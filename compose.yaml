@@ -1,0 +1,27 @@
+services:
+  cert-convert:
+    image: ghcr.io/cplieger/cert-convert:latest
+    container_name: cert-convert
+    restart: unless-stopped
+    user: "1000:1000"  # match your host user
+    mem_limit: 64m
+
+    environment:
+      TZ: "Europe/Paris"
+      PFX_PASSWORD: "your-pfx-password"
+      FALLBACK_SCAN_HOURS: "6"  # fsnotify fallback interval
+      PFX_ENCODER: "modern2023"  # modern2023, modern2026, or legacy
+
+    volumes:
+      - "/path/to/pem/certificates:/input:ro"
+      - "/path/to/pfx/output:/output:rw"
+
+    healthcheck:
+      test:
+        - CMD
+        - /cert-watcher
+        - health
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
