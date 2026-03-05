@@ -82,9 +82,15 @@ services:
 
 1. Set `PFX_PASSWORD` to the password you want embedded in the generated PFX files.
 2. Mount your PEM certificate directory to `/input` (read-only) and an output directory to `/output`.
-3. The container watches `/input` for changes using fsnotify. When a new or modified `.pem` file is detected, it generates a corresponding `.pfx` file in `/output`.
-4. If fsnotify misses events (common with network mounts), the container falls back to periodic full scans every `FALLBACK_SCAN_HOURS` hours.
-5. Choose `PFX_ENCODER` — see the [go-pkcs12 encoder documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables) for details on each profile:
+3. The container watches `/input` for changes using fsnotify. When a
+   new or modified `.pem` file is detected, it generates a
+   corresponding `.pfx` file in `/output`.
+4. If fsnotify misses events (common with network mounts), the
+   container falls back to periodic full scans every
+   `FALLBACK_SCAN_HOURS` hours.
+5. Choose `PFX_ENCODER` — see the
+   [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables)
+   for details on each profile:
    - `modern2023` (default): AES-256-CBC + SHA-256 MAC. Compatible with OpenSSL 1.1.1+, Java 12+, Windows Server 2019+.
    - `modern2026`: AES-256-CBC + PBMAC1 MAC. Requires OpenSSL 3.4.0+ or Java 26+.
    - `legacy`: 3DES + SHA-1. For older devices like some Synology firmware versions.
@@ -98,6 +104,7 @@ services:
 | `PFX_PASSWORD` | Password embedded in generated PFX files | - | Yes |
 | `FALLBACK_SCAN_HOURS` | Hours between full directory re-scans (fallback when fsnotify misses events) | `6` | No |
 | `PFX_ENCODER` | PFX encoding profile — modern2023 (AES-256-CBC + SHA-256, default), modern2026 (AES-256-CBC + PBMAC1, requires OpenSSL 3.4.0+), or legacy (3DES + SHA-1 for older devices). See [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables). | `modern2023` | No |
+
 
 ## Volumes
 
@@ -149,8 +156,14 @@ All dependencies are updated automatically via [Renovate](https://github.com/ren
 
 ## Design Principles
 
-- **Always up to date**: Base images, packages, and libraries are updated automatically via Renovate. Unlike many community Docker images that ship outdated or abandoned dependencies, these images receive continuous updates.
-- **Minimal attack surface**: When possible, pure Go apps use `gcr.io/distroless/static:nonroot` (no shell, no package manager, runs as non-root). Apps requiring system packages use Alpine with the minimum necessary privileges.
+- **Always up to date**: Base images, packages, and libraries are
+  updated automatically via Renovate. Unlike many community Docker
+  images that ship outdated or abandoned dependencies, these images
+  receive continuous updates.
+- **Minimal attack surface**: When possible, pure Go apps use
+  `gcr.io/distroless/static:nonroot` (no shell, no package manager,
+  runs as non-root). Apps requiring system packages use Alpine with
+  the minimum necessary privileges.
 - **Digest-pinned**: Every `FROM` instruction pins a SHA256 digest. All GitHub Actions are digest-pinned.
 - **Multi-platform**: Built for `linux/amd64` and `linux/arm64`.
 - **Healthchecks**: Every container includes a Docker healthcheck.
@@ -162,13 +175,23 @@ Issues, suggestions, and pull requests are welcome.
 
 ## Credits
 
-This is an original tool that integrates with [Go crypto/x509 + go-pkcs12](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12). Thanks to the Go crypto/x509 + go-pkcs12 maintainers for building the platform this tool extends.
+This is an original tool that integrates with
+[Go crypto/x509 + go-pkcs12](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12). Thanks to the
+Go crypto/x509 + go-pkcs12 maintainers for building the platform
+this tool extends.
 
 ## Disclaimer
 
-These images are built with care and follow security best practices, but they are intended for **homelab use**. No guarantees of fitness for production environments. Use at your own risk.
+These images are built with care and follow security best
+practices, but they are intended for **homelab use**. No
+guarantees of fitness for production environments. Use at
+your own risk.
 
-This project was built with AI-assisted tooling using [Claude Opus](https://www.anthropic.com/claude) and [Kiro](https://kiro.dev). The human maintainer defines architecture, supervises implementation, and makes all final decisions.
+This project was built with AI-assisted tooling using
+[Claude Opus](https://www.anthropic.com/claude) and
+[Kiro](https://kiro.dev). The human maintainer defines
+architecture, supervises implementation, and makes all
+final decisions.
 
 ## License
 

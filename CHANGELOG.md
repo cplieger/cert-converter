@@ -4,4 +4,5 @@
 
 ### Changed
 
-- Rebuilt with updated publishing pipeline
+- test(cert-convert): improve certificate chain building and modernize type hints
+- test(cert-convert): improve code quality and readability in test helpers
