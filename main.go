@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log"
 	"os"
@@ -166,6 +167,16 @@ func resetFallbackTimer(timer *time.Timer, interval time.Duration) {
 	}
 }
 
+// processAndSetHealth runs processAll and updates the health marker.
+func processAndSetHealth(certsRoot, outRoot, password string) {
+	if err := processAll(certsRoot, outRoot, password); err != nil {
+		log.Printf("error during processing: %v", err)
+		setHealthy(false)
+	} else {
+		setHealthy(true)
+	}
+}
+
 // watchLoop uses fsnotify for immediate reaction to cert changes,
 // with a periodic full scan as a safety net.
 func watchLoop(ctx context.Context, watcher *fsnotify.Watcher, certsRoot, outRoot, password string, interval time.Duration) {
@@ -201,21 +212,11 @@ func watchLoop(ctx context.Context, watcher *fsnotify.Watcher, certsRoot, outRoo
 		case <-debounceTimer.C:
 			pending = false
 			log.Println("cert change detected, processing...")
-			if err := processAll(certsRoot, outRoot, password); err != nil {
-				log.Printf("error during processing: %v", err)
-				setHealthy(false)
-			} else {
-				setHealthy(true)
-			}
+			processAndSetHealth(certsRoot, outRoot, password)
 			resetFallbackTimer(timer, interval)
 
 		case <-timerC:
-			if err := processAll(certsRoot, outRoot, password); err != nil {
-				log.Printf("error during periodic processing: %v", err)
-				setHealthy(false)
-			} else {
-				setHealthy(true)
-			}
+			processAndSetHealth(certsRoot, outRoot, password)
 			timer.Reset(interval)
 
 		case err, ok := <-watcher.Errors:
@@ -243,18 +244,23 @@ func pollLoop(ctx context.Context, certsRoot, outRoot, password string, interval
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := processAll(certsRoot, outRoot, password); err != nil {
-				log.Printf("error during processing: %v", err)
-				setHealthy(false)
-			} else {
-				setHealthy(true)
-			}
+			processAndSetHealth(certsRoot, outRoot, password)
 		}
 	}
 }
 
 // hashFile returns the hex-encoded SHA-256 of a file's contents.
+// Rejects files larger than 10 MB to prevent memory exhaustion from
+// maliciously large .crt or .key files.
 func hashFile(path string) (string, error) {
+	const maxFileSize = 10 << 20
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.Size() > maxFileSize {
+		return "", fmt.Errorf("file %s exceeds 10 MB size limit (%d bytes)", filepath.Base(path), info.Size())
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
@@ -425,13 +431,9 @@ func parsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 
 	// Try PKCS8 first — modern standard, handles RSA, ECDSA, and Ed25519
 	if key, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
-		switch k := key.(type) {
-		case *rsa.PrivateKey:
-			return k, nil
-		case *ecdsa.PrivateKey:
-			return k, nil
-		case ed25519.PrivateKey:
-			return k, nil
+		switch key.(type) {
+		case *rsa.PrivateKey, *ecdsa.PrivateKey, ed25519.PrivateKey:
+			return key, nil
 		default:
 			return nil, errors.New("unsupported private key type in PKCS8 container")
 		}
