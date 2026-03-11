@@ -12,8 +12,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -27,16 +28,7 @@ import (
 	"software.sslmate.com/src/go-pkcs12"
 )
 
-// fileHash stores the last known hash of a cert+key pair to skip unchanged files.
-type fileHash struct {
-	certHash string
-	keyHash  string
-}
-
-var (
-	mu     sync.Mutex
-	hashes = make(map[string]fileHash)
-)
+// --- Configuration ---
 
 const (
 	// Fixed container paths — configured via volume mounts, not env vars.
@@ -47,11 +39,23 @@ const (
 	// The "health" subcommand checks its existence for Docker healthchecks
 	// without requiring an HTTP server or open port.
 	healthFile = "/tmp/.healthy"
+
+	// maxFileSize is the maximum allowed size for cert/key files (10 MB).
+	// Prevents memory exhaustion from maliciously large files.
+	maxFileSize = 10 << 20
 )
 
-func main() {
-	log.SetOutput(os.Stdout)
+// Encoder name constants for PFX encoding selection.
+const (
+	encNameModern2023 = "modern2023"
+	encNameModern2026 = "modern2026"
+	encNameLegacyDES  = "legacydes"
+	encNameLegacyRC2  = "legacyrc2"
+)
 
+// --- Entrypoint ---
+
+func main() {
 	// CLI health probe for Docker healthcheck (distroless has no curl/wget).
 	// Checks for a marker file instead of making an HTTP request — no port needed.
 	if len(os.Args) > 1 && os.Args[1] == "health" {
@@ -61,29 +65,18 @@ func main() {
 		os.Exit(0)
 	}
 
-	certsRoot := certsRootDir
-	outRoot := outputDir
 	password := os.Getenv("PFX_PASSWORD")
-
-	interval := 6 * time.Hour
-	if v, ok := os.LookupEnv("FALLBACK_SCAN_HOURS"); ok {
-		low := strings.ToLower(strings.TrimSpace(v))
-		switch low {
-		case "", "0", "false":
-			interval = 0
-		default:
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				interval = time.Duration(n) * time.Hour
-			}
-		}
-	}
+	enc, encName := pickEncoder()
+	interval := parseFallbackInterval()
 
 	if interval > 0 {
-		log.Printf("Starting cert watcher: input=%s output=%s fallback_interval=%s",
-			certsRoot, outRoot, interval)
+		slog.Info("starting cert watcher",
+			"input", certsRootDir, "output", outputDir,
+			"fallback_interval", interval, "encoder", encName)
 	} else {
-		log.Printf("Starting cert watcher: input=%s output=%s fallback_scan=disabled",
-			certsRoot, outRoot)
+		slog.Info("starting cert watcher",
+			"input", certsRootDir, "output", outputDir,
+			"fallback_scan", "disabled", "encoder", encName)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -93,30 +86,32 @@ func main() {
 	defer setHealthy(false)
 
 	// Initial full scan — health reflects whether processing succeeded.
-	if err := processAll(certsRoot, outRoot, password); err != nil {
-		log.Printf("error during initial processing: %v", err)
+	if err := processAll(certsRootDir, outputDir, password, enc); err != nil {
+		slog.Error("initial processing failed", "error", err)
 		setHealthy(false)
 	} else {
 		setHealthy(true)
 	}
 
-	// Try fsnotify; fall back to polling if it fails
+	// Try fsnotify; fall back to polling if it fails.
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Printf("fsnotify unavailable (%v), using polling only", err)
-		pollLoop(ctx, certsRoot, outRoot, password, interval)
+		slog.Warn("fsnotify unavailable, using polling only", "error", err)
+		pollLoop(ctx, certsRootDir, outputDir, password, enc, interval)
 	} else {
 		defer watcher.Close()
-		if err := addWatchDirs(watcher, certsRoot); err != nil {
-			log.Printf("failed to watch directories (%v), using polling only", err)
-			pollLoop(ctx, certsRoot, outRoot, password, interval)
+		if err := addWatchDirs(watcher, certsRootDir); err != nil {
+			slog.Warn("failed to watch directories, using polling only", "error", err)
+			pollLoop(ctx, certsRootDir, outputDir, password, enc, interval)
 		} else {
-			watchLoop(ctx, watcher, certsRoot, outRoot, password, interval)
+			watchLoop(ctx, watcher, certsRootDir, outputDir, password, enc, interval)
 		}
 	}
 
-	log.Printf("Shutting down (%v)", context.Cause(ctx))
+	slog.Info("shutting down", "cause", context.Cause(ctx))
 }
+
+// --- Health ---
 
 // setHealthy creates or removes the health marker file.
 func setHealthy(ok bool) {
@@ -128,6 +123,45 @@ func setHealthy(ok bool) {
 		os.Remove(healthFile)
 	}
 }
+
+// --- Environment Parsing ---
+
+// parseFallbackInterval reads FALLBACK_SCAN_HOURS from the environment.
+// Returns 0 to disable polling, or the parsed duration.
+func parseFallbackInterval() time.Duration {
+	v, ok := os.LookupEnv("FALLBACK_SCAN_HOURS")
+	if !ok {
+		return 6 * time.Hour
+	}
+	trimmed := strings.TrimSpace(v)
+	switch strings.ToLower(trimmed) {
+	case "", "0", "false":
+		return 0
+	default:
+		if n, err := strconv.Atoi(trimmed); err == nil && n > 0 {
+			return time.Duration(n) * time.Hour
+		}
+		return 6 * time.Hour
+	}
+}
+
+// pickEncoder returns the PFX encoder and its name based on PFX_ENCODER env var.
+func pickEncoder() (enc *pkcs12.Encoder, name string) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("PFX_ENCODER"))) {
+	case encNameLegacyRC2:
+		return pkcs12.LegacyRC2, encNameLegacyRC2
+	case "legacy", encNameLegacyDES:
+		return pkcs12.LegacyDES, encNameLegacyDES
+	case encNameModern2026:
+		return pkcs12.Modern2026, encNameModern2026
+	case "", "modern", encNameModern2023:
+		return pkcs12.Modern2023, encNameModern2023
+	default:
+		return pkcs12.Modern2023, encNameModern2023
+	}
+}
+
+// --- Watch Loop ---
 
 // addWatchDirs recursively adds all directories under root to the watcher.
 func addWatchDirs(watcher *fsnotify.Watcher, root string) error {
@@ -148,7 +182,7 @@ func handleFsEvent(event fsnotify.Event, watcher *fsnotify.Watcher, pending *boo
 	if event.Has(fsnotify.Create) {
 		if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
 			if addErr := watcher.Add(event.Name); addErr != nil {
-				log.Printf("failed to watch new directory %s: %v", event.Name, addErr)
+				slog.Warn("failed to watch new directory", "path", event.Name, "error", addErr)
 			}
 		}
 	}
@@ -160,32 +194,15 @@ func handleFsEvent(event fsnotify.Event, watcher *fsnotify.Watcher, pending *boo
 	}
 }
 
-// resetFallbackTimer resets the fallback timer if it is enabled.
-func resetFallbackTimer(timer *time.Timer, interval time.Duration) {
-	if timer != nil {
-		timer.Reset(interval)
-	}
-}
-
-// processAndSetHealth runs processAll and updates the health marker.
-func processAndSetHealth(certsRoot, outRoot, password string) {
-	if err := processAll(certsRoot, outRoot, password); err != nil {
-		log.Printf("error during processing: %v", err)
-		setHealthy(false)
-	} else {
-		setHealthy(true)
-	}
-}
-
 // watchLoop uses fsnotify for immediate reaction to cert changes,
 // with a periodic full scan as a safety net.
-func watchLoop(ctx context.Context, watcher *fsnotify.Watcher, certsRoot, outRoot, password string, interval time.Duration) {
+func watchLoop(ctx context.Context, watcher *fsnotify.Watcher, certsRoot, outRoot, password string, enc *pkcs12.Encoder, interval time.Duration) {
 	const debounce = 2 * time.Second
 
-	var timer *time.Timer
+	var fallbackTimer *time.Timer
 	if interval > 0 {
-		timer = time.NewTimer(interval)
-		defer timer.Stop()
+		fallbackTimer = time.NewTimer(interval)
+		defer fallbackTimer.Stop()
 	}
 
 	var pending bool
@@ -194,9 +211,9 @@ func watchLoop(ctx context.Context, watcher *fsnotify.Watcher, certsRoot, outRoo
 	defer debounceTimer.Stop()
 
 	for {
-		var timerC <-chan time.Time
-		if timer != nil {
-			timerC = timer.C
+		var fallbackC <-chan time.Time
+		if fallbackTimer != nil {
+			fallbackC = fallbackTimer.C
 		}
 
 		select {
@@ -211,27 +228,31 @@ func watchLoop(ctx context.Context, watcher *fsnotify.Watcher, certsRoot, outRoo
 
 		case <-debounceTimer.C:
 			pending = false
-			log.Println("cert change detected, processing...")
-			processAndSetHealth(certsRoot, outRoot, password)
-			resetFallbackTimer(timer, interval)
+			slog.Info("cert change detected, processing")
+			processAndSetHealth(certsRoot, outRoot, password, enc)
+			if fallbackTimer != nil {
+				fallbackTimer.Reset(interval)
+			}
 
-		case <-timerC:
-			processAndSetHealth(certsRoot, outRoot, password)
-			timer.Reset(interval)
+		case <-fallbackC:
+			processAndSetHealth(certsRoot, outRoot, password, enc)
+			fallbackTimer.Reset(interval)
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
 				return
 			}
-			log.Printf("watcher error: %v", err)
+			slog.Warn("watcher error", "error", err)
 		}
 	}
 }
 
+// --- Poll Loop ---
+
 // pollLoop is the fallback when fsnotify is unavailable.
-func pollLoop(ctx context.Context, certsRoot, outRoot, password string, interval time.Duration) {
+func pollLoop(ctx context.Context, certsRoot, outRoot, password string, enc *pkcs12.Encoder, interval time.Duration) {
 	if interval <= 0 {
-		log.Println("Polling disabled and fsnotify unavailable, waiting for shutdown...")
+		slog.Info("polling disabled and fsnotify unavailable, waiting for shutdown")
 		<-ctx.Done()
 		return
 	}
@@ -244,29 +265,57 @@ func pollLoop(ctx context.Context, certsRoot, outRoot, password string, interval
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			processAndSetHealth(certsRoot, outRoot, password)
+			processAndSetHealth(certsRoot, outRoot, password, enc)
 		}
 	}
 }
 
+// --- Processing ---
+
+// processAndSetHealth runs processAll and updates the health marker.
+func processAndSetHealth(certsRoot, outRoot, password string, enc *pkcs12.Encoder) {
+	if err := processAll(certsRoot, outRoot, password, enc); err != nil {
+		slog.Error("processing failed", "error", err)
+		setHealthy(false)
+	} else {
+		setHealthy(true)
+	}
+}
+
+// fileHash stores the last known hash of a cert+key pair to skip unchanged files.
+type fileHash struct {
+	certHash string
+	keyHash  string
+}
+
+var (
+	mu     sync.Mutex
+	hashes = make(map[string]fileHash)
+)
+
 // hashFile returns the hex-encoded SHA-256 of a file's contents.
-// Rejects files larger than 10 MB to prevent memory exhaustion from
-// maliciously large .crt or .key files.
+// Uses streaming hash to avoid loading the entire file into memory.
+// Rejects files larger than maxFileSize to prevent resource exhaustion.
 func hashFile(path string) (string, error) {
-	const maxFileSize = 10 << 20
-	info, err := os.Stat(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
 	if err != nil {
 		return "", err
 	}
 	if info.Size() > maxFileSize {
 		return "", fmt.Errorf("file %s exceeds 10 MB size limit (%d bytes)", filepath.Base(path), info.Size())
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
+
+	h := sha256.New()
+	if _, err := io.Copy(h, io.LimitReader(f, maxFileSize)); err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:]), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // changed returns true if the cert or key file has changed since last conversion.
@@ -291,15 +340,12 @@ func changed(crtPath, keyPath string) bool {
 	return false
 }
 
-func processAll(certsRoot, outRoot, password string) error {
+func processAll(certsRoot, outRoot, password string, enc *pkcs12.Encoder) error {
 	return filepath.WalkDir(certsRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() {
-			return nil
-		}
-		if !strings.HasSuffix(path, ".crt") {
+		if d.IsDir() || !strings.HasSuffix(path, ".crt") {
 			return nil
 		}
 
@@ -325,39 +371,48 @@ func processAll(certsRoot, outRoot, password string) error {
 		}
 		destPath := filepath.Join(destDir, base+".pfx")
 
-		if err := convertToPFX(path, keyPath, destPath, password); err != nil {
-			log.Printf("failed to convert %s / %s: %v", path, keyPath, err)
+		if err := convertToPFX(path, keyPath, destPath, password, enc); err != nil {
+			slog.Error("conversion failed", "cert", rel, "error", err)
 			return nil
 		}
 
-		log.Printf("wrote %s", destPath)
+		destRel := strings.TrimSuffix(rel, ".crt") + ".pfx"
+		slog.Info("wrote pfx", "path", destRel)
 		return nil
 	})
 }
 
-func pickEncoder() *pkcs12.Encoder {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("PFX_ENCODER"))) {
-	case "legacyrc2":
-		return pkcs12.LegacyRC2
-	case "legacy", "legacydes":
-		return pkcs12.LegacyDES
-	case "modern2026":
-		return pkcs12.Modern2026
-	case "", "modern", "modern2023":
-		return pkcs12.Modern2023
-	default:
-		return pkcs12.Modern2023
+// --- PFX Conversion ---
+
+// readFileWithLimit opens a file, validates its size, and returns its contents.
+// Uses a single file handle to avoid TOCTOU races between stat and read.
+func readFileWithLimit(path string, limit int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > limit {
+		return nil, fmt.Errorf("file exceeds %d byte limit (%d bytes)", limit, info.Size())
+	}
+
+	return io.ReadAll(io.LimitReader(f, limit))
 }
 
-func convertToPFX(crtPath, keyPath, destPath, password string) error {
-	certPEM, err := os.ReadFile(crtPath)
+func convertToPFX(crtPath, keyPath, destPath, password string, enc *pkcs12.Encoder) error {
+	certPEM, err := readFileWithLimit(crtPath, maxFileSize)
 	if err != nil {
-		return err
+		return fmt.Errorf("read cert: %w", err)
 	}
-	keyPEM, err := os.ReadFile(keyPath)
+
+	keyPEM, err := readFileWithLimit(keyPath, maxFileSize)
 	if err != nil {
-		return err
+		return fmt.Errorf("read key: %w", err)
 	}
 
 	chain, err := parseCertChain(certPEM)
@@ -375,22 +430,35 @@ func convertToPFX(crtPath, keyPath, destPath, password string) error {
 		return err
 	}
 
-	enc := pickEncoder()
 	pfxData, err := enc.Encode(privKey, leaf, caCerts, password)
 	if err != nil {
 		return err
 	}
 
-	tmp := destPath + ".tmp." + strconv.FormatInt(time.Now().UnixNano(), 36)
-	if err := os.WriteFile(tmp, pfxData, 0o600); err != nil {
+	// Atomic write: temp file + rename prevents corruption on crash.
+	tmp, err := os.CreateTemp(filepath.Dir(destPath), ".cert-convert-*.tmp")
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, destPath); err != nil {
-		os.Remove(tmp)
+	tmpName := tmp.Name()
+
+	if _, err := tmp.Write(pfxData); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, destPath); err != nil {
+		os.Remove(tmpName)
 		return err
 	}
 	return nil
 }
+
+// --- PEM Parsing ---
 
 func parseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
 	var certs []*x509.Certificate
@@ -429,7 +497,7 @@ func parsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 		}
 	}
 
-	// Try PKCS8 first — modern standard, handles RSA, ECDSA, and Ed25519
+	// Try PKCS8 first — modern standard, handles RSA, ECDSA, and Ed25519.
 	if key, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
 		switch key.(type) {
 		case *rsa.PrivateKey, *ecdsa.PrivateKey, ed25519.PrivateKey:
@@ -439,7 +507,7 @@ func parsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 		}
 	}
 
-	// Fall back to legacy format-specific parsers
+	// Fall back to legacy format-specific parsers.
 	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
 		return key, nil
 	}

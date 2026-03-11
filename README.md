@@ -83,7 +83,7 @@ services:
 1. Set `PFX_PASSWORD` to the password you want embedded in the generated PFX files.
 2. Mount your PEM certificate directory to `/input` (read-only) and an output directory to `/output`.
 3. The container watches `/input` for changes using fsnotify. When a
-   new or modified `.pem` file is detected, it generates a
+   new or modified `.crt`/`.key` file pair is detected, it generates a
    corresponding `.pfx` file in `/output`.
 4. If fsnotify misses events (common with network mounts), the
    container falls back to periodic full scans every

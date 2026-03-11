@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026.03.11 (2026-03-11)
+
+### Added
+
+- Add security hardening and structured logging
+
+### Changed
+
+- Refactor(cert-convert): reorganize code structure and improve file handling
+- Migrate to structured logging and enhance validation
+
 ## 2026.03.10 (2026-03-10)
 
 ### Changed
