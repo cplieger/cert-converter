@@ -169,7 +169,7 @@ Issues, suggestions, and pull requests are welcome.
 
 ## Credits
 
-This is an original tool that integrates with [Go crypto/x509 + go-pkcs12](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12). Thanks to the Go crypto/x509 + go-pkcs12 maintainers for building the platform this tool extends.
+This is an original tool that builds upon [Go crypto/x509 + go-pkcs12](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12).
 
 ## Disclaimer
 
