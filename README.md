@@ -163,10 +163,6 @@ All dependencies are updated automatically via [Renovate](https://github.com/ren
 - **Healthchecks**: Every container includes a Docker healthcheck.
 - **Provenance**: Build provenance is attested via GitHub Actions, verifiable with `gh attestation verify`.
 
-## Contributing
-
-Issues, suggestions, and pull requests are welcome.
-
 ## Credits
 
 This is an original tool that builds upon [Go crypto/x509 + go-pkcs12](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12).
