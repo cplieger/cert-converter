@@ -64,8 +64,8 @@ services:
       PFX_ENCODER: "modern2023"  # modern2023, modern2026, or legacy
 
     volumes:
-      - "/path/to/pem/certificates:/input:ro"
-      - "/path/to/pfx/output:/output:rw"
+      - "\\/path/to/pem/certificates:/input:ro"
+      - "\\/path/to/pfx/output:/output:rw"
 
     healthcheck:
       test:
@@ -151,7 +151,7 @@ docker inspect --format='{{json .State.Health.Log}}' cert-convert | python3 -m j
 | Tests | 106 |
 | [Cyclomatic Complexity](https://en.wikipedia.org/wiki/Cyclomatic_complexity) (avg) | 5.7 |
 | [Cognitive Complexity](https://www.sonarsource.com/docs/CognitiveComplexity.pdf) (avg) | 8.2 |
-| [Mutation Efficacy](https://en.wikipedia.org/wiki/Mutation_testing) | 90.5% (29 runs) |
+| [Mutation Efficacy](https://en.wikipedia.org/wiki/Mutation_testing) | 90.5% (59 runs) |
 | Test Framework | Property-based ([rapid](https://github.com/flyingmutant/rapid)) + table-driven |
 
 The test suite validates all user-facing functionality: PEM certificate
