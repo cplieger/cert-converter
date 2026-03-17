@@ -168,6 +168,32 @@ are event-driven I/O paths that can't be unit tested meaningfully.
 Validated by Docker healthchecks in production (the health probe
 confirms the last processing cycle succeeded).
 
+## Security Review
+
+**No vulnerabilities found.** All scans clean across 10 tools.
+
+| Tool | Result |
+|------|--------|
+| [govulncheck](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) | No vulnerabilities in call graph |
+| [golangci-lint](https://golangci-lint.run/) (gosec, gocritic) | 0 issues |
+| [trivy](https://trivy.dev/) | 0 vulnerabilities |
+| [grype](https://github.com/anchore/grype) | 0 vulnerabilities |
+| [gitleaks](https://github.com/gitleaks/gitleaks) | No secrets detected |
+| [semgrep](https://semgrep.dev/) | 1 info (false positive) |
+| [hadolint](https://github.com/hadolint/hadolint) | Clean |
+
+This app has a minimal attack surface: no network listener, no
+HTTP server, no exposed ports. It reads PEM files from a mounted
+directory and writes PFX files to another. Runs as `nonroot` on
+a distroless base image with no shell or package manager.
+
+**Details for advanced users:** File paths are hardcoded
+(`/input`, `/output`), not configurable via env vars. File reads
+are TOCTOU-safe (stat + read from same handle) with a 10 MB cap.
+PFX writes use atomic temp-file + rename. The semgrep finding is
+the `/tmp/.healthy` health marker, a fixed-path zero-byte file
+in a single-process container.
+
 ## Dependencies
 
 All dependencies are updated automatically via [Renovate](https://github.com/renovatebot/renovate) and pinned by digest or version for reproducibility.
