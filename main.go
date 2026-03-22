@@ -69,13 +69,20 @@ func main() {
 	enc, encName := pickEncoder()
 	interval := parseFallbackInterval()
 
+	passwordStatus := "empty"
+	if password != "" {
+		passwordStatus = "configured"
+	}
+
 	if interval > 0 {
 		slog.Info("starting cert watcher",
 			"input", certsRootDir, "output", outputDir,
+			"password", passwordStatus,
 			"fallback_interval", interval, "encoder", encName)
 	} else {
 		slog.Info("starting cert watcher",
 			"input", certsRootDir, "output", outputDir,
+			"password", passwordStatus,
 			"fallback_scan", "disabled", "encoder", encName)
 	}
 
@@ -144,6 +151,8 @@ func parseFallbackInterval() time.Duration {
 		if n, err := strconv.Atoi(trimmed); err == nil && n > 0 {
 			return time.Duration(n) * time.Hour
 		}
+		slog.Warn("invalid FALLBACK_SCAN_HOURS, using default",
+			"value", v, "default", "6h")
 		return 6 * time.Hour
 	}
 }
@@ -160,6 +169,8 @@ func pickEncoder() (enc *pkcs12.Encoder, name string) {
 	case "", "modern", encNameModern2023:
 		return pkcs12.Modern2023, encNameModern2023
 	default:
+		slog.Warn("unknown PFX_ENCODER, using modern2023",
+			"value", os.Getenv("PFX_ENCODER"))
 		return pkcs12.Modern2023, encNameModern2023
 	}
 }
@@ -238,6 +249,7 @@ func watchLoop(ctx context.Context, watcher *fsnotify.Watcher, certsRoot, outRoo
 			}
 
 		case <-fallbackC:
+			slog.Debug("fallback scan triggered", "interval", interval)
 			processAndSetHealth(certsRoot, outRoot, password, enc)
 			fallbackTimer.Reset(interval)
 
@@ -268,6 +280,7 @@ func pollLoop(ctx context.Context, certsRoot, outRoot, password string, enc *pkc
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			slog.Debug("poll scan triggered", "interval", interval)
 			processAndSetHealth(certsRoot, outRoot, password, enc)
 		}
 	}
@@ -364,10 +377,12 @@ func processAll(certsRoot, outRoot, password string, enc *pkcs12.Encoder) error 
 
 		keyPath := strings.TrimSuffix(path, ".crt") + ".key"
 		if _, statErr := os.Stat(keyPath); statErr != nil {
+			slog.Debug("skipping cert without matching key", "path", path)
 			return nil
 		}
 
 		if !changed(path, keyPath) {
+			slog.Debug("skipping unchanged cert pair", "path", path)
 			return nil
 		}
 
@@ -384,15 +399,16 @@ func processAll(certsRoot, outRoot, password string, enc *pkcs12.Encoder) error 
 		}
 		destPath := filepath.Join(destDir, base+".pfx")
 
+		slog.Debug("converting cert pair", "path", rel)
 		if err := convertToPFX(path, keyPath, destPath, password, enc); err != nil {
-			slog.Error("conversion failed", "cert", rel, "error", err)
+			slog.Error("conversion failed", "path", rel, "error", err)
 			// Remove cached hash so the next scan retries this pair.
 			invalidateHash(path)
 			return nil
 		}
 
-		destRel := strings.TrimSuffix(rel, ".crt") + ".pfx"
-		slog.Info("wrote pfx", "path", destRel)
+		pfxRel := strings.TrimSuffix(rel, ".crt") + ".pfx"
+		slog.Info("wrote pfx", "path", pfxRel)
 		return nil
 	})
 }

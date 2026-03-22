@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026.03.21-0aabfbc (2026-03-22)
+
+### Added
+
+- Enhance logging with password status and debug traces
+
 ## 2026.03.15-784bd79 (2026-03-16)
 
 ### Dependencies
