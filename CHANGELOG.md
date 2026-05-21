@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026.05.18-7b15372 (2026-05-21)
+
+### Added
+
+- Add file-based healthcheck for distroless container
+- Add file-based healthcheck for distroless containers
+- Improve logging, security hardening, and test coverage
+
+### Fixed
+
+- Refactor health probe to enable unit testing
+
+### Security
+
+- Move healthcheck to Dockerfile and harden security
+
+### Changed
+
+- Introduce ScanResult, CacheChecker interface, distribute tests, and parallelize
+- Refactor into internal packages
+- Simplify tmpfs comment
+- Refactor(cert-convert): replace magic strings with named constants
+- Refactor compose (no user-visible change)
+- Resilience, pruning, scan summary, and hardening
+
+### Dependencies
+
+- Update gcr.io/distroless/static-debian13:nonroot docker digest to 963fa6c
+- Update golang:1.26-alpine docker digest to 91eda97 (#258)
+- Update third-party dependencies
+- fix(deps): update module github.com/fsnotify/fsnotify to v1.10.0
+- fix(deps): update module github.com/fsnotify/fsnotify to v1.10.1 (#239)
+- fix(deps): update module pgregory.net/rapid to v1.3.0
+
 ## 2026.04.16-8e0d8c0 (2026-04-17)
 
 ### Dependencies

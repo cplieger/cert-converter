@@ -1,10 +1,10 @@
 module cert-watcher
 
-go 1.26.2
+go 1.26.3
 
 require (
-	github.com/fsnotify/fsnotify v1.9.0
-	pgregory.net/rapid v1.2.0
+	github.com/fsnotify/fsnotify v1.10.1
+	pgregory.net/rapid v1.3.0
 	software.sslmate.com/src/go-pkcs12 v0.7.1
 )
 

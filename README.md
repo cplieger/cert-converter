@@ -55,7 +55,6 @@ services:
     container_name: cert-convert
     restart: unless-stopped
     user: "1000:1000"  # match your host user
-    mem_limit: 64m
 
     environment:
       TZ: "Europe/Paris"
@@ -64,18 +63,8 @@ services:
       PFX_ENCODER: "modern2023"  # modern2023, modern2026, or legacy
 
     volumes:
-      - "\\/path/to/pem/certificates:/input:ro"
-      - "\\/path/to/pfx/output:/output:rw"
-
-    healthcheck:
-      test:
-        - CMD
-        - /cert-watcher
-        - health
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
+      - "/path/to/pem/certificates:/input:ro"
+      - "/path/to/pfx/output:/output:rw"
 ```
 
 ## Deployment
@@ -147,10 +136,10 @@ docker inspect --format='{{json .State.Health.Log}}' cert-convert | python3 -m j
 
 | Metric | Value |
 |--------|-------|
-| [Test Coverage](https://go.dev/blog/cover) | 64.7% |
-| Tests | 106 |
-| [Cyclomatic Complexity](https://en.wikipedia.org/wiki/Cyclomatic_complexity) (avg) | 5.7 |
-| [Cognitive Complexity](https://www.sonarsource.com/docs/CognitiveComplexity.pdf) (avg) | 8.2 |
+| [Test Coverage](https://go.dev/blog/cover) | 69.5% |
+| Tests | 123 |
+| [Cyclomatic Complexity](https://en.wikipedia.org/wiki/Cyclomatic_complexity) (avg) | 5.3 |
+| [Cognitive Complexity](https://www.sonarsource.com/docs/CognitiveComplexity.pdf) (avg) | 6.1 |
 | [Mutation Efficacy](https://en.wikipedia.org/wiki/Mutation_testing) | 90.5% (59 runs) |
 | Test Framework | Property-based ([rapid](https://github.com/flyingmutant/rapid)) + table-driven |
 
@@ -202,8 +191,8 @@ All dependencies are updated automatically via [Renovate](https://github.com/ren
 |------------|---------|--------|
 | golang | `1.26-alpine` | [Go](https://hub.docker.com/_/golang) |
 | gcr.io/distroless/static-debian13 | `nonroot` | [Distroless](https://github.com/GoogleContainerTools/distroless) |
-| github.com/fsnotify/fsnotify | `v1.9.0` | [GitHub](https://github.com/fsnotify/fsnotify) |
-| pgregory.net/rapid | `v1.2.0` | [pkg.go.dev](https://pkg.go.dev/pgregory.net/rapid) |
+| github.com/fsnotify/fsnotify | `v1.10.1` | [GitHub](https://github.com/fsnotify/fsnotify) |
+| pgregory.net/rapid | `v1.3.0` | [pkg.go.dev](https://pkg.go.dev/pgregory.net/rapid) |
 | software.sslmate.com/src/go-pkcs12 | `v0.7.1` | [SSLMate](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12) |
 
 ## Design Principles
