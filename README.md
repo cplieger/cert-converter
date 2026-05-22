@@ -1,8 +1,8 @@
 # cert-converter
 
 ![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)
-[![GitHub release](https://img.shields.io/github/v/release/cplieger/cert-converter)](https://github.com/cplieger/cert-converter/releases)
-[![Image Size](https://ghcr-badge.egpl.dev/cplieger/cert-convert/size)](https://github.com/cplieger/cert-converter/pkgs/container/cert-convert)
+[![GitHub release](https://img.shields.io/github/v/release/cplieger/cert-converterer)](https://github.com/cplieger/cert-converterer/releases)
+[![Image Size](https://ghcr-badge.egpl.dev/cplieger/cert-converter/size)](https://github.com/cplieger/cert-converterer/pkgs/container/cert-convert)
 ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
 ![base: Distroless](https://img.shields.io/badge/base-Distroless_nonroot-4285F4?logo=google)
 
@@ -33,15 +33,15 @@ This image is published to both GHCR and Docker Hub:
 
 | Registry | Image |
 |----------|-------|
-| GHCR | `ghcr.io/cplieger/cert-convert` |
-| Docker Hub | `docker.io/cplieger/cert-convert` |
+| GHCR | `ghcr.io/cplieger/cert-converter` |
+| Docker Hub | `docker.io/cplieger/cert-converter` |
 
 ```bash
 # Pull from GHCR
-docker pull ghcr.io/cplieger/cert-convert:latest
+docker pull ghcr.io/cplieger/cert-converter:latest
 
 # Pull from Docker Hub
-docker pull cplieger/cert-convert:latest
+docker pull cplieger/cert-converter:latest
 ```
 
 Both registries receive identical images and tags. Use whichever you prefer.
@@ -50,9 +50,9 @@ Both registries receive identical images and tags. Use whichever you prefer.
 
 ```yaml
 services:
-  cert-convert:
-    image: ghcr.io/cplieger/cert-convert:latest
-    container_name: cert-convert
+  cert-converter:
+    image: ghcr.io/cplieger/cert-converter:latest
+    container_name: cert-converter
     restart: unless-stopped
     user: "1000:1000"  # match your host user
 
@@ -124,7 +124,7 @@ processing cycle completes.
 
 To check health manually:
 ```bash
-docker inspect --format='{{json .State.Health.Log}}' cert-convert | python3 -m json.tool
+docker inspect --format='{{json .State.Health.Log}}' cert-converter | python3 -m json.tool
 ```
 
 | Type | Command | Meaning |
