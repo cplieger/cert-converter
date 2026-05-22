@@ -70,3 +70,4 @@ linters:
           - unparam
           - usetesting
           - noctx
+          - revive
