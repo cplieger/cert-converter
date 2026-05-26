@@ -6,47 +6,35 @@
 ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
 ![base: Distroless](https://img.shields.io/badge/base-Distroless_nonroot-4285F4?logo=google)
 
-Automated PEM-to-PFX certificate converter with file watching
+Automatically converts PEM certificates to PFX format whenever they renew — set it and forget it.
 
-## Overview
+## What it does
 
 Watches a certificate directory using fsnotify (with polling fallback) for
 new or changed PEM certificate files. When a change is detected, it reads
-the certificate chain and private key, then produces a PKCS#12 (.pfx) file.
-SHA-256 change detection skips unchanged certificates. Supports modern2023,
-modern2026, and legacy PFX encoding profiles. Includes a CLI health probe
-for distroless Docker healthchecks (file-based, no HTTP server or open port).
-
-**Example use case:** Caddy generates PEM certificates natively. If you have
-apps that only accept PFX/PKCS#12 files (e.g. some Synology services, .NET
-apps, or Windows-based tools), point the input directory to Caddy's
-certificate folder and this container will automatically produce PFX files
-whenever Caddy renews certificates.
+the certificate chain and private key, then produces a PKCS#12 (.pfx) file —
+for example, if Caddy generates PEM certificates and you have apps that only
+accept PFX/PKCS#12 files (e.g. some Synology services, .NET apps, or
+Windows-based tools), point the input directory to Caddy's certificate folder
+and this container will automatically produce PFX files whenever certificates
+are renewed. SHA-256 change detection skips unchanged certificates. Supports
+modern2023, modern2026, and legacy PFX encoding profiles. Includes a CLI
+health probe for distroless Docker healthchecks (file-based, no HTTP server
+or open port).
 
 This is a distroless, rootless container — it runs as `nonroot` on
 `gcr.io/distroless/static` with no shell or package manager.
 
+### Why this design
 
-## Container Registries
+- **Distroless and rootless** — runs on `gcr.io/distroless/static:nonroot` with no shell or package manager, minimizing attack surface and eliminating entire classes of container escapes.
+- **fsnotify with polling fallback** — reacts to certificate changes in real time, but falls back to periodic full scans so network mounts and edge cases never cause missed renewals.
+- **SHA-256 skip-unchanged** — avoids unnecessary PFX regeneration by fingerprinting input files, reducing disk writes and keeping output timestamps meaningful.
+- **No HTTP server, no open ports** — the container has zero network listeners; health is reported via a file-based probe, leaving nothing exposed to the network.
 
-This image is published to both GHCR and Docker Hub:
+## Quick start
 
-| Registry | Image |
-|----------|-------|
-| GHCR | `ghcr.io/cplieger/cert-converter` |
-| Docker Hub | `docker.io/cplieger/cert-converter` |
-
-```bash
-# Pull from GHCR
-docker pull ghcr.io/cplieger/cert-converter:latest
-
-# Pull from Docker Hub
-docker pull cplieger/cert-converter:latest
-```
-
-Both registries receive identical images and tags. Use whichever you prefer.
-
-## Quick Start
+The image is published to both GHCR (`ghcr.io/cplieger/cert-converter`) and Docker Hub (`cplieger/cert-converter`) — identical contents, use whichever you prefer.
 
 ```yaml
 services:
@@ -67,25 +55,9 @@ services:
       - "/path/to/pfx/output:/output:rw"
 ```
 
-## Deployment
+## Configuration reference
 
-1. Set `PFX_PASSWORD` to the password you want embedded in the generated PFX files.
-2. Mount your PEM certificate directory to `/input` (read-only) and an output directory to `/output`.
-3. The container watches `/input` for changes using fsnotify. When a
-   new or modified `.crt`/`.key` file pair is detected, it generates a
-   corresponding `.pfx` file in `/output`.
-4. If fsnotify misses events (common with network mounts), the
-   container falls back to periodic full scans every
-   `FALLBACK_SCAN_HOURS` hours.
-5. Choose `PFX_ENCODER` — see the
-   [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables)
-   for details on each profile:
-   - `modern2023` (default): AES-256-CBC + SHA-256 MAC. Compatible with OpenSSL 1.1.1+, Java 12+, Windows Server 2019+.
-   - `modern2026`: AES-256-CBC + PBMAC1 MAC. Requires OpenSSL 3.4.0+ or Java 26+.
-   - `legacy`: 3DES + SHA-1. For older devices like some Synology firmware versions.
-
-
-## Environment Variables
+### Environment variables
 
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
@@ -94,45 +66,18 @@ services:
 | `FALLBACK_SCAN_HOURS` | Hours between full directory re-scans (fallback when fsnotify misses events) | `6` | No |
 | `PFX_ENCODER` | PFX encoding profile — modern2023 (AES-256-CBC + SHA-256, default), modern2026 (AES-256-CBC + PBMAC1, requires OpenSSL 3.4.0+), or legacy (3DES + SHA-1 for older devices). See [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables). | `modern2023` | No |
 
-
-## Volumes
+### Volumes
 
 | Mount | Description |
 |-------|-------------|
 | `/input` | PEM certificate directory (read-only) |
 | `/output` | PFX output directory |
 
+## Healthcheck
 
-## Docker Healthcheck
+The container includes a built-in health probe: after each successful certificate processing cycle, the main process creates a marker file at `/tmp/.healthy`; the `health` subcommand (`/cert-watcher health`) checks for this file and exits 0 if it exists. The container becomes unhealthy when the input directory is unreadable, PEM parsing fails, or PFX writes fail — any error during a processing cycle removes the marker. It auto-recovers on the next successful cycle (triggered by an fsnotify event or the fallback timer) without requiring a restart.
 
-The container includes a built-in Docker healthcheck. On startup and after
-each certificate processing cycle, the main process creates a marker file
-at `/tmp/.healthy`. The `health` subcommand checks for this file's existence.
-
-**When it becomes unhealthy:**
-- Input directory is unreadable or missing
-- PEM parsing fails (malformed certificate or key)
-- PFX write fails (output directory full or read-only)
-- Any error during the `processAll` cycle
-
-**When it recovers:**
-- The next successful processing cycle (triggered by fsnotify event or fallback timer) recreates the marker file and the container reports healthy again. No restart required.
-
-**On shutdown:** The marker file is removed, so a stopped container
-always reports unhealthy on the next start until the first successful
-processing cycle completes.
-
-To check health manually:
-```bash
-docker inspect --format='{{json .State.Health.Log}}' cert-converter | python3 -m json.tool
-```
-
-| Type | Command | Meaning |
-|------|---------|---------|
-| Docker | `/cert-watcher health` | Exit 0 = last processing cycle succeeded |
-
-
-## Code Quality
+## Code quality
 
 | Metric | Value |
 |--------|-------|
@@ -157,7 +102,7 @@ are event-driven I/O paths that can't be unit tested meaningfully.
 Validated by Docker healthchecks in production (the health probe
 confirms the last processing cycle succeeded).
 
-## Security Review
+## Security
 
 **No vulnerabilities found.** All scans clean across 10 tools.
 
@@ -185,7 +130,7 @@ in a single-process container.
 
 ## Dependencies
 
-All dependencies are updated automatically via [Renovate](https://github.com/renovatebot/renovate) and pinned by digest or version for reproducibility.
+Updated automatically via [Renovate](https://github.com/renovatebot/renovate) and pinned by digest. Builds carry signed SBOMs and provenance attestations verifiable with `gh attestation verify`.
 
 | Dependency | Version | Source |
 |------------|---------|--------|
@@ -195,18 +140,14 @@ All dependencies are updated automatically via [Renovate](https://github.com/ren
 | pgregory.net/rapid | `v1.3.0` | [pkg.go.dev](https://pkg.go.dev/pgregory.net/rapid) |
 | software.sslmate.com/src/go-pkcs12 | `v0.7.1` | [SSLMate](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12) |
 
-## Design Principles
-
-- **Always up to date**: Base images, packages, and libraries are updated automatically via Renovate. Unlike many community Docker images that ship outdated or abandoned dependencies, these images receive continuous updates.
-- **Minimal attack surface**: When possible, pure Go apps use `gcr.io/distroless/static:nonroot` (no shell, no package manager, runs as non-root). Apps requiring system packages use Alpine with the minimum necessary privileges.
-- **Digest-pinned**: Every `FROM` instruction pins a SHA256 digest. All GitHub Actions are digest-pinned.
-- **Multi-platform**: Built for `linux/amd64` and `linux/arm64`.
-- **Healthchecks**: Every container includes a Docker healthcheck.
-- **Provenance**: Build provenance is attested via GitHub Actions, verifiable with `gh attestation verify`.
-
 ## Credits
 
 This is an original tool that builds upon [Go crypto/x509 + go-pkcs12](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12).
+
+## Contributing
+
+Issues and pull requests are welcome. Please open an issue first for
+larger changes so the approach can be discussed before implementation.
 
 ## Disclaimer
 
