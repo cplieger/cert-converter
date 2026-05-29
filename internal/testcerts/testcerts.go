@@ -122,7 +122,11 @@ func GenerateCertChain(tb testing.TB) (leafPEM, keyPEM, caPEM, chainPEM []byte) 
 	}
 	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 
-	chainPEM = make([]byte, 0, len(leafPEM)+len(caPEM))
+	// Concatenate leaf + CA into the chain. Build via append on a nil
+	// slice rather than make([]byte, 0, len(a)+len(b)): the explicit
+	// len+len capacity expression trips CodeQL's
+	// go/allocation-size-overflow rule (it can't prove the sum doesn't
+	// wrap), and append grows the backing array safely on its own.
 	chainPEM = append(chainPEM, leafPEM...)
 	chainPEM = append(chainPEM, caPEM...)
 	return leafPEM, keyPEM, caPEM, chainPEM
