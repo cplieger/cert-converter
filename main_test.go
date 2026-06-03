@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"cert-watcher/internal/convert"
-	"cert-watcher/internal/health"
+	"github.com/cplieger/health"
 	"cert-watcher/internal/process"
 	"cert-watcher/internal/testcerts"
 

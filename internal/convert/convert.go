@@ -2,6 +2,7 @@
 package convert
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -10,11 +11,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
-	"os"
-	"path/filepath"
 
+	"github.com/cplieger/atomicfile"
 	"software.sslmate.com/src/go-pkcs12"
 )
 
@@ -31,28 +29,7 @@ const (
 
 // ReadFileWithLimit opens a file, validates its size, and returns its contents.
 func ReadFileWithLimit(path string, limit int64) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if info.Size() > limit {
-		return nil, fmt.Errorf("file exceeds %d byte limit (%d bytes)", limit, info.Size())
-	}
-
-	data, err := io.ReadAll(io.LimitReader(f, limit+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > limit {
-		return nil, fmt.Errorf("file grew past %d byte limit during read", limit)
-	}
-	return data, nil
+	return atomicfile.ReadBounded(context.Background(), path, limit)
 }
 
 // ParseCertChain decodes all CERTIFICATE PEM blocks from pemBytes,
@@ -134,35 +111,11 @@ func ToPFX(privKey crypto.PrivateKey, leaf *x509.Certificate, caCerts []*x509.Ce
 		return fmt.Errorf("encode pfx: %w", err)
 	}
 
-	tmp, err := os.CreateTemp(filepath.Dir(destPath), ".cert-convert-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-
-	if _, err := tmp.Write(pfxData); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+	if err := atomicfile.WriteFile(context.Background(), destPath, pfxData,
+		atomicfile.WithMode(0o644),
+		atomicfile.WithTempPattern(".cert-convert-*.tmp"),
+	); err != nil {
 		return fmt.Errorf("write pfx: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return fmt.Errorf("sync pfx: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("close pfx: %w", err)
-	}
-	if err := os.Rename(tmpName, destPath); err != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("rename pfx: %w", err)
-	}
-	if dir, dirErr := os.Open(filepath.Dir(destPath)); dirErr == nil {
-		if syncErr := dir.Sync(); syncErr != nil {
-			slog.Warn("dir sync failed, durability not guaranteed", "dir", filepath.Dir(destPath), "error", syncErr)
-		}
-		dir.Close()
 	}
 	return nil
 }
