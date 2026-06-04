@@ -112,7 +112,7 @@ func ToPFX(privKey crypto.PrivateKey, leaf *x509.Certificate, caCerts []*x509.Ce
 	}
 
 	if err := atomicfile.WriteFile(context.Background(), destPath, pfxData,
-		atomicfile.WithMode(0o644),
+		atomicfile.WithMode(0o600),
 		atomicfile.WithTempPattern(".cert-convert-*.tmp"),
 	); err != nil {
 		return fmt.Errorf("write pfx: %w", err)

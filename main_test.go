@@ -80,6 +80,14 @@ func TestConvertToPFX(t *testing.T) {
 		if len(caCerts) != 0 {
 			t.Errorf("expected 0 CA certs, got %d", len(caCerts))
 		}
+		// PFX contains private keys — must be 0o600 (owner-only).
+		fi, err := os.Stat(pfxPath)
+		if err != nil {
+			t.Fatalf("stat pfx: %v", err)
+		}
+		if mode := fi.Mode().Perm(); mode != 0o600 {
+			t.Errorf("PFX mode = %o, want 0o600 (private key file must be owner-only readable)", mode)
+		}
 	})
 
 	t.Run("RSA round trip", func(t *testing.T) {
