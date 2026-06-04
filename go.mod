@@ -3,7 +3,7 @@ module cert-watcher
 go 1.26.4
 
 require (
-	github.com/cplieger/atomicfile v1.0.0
+	github.com/cplieger/atomicfile v1.0.1
 	github.com/cplieger/health v1.0.1
 	github.com/fsnotify/fsnotify v1.10.1
 	pgregory.net/rapid v1.3.0
