@@ -1,7 +1,7 @@
 services:
-  cert-convert:
-    image: ghcr.io/cplieger/cert-convert:latest
-    container_name: cert-convert
+  cert-converter:
+    image: ghcr.io/cplieger/cert-converter:latest
+    container_name: cert-converter
     restart: unless-stopped
     user: "1000:1000"  # match your host user
 
