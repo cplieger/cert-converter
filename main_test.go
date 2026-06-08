@@ -384,7 +384,7 @@ func TestConvertToPFX_unwritable_dest(t *testing.T) {
 	}
 }
 
-// --- Tests: processAndSetHealth ---
+// --- Tests: runAndSetHealth ---
 
 // newTestMarker constructs a marker rooted in a fresh TempDir so tests
 // don't race on /tmp/.healthy.
@@ -394,7 +394,7 @@ func newTestMarker(t *testing.T) (*health.Marker, string) {
 	return health.NewMarker(path), path
 }
 
-func TestProcessAndSetHealth(t *testing.T) {
+func TestRunAndSetHealth(t *testing.T) {
 	t.Parallel()
 
 	scanner, _ := newTestScanner()
@@ -413,7 +413,7 @@ func TestProcessAndSetHealth(t *testing.T) {
 	}
 
 	if _, err := os.Stat(markerPath); err != nil {
-		t.Fatalf("health marker should exist after successful processAndSetHealth: %v", err)
+		t.Fatalf("health marker should exist after successful runAndSetHealth: %v", err)
 	}
 
 	pfxPath := filepath.Join(outDir, "test.pfx")
@@ -422,7 +422,7 @@ func TestProcessAndSetHealth(t *testing.T) {
 	}
 }
 
-func TestProcessAndSetHealth_failure(t *testing.T) {
+func TestRunAndSetHealth_failure(t *testing.T) {
 	t.Parallel()
 
 	scanner, _ := newTestScanner()
@@ -439,7 +439,7 @@ func TestProcessAndSetHealth_failure(t *testing.T) {
 	}
 
 	if _, err := os.Stat(markerPath); err == nil {
-		t.Fatal("health marker should not exist after failed processAndSetHealth")
+		t.Fatal("health marker should not exist after failed runAndSetHealth")
 	}
 }
 
