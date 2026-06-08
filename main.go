@@ -59,25 +59,22 @@ func main() {
 	cache := convert.NewHashCache()
 	scanner := process.New(cache)
 
-	result, err := scanner.Run(ctx, certsRootDir, outputDir, cfg.Password, cfg.Encoder)
-	if err != nil {
-		slog.Error("initial processing failed", "error", err)
-		marker.Set(false)
-	} else {
-		marker.Set(result.Failed == 0)
-	}
-
-	onChange := func(ctx context.Context) {
+	// runAndSetHealth runs a scan and flips the health marker: healthy
+	// only when the scan completed with zero conversion failures. Shared
+	// by the initial run and the watcher's on-change callback.
+	runAndSetHealth := func(ctx context.Context) {
 		result, err := scanner.Run(ctx, certsRootDir, outputDir, cfg.Password, cfg.Encoder)
 		if err != nil {
 			slog.Error("processing failed", "error", err)
 			marker.Set(false)
-		} else {
-			marker.Set(result.Failed == 0)
+			return
 		}
+		marker.Set(result.Failed == 0)
 	}
 
-	w := watch.New(certsRootDir, onChange,
+	runAndSetHealth(ctx)
+
+	w := watch.New(certsRootDir, runAndSetHealth,
 		watch.WithDebounce(watchDebounce),
 		watch.WithFallback(cfg.FallbackInterval))
 	w.Run(ctx)
