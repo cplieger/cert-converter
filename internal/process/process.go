@@ -11,8 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"cert-watcher/internal/convert"
-
+	"github.com/cplieger/cert-watcher/internal/convert"
 	"software.sslmate.com/src/go-pkcs12"
 )
 

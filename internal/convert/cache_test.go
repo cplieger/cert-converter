@@ -8,9 +8,8 @@ import (
 	"sync"
 	"testing"
 
-	"cert-watcher/internal/convert"
-	"cert-watcher/internal/testcerts"
-
+	"github.com/cplieger/cert-watcher/internal/convert"
+	"github.com/cplieger/cert-watcher/internal/testcerts"
 	"pgregory.net/rapid"
 )
 

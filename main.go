@@ -8,11 +8,11 @@ import (
 	"syscall"
 	"time"
 
-	"cert-watcher/internal/config"
-	"cert-watcher/internal/convert"
+	"github.com/cplieger/cert-watcher/internal/config"
+	"github.com/cplieger/cert-watcher/internal/convert"
+	"github.com/cplieger/cert-watcher/internal/process"
+	"github.com/cplieger/cert-watcher/internal/watch"
 	"github.com/cplieger/health"
-	"cert-watcher/internal/process"
-	"cert-watcher/internal/watch"
 )
 
 // Fixed container paths — configured via volume mounts, not env vars.

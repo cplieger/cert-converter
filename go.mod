@@ -1,4 +1,4 @@
-module cert-watcher
+module github.com/cplieger/cert-watcher
 
 go 1.26.4
 

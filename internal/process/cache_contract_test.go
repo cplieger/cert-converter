@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"cert-watcher/internal/convert"
-	"cert-watcher/internal/process"
+	"github.com/cplieger/cert-watcher/internal/convert"
+	"github.com/cplieger/cert-watcher/internal/process"
 )
 
 // CacheCheckerContract verifies behavioral invariants that any CacheChecker

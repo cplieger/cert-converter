@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"cert-watcher/internal/convert"
+	"github.com/cplieger/cert-watcher/internal/convert"
 )
 
 func BenchmarkHashFile(b *testing.B) {

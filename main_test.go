@@ -12,11 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"cert-watcher/internal/convert"
+	"github.com/cplieger/cert-watcher/internal/convert"
+	"github.com/cplieger/cert-watcher/internal/process"
+	"github.com/cplieger/cert-watcher/internal/testcerts"
 	"github.com/cplieger/health"
-	"cert-watcher/internal/process"
-	"cert-watcher/internal/testcerts"
-
 	"software.sslmate.com/src/go-pkcs12"
 )
 
