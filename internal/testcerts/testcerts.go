@@ -28,7 +28,6 @@ const pemTypeCert = "CERTIFICATE"
 // GenerateSelfSignedCert creates a self-signed certificate with the given
 // key type ("rsa" or "ecdsa") and common name. Returns PEM-encoded cert and key.
 func GenerateSelfSignedCert(tb FatalTB, cn, keyType string) (certPEM, keyPEM []byte) {
-
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: cn},
