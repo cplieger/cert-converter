@@ -53,8 +53,11 @@ func (s *Scanner) Run(ctx context.Context, certsRoot, outRoot, password string, 
 	seen := make(map[string]struct{})
 
 	// Reap temps orphaned by an interrupted PFX write (crash between temp-write
-	// and rename). Effective because atomicfile now honors WithTempPattern in
-	// the sweep; the shared const keeps it in lockstep with the write.
+	// and rename). The custom-pattern sweep is effective only once a
+	// WithTempPattern-aware CleanupStaleTemps is published in atomicfile and
+	// pinned here; on the currently pinned version it is a no-op for the custom
+	// pattern (normal writes stay fully atomic regardless). The shared const
+	// keeps the write and the sweep in lockstep for when that lands.
 	atomicfile.CleanupStaleTemps(outRoot, time.Hour, atomicfile.WithTempPattern(convert.TempPattern))
 
 	walkErr := filepath.WalkDir(certsRoot, func(path string, d fs.DirEntry, err error) error {
