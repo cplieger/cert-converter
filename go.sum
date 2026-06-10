@@ -1,5 +1,5 @@
-github.com/cplieger/atomicfile v1.1.0 h1:lXTD6YVLAz72j8kTkHJElUo1PeYOhZxUAhzkvQa00H8=
-github.com/cplieger/atomicfile v1.1.0/go.mod h1:V9XmBWRC+keTJQk7I4pMGNXJBt5MMcoXrZUFKQR6PnE=
+github.com/cplieger/atomicfile v1.2.0 h1:EootDaL3Y4yjxTQiImcgmUXI+E8qtIR0jXDfHxfEZGo=
+github.com/cplieger/atomicfile v1.2.0/go.mod h1:V9XmBWRC+keTJQk7I4pMGNXJBt5MMcoXrZUFKQR6PnE=
 github.com/cplieger/health v1.1.0 h1:s//JW6MZtiHLLAhJhD21wxzeqFP94dqV0KMa+zJRTWM=
 github.com/cplieger/health v1.1.0/go.mod h1:INjkN9qJnR14X5AFqX6ymFaHvx51djYgk2oQb/gJ9u8=
 github.com/fsnotify/fsnotify v1.10.1 h1:b0/UzAf9yR5rhf3RPm9gf3ehBPpf0oZKIjtpKrx59Ho=
@@ -10,5 +10,5 @@ golang.org/x/sys v0.38.0 h1:3yZWxaJjBmCWXqhN1qh02AkOnCQ1poK6oF+a7xWL6Gc=
 golang.org/x/sys v0.38.0/go.mod h1:OgkHotnGiDImocRcuBABYBEXf8A9a87e/uXjp9XT3ks=
 pgregory.net/rapid v1.3.0 h1:vBvO0VSqti75J1jjYqpgPNBLKMd1+gxa9fYo7vk/Exc=
 pgregory.net/rapid v1.3.0/go.mod h1:dPlE4OBBxgXPqkP79flB6sJL1dx5azpI7HQ9MY9Z7uk=
-software.sslmate.com/src/go-pkcs12 v0.7.1 h1:bxkUPRsvTPNRBZa4M/aSX4PyMOEbq3V8I6hbkG4F4Q8=
-software.sslmate.com/src/go-pkcs12 v0.7.1/go.mod h1:Qiz0EyvDRJjjxGyUQa2cCNZn/wMyzrRJ/qcDXOQazLI=
+software.sslmate.com/src/go-pkcs12 v0.7.2 h1:Rh9FoMaI5k7Oo6EOS+2/BnoZ+JFIS+XHjM0VGkSPXLM=
+software.sslmate.com/src/go-pkcs12 v0.7.2/go.mod h1:Qiz0EyvDRJjjxGyUQa2cCNZn/wMyzrRJ/qcDXOQazLI=
