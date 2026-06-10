@@ -40,7 +40,7 @@ func BenchmarkToPFX(b *testing.B) {
 
 	b.ResetTimer()
 	for range b.N {
-		if err := convert.ToPFX(key, cert, nil, destPath, "bench", enc); err != nil {
+		if err := convert.ToPFX(b.Context(), key, cert, nil, destPath, "bench", enc); err != nil {
 			b.Fatal(err)
 		}
 	}

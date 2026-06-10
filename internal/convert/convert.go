@@ -28,8 +28,8 @@ const (
 )
 
 // ReadFileWithLimit opens a file, validates its size, and returns its contents.
-func ReadFileWithLimit(path string, limit int64) ([]byte, error) {
-	return atomicfile.ReadBounded(context.Background(), path, limit)
+func ReadFileWithLimit(ctx context.Context, path string, limit int64) ([]byte, error) {
+	return atomicfile.ReadBounded(ctx, path, limit)
 }
 
 // ParseCertChain decodes all CERTIFICATE PEM blocks from pemBytes,
@@ -109,13 +109,13 @@ const TempPattern = ".cert-convert-*.tmp"
 
 // ToPFX encodes a private key, leaf certificate, and optional CA chain
 // as PKCS#12 and writes the result atomically to destPath.
-func ToPFX(privKey crypto.PrivateKey, leaf *x509.Certificate, caCerts []*x509.Certificate, destPath, password string, enc *pkcs12.Encoder) error {
+func ToPFX(ctx context.Context, privKey crypto.PrivateKey, leaf *x509.Certificate, caCerts []*x509.Certificate, destPath, password string, enc *pkcs12.Encoder) error {
 	pfxData, err := enc.Encode(privKey, leaf, caCerts, password)
 	if err != nil {
 		return fmt.Errorf("encode pfx: %w", err)
 	}
 
-	if err := atomicfile.WriteFile(context.Background(), destPath, pfxData,
+	if err := atomicfile.WriteFile(ctx, destPath, pfxData,
 		atomicfile.WithMode(0o600),
 		atomicfile.WithTempPattern(TempPattern),
 	); err != nil {

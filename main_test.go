@@ -65,7 +65,7 @@ func TestConvertToPFX(t *testing.T) {
 		crtPath, keyPath := writeCertAndKey(t, tmpDir, "test", certPEM, keyPEM)
 		pfxPath := filepath.Join(tmpDir, "test.pfx")
 
-		if err := process.ConvertPair(convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, pfxPath, "pass", pkcs12.Modern2023); err != nil {
+		if err := process.ConvertPair(t.Context(), convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, pfxPath, "pass", pkcs12.Modern2023); err != nil {
 			t.Fatalf("process.ConvertPair: %v", err)
 		}
 
@@ -96,7 +96,7 @@ func TestConvertToPFX(t *testing.T) {
 		crtPath, keyPath := writeCertAndKey(t, tmpDir, "test", certPEM, keyPEM)
 		pfxPath := filepath.Join(tmpDir, "test.pfx")
 
-		if err := process.ConvertPair(convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, pfxPath, "", pkcs12.Modern2023); err != nil {
+		if err := process.ConvertPair(t.Context(), convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, pfxPath, "", pkcs12.Modern2023); err != nil {
 			t.Fatalf("process.ConvertPair: %v", err)
 		}
 
@@ -116,7 +116,7 @@ func TestConvertToPFX(t *testing.T) {
 		crtPath, keyPath := writeCertAndKey(t, tmpDir, "chain", chainPEM, keyPEM)
 		pfxPath := filepath.Join(tmpDir, "chain.pfx")
 
-		if err := process.ConvertPair(convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, pfxPath, "chainpass", pkcs12.Modern2023); err != nil {
+		if err := process.ConvertPair(t.Context(), convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, pfxPath, "chainpass", pkcs12.Modern2023); err != nil {
 			t.Fatalf("process.ConvertPair: %v", err)
 		}
 
@@ -147,7 +147,7 @@ func TestConvertToPFX(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := process.ConvertPair(convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, pfxPath, "", pkcs12.Modern2023); err != nil {
+		if err := process.ConvertPair(t.Context(), convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, pfxPath, "", pkcs12.Modern2023); err != nil {
 			t.Fatalf("process.ConvertPair: %v", err)
 		}
 
@@ -317,7 +317,7 @@ func TestConvertToPFX_nonexistent_cert(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := process.ConvertPair(convert.CertPair{CertPath: filepath.Join(tmpDir, "missing.crt"), KeyPath: keyPath}, filepath.Join(tmpDir, "out.pfx"), "", pkcs12.Modern2023)
+	err := process.ConvertPair(t.Context(), convert.CertPair{CertPath: filepath.Join(tmpDir, "missing.crt"), KeyPath: keyPath}, filepath.Join(tmpDir, "out.pfx"), "", pkcs12.Modern2023)
 	if err == nil {
 		t.Fatal("process.ConvertPair should fail for nonexistent cert file")
 	}
@@ -336,7 +336,7 @@ func TestConvertToPFX_nonexistent_key(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := process.ConvertPair(convert.CertPair{CertPath: crtPath, KeyPath: filepath.Join(tmpDir, "missing.key")}, filepath.Join(tmpDir, "out.pfx"), "", pkcs12.Modern2023)
+	err := process.ConvertPair(t.Context(), convert.CertPair{CertPath: crtPath, KeyPath: filepath.Join(tmpDir, "missing.key")}, filepath.Join(tmpDir, "out.pfx"), "", pkcs12.Modern2023)
 	if err == nil {
 		t.Fatal("process.ConvertPair should fail for nonexistent key file")
 	}
@@ -352,7 +352,7 @@ func TestConvertToPFX_invalid_cert_PEM(t *testing.T) {
 	_, keyPEM := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
 	crtPath, keyPath := writeCertAndKey(t, tmpDir, "bad", []byte("not a cert"), keyPEM)
 
-	err := process.ConvertPair(convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, filepath.Join(tmpDir, "out.pfx"), "", pkcs12.Modern2023)
+	err := process.ConvertPair(t.Context(), convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, filepath.Join(tmpDir, "out.pfx"), "", pkcs12.Modern2023)
 	if err == nil {
 		t.Fatal("process.ConvertPair should fail for invalid cert PEM")
 	}
@@ -365,7 +365,7 @@ func TestConvertToPFX_invalid_key_PEM(t *testing.T) {
 	certPEM, _ := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
 	crtPath, keyPath := writeCertAndKey(t, tmpDir, "bad", certPEM, []byte("not a key"))
 
-	err := process.ConvertPair(convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, filepath.Join(tmpDir, "out.pfx"), "", pkcs12.Modern2023)
+	err := process.ConvertPair(t.Context(), convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, filepath.Join(tmpDir, "out.pfx"), "", pkcs12.Modern2023)
 	if err == nil {
 		t.Fatal("process.ConvertPair should fail for invalid key PEM")
 	}
@@ -378,7 +378,7 @@ func TestConvertToPFX_unwritable_dest(t *testing.T) {
 	tmpDir := t.TempDir()
 	crtPath, keyPath := writeCertAndKey(t, tmpDir, "test", certPEM, keyPEM)
 
-	err := process.ConvertPair(convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, "/nonexistent/dir/out.pfx", "", pkcs12.Modern2023)
+	err := process.ConvertPair(t.Context(), convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, "/nonexistent/dir/out.pfx", "", pkcs12.Modern2023)
 	if err == nil {
 		t.Fatal("process.ConvertPair should fail for unwritable destination")
 	}
@@ -464,7 +464,7 @@ func TestConvertToPFX_round_trip_all_encoders(t *testing.T) {
 			crtPath, keyPath := writeCertAndKey(t, tmpDir, "test", certPEM, keyPEM)
 			pfxPath := filepath.Join(tmpDir, "test.pfx")
 
-			if err := process.ConvertPair(convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, pfxPath, "testpass", tc.enc); err != nil {
+			if err := process.ConvertPair(t.Context(), convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, pfxPath, "testpass", tc.enc); err != nil {
 				t.Fatalf("process.ConvertPair(%s): %v", tc.name, err)
 			}
 
@@ -581,7 +581,7 @@ func TestConvertToPFX_with_password_containing_special_chars(t *testing.T) {
 	pfxPath := filepath.Join(tmpDir, "test.pfx")
 
 	password := "p@$$w0rd!#%&*(){}[]|\\:\";<>?,./~`"
-	if err := process.ConvertPair(convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, pfxPath, password, pkcs12.Modern2023); err != nil {
+	if err := process.ConvertPair(t.Context(), convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, pfxPath, password, pkcs12.Modern2023); err != nil {
 		t.Fatalf("process.ConvertPair(special password): %v", err)
 	}
 
@@ -646,7 +646,7 @@ func TestConvertToPFX_single_cert_has_no_CA_certs(t *testing.T) {
 	crtPath, keyPath := writeCertAndKey(t, tmpDir, "test", certPEM, keyPEM)
 	pfxPath := filepath.Join(tmpDir, "test.pfx")
 
-	if err := process.ConvertPair(convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, pfxPath, "pass", pkcs12.Modern2023); err != nil {
+	if err := process.ConvertPair(t.Context(), convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, pfxPath, "pass", pkcs12.Modern2023); err != nil {
 		t.Fatalf("process.ConvertPair: %v", err)
 	}
 
@@ -765,7 +765,7 @@ func TestConvertToPFX_cleans_up_tmp_on_rename_failure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := process.ConvertPair(convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, destPath, "", pkcs12.Modern2023)
+	err := process.ConvertPair(t.Context(), convert.CertPair{CertPath: crtPath, KeyPath: keyPath}, destPath, "", pkcs12.Modern2023)
 	if err == nil {
 		t.Fatal("process.ConvertPair should fail when destPath is a directory")
 	}
