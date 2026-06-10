@@ -296,7 +296,7 @@ func TestReadFileWithLimit(t *testing.T) {
 		if err := os.WriteFile(path, []byte("hello"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		data, err := convert.ReadFileWithLimit(path, 1024)
+		data, err := convert.ReadFileWithLimit(t.Context(), path, 1024)
 		if err != nil {
 			t.Fatalf("convert.ReadFileWithLimit: %v", err)
 		}
@@ -311,7 +311,7 @@ func TestReadFileWithLimit(t *testing.T) {
 		if err := os.WriteFile(path, make([]byte, 2048), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		_, err := convert.ReadFileWithLimit(path, 1024)
+		_, err := convert.ReadFileWithLimit(t.Context(), path, 1024)
 		if err == nil {
 			t.Error("expected error for oversized file")
 		}
@@ -319,7 +319,7 @@ func TestReadFileWithLimit(t *testing.T) {
 
 	t.Run("nonexistent file", func(t *testing.T) {
 		t.Parallel()
-		_, err := convert.ReadFileWithLimit("/nonexistent/file.txt", 1024)
+		_, err := convert.ReadFileWithLimit(t.Context(), "/nonexistent/file.txt", 1024)
 		if err == nil {
 			t.Error("expected error for nonexistent file")
 		}
@@ -334,7 +334,7 @@ func TestReadFileWithLimit_exact_limit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data, err := convert.ReadFileWithLimit(path, int64(len(content)))
+	data, err := convert.ReadFileWithLimit(t.Context(), path, int64(len(content)))
 	if err != nil {
 		t.Fatalf("convert.ReadFileWithLimit at exact limit: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestReadFileWithLimit_one_byte_over(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := convert.ReadFileWithLimit(path, int64(len(content)-1))
+	_, err := convert.ReadFileWithLimit(t.Context(), path, int64(len(content)-1))
 	if err == nil {
 		t.Fatal("convert.ReadFileWithLimit should reject file one byte over limit")
 	}
@@ -364,7 +364,7 @@ func TestReadFileWithLimit_empty_file(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data, err := convert.ReadFileWithLimit(path, 1024)
+	data, err := convert.ReadFileWithLimit(t.Context(), path, 1024)
 	if err != nil {
 		t.Fatalf("convert.ReadFileWithLimit(empty) = error %v", err)
 	}

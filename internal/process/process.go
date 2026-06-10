@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/cplieger/atomicfile"
 	"github.com/cplieger/cert-watcher/internal/convert"
 	"software.sslmate.com/src/go-pkcs12"
 )
@@ -49,6 +51,11 @@ func (s *Scanner) Run(ctx context.Context, certsRoot, outRoot, password string, 
 	var results []convert.ConversionResult
 	var unreadable int
 	seen := make(map[string]struct{})
+
+	// Reap temps orphaned by an interrupted PFX write (crash between temp-write
+	// and rename). atomicfile v1.2.0+ honors WithTempPattern in CleanupStaleTemps,
+	// so the shared const keeps the write and this sweep matched.
+	atomicfile.CleanupStaleTemps(outRoot, time.Hour, atomicfile.WithTempPattern(convert.TempPattern))
 
 	walkErr := filepath.WalkDir(certsRoot, func(path string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {
@@ -102,7 +109,7 @@ func (s *Scanner) Run(ctx context.Context, certsRoot, outRoot, password string, 
 		}
 
 		slog.Debug("converting cert pair", "path", rel)
-		if err := ConvertPair(pair, destPath, password, enc); err != nil {
+		if err := ConvertPair(ctx, pair, destPath, password, enc); err != nil {
 			slog.Error("conversion failed", "path", rel, "error", err)
 			s.cache.Invalidate(path)
 			results = append(results, convert.ConversionResult{Pair: pair, Status: convert.StatusFailed, Err: err})
@@ -153,12 +160,12 @@ func countResults(results []convert.ConversionResult, unreadable int) ScanResult
 }
 
 // ConvertPair reads a cert/key pair, parses them, and writes a PFX file.
-func ConvertPair(pair convert.CertPair, destPath, password string, enc *pkcs12.Encoder) error {
-	certPEM, err := convert.ReadFileWithLimit(pair.CertPath, convert.MaxFileSize)
+func ConvertPair(ctx context.Context, pair convert.CertPair, destPath, password string, enc *pkcs12.Encoder) error {
+	certPEM, err := convert.ReadFileWithLimit(ctx, pair.CertPath, convert.MaxFileSize)
 	if err != nil {
 		return fmt.Errorf("read cert: %w", err)
 	}
-	keyPEM, err := convert.ReadFileWithLimit(pair.KeyPath, convert.MaxFileSize)
+	keyPEM, err := convert.ReadFileWithLimit(ctx, pair.KeyPath, convert.MaxFileSize)
 	if err != nil {
 		return fmt.Errorf("read key: %w", err)
 	}
@@ -175,5 +182,5 @@ func ConvertPair(pair convert.CertPair, destPath, password string, enc *pkcs12.E
 	if err != nil {
 		return fmt.Errorf("parse private key: %w", err)
 	}
-	return convert.ToPFX(privKey, leaf, caCerts, destPath, password, enc)
+	return convert.ToPFX(ctx, privKey, leaf, caCerts, destPath, password, enc)
 }

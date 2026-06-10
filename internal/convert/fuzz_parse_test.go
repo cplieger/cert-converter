@@ -126,7 +126,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		password := "test"
 		enc := pkcs12.Modern2023
 
-		if err := convert.ToPFX(privKey, leaf, caCerts, dest, password, enc); err != nil {
+		if err := convert.ToPFX(t.Context(), privKey, leaf, caCerts, dest, password, enc); err != nil {
 			return // encoding may legitimately fail for mismatched key/cert
 		}
 
@@ -164,7 +164,7 @@ func FuzzReadFileWithLimit(f *testing.F) {
 			t.Fatal(err)
 		}
 
-		data, err := convert.ReadFileWithLimit(path, limit)
+		data, err := convert.ReadFileWithLimit(t.Context(), path, limit)
 		if err != nil {
 			return
 		}
