@@ -77,31 +77,6 @@ services:
 
 The container includes a built-in health probe: after each successful certificate processing cycle, the main process creates a marker file at `/tmp/.healthy`; the `health` subcommand (`/cert-watcher health`) checks for this file and exits 0 if it exists. The container becomes unhealthy when the input directory is unreadable, PEM parsing fails, or PFX writes fail — any error during a processing cycle removes the marker. It auto-recovers on the next successful cycle (triggered by an fsnotify event or the fallback timer) without requiring a restart.
 
-## Code quality
-
-| Metric | Value |
-|--------|-------|
-| [Test Coverage](https://go.dev/blog/cover) | 69.5% |
-| Tests | 123 |
-| [Cyclomatic Complexity](https://en.wikipedia.org/wiki/Cyclomatic_complexity) (avg) | 5.3 |
-| [Cognitive Complexity](https://www.sonarsource.com/docs/CognitiveComplexity.pdf) (avg) | 6.1 |
-| [Mutation Efficacy](https://en.wikipedia.org/wiki/Mutation_testing) | 90.5% (59 runs) |
-| Test Framework | Property-based ([rapid](https://github.com/flyingmutant/rapid)) + table-driven |
-
-The test suite validates all user-facing functionality: PEM certificate
-parsing (RSA, ECDSA, Ed25519, chain handling, corrupt input), PFX
-encoding round-trips across all encoder profiles, SHA-256 change
-detection with file size guards, fsnotify event handling with debounce
-logic, and the full processing pipeline (skip unchanged, reconvert on
-change, nested directories, error recovery). Property-based tests
-verify that parsing functions never panic on arbitrary input and that
-round-trips preserve certificate data.
-
-Not tested: the filesystem watcher loop and polling fallback — these
-are event-driven I/O paths that can't be unit tested meaningfully.
-Validated by Docker healthchecks in production (the health probe
-confirms the last processing cycle succeeded).
-
 ## Security
 
 **No vulnerabilities found.** All scans clean across 10 tools.
