@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/cplieger/atomicfile"
 	"github.com/cplieger/cert-watcher/internal/convert"
 	"software.sslmate.com/src/go-pkcs12"
 )
@@ -49,6 +51,11 @@ func (s *Scanner) Run(ctx context.Context, certsRoot, outRoot, password string, 
 	var results []convert.ConversionResult
 	var unreadable int
 	seen := make(map[string]struct{})
+
+	// Reap temps orphaned by an interrupted PFX write (crash between temp-write
+	// and rename). Effective because atomicfile now honors WithTempPattern in
+	// the sweep; the shared const keeps it in lockstep with the write.
+	atomicfile.CleanupStaleTemps(outRoot, time.Hour, atomicfile.WithTempPattern(convert.TempPattern))
 
 	walkErr := filepath.WalkDir(certsRoot, func(path string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {

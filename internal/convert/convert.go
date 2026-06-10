@@ -103,6 +103,10 @@ func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 	return nil, errors.New("failed to parse private key (tried PKCS8, PKCS1, SEC1)")
 }
 
+// TempPattern is the os.CreateTemp pattern for in-progress PFX writes. Shared
+// with the stale-temp sweep so CleanupStaleTemps can reclaim orphans.
+const TempPattern = ".cert-convert-*.tmp"
+
 // ToPFX encodes a private key, leaf certificate, and optional CA chain
 // as PKCS#12 and writes the result atomically to destPath.
 func ToPFX(privKey crypto.PrivateKey, leaf *x509.Certificate, caCerts []*x509.Certificate, destPath, password string, enc *pkcs12.Encoder) error {
@@ -113,7 +117,7 @@ func ToPFX(privKey crypto.PrivateKey, leaf *x509.Certificate, caCerts []*x509.Ce
 
 	if err := atomicfile.WriteFile(context.Background(), destPath, pfxData,
 		atomicfile.WithMode(0o600),
-		atomicfile.WithTempPattern(".cert-convert-*.tmp"),
+		atomicfile.WithTempPattern(TempPattern),
 	); err != nil {
 		return fmt.Errorf("write pfx: %w", err)
 	}
