@@ -12,7 +12,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/cplieger/atomicfile"
+	"github.com/cplieger/atomicfile/v2"
 	"software.sslmate.com/src/go-pkcs12"
 )
 
@@ -103,10 +103,6 @@ func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 	return nil, errors.New("failed to parse private key (tried PKCS8, PKCS1, SEC1)")
 }
 
-// TempPattern is the os.CreateTemp pattern for in-progress PFX writes. Shared
-// with the stale-temp sweep so CleanupStaleTemps can reclaim orphans.
-const TempPattern = ".cert-convert-*.tmp"
-
 // ToPFX encodes a private key, leaf certificate, and optional CA chain
 // as PKCS#12 and writes the result atomically to destPath.
 func ToPFX(ctx context.Context, privKey crypto.PrivateKey, leaf *x509.Certificate, caCerts []*x509.Certificate, destPath, password string, enc *pkcs12.Encoder) error {
@@ -115,9 +111,8 @@ func ToPFX(ctx context.Context, privKey crypto.PrivateKey, leaf *x509.Certificat
 		return fmt.Errorf("encode pfx: %w", err)
 	}
 
-	if err := atomicfile.WriteFile(ctx, destPath, pfxData,
+	if _, err := atomicfile.WriteFile(ctx, destPath, pfxData,
 		atomicfile.WithMode(0o600),
-		atomicfile.WithTempPattern(TempPattern),
 	); err != nil {
 		return fmt.Errorf("write pfx: %w", err)
 	}

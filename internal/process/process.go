@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cplieger/atomicfile"
+	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-watcher/internal/convert"
 	"software.sslmate.com/src/go-pkcs12"
 )
@@ -53,9 +53,10 @@ func (s *Scanner) Run(ctx context.Context, certsRoot, outRoot, password string, 
 	seen := make(map[string]struct{})
 
 	// Reap temps orphaned by an interrupted PFX write (crash between temp-write
-	// and rename). atomicfile v1.2.0+ honors WithTempPattern in CleanupStaleTemps,
-	// so the shared const keeps the write and this sweep matched.
-	atomicfile.CleanupStaleTemps(outRoot, time.Hour, atomicfile.WithTempPattern(convert.TempPattern))
+	// and rename). WriteFile names temps ".atomicfile-<digits>.tmp" and the
+	// default CleanupStaleTemps recognizes exactly that shape, so the sweep
+	// stays matched to the writes.
+	_, _ = atomicfile.CleanupStaleTemps(outRoot, time.Hour)
 
 	walkErr := filepath.WalkDir(certsRoot, func(path string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {
