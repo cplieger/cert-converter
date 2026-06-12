@@ -80,7 +80,7 @@ The container includes a built-in health probe: after each successful certificat
 
 ## Security
 
-**No vulnerabilities found.** All scans clean across 10 tools.
+**No vulnerabilities found.** All scans clean across the full scanner suite.
 
 | Tool | Result |
 |------|--------|
@@ -108,13 +108,13 @@ in a single-process container.
 
 Updated automatically via [Renovate](https://github.com/renovatebot/renovate) and pinned by digest. Builds carry signed SBOMs and provenance attestations verifiable with `gh attestation verify`.
 
-| Dependency | Version | Source |
-|------------|---------|--------|
-| golang | `1.26-alpine` | [Go](https://hub.docker.com/_/golang) |
-| gcr.io/distroless/static-debian13 | `nonroot` | [Distroless](https://github.com/GoogleContainerTools/distroless) |
-| github.com/fsnotify/fsnotify | `v1.10.1` | [GitHub](https://github.com/fsnotify/fsnotify) |
-| pgregory.net/rapid | `v1.3.0` | [pkg.go.dev](https://pkg.go.dev/pgregory.net/rapid) |
-| software.sslmate.com/src/go-pkcs12 | `v0.7.1` | [SSLMate](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12) |
+| Dependency | Source |
+|------------|--------|
+| golang | [Go](https://hub.docker.com/_/golang) |
+| gcr.io/distroless/static | [Distroless](https://github.com/GoogleContainerTools/distroless) |
+| github.com/fsnotify/fsnotify | [GitHub](https://github.com/fsnotify/fsnotify) |
+| pgregory.net/rapid | [pkg.go.dev](https://pkg.go.dev/pgregory.net/rapid) |
+| software.sslmate.com/src/go-pkcs12 | [SSLMate](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12) |
 
 ## Credits
 
