@@ -16,6 +16,7 @@ import (
 
 	"github.com/cplieger/cert-watcher/internal/convert"
 	"github.com/cplieger/cert-watcher/internal/testcerts"
+	"software.sslmate.com/src/go-pkcs12"
 )
 
 // --- Tests: convert.ParseCertChain ---
@@ -370,5 +371,43 @@ func TestReadFileWithLimit_empty_file(t *testing.T) {
 	}
 	if len(data) != 0 {
 		t.Errorf("convert.ReadFileWithLimit(empty) returned %d bytes, want 0", len(data))
+	}
+}
+
+// --- Tests: convert.ToPFX ---
+
+// TestToPFX_writes_decodable_pfx exercises the success path end-to-end: a valid
+// key/cert pair must encode without error and land a PKCS#12 file that decodes
+// back to the same leaf. This pins both error checks in ToPFX (encode + write):
+// negating either to `err == nil` turns the success path into a returned error,
+// which this assertion catches.
+func TestToPFX_writes_decodable_pfx(t *testing.T) {
+	t.Parallel()
+
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "topfx-test", "ecdsa")
+	certs, err := convert.ParseCertChain(certPEM)
+	if err != nil {
+		t.Fatalf("setup: convert.ParseCertChain: %v", err)
+	}
+	privKey, err := convert.ParsePrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("setup: convert.ParsePrivateKey: %v", err)
+	}
+	destPath := filepath.Join(t.TempDir(), "out.pfx")
+
+	err = convert.ToPFX(t.Context(), privKey, certs[0], nil, destPath, "pw", pkcs12.Modern2023)
+	if err != nil {
+		t.Fatalf("convert.ToPFX(valid key/cert) = error %v, want nil", err)
+	}
+	pfxData, readErr := os.ReadFile(destPath)
+	if readErr != nil {
+		t.Fatalf("convert.ToPFX did not write a readable file: %v", readErr)
+	}
+	_, leaf, _, decErr := pkcs12.DecodeChain(pfxData, "pw")
+	if decErr != nil {
+		t.Fatalf("decode pfx written by convert.ToPFX: %v", decErr)
+	}
+	if leaf.Subject.CommonName != "topfx-test" {
+		t.Errorf("convert.ToPFX wrote leaf CN = %q, want %q", leaf.Subject.CommonName, "topfx-test")
 	}
 }
