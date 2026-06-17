@@ -47,6 +47,12 @@ func TestParseFallbackInterval(t *testing.T) {
 		{"valid", "12", 12 * time.Hour},
 		{"one", "1", 1 * time.Hour},
 		{"negative", "-1", 6 * time.Hour},
+		// Non-canonical zeros reach the numeric branch (the "0" switch case
+		// only matches the literal string "0"), so they exercise the n > 0
+		// boundary: Atoi yields 0, which must NOT be treated as a positive
+		// interval. Pins n > 0 against the n >= 0 mutant.
+		{"non-canonical zero", "00", 6 * time.Hour},
+		{"signed zero", "+0", 6 * time.Hour},
 		{"non-numeric", "abc", 6 * time.Hour},
 		{"leading spaces", "  12", 12 * time.Hour},
 		{"trailing spaces", "12  ", 12 * time.Hour},
