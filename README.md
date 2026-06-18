@@ -63,19 +63,19 @@ services:
 
 ### Environment variables
 
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `TZ` | Container timezone | `Europe/Paris` | No |
-| `PFX_PASSWORD` | Password embedded in generated PFX files | - | Yes |
-| `FALLBACK_SCAN_HOURS` | Hours between full directory re-scans (fallback when fsnotify misses events) | `6` | No |
-| `PFX_ENCODER` | PFX encoding profile — modern2023 (AES-256-CBC + SHA-256, default), modern2026 (AES-256-CBC + PBMAC1, requires OpenSSL 3.4.0+), or legacy (3DES + SHA-1 for older devices). See [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables). | `modern2023` | No |
+| Variable              | Description                                                                                                                                                                                                                                                                     | Default        | Required |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- | -------- |
+| `TZ`                  | Container timezone                                                                                                                                                                                                                                                              | `Europe/Paris` | No       |
+| `PFX_PASSWORD`        | Password embedded in generated PFX files                                                                                                                                                                                                                                        | -              | Yes      |
+| `FALLBACK_SCAN_HOURS` | Hours between full directory re-scans (fallback when fsnotify misses events)                                                                                                                                                                                                    | `6`            | No       |
+| `PFX_ENCODER`         | PFX encoding profile — modern2023 (AES-256-CBC + SHA-256, default), modern2026 (AES-256-CBC + PBMAC1, requires OpenSSL 3.4.0+), or legacy (3DES + SHA-1 for older devices). See [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables). | `modern2023`   | No       |
 
 ### Volumes
 
-| Mount | Description |
-|-------|-------------|
-| `/input` | PEM certificate directory (read-only) |
-| `/output` | PFX output directory |
+| Mount     | Description                           |
+| --------- | ------------------------------------- |
+| `/input`  | PEM certificate directory (read-only) |
+| `/output` | PFX output directory                  |
 
 ## Healthcheck
 
@@ -85,15 +85,15 @@ The container includes a built-in health probe: after each successful certificat
 
 **No vulnerabilities found.** All scans clean across the full scanner suite.
 
-| Tool | Result |
-|------|--------|
+| Tool                                                                | Result                           |
+| ------------------------------------------------------------------- | -------------------------------- |
 | [govulncheck](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) | No vulnerabilities in call graph |
-| [golangci-lint](https://golangci-lint.run/) (gosec, gocritic) | 0 issues |
-| [trivy](https://trivy.dev/) | 0 vulnerabilities |
-| [grype](https://github.com/anchore/grype) | 0 vulnerabilities |
-| [gitleaks](https://github.com/gitleaks/gitleaks) | No secrets detected |
-| [semgrep](https://semgrep.dev/) | 1 info (false positive) |
-| [hadolint](https://github.com/hadolint/hadolint) | Clean |
+| [golangci-lint](https://golangci-lint.run/) (gosec, gocritic)       | 0 issues                         |
+| [trivy](https://trivy.dev/)                                         | 0 vulnerabilities                |
+| [grype](https://github.com/anchore/grype)                           | 0 vulnerabilities                |
+| [gitleaks](https://github.com/gitleaks/gitleaks)                    | No secrets detected              |
+| [semgrep](https://semgrep.dev/)                                     | 1 info (false positive)          |
+| [hadolint](https://github.com/hadolint/hadolint)                    | Clean                            |
 
 This app has a minimal attack surface: no network listener, no
 HTTP server, no exposed ports. It reads PEM files from a mounted
@@ -111,12 +111,12 @@ in a single-process container.
 
 Updated automatically via [Renovate](https://github.com/renovatebot/renovate) and pinned by digest. Builds carry signed SBOMs and provenance attestations verifiable with `gh attestation verify`.
 
-| Dependency | Source |
-|------------|--------|
-| golang | [Go](https://hub.docker.com/_/golang) |
-| gcr.io/distroless/static | [Distroless](https://github.com/GoogleContainerTools/distroless) |
-| github.com/fsnotify/fsnotify | [GitHub](https://github.com/fsnotify/fsnotify) |
-| pgregory.net/rapid | [pkg.go.dev](https://pkg.go.dev/pgregory.net/rapid) |
+| Dependency                         | Source                                                           |
+| ---------------------------------- | ---------------------------------------------------------------- |
+| golang                             | [Go](https://hub.docker.com/_/golang)                            |
+| gcr.io/distroless/static           | [Distroless](https://github.com/GoogleContainerTools/distroless) |
+| github.com/fsnotify/fsnotify       | [GitHub](https://github.com/fsnotify/fsnotify)                   |
+| pgregory.net/rapid                 | [pkg.go.dev](https://pkg.go.dev/pgregory.net/rapid)              |
 | software.sslmate.com/src/go-pkcs12 | [SSLMate](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12) |
 
 ## Credits
