@@ -1,3 +1,4 @@
+// Package main watches a PEM certificate directory and converts changed certificates to PFX/PKCS#12 on every renewal.
 package main
 
 import (
