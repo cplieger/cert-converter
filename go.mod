@@ -7,7 +7,7 @@ require (
 	github.com/cplieger/health v1.1.4
 	github.com/fsnotify/fsnotify v1.10.1
 	pgregory.net/rapid v1.3.0
-	software.sslmate.com/src/go-pkcs12 v0.7.2
+	software.sslmate.com/src/go-pkcs12 v0.7.3
 )
 
 require (
