@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/cplieger/atomicfile/v2"
 	"software.sslmate.com/src/go-pkcs12"
@@ -21,15 +22,26 @@ const MaxFileSize = 10 << 20
 
 // PEM block type constants.
 const (
-	PEMTypeCertificate   = "CERTIFICATE"
-	PEMTypePrivateKey    = "PRIVATE KEY"
-	PEMTypeRSAPrivateKey = "RSA PRIVATE KEY"
-	PEMTypeECPrivateKey  = "EC PRIVATE KEY"
+	PEMTypeCertificate         = "CERTIFICATE"
+	PEMTypePrivateKey          = "PRIVATE KEY"
+	PEMTypeRSAPrivateKey       = "RSA PRIVATE KEY"
+	PEMTypeECPrivateKey        = "EC PRIVATE KEY"
+	PEMTypeEncryptedPrivateKey = "ENCRYPTED PRIVATE KEY"
 )
 
-// ReadFileWithLimit opens a file, validates its size, and returns its contents.
-func ReadFileWithLimit(ctx context.Context, path string, limit int64) ([]byte, error) {
-	return atomicfile.ReadBounded(ctx, path, limit)
+// ReadBoundedFromRoot opens rel within root and reads it under a size limit,
+// confining the read to root's tree: a symlink or ".." component in rel can
+// never redirect the read outside root. It is the /input read seam — every
+// certificate and key read flows through the *os.Root (Go 1.24+) so a malicious
+// symlink planted in the watched directory cannot leak a file from outside it.
+// The caller owns root; ReadBoundedFromRoot does not close it.
+func ReadBoundedFromRoot(ctx context.Context, root *os.Root, rel string, limit int64) ([]byte, error) {
+	f, err := root.Open(rel)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return atomicfile.ReadBoundedFile(ctx, f, limit)
 }
 
 // ParseCertChain decodes all CERTIFICATE PEM blocks from pemBytes,
@@ -68,14 +80,23 @@ func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 		block, pemBytes = pem.Decode(pemBytes)
 		if block == nil {
 			if sawEncrypted {
-				return nil, errors.New("private key PEM block is encrypted (ENCRYPTED PRIVATE KEY); decrypt it before use")
+				return nil, errors.New("private key PEM block is encrypted; decrypt it before use")
 			}
 			return nil, errors.New("no private key PEM block found")
 		}
 		switch block.Type {
 		case PEMTypePrivateKey, PEMTypeRSAPrivateKey, PEMTypeECPrivateKey:
+			// A traditional OpenSSL key (RSA/EC PRIVATE KEY carrying
+			// "Proc-Type: 4,ENCRYPTED" + "DEK-Info" headers) holds encrypted
+			// DER that none of the parsers below can decode; surface the same
+			// actionable guidance as a PKCS#8 ENCRYPTED PRIVATE KEY block
+			// instead of a generic "failed to parse" error.
+			if block.Headers["Proc-Type"] == "4,ENCRYPTED" || block.Headers["DEK-Info"] != "" {
+				sawEncrypted = true
+				continue
+			}
 			// supported
-		case "ENCRYPTED PRIVATE KEY":
+		case PEMTypeEncryptedPrivateKey:
 			sawEncrypted = true
 			continue
 		default:

@@ -52,7 +52,7 @@ services:
       TZ: "Europe/Paris"
       PFX_PASSWORD: "your-pfx-password"
       FALLBACK_SCAN_HOURS: "6"  # fsnotify fallback interval
-      PFX_ENCODER: "modern2023"  # modern2023, modern2026, or legacy
+      PFX_ENCODER: "modern2023"  # modern2023, modern2026, legacy, or legacyrc2
 
     volumes:
       - "/path/to/pem/certificates:/input:ro"
@@ -63,12 +63,16 @@ services:
 
 ### Environment variables
 
-| Variable              | Description                                                                                                                                                                                                                                                                     | Default        | Required |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- | -------- |
-| `TZ`                  | Container timezone                                                                                                                                                                                                                                                              | `Europe/Paris` | No       |
-| `PFX_PASSWORD`        | Password embedded in generated PFX files                                                                                                                                                                                                                                        | -              | Yes      |
-| `FALLBACK_SCAN_HOURS` | Hours between full directory re-scans (fallback when fsnotify misses events)                                                                                                                                                                                                    | `6`            | No       |
-| `PFX_ENCODER`         | PFX encoding profile — modern2023 (AES-256-CBC + SHA-256, default), modern2026 (AES-256-CBC + PBMAC1, requires OpenSSL 3.4.0+), or legacy (3DES + SHA-1 for older devices). See [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables). | `modern2023`   | No       |
+| Variable                   | Description                                                                                                                                                                                                                                                                                                                                                                                                                                        | Default        | Required |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- | -------- |
+| `TZ`                       | Container timezone                                                                                                                                                                                                                                                                                                                                                                                                                                 | `Europe/Paris` | No       |
+| `PFX_PASSWORD`             | Password embedded in generated PFX files. Required: the container refuses to start when this is empty unless `PFX_ALLOW_EMPTY_PASSWORD=true` is set.                                                                                                                                                                                                                                                                                               | -              | Yes      |
+| `PFX_ALLOW_EMPTY_PASSWORD` | Opt out of the empty-password guard. When `PFX_PASSWORD` is empty the container refuses to start; set this to `true` to allow startup anyway. Generated PFX files then protect the embedded private key with an empty password (effectively no protection) — not recommended.                                                                                                                                                                      | `false`        | No       |
+| `FALLBACK_SCAN_HOURS`      | Hours between full directory re-scans (fallback when fsnotify misses events). Only an explicit `0` or `false` disables the periodic fallback; with it off, a missed fsnotify event (common on network mounts) is not recovered until the next change, so a renewal can be skipped. A set-but-empty (`FALLBACK_SCAN_HOURS=""`), whitespace, or invalid value uses the 6h default (like omitting the key), so a blank never silently disables it.    | `6`            | No       |
+| `PFX_ENCODER`              | PFX encoding profile — modern2023 (AES-256-CBC + SHA-256, default), modern2026 (AES-256-CBC + PBMAC1, requires OpenSSL 3.4.0+), legacy (3DES + SHA-1 for older devices), or legacyrc2 (RC2-40 + SHA-1, only for very old devices). `modern` is accepted as an alias for `modern2023`, and `legacy` is recorded as `legacydes` in startup logs. See [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables). | `modern2023`   | No       |
+| `LOG_LEVEL`                | Minimum log level — `debug`, `info` (default), `warn`, or `error` (case-insensitive; accepts slog offsets such as `info+2`). Set to `debug` to surface per-certificate skip reasons (orphan, unchanged, unreadable subdir) and filesystem-event detail that are otherwise suppressed. An unrecognized value falls back to `info`.                                                                                                                  | `info`         | No       |
+
+> **`FALLBACK_SCAN_HOURS` ceiling:** a value above `87600` (10 years) is clamped to that ceiling and logs a WARN — an `int64`-overflow guard, well beyond any realistic re-scan cadence.
 
 ### Volumes
 
@@ -79,7 +83,11 @@ services:
 
 ## Healthcheck
 
-The container includes a built-in health probe: after each successful certificate processing cycle, the main process creates a marker file at `/tmp/.healthy`; the `health` subcommand (`/cert-watcher health`) checks for this file and exits 0 if it exists. The container becomes unhealthy when the input directory is unreadable, PEM parsing fails, or PFX writes fail — any error during a processing cycle removes the marker. It auto-recovers on the next successful cycle (triggered by an fsnotify event or the fallback timer) without requiring a restart.
+The container includes a built-in health probe: after each processing cycle with no conversion failures, the main process creates a marker file at `/tmp/.healthy`; the `health` subcommand (`/cert-watcher health`) checks for this file and exits 0 if it exists.
+
+Health answers a single operational question — _should an orchestrator restart this container?_ — so it tracks only failures a restart could plausibly clear. The container becomes **unhealthy** when the `/input` root itself cannot be read, or when a certificate fails to convert (PEM or key parse error, cert/key mismatch, or PFX write failure). It **auto-recovers** on the next clean cycle (triggered by an fsnotify event or the fallback timer) without requiring a restart.
+
+An unreadable _sub-path_ under `/input` (e.g. one certificate directory with the wrong permissions or owner) is a steady-state misconfiguration a restart would not fix, so it is logged as a warning and its certificates are skipped — it does **not** flip the container unhealthy. Fix the directory permissions or run the container as a UID that can read it.
 
 ## Security
 
@@ -101,8 +109,10 @@ directory and writes PFX files to another. Runs as `nonroot` on
 a distroless base image with no shell or package manager.
 
 **Details for advanced users:** File paths are hardcoded
-(`/input`, `/output`), not configurable via env vars. File reads
-are TOCTOU-safe (stat + read from same handle) with a 10 MB cap.
+(`/input`, `/output`), not configurable via env vars. Input reads
+are confined to `/input` through an `os.Root`, so a symlink planted
+in the input tree cannot redirect a read outside it; reads are
+TOCTOU-safe (stat + read from the same handle) with a 10 MB cap.
 PFX writes use atomic temp-file + rename. The semgrep finding is
 the `/tmp/.healthy` health marker, a fixed-path zero-byte file
 in a single-process container.

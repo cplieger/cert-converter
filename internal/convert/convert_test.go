@@ -2,6 +2,7 @@ package convert_test
 
 import (
 	"bytes"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -11,6 +12,7 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -287,91 +289,83 @@ func TestParsePrivateKey_RSA_PKCS8(t *testing.T) {
 	}
 }
 
-// --- Tests: convert.ReadFileWithLimit ---
+// --- Tests: convert.ReadBoundedFromRoot ---
 
-func TestReadFileWithLimit(t *testing.T) {
+func TestReadBoundedFromRoot(t *testing.T) {
 	t.Parallel()
-	t.Run("normal file", func(t *testing.T) {
+	t.Run("reads file within limit through root", func(t *testing.T) {
 		t.Parallel()
-		path := filepath.Join(t.TempDir(), "small.txt")
-		if err := os.WriteFile(path, []byte("hello"), 0o644); err != nil {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "in.pem"), []byte("hello"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		data, err := convert.ReadFileWithLimit(t.Context(), path, 1024)
+		root, err := os.OpenRoot(dir)
 		if err != nil {
-			t.Fatalf("convert.ReadFileWithLimit: %v", err)
+			t.Fatal(err)
 		}
-		if string(data) != "hello" {
+		defer root.Close()
+		data, err := convert.ReadBoundedFromRoot(t.Context(), root, "in.pem", 1024)
+		if err != nil {
+			t.Fatalf("convert.ReadBoundedFromRoot: %v", err)
+		}
+		if !bytes.Equal(data, []byte("hello")) {
 			t.Errorf("got %q, want %q", data, "hello")
 		}
 	})
 
-	t.Run("oversized file", func(t *testing.T) {
+	t.Run("rejects oversized file", func(t *testing.T) {
 		t.Parallel()
-		path := filepath.Join(t.TempDir(), "big.txt")
-		if err := os.WriteFile(path, make([]byte, 2048), 0o644); err != nil {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "big.pem"), make([]byte, 2048), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		_, err := convert.ReadFileWithLimit(t.Context(), path, 1024)
-		if err == nil {
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+		if _, err := convert.ReadBoundedFromRoot(t.Context(), root, "big.pem", 1024); err == nil {
 			t.Error("expected error for oversized file")
 		}
 	})
 
 	t.Run("nonexistent file", func(t *testing.T) {
 		t.Parallel()
-		_, err := convert.ReadFileWithLimit(t.Context(), "/nonexistent/file.txt", 1024)
-		if err == nil {
+		dir := t.TempDir()
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+		if _, err := convert.ReadBoundedFromRoot(t.Context(), root, "missing.pem", 1024); err == nil {
 			t.Error("expected error for nonexistent file")
 		}
 	})
-}
 
-func TestReadFileWithLimit_exact_limit(t *testing.T) {
-	t.Parallel()
-	content := []byte("exactly at limit")
-	path := filepath.Join(t.TempDir(), "exact.txt")
-	if err := os.WriteFile(path, content, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	data, err := convert.ReadFileWithLimit(t.Context(), path, int64(len(content)))
-	if err != nil {
-		t.Fatalf("convert.ReadFileWithLimit at exact limit: %v", err)
-	}
-	if !bytes.Equal(data, content) {
-		t.Errorf("convert.ReadFileWithLimit = %q, want %q", data, content)
-	}
-}
-
-func TestReadFileWithLimit_one_byte_over(t *testing.T) {
-	t.Parallel()
-	content := []byte("one byte over the limit")
-	path := filepath.Join(t.TempDir(), "over.txt")
-	if err := os.WriteFile(path, content, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err := convert.ReadFileWithLimit(t.Context(), path, int64(len(content)-1))
-	if err == nil {
-		t.Fatal("convert.ReadFileWithLimit should reject file one byte over limit")
-	}
-}
-
-func TestReadFileWithLimit_empty_file(t *testing.T) {
-	t.Parallel()
-	path := filepath.Join(t.TempDir(), "empty.txt")
-	if err := os.WriteFile(path, []byte{}, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	data, err := convert.ReadFileWithLimit(t.Context(), path, 1024)
-	if err != nil {
-		t.Fatalf("convert.ReadFileWithLimit(empty) = error %v", err)
-	}
-	if len(data) != 0 {
-		t.Errorf("convert.ReadFileWithLimit(empty) returned %d bytes, want 0", len(data))
-	}
+	t.Run("confines a symlink escaping the root", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlink semantics differ on Windows")
+		}
+		t.Parallel()
+		// The security guarantee of item l-f14: a symlink planted in the
+		// watched directory that points outside it must not leak the target.
+		outside := t.TempDir()
+		if err := os.WriteFile(filepath.Join(outside, "secret"), []byte("top secret"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		dir := t.TempDir()
+		if err := os.Symlink(filepath.Join(outside, "secret"), filepath.Join(dir, "leak.pem")); err != nil {
+			t.Fatal(err)
+		}
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+		if _, err := convert.ReadBoundedFromRoot(t.Context(), root, "leak.pem", 1024); err == nil {
+			t.Fatal("ReadBoundedFromRoot followed a symlink escaping the root; want a confinement error")
+		}
+	})
 }
 
 // --- Tests: convert.ToPFX ---
@@ -409,5 +403,88 @@ func TestToPFX_writes_decodable_pfx(t *testing.T) {
 	}
 	if leaf.Subject.CommonName != "topfx-test" {
 		t.Errorf("convert.ToPFX wrote leaf CN = %q, want %q", leaf.Subject.CommonName, "topfx-test")
+	}
+}
+
+func TestParsePrivateKey_encrypted_block_returns_distinct_error(t *testing.T) {
+	t.Parallel()
+	encPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "ENCRYPTED PRIVATE KEY",
+		Bytes: []byte("opaque-ciphertext"),
+	})
+	_, err := convert.ParsePrivateKey(encPEM)
+	if err == nil {
+		t.Fatal("convert.ParsePrivateKey(ENCRYPTED PRIVATE KEY) = nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "encrypted") {
+		t.Errorf("error = %q, want it to contain \"encrypted\"", err.Error())
+	}
+}
+
+func TestParsePrivateKey_unsupported_pkcs8_type_rejected(t *testing.T) {
+	t.Parallel()
+	xkey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(xkey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	_, err = convert.ParsePrivateKey(keyPEM)
+	if err == nil {
+		t.Fatal("ParsePrivateKey(X25519 PKCS8) = nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "unsupported private key type in PKCS8 container") {
+		t.Errorf("error = %q, want \"unsupported private key type in PKCS8 container\"",
+			err.Error())
+	}
+}
+
+func TestParsePrivateKey_traditional_openssl_encrypted_returns_distinct_error(t *testing.T) {
+	t.Parallel()
+	encPEM := pem.EncodeToMemory(&pem.Block{
+		Type: "RSA PRIVATE KEY",
+		Headers: map[string]string{
+			"Proc-Type": "4,ENCRYPTED",
+			"DEK-Info":  "AES-128-CBC,0123456789ABCDEF0123456789ABCDEF",
+		},
+		Bytes: []byte("opaque encrypted key material"),
+	})
+
+	_, err := convert.ParsePrivateKey(encPEM)
+	if err == nil {
+		t.Fatal("convert.ParsePrivateKey(traditional OpenSSL encrypted RSA key) = nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "encrypted") {
+		t.Errorf("convert.ParsePrivateKey(encrypted) error = %q, want it to contain %q", err.Error(), "encrypted")
+	}
+}
+
+func TestToPFX_returns_wrapped_error_on_write_failure(t *testing.T) {
+	t.Parallel()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "write-fail", "ecdsa")
+	certs, err := convert.ParseCertChain(certPEM)
+	if err != nil {
+		t.Fatalf("setup: convert.ParseCertChain: %v", err)
+	}
+	privKey, err := convert.ParsePrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("setup: convert.ParsePrivateKey: %v", err)
+	}
+	// Destination sits inside a directory that does not exist; ToPFX does
+	// not create parents, so the atomic temp-file create fails.
+	destPath := filepath.Join(t.TempDir(), "missing-subdir", "out.pfx")
+
+	err = convert.ToPFX(t.Context(), privKey, certs[0], nil, destPath, "pw", pkcs12.Modern2023)
+	if err == nil {
+		t.Fatal("convert.ToPFX(unwritable destination) = nil error, want a wrapped write error")
+	}
+	if !strings.Contains(err.Error(), "write pfx") {
+		t.Errorf("convert.ToPFX(unwritable destination) error = %q, want it to contain %q", err.Error(), "write pfx")
+	}
+	if _, statErr := os.Stat(destPath); statErr == nil {
+		t.Errorf("convert.ToPFX wrote a file at an unwritable destination; want none")
 	}
 }

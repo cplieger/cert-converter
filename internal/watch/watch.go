@@ -3,8 +3,10 @@ package watch
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -63,13 +65,14 @@ func (w *Watcher) Run(ctx context.Context) {
 		w.pollLoopWithUpgrade(ctx)
 		return
 	}
-	defer watcher.Close()
 
 	if err := w.addWatchDirs(watcher, w.root); err != nil {
+		watcher.Close() // release fd + readEvents goroutine before long-lived fallback
 		slog.Warn("failed to watch directories, using polling with periodic upgrade attempts", "error", err)
 		w.pollLoopWithUpgrade(ctx)
 		return
 	}
+	defer watcher.Close()
 
 	slog.Info("fsnotify active", "directories", watcher.WatchList())
 	w.watchLoop(ctx, watcher)
@@ -79,7 +82,11 @@ func (w *Watcher) Run(ctx context.Context) {
 func (w *Watcher) addWatchDirs(watcher *fsnotify.Watcher, root string) error {
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return err
+			if path == root {
+				return err
+			}
+			slog.Warn("skipping unwatchable path", "path", path, "error", err)
+			return nil
 		}
 		if d.IsDir() {
 			return watcher.Add(path)
@@ -88,23 +95,50 @@ func (w *Watcher) addWatchDirs(watcher *fsnotify.Watcher, root string) error {
 	})
 }
 
-// handleFsEvent processes a single fsnotify event, adding new directories
-// to the watcher and returning true if a cert/key file changed.
-func (w *Watcher) handleFsEvent(event fsnotify.Event, watcher *fsnotify.Watcher) bool {
+// handleFsEvent processes a single fsnotify event, keeping the watch set in
+// sync with directory changes and reporting whether the event warrants a
+// rescan. The three event classes are handled distinctly:
+//
+//   - Create: a new subtree is added to the watcher. A newly created directory
+//     triggers a rescan (it may already hold a cert/key pair created before the
+//     watch attached); a newly created file triggers one only if it is a cert
+//     or key.
+//   - Remove/Rename: always triggers a rescan. The path is already gone, so it
+//     cannot be stat-ed to tell a cert file from a directory — and a renamed or
+//     deleted domain-named directory (e.g. "example.com", whose ".com" suffix
+//     fooled the old extension heuristic into skipping it) must still be
+//     reflected in the output. A rescan is cheap: the fingerprint cache skips
+//     unchanged pairs and prunes vanished ones.
+//   - Write: triggers a rescan only for a cert or key file; a metadata-only
+//     Chmod or a write to an unrelated file is ignored.
+func (w *Watcher) handleFsEvent(watcher *fsnotify.Watcher, event fsnotify.Event) bool {
 	slog.Debug("fs event", "op", event.Op.String(), "path", event.Name)
-
-	if event.Has(fsnotify.Create) {
+	switch {
+	case event.Has(fsnotify.Create):
 		if err := w.addWatchDirs(watcher, event.Name); err != nil {
 			slog.Warn("failed to watch new directory subtree", "path", event.Name, "error", err)
 		}
-	}
-	if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
-		if walkErr := w.addWatchDirs(watcher, event.Name); walkErr != nil {
-			slog.Debug("removed path no longer watchable", "path", event.Name, "error", walkErr)
+		if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+			return true
 		}
+		return isCertFile(event.Name)
+	case event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename):
+		// event.Name is already gone on Remove/Rename (inotify reports the old
+		// name), so there is nothing to add to the watch set: fsnotify drops the
+		// watch for a deleted directory itself, and a rename destination inside
+		// the tree arrives as its own Create event. addWatchDirs here can only
+		// fail, so just rescan.
 		return true
+	case event.Has(fsnotify.Write):
+		return isCertFile(event.Name)
 	}
-	return strings.HasSuffix(event.Name, ".crt") || strings.HasSuffix(event.Name, ".key")
+	return false
+}
+
+// isCertFile reports whether name is a certificate or private-key file by
+// extension — the only inputs cert-converter acts on.
+func isCertFile(name string) bool {
+	return strings.HasSuffix(name, ".crt") || strings.HasSuffix(name, ".key")
 }
 
 // watchLoop uses fsnotify for immediate reaction to cert changes,
@@ -133,9 +167,10 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) {
 
 		case event, ok := <-watcher.Events:
 			if !ok {
+				slog.Warn("fsnotify events channel closed, watcher stopping; process will exit and restart")
 				return
 			}
-			if w.handleFsEvent(event, watcher) && !pending {
+			if w.handleFsEvent(watcher, event) && !pending {
 				pending = true
 				debounceTimer.Reset(w.debounce)
 			}
@@ -155,9 +190,18 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) {
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
+				slog.Warn("fsnotify errors channel closed, watcher stopping; process will exit and restart")
 				return
 			}
-			slog.Warn("watcher error", "error", err)
+			if errors.Is(err, fsnotify.ErrEventOverflow) {
+				slog.Warn("fsnotify event queue overflowed; events were dropped, forcing a rescan to recover any missed renewal", "error", err)
+				if !pending {
+					pending = true
+					debounceTimer.Reset(w.debounce)
+				}
+			} else {
+				slog.Warn("watcher error", "error", err)
+			}
 		}
 	}
 }
@@ -166,7 +210,7 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) {
 // upgrade to fsnotify on every tick.
 func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) {
 	if w.fallback <= 0 {
-		slog.Info("polling disabled and fsnotify unavailable, waiting for shutdown")
+		slog.Warn("polling disabled and fsnotify unavailable; change detection inactive until restart")
 		<-ctx.Done()
 		return
 	}

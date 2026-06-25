@@ -1,32 +1,22 @@
 package convert_test
 
 import (
-	"os"
 	"testing"
 
 	"github.com/cplieger/cert-watcher/internal/convert"
 )
 
-func BenchmarkHashFile(b *testing.B) {
-	f, err := os.CreateTemp(b.TempDir(), "bench-hash-*")
-	if err != nil {
-		b.Fatal(err)
+func BenchmarkFingerprint(b *testing.B) {
+	cert := make([]byte, 4096)
+	key := make([]byte, 4096)
+	for i := range cert {
+		cert[i] = byte(i % 256)
+		key[i] = byte((i + 1) % 256)
 	}
-	data := make([]byte, 4096)
-	for i := range data {
-		data[i] = byte(i % 256)
-	}
-	if _, err := f.Write(data); err != nil {
-		b.Fatal(err)
-	}
-	f.Close()
 
-	cache := convert.NewHashCache()
-	b.SetBytes(int64(len(data)))
+	b.SetBytes(int64(len(cert) + len(key)))
 	b.ResetTimer()
 	for range b.N {
-		if _, err := cache.HashFile(f.Name()); err != nil {
-			b.Fatal(err)
-		}
+		_ = convert.Fingerprint(cert, key)
 	}
 }

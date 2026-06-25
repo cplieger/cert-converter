@@ -148,7 +148,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 	})
 }
 
-func FuzzReadFileWithLimit(f *testing.F) {
+func FuzzReadBoundedFromRoot(f *testing.F) {
 	f.Add([]byte("hello"), int64(10))
 	f.Add([]byte("hello world"), int64(5))
 	f.Add([]byte{}, int64(0))
@@ -159,12 +159,16 @@ func FuzzReadFileWithLimit(f *testing.F) {
 			limit = 0
 		}
 		dir := t.TempDir()
-		path := filepath.Join(dir, "input")
-		if err := os.WriteFile(path, content, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "input"), content, 0o644); err != nil {
 			t.Fatal(err)
 		}
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
 
-		data, err := convert.ReadFileWithLimit(t.Context(), path, limit)
+		data, err := convert.ReadBoundedFromRoot(t.Context(), root, "input", limit)
 		if err != nil {
 			return
 		}
