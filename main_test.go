@@ -756,16 +756,16 @@ func TestResolveLogLevel(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		raw     string
-		set     bool
 		want    slog.Level
+		set     bool
 		wantBad bool
 	}{
-		{"unset uses info", "", false, slog.LevelInfo, false},
-		{"debug", "debug", true, slog.LevelDebug, false},
-		{"uppercase WARN", "WARN", true, slog.LevelWarn, false},
-		{"offset info+2", "info+2", true, slog.LevelInfo + 2, false},
-		{"invalid falls back to info", "bogus", true, slog.LevelInfo, true},
-		{"set-but-empty falls back to info", "", true, slog.LevelInfo, true},
+		{"unset uses info", "", slog.LevelInfo, false, false},
+		{"debug", "debug", slog.LevelDebug, true, false},
+		{"uppercase WARN", "WARN", slog.LevelWarn, true, false},
+		{"offset info+2", "info+2", slog.LevelInfo + 2, true, false},
+		{"invalid falls back to info", "bogus", slog.LevelInfo, true, true},
+		{"set-but-empty falls back to info", "", slog.LevelInfo, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
