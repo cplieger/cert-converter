@@ -3,89 +3,69 @@ package convert
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
-	"io"
-	"os"
-	"path/filepath"
 	"sync"
 )
 
-// fileHash stores the last known hash of a cert+key pair.
-type fileHash struct {
-	certHash string
-	keyHash  string
-}
-
-// HashCache tracks file hashes to skip unchanged cert pairs.
+// HashCache tracks a content fingerprint per cert/key key so the scanner can
+// skip pairs whose inputs have not changed since the last scan. It performs NO
+// file I/O: the scanner reads each cert and key once (through a confined
+// *os.Root), derives a fingerprint with Fingerprint, and asks Changed whether
+// it differs from the last seen value. Keeping the cache I/O-free is what lets
+// a scan read each input exactly once — the previous design hashed the files
+// here and the converter then read them again.
 type HashCache struct {
-	hashes map[string]fileHash
-	mu     sync.Mutex
+	fingerprints map[string]string
+	mu           sync.Mutex
 }
 
 // NewHashCache returns an initialised HashCache.
 func NewHashCache() *HashCache {
-	return &HashCache{hashes: make(map[string]fileHash)}
+	return &HashCache{fingerprints: make(map[string]string)}
 }
 
-// HashFile returns the hex-encoded SHA-256 of a file's contents.
-func (c *HashCache) HashFile(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return "", err
-	}
-	if info.Size() > MaxFileSize {
-		return "", fmt.Errorf("file %s exceeds 10 MB size limit (%d bytes)", filepath.Base(path), info.Size())
-	}
-
+// Fingerprint derives a collision-resistant fingerprint of a cert+key pair from
+// their PEM bytes. Each input is hashed separately before the two digests are
+// combined, so the boundary between cert and key is unambiguous: a byte moved
+// from the key into the cert still changes the fingerprint (a plain
+// concatenation would not detect that shift).
+func Fingerprint(certPEM, keyPEM []byte) string {
+	certSum := sha256.Sum256(certPEM)
+	keySum := sha256.Sum256(keyPEM)
 	h := sha256.New()
-	if _, err := io.Copy(h, io.LimitReader(f, MaxFileSize)); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	h.Write(certSum[:])
+	h.Write(keySum[:])
+	return hex.EncodeToString(h.Sum(nil))
 }
 
-// Changed returns true if the cert or key file has changed since last check.
-func (c *HashCache) Changed(crtPath, keyPath string) bool {
-	certH, err := c.HashFile(crtPath)
-	if err != nil {
-		return true
-	}
-	keyH, err := c.HashFile(keyPath)
-	if err != nil {
-		return true
-	}
-
+// Changed reports whether key's fingerprint differs from the last seen value
+// (or was never seen), recording the new fingerprint when it differs. The
+// caller MUST Invalidate(key) if the conversion that follows a true result
+// fails, so the next scan retries rather than treating the failed pair as
+// already current.
+func (c *HashCache) Changed(key, fingerprint string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	prev, exists := c.hashes[crtPath]
-	if !exists || prev.certHash != certH || prev.keyHash != keyH {
-		c.hashes[crtPath] = fileHash{certHash: certH, keyHash: keyH}
-		return true
+	if prev, ok := c.fingerprints[key]; ok && prev == fingerprint {
+		return false
 	}
-	return false
+	c.fingerprints[key] = fingerprint
+	return true
 }
 
-// Invalidate removes the cached hash for a cert path so the next scan retries.
-func (c *HashCache) Invalidate(crtPath string) {
+// Invalidate drops the cached fingerprint for key so the next Changed retries.
+func (c *HashCache) Invalidate(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.hashes, crtPath)
+	delete(c.fingerprints, key)
 }
 
-// Prune removes hash entries for paths not present in seen.
+// Prune removes fingerprint entries for keys not present in seen.
 func (c *HashCache) Prune(seen map[string]struct{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for k := range c.hashes {
+	for k := range c.fingerprints {
 		if _, ok := seen[k]; !ok {
-			delete(c.hashes, k)
+			delete(c.fingerprints, k)
 		}
 	}
 }

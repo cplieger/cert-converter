@@ -1,8 +1,6 @@
 package process_test
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/cplieger/cert-watcher/internal/convert"
@@ -10,77 +8,56 @@ import (
 )
 
 // CacheCheckerContract verifies behavioral invariants that any CacheChecker
-// implementation must satisfy.
+// implementation must satisfy. The cache is keyed by an opaque string and a
+// content fingerprint and performs no file I/O.
 func CacheCheckerContract(t *testing.T, newCache func() process.CacheChecker) {
 	t.Helper()
 
-	writeTempFile := func(t *testing.T, dir, name, content string) string {
-		t.Helper()
-		p := filepath.Join(dir, name)
-		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return p
-	}
-
 	t.Run("Changed_returns_true_on_first_call", func(t *testing.T) {
 		cache := newCache()
-		dir := t.TempDir()
-		crt := writeTempFile(t, dir, "a.crt", "cert-data")
-		key := writeTempFile(t, dir, "a.key", "key-data")
-
-		if !cache.Changed(crt, key) {
+		if !cache.Changed("k", "fp") {
 			t.Fatal("expected Changed to return true on first call")
 		}
 	})
 
-	t.Run("Changed_returns_false_without_content_change", func(t *testing.T) {
+	t.Run("Changed_returns_false_without_fingerprint_change", func(t *testing.T) {
 		cache := newCache()
-		dir := t.TempDir()
-		crt := writeTempFile(t, dir, "a.crt", "cert-data")
-		key := writeTempFile(t, dir, "a.key", "key-data")
+		cache.Changed("k", "fp") // prime
+		if cache.Changed("k", "fp") {
+			t.Fatal("expected Changed to return false when the fingerprint is unchanged")
+		}
+	})
 
-		cache.Changed(crt, key) // prime
-		if cache.Changed(crt, key) {
-			t.Fatal("expected Changed to return false on subsequent call without content change")
+	t.Run("Changed_returns_true_on_fingerprint_change", func(t *testing.T) {
+		cache := newCache()
+		cache.Changed("k", "fp-1") // prime
+		if !cache.Changed("k", "fp-2") {
+			t.Fatal("expected Changed to return true when the fingerprint changes")
 		}
 	})
 
 	t.Run("Invalidate_causes_next_Changed_to_return_true", func(t *testing.T) {
 		cache := newCache()
-		dir := t.TempDir()
-		crt := writeTempFile(t, dir, "a.crt", "cert-data")
-		key := writeTempFile(t, dir, "a.key", "key-data")
-
-		cache.Changed(crt, key) // prime
-		cache.Invalidate(crt)
-		if !cache.Changed(crt, key) {
+		cache.Changed("k", "fp") // prime
+		cache.Invalidate("k")
+		if !cache.Changed("k", "fp") {
 			t.Fatal("expected Changed to return true after Invalidate")
 		}
 	})
 
 	t.Run("Prune_removes_entries_not_in_seen", func(t *testing.T) {
 		cache := newCache()
-		dir := t.TempDir()
-		crt1 := writeTempFile(t, dir, "a.crt", "cert-a")
-		key1 := writeTempFile(t, dir, "a.key", "key-a")
-		crt2 := writeTempFile(t, dir, "b.crt", "cert-b")
-		key2 := writeTempFile(t, dir, "b.key", "key-b")
+		cache.Changed("k1", "fp1")
+		cache.Changed("k2", "fp2")
 
-		cache.Changed(crt1, key1)
-		cache.Changed(crt2, key2)
+		// Only k1 is in the seen set; k2 should be pruned.
+		cache.Prune(map[string]struct{}{"k1": {}})
 
-		// Only crt1 is in the seen set; crt2 should be pruned.
-		seen := map[string]struct{}{crt1: {}}
-		cache.Prune(seen)
-
-		// crt1 still cached — unchanged.
-		if cache.Changed(crt1, key1) {
-			t.Fatal("expected crt1 to remain cached after Prune")
+		if cache.Changed("k1", "fp1") {
+			t.Fatal("expected k1 to remain cached after Prune")
 		}
-		// crt2 was pruned — should report changed.
-		if !cache.Changed(crt2, key2) {
-			t.Fatal("expected crt2 to report changed after being pruned")
+		if !cache.Changed("k2", "fp2") {
+			t.Fatal("expected k2 to report changed after being pruned")
 		}
 	})
 }
