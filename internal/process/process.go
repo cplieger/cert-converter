@@ -62,38 +62,19 @@ func (s *Scanner) Run(ctx context.Context, certsRoot, outRoot, password string, 
 	}
 	defer func() { _ = root.Close() }()
 
-	var results []convert.ConversionResult
-	var unreadable int
-	seen := make(map[string]struct{})
+	reapStaleTemps(outRoot)
 
-	// Reap temps orphaned by an interrupted PFX write (crash between temp-write
-	// and rename). WriteFile names temps ".atomicfile-<digits>.tmp" and the
-	// default CleanupStaleTemps recognizes exactly that shape, so the sweep
-	// stays matched to the writes.
-	if removed, err := atomicfile.CleanupStaleTemps(outRoot, time.Hour); err != nil {
-		slog.Warn("stale temp cleanup failed", "dir", outRoot, "error", err)
-	} else if removed > 0 {
-		slog.Debug("reaped stale temp files", "dir", outRoot, "count", removed)
+	sw := &scanWalk{
+		scanner:   s,
+		root:      root,
+		certsRoot: certsRoot,
+		outRoot:   outRoot,
+		password:  password,
+		enc:       enc,
+		seen:      make(map[string]struct{}),
 	}
-
 	walkErr := filepath.WalkDir(certsRoot, func(path string, d fs.DirEntry, err error) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err != nil {
-			if path == certsRoot {
-				return err
-			}
-			slog.Warn("skipping unreadable path", "path", path, "error", err)
-			unreadable++
-			return nil
-		}
-		if d.IsDir() || !strings.HasSuffix(path, ".crt") {
-			return nil
-		}
-		seen[path] = struct{}{}
-		results = append(results, s.convertEntry(ctx, root, path, certsRoot, outRoot, password, enc))
-		return nil
+		return sw.visit(ctx, path, d, err)
 	})
 
 	// A non-nil walkErr means WalkDir aborted before visiting every entry
@@ -103,40 +84,101 @@ func (s *Scanner) Run(ctx context.Context, certsRoot, outRoot, password string, 
 	// next clean cycle. Prune only after a complete walk -- a genuinely
 	// removed pair is reaped on the next successful scan.
 	if walkErr == nil {
-		s.cache.Prune(seen)
+		s.cache.Prune(sw.seen)
 	}
 
-	result := countResults(results, unreadable)
-	if walkErr != nil {
-		if errors.Is(walkErr, context.Canceled) || errors.Is(walkErr, context.DeadlineExceeded) {
-			slog.Debug("scan cancelled during shutdown",
-				"error", walkErr,
-				"total", result.Total,
-				"converted", result.Converted,
-				"unchanged", result.Unchanged,
-				"orphan", result.Orphan,
-				"unreadable", result.Unreadable,
-				"failed", result.Failed)
-		} else {
-			slog.Warn("scan aborted before completion",
-				"error", walkErr,
-				"total", result.Total,
-				"converted", result.Converted,
-				"unchanged", result.Unchanged,
-				"orphan", result.Orphan,
-				"unreadable", result.Unreadable,
-				"failed", result.Failed)
-		}
-		return result, walkErr
+	result := countResults(sw.results, sw.unreadable)
+	logScanOutcome(result, walkErr)
+	return result, walkErr
+}
+
+// reapStaleTemps removes PFX temp files orphaned by an interrupted atomic write
+// (a crash between temp-write and rename). WriteFile names temps
+// ".atomicfile-<digits>.tmp" and the default CleanupStaleTemps recognizes
+// exactly that shape, so the sweep stays matched to the writes.
+func reapStaleTemps(outRoot string) {
+	if removed, err := atomicfile.CleanupStaleTemps(outRoot, time.Hour); err != nil {
+		slog.Warn("stale temp cleanup failed", "dir", outRoot, "error", err)
+	} else if removed > 0 {
+		slog.Debug("reaped stale temp files", "dir", outRoot, "count", removed)
 	}
-	slog.Info("scan complete",
+}
+
+// scanWalk carries the read-only conversion parameters and the mutable
+// accounting for one Scanner.Run tree walk: the per-pair results, the count of
+// unreadable sub-paths, and the set of cert paths seen (for cache pruning).
+// Hoisting the WalkDir callback onto this struct keeps Scanner.Run flat.
+type scanWalk struct {
+	scanner    *Scanner
+	root       *os.Root
+	enc        *pkcs12.Encoder
+	seen       map[string]struct{}
+	certsRoot  string
+	outRoot    string
+	password   string
+	results    []convert.ConversionResult
+	unreadable int
+}
+
+// visit is the WalkDir callback. A walk error at the root, or a cancelled
+// context, aborts the walk; an error below the root marks one unreadable
+// sub-path and continues. Directories and non-.crt files are ignored; every
+// .crt entry is recorded as seen and dispatched to convertEntry.
+func (sw *scanWalk) visit(ctx context.Context, path string, d fs.DirEntry, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil {
+		if path == sw.certsRoot {
+			return err
+		}
+		slog.Warn("skipping unreadable path", "path", path, "error", err)
+		sw.unreadable++
+		return nil
+	}
+	if d.IsDir() || !strings.HasSuffix(path, ".crt") {
+		return nil
+	}
+	sw.seen[path] = struct{}{}
+	sw.results = append(sw.results,
+		sw.scanner.convertEntry(ctx, sw.root, path, sw.certsRoot, sw.outRoot, sw.password, sw.enc))
+	return nil
+}
+
+// logScanOutcome emits the end-of-scan summary. A completed walk logs at Info;
+// a walk aborted by shutdown (context cancellation or deadline) logs at Debug;
+// any other abort logs at Warn so an operator sees the partial scan and its
+// error.
+func logScanOutcome(result ScanResult, walkErr error) {
+	if walkErr == nil {
+		slog.Info("scan complete",
+			"total", result.Total,
+			"converted", result.Converted,
+			"unchanged", result.Unchanged,
+			"orphan", result.Orphan,
+			"unreadable", result.Unreadable,
+			"failed", result.Failed)
+		return
+	}
+	if errors.Is(walkErr, context.Canceled) || errors.Is(walkErr, context.DeadlineExceeded) {
+		slog.Debug("scan cancelled during shutdown",
+			"error", walkErr,
+			"total", result.Total,
+			"converted", result.Converted,
+			"unchanged", result.Unchanged,
+			"orphan", result.Orphan,
+			"unreadable", result.Unreadable,
+			"failed", result.Failed)
+		return
+	}
+	slog.Warn("scan aborted before completion",
+		"error", walkErr,
 		"total", result.Total,
 		"converted", result.Converted,
 		"unchanged", result.Unchanged,
 		"orphan", result.Orphan,
 		"unreadable", result.Unreadable,
 		"failed", result.Failed)
-	return result, walkErr
 }
 
 // convertEntry resolves the outcome for one .crt entry under certsRoot. It
