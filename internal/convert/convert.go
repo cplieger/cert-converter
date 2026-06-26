@@ -74,9 +74,23 @@ func ParseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
 // ParsePrivateKey extracts a private key from PEM data, trying PKCS8
 // first, then falling back to PKCS1 (RSA) and SEC1 (EC) formats.
 func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
-	var block *pem.Block
+	block, err := findPrivateKeyBlock(pemBytes)
+	if err != nil {
+		return nil, err
+	}
+	return parsePrivateKeyBlock(block)
+}
+
+// findPrivateKeyBlock scans pemBytes for the first PEM block holding a private
+// key cert-converter can decode, skipping certificate and other blocks. It
+// distinguishes "no key block at all" from "the only key blocks are encrypted"
+// so the caller surfaces actionable guidance: both a PKCS#8 ENCRYPTED PRIVATE
+// KEY block and a traditional OpenSSL key carrying "Proc-Type: 4,ENCRYPTED" +
+// "DEK-Info" headers hold ciphertext none of the parsers can decode.
+func findPrivateKeyBlock(pemBytes []byte) (*pem.Block, error) {
 	var sawEncrypted bool
 	for {
+		var block *pem.Block
 		block, pemBytes = pem.Decode(pemBytes)
 		if block == nil {
 			if sawEncrypted {
@@ -86,25 +100,32 @@ func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 		}
 		switch block.Type {
 		case PEMTypePrivateKey, PEMTypeRSAPrivateKey, PEMTypeECPrivateKey:
-			// A traditional OpenSSL key (RSA/EC PRIVATE KEY carrying
-			// "Proc-Type: 4,ENCRYPTED" + "DEK-Info" headers) holds encrypted
-			// DER that none of the parsers below can decode; surface the same
-			// actionable guidance as a PKCS#8 ENCRYPTED PRIVATE KEY block
-			// instead of a generic "failed to parse" error.
-			if block.Headers["Proc-Type"] == "4,ENCRYPTED" || block.Headers["DEK-Info"] != "" {
+			if isEncryptedPEMBlock(block) {
 				sawEncrypted = true
 				continue
 			}
-			// supported
+			return block, nil
 		case PEMTypeEncryptedPrivateKey:
 			sawEncrypted = true
 			continue
 		default:
 			continue
 		}
-		break
 	}
+}
 
+// isEncryptedPEMBlock reports whether a traditional OpenSSL private-key block
+// carries encryption headers ("Proc-Type: 4,ENCRYPTED" or "DEK-Info"), whose
+// body is ciphertext the DER parsers cannot decode.
+func isEncryptedPEMBlock(block *pem.Block) bool {
+	return block.Headers["Proc-Type"] == "4,ENCRYPTED" || block.Headers["DEK-Info"] != ""
+}
+
+// parsePrivateKeyBlock decodes a single unencrypted private-key PEM block,
+// trying PKCS8 first, then falling back to PKCS1 (RSA) and SEC1 (EC). A PKCS8
+// container holding a key type cert-converter does not support is rejected with
+// a distinct error rather than reported as unparseable.
+func parsePrivateKeyBlock(block *pem.Block) (crypto.PrivateKey, error) {
 	if key, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
 		switch key.(type) {
 		case *rsa.PrivateKey, *ecdsa.PrivateKey, ed25519.PrivateKey:

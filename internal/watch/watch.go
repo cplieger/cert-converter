@@ -144,23 +144,10 @@ func isCertFile(name string) bool {
 // watchLoop uses fsnotify for immediate reaction to cert changes,
 // with a periodic full scan as a safety net.
 func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) {
-	var fallbackTimer *time.Timer
-	if w.fallback > 0 {
-		fallbackTimer = time.NewTimer(w.fallback)
-		defer fallbackTimer.Stop()
-	}
-
-	var pending bool
-	debounceTimer := time.NewTimer(w.debounce)
-	debounceTimer.Stop()
-	defer debounceTimer.Stop()
+	st := newWatchState(w)
+	defer st.stop()
 
 	for {
-		var fallbackC <-chan time.Time
-		if fallbackTimer != nil {
-			fallbackC = fallbackTimer.C
-		}
-
 		select {
 		case <-ctx.Done():
 			return
@@ -170,40 +157,107 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) {
 				slog.Warn("fsnotify events channel closed, watcher stopping; process will exit and restart")
 				return
 			}
-			if w.handleFsEvent(watcher, event) && !pending {
-				pending = true
-				debounceTimer.Reset(w.debounce)
+			if w.handleFsEvent(watcher, event) {
+				st.scheduleScan()
 			}
 
-		case <-debounceTimer.C:
-			pending = false
-			slog.Info("cert change detected, processing")
-			w.onChange(ctx)
-			if fallbackTimer != nil {
-				fallbackTimer.Reset(w.fallback)
-			}
+		case <-st.debounceTimer.C:
+			st.runDebouncedScan(ctx)
 
-		case <-fallbackC:
-			slog.Debug("fallback scan triggered", "interval", w.fallback)
-			w.onChange(ctx)
-			fallbackTimer.Reset(w.fallback)
+		case <-st.fallbackChan():
+			st.runFallbackScan(ctx)
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
 				slog.Warn("fsnotify errors channel closed, watcher stopping; process will exit and restart")
 				return
 			}
-			if errors.Is(err, fsnotify.ErrEventOverflow) {
-				slog.Warn("fsnotify event queue overflowed; events were dropped, forcing a rescan to recover any missed renewal", "error", err)
-				if !pending {
-					pending = true
-					debounceTimer.Reset(w.debounce)
-				}
-			} else {
-				slog.Warn("watcher error", "error", err)
-			}
+			st.handleWatcherError(err)
 		}
 	}
+}
+
+// watchState carries the mutable accounting for one watchLoop run: the pending
+// debounce flag and the debounce/fallback timers. Hoisting the per-event work
+// onto its methods keeps watchLoop's select a flat dispatch table rather than a
+// deeply nested switch.
+type watchState struct {
+	w             *Watcher
+	debounceTimer *time.Timer
+	fallbackTimer *time.Timer // nil when the periodic fallback rescan is disabled
+	pending       bool
+}
+
+// newWatchState builds the loop state: a stopped debounce timer (nothing is
+// pending until an event arrives) and, when w.fallback > 0, a running fallback
+// timer for the periodic safety-net rescan.
+func newWatchState(w *Watcher) *watchState {
+	st := &watchState{w: w}
+	st.debounceTimer = time.NewTimer(w.debounce)
+	st.debounceTimer.Stop()
+	if w.fallback > 0 {
+		st.fallbackTimer = time.NewTimer(w.fallback)
+	}
+	return st
+}
+
+// stop releases both timers when the loop exits.
+func (st *watchState) stop() {
+	st.debounceTimer.Stop()
+	if st.fallbackTimer != nil {
+		st.fallbackTimer.Stop()
+	}
+}
+
+// fallbackChan returns the fallback timer's channel, or nil when the fallback
+// is disabled. A receive on a nil channel blocks forever, so the loop's
+// fallback case never fires without a fallback timer.
+func (st *watchState) fallbackChan() <-chan time.Time {
+	if st.fallbackTimer == nil {
+		return nil
+	}
+	return st.fallbackTimer.C
+}
+
+// scheduleScan arms the debounce timer to coalesce a burst of events into one
+// scan. A scan already pending is left to fire on its existing schedule.
+func (st *watchState) scheduleScan() {
+	if st.pending {
+		return
+	}
+	st.pending = true
+	st.debounceTimer.Reset(st.w.debounce)
+}
+
+// runDebouncedScan fires the debounced rescan and re-arms the fallback timer so
+// the safety-net interval is measured from the last real scan.
+func (st *watchState) runDebouncedScan(ctx context.Context) {
+	st.pending = false
+	slog.Info("cert change detected, processing")
+	st.w.onChange(ctx)
+	if st.fallbackTimer != nil {
+		st.fallbackTimer.Reset(st.w.fallback)
+	}
+}
+
+// runFallbackScan fires the periodic safety-net rescan and re-arms its timer.
+// It is reached only when fallbackTimer is non-nil (see fallbackChan).
+func (st *watchState) runFallbackScan(ctx context.Context) {
+	slog.Debug("fallback scan triggered", "interval", st.w.fallback)
+	st.w.onChange(ctx)
+	st.fallbackTimer.Reset(st.w.fallback)
+}
+
+// handleWatcherError reacts to an fsnotify error: an event-queue overflow
+// dropped events, so force a rescan to recover any missed renewal; any other
+// error is logged and the loop continues.
+func (st *watchState) handleWatcherError(err error) {
+	if errors.Is(err, fsnotify.ErrEventOverflow) {
+		slog.Warn("fsnotify event queue overflowed; events were dropped, forcing a rescan to recover any missed renewal", "error", err)
+		st.scheduleScan()
+		return
+	}
+	slog.Warn("watcher error", "error", err)
 }
 
 // pollLoopWithUpgrade polls on the fallback interval and attempts to
