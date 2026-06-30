@@ -10,6 +10,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	// Embed the IANA tz database so TZ (default Europe/Paris) is honored even
+	// though the distroless static base ships no /usr/share/zoneinfo; without
+	// it time.Local silently falls back to UTC.
+	_ "time/tzdata"
 
 	"github.com/cplieger/cert-watcher/internal/config"
 	"github.com/cplieger/cert-watcher/internal/convert"
