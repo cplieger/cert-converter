@@ -1,6 +1,6 @@
 # Security assurance case — cert-converter
 
-This extends the fleet-wide
+This extends the shared
 [default assurance case](https://github.com/cplieger/.github/blob/main/assurance-case.md)
 with the threat model specific to `cert-converter`. Read that first.
 
