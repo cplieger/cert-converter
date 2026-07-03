@@ -3,7 +3,6 @@
 [![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/cert-converter/badges/size.json)](https://github.com/cplieger/cert-converter/pkgs/container/cert-converter)
 ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
 ![base: Distroless](https://img.shields.io/badge/base-Distroless_nonroot-4285F4?logo=google)
-[![Go Report Card](https://goreportcard.com/badge/github.com/cplieger/cert-converter)](https://goreportcard.com/report/github.com/cplieger/cert-converter)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/cert-converter/badges/coverage.json)](https://github.com/cplieger/cert-converter/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/cert-converter/badges/mutation.json)](https://github.com/cplieger/cert-converter/issues?q=label%3Agremlins-tracker)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13200/badge)](https://www.bestpractices.dev/projects/13200)
@@ -25,9 +24,6 @@ are renewed. SHA-256 change detection skips unchanged certificates. Supports
 modern2023, modern2026, and legacy PFX encoding profiles. Includes a CLI
 health probe for distroless Docker healthchecks (file-based, no HTTP server
 or open port).
-
-This is a distroless, rootless container — it runs as `nonroot` on
-`gcr.io/distroless/static` with no shell or package manager.
 
 ### Why this design
 
@@ -72,7 +68,7 @@ services:
 | `PFX_ENCODER`              | PFX encoding profile — modern2023 (AES-256-CBC + SHA-256, default), modern2026 (AES-256-CBC + PBMAC1, requires OpenSSL 3.4.0+), legacy (3DES + SHA-1 for older devices), or legacyrc2 (RC2-40 + SHA-1, only for very old devices). `modern` is accepted as an alias for `modern2023`, and `legacy` is recorded as `legacydes` in startup logs. See [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables). | `modern2023`   | No       |
 | `LOG_LEVEL`                | Minimum log level — `debug`, `info` (default), `warn`, or `error` (case-insensitive; accepts slog offsets such as `info+2`). Set to `debug` to surface per-certificate skip reasons (orphan, unchanged, unreadable subdir) and filesystem-event detail that are otherwise suppressed. An unrecognized value falls back to `info`.                                                                                                                  | `info`         | No       |
 
-> **`FALLBACK_SCAN_HOURS` ceiling:** a value above `87600` (10 years) is clamped to that ceiling and logs a WARN — an `int64`-overflow guard, well beyond any realistic re-scan cadence.
+> **`FALLBACK_SCAN_HOURS` ceiling:** a value above `87600` (10 years) is clamped to that ceiling and logs a WARN.
 
 ### Volumes
 
@@ -103,19 +99,16 @@ An unreadable _sub-path_ under `/input` (e.g. one certificate directory with the
 | [semgrep](https://semgrep.dev/)                                     | 1 info (false positive)          |
 | [hadolint](https://github.com/hadolint/hadolint)                    | Clean                            |
 
-This app has a minimal attack surface: no network listener, no
-HTTP server, no exposed ports. It reads PEM files from a mounted
-directory and writes PFX files to another. Runs as `nonroot` on
-a distroless base image with no shell or package manager.
+This app has a minimal attack surface: it reads PEM files from a
+mounted directory and writes PFX files to another, with no network
+listener or open port (see [Why this design](#why-this-design)).
 
 **Details for advanced users:** File paths are hardcoded
 (`/input`, `/output`), not configurable via env vars. Input reads
 are confined to `/input` through an `os.Root`, so a symlink planted
 in the input tree cannot redirect a read outside it; reads are
 TOCTOU-safe (stat + read from the same handle) with a 10 MB cap.
-PFX writes use atomic temp-file + rename. The semgrep finding is
-the `/tmp/.healthy` health marker, a fixed-path zero-byte file
-in a single-process container.
+PFX writes use atomic temp-file + rename.
 
 ## Dependencies
 
@@ -140,7 +133,7 @@ larger changes so the approach can be discussed before implementation.
 
 ## Disclaimer
 
-These images are built with care and follow security best practices, but they are intended for **homelab use**. No guarantees of fitness for production environments. Use at your own risk.
+This project is built with care and follows security best practices, but it is intended for personal / self-hosted use. No guarantees of fitness for production environments. Use at your own risk.
 
 This project was built with AI-assisted tooling using [Claude Opus](https://www.anthropic.com/claude) and [Kiro](https://kiro.dev). The human maintainer defines architecture, supervises implementation, and makes all final decisions.
 
