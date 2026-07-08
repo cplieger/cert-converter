@@ -62,6 +62,9 @@ health marker (any failure clears it; a clean cycle sets it).
 - **Health is a file marker, not a probe endpoint.** A successful cycle
   writes the marker; `/cert-watcher health` exits 0 if it exists. There
   is no port to bind.
+- **Logs are UTC.** A `utcTimeAttr` slog `ReplaceAttr` forces every
+  record's timestamp to UTC, so the container needs no `TZ` and the
+  binary embeds no `time/tzdata`.
 
 ## Running checks locally
 
