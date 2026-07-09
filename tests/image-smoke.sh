@@ -31,7 +31,7 @@ IMG="${1:?usage: image-smoke.sh <image-ref>}"
 NAME="smoke-cert-converter-$$"
 TIMEOUT=90 # must cover the 15s start-period + a few 30s healthcheck intervals
 
-# shellcheck disable=SC2329  # invoked indirectly via trap
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via trap
 cleanup() {
   code=$?
   # Dump container logs only on failure (a passing run stays quiet).
