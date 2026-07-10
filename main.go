@@ -16,6 +16,7 @@ import (
 	"github.com/cplieger/cert-watcher/internal/process"
 	"github.com/cplieger/cert-watcher/internal/watch"
 	"github.com/cplieger/health"
+	"github.com/cplieger/slogx"
 )
 
 // Fixed container paths — configured via volume mounts, not env vars.
@@ -38,22 +39,6 @@ func healthyAfterScan(r process.ScanResult) bool {
 	return r.Failed == 0
 }
 
-// resolveLogLevel maps the LOG_LEVEL env value to an slog.Level. slog accepts
-// debug/info/warn/error (case-insensitive) with optional +/- offsets; when the
-// variable is set but does not parse, it falls back to slog.LevelInfo and
-// reports badLevel=true so the caller can warn. An unset variable uses
-// LevelInfo with badLevel=false. Pure (no I/O) so the LOG_LEVEL fallback
-// contract is unit-testable without reconstructing it in main.
-func resolveLogLevel(raw string, set bool) (level slog.Level, badLevel bool) {
-	level = slog.LevelInfo
-	if set {
-		if err := level.UnmarshalText([]byte(raw)); err != nil {
-			return slog.LevelInfo, true
-		}
-	}
-	return level, false
-}
-
 // watchDebounce is the debounce window for the watcher.
 const watchDebounce = 2 * time.Second
 
@@ -64,10 +49,10 @@ func main() {
 		health.RunProbe(health.DefaultPath)
 	}
 
-	rawLevel, levelSet := os.LookupEnv("LOG_LEVEL")
-	lvl, badLevel := resolveLogLevel(rawLevel, levelSet)
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl, ReplaceAttr: utcTimeAttr})))
-	if badLevel {
+	rawLevel := os.Getenv("LOG_LEVEL")
+	lvl, ok := slogx.ParseLevel(rawLevel, slog.LevelInfo)
+	slogx.Setup(slogx.Options{Level: lvl})
+	if !ok {
 		slog.Warn("invalid LOG_LEVEL, using default", "value", rawLevel, "default", "info")
 	}
 
@@ -137,16 +122,4 @@ func main() {
 	w.Run(ctx)
 
 	slog.Info("shutting down", "reason", context.Cause(ctx))
-}
-
-// utcTimeAttr is a slog ReplaceAttr that renders the record's built-in time
-// key in UTC, so log-line timestamps are zone-stable regardless of the
-// container's TZ (the fleet logs-in-UTC standard). It rewrites only the
-// top-level time attribute; a user attribute that happens to share the "time"
-// key inside a group is left untouched.
-func utcTimeAttr(groups []string, a slog.Attr) slog.Attr {
-	if len(groups) == 0 && a.Key == slog.TimeKey && a.Value.Kind() == slog.KindTime {
-		a.Value = slog.TimeValue(a.Value.Time().UTC())
-	}
-	return a
 }

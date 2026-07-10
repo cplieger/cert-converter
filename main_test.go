@@ -5,7 +5,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/x509"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -745,36 +744,6 @@ func TestHealthyAfterScan(t *testing.T) {
 			t.Parallel()
 			if got := healthyAfterScan(tc.in); got != tc.want {
 				t.Errorf("healthyAfterScan(%+v) = %v, want %v", tc.in, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestResolveLogLevel(t *testing.T) {
-	t.Parallel()
-
-	for _, tc := range []struct {
-		name    string
-		raw     string
-		want    slog.Level
-		set     bool
-		wantBad bool
-	}{
-		{"unset uses info", "", slog.LevelInfo, false, false},
-		{"debug", "debug", slog.LevelDebug, true, false},
-		{"uppercase WARN", "WARN", slog.LevelWarn, true, false},
-		{"offset info+2", "info+2", slog.LevelInfo + 2, true, false},
-		{"invalid falls back to info", "bogus", slog.LevelInfo, true, true},
-		{"set-but-empty falls back to info", "", slog.LevelInfo, true, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got, bad := resolveLogLevel(tc.raw, tc.set)
-			if got != tc.want {
-				t.Errorf("resolveLogLevel(%q, %v) level = %v, want %v", tc.raw, tc.set, got, tc.want)
-			}
-			if bad != tc.wantBad {
-				t.Errorf("resolveLogLevel(%q, %v) badLevel = %v, want %v", tc.raw, tc.set, bad, tc.wantBad)
 			}
 		})
 	}
