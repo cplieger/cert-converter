@@ -75,6 +75,52 @@ services:
 | `/input`  | PEM certificate directory (read-only) |
 | `/output` | PFX output directory                  |
 
+## Alerting
+
+cert-converter has no metrics endpoint; its operational state is in its logs.
+Ship the container's logs to Loki (Grafana Alloy's Docker log discovery does
+this with no configuration) and evaluate these with
+[Loki's ruler](https://grafana.com/docs/loki/latest/alert/); firing alerts
+deliver through your Alertmanager exactly like Prometheus metric alerts.
+
+```yaml
+groups:
+  - name: cert-converter
+    rules:
+      - alert: CertConverterConversionFailed
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"} |= `scan complete`
+            |~ ` (failed|unreadable)=[1-9]` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter failed to convert a certificate"
+          description: >
+            A scan logged failed>0 or unreadable>0 (PEM parse, PFX write, or
+            input read failure); the affected .pfx is stale or missing. Check
+            /input permissions and the certificate chain.
+      - alert: CertConverterScanStalled
+        expr: |
+          absent_over_time({container="cert-converter"} |= `scan complete` [8h])
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter has not completed a scan in 8h"
+          description: >
+            cert-converter emits a `scan complete` line at least every
+            FALLBACK_SCAN_HOURS (default 6h). None in 8h while the container is
+            up means the fsnotify watch and the fallback timer are both wedged;
+            certificates silently stop converting. Restart the container.
+```
+
+Thresholds and the `severity` label are starting points; adjust the stall
+window to your `FALLBACK_SCAN_HOURS` and the `container` selector to your
+deployment, and route by whatever labels your Alertmanager uses.
+
 ## Healthcheck
 
 The container includes a built-in health probe: after each processing cycle with no conversion failures, the main process creates a marker file at `/tmp/.healthy`; the `health` subcommand (`/cert-watcher health`) checks for this file and exits 0 if it exists.
