@@ -1,35 +1,59 @@
 #!/bin/sh
-# Runtime image smoke test for cert-converter. Invoked by the central CI docker job:
-#   sh tests/image-smoke.sh <image-ref>
+# Runtime image smoke-test harness — CANONICAL COPY in cplieger/ci
+# (configs/image-smoke.sh), synced to each serving app's tests/image-smoke.sh
+# by scripts/classify-repos.sh (a repo enrolls by committing a
+# tests/image-smoke.conf; see below). DO NOT edit the synced copy in an app
+# repo — change it here and let the sync land it.
 #
-# Starts the assembled image and waits for the container's own HEALTHCHECK
-# (CMD ["/cert-watcher", "health"], start-period 15s / interval 30s) to report
-# "healthy": proves the cert-watcher binary runs in the distroless base, loads
-# its config, completes the initial scan, and writes the /tmp/.healthy marker
-# that its `health` subcommand probes (health.RunProbe exits 0 iff the marker
-# exists).
+# Invoked by the shared CI docker job:  sh tests/image-smoke.sh <image-ref>
 #
-# cert-converter has no network listener, so this stays a health-gated Tier-2
-# test (no served surface to assert for Tier 1). Reaching "healthy" needs the
-# smallest slice of the app's real config:
-#   -e PFX_PASSWORD  config.Load() returns ErrEmptyPassword and main exits 1 on
-#                    an empty password unless PFX_ALLOW_EMPTY_PASSWORD=true
-#                    (internal/config/config.go); the value itself is unused
-#                    here because an empty /input converts nothing.
-#   --tmpfs /input   the watch root is the hardcoded /input (main.go), opened
-#                    via os.OpenRoot at the start of every scan
-#                    (internal/process/process.go). The distroless image ships
-#                    no /input, so without this mount the initial scan errors
-#                    and the marker never flips healthy. An empty dir converts
-#                    zero certs -> ScanResult.Failed==0 -> healthyAfterScan==true.
-# No /output or /tmp mount is needed: stale-temp cleanup on a missing /output
-# only WARNs, an empty /input writes no PFX, and the distroless base ships a
-# writable /tmp for the marker.
+# It starts the assembled image and waits for the container's own HEALTHCHECK
+# to report "healthy" — proving the binary runs in the final image, loads its
+# config, binds any listener, and its health probe works, catching failures the
+# build cannot see (a broken //go:embed frontend, a missing runtime dependency,
+# a server that never binds, a broken HEALTHCHECK). It fails fast on an early
+# exit (a crash-boot is reported by its exit code, more debuggable than
+# "unhealthy") and dumps the container log tail only on failure.
+#
+# Per-app knobs come from tests/image-smoke.conf beside this script; everything
+# below the config block is identical across apps. The .conf is a POSIX-sh
+# fragment sourced for these variables (all optional):
+#
+#   SMOKE_APP_NAME   label for log lines + container name (default: "image")
+#   SMOKE_TIMEOUT    seconds to wait for "healthy" (default: 120). Size it to
+#                    cover the image's HEALTHCHECK start-period plus a couple of
+#                    intervals; a slow-but-OK cold boot must not be failed early.
+#   SMOKE_RUN_ARGS   extra `docker run` args (env, tmpfs, ...) as a word-split
+#                    string, e.g. "-e FOO=bar --tmpfs /input". Values must not
+#                    contain spaces (these are controlled test configs).
+#
+# The harness also exports $SMOKE_DIR (this script's own absolute directory)
+# before sourcing the .conf, so an app that needs a config/fixture file on disk
+# can bind-mount a committed fixture dir, e.g.:
+#   SMOKE_RUN_ARGS="-e SYNC_INTERVAL=off -v ${SMOKE_DIR}/fixtures:/config:ro"
 set -eu
 
 IMG="${1:?usage: image-smoke.sh <image-ref>}"
-NAME="smoke-cert-converter-$$"
-TIMEOUT=90 # must cover the 15s start-period + a few 30s healthcheck intervals
+
+# Absolute directory of this script (also holds image-smoke.conf and any per-app
+# fixtures). Exposed to the .conf as $SMOKE_DIR so a .conf can bind-mount a
+# committed fixture dir with an absolute source path (docker -v requires one).
+SMOKE_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+# Per-app config lives beside this script (repo-local, NOT synced). Pre-set the
+# knobs so `set -u` is safe and a repo with no .conf still runs with defaults.
+SMOKE_APP_NAME=""
+SMOKE_TIMEOUT=""
+SMOKE_RUN_ARGS=""
+CONF="$SMOKE_DIR/image-smoke.conf"
+if [ -f "$CONF" ]; then
+  # shellcheck disable=SC1090  # per-app config path, resolved at runtime
+  . "$CONF"
+fi
+
+APP="${SMOKE_APP_NAME:-image}"
+TIMEOUT="${SMOKE_TIMEOUT:-120}"
+NAME="smoke-${APP}-$$"
 
 # shellcheck disable=SC2317,SC2329  # invoked indirectly via trap
 cleanup() {
@@ -43,10 +67,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-docker run -d --name "$NAME" \
-  -e PFX_PASSWORD=smoke-test \
-  --tmpfs /input \
-  "$IMG" >/dev/null
+# SMOKE_RUN_ARGS is intentionally word-split (simple test args, no spaces).
+# shellcheck disable=SC2086
+docker run -d --name "$NAME" $SMOKE_RUN_ARGS "$IMG" >/dev/null
 
 i=0
 status=starting
@@ -56,17 +79,17 @@ while [ "$i" -lt "$TIMEOUT" ]; do
   # and the verdict never depends on what health a stopped container reports.
   if [ "$(docker inspect --format '{{ .State.Running }}' "$NAME" 2>/dev/null || echo missing)" != "true" ]; then
     ec=$(docker inspect --format '{{ .State.ExitCode }}' "$NAME" 2>/dev/null || echo '?')
-    printf 'FAIL: cert-converter container exited early (exit code %s)\n' "$ec" >&2
+    printf 'FAIL: %s container exited early (exit code %s)\n' "$APP" "$ec" >&2
     exit 1
   fi
   status=$(docker inspect --format '{{ if .State.Health }}{{ .State.Health.Status }}{{ else }}no-healthcheck{{ end }}' "$NAME" 2>/dev/null || echo gone)
   case "$status" in
     healthy)
-      printf 'cert-converter image smoke: ok (healthy after %ss)\n' "$i"
+      printf '%s image smoke: ok (healthy after %ss)\n' "$APP" "$i"
       exit 0
       ;;
     unhealthy)
-      printf 'FAIL: cert-converter reported unhealthy\n' >&2
+      printf 'FAIL: %s reported unhealthy\n' "$APP" >&2
       exit 1
       ;;
     no-healthcheck)
@@ -74,12 +97,12 @@ while [ "$i" -lt "$TIMEOUT" ]; do
       exit 1
       ;;
     gone)
-      printf 'FAIL: cert-converter container is gone\n' >&2
+      printf 'FAIL: %s container is gone\n' "$APP" >&2
       exit 1
       ;;
   esac
   i=$((i + 1))
   sleep 1
 done
-printf 'FAIL: cert-converter did not become healthy within %ss (last status: %s)\n' "$TIMEOUT" "$status" >&2
+printf 'FAIL: %s did not become healthy within %ss (last status: %s)\n' "$APP" "$TIMEOUT" "$status" >&2
 exit 1
