@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/cert-watcher/internal/convert"
+	"github.com/cplieger/cert-converter/internal/convert"
 	"software.sslmate.com/src/go-pkcs12"
 )
 

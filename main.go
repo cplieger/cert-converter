@@ -11,10 +11,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cplieger/cert-watcher/internal/config"
-	"github.com/cplieger/cert-watcher/internal/convert"
-	"github.com/cplieger/cert-watcher/internal/process"
-	"github.com/cplieger/cert-watcher/internal/watch"
+	"github.com/cplieger/cert-converter/internal/config"
+	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/process"
+	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/health"
 	"github.com/cplieger/slogx"
 )
