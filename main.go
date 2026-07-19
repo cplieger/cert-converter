@@ -46,7 +46,14 @@ const watchDebounce = 2 * time.Second
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "health" {
-		health.RunProbe(health.DefaultPath)
+		// The fallback rescan is the marker's guaranteed refresh floor
+		// (fs events refresh it sooner), so a marker older than 3 fallback
+		// intervals means the watch loop is wedged and a restart fixes it.
+		// FALLBACK_SCAN_HOURS=0/false disables the fallback and with it
+		// the deadline (WithMaxAge(0) is a no-op): watch-only mode has no
+		// guaranteed refresh cadence to hold the marker to.
+		health.RunProbe(health.DefaultPath,
+			health.WithMaxAge(3*config.FallbackInterval()))
 	}
 
 	rawLevel := os.Getenv("LOG_LEVEL")

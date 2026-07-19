@@ -58,19 +58,25 @@ func Load() (Config, error) {
 
 	enc, encName := pickEncoder(os.Getenv("PFX_ENCODER"))
 
-	var interval time.Duration
-	if v, ok := os.LookupEnv("FALLBACK_SCAN_HOURS"); ok {
-		interval = parseFallbackInterval(v)
-	} else {
-		interval = defaultFallbackInterval
-	}
-
 	return Config{
 		Password:         password,
 		Encoder:          enc,
 		EncoderName:      encName,
-		FallbackInterval: interval,
+		FallbackInterval: FallbackInterval(),
 	}, nil
+}
+
+// FallbackInterval returns the effective FALLBACK_SCAN_HOURS as a
+// duration (0 = fallback rescan disabled), parsed with the same rules
+// Load applies. Exported separately so the health subcommand can derive
+// its probe max-age from the same source of truth without a full config
+// load, which would fail on a missing PFX_PASSWORD the probe does not
+// need.
+func FallbackInterval() time.Duration {
+	if v, ok := os.LookupEnv("FALLBACK_SCAN_HOURS"); ok {
+		return parseFallbackInterval(v)
+	}
+	return defaultFallbackInterval
 }
 
 // parseFallbackInterval parses a FALLBACK_SCAN_HOURS value into a re-scan
