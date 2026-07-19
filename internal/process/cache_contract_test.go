@@ -3,8 +3,8 @@ package process_test
 import (
 	"testing"
 
-	"github.com/cplieger/cert-watcher/internal/convert"
-	"github.com/cplieger/cert-watcher/internal/process"
+	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/process"
 )
 
 // CacheCheckerContract verifies behavioral invariants that any CacheChecker

@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cplieger/cert-watcher/internal/convert"
-	"github.com/cplieger/cert-watcher/internal/process"
-	"github.com/cplieger/cert-watcher/internal/testcerts"
+	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/process"
+	"github.com/cplieger/cert-converter/internal/testcerts"
 	"software.sslmate.com/src/go-pkcs12"
 )
 

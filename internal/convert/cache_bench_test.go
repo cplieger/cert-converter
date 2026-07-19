@@ -3,7 +3,7 @@ package convert_test
 import (
 	"testing"
 
-	"github.com/cplieger/cert-watcher/internal/convert"
+	"github.com/cplieger/cert-converter/internal/convert"
 )
 
 func BenchmarkFingerprint(b *testing.B) {

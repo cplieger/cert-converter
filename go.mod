@@ -1,4 +1,4 @@
-module github.com/cplieger/cert-watcher
+module github.com/cplieger/cert-converter
 
 go 1.26.5
 
