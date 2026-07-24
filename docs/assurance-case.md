@@ -1,4 +1,4 @@
-# Security assurance case — cert-converter
+# Security assurance case: cert-converter
 
 This extends the shared
 [default assurance case](https://github.com/cplieger/.github/blob/main/assurance-case.md)
@@ -29,7 +29,7 @@ corrupting it, even when fed malformed input, on a least-privilege runtime.
 ## Cryptography
 
 Uses Go stdlib `crypto/x509`, `crypto/tls`, and `software.sslmate.com`/stdlib
-PKCS#12 handling — no home-grown crypto. Operates on key material but never
+PKCS#12 handling; no home-grown crypto. Operates on key material but never
 transmits it; output stays on the local filesystem.
 
 ## Residual risks

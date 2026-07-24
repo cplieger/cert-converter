@@ -6,7 +6,7 @@ repo. Most of it is standard Go, but a few things are easy to trip over.
 ## What this is
 
 A watcher daemon that converts PEM certificate/key pairs to PFX/PKCS#12
-whenever they change on disk. There is no HTTP server and no open port —
+whenever they change on disk. There is no HTTP server and no open port;
 the only runtime surfaces are the `/input` (read-only) and `/output`
 volumes plus a file-based health marker.
 
@@ -21,21 +21,21 @@ github.com/cplieger/cert-converter` in `go.mod`). Build output and the
 scan, then hand off to the watcher. The real work lives under
 `internal/`:
 
-- `internal/config` — parses `PFX_PASSWORD`, `PFX_ENCODER`, and
+- `internal/config`: parses `PFX_PASSWORD`, `PFX_ENCODER`, and
   `FALLBACK_SCAN_HOURS` from the environment. `PickEncoder` maps the
   encoder name to a `go-pkcs12` encoder; unknown values warn and fall
   back to `modern2023`.
-- `internal/convert` — PEM parsing (`ParseCertChain`, `ParsePrivateKey`),
+- `internal/convert`: PEM parsing (`ParseCertChain`, `ParsePrivateKey`),
   PFX encoding (`ToPFX`), and the SHA-256 `HashCache` for
   skip-unchanged detection. `types.go` holds the `CertPair` /
   `ConversionResult` value types.
-- `internal/process` — orchestration. `Scanner.Run` walks `/input`,
+- `internal/process`: orchestration. `Scanner.Run` walks `/input`,
   pairs each `*.crt` with its sibling `*.key`, consults the cache, and
   writes PFX files to `/output`, returning a `ScanResult` count summary.
-- `internal/watch` — fsnotify watch loop with a debounce window and a
+- `internal/watch`: fsnotify watch loop with a debounce window and a
   periodic full-scan fallback. Falls back to polling (with periodic
   upgrade attempts) when fsnotify is unavailable.
-- `internal/testcerts` — test-only helpers that generate certificates;
+- `internal/testcerts`: test-only helpers that generate certificates;
   imported only from `_test.go`.
 
 Data flow: `watch` detects a change and invokes the `onChange` callback
@@ -49,7 +49,7 @@ health marker (any failure clears it; a clean cycle sets it).
   same directory. A `.crt` with no matching `.key` is recorded as an
   orphan and skipped, not an error.
 - **Paths are hardcoded on purpose.** `/input` and `/output` are
-  constants in `main.go`, not env vars. Don't add env knobs for them —
+  constants in `main.go`, not env vars. Don't add env knobs for them;
   the container contract relies on the fixed mounts.
 - **Reads are bounded.** Cert/key reads go through
   `convert.ReadFileWithLimit` / the cache hasher with a 10 MB cap
