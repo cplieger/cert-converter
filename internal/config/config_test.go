@@ -540,11 +540,14 @@ func TestLoad_unknown_encoder_warns_and_falls_back_to_modern2023(t *testing.T) {
 	}
 }
 
-// TestWarnUnencodablePassword_reports_the_unrepresentable_shape pins every
-// diagnostic branch of the startup warning: the shape must be named with its
-// remediation, and the secret value must never reach the log. slog.Default is
-// process-global, so this test must not run in parallel.
-func TestWarnUnencodablePassword_reports_the_unrepresentable_shape(t *testing.T) {
+// TestCheckPasswordEncodable_refuses_every_unrepresentable_shape pins a DELIBERATE
+// reversal: all three shapes are now a startup REFUSAL rather than a warning that let
+// the container start (deferred findings l-f12, l-f14, l-f2).
+//
+// Each must be rejected, must name its shape and remediation so an operator can act,
+// and must never put the secret value in the error — the error text reaches the startup
+// log, which every aggregator retains.
+func TestCheckPasswordEncodable_refuses_every_unrepresentable_shape(t *testing.T) {
 	for _, tc := range []struct {
 		name            string
 		password        string
@@ -563,7 +566,7 @@ func TestWarnUnencodablePassword_reports_the_unrepresentable_shape(t *testing.T)
 			name:            "non-BMP character",
 			password:        "password-\U0001F600",
 			wantMessage:     "outside the Basic Multilingual Plane",
-			wantRemediation: "use a PFX password made only of BMP characters",
+			wantRemediation: "use a password made only of BMP characters",
 			secretNeedle:    "password-\U0001F600",
 		},
 		{
@@ -575,38 +578,99 @@ func TestWarnUnencodablePassword_reports_the_unrepresentable_shape(t *testing.T)
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			prev := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-			t.Cleanup(func() { slog.SetDefault(prev) })
-
-			warnUnencodablePassword(tc.password)
-
-			out := buf.String()
-			if !strings.Contains(out, tc.wantMessage) || !strings.Contains(out, tc.wantRemediation) {
-				t.Errorf("warnUnencodablePassword(%q) logged %q, want message %q and remediation %q",
-					tc.password, out, tc.wantMessage, tc.wantRemediation)
+			t.Parallel()
+			err := checkPasswordEncodable(tc.password)
+			if !errors.Is(err, ErrUnencodablePassword) {
+				t.Fatalf("checkPasswordEncodable(%q) = %v, want ErrUnencodablePassword: the container must refuse to start", tc.password, err)
 			}
-			if strings.Contains(out, tc.secretNeedle) {
-				t.Errorf("warnUnencodablePassword(%q) leaked the password in %q", tc.password, out)
+			got := err.Error()
+			if !strings.Contains(got, tc.wantMessage) || !strings.Contains(got, tc.wantRemediation) {
+				t.Errorf("checkPasswordEncodable(%q) = %q, want shape %q and remediation %q",
+					tc.password, got, tc.wantMessage, tc.wantRemediation)
+			}
+			if strings.Contains(got, tc.secretNeedle) {
+				t.Errorf("checkPasswordEncodable(%q) leaked the password in %q", tc.password, got)
 			}
 		})
 	}
 }
 
-// TestWarnUnencodablePassword_invalid_utf8_wins_over_non_bmp pins the branch
-// precedence the pre-refactor early return provided: a password that is both
-// invalid UTF-8 and carries a non-BMP rune reports only the UTF-8 shape.
-// slog.Default is process-global, so this test must not run in parallel.
-func TestWarnUnencodablePassword_invalid_utf8_wins_over_non_bmp(t *testing.T) {
-	logs := capture.Default(t)
-
-	warnUnencodablePassword(string([]byte{0xff}) + "pw-\U0001F600")
-
-	if !logs.Contains("not valid UTF-8") {
-		t.Errorf("warnUnencodablePassword logged %v, want the invalid-UTF-8 diagnostic", logs.Messages())
+// TestCheckPasswordEncodable_invalid_utf8_wins_over_non_bmp pins the branch precedence:
+// a password that is both invalid UTF-8 and carries a non-BMP rune reports only the
+// UTF-8 shape, so the operator gets one actionable reason rather than two.
+func TestCheckPasswordEncodable_invalid_utf8_wins_over_non_bmp(t *testing.T) {
+	t.Parallel()
+	err := checkPasswordEncodable(string([]byte{0xff}) + "pw-\U0001F600")
+	if err == nil {
+		t.Fatal("checkPasswordEncodable = nil, want a refusal")
 	}
-	if logs.Contains("Basic Multilingual Plane") {
-		t.Errorf("warnUnencodablePassword logged %v, want only the invalid-UTF-8 diagnostic", logs.Messages())
+	if !strings.Contains(err.Error(), "not valid UTF-8") {
+		t.Errorf("checkPasswordEncodable = %v, want the invalid-UTF-8 reason", err)
+	}
+	if strings.Contains(err.Error(), "Basic Multilingual Plane") {
+		t.Errorf("checkPasswordEncodable = %v, want only the invalid-UTF-8 reason", err)
+	}
+}
+
+// TestCheckPasswordEncodable_accepts_a_usable_password pins that the gate does not
+// reject what PKCS#12 can carry: an ordinary ASCII password, a BMP non-ASCII one, and
+// the empty password (whose acceptability is the PFX_ALLOW_EMPTY_PASSWORD opt-out's
+// business, not this gate's).
+func TestCheckPasswordEncodable_accepts_a_usable_password(t *testing.T) {
+	t.Parallel()
+	for _, pw := range []string{"", "hunter2", "pässwörd-Ünicode", "日本語パスワード"} {
+		if err := checkPasswordEncodable(pw); err != nil {
+			t.Errorf("checkPasswordEncodable(%q) = %v, want nil", pw, err)
+		}
+	}
+}
+
+// TestLoad_rejects_a_whitespace_only_password pins the other half of the unification
+// (deferred finding l-f5): the blank guard now trims, so PFX_PASSWORD=" " — a quoting
+// slip in a compose file or .env — is REFUSED where it previously started and embedded a
+// single space into every generated bundle as the only protection on the private key.
+//
+// The opt-out still works, and it now means the same thing for a blank value as for an
+// absent one.
+func TestLoad_rejects_a_whitespace_only_password(t *testing.T) {
+	for _, tc := range []struct {
+		name, password, allowEmpty string
+		wantErr                    bool
+	}{
+		{"a single space is blank", " ", "", true},
+		{"tabs and newlines are blank", "\t\n ", "", true},
+		{"exactly empty is blank", "", "", true},
+		{"the opt-out accepts a blank value", " ", "true", false},
+		{"a real password is accepted", "hunter2", "", false},
+		{"a password with inner spaces is not blank", "two words", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PFX_PASSWORD", tc.password)
+			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", tc.allowEmpty)
+			t.Setenv("PFX_PASSWORD_FILE", "")
+
+			_, err := Load()
+			if tc.wantErr {
+				if !errors.Is(err, ErrEmptyPassword) {
+					t.Errorf("Load(PFX_PASSWORD=%q) = %v, want ErrEmptyPassword", tc.password, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("Load(PFX_PASSWORD=%q, allow=%q) = %v, want nil", tc.password, tc.allowEmpty, err)
+			}
+		})
+	}
+}
+
+// TestLoad_refuses_an_unencodable_password pins that the encoding gate is reached from
+// Load, not just callable in isolation: the container must not start.
+func TestLoad_refuses_an_unencodable_password(t *testing.T) {
+	t.Setenv("PFX_PASSWORD", "pw-\U0001F600")
+	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
+	t.Setenv("PFX_PASSWORD_FILE", "")
+
+	if _, err := Load(); !errors.Is(err, ErrUnencodablePassword) {
+		t.Errorf("Load(non-BMP password) = %v, want ErrUnencodablePassword", err)
 	}
 }

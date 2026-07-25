@@ -3,6 +3,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
@@ -38,8 +39,22 @@ type Config struct {
 // opt-out (PFX_ALLOW_EMPTY_PASSWORD=true) is not set. A PFX generated with an
 // empty password protects the embedded private key with no password at all.
 var ErrEmptyPassword = errors.New(
-	"PFX_PASSWORD is empty; set it, point PFX_PASSWORD_FILE at a secret file, " +
+	"PFX_PASSWORD is empty or blank; set it, point PFX_PASSWORD_FILE at a secret file, " +
 		"or set PFX_ALLOW_EMPTY_PASSWORD=true")
+
+// ErrUnencodablePassword is returned when the configured password cannot survive
+// the PKCS#12 BMPString (UCS-2) encoding intact.
+//
+// This is a startup refusal rather than a warning because every one of the three
+// shapes is unconditionally broken and no scan can recover from it (deferred findings
+// l-f12, l-f14, l-f2). Warning and continuing produced two failure modes, both worse
+// than refusing to start: a non-BMP rune fails every Encode, so the container starts
+// and is then permanently unhealthy with an identical failure on every fsnotify event
+// and every fallback tick; while invalid UTF-8 or an embedded NUL SUCCEEDS and reports
+// healthy, silently writing bundles protected by a password no consumer can reproduce.
+// The second is the dangerous one — the operator's only signal was a single startup
+// WARN, and the Loki rules key on failure counts that stay at zero.
+var ErrUnencodablePassword = errors.New("PFX_PASSWORD cannot be encoded by PKCS#12")
 
 // PasswordStatus is a non-secret classification of how well PFX_PASSWORD
 // protects the private key inside every generated PFX file.
@@ -70,6 +85,24 @@ func ClassifyPassword(password string) PasswordStatus {
 	}
 }
 
+// isBlank reports whether a password offers no real protection, treating an
+// all-whitespace value the same as an empty one.
+//
+// This is the single blankness rule for BOTH delivery channels (deferred finding
+// l-f5). The same question previously had three homes and three answers: a
+// whitespace-only PFX_PASSWORD was accepted with a warning, a whitespace-only
+// PFX_PASSWORD_FILE aborted startup inside envx, and PFX_ALLOW_EMPTY_PASSWORD
+// governed only the environment channel — so the opt-out meant different things
+// depending on how the secret arrived. It now means one thing either way.
+//
+// PFX_PASSWORD=" " (a quoting slip in a compose file or .env) is therefore REJECTED
+// where it previously started and embedded a single space into every bundle. That is
+// the intended behaviour change: README documents the guard as refusing to start when
+// the password is empty, which an operator reasonably reads as covering a blank value.
+func isBlank(password string) bool {
+	return ClassifyPassword(password) != PasswordConfigured
+}
+
 // Load reads environment variables and returns a populated Config. The PFX
 // password follows the Docker-secrets convention: when PFX_PASSWORD_FILE is
 // set the secret is read from that file (bounded, whitespace-trimmed) so it
@@ -92,10 +125,12 @@ func Load() (Config, error) {
 		password = "" // fall through to the empty-password guard below
 	}
 	allowEmpty := allowEmptyPassword(os.Getenv("PFX_ALLOW_EMPTY_PASSWORD"))
-	if ClassifyPassword(password) == PasswordEmpty && !allowEmpty {
+	if isBlank(password) && !allowEmpty {
 		return Config{}, ErrEmptyPassword
 	}
-	warnUnencodablePassword(password)
+	if err := checkPasswordEncodable(password); err != nil {
+		return Config{}, err
+	}
 	if os.Getenv("PFX_PASSWORD_FILE") != "" {
 		// Record the secret's SOURCE (never its value) so an operator can confirm
 		// a mounted secret was actually consumed instead of silently falling back
@@ -167,35 +202,47 @@ func allowEmptyPassword(raw string) bool {
 	return false
 }
 
-// warnUnencodablePassword warns when the PFX password cannot survive the
-// PKCS#12 BMPString (UCS-2) encoding go-pkcs12 applies to it. Three shapes are
-// diagnosed, and none is rejected here because the value is the operator's
-// choice: a rune outside the Basic Multilingual Plane makes every Encode call
-// fail, a byte sequence that is not valid UTF-8 is replaced rune-by-rune
-// with U+FFFD, so the PFX ends up protected by a different, lower-entropy
-// password than the configured secret, and a NUL byte (reachable only through
-// PFX_PASSWORD_FILE, since an environment string cannot carry one) is encoded
-// verbatim into a NUL-terminated password format, so no consumer can reproduce
-// the password the PFX was built with. Only the shape is reported, never the
-// value. The recognition itself is convert.InspectPasswordEncoding's — the
-// package that enforces the same invariant before encoding — so this startup
-// diagnostic cannot drift from the conversion gate.
-func warnUnencodablePassword(password string) {
+// checkPasswordEncodable rejects a password PKCS#12 cannot carry intact.
+//
+// This replaces a warn-and-continue that was documented as deliberate ("neither is
+// rejected here because the value is the operator's choice"). That choice was wrong for
+// all three shapes, and go.md's config rule says so directly: validate at startup, fail
+// fast, do not discover invalid config at request time. Each shape is unconditionally
+// broken and no scan recovers from it:
+//
+//   - NonBMP: UCS-2 cannot represent the rune, so every Encode call fails. The
+//     container started, then reported unhealthy forever with an identical failure on
+//     every event and every fallback tick — a restart cannot clear it.
+//   - InvalidUTF8: go-pkcs12's bmpString ranges over the string, so each invalid byte
+//     becomes U+FFFD and Encode SUCCEEDS. Bundles are written, the scan counts them
+//     converted, health stays green — and no consumer can open them with the configured
+//     secret, because distinct invalid bytes all collapse to the same replacement rune.
+//   - EmbeddedNUL: PKCS#12 passwords are NUL-terminated, so an interior NUL encodes
+//     verbatim and no consumer can reproduce the password the bundle was built with.
+//     Also succeeds silently.
+//
+// The last two are the dangerous ones: nothing in the conversion path, the scan
+// summary, or health reflected them, and the README's Loki rules key on failure counts
+// that stay at zero. The only signal was one startup WARN an operator had to notice.
+//
+// An empty password is not inspected — that is the allowEmptyPassword opt-out's
+// business, and it is reached only when the operator asked for it. Only the SHAPE is
+// reported, never the value. Recognition is convert.InspectPasswordEncoding's, the same
+// package that encodes, so this gate cannot drift from the encoder.
+func checkPasswordEncodable(password string) error {
 	if password == "" {
-		return
+		return nil
 	}
 	issues := convert.InspectPasswordEncoding(password)
 	switch {
 	case issues.InvalidUTF8:
-		slog.Warn("PFX_PASSWORD is not valid UTF-8; every invalid byte is encoded as U+FFFD, so generated PFX files are protected by a different, lower-entropy password than the configured secret",
-			"remediation", "supply a text secret (for example base64) instead of raw binary bytes")
+		return fmt.Errorf("%w: not valid UTF-8, so every invalid byte would be encoded as U+FFFD and generated PFX files would be protected by a different, lower-entropy password than the configured secret; supply a text secret (for example base64) instead of raw binary bytes", ErrUnencodablePassword)
 	case issues.NonBMP:
-		slog.Warn("PFX_PASSWORD contains a character outside the Basic Multilingual Plane; PKCS#12 cannot encode it, so every conversion will fail",
-			"remediation", "use a PFX password made only of BMP characters (ASCII is safest)")
+		return fmt.Errorf("%w: contains a character outside the Basic Multilingual Plane, which PKCS#12 cannot encode, so every conversion would fail; use a password made only of BMP characters (ASCII is safest)", ErrUnencodablePassword)
 	case issues.EmbeddedNUL:
-		slog.Warn("PFX_PASSWORD contains a NUL byte; PKCS#12 passwords are NUL-terminated, so generated PFX files cannot be opened with any password a consumer can supply",
-			"remediation", "strip NUL bytes from the secret file (a UTF-16 or NUL-padded file is the usual cause); use a plain UTF-8 text secret")
+		return fmt.Errorf("%w: contains a NUL byte, and PKCS#12 passwords are NUL-terminated, so generated PFX files could not be opened with any password a consumer can supply; strip NUL bytes from the secret file (a UTF-16 or NUL-padded file is the usual cause)", ErrUnencodablePassword)
 	}
+	return nil
 }
 
 // parseFallbackInterval parses a FALLBACK_SCAN_HOURS value into a re-scan
