@@ -110,6 +110,11 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 		return Analysis{}, fmt.Errorf("parse private key: %w", err)
 	}
 
+	// One clock read for the whole analysis. Ranking and the validity
+	// observations must agree with each other, and a comparator that re-reads
+	// the time can stop being transitive mid-reduction.
+	now := timeNow()
+
 	var obs []Observation
 
 	certs, dupCerts := dedupeCerts(certs)
@@ -132,7 +137,7 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 		})
 	}
 
-	g := newCertGraph(certs)
+	g := newCertGraph(certs, now)
 
 	identity, tieObs, err := g.selectIdentity(signers)
 	if err != nil {
@@ -165,7 +170,7 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 				identity.cert+1, len(certs)),
 		})
 	}
-	obs = append(obs, validityObservations(leaf)...)
+	obs = append(obs, validityObservations(leaf, now)...)
 
 	path := g.pathFrom(identity.cert)
 	chain := make([]*x509.Certificate, 0, len(path)-1)
@@ -202,13 +207,11 @@ type identityMatch struct {
 // root present in the bundle. Every edge is cryptographic evidence, not a naming
 // coincidence.
 type certGraph struct {
-	certs []*x509.Certificate
-	// parents[i] lists indices whose certificate signed certs[i].
-	parents [][]int
-	// issuer[i] is true when certs[i] signed some other certificate here.
-	issuer []bool
-	// distToRoot[i] is the fewest parent hops from certs[i] to a self-signed
-	// certificate in this bundle, or -1 when none is reachable.
+	now        time.Time
+	certs      []*x509.Certificate
+	parents    [][]int
+	children   [][]int
+	issuer     []bool
 	distToRoot []int
 }
 
@@ -223,35 +226,48 @@ type certGraph struct {
 // KeyUsage is zero passes its CertSign check; and a v1/v2 certificate with no
 // basic-constraints extension is not rejected by its IsCA check. Identity role is
 // therefore enforced separately, by Analyse's own issuer check.
-func newCertGraph(certs []*x509.Certificate) *certGraph {
+func newCertGraph(certs []*x509.Certificate, now time.Time) *certGraph {
 	g := &certGraph{
 		certs:      certs,
 		parents:    make([][]int, len(certs)),
+		children:   make([][]int, len(certs)),
 		issuer:     make([]bool, len(certs)),
 		distToRoot: make([]int, len(certs)),
+		now:        now,
 	}
 	for child := range certs {
 		for parent := range certs {
-			if child == parent {
-				continue
-			}
-			if !bytes.Equal(certs[child].RawIssuer, certs[parent].RawSubject) {
-				continue
-			}
-			if certs[child].CheckSignatureFrom(certs[parent]) != nil {
+			if child == parent || !g.isIssuance(child, parent) {
 				continue
 			}
 			g.parents[child] = append(g.parents[child], parent)
+			g.children[parent] = append(g.children[parent], child)
 			g.issuer[parent] = true
 		}
 	}
-	for i := range certs {
-		g.distToRoot[i] = -2 // unvisited
-	}
-	for i := range certs {
-		g.computeDistToRoot(i, make([]bool, len(certs)))
-	}
+	g.computeDistances()
 	return g
+}
+
+// isIssuance reports whether certs[parent] issued certs[child].
+//
+// The key-reuse exclusion is not cosmetic. Two DISTINCT self-signed certificates
+// that share a subject AND a public key — a regenerated self-signed certificate
+// left beside the one it replaces, which `openssl req -x509` produces with
+// basicConstraints CA:TRUE by default — each verify against the other, so a
+// naive rule records a mutual issuance edge. Both then look like issuers, and
+// Analyse's role check rejects the identity outright. Key reuse is not issuance:
+// a certificate cannot meaningfully have issued another certificate holding its
+// own key, so no edge exists between them.
+func (g *certGraph) isIssuance(child, parent int) bool {
+	c, p := g.certs[child], g.certs[parent]
+	if !bytes.Equal(c.RawIssuer, p.RawSubject) {
+		return false
+	}
+	if bytes.Equal(c.RawSubject, p.RawSubject) && samePublicKey(c.PublicKey, p.PublicKey) {
+		return false
+	}
+	return c.CheckSignatureFrom(p) == nil
 }
 
 // isIssuer reports whether certs[i] signed another certificate in this bundle.
@@ -265,31 +281,41 @@ func (g *certGraph) isSelfSigned(i int) bool {
 		g.certs[i].CheckSignatureFrom(g.certs[i]) == nil
 }
 
-// computeDistToRoot memoises the shortest parent-hop distance from i to a
-// self-signed certificate in the bundle, or -1 when none is reachable. onPath
-// guards against a cycle, which cannot occur cryptographically but must not hang
-// the scan if a pathological bundle produces one.
-func (g *certGraph) computeDistToRoot(i int, onPath []bool) int {
-	if g.distToRoot[i] != -2 {
-		return g.distToRoot[i]
+// computeDistances fills distToRoot with the fewest parent hops from each
+// certificate to a self-signed certificate in this bundle, or -1 when none is
+// reachable.
+//
+// It is a multi-source breadth-first walk DOWNWARD from every root over the
+// children edges. The obvious alternative — a memoised depth-first walk upward
+// with an on-path cycle guard — is subtly wrong, and both adversarial reviews
+// reproduced the failure: the guard's -1 gets memoised for a node that was merely
+// FORBIDDEN on the current path, not genuinely unreachable, so a bundle
+// containing a cross-certification loop yields distances that depend on the order
+// certificates appeared in the file. Cycles are real: RFC 4158 describes mesh
+// PKIs with bidirectional cross-certification, and RFC 5280 permits several
+// certificates for one CA name. BFS from the roots has no path state to leak, so
+// it is cycle-safe and order-independent by construction.
+func (g *certGraph) computeDistances() {
+	for i := range g.certs {
+		g.distToRoot[i] = -1
 	}
-	if g.isSelfSigned(i) {
-		g.distToRoot[i] = 0
-		return 0
-	}
-	if onPath[i] {
-		return -1
-	}
-	onPath[i] = true
-	best := -1
-	for _, p := range g.parents[i] {
-		if d := g.computeDistToRoot(p, onPath); d >= 0 && (best == -1 || d+1 < best) {
-			best = d + 1
+	queue := make([]int, 0, len(g.certs))
+	for i := range g.certs {
+		if g.isSelfSigned(i) {
+			g.distToRoot[i] = 0
+			queue = append(queue, i)
 		}
 	}
-	onPath[i] = false
-	g.distToRoot[i] = best
-	return best
+	for head := 0; head < len(queue); head++ {
+		cur := queue[head]
+		for _, child := range g.children[cur] {
+			if g.distToRoot[child] != -1 {
+				continue // already reached by an equal-or-shorter route
+			}
+			g.distToRoot[child] = g.distToRoot[cur] + 1
+			queue = append(queue, child)
+		}
+	}
 }
 
 // selectIdentity resolves which certificate and key form the identity, matching
@@ -378,18 +404,26 @@ func (g *certGraph) resolveAmbiguousMatches(matches []identityMatch) (identityMa
 }
 
 // betterIdentity ranks two certificates that share a private key: valid at scan
-// time first, then the later NotBefore, then a byte comparison of the subject so
-// the choice is total and reproducible.
+// time first, then the later NotBefore, then a byte comparison of the full
+// certificate DER.
+//
+// The final key is the whole DER, not the subject. A renewal shares its
+// predecessor's subject by definition, so a subject comparison is always 0 for
+// exactly the inputs this comparator exists to rank; and NotBefore is
+// second-granular, so two certificates minted in the same second tie there too.
+// With both keys inert the fold degenerated to "first block in the file wins" —
+// order-dependence in the one function whose headline claim is order invariance.
+// Both adversarial reviews reproduced it. DER is a total order over distinct
+// certificates, so ties are now impossible.
 func (g *certGraph) betterIdentity(a, b int) bool {
-	now := timeNow()
-	va, vb := validAt(g.certs[a], now), validAt(g.certs[b], now)
+	va, vb := validAt(g.certs[a], g.now), validAt(g.certs[b], g.now)
 	if va != vb {
 		return va
 	}
 	if !g.certs[a].NotBefore.Equal(g.certs[b].NotBefore) {
 		return g.certs[a].NotBefore.After(g.certs[b].NotBefore)
 	}
-	return bytes.Compare(g.certs[a].RawSubject, g.certs[b].RawSubject) < 0
+	return bytes.Compare(g.certs[a].Raw, g.certs[b].Raw) < 0
 }
 
 // pathFrom returns the chain from start upward, nearest parent first, as indices.
@@ -425,6 +459,13 @@ func (g *certGraph) pathFrom(start int) []int {
 }
 
 // betterParent ranks two candidate issuers at a branch point.
+//
+// The final key is the full DER. A subject comparison would be useless here by
+// construction: every candidate reached this point by matching the child's
+// RawIssuer against its own RawSubject, so all candidates at one branch have
+// identical subjects. RFC 5280 permits a CA to hold several certificates under
+// one name, so real branches with equal distance and equal NotAfter exist, and
+// with an inert final key the choice fell back to file order.
 func (g *certGraph) betterParent(a, b int) bool {
 	ra, rb := g.distToRoot[a] >= 0, g.distToRoot[b] >= 0
 	if ra != rb {
@@ -436,7 +477,7 @@ func (g *certGraph) betterParent(a, b int) bool {
 	if !g.certs[a].NotAfter.Equal(g.certs[b].NotAfter) {
 		return g.certs[a].NotAfter.After(g.certs[b].NotAfter)
 	}
-	return bytes.Compare(g.certs[a].RawSubject, g.certs[b].RawSubject) < 0
+	return bytes.Compare(g.certs[a].Raw, g.certs[b].Raw) < 0
 }
 
 // outsidePath returns the certificates not on path, in input order.
@@ -454,6 +495,17 @@ func (g *certGraph) outsidePath(path []int) []*x509.Certificate {
 	return extra
 }
 
+// samePublicKey reports whether two certificate public keys are the same key.
+// Used to tell KEY REUSE apart from issuance: a certificate holding the same
+// public key as another cannot have issued it.
+func samePublicKey(a, b crypto.PublicKey) bool {
+	matcher, ok := a.(interface{ Equal(crypto.PublicKey) bool })
+	if !ok {
+		return false
+	}
+	return matcher.Equal(b)
+}
+
 // validAt reports whether c is inside its validity window at now.
 func validAt(c *x509.Certificate, now time.Time) bool {
 	return !now.Before(c.NotBefore) && !now.After(c.NotAfter)
@@ -461,8 +513,7 @@ func validAt(c *x509.Certificate, now time.Time) bool {
 
 // validityObservations reports an identity outside its validity window. Never an
 // error: conversion of an expired certificate is a supported migration case.
-func validityObservations(leaf *x509.Certificate) []Observation {
-	now := timeNow()
+func validityObservations(leaf *x509.Certificate, now time.Time) []Observation {
 	switch {
 	case now.Before(leaf.NotBefore):
 		return []Observation{{

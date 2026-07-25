@@ -184,29 +184,23 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		if certErr != nil {
 			return
 		}
-		parsedKey, keyErr := convert.ParsePrivateKey(data)
-		if keyErr != nil {
-			return
-		}
-		signer, ok := parsedKey.(crypto.Signer)
-		if !ok {
-			t.Fatalf("convert.ParsePrivateKey returned %T, want crypto.Signer", parsedKey)
-		}
-		// crypto/x509 leaves PublicKey nil for an unrecognised SPKI algorithm OID,
-		// and PairInRoot rejects that pair (publicKeyMatches: supported=false), so the
-		// round-trip invariant does not apply to such input.
-		matcher, ok := certs[0].PublicKey.(interface{ Equal(crypto.PublicKey) bool })
-		if !ok {
-			return
-		}
-		if !matcher.Equal(signer.Public()) {
+		if _, keyErr := convert.ParsePrivateKey(data); keyErr != nil {
 			return
 		}
 
-		leaf := certs[0]
-		var caCerts []*x509.Certificate
-		if len(certs) > 1 {
-			caCerts = certs[1:]
+		// Analyse owns identity selection, so the oracle asks IT what the pair is
+		// instead of assuming certs[0]. Assuming a position was valid while the
+		// production rule was positional; under structural selection it asserted
+		// exactly the behaviour the rewrite removed (every certificate after the
+		// first embedded in the PFX, chain membership unchecked), so a bundle with
+		// an unrelated or duplicated certificate would fail this target for being
+		// CORRECT.
+		analysis, analyseErr := convert.Analyse(data, data)
+		if analyseErr != nil {
+			// A parseable certificate and key can still be an unresolvable pair
+			// (no key matches, several identities, the key belongs to an issuer).
+			// Those are legitimate rejections, not round-trip failures.
+			return
 		}
 
 		dir := t.TempDir()
@@ -219,7 +213,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		password := "test"
 
 		if _, err := convert.PairInRoot(t.Context(), data, data, root, "out.pfx", password, convert.EncNameModern2023); err != nil {
-			t.Fatalf("PairInRoot rejected a parseable matching certificate and key: %v", err)
+			t.Fatalf("PairInRoot rejected a pair Analyse resolved: %v", err)
 		}
 
 		pfxData, err := os.ReadFile(dest)
@@ -231,20 +225,47 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		if err != nil {
 			t.Fatalf("decode pfx: %v", err)
 		}
-		if !bytes.Equal(decodedLeaf.Raw, leaf.Raw) {
-			t.Fatal("leaf certificate changed across the PFX round trip")
+
+		// Invariant 1: the bundle round-trips the identity Analyse selected, and
+		// DecodeChain reads the FIRST bag as the leaf, so this also proves the
+		// emitted bag order is leaf-first.
+		if !bytes.Equal(decodedLeaf.Raw, analysis.Leaf.Raw) {
+			t.Fatal("round-tripped leaf is not the certificate Analyse selected")
 		}
-		if len(decodedCAs) != len(caCerts) {
-			t.Fatalf("CA count mismatch: got %d want %d", len(decodedCAs), len(caCerts))
+
+		// Invariant 2: the emitted chain is exactly Analyse's chain, in order.
+		if len(decodedCAs) != len(analysis.Chain) {
+			t.Fatalf("CA count mismatch: got %d, want %d", len(decodedCAs), len(analysis.Chain))
 		}
-		for i := range caCerts {
-			if !bytes.Equal(decodedCAs[i].Raw, caCerts[i].Raw) {
+		for i := range analysis.Chain {
+			if !bytes.Equal(decodedCAs[i].Raw, analysis.Chain[i].Raw) {
 				t.Fatalf("CA certificate %d changed across the PFX round trip", i)
 			}
 		}
-		wantKey, err := x509.MarshalPKCS8PrivateKey(parsedKey)
+
+		// Invariant 3: nothing is invented. Every emitted certificate came from
+		// the input, and none is the leaf repeated.
+		for i, ca := range decodedCAs {
+			if bytes.Equal(ca.Raw, decodedLeaf.Raw) {
+				t.Fatalf("CA certificate %d is the leaf repeated", i)
+			}
+			found := false
+			for _, in := range certs {
+				if bytes.Equal(ca.Raw, in.Raw) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("CA certificate %d is not present in the input", i)
+			}
+		}
+
+		// Invariant 4: the embedded key is the private half of the embedded leaf,
+		// which is the property that makes the bundle usable at all.
+		wantKey, err := x509.MarshalPKCS8PrivateKey(analysis.Key)
 		if err != nil {
-			t.Fatalf("marshal input private key: %v", err)
+			t.Fatalf("marshal selected private key: %v", err)
 		}
 		gotKey, err := x509.MarshalPKCS8PrivateKey(decodedKey)
 		if err != nil {
