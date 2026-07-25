@@ -95,14 +95,16 @@ func TestLogEntryFailure_levels(t *testing.T) {
 
 // TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one pins the
 // diagnosability split in readPair. Both outcomes are the same health-neutral
-// statusOrphan, so the log line is the ONLY observable difference between a
-// cert that simply has no sibling key (the normal, quiet steady state, Debug)
-// and one whose sibling key exists but cannot be stat-ed through the confined
-// root (a symlink escaping /input, or a permission error), which is deliberately
-// surfaced at Warn so the misconfiguration is diagnosable rather than hidden
-// behind LOG_LEVEL=debug. Collapsing the two arms leaves an operator with no
-// default-level evidence of a broken input layout. Runs serially: it swaps
-// slog.Default().
+// health-neutral, so neither flips the container unhealthy -- but they are DIFFERENT
+// conditions and must not be reported as the same one.
+//
+// A cert with no sibling key at all is a genuine orphan: the normal, quiet steady
+// state, Debug. A sibling key that exists but cannot be stat-ed through the confined
+// root (a symlink escaping /input, or a permission error) is statusUnreadable and Warn:
+// the key IS there, so calling it an orphan misdescribes it in the scan summary and in
+// the all-orphan diagnostic, and Warn is what makes the broken layout diagnosable
+// instead of hidden behind LOG_LEVEL=debug (deferred finding h-f9). Runs serially: it
+// swaps slog.Default().
 func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing.T) {
 	base := t.TempDir()
 	input := filepath.Join(base, "input")
@@ -137,9 +139,12 @@ func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	for _, tt := range []struct{ certRel, keyRel, wantMsg, wantLevel string }{
-		{"lonely.crt", "lonely.key", "skipping cert without matching key", "level=DEBUG"},
-		{"escape.crt", "escape.key", "skipping cert: cannot stat sibling key", "level=WARN"},
+	for _, tt := range []struct {
+		certRel, keyRel, wantMsg, wantLevel string
+		wantOutcome                         conversionStatus
+	}{
+		{"lonely.crt", "lonely.key", "skipping cert without matching key", "level=DEBUG", statusOrphan},
+		{"escape.crt", "escape.key", "skipping cert: cannot stat sibling key", "level=WARN", statusUnreadable},
 	} {
 		buf.Reset()
 
@@ -148,8 +153,11 @@ func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing
 		if ok {
 			t.Errorf("readPair(%q) ok = true, want false (an unusable sibling key is never a readable pair)", tt.certRel)
 		}
-		if outcome != statusOrphan {
-			t.Errorf("readPair(%q) outcome = %d, want statusOrphan (%d)", tt.certRel, outcome, statusOrphan)
+		if outcome != tt.wantOutcome {
+			t.Errorf("readPair(%q) outcome = %d, want %d", tt.certRel, outcome, tt.wantOutcome)
+		}
+		if outcome == statusFailed {
+			t.Errorf("readPair(%q) outcome flips health; neither condition is clearable by a restart", tt.certRel)
 		}
 		out := buf.String()
 		if !strings.Contains(out, tt.wantMsg) || !strings.Contains(out, tt.wantLevel) {

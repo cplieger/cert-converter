@@ -108,9 +108,13 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 
 	result := countResults(sw.results, sw.unreadable)
 	result.Removed = out.reconcile(s.opts.Lifecycle, sw.seen, reapContext{
-		scanTotal:     result.Total,
-		failed:        result.Failed,
-		unreadable:    sw.unreadable,
+		scanTotal: result.Total,
+		failed:    result.Failed,
+		// result.Unreadable, not sw.unreadable: it also carries the per-entry
+		// statusUnreadable count. A cert the scan could not read is absent from `seen`,
+		// so its existing .pfx would read as an orphan and be deleted on the very scan
+		// that failed to read its input.
+		unreadable:    result.Unreadable,
 		unresolved:    sw.unresolved,
 		walkCompleted: walkErr == nil,
 	})
@@ -340,27 +344,62 @@ type pairInputs struct {
 func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInputs, conversionStatus, bool) {
 	if _, statErr := sw.src.stat(keyRel); statErr != nil {
 		if errors.Is(statErr, fs.ErrNotExist) {
+			// A genuine orphan: the certificate has no sibling key at all.
 			slog.Debug("skipping cert without matching key", "path", rel)
-		} else {
-			// A non-ENOENT stat failure (a sibling key that is a symlink the
-			// *os.Root refuses because it escapes /input, or a permission/IO
-			// error) is not a genuine "no key" orphan: surface it so the
-			// misconfiguration is diagnosable instead of silently skipped at
-			// debug. Still health-neutral (statusOrphan) and non-invalidating.
-			slog.Warn("skipping cert: cannot stat sibling key", "path", rel, "error", statErr)
+			return pairInputs{}, statusOrphan, false
 		}
-		return pairInputs{}, statusOrphan, false
+		// A non-ENOENT stat failure (a sibling key that is a symlink the *os.Root
+		// refuses because it escapes /input, or a permission/IO error) is NOT a
+		// genuine "no key" orphan — the key is there and cannot be read. Reporting it
+		// as an orphan misdescribed it in the scan summary and in the all-orphan
+		// diagnostic, so it is statusUnreadable, the same outcome the two bounded
+		// reads below produce for the same class of condition. Health-neutral either
+		// way; the message is unchanged because an alert rule keys on it.
+		slog.Warn("skipping cert: cannot stat sibling key", "path", rel, "error", statErr)
+		return pairInputs{}, statusUnreadable, false
 	}
 
 	certPEM, err := sw.src.readBounded(ctx, rel)
 	if err != nil {
-		return pairInputs{}, failEntry(rel, "failed to read certificate", err), false
+		noteUnreadableInput(rel, "certificate", err)
+		return pairInputs{}, statusUnreadable, false
 	}
 	keyPEM, err := sw.src.readBounded(ctx, keyRel)
 	if err != nil {
-		return pairInputs{}, failEntry(rel, "failed to read private key", err), false
+		noteUnreadableInput(rel, "private key", err)
+		return pairInputs{}, statusUnreadable, false
 	}
 	return pairInputs{certPEM: certPEM, keyPEM: keyPEM}, statusUnset, true
+}
+
+// noteUnreadableInput logs a failed read of an /input file the same way readPair's
+// sibling-key stat does: Debug when the file simply vanished, Warn otherwise. The
+// caller returns the health-neutral statusUnreadable, kept at the call site so the
+// outcome is visible where the branch is taken.
+//
+// Every reason a read fails here is a steady-state condition a restart cannot clear
+// (deferred finding h-f9). A confinement refusal in particular cannot be identified by
+// sentinel — os.Root reports "path escapes from parent", which matches none of
+// fs.ErrPermission, fs.ErrNotExist, fs.ErrInvalid, syscall.ELOOP or syscall.EXDEV — so
+// classifying per-error would mean matching on Go's error text. Treating every
+// non-ENOENT read failure alike avoids that entirely and makes the two reads of a pair
+// agree, which was the actual defect: the sibling key's stat failure was already
+// health-neutral while the cert's read failure flipped the container unhealthy.
+//
+// ENOENT is a benign race — the entry existed at readdir and was gone by the read (a
+// renewal replacing a file, an atomic-write temp) — so it stays at Debug.
+//
+// The pair is still not converted, so the outcome feeds ScanResult.Unreadable, which
+// blocks orphan reaping: an input tree the scan could not fully read cannot prove an
+// output is orphaned.
+func noteUnreadableInput(rel, what string, err error) {
+	if errors.Is(err, fs.ErrNotExist) {
+		slog.Debug("skipping cert: "+what+" vanished during the scan", "path", rel, "error", err)
+		return
+	}
+	slog.Warn("skipping cert: cannot read "+what,
+		"path", rel, "error", err,
+		"remediation", "check /input permissions and that the path is a regular file inside the mount, not a symlink out of it")
 }
 
 // convertEntry resolves the outcome for one .crt entry under certsRoot. It
@@ -450,8 +489,13 @@ func logConversionObservations(rel string, observations []convert.Observation) {
 }
 
 // countResults derives summary counts from typed results.
-func countResults(results []conversionStatus, unreadable int) ScanResult {
-	var converted, unchanged, orphan, failed int
+//
+// walkUnreadable (sub-paths the walk could not enter) and per-entry statusUnreadable
+// (a cert or key the scan could not read) are folded into one Unreadable count on
+// purpose: both mean "an /input path this app could not read", both carry the same
+// operator remediation, both are health-neutral, and both must block orphan reaping.
+func countResults(results []conversionStatus, walkUnreadable int) ScanResult {
+	var converted, unchanged, orphan, failed, unreadable int
 	for _, r := range results {
 		switch r {
 		case statusConverted:
@@ -462,6 +506,8 @@ func countResults(results []conversionStatus, unreadable int) ScanResult {
 			orphan++
 		case statusFailed:
 			failed++
+		case statusUnreadable:
+			unreadable++
 		}
 	}
 	return ScanResult{
@@ -470,6 +516,6 @@ func countResults(results []conversionStatus, unreadable int) ScanResult {
 		Unchanged:  unchanged,
 		Orphan:     orphan,
 		Failed:     failed,
-		Unreadable: unreadable,
+		Unreadable: walkUnreadable + unreadable,
 	}
 }

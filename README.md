@@ -73,9 +73,9 @@ services:
 
 Create the host output directory owned by the UID you set in `user:`
 (`mkdir -p /path/to/pfx/output && chown 1000:1000 /path/to/pfx/output`) before
-the first start. Unlike an unreadable `/input` sub-path, which is only warned
-about and skipped, an unwritable `/output` fails every conversion and keeps the
-container unhealthy. Generated `.pfx` files are mode `0600` and their
+the first start. Unlike anything under `/input` the scan cannot read, which is
+only warned about and skipped, an unwritable `/output` fails every conversion and
+keeps the container unhealthy. Generated `.pfx` files are mode `0600` and their
 directories `0750`, both owned by that UID, so whatever consumes them must run
 as the same UID (or as a privileged process); group membership alone is
 insufficient because mode `0600` grants no group read access.
@@ -99,9 +99,11 @@ completion` line behind `CertConverterScanAborted`). If you run at `warn` or
 `CertConverterScanStalled` expressions unchanged. Container health covers
 conversion failures and aborted scans (and, with the fallback rescan enabled, a
 stalled watch loop through the marker's freshness deadline), but it deliberately
-ignores `unreadable>0` — an unreadable `/input` sub-path stays healthy — so at
-`warn` also alert on the WARN line `some /input paths were unreadable and were
-skipped` to keep that coverage. At `error` that WARN is suppressed too, so use a
+ignores `unreadable>0` — nothing the scan merely could not READ under `/input`
+flips health, because none of it is clearable by a restart — so at `warn` also
+alert on the WARN lines `some /input paths were unreadable and were skipped` and
+`skipping cert: cannot read` to keep that coverage. At `error` that WARN is
+suppressed too, so use a
 lower log level if you need equivalent unreadable-path alerting. Otherwise write
 replacement rules over the messages your level still emits.
 
@@ -121,9 +123,14 @@ groups:
         annotations:
           summary: "cert-converter failed to convert a certificate"
           description: >
-            A scan logged failed>0 or unreadable>0 (PEM parse, PFX write, or
-            input read failure); the affected .pfx is stale or missing. Check
-            /input permissions and the certificate chain.
+            A scan logged failed>0 (PEM parse, cert/key mismatch, or PFX write)
+            or unreadable>0 (an /input path the scan could not read); the
+            affected .pfx is stale or missing. Only the failed>0 half flips
+            container health — an unreadable path is a layout or permissions
+            condition a restart cannot clear — so this rule deliberately covers
+            more than the healthcheck does. Check /input permissions, that each
+            cert and its sibling key are regular files inside the mount rather
+            than symlinks out of it, and the certificate chain.
       - alert: CertConverterScanAborted
         expr: |
           sum by (container) (count_over_time(

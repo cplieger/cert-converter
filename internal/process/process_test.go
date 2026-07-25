@@ -23,6 +23,19 @@ func newScanner(certsRoot, outRoot string) *process.Scanner {
 	})
 }
 
+// newSyncScanner is newScanner with OUTPUT_LIFECYCLE=sync, for tests that must prove a
+// reap did NOT happen: under the default warn mode nothing is ever deleted, so such a
+// test would pass without exercising the gate it claims to check.
+func newSyncScanner(certsRoot, outRoot string) *process.Scanner {
+	return process.New(&process.Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+		Lifecycle: process.LifecycleSync,
+	})
+}
+
 // TestScannerRun_skips_a_cert_recreated_after_removal pins a DELIBERATE reversal
 // of the previous contract, and the reasoning matters more than the assertion.
 //
@@ -163,12 +176,24 @@ func TestScannerRun_regenerates_pfx_when_output_is_not_a_regular_file(t *testing
 	}
 }
 
-// TestScannerRun_counts_non_regular_key_as_failed pins the classification of a
-// sibling key that exists but cannot be read as PEM: root.Stat succeeds, so the
-// pair is not an orphan, while the confined bounded read refuses a non-regular
-// file. That must surface as a conversion failure so health reports it, and it
-// must be retried on the next scan rather than cached as a success.
-func TestScannerRun_counts_non_regular_key_as_failed(t *testing.T) {
+// TestScannerRun_counts_non_regular_key_as_unreadable pins a DELIBERATE reversal of
+// this test's previous contract, and the reasoning matters more than the assertion.
+//
+// It used to require Failed=1 for a sibling key that exists but cannot be read
+// (root.Stat succeeds, so the pair is not an orphan, while the confined bounded read
+// refuses a non-regular file), which flipped the container unhealthy.
+//
+// That was wrong by the health philosophy both the README and the steering doc state:
+// health answers only "should an orchestrator restart this container?", and a directory
+// in a key's place -- like a symlink escaping /input, or a permission denial -- is a
+// steady-state layout condition no restart can clear. The old classification made the
+// container restart-loop forever on a misconfiguration, and it disagreed with the
+// sibling-key STAT failure one line above, which was already health-neutral (deferred
+// finding h-f9).
+//
+// The pair is still not converted, still WARNed with its path, still retried on the
+// next scan, and still blocks orphan reaping. Only the health flip is gone.
+func TestScannerRun_counts_non_regular_key_as_unreadable(t *testing.T) {
 	t.Parallel()
 	certsRoot := t.TempDir()
 	outRoot := t.TempDir()
@@ -187,8 +212,11 @@ func TestScannerRun_counts_non_regular_key_as_failed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Run(non-regular key) = %v, want nil (a per-cert failure is not a scan error)", err)
 	}
-	if res1.Failed != 1 || res1.Orphan != 0 || res1.Converted != 0 {
-		t.Fatalf("first Run(non-regular key) = %+v, want Failed 1 Orphan 0 Converted 0", res1)
+	if res1.Unreadable != 1 || res1.Failed != 0 || res1.Orphan != 0 || res1.Converted != 0 {
+		t.Fatalf("first Run(non-regular key) = %+v, want Unreadable 1 Failed 0 Orphan 0 Converted 0", res1)
+	}
+	if !healthNeutral(res1) {
+		t.Errorf("Run(non-regular key) = %+v flips health; a layout condition no restart can fix must not", res1)
 	}
 	if _, statErr := os.Stat(filepath.Join(outRoot, "badkey.pfx")); statErr == nil {
 		t.Errorf("Run(non-regular key) wrote a pfx; want no output file")
@@ -198,7 +226,12 @@ func TestScannerRun_counts_non_regular_key_as_failed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Run(non-regular key) = %v, want nil", err)
 	}
-	if res2.Failed != 1 || res2.Unchanged != 0 {
-		t.Errorf("second Run(non-regular key) = %+v, want Failed 1 Unchanged 0 (a failed pair must be retried, never cached as a success)", res2)
+	if res2.Unreadable != 1 || res2.Unchanged != 0 {
+		t.Errorf("second Run(non-regular key) = %+v, want Unreadable 1 Unchanged 0 (an unreadable pair must be retried, never cached as a success)", res2)
 	}
 }
+
+// healthNeutral mirrors main.healthyAfterScan: health is driven solely by conversion
+// failures. Duplicated here rather than imported because package main cannot be
+// imported; the duplication is asserted against by TestHealthyAfterScan in main_test.go.
+func healthNeutral(r process.ScanResult) bool { return r.Failed == 0 }
