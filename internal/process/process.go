@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -87,12 +86,12 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	reapStaleTemps(ctx, outHandle)
 
 	sw := &scanWalk{
-		cache:     s.cache,
-		inHandle:  inHandle,
-		outHandle: outHandle,
-		password:  s.opts.Password,
-		enc:       s.opts.Encoder,
-		seen:      make(map[string]struct{}),
+		cache:    s.cache,
+		src:      &source{root: inHandle},
+		out:      &store{root: outHandle},
+		password: s.opts.Password,
+		enc:      s.opts.Encoder,
+		seen:     make(map[string]struct{}),
 	}
 	// Enumerate the input tree THROUGH the root handle, exactly as the
 	// /output stale-temp sweep does: every step is an openat-relative
@@ -307,8 +306,8 @@ func (tr *tempReap) logOutcome(walkErr error) {
 // Hoisting the WalkDir callback onto this struct keeps Scanner.Run flat.
 type scanWalk struct {
 	cache      *hashCache
-	inHandle   *os.Root
-	outHandle  *os.Root
+	src        *source
+	out        *store
 	seen       map[string]struct{}
 	enc        convert.EncoderType
 	password   string
@@ -368,7 +367,7 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 	if d.Type()&fs.ModeSymlink == 0 || layout.IsRelevant(rel) {
 		return
 	}
-	fi, err := sw.inHandle.Stat(rel)
+	fi, err := sw.src.stat(rel)
 	switch {
 	case err != nil && !errors.Is(err, fs.ErrNotExist):
 		// The error is the only evidence of the cause here (a target outside the
@@ -502,7 +501,7 @@ type pairInputs struct {
 // propagated from a successful read can never be mistaken for a conversion.
 // Every status and log message is identical to what convertEntry emitted inline.
 func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInputs, conversionStatus, bool) {
-	if _, statErr := sw.inHandle.Stat(keyRel); statErr != nil {
+	if _, statErr := sw.src.stat(keyRel); statErr != nil {
 		if errors.Is(statErr, fs.ErrNotExist) {
 			slog.Debug("skipping cert without matching key", "path", rel)
 		} else {
@@ -516,11 +515,11 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 		return pairInputs{}, statusOrphan, false
 	}
 
-	certPEM, err := convert.ReadBoundedFromRoot(ctx, sw.inHandle, rel, convert.MaxFileSize)
+	certPEM, err := sw.src.readBounded(ctx, rel)
 	if err != nil {
 		return pairInputs{}, failEntry(rel, "failed to read certificate", err), false
 	}
-	keyPEM, err := convert.ReadBoundedFromRoot(ctx, sw.inHandle, keyRel, convert.MaxFileSize)
+	keyPEM, err := sw.src.readBounded(ctx, keyRel)
 	if err != nil {
 		return pairInputs{}, failEntry(rel, "failed to read private key", err), false
 	}
@@ -556,21 +555,23 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		return statusUnchanged
 	}
 
-	if destDir := filepath.Dir(pfxRel); destDir != "." {
-		if err := sw.outHandle.MkdirAll(destDir, 0o750); err != nil {
-			// destDir is filepath.Dir(rel), and the *os.Root error names the
-			// failing component, so the cert path carries the directory too.
-			return failEntry(rel, "failed to create output directory", err)
-		}
-	}
-
 	slog.Debug("converting cert pair", "path", rel)
-	observations, err := convert.PairInRoot(ctx, certPEM, keyPEM, sw.outHandle, pfxRel, sw.password, sw.enc)
-	// Observations describe the INPUT, so they are worth logging whether or not
-	// the write succeeded: a reordered bundle or a multi-key file is the same
-	// operator-visible fact either way.
-	logConversionObservations(rel, observations)
+
+	// Three separated steps: the codec resolves the pair, the codec encodes it,
+	// and the output owner writes it. Observations describe the INPUT, so they are
+	// logged whether or not the write succeeds — a reordered bundle or a multi-key
+	// file is the same operator-visible fact either way.
+	analysis, err := convert.Analyse(certPEM, keyPEM)
 	if err != nil {
+		return failEntry(rel, "conversion failed", err)
+	}
+	logConversionObservations(rel, analysis.Observations)
+
+	pfxData, err := convert.Encode(&analysis, sw.enc, sw.password)
+	if err != nil {
+		return failEntry(rel, "conversion failed", err)
+	}
+	if err := sw.out.write(ctx, pfxRel, pfxData); err != nil {
 		return failEntry(rel, "conversion failed", err)
 	}
 	// Commit the fingerprint at the success boundary: only now is it true that
@@ -619,13 +620,13 @@ func (sw *scanWalk) outputIsCurrent(rel, pfxRel, fingerprint string) bool {
 	if !sw.cache.matches(rel, fingerprint) {
 		return false
 	}
-	// Lstat, not Stat: a symlink planted under the output name must not be
-	// accepted as the prior PFX (it would let unrelated content satisfy the
-	// cache-coherence gate), and only a regular file is a usable PFX. Anything
-	// else -- a directory, a symlink, a device node -- means the output
-	// contract is broken, so force a reconvert whose confined atomic write
-	// either restores a regular PFX or fails the entry and reports unhealthy.
-	fi, statErr := sw.outHandle.Lstat(pfxRel)
+	// The store lstats rather than stats, so a symlink planted under the output
+	// name is not accepted as the prior PFX (it would let unrelated content
+	// satisfy the cache-coherence gate). Only a regular file is a usable PFX;
+	// anything else -- a directory, a symlink, a device node -- means the output
+	// contract is broken, so force a reconvert whose confined atomic write either
+	// restores a regular PFX or fails the entry and reports unhealthy.
+	fi, statErr := sw.out.lstat(pfxRel)
 	if statErr == nil && fi.Mode().IsRegular() {
 		slog.Debug("skipping unchanged cert pair", "path", rel)
 		return true

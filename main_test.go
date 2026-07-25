@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/testcerts"
@@ -36,17 +37,26 @@ func newTestScanner(certsRoot, outRoot, password string, enc convert.EncoderType
 }
 
 // convertPairToPath converts an already-read cert+key pair to a PFX at destPath
-// through PairInRoot, the only PFX-writing entry point convert exposes: it opens
-// an *os.Root over destPath's directory and writes the base name inside it.
-// Tests that assert on an ambient destination path use this instead of an
-// unconfined API, so they exercise exactly the path production takes.
+// by composing the same three steps production composes: convert.Analyse resolves
+// the pair, convert.Encode produces the bytes, and the write is confined to an
+// *os.Root over destPath's directory. internal/convert is a pure codec and no
+// longer writes anything, so there is no single call to wrap any more.
 func convertPairToPath(ctx context.Context, certPEM, keyPEM []byte, destPath, password string, enc convert.EncoderType) error {
 	root, err := os.OpenRoot(filepath.Dir(destPath))
 	if err != nil {
 		return err
 	}
 	defer func() { _ = root.Close() }()
-	_, err = convert.PairInRoot(ctx, certPEM, keyPEM, root, filepath.Base(destPath), password, enc)
+	analysis, err := convert.Analyse(certPEM, keyPEM)
+	if err != nil {
+		return err
+	}
+	pfx, err := convert.Encode(&analysis, enc, password)
+	if err != nil {
+		return err
+	}
+	_, err = atomicfile.WriteFileInRoot(ctx, root, filepath.Base(destPath), pfx,
+		atomicfile.WithMode(0o600))
 	return err
 }
 
@@ -288,49 +298,6 @@ func TestProcessAll(t *testing.T) {
 }
 
 // --- Tests: Pair error paths ---
-
-// Pair operates on already-read bytes, so the former "nonexistent
-// cert/key file" cases moved to the read seam (convert.ReadBoundedFromRoot, see
-// internal/convert) and the scanner's orphan/unreadable handling. What remains
-// here are the parse and write failures Pair itself owns.
-
-func TestConvertToPFX_invalid_cert_PEM(t *testing.T) {
-	t.Parallel()
-
-	_, keyPEM := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
-	err := convertPairToPath(t.Context(), []byte("not a cert"), keyPEM, filepath.Join(t.TempDir(), "out.pfx"), "", convert.EncNameModern2023)
-	if err == nil {
-		t.Fatal("convert.PairInRoot should fail for invalid cert PEM")
-	}
-}
-
-func TestConvertToPFX_invalid_key_PEM(t *testing.T) {
-	t.Parallel()
-
-	certPEM, _ := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
-	err := convertPairToPath(t.Context(), certPEM, []byte("not a key"), filepath.Join(t.TempDir(), "out.pfx"), "", convert.EncNameModern2023)
-	if err == nil {
-		t.Fatal("convert.PairInRoot should fail for invalid key PEM")
-	}
-}
-
-func TestConvertToPFX_unwritable_dest(t *testing.T) {
-	t.Parallel()
-
-	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
-	// Open the root over a real directory so the failure happens inside the
-	// confined write (atomicfile under PairInRoot) instead of in the test
-	// helper's own os.OpenRoot: rel names a subdirectory that does not exist.
-	root, err := os.OpenRoot(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = root.Close() }()
-	_, err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, filepath.Join("no-such-dir", "out.pfx"), "", convert.EncNameModern2023)
-	if err == nil {
-		t.Fatal("convert.PairInRoot should fail for an unwritable destination")
-	}
-}
 
 // --- Tests: logPasswordStatus ---
 

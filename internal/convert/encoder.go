@@ -17,15 +17,6 @@ const (
 	EncNameLegacyRC2  EncoderType = "legacyrc2"
 )
 
-// PickEncoder returns the PFX encoder and its name based on the raw env value.
-// It composes EncoderName and encoderFor for callers that need both the
-// normalized app-owned name and the resolved vendor encoder, keeping the
-// PKCS#12 vendor types confined to this package.
-func PickEncoder(raw string) (enc *pkcs12.Encoder, name EncoderType) {
-	name, _ = EncoderName(raw)
-	return encoderFor(name), name
-}
-
 // EncoderName normalizes a raw PFX_ENCODER value to one of the known encoder
 // names. It owns the normalization rule but not the diagnostic: known reports
 // whether raw matched a recognized spelling, so the caller that read the

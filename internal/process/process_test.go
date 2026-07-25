@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/testcerts"
@@ -25,10 +26,10 @@ func newScanner(certsRoot, outRoot string) *process.Scanner {
 }
 
 // convertPairToPath converts an already-read cert+key pair to a PFX at destPath
-// through PairInRoot, the only PFX-writing entry point convert exposes: it opens
-// an *os.Root over destPath's directory and writes the base name inside it.
-// Tests that assert on an ambient destination path use this instead of an
-// unconfined API, so they exercise exactly the path production takes.
+// by composing the same three steps production composes: convert.Analyse resolves
+// the pair, convert.Encode produces the bytes, and the write is confined to an
+// *os.Root over destPath's directory. internal/convert is a pure codec and no
+// longer writes anything, so there is no single call to wrap any more.
 func convertPairToPath(t *testing.T, certPEM, keyPEM []byte, destPath, password string, enc convert.EncoderType) error {
 	t.Helper()
 	root, err := os.OpenRoot(filepath.Dir(destPath))
@@ -36,7 +37,16 @@ func convertPairToPath(t *testing.T, certPEM, keyPEM []byte, destPath, password 
 		t.Fatalf("setup: os.OpenRoot(%q) = %v", filepath.Dir(destPath), err)
 	}
 	defer func() { _ = root.Close() }()
-	_, err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, filepath.Base(destPath), password, enc)
+	analysis, err := convert.Analyse(certPEM, keyPEM)
+	if err != nil {
+		return err
+	}
+	pfx, err := convert.Encode(&analysis, enc, password)
+	if err != nil {
+		return err
+	}
+	_, err = atomicfile.WriteFileInRoot(t.Context(), root, filepath.Base(destPath), pfx,
+		atomicfile.WithMode(0o600))
 	return err
 }
 

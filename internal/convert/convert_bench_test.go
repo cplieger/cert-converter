@@ -46,7 +46,7 @@ func BenchmarkPairInRoot(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := convert.PairInRoot(b.Context(), certPEM, keyPEM, root, "bench.pfx", "bench", convert.EncNameModern2023); err != nil {
+		if _, err := convertPairInRoot(b.Context(), certPEM, keyPEM, root, "bench.pfx", "bench", convert.EncNameModern2023); err != nil {
 			b.Fatal(err)
 		}
 	}

@@ -14,9 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"testing"
-	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/testcerts"
@@ -351,152 +349,6 @@ func TestParsePrivateKey_RSA_PKCS8(t *testing.T) {
 	}
 }
 
-// --- Tests: convert.ReadBoundedFromRoot ---
-
-func TestReadBoundedFromRoot(t *testing.T) {
-	t.Parallel()
-	t.Run("reads file within limit through root", func(t *testing.T) {
-		t.Parallel()
-		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "in.pem"), []byte("hello"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer root.Close()
-		data, err := convert.ReadBoundedFromRoot(t.Context(), root, "in.pem", 1024)
-		if err != nil {
-			t.Fatalf("convert.ReadBoundedFromRoot: %v", err)
-		}
-		if !bytes.Equal(data, []byte("hello")) {
-			t.Errorf("got %q, want %q", data, "hello")
-		}
-	})
-
-	t.Run("rejects oversized file", func(t *testing.T) {
-		t.Parallel()
-		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "big.pem"), make([]byte, 2048), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer root.Close()
-		if _, err := convert.ReadBoundedFromRoot(t.Context(), root, "big.pem", 1024); err == nil {
-			t.Error("expected error for oversized file")
-		}
-	})
-
-	t.Run("nonexistent file", func(t *testing.T) {
-		t.Parallel()
-		dir := t.TempDir()
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer root.Close()
-		if _, err := convert.ReadBoundedFromRoot(t.Context(), root, "missing.pem", 1024); err == nil {
-			t.Error("expected error for nonexistent file")
-		}
-	})
-
-	t.Run("confines a symlink escaping the root", func(t *testing.T) {
-		if runtime.GOOS == "windows" {
-			t.Skip("symlink semantics differ on Windows")
-		}
-		t.Parallel()
-		// The security guarantee of item l-f14: a symlink planted in the
-		// watched directory that points outside it must not leak the target.
-		outside := t.TempDir()
-		if err := os.WriteFile(filepath.Join(outside, "secret"), []byte("top secret"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		dir := t.TempDir()
-		if err := os.Symlink(filepath.Join(outside, "secret"), filepath.Join(dir, "leak.pem")); err != nil {
-			t.Fatal(err)
-		}
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer root.Close()
-		if _, err := convert.ReadBoundedFromRoot(t.Context(), root, "leak.pem", 1024); err == nil {
-			t.Fatal("ReadBoundedFromRoot followed a symlink escaping the root; want a confinement error")
-		}
-	})
-
-	t.Run("refuses a parent-directory traversal in rel", func(t *testing.T) {
-		t.Parallel()
-		// The other half of the confinement contract: the read must not escape
-		// through a ".." component either, which is why the open goes through
-		// the *os.Root instead of filepath.Join + os.Open.
-		outside := t.TempDir()
-		if err := os.WriteFile(filepath.Join(outside, "secret.pem"), []byte("top secret"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		dir, err := os.MkdirTemp(outside, "watched")
-		if err != nil {
-			t.Fatal(err)
-		}
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer root.Close()
-
-		data, err := convert.ReadBoundedFromRoot(t.Context(), root, "../secret.pem", 1024)
-		if err == nil {
-			t.Fatalf("convert.ReadBoundedFromRoot(%q) read %d bytes; want a confinement error", "../secret.pem", len(data))
-		}
-		if bytes.Contains(data, []byte("top secret")) {
-			t.Error("convert.ReadBoundedFromRoot returned content from outside the root")
-		}
-	})
-
-	t.Run("rejects a non-regular file without blocking", func(t *testing.T) {
-		if runtime.GOOS == "windows" {
-			t.Skip("mkfifo is not available on Windows")
-		}
-		t.Parallel()
-		// The guarantee of item h-f5: open(2) on a FIFO with no writer blocks
-		// forever, and the scan runs on the watch loop's only goroutine, so a
-		// FIFO planted in the watched tree must be rejected, not waited on.
-		dir := t.TempDir()
-		if err := syscall.Mkfifo(filepath.Join(dir, "evil.crt"), 0o600); err != nil {
-			t.Fatalf("setup: mkfifo: %v", err)
-		}
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer root.Close()
-
-		done := make(chan error, 1)
-		go func() {
-			_, readErr := convert.ReadBoundedFromRoot(t.Context(), root, "evil.crt", 1024)
-			done <- readErr
-		}()
-		select {
-		case readErr := <-done:
-			if readErr == nil {
-				t.Fatal("ReadBoundedFromRoot read a FIFO; want a not-a-regular-file error")
-			}
-			if !strings.Contains(readErr.Error(), "not a regular file") {
-				t.Errorf("ReadBoundedFromRoot(FIFO) error = %q, want it to mention %q",
-					readErr.Error(), "not a regular file")
-			}
-		case <-time.After(10 * time.Second):
-			t.Fatal("ReadBoundedFromRoot blocked on a FIFO; the O_NONBLOCK open regressed")
-		}
-	})
-}
-
-// --- Tests: convert.PairInRoot ---
-
 func TestParsePrivateKey_encrypted_block_returns_distinct_error(t *testing.T) {
 	t.Parallel()
 	encPEM := pem.EncodeToMemory(&pem.Block{
@@ -560,55 +412,6 @@ func TestParsePrivateKey_traditional_openssl_encrypted_returns_distinct_error(t 
 	}
 }
 
-// TestParsePrivateKey_malformed_labelled_block_names_its_own_format pins that
-// the fallback error reports the parser matching the block's own PEM label, not
-// the PKCS8 attempt every block starts with.
-func TestParsePrivateKey_malformed_labelled_block_names_its_own_format(t *testing.T) {
-	t.Parallel()
-	for _, blockType := range []string{"RSA PRIVATE KEY", "EC PRIVATE KEY", "PRIVATE KEY"} {
-		t.Run(blockType, func(t *testing.T) {
-			t.Parallel()
-			keyPEM := pem.EncodeToMemory(&pem.Block{
-				Type:  blockType,
-				Bytes: []byte("this is not valid DER"),
-			})
-			_, err := convert.ParsePrivateKey(keyPEM)
-			if err == nil {
-				t.Fatalf("convert.ParsePrivateKey(malformed %s) = nil error, want error", blockType)
-			}
-			if !strings.Contains(err.Error(), blockType) {
-				t.Errorf("convert.ParsePrivateKey(malformed %s) error = %q, want it to name %q",
-					blockType, err.Error(), blockType)
-			}
-		})
-	}
-}
-
-func TestPairInRoot_returns_wrapped_error_on_write_failure(t *testing.T) {
-	t.Parallel()
-	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "write-fail", "ecdsa")
-	dir := t.TempDir()
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
-	// Destination sits inside a directory that does not exist; the confined
-	// write does not create parents, so the atomic temp-file create fails.
-	rel := filepath.Join("missing-subdir", "out.pfx")
-
-	_, err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, rel, "pw", convert.EncNameModern2023)
-	if err == nil {
-		t.Fatal("convert.PairInRoot(unwritable destination) = nil error, want a wrapped write error")
-	}
-	if !strings.Contains(err.Error(), "write pfx") {
-		t.Errorf("convert.PairInRoot(unwritable destination) error = %q, want it to contain %q", err.Error(), "write pfx")
-	}
-	if _, statErr := os.Stat(filepath.Join(dir, rel)); statErr == nil {
-		t.Errorf("convert.PairInRoot wrote a file at an unwritable destination; want none")
-	}
-}
-
 // TestPairInRoot_round_trips_chain_for_every_encoder_profile pins the four PFX
 // encoding profiles PFX_ENCODER can select and the CA-chain handling: each
 // profile must produce a PKCS#12 file that decodes back to the same leaf AND
@@ -634,32 +437,32 @@ func TestPairInRoot_round_trips_chain_for_every_encoder_profile(t *testing.T) {
 			defer root.Close()
 			rel := name + ".pfx"
 			destPath := filepath.Join(dir, rel)
-			if _, err := convert.PairInRoot(t.Context(), chainPEM, keyPEM, root, rel, "pw", enc); err != nil {
-				t.Fatalf("convert.PairInRoot(%s) = error %v, want nil", name, err)
+			if _, err := convertPairInRoot(t.Context(), chainPEM, keyPEM, root, rel, "pw", enc); err != nil {
+				t.Fatalf("convertPairInRoot(%s) = error %v, want nil", name, err)
 			}
 			info, err := os.Stat(destPath)
 			if err != nil {
-				t.Fatalf("convert.PairInRoot(%s) did not write a file: %v", name, err)
+				t.Fatalf("convertPairInRoot(%s) did not write a file: %v", name, err)
 			}
 			if perm := info.Mode().Perm(); perm != 0o600 {
-				t.Errorf("convert.PairInRoot(%s) wrote mode %o, want 600", name, perm)
+				t.Errorf("convertPairInRoot(%s) wrote mode %o, want 600", name, perm)
 			}
 			pfxData, err := os.ReadFile(destPath)
 			if err != nil {
-				t.Fatalf("read pfx written by convert.PairInRoot(%s): %v", name, err)
+				t.Fatalf("read pfx written by convertPairInRoot(%s): %v", name, err)
 			}
 			_, leaf, cas, err := pkcs12.DecodeChain(pfxData, "pw")
 			if err != nil {
-				t.Fatalf("decode pfx written by convert.PairInRoot(%s): %v", name, err)
+				t.Fatalf("decode pfx written by convertPairInRoot(%s): %v", name, err)
 			}
 			if leaf.Subject.CommonName != "leaf.example.com" {
-				t.Errorf("convert.PairInRoot(%s) leaf CN = %q, want %q", name, leaf.Subject.CommonName, "leaf.example.com")
+				t.Errorf("convertPairInRoot(%s) leaf CN = %q, want %q", name, leaf.Subject.CommonName, "leaf.example.com")
 			}
 			if len(cas) != 1 {
-				t.Fatalf("convert.PairInRoot(%s) round-tripped %d CA certs, want 1", name, len(cas))
+				t.Fatalf("convertPairInRoot(%s) round-tripped %d CA certs, want 1", name, len(cas))
 			}
 			if cas[0].Subject.CommonName != "Test CA" {
-				t.Errorf("convert.PairInRoot(%s) CA CN = %q, want %q", name, cas[0].Subject.CommonName, "Test CA")
+				t.Errorf("convertPairInRoot(%s) CA CN = %q, want %q", name, cas[0].Subject.CommonName, "Test CA")
 			}
 		})
 	}
@@ -681,7 +484,7 @@ func TestPairInRoot_confines_the_write_to_the_output_root(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer root.Close()
-		if _, err := convert.PairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023); err != nil {
+		if _, err := convertPairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023); err != nil {
 			t.Fatalf("convert.PairInRoot = error %v, want nil", err)
 		}
 		info, statErr := os.Stat(filepath.Join(dir, "out.pfx"))
@@ -720,12 +523,12 @@ func TestPairInRoot_confines_the_write_to_the_output_root(t *testing.T) {
 		}
 		defer root.Close()
 
-		_, writeErr := convert.PairInRoot(t.Context(), certPEM, keyPEM, root, "escape/out.pfx", "pw", convert.EncNameModern2023)
+		_, writeErr := convertPairInRoot(t.Context(), certPEM, keyPEM, root, "escape/out.pfx", "pw", convert.EncNameModern2023)
 		if _, statErr := os.Stat(filepath.Join(outside, "out.pfx")); statErr == nil {
 			t.Error("convert.PairInRoot wrote the PFX outside the output root through a symlinked subdirectory")
 		}
 		if writeErr == nil {
-			t.Error("convert.PairInRoot(symlinked subdirectory) = nil error, want a confinement error")
+			t.Error("convertPairInRoot(symlinked subdirectory) = nil error, want a confinement error")
 		}
 	})
 }
@@ -763,9 +566,9 @@ func TestPairInRoot_resolves_a_leaf_last_chain_structurally(t *testing.T) {
 		}
 		defer root.Close()
 
-		obs, err := convert.PairInRoot(t.Context(), leafLast, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
+		obs, err := convertPairInRoot(t.Context(), leafLast, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
 		if err != nil {
-			t.Fatalf("convert.PairInRoot(leaf-last chain) = error %v, want nil: the key identifies the leaf regardless of position", err)
+			t.Fatalf("convertPairInRoot(leaf-last chain) = error %v, want nil: the key identifies the leaf regardless of position", err)
 		}
 
 		pfxData, err := os.ReadFile(filepath.Join(dir, "out.pfx"))
@@ -802,9 +605,9 @@ func TestPairInRoot_resolves_a_leaf_last_chain_structurally(t *testing.T) {
 		}
 		defer root.Close()
 
-		_, err = convert.PairInRoot(t.Context(), leafLast, otherKeyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
+		_, err = convertPairInRoot(t.Context(), leafLast, otherKeyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
 		if err == nil {
-			t.Fatal("convert.PairInRoot(unrelated key) = nil error, want a no-match error")
+			t.Fatal("convertPairInRoot(unrelated key) = nil error, want a no-match error")
 		}
 		got := err.Error()
 		for _, want := range []string{"none of the 1 private key block(s)", "2 certificate(s)"} {
@@ -1063,9 +866,9 @@ func TestPairInRoot_rejects_a_certificate_whose_public_key_type_is_unverifiable(
 	}
 	defer root.Close()
 
-	_, err = convert.PairInRoot(t.Context(), patched, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
+	_, err = convertPairInRoot(t.Context(), patched, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
 	if err == nil {
-		t.Fatal("convert.PairInRoot(certificate with an unknown public key algorithm) = nil error, want an unverifiable-key-type error")
+		t.Fatal("convertPairInRoot(certificate with an unknown public key algorithm) = nil error, want an unverifiable-key-type error")
 	}
 	if !strings.Contains(err.Error(), "cannot be verified against the private key") {
 		t.Errorf("convert.PairInRoot error = %q, want it to report the public key type as unverifiable", err.Error())
@@ -1160,18 +963,18 @@ func TestPairInRoot_rejects_password_outside_BMP_without_writing(t *testing.T) {
 	defer root.Close()
 
 	const password = "safe-\U0001F642-suffix"
-	_, err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", password, convert.EncNameModern2023)
+	_, err = convertPairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", password, convert.EncNameModern2023)
 	if err == nil {
-		t.Fatal("convert.PairInRoot(non-BMP password) = nil error, want rejection")
+		t.Fatal("convertPairInRoot(non-BMP password) = nil error, want rejection")
 	}
 	if !strings.Contains(err.Error(), "outside the Basic Multilingual Plane") {
-		t.Errorf("convert.PairInRoot(non-BMP password) error = %q, want an actionable BMP constraint", err.Error())
+		t.Errorf("convertPairInRoot(non-BMP password) error = %q, want an actionable BMP constraint", err.Error())
 	}
 	if strings.Contains(err.Error(), "\U0001F642") {
-		t.Errorf("convert.PairInRoot(non-BMP password) error = %q, want the secret character omitted", err.Error())
+		t.Errorf("convertPairInRoot(non-BMP password) error = %q, want the secret character omitted", err.Error())
 	}
 	if _, statErr := os.Stat(filepath.Join(dir, "out.pfx")); statErr == nil {
-		t.Error("convert.PairInRoot(non-BMP password) wrote a PFX; want no file")
+		t.Error("convertPairInRoot(non-BMP password) wrote a PFX; want no file")
 	}
 }
 
@@ -1219,9 +1022,9 @@ func TestPairInRoot_bounds_the_certificate_subject_it_names(t *testing.T) {
 			}
 			defer root.Close()
 
-			obs, err := convert.PairInRoot(t.Context(), bundle, identityKeyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
+			obs, err := convertPairInRoot(t.Context(), bundle, identityKeyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
 			if err != nil {
-				t.Fatalf("convert.PairInRoot(bundle with an unrelated extra cert) = error %v, want nil: the extra is excluded, not fatal", err)
+				t.Fatalf("convertPairInRoot(bundle with an unrelated extra cert) = error %v, want nil: the extra is excluded, not fatal", err)
 			}
 
 			var detail string

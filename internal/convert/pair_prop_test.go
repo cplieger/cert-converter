@@ -54,7 +54,7 @@ func TestPairInRoot_accepts_a_pair_iff_the_key_matches_the_leaf(t *testing.T) {
 		destPath := filepath.Join(outDir, relName)
 		_ = os.Remove(destPath)
 
-		_, err := convert.PairInRoot(rt.Context(), pool[i].certPEM, pool[j].keyPEM, outRoot, relName, "pw", convert.EncNameModern2023)
+		_, err := convertPairInRoot(rt.Context(), pool[i].certPEM, pool[j].keyPEM, outRoot, relName, "pw", convert.EncNameModern2023)
 
 		if i == j {
 			if err != nil {

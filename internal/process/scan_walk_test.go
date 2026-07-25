@@ -100,7 +100,7 @@ func TestOutputIsCurrent_regenerates_when_the_output_stat_fails(t *testing.T) {
 		pfxRel      = "swapped/tls.pfx"
 		fingerprint = "cafebabe"
 	)
-	sw := &scanWalk{cache: newHashCache(), outHandle: outHandle}
+	sw := &scanWalk{cache: newHashCache(), out: &store{root: outHandle}}
 	sw.cache.record(certRel, fingerprint)
 
 	var buf bytes.Buffer
@@ -169,7 +169,7 @@ func TestScanWalkVisit_cancellation_during_conversion_aborts_the_walk(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	sw := &scanWalk{cache: newHashCache(), inHandle: inHandle, outHandle: outHandle, seen: make(map[string]struct{})}
+	sw := &scanWalk{cache: newHashCache(), src: &source{root: inHandle}, out: &store{root: outHandle}, seen: make(map[string]struct{})}
 
 	got := sw.visit(&cancelAfterFirstCheck{}, "late.crt", fs.FileInfoToDirEntry(fi), nil)
 
@@ -209,7 +209,7 @@ func TestNoteUnwalkableSymlink_reports_resolution_outcomes(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = root.Close() })
-	sw := &scanWalk{inHandle: root}
+	sw := &scanWalk{src: &source{root: root}}
 
 	var buf bytes.Buffer
 	prev := slog.Default()
@@ -272,7 +272,7 @@ func TestNoteUnwalkableSymlink_stays_silent_where_nothing_is_hidden(t *testing.T
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = inHandle.Close() })
-	sw := &scanWalk{inHandle: inHandle}
+	sw := &scanWalk{src: &source{root: inHandle}}
 
 	var buf bytes.Buffer
 	prev := slog.Default()

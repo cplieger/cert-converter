@@ -130,7 +130,7 @@ func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = inHandle.Close() })
-	sw := &scanWalk{inHandle: inHandle}
+	sw := &scanWalk{src: &source{root: inHandle}}
 
 	var buf bytes.Buffer
 	prev := slog.Default()

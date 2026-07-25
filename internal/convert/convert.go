@@ -3,7 +3,6 @@ package convert
 
 import (
 	"bytes"
-	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -12,17 +11,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
-	"syscall"
 	"unicode/utf8"
-
-	"github.com/cplieger/atomicfile/v2"
-	"software.sslmate.com/src/go-pkcs12"
 )
-
-// MaxFileSize is the maximum allowed size for cert/key files (10 MB).
-const MaxFileSize = 10 << 20
 
 // PEM block type constants.
 const (
@@ -32,36 +23,6 @@ const (
 	pemTypeECPrivateKey        = "EC PRIVATE KEY"
 	pemTypeEncryptedPrivateKey = "ENCRYPTED PRIVATE KEY"
 )
-
-// --- Confined bounded input reads ---
-
-// ReadBoundedFromRoot opens rel within root and reads it under a size limit,
-// confining the read to root's tree: a symlink or ".." component in rel can
-// never redirect the read outside root. It is the /input read seam — every
-// certificate and key read flows through the *os.Root (Go 1.24+) so a malicious
-// symlink planted in the watched directory cannot leak a file from outside it.
-// Only regular files are read, and the open is non-blocking, so a named pipe,
-// device node, or socket planted in the watched tree cannot stall the scan.
-// The caller owns root; ReadBoundedFromRoot does not close it.
-func ReadBoundedFromRoot(ctx context.Context, root *os.Root, rel string, limit int64) ([]byte, error) {
-	// O_NONBLOCK so a FIFO or device node planted in the watched tree cannot
-	// wedge the open: open(2) on a FIFO with no writer blocks forever, and the
-	// scan runs on the watch loop's only goroutine. The flag has no effect on a
-	// regular file, the only input cert-converter accepts.
-	f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s: not a regular file (type %s)", rel, fi.Mode().Type())
-	}
-	return atomicfile.ReadBoundedFile(ctx, f, limit)
-}
 
 // --- Certificate chain parsing ---
 
@@ -240,21 +201,6 @@ func (e boundedTextError) Unwrap() error { return e.err }
 // chain, a partially decodable key file is NOT rejected: a usable later block
 // still wins, and the count only enriches the failure message.
 //
-// Unexported for the same reason as parseCertChain: PairInRoot is the package's
-// only production conversion edge.
-//
-// It returns the FIRST usable key. Identity resolution needs every key in the
-// file (a rotation appends the new key beside the old, and only the one matching
-// the leaf is correct), so Analyse calls parsePrivateKeys instead; this wrapper
-// remains for the single-key callers and for the parser's own direct coverage.
-func parsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
-	keys, err := parsePrivateKeys(pemBytes)
-	if err != nil {
-		return nil, err
-	}
-	return keys[0], nil
-}
-
 // keyScan accumulates what one pass over a key file's PEM blocks learned: the
 // usable keys, plus the evidence noPrivateKeyError needs when there are none.
 // Hoisting the loop body onto it keeps parsePrivateKeys a plain drain loop.
@@ -270,8 +216,8 @@ type keyScan struct {
 	sawEncrypted  bool
 }
 
-// visit classifies one PEM block, applying the same per-block rules the
-// single-key parser has always used.
+// visit classifies one PEM block, applying the same per-block rules the parser
+// has always used.
 func (s *keyScan) visit(block *pem.Block) {
 	switch block.Type {
 	case pemTypePrivateKey, pemTypeRSAPrivateKey, pemTypeECPrivateKey:
@@ -409,35 +355,6 @@ func parsePrivateKeyBlock(block *pem.Block) (crypto.PrivateKey, error) {
 	}
 	return nil, fmt.Errorf("failed to parse private key from %s block (tried PKCS8, PKCS1, SEC1): %w",
 		block.Type, parseErr)
-}
-
-// --- Confined PFX encoding and write ---
-
-// toPFXInRoot encodes a private key, leaf certificate, and optional CA chain as
-// PKCS#12 and writes the result atomically under root's tree, so a symlink
-// planted under the output directory cannot redirect the private-key-bearing
-// PFX outside it. rel is resolved relative to root. It is unexported because
-// PairInRoot is the package's only PFX-writing entry point: exporting a
-// lower-level variant would offer a second write contract with no production
-// consumer.
-func toPFXInRoot(ctx context.Context, privKey crypto.PrivateKey, leaf *x509.Certificate, caCerts []*x509.Certificate, root *os.Root, rel, password string, enc *pkcs12.Encoder) error {
-	if InspectPasswordEncoding(password).NonBMP {
-		return errors.New("pfx password contains a character outside the Basic Multilingual Plane, " +
-			"which the PKCS#12 UCS-2 password encoding cannot represent; " +
-			"choose a password made of BMP characters (ASCII is safest)")
-	}
-
-	pfxData, err := enc.Encode(privKey, leaf, caCerts, password)
-	if err != nil {
-		return fmt.Errorf("encode pfx: %w", err)
-	}
-
-	if _, err := atomicfile.WriteFileInRoot(ctx, root, rel, pfxData,
-		atomicfile.WithMode(0o600),
-	); err != nil {
-		return fmt.Errorf("write pfx: %w", err)
-	}
-	return nil
 }
 
 // PasswordEncodingIssues reports the ways a PFX password cannot survive the
