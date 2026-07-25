@@ -156,7 +156,7 @@ groups:
             CertConverterScanAborted alert first, since that one names the
             /input problem and fires within 15m. If no scan aborted, the loop is
             wedged: restart the container.
-      - alert: CertConverterInputSymlinkSkipped
+      - alert: CertConverterInputPathUnreachable
         expr: |
           sum by (container) (count_over_time(
             {container="cert-converter"}
@@ -168,16 +168,18 @@ groups:
         annotations:
           summary: "cert-converter skipped an unreachable /input path"
           description: >
-            A symlink under /input could not be resolved through the input root,
-            or a certificate's sibling `<name>.key` could not be stat'ed (it
-            escapes the input root, or its permissions deny the read), so
-            whatever it points to — including every certificate under a linked
-            directory, or that one certificate — was not converted. This
-            outcome is health-neutral: the scan still logs `scan complete` with
-            failed=0 and unreadable=0, so none of the other rules fire and the
-            affected .pfx stays stale or absent indefinitely. Mount the
-            certificate path directly instead of linking to it, or repair the
-            permissions of the link target and of the sibling key.
+            An /input path could not be reached, so what it holds was not
+            converted. Either a symlink could not be resolved through the input
+            root, or a certificate's sibling `<name>.key` could not be stat'ed —
+            which covers a path escaping the input root, a permission denial, and
+            any other IO error, not only a symlink. Whatever was skipped —
+            every certificate under a linked directory, or that one certificate —
+            was not converted. This outcome is health-neutral: the scan still
+            logs `scan complete` with failed=0 and unreadable=0, so none of the
+            other rules fire and the affected .pfx stays stale or absent
+            indefinitely. Mount the certificate path directly instead of linking
+            to it, or repair the permissions of the link target and of the
+            sibling key.
       - alert: CertConverterNoCertificatePairs
         expr: |
           sum by (container) (count_over_time(
@@ -222,6 +224,30 @@ groups:
             and no other rule fires, while `.atomicfile-*.tmp` files — each
             holding a private key — accumulate under /output indefinitely. Check
             /output ownership and permissions for the UID in `user:`.
+      - alert: CertConverterOrphanRemovalDisabled
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |~ `orphan removal is disabled for this scan` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter cannot reap orphaned /output bundles"
+          description: >
+            The orphan walk could not enumerate /output completely, so this scan
+            refused to delete anything: either a sub-path could not be read, or
+            the tree contains a symlink (writes resolve through the output root
+            and follow it, while the orphan walk does not, so the two disagree
+            about where a bundle lives and a freshly written one would read as an
+            orphan). Only relevant with `OUTPUT_LIFECYCLE=sync`, where it is the
+            difference between "nothing to reap" and "reaping is off" — the two
+            are otherwise indistinguishable, since refusing to delete is
+            health-neutral and no other rule fires. A `.pfx` whose certificate
+            was removed from /input therefore stays served indefinitely. Check
+            /output ownership and permissions for the UID in `user:`, and mount
+            the real output directory instead of linking to it.
 ```
 
 Thresholds and the `severity` label are starting points; adjust the stall
@@ -235,8 +261,9 @@ of reporting a wedged loop — drop it, exactly as the `health` probe drops its
 staleness deadline in that configuration. The same applies at
 `LOG_LEVEL=warn`/`error`, where the `scan complete` heartbeat is filtered out
 of the logs entirely (see the prerequisite above): both conditions invalidate
-the heartbeat rule. `CertConverterInputSymlinkSkipped`,
-`CertConverterNoCertificatePairs`, and `CertConverterOutputCleanupDegraded` are
+the heartbeat rule. `CertConverterInputPathUnreachable`,
+`CertConverterNoCertificatePairs`, `CertConverterOutputCleanupDegraded`, and
+`CertConverterOrphanRemovalDisabled` are
 the exceptions to the prerequisite: they key on WARN lines, so they work at
 `debug`, `info`, or `warn` and are suppressed only at `error`.
 
