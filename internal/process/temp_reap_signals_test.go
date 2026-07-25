@@ -63,7 +63,7 @@ func TestTempReapLogOutcome_operator_signals(t *testing.T) {
 			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 			t.Cleanup(func() { slog.SetDefault(prev) })
 
-			tr := &tempReap{outHandle: root, cutoff: time.Now(), reaped: tt.reaped, failed: tt.failed, unreadable: tt.unreadable}
+			tr := &tempReap{store: &store{root: root}, cutoff: time.Now(), reaped: tt.reaped, failed: tt.failed, unreadable: tt.unreadable}
 			tr.logOutcome(tt.walkErr)
 
 			out := buf.String()
@@ -120,7 +120,7 @@ func TestTempReapVisit_aggregates_non_benign_candidate_failures(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = root.Close() })
 
-	tr := &tempReap{outHandle: root, cutoff: time.Now().Add(-staleTempAge)}
+	tr := &tempReap{store: &store{root: root}, cutoff: time.Now().Add(-staleTempAge)}
 	if got := tr.visit(t.Context(), "swapped/.atomicfile-444.tmp", fs.FileInfoToDirEntry(fi), nil); got != nil {
 		t.Errorf("visit(refused candidate) = %v, want nil so the rest of the tree is still swept", got)
 	}
@@ -139,7 +139,7 @@ func TestTempReapVisit_aggregates_non_benign_candidate_failures(t *testing.T) {
 // TestTempReapLogOutcome_is_silent_for_a_clean_sweep pins the quiet steady state
 // of the /output sweep: with nothing reaped, nothing refused, no unreadable
 // sub-path and no walk error, logOutcome must emit nothing at all.
-// reapStaleTemps runs at the start of every scan -- each debounced fsnotify
+// sweepStaleTemps runs at the start of every scan -- each debounced fsnotify
 // event and each fallback tick -- so a counter guard that also fired on zero
 // would put a "count=0" info line, and for the two aggregate counters an
 // operator-facing warning with a remediation hint, into the log on every scan of
@@ -156,7 +156,7 @@ func TestTempReapLogOutcome_is_silent_for_a_clean_sweep(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	tr := &tempReap{outHandle: root, cutoff: time.Now()}
+	tr := &tempReap{store: &store{root: root}, cutoff: time.Now()}
 	tr.logOutcome(nil)
 
 	if out := buf.String(); out != "" {

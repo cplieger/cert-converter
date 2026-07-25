@@ -28,7 +28,7 @@ func TestTempReapVisit_classifies_walk_errors(t *testing.T) {
 
 	t.Run("an error at the root aborts the sweep", func(t *testing.T) {
 		t.Parallel()
-		tr := &tempReap{outHandle: root, cutoff: time.Now()}
+		tr := &tempReap{store: &store{root: root}, cutoff: time.Now()}
 		if got := tr.visit(t.Context(), ".", nil, sentinel); !errors.Is(got, sentinel) {
 			t.Errorf("visit(\".\", err) = %v, want the walk error so the sweep aborts", got)
 		}
@@ -39,7 +39,7 @@ func TestTempReapVisit_classifies_walk_errors(t *testing.T) {
 
 	t.Run("an error below the root is counted and skipped", func(t *testing.T) {
 		t.Parallel()
-		tr := &tempReap{outHandle: root, cutoff: time.Now()}
+		tr := &tempReap{store: &store{root: root}, cutoff: time.Now()}
 		if got := tr.visit(t.Context(), "sub", nil, sentinel); got != nil {
 			t.Errorf("visit(\"sub\", err) = %v, want nil so the sweep continues", got)
 		}
@@ -55,7 +55,7 @@ func TestTempReapVisit_classifies_walk_errors(t *testing.T) {
 		t.Parallel()
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		tr := &tempReap{outHandle: root, cutoff: time.Now()}
+		tr := &tempReap{store: &store{root: root}, cutoff: time.Now()}
 		if got := tr.visit(ctx, "anything", nil, nil); !errors.Is(got, context.Canceled) {
 			t.Errorf("visit(cancelled ctx) = %v, want context.Canceled", got)
 		}
@@ -101,7 +101,7 @@ func TestReapStaleTemp_reports_non_benign_failures(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = root.Close() })
 
-		removed, failed := reapStaleTemp(root, ".atomicfile-111.tmp", d, cutoff)
+		removed, failed := (&store{root: root}).reapStaleTemp(".atomicfile-111.tmp", d, cutoff)
 		if removed || failed {
 			t.Errorf("reapStaleTemp(vanished temp) = (%v, %v), want (false, false): a readdir/Lstat race is benign", removed, failed)
 		}
@@ -137,7 +137,7 @@ func TestReapStaleTemp_reports_non_benign_failures(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = root.Close() })
 
-		removed, failed := reapStaleTemp(root, "swapped/.atomicfile-222.tmp", d, cutoff)
+		removed, failed := (&store{root: root}).reapStaleTemp("swapped/.atomicfile-222.tmp", d, cutoff)
 		if removed {
 			t.Errorf("reapStaleTemp(escaping temp) removed = true, want false")
 		}
@@ -177,7 +177,7 @@ func TestReapStaleTemp_reports_non_benign_failures(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = root.Close() })
 
-		removed, failed := reapStaleTemp(root, "sub/.atomicfile-333.tmp", d, cutoff)
+		removed, failed := (&store{root: root}).reapStaleTemp("sub/.atomicfile-333.tmp", d, cutoff)
 		if removed {
 			t.Errorf("reapStaleTemp(unremovable temp) removed = true, want false")
 		}

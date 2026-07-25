@@ -760,7 +760,7 @@ func TestConvertToPFX_cleans_up_tmp_on_rename_failure(t *testing.T) {
 
 	err := convertPairToPath(t.Context(), certPEM, keyPEM, destPath, "", convert.EncNameModern2023)
 	if err == nil {
-		t.Fatal("convert.PairInRoot should fail when destPath is a directory")
+		t.Fatal("convertPairToPath should fail when destPath is a directory")
 	}
 
 	// Verify no leaked tmp files (atomicfile names temps ".atomicfile-<digits>.tmp").

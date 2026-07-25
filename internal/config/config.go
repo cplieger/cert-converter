@@ -25,7 +25,7 @@ const defaultFallbackInterval = 6 * time.Hour
 // Config holds the runtime configuration for cert-converter. The PFX encoder is
 // carried as the app-owned convert.EncoderType name, not as a go-pkcs12 value:
 // the vendor type stays confined to internal/convert, which resolves the name
-// with encoderFor inside PairInRoot; main and process only carry the name.
+// with encoderFor inside convert.Encode; main and process only carry the name.
 type Config struct {
 	Password         string
 	EncoderName      convert.EncoderType

@@ -8,7 +8,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 )
 
-// convertPairInRoot is the test-side stand-in for the retired convert.PairInRoot:
+// convertPairInRoot is the test-side stand-in for the retired convertPairInRoot:
 // analyse, encode, then write confined to root.
 //
 // It exists because the three steps are no longer one function. internal/convert

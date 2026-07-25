@@ -14,7 +14,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 )
 
-func BenchmarkPairInRoot(b *testing.B) {
+func BenchmarkConvertPair(b *testing.B) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		b.Fatal(err)

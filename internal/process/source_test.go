@@ -164,4 +164,4 @@ func TestSourceReadBounded(t *testing.T) {
 	})
 }
 
-// --- Tests: convert.PairInRoot ---
+// --- Tests: convertPairInRoot ---

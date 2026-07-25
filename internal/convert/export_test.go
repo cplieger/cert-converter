@@ -2,7 +2,7 @@ package convert
 
 import "crypto"
 
-// Test-only handles on the package-internal PEM parsers. PairInRoot is the
+// Test-only handles on the package-internal PEM parsers. Analyse is the
 // package's only production conversion edge (it owns the cert/key match, the
 // leaf/chain split and the PFX write), so parseCertChain and parsePrivateKey
 // stay unexported: no production package outside internal/convert may bypass

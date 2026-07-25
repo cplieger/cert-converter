@@ -50,7 +50,7 @@ func convertPairToPath(t *testing.T, certPEM, keyPEM []byte, destPath, password 
 	return err
 }
 
-func TestPairInRoot_rejects_mismatched_cert_and_key(t *testing.T) {
+func TestConvertPair_rejects_mismatched_cert_and_key(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	certPEM, _ := testcerts.GenerateSelfSignedCert(t, "cert.example.com", "ecdsa")
@@ -59,13 +59,13 @@ func TestPairInRoot_rejects_mismatched_cert_and_key(t *testing.T) {
 
 	err := convertPairToPath(t, certPEM, keyPEM, destPath, "pw", convert.EncNameModern2023)
 	if err == nil {
-		t.Fatal("convert.PairInRoot(mismatched cert/key) = nil, want error")
+		t.Fatal("convertPairInRoot(mismatched cert/key) = nil, want error")
 	}
 	if !strings.Contains(err.Error(), "matches any of") {
-		t.Errorf("convert.PairInRoot(mismatched) error = %q, want it to contain %q", err.Error(), "matches any of")
+		t.Errorf("convertPairInRoot(mismatched) error = %q, want it to contain %q", err.Error(), "matches any of")
 	}
 	if _, statErr := os.Stat(destPath); statErr == nil {
-		t.Errorf("convert.PairInRoot wrote a pfx at %q for a mismatched pair; want no file written", destPath)
+		t.Errorf("convertPairInRoot wrote a pfx at %q for a mismatched pair; want no file written", destPath)
 	}
 }
 

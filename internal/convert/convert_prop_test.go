@@ -16,7 +16,7 @@ import (
 	"software.sslmate.com/src/go-pkcs12"
 )
 
-// TestPairInRoot_password_guard_agrees_with_the_pkcs12_encoder is the oracle
+// TestConvertPair_password_guard_agrees_with_the_pkcs12_encoder is the oracle
 // property for the PFX password guard: for an arbitrary password,
 // InspectPasswordEncoding must predict the encoder's verdict exactly. A
 // password it reports as non-BMP must be rejected with the actionable
@@ -25,7 +25,7 @@ import (
 // go-pkcs12's own refusal names neither the password nor the constraint, so a
 // drift between the guard and the encoder turns a clear startup-level
 // diagnostic back into an opaque conversion failure.
-func TestPairInRoot_password_guard_agrees_with_the_pkcs12_encoder(t *testing.T) {
+func TestConvertPair_password_guard_agrees_with_the_pkcs12_encoder(t *testing.T) {
 	t.Parallel()
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "password-oracle.example.com", "ecdsa")
 	certBlock, _ := pem.Decode(certPEM)
@@ -51,23 +51,23 @@ func TestPairInRoot_password_guard_agrees_with_the_pkcs12_encoder(t *testing.T) 
 
 		if issues.NonBMP {
 			if err == nil {
-				rt.Fatalf("PairInRoot with a non-BMP password (%d bytes) = nil, want the BMP rejection", len(password))
+				rt.Fatalf("convertPairInRoot with a non-BMP password (%d bytes) = nil, want the BMP rejection", len(password))
 			}
 			if !strings.Contains(err.Error(), "Basic Multilingual Plane") {
-				rt.Errorf("PairInRoot error = %q, want it to name the Basic Multilingual Plane limit rather than the vendor message", err.Error())
+				rt.Errorf("convertPairInRoot error = %q, want it to name the Basic Multilingual Plane limit rather than the vendor message", err.Error())
 			}
 			if _, statErr := os.Stat(dest); !errors.Is(statErr, fs.ErrNotExist) {
-				rt.Errorf("PairInRoot wrote %q for a rejected password (stat error %v); want no file", dest, statErr)
+				rt.Errorf("convertPairInRoot wrote %q for a rejected password (stat error %v); want no file", dest, statErr)
 			}
 			return
 		}
 
 		if err != nil {
-			rt.Fatalf("PairInRoot with an encodable password (%d bytes) = %v, want nil", len(password), err)
+			rt.Fatalf("convertPairInRoot with an encodable password (%d bytes) = %v, want nil", len(password), err)
 		}
 		pfxData, readErr := os.ReadFile(dest)
 		if readErr != nil {
-			rt.Fatalf("PairInRoot wrote no readable pfx: %v", readErr)
+			rt.Fatalf("convertPairInRoot wrote no readable pfx: %v", readErr)
 		}
 		_, leaf, _, decErr := pkcs12.DecodeChain(pfxData, password)
 		if decErr != nil {

@@ -15,13 +15,13 @@ import (
 	"software.sslmate.com/src/go-pkcs12"
 )
 
-// TestPairInRoot_accepts_a_pair_iff_the_key_matches_the_leaf is the oracle
+// TestConvertPair_accepts_a_pair_iff_the_key_matches_the_leaf is the oracle
 // property for the cert/key correspondence gate: over every combination drawn
 // from a pool of independently generated pairs (including a cross-key-type
-// combination), PairInRoot must succeed exactly when the key belongs to the
+// combination), conversion must succeed exactly when the key belongs to the
 // leaf, and must leave no .pfx behind otherwise. A PFX written from a
 // mismatched key deploys a certificate no consumer can serve.
-func TestPairInRoot_accepts_a_pair_iff_the_key_matches_the_leaf(t *testing.T) {
+func TestConvertPair_accepts_a_pair_iff_the_key_matches_the_leaf(t *testing.T) {
 	t.Parallel()
 
 	type certKeyPair struct {
@@ -58,11 +58,11 @@ func TestPairInRoot_accepts_a_pair_iff_the_key_matches_the_leaf(t *testing.T) {
 
 		if i == j {
 			if err != nil {
-				rt.Fatalf("PairInRoot(cert %s, its own key) = %v, want nil", pool[i].name, err)
+				rt.Fatalf("convertPairInRoot(cert %s, its own key) = %v, want nil", pool[i].name, err)
 			}
 			pfxData, readErr := os.ReadFile(destPath)
 			if readErr != nil {
-				rt.Fatalf("PairInRoot(cert %s, its own key) wrote no readable pfx: %v", pool[i].name, readErr)
+				rt.Fatalf("convertPairInRoot(cert %s, its own key) wrote no readable pfx: %v", pool[i].name, readErr)
 			}
 			_, leaf, _, decErr := pkcs12.DecodeChain(pfxData, "pw")
 			if decErr != nil {
@@ -75,13 +75,13 @@ func TestPairInRoot_accepts_a_pair_iff_the_key_matches_the_leaf(t *testing.T) {
 		}
 
 		if err == nil {
-			rt.Fatalf("PairInRoot(cert %s, key %s) = nil, want a mismatch error", pool[i].name, pool[j].name)
+			rt.Fatalf("convertPairInRoot(cert %s, key %s) = nil, want a mismatch error", pool[i].name, pool[j].name)
 		}
 		if !strings.Contains(err.Error(), "matches any of") {
-			rt.Errorf("PairInRoot(cert %s, key %s) error = %q, want it to report that no key matched any certificate", pool[i].name, pool[j].name, err.Error())
+			rt.Errorf("convertPairInRoot(cert %s, key %s) error = %q, want it to report that no key matched any certificate", pool[i].name, pool[j].name, err.Error())
 		}
 		if _, statErr := os.Stat(destPath); !errors.Is(statErr, fs.ErrNotExist) {
-			rt.Errorf("PairInRoot(cert %s, key %s) left a pfx at %q (stat error %v); want no output for a mismatched pair", pool[i].name, pool[j].name, destPath, statErr)
+			rt.Errorf("convertPairInRoot(cert %s, key %s) left a pfx at %q (stat error %v); want no output for a mismatched pair", pool[i].name, pool[j].name, destPath, statErr)
 		}
 	})
 }

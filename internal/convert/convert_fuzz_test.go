@@ -213,7 +213,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		password := "test"
 
 		if _, err := convertPairInRoot(t.Context(), data, data, root, "out.pfx", password, convert.EncNameModern2023); err != nil {
-			t.Fatalf("PairInRoot rejected a pair Analyse resolved: %v", err)
+			t.Fatalf("convertPairInRoot rejected a pair Analyse resolved: %v", err)
 		}
 
 		pfxData, err := os.ReadFile(dest)

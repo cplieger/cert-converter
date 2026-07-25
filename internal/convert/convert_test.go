@@ -412,11 +412,11 @@ func TestParsePrivateKey_traditional_openssl_encrypted_returns_distinct_error(t 
 	}
 }
 
-// TestPairInRoot_round_trips_chain_for_every_encoder_profile pins the four PFX
+// TestConvertPair_round_trips_chain_for_every_encoder_profile pins the four PFX
 // encoding profiles PFX_ENCODER can select and the CA-chain handling: each
 // profile must produce a PKCS#12 file that decodes back to the same leaf AND
 // the same CA chain, at mode 0600.
-func TestPairInRoot_round_trips_chain_for_every_encoder_profile(t *testing.T) {
+func TestConvertPair_round_trips_chain_for_every_encoder_profile(t *testing.T) {
 	t.Parallel()
 	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
 
@@ -468,11 +468,11 @@ func TestPairInRoot_round_trips_chain_for_every_encoder_profile(t *testing.T) {
 	}
 }
 
-// TestPairInRoot_confines_the_write_to_the_output_root pins the guarantee of
+// TestConvertPair_confines_the_write_to_the_output_root pins the guarantee of
 // item h-f8 on the path production actually takes: the confined write must
 // produce a decodable 0600 PFX, and a symlinked subdirectory under the output
 // root must not redirect the private-key-bearing PFX outside it.
-func TestPairInRoot_confines_the_write_to_the_output_root(t *testing.T) {
+func TestConvertPair_confines_the_write_to_the_output_root(t *testing.T) {
 	t.Parallel()
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "confined", "ecdsa")
 
@@ -485,25 +485,25 @@ func TestPairInRoot_confines_the_write_to_the_output_root(t *testing.T) {
 		}
 		defer root.Close()
 		if _, err := convertPairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023); err != nil {
-			t.Fatalf("convert.PairInRoot = error %v, want nil", err)
+			t.Fatalf("convertPairInRoot = error %v, want nil", err)
 		}
 		info, statErr := os.Stat(filepath.Join(dir, "out.pfx"))
 		if statErr != nil {
-			t.Fatalf("convert.PairInRoot did not write a file: %v", statErr)
+			t.Fatalf("convertPairInRoot did not write a file: %v", statErr)
 		}
 		if perm := info.Mode().Perm(); perm != 0o600 {
-			t.Errorf("convert.PairInRoot wrote mode %o, want 600", perm)
+			t.Errorf("convertPairInRoot wrote mode %o, want 600", perm)
 		}
 		pfxData, readErr := os.ReadFile(filepath.Join(dir, "out.pfx"))
 		if readErr != nil {
-			t.Fatalf("read pfx written by convert.PairInRoot: %v", readErr)
+			t.Fatalf("read pfx written by convertPairInRoot: %v", readErr)
 		}
 		_, leaf, _, decErr := pkcs12.DecodeChain(pfxData, "pw")
 		if decErr != nil {
-			t.Fatalf("decode pfx written by convert.PairInRoot: %v", decErr)
+			t.Fatalf("decode pfx written by convertPairInRoot: %v", decErr)
 		}
 		if leaf.Subject.CommonName != "confined" {
-			t.Errorf("convert.PairInRoot leaf CN = %q, want %q", leaf.Subject.CommonName, "confined")
+			t.Errorf("convertPairInRoot leaf CN = %q, want %q", leaf.Subject.CommonName, "confined")
 		}
 	})
 
@@ -525,7 +525,7 @@ func TestPairInRoot_confines_the_write_to_the_output_root(t *testing.T) {
 
 		_, writeErr := convertPairInRoot(t.Context(), certPEM, keyPEM, root, "escape/out.pfx", "pw", convert.EncNameModern2023)
 		if _, statErr := os.Stat(filepath.Join(outside, "out.pfx")); statErr == nil {
-			t.Error("convert.PairInRoot wrote the PFX outside the output root through a symlinked subdirectory")
+			t.Error("convertPairInRoot wrote the PFX outside the output root through a symlinked subdirectory")
 		}
 		if writeErr == nil {
 			t.Error("convertPairInRoot(symlinked subdirectory) = nil error, want a confinement error")
@@ -533,13 +533,13 @@ func TestPairInRoot_confines_the_write_to_the_output_root(t *testing.T) {
 	})
 }
 
-// TestPairInRoot_names_the_matching_certificate_for_a_leaf_last_chain pins the
+// TestConvertPair_names_the_matching_certificate_for_a_leaf_last_chain pins the
 // leaf-last chain diagnosis: when a LATER certificate in the chain matches the
 // private key, the mismatch error keeps the base sentence as its prefix (existing
 // log matching depends on it) and additionally names the position and subject of
 // the certificate that does match. An unrelated key, where no certificate in the
 // chain matches, must get the base sentence alone and no leaf-last claim.
-// TestPairInRoot_resolves_a_leaf_last_chain_structurally pins the behaviour that
+// TestConvertPair_resolves_a_leaf_last_chain_structurally pins the behaviour that
 // replaced the old leaf-last DIAGNOSTIC. Identity selection is key-first, so the
 // certificate the private key matches is the identity wherever it sits in the
 // file: a bundle pasted root-first now converts correctly instead of failing with
@@ -550,7 +550,7 @@ func TestPairInRoot_confines_the_write_to_the_output_root(t *testing.T) {
 //
 // An unrelated key, where no certificate matches, still fails — and now says
 // exactly what was examined instead of claiming the chain is misordered.
-func TestPairInRoot_resolves_a_leaf_last_chain_structurally(t *testing.T) {
+func TestConvertPair_resolves_a_leaf_last_chain_structurally(t *testing.T) {
 	t.Parallel()
 	leafPEM, keyPEM, caPEM, _ := testcerts.GenerateCertChain(t)
 	_, otherKeyPEM := testcerts.GenerateSelfSignedCert(t, "unrelated.example.com", "ecdsa")
@@ -621,7 +621,7 @@ func TestPairInRoot_resolves_a_leaf_last_chain_structurally(t *testing.T) {
 			t.Errorf("error = %q, want no leaf-last claim for a key that matches nothing", got)
 		}
 		if _, statErr := os.Stat(filepath.Join(dir, "out.pfx")); statErr == nil {
-			t.Error("convert.PairInRoot wrote a pfx for a pair with no matching certificate; want no file written")
+			t.Error("convertPairInRoot wrote a pfx for a pair with no matching certificate; want no file written")
 		}
 	})
 }
@@ -822,7 +822,7 @@ func TestParsePrivateKey_a_non_encryption_pem_header_still_parses(t *testing.T) 
 	}
 }
 
-// TestPairInRoot_rejects_a_certificate_whose_public_key_type_is_unverifiable pins
+// TestConvertPair_rejects_a_certificate_whose_public_key_type_is_unverifiable pins
 // the supported=false half of the leaf/key correspondence check: crypto/x509
 // leaves Certificate.PublicKey nil for an SPKI algorithm OID it does not
 // recognise, so no Equal(crypto.PublicKey) method is available and the pair
@@ -830,7 +830,7 @@ func TestParsePrivateKey_a_non_encryption_pem_header_still_parses(t *testing.T) 
 // never silently treated as a match and encoded into a PFX, and never reported as
 // a plain mismatch, which would send the operator after the wrong file -- and no
 // file may be written.
-func TestPairInRoot_rejects_a_certificate_whose_public_key_type_is_unverifiable(t *testing.T) {
+func TestConvertPair_rejects_a_certificate_whose_public_key_type_is_unverifiable(t *testing.T) {
 	t.Parallel()
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "unverifiable", "ecdsa")
 	block, _ := pem.Decode(certPEM)
@@ -871,13 +871,13 @@ func TestPairInRoot_rejects_a_certificate_whose_public_key_type_is_unverifiable(
 		t.Fatal("convertPairInRoot(certificate with an unknown public key algorithm) = nil error, want an unverifiable-key-type error")
 	}
 	if !strings.Contains(err.Error(), "cannot be verified against the private key") {
-		t.Errorf("convert.PairInRoot error = %q, want it to report the public key type as unverifiable", err.Error())
+		t.Errorf("convertPairInRoot error = %q, want it to report the public key type as unverifiable", err.Error())
 	}
 	if strings.Contains(err.Error(), "does not match the private key") {
-		t.Errorf("convert.PairInRoot error = %q, want the unverifiable-type error, not the plain mismatch error", err.Error())
+		t.Errorf("convertPairInRoot error = %q, want the unverifiable-type error, not the plain mismatch error", err.Error())
 	}
 	if _, statErr := os.Stat(filepath.Join(dir, "out.pfx")); statErr == nil {
-		t.Error("convert.PairInRoot wrote a pfx for an unverifiable pair; want no file written")
+		t.Error("convertPairInRoot wrote a pfx for an unverifiable pair; want no file written")
 	}
 }
 
@@ -948,11 +948,11 @@ func TestParsePrivateKey_reports_truncated_declared_armour(t *testing.T) {
 	}
 }
 
-// TestPairInRoot_rejects_password_outside_BMP_without_writing pins the app-owned
+// TestConvertPair_rejects_password_outside_BMP_without_writing pins the app-owned
 // non-BMP password guard: the rejection must carry the actionable BMP
 // constraint, must not echo the secret character, and must happen before any
 // PFX is written.
-func TestPairInRoot_rejects_password_outside_BMP_without_writing(t *testing.T) {
+func TestConvertPair_rejects_password_outside_BMP_without_writing(t *testing.T) {
 	t.Parallel()
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "non-bmp-password", "ecdsa")
 	dir := t.TempDir()
@@ -978,7 +978,7 @@ func TestPairInRoot_rejects_password_outside_BMP_without_writing(t *testing.T) {
 	}
 }
 
-// TestPairInRoot_bounds_the_certificate_subject_it_names pins the log-hygiene
+// TestConvertPair_bounds_the_certificate_subject_it_names pins the log-hygiene
 // rule for certificate-controlled text. A subject comes out of a PEM file the app
 // does not control and is capped only by MaxFileSize, so it must be truncated
 // before it reaches anything logged, and the cut must fall on a rune boundary so
@@ -990,7 +990,7 @@ func TestPairInRoot_rejects_password_outside_BMP_without_writing(t *testing.T) {
 // rather than silently embedded. That doubles as the regression test for the
 // former `caCerts = chain[1:]` behaviour, which put every certificate after
 // position 0 into the PFX whether or not it belonged to the chain.
-func TestPairInRoot_bounds_the_certificate_subject_it_names(t *testing.T) {
+func TestConvertPair_bounds_the_certificate_subject_it_names(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name          string

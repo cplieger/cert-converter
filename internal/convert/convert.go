@@ -36,7 +36,7 @@ const (
 // rather than silently truncated, because a PFX built from a truncated chain
 // fails validation obscurely at the consumer instead of here.
 //
-// It is unexported because PairInRoot is the package's only production
+// It is unexported because Analyse is the package's only production
 // conversion edge: it owns the cert/key match, the leaf/chain split and the PFX
 // write, so publishing the lower-level parser would offer a second contract
 // that bypasses those invariants with no production consumer. The package's own
