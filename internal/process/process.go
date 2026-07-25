@@ -472,8 +472,10 @@ type pairInputs struct {
 //
 // The returned conversionStatus is meaningful only when ok is false: it is the
 // outcome convertEntry must propagate for that entry, with the failure already
-// logged. On the ok path it is the zero value and the caller ignores it. Every
-// status and log message is identical to what convertEntry emitted inline.
+// logged. On the ok path it is the enum's zero value, which is statusConverted,
+// so the caller MUST gate on ok and must never propagate the status from a
+// successful read. Every status and log message is identical to what
+// convertEntry emitted inline.
 func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInputs, conversionStatus, bool) {
 	if _, statErr := sw.inHandle.Stat(keyRel); statErr != nil {
 		if errors.Is(statErr, fs.ErrNotExist) {
@@ -497,6 +499,8 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 	if err != nil {
 		return pairInputs{}, failEntry(rel, "failed to read private key", err), false
 	}
+	// Placeholder status: the zero value is statusConverted, so it is only safe
+	// because ok == true tells the caller to ignore it.
 	return pairInputs{certPEM: certPEM, keyPEM: keyPEM}, 0, true
 }
 

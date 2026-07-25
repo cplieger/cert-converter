@@ -529,3 +529,24 @@ func TestWarnUnencodablePassword_reports_the_unrepresentable_shape(t *testing.T)
 		})
 	}
 }
+
+// TestWarnUnencodablePassword_invalid_utf8_wins_over_non_bmp pins the branch
+// precedence the pre-refactor early return provided: a password that is both
+// invalid UTF-8 and carries a non-BMP rune reports only the UTF-8 shape.
+// slog.Default is process-global, so this test must not run in parallel.
+func TestWarnUnencodablePassword_invalid_utf8_wins_over_non_bmp(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	warnUnencodablePassword(string([]byte{0xff}) + "pw-\U0001F600")
+
+	out := buf.String()
+	if !strings.Contains(out, "not valid UTF-8") {
+		t.Errorf("warnUnencodablePassword logged %q, want the invalid-UTF-8 diagnostic", out)
+	}
+	if strings.Contains(out, "Basic Multilingual Plane") {
+		t.Errorf("warnUnencodablePassword logged %q, want only the invalid-UTF-8 diagnostic", out)
+	}
+}
