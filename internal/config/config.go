@@ -75,8 +75,9 @@ func ClassifyPassword(password string) PasswordStatus {
 // returns ErrEmptyPassword when neither supplies a value unless
 // PFX_ALLOW_EMPTY_PASSWORD is set to true, and it fails loudly when a
 // configured PFX_PASSWORD_FILE cannot be used — including a path envx
-// rejects (it must already be cleaned and carry no ".." component), an
-// oversized file, and a file whose trimmed content is empty.
+// rejects (it must already be cleaned and contain no ".." anywhere, so even
+// a "pfx..v2" filename is refused), an oversized file, and a file whose
+// trimmed content is empty.
 func Load() (Config, error) {
 	password, secretErr := envx.Secret("PFX_PASSWORD")
 	if secretErr != nil {

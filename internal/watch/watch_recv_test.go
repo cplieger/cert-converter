@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -119,5 +120,37 @@ func TestHandleErrorRecv_stops_on_close_and_resyncs_on_overflow(t *testing.T) {
 	}
 	if otherState.pending {
 		t.Error("handleErrorRecv(non-overflow error) scheduled a scan; want the error logged only")
+	}
+}
+
+// TestHandleFallbackTick_resyncs_the_watch_set_before_scanning pins the second
+// half of the fallback tick: besides firing the safety-net rescan it re-asserts
+// the watch set, so a directory whose watcher.Add failed earlier (unreadable, or
+// the inotify watch limit exhausted) is picked up again once the condition is
+// repaired instead of staying outside the watch set for the process's life.
+func TestHandleFallbackTick_resyncs_the_watch_set_before_scanning(t *testing.T) {
+	t.Parallel()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Skipf("fsnotify unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = watcher.Close() })
+	root := t.TempDir()
+	nested := filepath.Join(root, "acme-v02", "example.com")
+	if err := os.MkdirAll(nested, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	scans := 0
+	w := New(root, func(context.Context) { scans++ }, WithFallback(time.Hour))
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+
+	w.handleFallbackTick(t.Context(), watcher, st)
+
+	if scans != 1 {
+		t.Errorf("handleFallbackTick scans = %d, want 1 (the safety-net rescan must still fire)", scans)
+	}
+	if watched := watcher.WatchList(); !slices.Contains(watched, nested) {
+		t.Errorf("handleFallbackTick did not re-sync the watch set; %q missing from %v", nested, watched)
 	}
 }

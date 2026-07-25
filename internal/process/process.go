@@ -42,13 +42,13 @@ type Options struct {
 // Scanner walks a certificate directory, checks for changes via a hash cache,
 // and dispatches conversion of cert/key pairs to PFX format.
 //
-// A Scanner is NOT safe for concurrent Run calls sharing a cache. Each cache
-// method is individually atomic, but the per-entry matches -> convert -> record
-// sequence is not: overlapping scans could let one skip a pair as unchanged on the
-// strength of a fingerprint the other recorded for a different set of bytes, and
-// one scan's prune can drop the other's live fingerprints. Run
-// every scan from a single goroutine, as main.go does (initial scan, then the
-// watcher's synchronous onChange callback).
+// A Scanner is NOT safe for concurrent Run calls: they share the Scanner's own
+// fingerprint cache. Each cache method is individually atomic, but the per-entry
+// matches -> convert -> record sequence is not: overlapping scans could let one
+// skip a pair as unchanged on the strength of a fingerprint the other recorded
+// for a different set of bytes, and one scan's prune can drop the other's live
+// fingerprints. Run every scan from a single goroutine, as main.go does (initial
+// scan, then the watcher's synchronous onChange callback).
 type Scanner struct {
 	cache *hashCache
 	opts  Options

@@ -91,11 +91,14 @@ func (w *Watcher) Run(ctx context.Context) {
 // The divergence is deliberate and bounded: inotify registration takes a path,
 // not a directory handle, so there is no root-confined equivalent of
 // watcher.Add, and nothing in this package reads file CONTENT — filepath.WalkDir
-// stats with Lstat and never descends a symlinked directory, and handleFsEvent's
-// os.Lstat does not follow one either, so no watch is ever registered outside
-// the real tree. Any future read of a watched file must go through
-// internal/process's confined root (convert.ReadBoundedFromRoot); never build an
-// ambient path here and read it.
+// stats with Lstat and does not intentionally descend a symlinked directory,
+// while handleFsEvent's os.Lstat also skips a symlink visible at inspection.
+// The ambient path can still be swapped before watcher.Add; fsnotify does not
+// request IN_DONT_FOLLOW, so that race can attach to the replacement target.
+// This remains bounded because this package reads no content and any resulting
+// event only triggers internal/process's root-confined scan. Any future read of
+// a watched file must go through internal/process's confined root
+// (convert.ReadBoundedFromRoot); never build an ambient path here and read it.
 func (w *Watcher) addWatchDirs(watcher *fsnotify.Watcher, root string) error {
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
