@@ -23,8 +23,14 @@ type FatalTB interface {
 	Fatalf(format string, args ...any)
 }
 
-// pemTypeCert is the PEM block type for X.509 certificates.
-const pemTypeCert = "CERTIFICATE"
+// pemTypeCert, pemTypeKeyPKCS8 and pemTypeKeyPKCS1 are the PEM block types this
+// helper emits: X.509 certificates, PKCS#8 private keys (the ECDSA path) and the
+// legacy PKCS#1 RSA private key.
+const (
+	pemTypeCert     = "CERTIFICATE"
+	pemTypeKeyPKCS8 = "PRIVATE KEY"
+	pemTypeKeyPKCS1 = "RSA PRIVATE KEY"
+)
 
 // signCert signs template with parent (parent == template yields a self-signed
 // certificate) and returns both the DER bytes and the PEM encoding.
@@ -57,7 +63,7 @@ func GenerateSelfSignedCert(tb FatalTB, cn, keyType string) (certPEM, keyPEM []b
 		if err != nil {
 			tb.Fatal(err)
 		}
-		keyPEM = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+		keyPEM = pem.EncodeToMemory(&pem.Block{Type: pemTypeKeyPKCS8, Bytes: keyDER})
 
 	case "rsa":
 		key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -65,7 +71,7 @@ func GenerateSelfSignedCert(tb FatalTB, cn, keyType string) (certPEM, keyPEM []b
 			tb.Fatal(err)
 		}
 		_, certPEM = signCert(tb, template, template, &key.PublicKey, key)
-		keyPEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+		keyPEM = pem.EncodeToMemory(&pem.Block{Type: pemTypeKeyPKCS1, Bytes: x509.MarshalPKCS1PrivateKey(key)})
 
 	default:
 		tb.Fatalf("unsupported key type: %s", keyType)
@@ -115,7 +121,7 @@ func GenerateCertChain(tb testing.TB) (leafPEM, keyPEM, caPEM, chainPEM []byte) 
 	if err != nil {
 		tb.Fatal(err)
 	}
-	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: pemTypeKeyPKCS8, Bytes: keyDER})
 
 	// Concatenate leaf + CA into the chain. Build via append on a nil
 	// slice rather than make([]byte, 0, len(a)+len(b)): the explicit

@@ -70,10 +70,17 @@ health marker (any failure clears it; a clean cycle sets it).
   cache does no file I/O of its own: the scanner reads each input once and
   passes the bytes to `process`'s own `pairFingerprint`. PFX writes are atomic
   (temp + rename) via `cplieger/atomicfile`. Keep new file I/O on these helpers.
-- **The watcher loop and poll fallback are not unit-tested.** They are
-  event-driven I/O paths validated by the Docker healthcheck in
-  production. Logic worth testing belongs in `config`, `convert`, or
-  `process`, not in `watch`.
+- **The watch loop's `select` and the poll fallback are not unit-tested.**
+  `Run`'s fsnotify-vs-poll mode selection, `watchLoop`'s `select`, and
+  `pollLoopWithUpgrade` are event-driven I/O paths validated by the Docker
+  healthcheck in production; a test cannot make `fsnotify.NewWatcher` fail.
+  Everything reachable without that seam IS unit-tested here: event
+  classification (`handleFsEvent`), watch-set construction (`addWatchDirs`),
+  the per-arm receive helpers (`handleEventRecv`, `handleErrorRecv`,
+  `handleFallbackTick`), the channel-closed-vs-shutdown translation
+  (`lostOrShutdown`), and the debounce/fallback timer accounting
+  (`watchState`, under `testing/synctest`). New logic in this package follows
+  the same shape: put it in a helper the loop calls, and test the helper.
 - **Health is a file marker, not a probe endpoint.** A successful cycle
   writes the marker; `/cert-watcher health` exits 0 if it exists. There
   is no port to bind.
@@ -101,8 +108,10 @@ golangci-lint fmt
 
 Tests are property-based ([rapid](https://github.com/flyingmutant/rapid))
 plus table-driven, and there are fuzz targets in `internal/convert`
-(`convert_fuzz_test.go`). Run a fuzz target directly when touching the
-parsers:
+(`convert_fuzz_test.go`) and in `internal/process`
+(`stale_temp_name_fuzz_test.go`, which drives the `/output` stale-temp
+deletion gate). Run a fuzz target directly when touching a parser or that
+gate:
 
 ```sh
 go test ./internal/convert -run '^$' -fuzz FuzzParseCertChain -fuzztime 30s

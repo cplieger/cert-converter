@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/slogx/capture"
 	"pgregory.net/rapid"
 )
 
@@ -36,19 +37,16 @@ func TestLoad_empty_password_optout_warns_only_on_unrecognized_values(t *testing
 			t.Setenv("PFX_PASSWORD", "pw")
 			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", tc.optout)
 
-			var buf bytes.Buffer
-			prev := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-			t.Cleanup(func() { slog.SetDefault(prev) })
+			logs := capture.Default(t)
 
 			if _, err := Load(); err != nil {
 				t.Fatalf("Load() = %v, want nil", err)
 			}
 
-			warned := strings.Contains(buf.String(), "unrecognized PFX_ALLOW_EMPTY_PASSWORD")
+			warned := logs.CountLevel(slog.LevelWarn, "unrecognized PFX_ALLOW_EMPTY_PASSWORD") > 0
 			if warned != tc.wantWarn {
-				t.Errorf("Load() with PFX_ALLOW_EMPTY_PASSWORD=%q warned = %v, want %v (log: %q)",
-					tc.optout, warned, tc.wantWarn, buf.String())
+				t.Errorf("Load() with PFX_ALLOW_EMPTY_PASSWORD=%q warned = %v, want %v (log: %v)",
+					tc.optout, warned, tc.wantWarn, logs.Messages())
 			}
 		})
 	}
@@ -355,6 +353,37 @@ func TestLoad_empty_password_optout_requires_literal_true(t *testing.T) {
 	}
 }
 
+// TestClassifyPassword pins the exported blank-password predicate directly in
+// its owning package: Load only ever asks whether the status is
+// PasswordEmpty, so the whitespace-only branch is never exercised by any test
+// in this package. No t.Parallel: every test in this file mutates process
+// state (env / slog default) and the file is deliberately serial.
+func TestClassifyPassword(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		password string
+		want     PasswordStatus
+	}{
+		{"empty is empty", "", PasswordEmpty},
+		{"single space is whitespace-only", " ", PasswordWhitespaceOnly},
+		{"tab newline and space are whitespace-only", "\t\n ", PasswordWhitespaceOnly},
+		// unicode.IsSpace covers U+00A0, so a non-breaking space pasted from a
+		// document is whitespace-only, not a real password.
+		{"non-breaking space is whitespace-only", "\u00a0", PasswordWhitespaceOnly},
+		{"real value is configured", "s3cret", PasswordConfigured},
+		{"padded real value is configured", "  s3cret  ", PasswordConfigured},
+		{"single printable char is configured", "x", PasswordConfigured},
+		// TrimSpace does not trim NUL, so a binary secret is a real password.
+		{"NUL byte is configured", "\x00", PasswordConfigured},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClassifyPassword(tc.password); got != tc.want {
+				t.Errorf("ClassifyPassword(%q) = %q, want %q", tc.password, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLogLevel(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -426,17 +455,14 @@ func TestLoad_env_password_logs_no_secret_source(t *testing.T) {
 	t.Setenv("PFX_PASSWORD_FILE", "")
 	t.Setenv("PFX_PASSWORD", "from-env")
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	logs := capture.Default(t)
 
 	if _, err := Load(); err != nil {
 		t.Fatalf("Load() = %v, want nil", err)
 	}
 
-	if out := buf.String(); strings.Contains(out, "PFX_PASSWORD_FILE") {
-		t.Errorf("Load() logged %q, want no secret-source record when PFX_PASSWORD_FILE is unset", out)
+	if n := logs.Count("PFX password configured"); n != 0 {
+		t.Errorf("Load() logged %v, want no secret-source record when PFX_PASSWORD_FILE is unset", logs.Messages())
 	}
 }
 
@@ -460,10 +486,7 @@ func TestLoad_unknown_encoder_warns_and_falls_back_to_modern2023(t *testing.T) {
 			t.Setenv("PFX_PASSWORD", "pw")
 			t.Setenv("PFX_ENCODER", tc.raw)
 
-			var buf bytes.Buffer
-			prev := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-			t.Cleanup(func() { slog.SetDefault(prev) })
+			logs := capture.Default(t)
 
 			cfg, err := Load()
 			if err != nil {
@@ -472,19 +495,19 @@ func TestLoad_unknown_encoder_warns_and_falls_back_to_modern2023(t *testing.T) {
 			if cfg.EncoderName != tc.wantName {
 				t.Errorf("Load() with PFX_ENCODER=%q EncoderName = %q, want %q", tc.raw, cfg.EncoderName, tc.wantName)
 			}
-			warned := strings.Contains(buf.String(), "unknown PFX_ENCODER")
+			warned := logs.CountLevel(slog.LevelWarn, "unknown PFX_ENCODER") > 0
 			if warned != tc.wantWarn {
-				t.Errorf("Load() with PFX_ENCODER=%q warned = %v, want %v (log: %q)", tc.raw, warned, tc.wantWarn, buf.String())
+				t.Errorf("Load() with PFX_ENCODER=%q warned = %v, want %v (log: %v)", tc.raw, warned, tc.wantWarn, logs.Messages())
 			}
-			if tc.wantWarn && !strings.Contains(buf.String(), tc.raw) {
-				t.Errorf("Load() with PFX_ENCODER=%q logged %q, want the rejected value named so an operator can spot the typo", tc.raw, buf.String())
+			if tc.wantWarn && !logs.AttrContains("unknown PFX_ENCODER", "value", tc.raw) {
+				t.Errorf("Load() with PFX_ENCODER=%q logged %v, want the rejected value named so an operator can spot the typo", tc.raw, logs.Messages())
 			}
 		})
 	}
 }
 
-// TestWarnUnencodablePassword_reports_the_unrepresentable_shape pins both
-// diagnostic branches of the startup warning: the shape must be named with its
+// TestWarnUnencodablePassword_reports_the_unrepresentable_shape pins every
+// diagnostic branch of the startup warning: the shape must be named with its
 // remediation, and the secret value must never reach the log. slog.Default is
 // process-global, so this test must not run in parallel.
 func TestWarnUnencodablePassword_reports_the_unrepresentable_shape(t *testing.T) {
@@ -508,6 +531,13 @@ func TestWarnUnencodablePassword_reports_the_unrepresentable_shape(t *testing.T)
 			wantMessage:     "outside the Basic Multilingual Plane",
 			wantRemediation: "use a PFX password made only of BMP characters",
 			secretNeedle:    "password-\U0001F600",
+		},
+		{
+			name:            "embedded NUL",
+			password:        "sentinel-secret\x00",
+			wantMessage:     "contains a NUL byte",
+			wantRemediation: "strip NUL bytes from the secret file",
+			secretNeedle:    "sentinel-secret",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -535,18 +565,14 @@ func TestWarnUnencodablePassword_reports_the_unrepresentable_shape(t *testing.T)
 // invalid UTF-8 and carries a non-BMP rune reports only the UTF-8 shape.
 // slog.Default is process-global, so this test must not run in parallel.
 func TestWarnUnencodablePassword_invalid_utf8_wins_over_non_bmp(t *testing.T) {
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	logs := capture.Default(t)
 
 	warnUnencodablePassword(string([]byte{0xff}) + "pw-\U0001F600")
 
-	out := buf.String()
-	if !strings.Contains(out, "not valid UTF-8") {
-		t.Errorf("warnUnencodablePassword logged %q, want the invalid-UTF-8 diagnostic", out)
+	if !logs.Contains("not valid UTF-8") {
+		t.Errorf("warnUnencodablePassword logged %v, want the invalid-UTF-8 diagnostic", logs.Messages())
 	}
-	if strings.Contains(out, "Basic Multilingual Plane") {
-		t.Errorf("warnUnencodablePassword logged %q, want only the invalid-UTF-8 diagnostic", out)
+	if logs.Contains("Basic Multilingual Plane") {
+		t.Errorf("warnUnencodablePassword logged %v, want only the invalid-UTF-8 diagnostic", logs.Messages())
 	}
 }

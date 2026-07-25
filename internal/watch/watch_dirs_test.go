@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
-
-	"github.com/fsnotify/fsnotify"
 )
 
 // TestAddWatchDirs_watches_whole_subtree_and_fails_on_missing_root pins the
@@ -20,11 +18,7 @@ import (
 func TestAddWatchDirs_watches_whole_subtree_and_fails_on_missing_root(t *testing.T) {
 	t.Parallel()
 
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		t.Skipf("fsnotify unavailable: %v", err)
-	}
-	defer func() { _ = watcher.Close() }()
+	watcher := newTestWatcher(t)
 
 	root := t.TempDir()
 	nested := filepath.Join(root, "acme-v02", "example.com")
@@ -65,13 +59,7 @@ func TestAddWatchDirs_watches_whole_subtree_and_fails_on_missing_root(t *testing
 // all when it is disabled).
 func TestAddWatchDirs_fails_when_the_root_watch_cannot_be_added(t *testing.T) {
 	t.Parallel()
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		t.Skipf("fsnotify unavailable: %v", err)
-	}
-	if err := watcher.Close(); err != nil {
-		t.Fatalf("setup: watcher.Close() = %v", err)
-	}
+	watcher := newClosedTestWatcher(t)
 	root := t.TempDir()
 
 	if err := New(root, func(context.Context) {}).addWatchDirs(t.Context(), watcher, root); err == nil {
@@ -81,11 +69,7 @@ func TestAddWatchDirs_fails_when_the_root_watch_cannot_be_added(t *testing.T) {
 
 func TestAddWatchDirs_reports_shutdown_instead_of_a_watch_failure(t *testing.T) {
 	t.Parallel()
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		t.Skipf("fsnotify unavailable: %v", err)
-	}
-	t.Cleanup(func() { _ = watcher.Close() })
+	watcher := newTestWatcher(t)
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "example.com"), 0o750); err != nil {
 		t.Fatal(err)
@@ -93,7 +77,7 @@ func TestAddWatchDirs_reports_shutdown_instead_of_a_watch_failure(t *testing.T) 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err = New(root, func(context.Context) {}).addWatchDirs(ctx, watcher, root)
+	err := New(root, func(context.Context) {}).addWatchDirs(ctx, watcher, root)
 
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("addWatchDirs(cancelled ctx) = %v, want context.Canceled so Run treats it as shutdown rather than falling back to polling", err)

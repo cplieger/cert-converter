@@ -135,3 +135,31 @@ func TestTempReapVisit_aggregates_non_benign_candidate_failures(t *testing.T) {
 		t.Errorf("os.Stat(%q) = %v, want nil: nothing outside the output root may be unlinked", temp, statErr)
 	}
 }
+
+// TestTempReapLogOutcome_is_silent_for_a_clean_sweep pins the quiet steady state
+// of the /output sweep: with nothing reaped, nothing refused, no unreadable
+// sub-path and no walk error, logOutcome must emit nothing at all.
+// reapStaleTemps runs at the start of every scan -- each debounced fsnotify
+// event and each fallback tick -- so a counter guard that also fired on zero
+// would put a "count=0" info line, and for the two aggregate counters an
+// operator-facing warning with a remediation hint, into the log on every scan of
+// a perfectly healthy /output. Runs serially: it swaps slog.Default().
+func TestTempReapLogOutcome_is_silent_for_a_clean_sweep(t *testing.T) {
+	root, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	tr := &tempReap{outHandle: root, cutoff: time.Now()}
+	tr.logOutcome(nil)
+
+	if out := buf.String(); out != "" {
+		t.Errorf("logOutcome(clean sweep) logged %q, want no output at all", out)
+	}
+}

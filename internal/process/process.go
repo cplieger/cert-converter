@@ -412,6 +412,17 @@ func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
 		"unreadable", result.Unreadable,
 		"failed", result.Failed)
 	slog.Log(ctx, level, msg, attrs...)
+	if walkErr == nil && result.Total > 0 && result.Orphan == result.Total {
+		// Every .crt under /input lacks its sibling .key, so the scan
+		// completed with failed=0 and produced nothing at all. The counts
+		// above carry orphan, but no README Loki rule keys on it and the
+		// per-cert reason is Debug-only, so this steady-state naming
+		// misconfiguration (a key extension that is not .key) is silent at
+		// the default level, exactly like the Total==0 case below. Name it.
+		slog.Warn("every certificate under the input root is missing its sibling .key; no PFX output is being produced",
+			"orphan", result.Orphan,
+			"remediation", "name each private key <name>.key beside its <name>.crt (Caddy's layout)")
+	}
 	if walkErr == nil && result.Total == 0 && result.Unreadable == 0 {
 		// A completed scan that visited no .crt at all is indistinguishable from
 		// a healthy steady state in the counts above (failed=0 keeps the marker
@@ -472,10 +483,9 @@ type pairInputs struct {
 //
 // The returned conversionStatus is meaningful only when ok is false: it is the
 // outcome convertEntry must propagate for that entry, with the failure already
-// logged. On the ok path it is the enum's zero value, which is statusConverted,
-// so the caller MUST gate on ok and must never propagate the status from a
-// successful read. Every status and log message is identical to what
-// convertEntry emitted inline.
+// logged. On the ok path it is statusUnset, which is not an outcome, so a status
+// propagated from a successful read can never be mistaken for a conversion.
+// Every status and log message is identical to what convertEntry emitted inline.
 func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInputs, conversionStatus, bool) {
 	if _, statErr := sw.inHandle.Stat(keyRel); statErr != nil {
 		if errors.Is(statErr, fs.ErrNotExist) {
@@ -499,9 +509,7 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 	if err != nil {
 		return pairInputs{}, failEntry(rel, "failed to read private key", err), false
 	}
-	// Placeholder status: the zero value is statusConverted, so it is only safe
-	// because ok == true tells the caller to ignore it.
-	return pairInputs{certPEM: certPEM, keyPEM: keyPEM}, 0, true
+	return pairInputs{certPEM: certPEM, keyPEM: keyPEM}, statusUnset, true
 }
 
 // convertEntry resolves the outcome for one .crt entry under certsRoot. It

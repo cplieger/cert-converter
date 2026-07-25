@@ -10,6 +10,32 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// newTestWatcher returns a live fsnotify watcher, closed at test end, and skips
+// the test on a host where inotify is unavailable.
+func newTestWatcher(t *testing.T) *fsnotify.Watcher {
+	t.Helper()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Skipf("fsnotify unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = watcher.Close() })
+	return watcher
+}
+
+// newClosedTestWatcher returns an already-closed watcher: every watcher.Add on
+// it fails, which is how these tests drive the watch-set failure paths.
+func newClosedTestWatcher(t *testing.T) *fsnotify.Watcher {
+	t.Helper()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Skipf("fsnotify unavailable: %v", err)
+	}
+	if err := watcher.Close(); err != nil {
+		t.Fatalf("setup: watcher.Close() = %v", err)
+	}
+	return watcher
+}
+
 // TestHandleFsEvent is the first unit coverage of the watcher's event
 // classifier. It pins the rescan decision per event class, including the
 // d-u2-1 regression: a removed/renamed domain-named directory (e.g.
@@ -21,11 +47,7 @@ func TestHandleFsEvent(t *testing.T) {
 	root := t.TempDir()
 	w := New(root, func(context.Context) {})
 
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		t.Skipf("fsnotify unavailable: %v", err)
-	}
-	defer func() { _ = watcher.Close() }()
+	watcher := newTestWatcher(t)
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("addWatchDirs: %v", err)
 	}
@@ -87,13 +109,7 @@ func TestNew_applies_debounce_and_fallback_options(t *testing.T) {
 // watched.
 func TestHandleFsEvent_rescans_even_when_the_new_subtree_cannot_be_watched(t *testing.T) {
 	t.Parallel()
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		t.Skipf("fsnotify unavailable: %v", err)
-	}
-	if err := watcher.Close(); err != nil {
-		t.Fatalf("setup: watcher.Close() = %v", err)
-	}
+	watcher := newClosedTestWatcher(t)
 	root := t.TempDir()
 	newDir := filepath.Join(root, "example.com")
 	if err := os.MkdirAll(newDir, 0o750); err != nil {

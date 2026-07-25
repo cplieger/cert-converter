@@ -42,7 +42,10 @@ type Watcher struct {
 // Option configures a Watcher.
 type Option func(*Watcher)
 
-// WithDebounce sets the debounce window for coalescing events.
+// WithDebounce sets the debounce window for coalescing events. Zero or a
+// negative duration disables coalescing: the timer fires as soon as the loop
+// reaches its arm, so a burst is followed by a scan per scheduling round
+// rather than one scan per window.
 func WithDebounce(d time.Duration) Option {
 	return func(w *Watcher) { w.debounce = d }
 }
@@ -94,14 +97,26 @@ func (w *Watcher) Run(ctx context.Context) error {
 	defer watcher.Close()
 
 	slog.Info("fsnotify active", "directory_count", len(watcher.WatchList()))
+	return w.scanThenWatch(ctx, watcher)
+}
+
+// scanThenWatch scans once with the watch set already live and then runs the
+// watch loop. Both entry points share it - Run's fsnotify path and
+// pollLoopWithUpgrade's poll-to-watch handoff - so the attach-then-scan
+// ordering and its shutdown guard cannot drift apart between them.
+//
+// Attach-then-scan: the scan that preceded this watch set (main's startup scan,
+// or the poll tick being upgraded) ran before these watches existed, so a
+// renewal landing in that window produced no event. Scanning once with the
+// watch set live closes that gap; the fingerprint cache makes the extra scan a
+// no-op when nothing changed, and events arriving during it stay queued and
+// trigger the normal debounced follow-up. A shutdown that arrives first skips
+// the scan: the loop would return immediately anyway, and scanning would only
+// log an interrupted scan on the way out.
+func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) error {
 	if ctx.Err() != nil {
 		return nil
 	}
-	// Attach-then-scan: main's startup scan ran before these watches existed, so
-	// a renewal landing in that window produced no event. Scanning once with the
-	// watch set live closes it; the fingerprint cache makes the extra scan a
-	// no-op when nothing changed, and events arriving during it stay queued and
-	// trigger the normal debounced follow-up.
 	w.onChange(ctx)
 	return w.watchLoop(ctx, watcher)
 }
@@ -399,6 +414,12 @@ func (st *watchState) scheduleScan() {
 // the safety-net interval is measured from the last real scan.
 func (st *watchState) runDebouncedScan(ctx context.Context) {
 	st.pending = false
+	// A stop request must prevent new work on every arm: watchLoop's select has
+	// no ctx precedence (Go picks a ready case at random), so a debounce deadline
+	// reached in the same instant as cancellation can win over ctx.Done.
+	if ctx.Err() != nil {
+		return
+	}
 	slog.Info("cert change detected, processing")
 	st.w.onChange(ctx)
 	if st.fallbackTimer != nil {
@@ -451,33 +472,43 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			if ctx.Err() != nil {
+				return nil
+			}
 			slog.Debug("poll scan triggered", "interval", w.fallback)
-			fw, err := fsnotify.NewWatcher()
-			if err != nil {
-				slog.Info("fsnotify still unavailable, staying in poll mode",
-					"mode", "poll", "retry_interval", w.fallback, "error", err)
-				w.onChange(ctx)
-				continue
+			if done, tickErr := w.pollTick(ctx); done {
+				return tickErr
 			}
-			if addErr := w.addWatchDirs(ctx, fw, w.root); addErr != nil {
-				fw.Close()
-				if ctx.Err() != nil {
-					return nil // shutdown interrupted the walk; not an upgrade failure
-				}
-				slog.Info("fsnotify available but the watch set could not be rebuilt, staying in poll mode",
-					"mode", "poll", "retry_interval", w.fallback, "error", addErr)
-				w.onChange(ctx)
-				continue
-			}
-			slog.Info("fsnotify recovered, upgrading from poll to watch",
-				"directory_count", len(fw.WatchList()))
-			// Attach-then-scan: this tick's scan runs with the new watch set
-			// already live, so a renewal landing during it still produces an
-			// event instead of falling into a gap covered by neither mode.
-			w.onChange(ctx)
-			loopErr := w.watchLoop(ctx, fw)
-			fw.Close()
-			return loopErr
 		}
 	}
+}
+
+// pollTick handles one poll-loop tick: it re-attempts the fsnotify upgrade and,
+// when that fails, runs the polling scan that keeps change detection alive. It
+// reports done=true when the poll loop must return -- the upgrade succeeded and
+// the watch loop it handed off to has finished, or shutdown interrupted the
+// attempt -- and carries that return value in the error.
+func (w *Watcher) pollTick(ctx context.Context) (done bool, err error) {
+	fw, newErr := fsnotify.NewWatcher()
+	if newErr != nil {
+		slog.Info("fsnotify still unavailable, staying in poll mode",
+			"mode", "poll", "retry_interval", w.fallback, "error", newErr)
+		w.onChange(ctx)
+		return false, nil
+	}
+	if addErr := w.addWatchDirs(ctx, fw, w.root); addErr != nil {
+		fw.Close()
+		if ctx.Err() != nil {
+			return true, nil // shutdown interrupted the walk; not an upgrade failure
+		}
+		slog.Info("fsnotify available but the watch set could not be rebuilt, staying in poll mode",
+			"mode", "poll", "retry_interval", w.fallback, "error", addErr)
+		w.onChange(ctx)
+		return false, nil
+	}
+	slog.Info("fsnotify recovered, upgrading from poll to watch",
+		"directory_count", len(fw.WatchList()))
+	loopErr := w.scanThenWatch(ctx, fw)
+	fw.Close()
+	return true, loopErr
 }

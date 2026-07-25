@@ -83,6 +83,47 @@ func logPasswordStatus(password string) string {
 	return string(status)
 }
 
+// fallbackLogValue renders the fallback rescan cadence for the startup log.
+// A non-positive interval means the rescan is switched off, which is reported
+// as "disabled" rather than as a bare "0s" duration: the value is the
+// operator's confirmation that FALLBACK_SCAN_HOURS=0/false took effect, and
+// that the health probe's staleness deadline is off with it.
+func fallbackLogValue(d time.Duration) string {
+	if d <= 0 {
+		return "disabled"
+	}
+	return d.String()
+}
+
+// runProbe is a seam: health.RunProbe exits the process, so tests replace it.
+var runProbe = health.RunProbe
+
+// dispatchArgs runs the health probe when argv requests it and warns on an
+// unrecognized argument. It returns only when the watcher should start.
+func dispatchArgs(args []string) {
+	if len(args) <= 1 {
+		return
+	}
+	switch args[1] {
+	case "health":
+		// The fallback rescan is the marker's guaranteed refresh floor
+		// (fs events refresh it sooner), so a marker older than 3 fallback
+		// intervals means the watch loop is wedged and a restart fixes it.
+		// FALLBACK_SCAN_HOURS=0/false disables the fallback and with it
+		// the deadline (WithMaxAge(0) is a no-op): watch-only mode has no
+		// guaranteed refresh cadence to hold the marker to.
+		// RunProbe exits the process, so this never falls through to the
+		// watcher below.
+		runProbe(health.DefaultPath,
+			health.WithMaxAge(3*config.FallbackInterval()))
+	default:
+		// Not an error (the watcher takes no arguments), but a mistyped probe
+		// invocation would otherwise silently start a second watcher.
+		slog.Warn("unrecognized argument, starting the watcher",
+			"argument", args[1], "known_subcommands", "health")
+	}
+}
+
 func main() {
 	os.Exit(run())
 }
@@ -98,26 +139,7 @@ func run() int {
 		slog.Warn("invalid LOG_LEVEL, using default", "value", rawLevel, "default", strings.ToLower(lvl.String()))
 	}
 
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "health":
-			// The fallback rescan is the marker's guaranteed refresh floor
-			// (fs events refresh it sooner), so a marker older than 3 fallback
-			// intervals means the watch loop is wedged and a restart fixes it.
-			// FALLBACK_SCAN_HOURS=0/false disables the fallback and with it
-			// the deadline (WithMaxAge(0) is a no-op): watch-only mode has no
-			// guaranteed refresh cadence to hold the marker to.
-			// RunProbe exits the process, so this never falls through to the
-			// watcher below.
-			health.RunProbe(health.DefaultPath,
-				health.WithMaxAge(3*config.FallbackInterval()))
-		default:
-			// Not an error (the watcher takes no arguments), but a mistyped probe
-			// invocation would otherwise silently start a second watcher.
-			slog.Warn("unrecognized argument, starting the watcher",
-				"argument", os.Args[1], "known_subcommands", "health")
-		}
-	}
+	dispatchArgs(os.Args)
 
 	// Clear any marker left by a previous run BEFORE the first failure exit:
 	// /tmp/.healthy lives in the container's writable layer and survives a
@@ -135,14 +157,10 @@ func run() int {
 	}
 
 	passwordStatus := logPasswordStatus(cfg.Password)
-	fallback := cfg.FallbackInterval.String()
-	if cfg.FallbackInterval <= 0 {
-		fallback = "disabled"
-	}
 	slog.Info("starting cert watcher",
 		"input", certsRootDir, "output", outputDir,
 		"password", passwordStatus,
-		"fallback_scan", fallback, "encoder", cfg.EncoderName)
+		"fallback_scan", fallbackLogValue(cfg.FallbackInterval), "encoder", cfg.EncoderName)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -171,8 +189,8 @@ func run() int {
 		// it. Exit non-zero so restart: on-failure deployments restart too; the
 		// deferred marker.Cleanup drops the marker on the way out, so a probe
 		// cannot report healthy after this point.
-		slog.Error("watcher stopped without a shutdown signal; " +
-			"change detection is dead, exiting for a restart")
+		slog.Error("watcher stopped without a shutdown signal; "+
+			"change detection is dead, exiting for a restart", "error", runErr)
 		return 1
 	}
 

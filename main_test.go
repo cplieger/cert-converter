@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/process"
@@ -164,7 +165,7 @@ func TestConvertToPFX(t *testing.T) {
 			t.Fatalf("convertPairToPath: %v", err)
 		}
 
-		decodePFX(t, pfxPath, "") // panics if still "old data"
+		decodePFX(t, pfxPath, "") // fails the test if the file still holds "old data"
 	})
 }
 
@@ -803,6 +804,32 @@ func TestConvertToPFX_cleans_up_tmp_on_rename_failure(t *testing.T) {
 		if strings.HasPrefix(e.Name(), ".atomicfile-") {
 			t.Errorf("leaked temp file after rename failure: %s", e.Name())
 		}
+	}
+}
+
+// TestFallbackLogValue pins the startup log's rendering of the fallback
+// cadence, the one operator-visible decision left in run(): a disabled
+// rescan must read "disabled", never a bare "0s".
+func TestFallbackLogValue(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		in   time.Duration
+		want string
+	}{
+		{"explicit zero is disabled", 0, "disabled"},
+		{"negative is disabled", -1 * time.Hour, "disabled"},
+		{"default cadence", 6 * time.Hour, "6h0m0s"},
+		{"one hour", 1 * time.Hour, "1h0m0s"},
+		{"clamp ceiling", 87600 * time.Hour, "87600h0m0s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := fallbackLogValue(tc.in); got != tc.want {
+				t.Errorf("fallbackLogValue(%v) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 

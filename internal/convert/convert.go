@@ -67,7 +67,9 @@ func ReadBoundedFromRoot(ctx context.Context, root *os.Root, rel string, limit i
 
 // parseCertChain decodes all CERTIFICATE PEM blocks from pemBytes, returning
 // them in order. Blocks of any other type (the private key of a combined
-// cert+key file, for instance) are skipped. It returns an error if no
+// cert+key file, for instance) are skipped, and the "no certificate" diagnostic
+// names the first skipped block's label (bounded) so a swapped cert/key pair is
+// diagnosable from the message alone. It returns an error if no
 // CERTIFICATE block is present, and also if any CERTIFICATE block holds DER
 // that x509 cannot parse: a partially decodable chain is rejected outright
 // rather than silently truncated, because a PFX built from a truncated chain
@@ -81,7 +83,7 @@ func ReadBoundedFromRoot(ctx context.Context, root *os.Root, rel string, limit i
 func parseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
 	declaredCertBlocks := countDeclaredBlocks(pemBytes, certBeginMarker)
 	var certs []*x509.Certificate
-	var skipped int
+	var skipped skippedBlocks
 
 	for {
 		var block *pem.Block
@@ -90,12 +92,12 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
 			break
 		}
 		if block.Type != pemTypeCertificate {
-			skipped++
+			skipped.add(block.Type)
 			continue
 		}
 		c, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			return nil, fmt.Errorf("certificate PEM block %d: %w", len(certs)+1, err)
+			return nil, fmt.Errorf("certificate PEM block %d: %w", len(certs)+1, boundedTextError{err})
 		}
 		certs = append(certs, c)
 	}
@@ -105,13 +107,16 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
 	}
 
 	if len(certs) == 0 {
-		if skipped > 0 {
-			return nil, fmt.Errorf("no certificate PEM block found (skipped %d non-certificate PEM block(s))", skipped)
+		if skipped.count > 0 {
+			return nil, fmt.Errorf("no certificate PEM block found (skipped %d non-certificate PEM block(s), first %q)",
+				skipped.count, skipped.firstTypeForLog())
 		}
 		return nil, errors.New("no certificate PEM block found")
 	}
 	return certs, nil
 }
+
+// --- PEM declaration counting (shared by both parsers) ---
 
 // pemBeginMarker builds the PEM declaration line that opens a block of the
 // given type, exactly as encoding/pem writes it. Deriving the markers from the
@@ -162,6 +167,60 @@ func countDeclaredBlocks(pemBytes []byte, markers ...[]byte) int {
 	return n
 }
 
+// skippedBlocks accumulates the PEM blocks a parser passed over: how many, and
+// the label of the first one, which is what a diagnostic names so an operator
+// learns WHAT the file held rather than only that something was skipped. Both
+// parsers share it, so the "remember the first label" rule lives in one place
+// and cannot drift between them.
+type skippedBlocks struct {
+	firstType string
+	count     int
+}
+
+// add records one skipped block, keeping the first label seen.
+func (s *skippedBlocks) add(blockType string) {
+	s.count++
+	if s.count == 1 {
+		s.firstType = blockType
+	}
+}
+
+// firstTypeForLog returns the first skipped label bounded for a log line: the
+// PEM type is operator-supplied text capped only by MaxFileSize.
+func (s *skippedBlocks) firstTypeForLog() string {
+	return boundLogText(s.firstType, maxBlockTypeLogLen)
+}
+
+// maxBlockTypeLogLen bounds the PEM block label a parse diagnostic names. A PEM
+// type line is arbitrary operator-supplied text bounded only by MaxFileSize, so
+// it is truncated before it reaches the log.
+const maxBlockTypeLogLen = 64
+
+// boundLogText truncates s to limit bytes for a log-bound diagnostic built from
+// operator-supplied file content, dropping the partial rune the cut may leave
+// behind so the %q form stays readable. It is the single home for that rule:
+// every diagnostic in this package that interpolates input-derived text (a
+// certificate subject, a PEM block label) goes through it.
+func boundLogText(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	return strings.ToValidUTF8(s[:limit], "") + "...(truncated)"
+}
+
+// boundedTextError caps the rendered text of a certificate-derived error. The
+// crypto/x509 parser interpolates certificate-controlled fields into several of
+// its messages with %q (a SAN URI, a name constraint, an extension OID), and a
+// certificate is capped only by MaxFileSize (10 MB), so the unbounded text would
+// put a multi-megabyte line into the log of every scan that retries the pair.
+// It shares the same bound (maxSubjectLogLen) and the same partial-rune handling
+// as every other certificate-controlled interpolation in this package. Unwrap is
+// kept so errors.Is/As still reach the wrapped error.
+type boundedTextError struct{ err error }
+
+func (e boundedTextError) Error() string { return boundLogText(e.err.Error(), maxSubjectLogLen) }
+func (e boundedTextError) Unwrap() error { return e.err }
+
 // --- Private key parsing ---
 
 // parsePrivateKey extracts a private key from PEM data, trying PKCS8
@@ -186,7 +245,8 @@ func countDeclaredBlocks(pemBytes []byte, markers ...[]byte) int {
 func parsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 	declaredKeyBlocks := countDeclaredBlocks(pemBytes, keyBeginMarkers...)
 	var sawEncrypted bool
-	var skipped, decodedKeyBlocks int
+	var decodedKeyBlocks int
+	var skipped skippedBlocks
 	var firstParseErr error
 	for {
 		var block *pem.Block
@@ -214,7 +274,7 @@ func parsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 			decodedKeyBlocks++
 			sawEncrypted = true
 		default:
-			skipped++
+			skipped.add(block.Type)
 		}
 	}
 }
@@ -222,13 +282,15 @@ func parsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 // noPrivateKeyError explains why parsePrivateKey decoded no usable key, in
 // order of specificity: a DER parse failure from a key-labelled block outranks
 // "everything was encrypted", which outranks "there were PEM blocks, none of
-// them a key", which outranks "no PEM block at all". The last two are further
+// them a key" (which names the first skipped block's label, bounded, so an
+// ssh-keygen-format or otherwise unsupported key file is diagnosable from the
+// message alone), which outranks "no PEM block at all". The last two are further
 // qualified by undecodedKeyBlocks, the number of private-key declarations the
 // file carries that encoding/pem dropped (truncated armour, a corrupt body, or
 // a run-together END/BEGIN line), so a damaged key file is not reported with
 // the same sentence as a file that genuinely holds no key. The base sentence is
 // kept as the prefix so existing log matching is unaffected.
-func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped, undecodedKeyBlocks int) error {
+func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped skippedBlocks, undecodedKeyBlocks int) error {
 	switch {
 	case firstParseErr != nil:
 		return firstParseErr
@@ -236,8 +298,9 @@ func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped, undecode
 		return errors.New("private key PEM block is encrypted; decrypt it before use")
 	}
 	msg := "no private key PEM block found"
-	if skipped > 0 {
-		msg = fmt.Sprintf("%s (skipped %d PEM block(s))", msg, skipped)
+	if skipped.count > 0 {
+		msg = fmt.Sprintf("%s (skipped %d PEM block(s), first %q)", msg, skipped.count,
+			skipped.firstTypeForLog())
 	}
 	if undecodedKeyBlocks > 0 {
 		msg = fmt.Sprintf("%s; the file declares %d private-key PEM block(s) that could not be decoded (truncated armour or a corrupt body)", msg, undecodedKeyBlocks)
@@ -348,17 +411,27 @@ type PasswordEncodingIssues struct {
 	// NonBMP means the password holds a rune above U+FFFF, which UCS-2 cannot
 	// represent at all, so every Encode call fails.
 	NonBMP bool
+	// EmbeddedNUL means the password contains U+0000. PKCS#12 passwords are
+	// NUL-terminated BMPStrings (RFC 7292 appendix B.1), and go-pkcs12 encodes
+	// an interior NUL verbatim before appending its own terminator, so no
+	// consumer that builds the BMPString from a NUL-terminated string
+	// (OpenSSL, Windows CryptoAPI) can reproduce the key-derivation input.
+	EmbeddedNUL bool
 }
 
 // InspectPasswordEncoding reports how a PFX password fares under the PKCS#12
-// UCS-2 password encoding. Both shapes are computed in one pass so callers do
+// UCS-2 password encoding. All shapes are computed in one pass so callers do
 // not re-derive the rule: go-pkcs12 rejects a non-BMP password with a message
-// that names neither the password nor the constraint's source, and it silently
-// replaces invalid UTF-8 rune-by-rune. The offending rune or byte is
-// deliberately never reported: it is part of a secret, and the diagnostics
-// built on this query go to the container log.
+// that names neither the password nor the constraint's source, it silently
+// replaces invalid UTF-8 rune-by-rune, and it encodes an interior NUL verbatim
+// into a password format that is itself NUL-terminated. The offending rune or
+// byte is deliberately never reported: it is part of a secret, and the
+// diagnostics built on this query go to the container log.
 func InspectPasswordEncoding(password string) PasswordEncodingIssues {
-	issues := PasswordEncodingIssues{InvalidUTF8: !utf8.ValidString(password)}
+	issues := PasswordEncodingIssues{
+		InvalidUTF8: !utf8.ValidString(password),
+		EmbeddedNUL: strings.ContainsRune(password, 0),
+	}
 	for _, r := range password {
 		if r > 0xFFFF {
 			issues.NonBMP = true

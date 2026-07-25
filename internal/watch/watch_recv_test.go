@@ -22,11 +22,7 @@ import (
 // dead channel forever with no change detection and a still-healthy marker.
 func TestHandleEventRecv_closed_channel_stops_the_loop(t *testing.T) {
 	t.Parallel()
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		t.Skipf("fsnotify unavailable: %v", err)
-	}
-	t.Cleanup(func() { _ = watcher.Close() })
+	watcher := newTestWatcher(t)
 	root := t.TempDir()
 	w := New(root, func(context.Context) {})
 	st := newWatchState(w)
@@ -45,11 +41,7 @@ func TestHandleEventRecv_closed_channel_stops_the_loop(t *testing.T) {
 // debounced rescan, an unrelated file does not, and both keep the loop running.
 func TestHandleEventRecv_arms_the_debounce_only_for_interesting_events(t *testing.T) {
 	t.Parallel()
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		t.Skipf("fsnotify unavailable: %v", err)
-	}
-	t.Cleanup(func() { _ = watcher.Close() })
+	watcher := newTestWatcher(t)
 	root := t.TempDir()
 
 	for _, tc := range []struct {
@@ -85,11 +77,7 @@ func TestHandleEventRecv_arms_the_debounce_only_for_interesting_events(t *testin
 // other watcher error is logged without arming a scan.
 func TestHandleErrorRecv_stops_on_close_and_resyncs_on_overflow(t *testing.T) {
 	t.Parallel()
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		t.Skipf("fsnotify unavailable: %v", err)
-	}
-	t.Cleanup(func() { _ = watcher.Close() })
+	watcher := newTestWatcher(t)
 	root := t.TempDir()
 	nested := filepath.Join(root, "acme-v02", "example.com")
 	if err := os.MkdirAll(nested, 0o750); err != nil {
@@ -133,11 +121,7 @@ func TestHandleErrorRecv_stops_on_close_and_resyncs_on_overflow(t *testing.T) {
 // repaired instead of staying outside the watch set for the process's life.
 func TestHandleFallbackTick_resyncs_the_watch_set_before_scanning(t *testing.T) {
 	t.Parallel()
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		t.Skipf("fsnotify unavailable: %v", err)
-	}
-	t.Cleanup(func() { _ = watcher.Close() })
+	watcher := newTestWatcher(t)
 	root := t.TempDir()
 	nested := filepath.Join(root, "acme-v02", "example.com")
 	if err := os.MkdirAll(nested, 0o750); err != nil {
@@ -164,11 +148,7 @@ func TestHandleFallbackTick_resyncs_the_watch_set_before_scanning(t *testing.T) 
 // health marker while the loop is already returning.
 func TestHandleFallbackTick_skips_the_scan_when_shutdown_cut_the_resync_short(t *testing.T) {
 	t.Parallel()
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		t.Skipf("fsnotify unavailable: %v", err)
-	}
-	t.Cleanup(func() { _ = watcher.Close() })
+	watcher := newTestWatcher(t)
 	root := t.TempDir()
 	scans := 0
 	w := New(root, func(context.Context) { scans++ }, WithFallback(time.Hour))
@@ -190,13 +170,7 @@ func TestHandleFallbackTick_skips_the_scan_when_shutdown_cut_the_resync_short(t 
 // would exit Run and restart the container on a recoverable overflow.
 func TestHandleErrorRecv_keeps_the_loop_running_when_the_overflow_resync_fails(t *testing.T) {
 	t.Parallel()
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		t.Skipf("fsnotify unavailable: %v", err)
-	}
-	if err := watcher.Close(); err != nil {
-		t.Fatalf("setup: watcher.Close() = %v", err)
-	}
+	watcher := newClosedTestWatcher(t)
 	root := t.TempDir()
 	w := New(root, func(context.Context) {})
 	st := newWatchState(w)
@@ -216,11 +190,7 @@ func TestHandleErrorRecv_keeps_the_loop_running_when_the_overflow_resync_fails(t
 // must NOT appear in the watch list after a benign watcher error.
 func TestHandleErrorRecv_does_not_resync_the_watch_set_for_a_benign_error(t *testing.T) {
 	t.Parallel()
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		t.Skipf("fsnotify unavailable: %v", err)
-	}
-	t.Cleanup(func() { _ = watcher.Close() })
+	watcher := newTestWatcher(t)
 	root := t.TempDir()
 	w := New(root, func(context.Context) {})
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
@@ -282,13 +252,7 @@ func TestLostOrShutdown_gives_cancellation_precedence(t *testing.T) {
 // a failed watch-set repair must warn and still scan rather than skip the tick.
 func TestHandleFallbackTick_runs_the_scan_when_resync_fails(t *testing.T) {
 	t.Parallel()
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		t.Skipf("fsnotify unavailable: %v", err)
-	}
-	if err := watcher.Close(); err != nil {
-		t.Fatalf("setup: watcher.Close() = %v", err)
-	}
+	watcher := newClosedTestWatcher(t)
 	scans := 0
 	w := New(t.TempDir(), func(context.Context) { scans++ }, WithFallback(time.Hour))
 	st := newWatchState(w)

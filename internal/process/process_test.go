@@ -144,6 +144,9 @@ func TestScannerRun_returns_error_for_unopenable_input_root(t *testing.T) {
 	if err == nil {
 		t.Fatal("Scanner.Run(unopenable input root) = nil error, want a scan error so the container is marked unhealthy")
 	}
+	if !strings.Contains(err.Error(), "open input root") {
+		t.Errorf("Scanner.Run(unopenable input root) error = %q, want it to identify the input root", err)
+	}
 	if (res != process.ScanResult{}) {
 		t.Errorf("Scanner.Run(unopenable input root) result = %+v, want the zero ScanResult", res)
 	}

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 )
 
 // PairInRoot parses an already-read cert chain and private key, verifies the
@@ -85,12 +84,10 @@ const maxSubjectLogLen = 256
 
 // boundSubject truncates a certificate subject to maxSubjectLogLen bytes for a
 // log-bound diagnostic, dropping the partial rune the cut may leave behind so
-// the %q form stays readable.
+// the %q form stays readable. It is a named alias for the package's shared
+// boundLogText rule.
 func boundSubject(subject string) string {
-	if len(subject) <= maxSubjectLogLen {
-		return subject
-	}
-	return strings.ToValidUTF8(subject[:maxSubjectLogLen], "") + "...(truncated)"
+	return boundLogText(subject, maxSubjectLogLen)
 }
 
 // publicKeyMatches reports whether pub is the public half of signer's private

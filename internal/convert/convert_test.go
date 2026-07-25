@@ -1039,15 +1039,18 @@ func TestPairInRoot_rejects_a_certificate_whose_public_key_type_is_unverifiable(
 
 // TestInspectPasswordEncoding_classifies_both_unencodable_shapes pins the
 // single home of the PKCS#12 UCS-2 password rule that both the conversion gate
-// (toPFXInRoot) and the config startup diagnostic consume. The two shapes are
+// (toPFXInRoot) and the config startup diagnostic consume. The shapes are
 // independent: invalid UTF-8 loses entropy silently, a non-BMP rune makes every
-// Encode call fail, and a password can carry both.
+// Encode call fail, an interior NUL makes the generated PFX unopenable by any
+// consumer that builds the NUL-terminated BMPString itself, and a password can
+// carry several at once.
 func TestInspectPasswordEncoding_classifies_both_unencodable_shapes(t *testing.T) {
 	t.Parallel()
 	for name, tc := range map[string]struct {
 		password        string
 		wantInvalidUTF8 bool
 		wantNonBMP      bool
+		wantEmbeddedNUL bool
 	}{
 		"empty":               {password: ""},
 		"plain ASCII":         {password: "correct-horse"},
@@ -1060,11 +1063,22 @@ func TestInspectPasswordEncoding_classifies_both_unencodable_shapes(t *testing.T
 			wantInvalidUTF8: true,
 			wantNonBMP:      true,
 		},
+		"interior NUL":      {password: "s3cret\x00", wantEmbeddedNUL: true},
+		"NUL padded UTF-16": {password: "s\x00e\x00c\x00", wantEmbeddedNUL: true},
+		"NUL + non-BMP": {
+			password:        "pw\x00-\U0001F600",
+			wantNonBMP:      true,
+			wantEmbeddedNUL: true,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			got := convert.InspectPasswordEncoding(tc.password)
-			want := convert.PasswordEncodingIssues{InvalidUTF8: tc.wantInvalidUTF8, NonBMP: tc.wantNonBMP}
+			want := convert.PasswordEncodingIssues{
+				InvalidUTF8: tc.wantInvalidUTF8,
+				NonBMP:      tc.wantNonBMP,
+				EmbeddedNUL: tc.wantEmbeddedNUL,
+			}
 			if got != want {
 				t.Errorf("convert.InspectPasswordEncoding(%q) = %+v, want %+v", tc.password, got, want)
 			}
@@ -1117,5 +1131,69 @@ func TestPairInRoot_rejects_password_outside_BMP_without_writing(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(dir, "out.pfx")); statErr == nil {
 		t.Error("convert.PairInRoot(non-BMP password) wrote a PFX; want no file")
+	}
+}
+
+// TestPairInRoot_bounds_the_certificate_subject_it_names pins the log-hygiene
+// half of the leaf-last diagnostic: the subject comes out of a PEM file the app
+// does not control and is capped only by MaxFileSize, so an oversized subject
+// must be truncated before it reaches the error every retrying scan logs, and
+// the cut must fall on a rune boundary so the %q form stays readable.
+func TestPairInRoot_bounds_the_certificate_subject_it_names(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name          string
+		commonName    string
+		wantNotInErr  string
+		wantNoEscapes bool
+	}{
+		{
+			name:         "an oversized subject is truncated before it reaches the log",
+			commonName:   strings.Repeat("a", 300) + ".tail-marker.example.com",
+			wantNotInErr: "tail-marker",
+		},
+		{
+			name:          "a multi-byte subject is cut on a rune boundary",
+			commonName:    strings.Repeat("é", 200),
+			wantNoEscapes: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			matchCertPEM, matchKeyPEM := testcerts.GenerateSelfSignedCert(t, tc.commonName, "ecdsa")
+			otherCertPEM, _ := testcerts.GenerateSelfSignedCert(t, "leaf.example.com", "ecdsa")
+			leafLast := append(append([]byte{}, otherCertPEM...), matchCertPEM...)
+
+			dir := t.TempDir()
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatalf("setup: os.OpenRoot: %v", err)
+			}
+			defer root.Close()
+
+			err = convert.PairInRoot(t.Context(), leafLast, matchKeyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
+			if err == nil {
+				t.Fatal("convert.PairInRoot(leaf-last chain) = nil error, want a mismatch error")
+			}
+			got := err.Error()
+			if !strings.Contains(got, "certificate 2 of 2") {
+				t.Errorf("convert.PairInRoot error = %q, want it to name the matching certificate", got)
+			}
+			if !strings.Contains(got, "...(truncated)") {
+				t.Errorf("convert.PairInRoot error = %q, want the oversized subject marked as truncated", got)
+			}
+			if len(got) > 600 {
+				t.Errorf("convert.PairInRoot error is %d bytes, want a bounded diagnostic (the subject is capped at 256 bytes)", len(got))
+			}
+			if tc.wantNotInErr != "" && strings.Contains(got, tc.wantNotInErr) {
+				t.Errorf("convert.PairInRoot error = %q, want it NOT to contain %q from beyond the subject cap", got, tc.wantNotInErr)
+			}
+			if tc.wantNoEscapes && strings.Contains(got, `\x`) {
+				t.Errorf("convert.PairInRoot error = %q, want no escaped partial rune: the cut must drop it", got)
+			}
+			if _, statErr := os.Stat(filepath.Join(dir, "out.pfx")); statErr == nil {
+				t.Error("convert.PairInRoot wrote a pfx for a mismatched pair; want no file written")
+			}
+		})
 	}
 }

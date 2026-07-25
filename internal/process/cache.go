@@ -65,6 +65,13 @@ func (c *hashCache) record(key, fingerprint string) {
 }
 
 // prune removes fingerprint entries for keys not present in seen.
+//
+// The caller owns the one precondition the cache cannot check: seen must be a
+// COMPLETE enumeration of the tree it describes. Pruning against a partial set
+// drops fingerprints for pairs that still exist, and every one of them is then
+// reconverted on the next scan -- rewriting identical PFX bytes and churning the
+// output timestamps the skip-unchanged behaviour exists to keep meaningful.
+// Scanner.Run therefore gates the call on the walk's completeness.
 func (c *hashCache) prune(seen map[string]struct{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -1,4 +1,4 @@
-package process_test
+package convert_test
 
 import (
 	"errors"
@@ -11,6 +11,19 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 )
+
+// convertPairToPath opens destPath's parent directory as an *os.Root and
+// converts the pair into it, so a path-oriented case reads naturally against
+// the root-relative PairInRoot API.
+func convertPairToPath(t *testing.T, certPEM, keyPEM []byte, destPath, password string, enc convert.EncoderType) error {
+	t.Helper()
+	root, err := os.OpenRoot(filepath.Dir(destPath))
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot(%q) = %v", filepath.Dir(destPath), err)
+	}
+	defer func() { _ = root.Close() }()
+	return convert.PairInRoot(t.Context(), certPEM, keyPEM, root, filepath.Base(destPath), password, enc)
+}
 
 // TestPairInRoot_rejects_malformed_input_without_writing_output pins the
 // failure contract at the /input boundary: malformed PEM on either side is

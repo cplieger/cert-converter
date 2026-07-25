@@ -174,6 +174,45 @@ groups:
             so none of the other rules fire and the affected .pfx stays stale or
             absent indefinitely. Mount the certificate path directly instead of
             linking to it, or repair the link target's permissions.
+      - alert: CertConverterNoCertificatePairs
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |= `no certificate pairs found under the input root` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter found no certificate pairs under /input"
+          description: >
+            A scan completed without visiting a single `<name>.crt` with a
+            sibling `<name>.key`, so no PFX is produced at all. This is the
+            signature of a wrong or vanished /input mount, or of a certbot-style
+            directory of fullchain.pem/privkey.pem this app does not read. The
+            outcome is health-neutral — the scan still logs `scan complete` with
+            failed=0 and unreadable=0 — so none of the other rules fire. Check
+            the /input mount and the .crt/.key filename contract. A fresh
+            deployment legitimately reports this until the first issuance; raise
+            `for:` if that is noisy.
+      - alert: CertConverterOutputCleanupDegraded
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |~ `some (stale output temps could not be inspected or removed|output paths could not be inspected during stale temp cleanup)` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter cannot clean up stale /output temp files"
+          description: >
+            The stale-temp sweep could not inspect or unlink temp files left
+            behind by an interrupted atomic write, or could not enter an /output
+            sub-path. Conversions may still succeed, so this is health-neutral
+            and no other rule fires, while `.atomicfile-*.tmp` files — each
+            holding a private key — accumulate under /output indefinitely. Check
+            /output ownership and permissions for the UID in `user:`.
 ```
 
 Thresholds and the `severity` label are starting points; adjust the stall
@@ -187,9 +226,10 @@ of reporting a wedged loop — drop it, exactly as the `health` probe drops its
 staleness deadline in that configuration. The same applies at
 `LOG_LEVEL=warn`/`error`, where the `scan complete` heartbeat is filtered out
 of the logs entirely (see the prerequisite above): both conditions invalidate
-the heartbeat rule. `CertConverterInputSymlinkSkipped` is the exception to the
-prerequisite: it keys on a WARN line, so it works at `debug`, `info`, or `warn`
-and is suppressed only at `error`.
+the heartbeat rule. `CertConverterInputSymlinkSkipped`,
+`CertConverterNoCertificatePairs`, and `CertConverterOutputCleanupDegraded` are
+the exceptions to the prerequisite: they key on WARN lines, so they work at
+`debug`, `info`, or `warn` and are suppressed only at `error`.
 
 ## Healthcheck
 

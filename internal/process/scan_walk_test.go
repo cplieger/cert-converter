@@ -232,3 +232,72 @@ func TestNoteUnwalkableSymlink_reports_resolution_outcomes(t *testing.T) {
 		}
 	}
 }
+
+// TestNoteUnwalkableSymlink_stays_silent_where_nothing_is_hidden pins the
+// silence half of the symlink notice, which its message assertions cannot cover.
+// A dangling link whose target stays inside the root hides no certificates, and
+// a symlinked .crt or .key is already classified and logged by convertEntry, so
+// neither may produce a second line. The warning suppressed here is the one the
+// README's CertConverterInputSymlinkSkipped alert keys on, so a false positive
+// pages an operator over a link that costs nothing. The final case is the
+// control: an unresolvable non-cert link must still warn, so the test cannot
+// pass by silencing everything. Runs serially: it swaps slog.Default().
+func TestNoteUnwalkableSymlink_stays_silent_where_nothing_is_hidden(t *testing.T) {
+	base := t.TempDir()
+	input := filepath.Join(base, "input")
+	outside := filepath.Join(base, "outside")
+	for _, dir := range []string{input, outside} {
+		if err := os.Mkdir(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	links := map[string]string{
+		// A dangling link whose target stays INSIDE the root: the confined Stat
+		// reports ENOENT, which hides nothing, so it must stay silent.
+		"dangling": "no-such-target",
+		// Escaping links under the pair names: convertEntry owns these, so the
+		// notice must not double-report them.
+		"tls.crt": filepath.Join(outside, "real.crt"),
+		"tls.key": filepath.Join(outside, "real.key"),
+		// The control: same escaping target, a name the notice owns.
+		"linked-dir": outside,
+	}
+	for name, target := range links {
+		if err := os.Symlink(target, filepath.Join(input, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inHandle, err := os.OpenRoot(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = inHandle.Close() })
+	sw := &scanWalk{inHandle: inHandle}
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	entry := func(name string) fs.DirEntry {
+		fi, lerr := os.Lstat(filepath.Join(input, name))
+		if lerr != nil {
+			t.Fatal(lerr)
+		}
+		return fs.FileInfoToDirEntry(fi)
+	}
+
+	for _, name := range []string{"dangling", "tls.crt", "tls.key"} {
+		buf.Reset()
+		sw.noteUnwalkableSymlink(name, entry(name))
+		if out := buf.String(); out != "" {
+			t.Errorf("noteUnwalkableSymlink(%q) logged %q, want no output", name, out)
+		}
+	}
+
+	buf.Reset()
+	sw.noteUnwalkableSymlink("linked-dir", entry("linked-dir"))
+	if out := buf.String(); !strings.Contains(out, "skipping symlink that could not be resolved through the input root") {
+		t.Errorf("noteUnwalkableSymlink(%q) logged %q, want the unresolved-symlink warning", "linked-dir", out)
+	}
+}

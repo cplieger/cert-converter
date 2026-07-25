@@ -159,12 +159,15 @@ func allowEmptyPassword(raw string) bool {
 }
 
 // warnUnencodablePassword warns when the PFX password cannot survive the
-// PKCS#12 BMPString (UCS-2) encoding go-pkcs12 applies to it. Two shapes are
-// diagnosed, and neither is rejected here because the value is the operator's
+// PKCS#12 BMPString (UCS-2) encoding go-pkcs12 applies to it. Three shapes are
+// diagnosed, and none is rejected here because the value is the operator's
 // choice: a rune outside the Basic Multilingual Plane makes every Encode call
-// fail, and a byte sequence that is not valid UTF-8 is replaced rune-by-rune
+// fail, a byte sequence that is not valid UTF-8 is replaced rune-by-rune
 // with U+FFFD, so the PFX ends up protected by a different, lower-entropy
-// password than the configured secret. Only the shape is reported, never the
+// password than the configured secret, and a NUL byte (reachable only through
+// PFX_PASSWORD_FILE, since an environment string cannot carry one) is encoded
+// verbatim into a NUL-terminated password format, so no consumer can reproduce
+// the password the PFX was built with. Only the shape is reported, never the
 // value. The recognition itself is convert.InspectPasswordEncoding's — the
 // package that enforces the same invariant before encoding — so this startup
 // diagnostic cannot drift from the conversion gate.
@@ -180,6 +183,9 @@ func warnUnencodablePassword(password string) {
 	case issues.NonBMP:
 		slog.Warn("PFX_PASSWORD contains a character outside the Basic Multilingual Plane; PKCS#12 cannot encode it, so every conversion will fail",
 			"remediation", "use a PFX password made only of BMP characters (ASCII is safest)")
+	case issues.EmbeddedNUL:
+		slog.Warn("PFX_PASSWORD contains a NUL byte; PKCS#12 passwords are NUL-terminated, so generated PFX files cannot be opened with any password a consumer can supply",
+			"remediation", "strip NUL bytes from the secret file (a UTF-16 or NUL-padded file is the usual cause); use a plain UTF-8 text secret")
 	}
 }
 
