@@ -82,3 +82,40 @@ func TestWatchLoop_returns_ErrWatchLost_when_the_watcher_dies(t *testing.T) {
 		t.Fatal("watchLoop did not return after the watcher died; the process would keep running with no change detection")
 	}
 }
+
+// TestPollLoopWithUpgrade_reports_dead_change_detection pins the fix for the one
+// state in which this app could lie about being healthy.
+//
+// With FALLBACK_SCAN_HOURS disabling the periodic rescan AND fsnotify unavailable
+// (inotify instance exhaustion is ordinary host pressure), there is no mechanism
+// left that can ever notice a renewal. The loop used to log once and park on
+// ctx.Done(), returning nil at shutdown. Because the initial scan had already
+// written the health marker, and because disabling the fallback also disarms the
+// probe's freshness deadline, nothing contradicted it: the container reported
+// HEALTHY indefinitely while converting nothing, and the operator's first signal
+// was a downstream service serving an expired certificate.
+//
+// Returning ErrWatchLost reaches main's existing non-zero exit path. That is the
+// right answer here specifically BECAUSE the failure is restart-clearable — unlike
+// a missing volume or a bad symlink, an exhausted inotify table usually clears — so
+// the restart has a real chance of succeeding rather than looping pointlessly.
+func TestPollLoopWithUpgrade_reports_dead_change_detection(t *testing.T) {
+	t.Parallel()
+
+	w := &Watcher{fallback: 0} // FALLBACK_SCAN_HOURS=0/false
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- w.pollLoopWithUpgrade(ctx) }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrWatchLost) {
+			t.Errorf("pollLoopWithUpgrade(no fallback, no fsnotify) = %v, want ErrWatchLost", err)
+		}
+	case <-time.After(2 * time.Second):
+		// The defect was precisely that this call never returns.
+		t.Fatal("pollLoopWithUpgrade did not return; it parked on ctx.Done() with change detection dead, which is what let the container report healthy forever")
+	}
+}

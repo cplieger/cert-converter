@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -98,11 +99,14 @@ func fallbackLogValue(d time.Duration) string {
 // runProbe is a seam: health.RunProbe exits the process, so tests replace it.
 var runProbe = health.RunProbe
 
-// dispatchArgs runs the health probe when argv requests it and warns on an
+// dispatchArgs runs the health probe when argv requests it and REJECTS an
 // unrecognized argument. It returns only when the watcher should start.
-func dispatchArgs(args []string) {
+// It returns the process exit code, or continueToWatcher when argv asks for the
+// watcher. Returning rather than calling os.Exit keeps the decision testable and
+// keeps every exit on one path through run().
+func dispatchArgs(args []string) int {
 	if len(args) <= 1 {
-		return
+		return continueToWatcher
 	}
 	switch args[1] {
 	case "health":
@@ -116,13 +120,32 @@ func dispatchArgs(args []string) {
 		// watcher below.
 		runProbe(health.DefaultPath,
 			health.WithMaxAge(3*config.FallbackInterval()))
+		return continueToWatcher // unreachable in production; runProbe exits
 	default:
-		// Not an error (the watcher takes no arguments), but a mistyped probe
-		// invocation would otherwise silently start a second watcher.
-		slog.Warn("unrecognized argument, starting the watcher",
-			"argument", args[1], "known_subcommands", "health")
+		// Refuse rather than fall through. Falling through reached
+		// marker.Set(false) below, which UNLINKS the resident watcher's health
+		// marker, and then started a second watcher against the same /input and
+		// /output with its own unsynchronised view. A mistyped HEALTHCHECK
+		// override (`healthz`, `--health`) or a stray `docker exec ... status`
+		// therefore made the container report unhealthy until the resident
+		// watcher's next clean cycle, up to FALLBACK_SCAN_HOURS away, and could
+		// leave two processes writing one output tree.
+		//
+		// The ENTRYPOINT takes no arguments, so anything here is a mistake and a
+		// usage error is the honest response.
+		fmt.Fprintf(os.Stderr, "cert-watcher: unrecognized argument %q\n", args[1])
+		fmt.Fprintln(os.Stderr, "usage: cert-watcher            start the watcher (no arguments)")
+		fmt.Fprintln(os.Stderr, "       cert-watcher health     probe the health marker")
+		return exitUsage
 	}
 }
+
+// dispatchArgs sentinels. continueToWatcher is deliberately negative so it can
+// never collide with a real exit code.
+const (
+	continueToWatcher = -1
+	exitUsage         = 2
+)
 
 func main() {
 	os.Exit(run())
@@ -139,7 +162,9 @@ func run() int {
 		slog.Warn("invalid LOG_LEVEL, using default", "value", rawLevel, "default", strings.ToLower(lvl.String()))
 	}
 
-	dispatchArgs(os.Args)
+	if code := dispatchArgs(os.Args); code != continueToWatcher {
+		return code
+	}
 
 	// Clear any marker left by a previous run BEFORE the first failure exit:
 	// /tmp/.healthy lives in the container's writable layer and survives a

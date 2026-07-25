@@ -811,10 +811,14 @@ func TestDispatchArgs(t *testing.T) {
 		args      []string
 		wantProbe bool
 		wantWarn  bool
+		wantCode  int
 	}{
-		{"no argument starts the watcher", []string{"cert-watcher"}, false, false},
-		{"health probes the marker", []string{"cert-watcher", "health"}, true, false},
-		{"typo warns and starts the watcher", []string{"cert-watcher", "helth"}, false, true},
+		{"no argument starts the watcher", []string{"cert-watcher"}, false, false, continueToWatcher},
+		{"health probes the marker", []string{"cert-watcher", "health"}, true, false, continueToWatcher},
+		// A typo used to WARN and fall through, which unlinked the resident
+		// watcher's health marker and started a second watcher over the same
+		// output tree. It is now a usage error that never reaches the marker.
+		{"typo is a usage error and never starts a watcher", []string{"cert-watcher", "helth"}, false, false, exitUsage},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
@@ -826,7 +830,7 @@ func TestDispatchArgs(t *testing.T) {
 			}
 			t.Cleanup(func() { runProbe = prev })
 
-			dispatchArgs(tc.args)
+			gotCode := dispatchArgs(tc.args)
 
 			if probed != tc.wantProbe {
 				t.Errorf("dispatchArgs(%q) probed = %v, want %v", tc.args, probed, tc.wantProbe)
@@ -836,6 +840,9 @@ func TestDispatchArgs(t *testing.T) {
 			}
 			if warned := logs.CountLevel(slog.LevelWarn, "unrecognized argument") > 0; warned != tc.wantWarn {
 				t.Errorf("dispatchArgs(%q) warned = %v, want %v (log: %v)", tc.args, warned, tc.wantWarn, logs.Messages())
+			}
+			if gotCode != tc.wantCode {
+				t.Errorf("dispatchArgs(%q) = %d, want %d", tc.args, gotCode, tc.wantCode)
 			}
 		})
 	}
@@ -871,7 +878,7 @@ func TestDispatchArgs_arms_the_marker_lease(t *testing.T) {
 			}
 			t.Cleanup(func() { runProbe = prev })
 
-			dispatchArgs([]string{"cert-watcher", "health"})
+			_ = dispatchArgs([]string{"cert-watcher", "health"})
 
 			if !probed {
 				t.Fatalf("dispatchArgs([health]) did not probe with FALLBACK_SCAN_HOURS=%q", tc.fallbackHours)

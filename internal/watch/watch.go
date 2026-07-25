@@ -460,10 +460,19 @@ func (st *watchState) handleWatcherError(err error) bool {
 // ErrWatchLost from the watch loop it upgrades into.
 func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) error {
 	if w.fallback <= 0 {
-		slog.Error("polling disabled and fsnotify unavailable; change detection inactive until restart",
+		// Return, do not park. Parking here left the container reporting HEALTHY
+		// forever while converting nothing: the initial scan had already written the
+		// marker, and disabling the fallback also disarms the probe's freshness
+		// deadline, so nothing ever contradicted it. Returning ErrWatchLost reaches
+		// main's existing non-zero exit path, which is correct precisely because this
+		// failure IS restart-clearable — inotify instance exhaustion is usually
+		// transient host pressure, so the retry has a real chance of succeeding.
+		//
+		// This also honours Run's own documented contract: dead change detection is
+		// an error return, not a survivable steady state.
+		slog.Error("polling disabled and fsnotify unavailable; change detection is inactive, exiting for a restart",
 			"remediation", "unset FALLBACK_SCAN_HOURS (or set it above 0) so the periodic rescan covers the missing fsnotify watch")
-		<-ctx.Done()
-		return nil
+		return ErrWatchLost
 	}
 
 	ticker := time.NewTicker(w.fallback)
