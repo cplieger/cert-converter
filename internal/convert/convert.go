@@ -64,14 +64,20 @@ func ReadBoundedFromRoot(ctx context.Context, root *os.Root, rel string, limit i
 
 // --- Certificate chain parsing ---
 
-// ParseCertChain decodes all CERTIFICATE PEM blocks from pemBytes, returning
+// parseCertChain decodes all CERTIFICATE PEM blocks from pemBytes, returning
 // them in order. Blocks of any other type (the private key of a combined
 // cert+key file, for instance) are skipped. It returns an error if no
 // CERTIFICATE block is present, and also if any CERTIFICATE block holds DER
 // that x509 cannot parse: a partially decodable chain is rejected outright
 // rather than silently truncated, because a PFX built from a truncated chain
 // fails validation obscurely at the consumer instead of here.
-func ParseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
+//
+// It is unexported because PairInRoot is the package's only production
+// conversion edge: it owns the cert/key match, the leaf/chain split and the PFX
+// write, so publishing the lower-level parser would offer a second contract
+// that bypasses those invariants with no production consumer. The package's own
+// tests reach it through export_test.go.
+func parseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
 	declaredCertBlocks := countDeclaredCertBlocks(pemBytes)
 	var certs []*x509.Certificate
 	var skipped int
@@ -136,7 +142,7 @@ func countDeclaredCertBlocks(pemBytes []byte) int {
 
 // --- Private key parsing ---
 
-// ParsePrivateKey extracts a private key from PEM data, trying PKCS8
+// parsePrivateKey extracts a private key from PEM data, trying PKCS8
 // first, then falling back to PKCS1 (RSA) and SEC1 (EC) formats.
 //
 // Block selection and DER validation share one loop, so a key file whose first
@@ -147,7 +153,10 @@ func countDeclaredCertBlocks(pemBytes []byte) int {
 // guidance: both a PKCS#8 ENCRYPTED PRIVATE KEY block and a traditional OpenSSL
 // key carrying "Proc-Type: 4,ENCRYPTED" + "DEK-Info" headers hold ciphertext
 // none of the parsers can decode.
-func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
+//
+// Unexported for the same reason as parseCertChain: PairInRoot is the package's
+// only production conversion edge.
+func parsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 	var sawEncrypted bool
 	var skipped int
 	var firstParseErr error
@@ -180,7 +189,7 @@ func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 	}
 }
 
-// noPrivateKeyError explains why ParsePrivateKey decoded no usable key, in
+// noPrivateKeyError explains why parsePrivateKey decoded no usable key, in
 // order of specificity: a DER parse failure from a key-labelled block outranks
 // "everything was encrypted", which outranks "there were PEM blocks, none of
 // them a key", which outranks "no PEM block at all".

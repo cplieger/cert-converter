@@ -9,9 +9,16 @@ import (
 // HashCache tracks a content fingerprint per cert/key key so the scanner can
 // skip pairs whose inputs have not changed since the last scan. It performs NO
 // file I/O: the scanner reads each cert and key once (through a confined
-// *os.Root), derives a fingerprint with Fingerprint, and asks Changed whether
-// it differs from the last seen value. Keeping the cache I/O-free is what lets
+// *os.Root), derives a fingerprint with Fingerprint, and asks Matches whether
+// it equals the last recorded value. Keeping the cache I/O-free is what lets
 // a scan read each input exactly once.
+//
+// Query and mutation are deliberately separate: Matches only reads, and Record
+// commits a fingerprint at the success boundary (after the conversion it
+// describes actually wrote a PFX). A caller therefore cannot leave the cache
+// claiming a pair is current on the strength of a conversion that failed, and an
+// early exit added between the query and the write is safe by construction — no
+// rollback obligation exists to forget.
 type HashCache struct {
 	fingerprints map[string]string
 	mu           sync.Mutex
@@ -36,26 +43,25 @@ func Fingerprint(certPEM, keyPEM []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// Changed reports whether key's fingerprint differs from the last seen value
-// (or was never seen), recording the new fingerprint when it differs. The
-// caller MUST Invalidate(key) if the conversion that follows a true result
-// fails, so the next scan retries rather than treating the failed pair as
-// already current.
-func (c *HashCache) Changed(key, fingerprint string) bool {
+// Matches reports whether key's recorded fingerprint equals fingerprint. It is
+// a pure query: a key never seen (or one whose recorded fingerprint differs)
+// reports false and the cache is left untouched, so a caller that goes on to
+// fail — or returns early for any other reason — owes the cache nothing.
+func (c *HashCache) Matches(key, fingerprint string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if prev, ok := c.fingerprints[key]; ok && prev == fingerprint {
-		return false
-	}
-	c.fingerprints[key] = fingerprint
-	return true
+	prev, ok := c.fingerprints[key]
+	return ok && prev == fingerprint
 }
 
-// Invalidate drops the cached fingerprint for key so the next Changed retries.
-func (c *HashCache) Invalidate(key string) {
+// Record commits fingerprint as key's current value. Callers must call it only
+// after the conversion the fingerprint describes has succeeded, so a later scan
+// can trust a Matches hit to mean "the recorded output was actually produced
+// from these bytes".
+func (c *HashCache) Record(key, fingerprint string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.fingerprints, key)
+	c.fingerprints[key] = fingerprint
 }
 
 // Prune removes fingerprint entries for keys not present in seen.

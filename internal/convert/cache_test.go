@@ -56,68 +56,76 @@ func TestFingerprint(t *testing.T) {
 	})
 }
 
-func TestChanged(t *testing.T) {
+func TestMatches(t *testing.T) {
 	t.Parallel()
 	cache := convert.NewHashCache()
 
-	if !cache.Changed("key", "fp-1") {
-		t.Error("first call should report changed")
+	if cache.Matches("key", "fp-1") {
+		t.Error("a key never recorded must not match")
 	}
-	if cache.Changed("key", "fp-1") {
-		t.Error("second call with same fingerprint should report not changed")
+	cache.Record("key", "fp-1")
+	if !cache.Matches("key", "fp-1") {
+		t.Error("a recorded fingerprint must match")
 	}
-	if !cache.Changed("key", "fp-2") {
-		t.Error("call with a new fingerprint should report changed")
+	if cache.Matches("key", "fp-2") {
+		t.Error("a different fingerprint must not match the recorded one")
 	}
-	if cache.Changed("key", "fp-2") {
-		t.Error("repeat of the new fingerprint should report not changed")
+	cache.Record("key", "fp-2")
+	if !cache.Matches("key", "fp-2") {
+		t.Error("the newly recorded fingerprint must match")
+	}
+	if cache.Matches("key", "fp-1") {
+		t.Error("the superseded fingerprint must no longer match")
 	}
 }
 
-func TestChanged_distinct_keys_are_independent(t *testing.T) {
+// TestMatches_is_a_pure_query pins the read-only contract Record depends on: a
+// miss must never record anything, so a conversion that fails after the query
+// (nothing recorded) leaves the pair due for a retry with no rollback.
+func TestMatches_is_a_pure_query(t *testing.T) {
 	t.Parallel()
 	cache := convert.NewHashCache()
-	if !cache.Changed("a", "fp") {
-		t.Fatal("first call for key a should report changed")
+
+	cache.Record("key", "fp-old")
+	for range 3 {
+		if cache.Matches("key", "fp-new") {
+			t.Fatal("Matches must report false for a fingerprint that was never recorded")
+		}
 	}
-	if !cache.Changed("b", "fp") {
-		t.Error("first call for key b should report changed even with the same fingerprint")
+	if !cache.Matches("key", "fp-old") {
+		t.Error("a failed Matches query must not disturb the recorded fingerprint")
 	}
 }
 
-func TestInvalidate(t *testing.T) {
+func TestMatches_distinct_keys_are_independent(t *testing.T) {
 	t.Parallel()
 	cache := convert.NewHashCache()
-
-	if !cache.Changed("key", "fp") {
-		t.Fatal("first call should report changed")
+	cache.Record("a", "fp")
+	if !cache.Matches("a", "fp") {
+		t.Fatal("key a should match its recorded fingerprint")
 	}
-	if cache.Changed("key", "fp") {
-		t.Fatal("second call should report not changed")
-	}
-	cache.Invalidate("key")
-	if !cache.Changed("key", "fp") {
-		t.Error("should report changed after Invalidate")
+	if cache.Matches("b", "fp") {
+		t.Error("key b must not match on the strength of key a's fingerprint")
 	}
 }
 
 func TestPrune(t *testing.T) {
 	t.Parallel()
 	cache := convert.NewHashCache()
-	cache.Changed("keep", "fp1")
-	cache.Changed("drop", "fp2")
+	cache.Record("keep", "fp1")
+	cache.Record("drop", "fp2")
 
 	cache.Prune(map[string]struct{}{"keep": {}})
 
-	if cache.Changed("keep", "fp1") {
+	if !cache.Matches("keep", "fp1") {
 		t.Error("pruned a key that was in the seen set")
 	}
-	if !cache.Changed("drop", "fp2") {
+	if cache.Matches("drop", "fp2") {
 		t.Error("key absent from seen set should have been pruned")
 	}
 }
 
-func TestChanged_concurrent_callers_are_race_free(t *testing.T) {
+func TestCache_concurrent_callers_are_race_free(t *testing.T) {
 	t.Parallel()
 	cache := convert.NewHashCache()
 
@@ -137,39 +145,44 @@ func TestChanged_concurrent_callers_are_race_free(t *testing.T) {
 			defer wg.Done()
 			for i := range iterations {
 				k := keys[(gi*iterations+i)%nKeys]
-				_ = cache.Changed(k, fmt.Sprintf("fp-%d", i))
-				if i%5 == 0 {
-					cache.Invalidate(k)
+				fp := fmt.Sprintf("fp-%d", i)
+				if !cache.Matches(k, fp) {
+					cache.Record(k, fp)
 				}
 			}
 		}(g)
 	}
 	wg.Wait()
 
-	if !cache.Changed("post-concurrent", "fp") {
-		t.Error("Changed should return true for a new key after the concurrent run")
+	if cache.Matches("post-concurrent", "fp") {
+		t.Error("Matches should return false for a key never recorded during the concurrent run")
 	}
 }
 
-func TestChanged_invariant_idempotent_between_changes(t *testing.T) {
+func TestCache_invariant_record_then_match_is_stable(t *testing.T) {
 	t.Parallel()
 	rapid.Check(t, func(t *rapid.T) {
 		cache := convert.NewHashCache()
 		key := rapid.String().Draw(t, "key")
 		fp := rapid.String().Draw(t, "fingerprint")
 
-		if !cache.Changed(key, fp) {
-			t.Error("first Changed call must return true")
+		if cache.Matches(key, fp) {
+			t.Error("an unrecorded key must not match")
 		}
+		cache.Record(key, fp)
 		n := rapid.IntRange(0, 20).Draw(t, "subsequent_calls")
 		for range n {
-			if cache.Changed(key, fp) {
-				t.Error("subsequent Changed call returned true without a fingerprint change or Invalidate")
+			if !cache.Matches(key, fp) {
+				t.Error("a recorded fingerprint must keep matching without another Record")
 			}
 		}
-		cache.Invalidate(key)
-		if !cache.Changed(key, fp) {
-			t.Error("Changed after Invalidate must return true")
+		other := fp + "\x00differs"
+		if cache.Matches(key, other) {
+			t.Error("a different fingerprint must not match the recorded one")
+		}
+		// The failed query above must not have mutated the entry.
+		if !cache.Matches(key, fp) {
+			t.Error("a failed Matches query must leave the recorded fingerprint intact")
 		}
 	})
 }

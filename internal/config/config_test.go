@@ -100,6 +100,9 @@ func TestParseFallbackInterval_clamps_excessive_values(t *testing.T) {
 		{"at ceiling unclamped", "87600", 87600 * time.Hour},
 		{"one above ceiling clamped", "87601", 87600 * time.Hour},
 		{"far above ceiling clamped", "1000000", 87600 * time.Hour},
+		// Beyond int64: overflow is still a positive above-ceiling value, so it
+		// clamps rather than falling through to the 6h default.
+		{"beyond int64 clamped", "999999999999999999999999999999", 87600 * time.Hour},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := parseFallbackInterval(tc.val); got != tc.want {

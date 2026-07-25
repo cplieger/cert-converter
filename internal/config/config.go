@@ -61,11 +61,12 @@ func Load() (Config, error) {
 	if password == "" && !allowEmpty {
 		return Config{}, ErrEmptyPassword
 	}
-	if path := os.Getenv("PFX_PASSWORD_FILE"); path != "" {
-		// Record the secret's SOURCE (never its value) so an operator can
-		// confirm a mounted secret was actually consumed instead of silently
-		// falling back to PFX_PASSWORD.
-		slog.Info("PFX password read from PFX_PASSWORD_FILE", "path", path)
+	if os.Getenv("PFX_PASSWORD_FILE") != "" {
+		// Record the secret's SOURCE (never its value, and never the configured
+		// path — that would export the internal secret-mount topology to every
+		// log reader) so an operator can confirm a mounted secret was actually
+		// consumed instead of silently falling back to PFX_PASSWORD.
+		slog.Info("PFX password configured", "source", "PFX_PASSWORD_FILE")
 	}
 
 	encName := convert.EncoderName(os.Getenv("PFX_ENCODER"))
@@ -136,12 +137,17 @@ func parseFallbackInterval(v string) time.Duration {
 	case "":
 		return defaultFallbackInterval
 	default:
-		if n, err := strconv.Atoi(trimmed); err == nil && n > 0 {
-			if n > maxFallbackHours {
-				slog.Warn("FALLBACK_SCAN_HOURS too large, clamping",
-					"value", v, "max_hours", maxFallbackHours)
-				n = maxFallbackHours
-			}
+		n, err := strconv.ParseInt(trimmed, 10, 64)
+		// A value too large for int64 is still a positive above-ceiling value:
+		// clamp it like 87601 instead of misreading overflow as malformed input.
+		positiveOverflow := errors.Is(err, strconv.ErrRange) &&
+			!strings.HasPrefix(trimmed, "-")
+		if positiveOverflow || (err == nil && n > maxFallbackHours) {
+			slog.Warn("FALLBACK_SCAN_HOURS too large, clamping",
+				"value", v, "max_hours", maxFallbackHours)
+			return time.Duration(maxFallbackHours) * time.Hour
+		}
+		if err == nil && n > 0 {
 			return time.Duration(n) * time.Hour
 		}
 		slog.Warn("invalid FALLBACK_SCAN_HOURS, using default",

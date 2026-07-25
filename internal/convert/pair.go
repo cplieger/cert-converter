@@ -31,7 +31,7 @@ func PairInRoot(ctx context.Context, certPEM, keyPEM []byte, outRoot *os.Root, r
 // returning the leaf, the remaining chain (the CA certificates, if any) and the
 // key. It is the front half of PairInRoot and performs no file I/O.
 func parseAndMatch(certPEM, keyPEM []byte) (leaf *x509.Certificate, caCerts []*x509.Certificate, privKey crypto.PrivateKey, err error) {
-	chain, err := ParseCertChain(certPEM)
+	chain, err := parseCertChain(certPEM)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("parse cert chain: %w", err)
 	}
@@ -39,7 +39,7 @@ func parseAndMatch(certPEM, keyPEM []byte) (leaf *x509.Certificate, caCerts []*x
 	if len(chain) > 1 {
 		caCerts = chain[1:]
 	}
-	privKey, err = ParsePrivateKey(keyPEM)
+	privKey, err = parsePrivateKey(keyPEM)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("parse private key: %w", err)
 	}

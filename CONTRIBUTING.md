@@ -27,13 +27,16 @@ scan, then hand off to the watcher. The real work lives under
   separately from `Load` so `main` can install the logger before the
   config load emits its own WARN lines) from the environment, then
   delegates encoder selection to `convert.EncoderName`.
-- `internal/convert`: PEM parsing (`ParseCertChain`, `ParsePrivateKey`),
-  cert/key matching and confined PFX encoding (`PairInRoot`, the only
-  PFX-writing entry point; its encoder helper is package-internal), the
-  encoder-profile mapping (`EncoderName` /
+- `internal/convert`: PEM parsing (package-internal; reached through
+  `PairInRoot`, which is the package's only production conversion edge —
+  the parsers are exposed to the package's own tests via
+  `export_test.go`), cert/key matching and confined PFX encoding
+  (`PairInRoot`, the only PFX-writing entry point; its encoder helper is
+  package-internal), the encoder-profile mapping (`EncoderName` /
   `EncoderFor` / `PickEncoder` in `encoder.go`; unknown values warn and
   fall back to `modern2023`), and the SHA-256 `HashCache` for
-  skip-unchanged detection.
+  skip-unchanged detection (a read-only `Matches` query plus a `Record`
+  commit applied only after a successful conversion).
 - `internal/process`: orchestration, plus `types.go` holding the
   package-private `conversionStatus` outcome enum (`ScanResult` is the
   package's only exported outcome surface). `Scanner.Run` walks `/input`,
