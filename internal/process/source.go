@@ -2,9 +2,7 @@ package process
 
 import (
 	"context"
-	"fmt"
 	"os"
-	"syscall"
 
 	"github.com/cplieger/atomicfile/v2"
 )
@@ -48,22 +46,12 @@ func (s *source) readBounded(ctx context.Context, rel string) ([]byte, error) {
 // readBoundedLimit is readBounded with an explicit cap. Production always uses
 // maxFileSize; the parameter exists so the size-cap boundary itself is testable
 // without writing a 10 MB fixture per case.
+//
+// atomicfile owns the confined read: it opens through the root non-blocking (so a
+// FIFO planted in the watched tree is rejected rather than wedging the scan's only
+// goroutine), requires a regular file, and stats the open handle rather than the
+// path. Hand-rolling that sequence here is what deferred finding l-f27 named — the
+// same three details the library already guarantees on the write side.
 func (s *source) readBoundedLimit(ctx context.Context, rel string, limit int64) ([]byte, error) {
-	// O_NONBLOCK so a FIFO or device node planted in the watched tree cannot
-	// wedge the open: open(2) on a FIFO with no writer blocks forever, and the
-	// scan runs on the watch loop's only goroutine. The flag has no effect on a
-	// regular file, the only input cert-converter accepts.
-	f, err := s.root.OpenFile(rel, os.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s: not a regular file (type %s)", rel, fi.Mode().Type())
-	}
-	return atomicfile.ReadBoundedFile(ctx, f, limit)
+	return atomicfile.ReadBoundedInRoot(ctx, s.root, rel, limit)
 }
