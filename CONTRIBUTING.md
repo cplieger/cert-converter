@@ -33,7 +33,8 @@ scan, then hand off to the watcher. The real work lives under
   fall back to `modern2023`), and the SHA-256 `HashCache` for
   skip-unchanged detection.
 - `internal/process`: orchestration, plus `types.go` holding the
-  `ConversionStatus` outcome enum. `Scanner.Run` walks `/input`,
+  package-private `conversionStatus` outcome enum (`ScanResult` is the
+  package's only exported outcome surface). `Scanner.Run` walks `/input`,
   pairs each `*.crt` with its sibling `*.key`, consults the cache, and
   writes PFX files to `/output`, returning a `ScanResult` count summary.
 - `internal/watch`: fsnotify watch loop with a debounce window and a

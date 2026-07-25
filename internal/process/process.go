@@ -163,6 +163,12 @@ func reapStaleTemp(outHandle *os.Root, rel string, d fs.DirEntry, cutoff time.Ti
 		return false
 	}
 	if err := outHandle.Remove(rel); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// The temp vanished between the Lstat and the unlink (a co-mounting
+			// reaper, or the write it belonged to finishing its rename). Benign,
+			// exactly as atomicfile's own CleanupStaleTemps treats it.
+			return false
+		}
 		slog.Warn("stale temp cleanup failed", "path", rel, "error", err)
 		return false
 	}

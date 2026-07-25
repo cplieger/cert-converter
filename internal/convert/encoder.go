@@ -19,8 +19,9 @@ const (
 )
 
 // PickEncoder returns the PFX encoder and its name based on the raw env value.
-// It lives beside ToPFX, the only other consumer of the PKCS#12 vendor types,
-// so the vendor dependency stays confined to the package that encodes.
+// It composes EncoderName and EncoderFor for callers that need both the
+// normalized app-owned name and the resolved vendor encoder, keeping the
+// PKCS#12 vendor types confined to this package.
 func PickEncoder(raw string) (enc *pkcs12.Encoder, name EncoderType) {
 	name = EncoderName(raw)
 	return EncoderFor(name), name

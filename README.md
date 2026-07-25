@@ -42,7 +42,7 @@ services:
     user: "1000:1000"  # match your host user
 
     environment:
-      PFX_PASSWORD: "your-pfx-password"  # required
+      PFX_PASSWORD: "${PFX_PASSWORD:-}"  # set this or configure PFX_PASSWORD_FILE; empty is rejected
       PFX_ENCODER: "modern2023"  # modern2023, modern2026, legacy, or legacyrc2
 
     volumes:

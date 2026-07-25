@@ -68,7 +68,7 @@ func ReadBoundedFromRoot(ctx context.Context, root *os.Root, rel string, limit i
 // rather than silently truncated, because a PFX built from a truncated chain
 // fails validation obscurely at the consumer instead of here.
 func ParseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
-	declaredCertBlocks := bytes.Count(pemBytes, []byte("-----BEGIN CERTIFICATE-----"))
+	declaredCertBlocks := countDeclaredCertBlocks(pemBytes)
 	var certs []*x509.Certificate
 	var skipped int
 
@@ -100,6 +100,25 @@ func ParseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
 		return nil, errors.New("no certificate PEM block found")
 	}
 	return certs, nil
+}
+
+// certBeginMarker is the PEM declaration line that opens a CERTIFICATE block.
+var certBeginMarker = []byte("-----BEGIN CERTIFICATE-----")
+
+// countDeclaredCertBlocks counts CERTIFICATE declarations the way encoding/pem
+// recognises them: a marker declares a block only when it occupies a complete
+// line, so the same text embedded in surrounding prose (which pem.Decode
+// ignores entirely) is not counted and cannot make a valid chain look
+// malformed. Trailing carriage returns, spaces and tabs are stripped first,
+// mirroring pem's own line handling so CRLF input counts identically.
+func countDeclaredCertBlocks(pemBytes []byte) int {
+	var n int
+	for _, line := range bytes.Split(pemBytes, []byte("\n")) {
+		if bytes.Equal(bytes.TrimRight(line, " \t\r"), certBeginMarker) {
+			n++
+		}
+	}
+	return n
 }
 
 // ParsePrivateKey extracts a private key from PEM data, trying PKCS8
@@ -173,7 +192,7 @@ func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped int) erro
 func isEncryptedPEMBlock(block *pem.Block) bool {
 	for name, value := range block.Headers {
 		switch {
-		case strings.EqualFold(name, "DEK-Info") && strings.TrimSpace(value) != "":
+		case strings.EqualFold(name, "DEK-Info") && value != "":
 			return true
 		case strings.EqualFold(name, "Proc-Type"):
 			normalized := strings.ToUpper(strings.Join(strings.Fields(value), ""))

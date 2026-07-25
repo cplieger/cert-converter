@@ -118,6 +118,30 @@ func TestParseCertChain_skips_non_certificate_blocks(t *testing.T) {
 	}
 }
 
+func TestParseCertChain_ignores_marker_text_inside_prose(t *testing.T) {
+	t.Parallel()
+	certPEM, _ := testcerts.GenerateSelfSignedCert(t, "prose", "ecdsa")
+
+	// encoding/pem only treats a marker as a declaration when it occupies a
+	// whole line, so prose mentioning the marker must not be counted as a
+	// second declared block (which would make a valid chain look malformed).
+	withProse := make([]byte, 0, len(certPEM)+64)
+	withProse = append(withProse, certPEM...)
+	withProse = append(withProse, []byte("see -----BEGIN CERTIFICATE----- above\n")...)
+
+	certs, err := convert.ParseCertChain(withProse)
+	if err != nil {
+		t.Fatalf("convert.ParseCertChain(cert + prose) = error %v, want nil", err)
+	}
+	if len(certs) != 1 {
+		t.Fatalf("convert.ParseCertChain(cert + prose) returned %d certs, want 1", len(certs))
+	}
+	if certs[0].Subject.CommonName != "prose" {
+		t.Errorf("convert.ParseCertChain(cert + prose) CN = %q, want %q",
+			certs[0].Subject.CommonName, "prose")
+	}
+}
+
 func TestParseCertChain_empty_input(t *testing.T) {
 	t.Parallel()
 	_, err := convert.ParseCertChain([]byte{})

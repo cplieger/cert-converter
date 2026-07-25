@@ -452,3 +452,49 @@ func TestScannerRun_reconverts_cert_recreated_after_removal(t *testing.T) {
 		t.Errorf("post-recreate Run Unchanged = %d, want 1 (only the untouched anchor pair stays an unchanged skip)", res3.Unchanged)
 	}
 }
+
+
+// TestScannerRun_regenerates_pfx_when_output_is_not_a_regular_file pins the
+// output-TYPE half of the cache-coherence gate: an unchanged input whose prior
+// PFX has been replaced by a non-regular file must not be reported as an
+// unchanged skip, and the broken output must surface as a conversion failure so
+// health reports it. A revert of outputIsCurrent's Lstat+IsRegular check back to
+// a bare Stat passes the rest of the suite.
+func TestScannerRun_regenerates_pfx_when_output_is_not_a_regular_file(t *testing.T) {
+	t.Parallel()
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "probe.example.com", "ecdsa")
+	if err := os.WriteFile(filepath.Join(certsRoot, "probe.crt"), certPEM, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(certsRoot, "probe.key"), keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanner := newScanner(certsRoot, outRoot)
+	res1, err := scanner.Run(t.Context())
+	if err != nil || res1.Converted != 1 {
+		t.Fatalf("first Run = %+v, %v, want Converted 1 and nil", res1, err)
+	}
+
+	// The broken-output case: the prior PFX is replaced by a directory, so no
+	// usable PFX exists even though the input fingerprint is unchanged.
+	pfxPath := filepath.Join(outRoot, "probe.pfx")
+	if err := os.Remove(pfxPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(pfxPath, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	res2, err := scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("second Run = %v, want nil (a per-entry failure is not a scan error)", err)
+	}
+	if res2.Unchanged != 0 {
+		t.Errorf("second Run Unchanged = %d, want 0 (a non-regular output must never satisfy the skip gate)", res2.Unchanged)
+	}
+	if res2.Failed != 1 {
+		t.Errorf("second Run Failed = %d, want 1 (a broken output contract must be reported so health goes unhealthy)", res2.Failed)
+	}
+}

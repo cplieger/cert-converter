@@ -317,9 +317,17 @@ func TestConvertToPFX_unwritable_dest(t *testing.T) {
 	t.Parallel()
 
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
-	err := convertPairToPath(t.Context(), certPEM, keyPEM, "/nonexistent/dir/out.pfx", "", convert.EncNameModern2023)
+	// Open the root over a real directory so the failure happens inside the
+	// confined write (atomicfile under PairInRoot) instead of in the test
+	// helper's own os.OpenRoot: rel names a subdirectory that does not exist.
+	root, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, filepath.Join("no-such-dir", "out.pfx"), "", convert.EncNameModern2023)
 	if err == nil {
-		t.Fatal("convert.PairInRoot should fail for unwritable destination")
+		t.Fatal("convert.PairInRoot should fail for an unwritable destination")
 	}
 }
 
