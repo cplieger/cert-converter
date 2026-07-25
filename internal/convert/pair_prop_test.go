@@ -54,7 +54,7 @@ func TestPairInRoot_accepts_a_pair_iff_the_key_matches_the_leaf(t *testing.T) {
 		destPath := filepath.Join(outDir, relName)
 		_ = os.Remove(destPath)
 
-		err := convert.PairInRoot(rt.Context(), pool[i].certPEM, pool[j].keyPEM, outRoot, relName, "pw", convert.EncNameModern2023)
+		_, err := convert.PairInRoot(rt.Context(), pool[i].certPEM, pool[j].keyPEM, outRoot, relName, "pw", convert.EncNameModern2023)
 
 		if i == j {
 			if err != nil {
@@ -77,8 +77,8 @@ func TestPairInRoot_accepts_a_pair_iff_the_key_matches_the_leaf(t *testing.T) {
 		if err == nil {
 			rt.Fatalf("PairInRoot(cert %s, key %s) = nil, want a mismatch error", pool[i].name, pool[j].name)
 		}
-		if !strings.Contains(err.Error(), "does not match") {
-			rt.Errorf("PairInRoot(cert %s, key %s) error = %q, want it to report the key does not match", pool[i].name, pool[j].name, err.Error())
+		if !strings.Contains(err.Error(), "matches any of") {
+			rt.Errorf("PairInRoot(cert %s, key %s) error = %q, want it to report that no key matched any certificate", pool[i].name, pool[j].name, err.Error())
 		}
 		if _, statErr := os.Stat(destPath); !errors.Is(statErr, fs.ErrNotExist) {
 			rt.Errorf("PairInRoot(cert %s, key %s) left a pfx at %q (stat error %v); want no output for a mismatched pair", pool[i].name, pool[j].name, destPath, statErr)

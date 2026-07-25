@@ -132,3 +132,89 @@ func GenerateCertChain(tb testing.TB) (leafPEM, keyPEM, caPEM, chainPEM []byte) 
 	chainPEM = append(chainPEM, caPEM...)
 	return leafPEM, keyPEM, caPEM, chainPEM
 }
+
+// ChainMaterial carries every piece of a generated CA -> leaf chain that a test
+// needs to assemble an adversarial bundle: each certificate's PEM, each private
+// key's PEM, and two alternative leaves reusing the leaf's key.
+//
+// GenerateCertChain deliberately exposes only the leaf's key, which is right for
+// the happy path but cannot express the cases identity selection has to get
+// right: a bundle whose supplied key belongs to the ISSUER, or one holding a
+// renewed certificate that reuses its predecessor's key.
+type ChainMaterial struct {
+	// CAPEM is the self-signed CA that issued LeafPEM.
+	CAPEM []byte
+	// CAKeyPEM is the CA's private key: the input that must be REJECTED as an
+	// identity when the CA has issued another certificate in the same bundle.
+	CAKeyPEM []byte
+	// LeafPEM is the end-entity certificate, issued by CAPEM.
+	LeafPEM []byte
+	// LeafKeyPEM is LeafPEM's private key.
+	LeafKeyPEM []byte
+	// RenewedPEM is a second end-entity certificate reusing LeafKeyPEM with a
+	// later NotBefore, both currently valid: the renewed-certificate tie.
+	RenewedPEM []byte
+	// FutureRenewedPEM reuses LeafKeyPEM with a NotBefore in the FUTURE. It has
+	// the latest NotBefore of the three, so a tie-break that ranked on NotBefore
+	// alone would select a certificate no consumer will accept yet.
+	FutureRenewedPEM []byte
+}
+
+// GenerateChainMaterial builds a CA, a leaf it issued, and two alternative leaves
+// that reuse the leaf's key (one currently valid, one future-dated).
+func GenerateChainMaterial(tb FatalTB) ChainMaterial {
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	now := time.Now()
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Material Test CA"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	caDER, caPEM := signCert(tb, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	caKeyDER, err := x509.MarshalPKCS8PrivateKey(caKey)
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	leafKeyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	// Three certificates over ONE key: the original, a renewal already in force,
+	// and a renewal that has not started yet.
+	newLeaf := func(serial int64, cn string, notBefore time.Time) []byte {
+		tmpl := &x509.Certificate{
+			SerialNumber: big.NewInt(serial),
+			Subject:      pkix.Name{CommonName: cn},
+			NotBefore:    notBefore,
+			NotAfter:     notBefore.Add(24 * time.Hour),
+		}
+		_, leafPEM := signCert(tb, tmpl, caCert, &leafKey.PublicKey, caKey)
+		return leafPEM
+	}
+
+	return ChainMaterial{
+		CAPEM:            caPEM,
+		CAKeyPEM:         pem.EncodeToMemory(&pem.Block{Type: pemTypeKeyPKCS8, Bytes: caKeyDER}),
+		LeafPEM:          newLeaf(2, "material-leaf.example.com", now.Add(-30*time.Minute)),
+		LeafKeyPEM:       pem.EncodeToMemory(&pem.Block{Type: pemTypeKeyPKCS8, Bytes: leafKeyDER}),
+		RenewedPEM:       newLeaf(3, "material-renewed.example.com", now.Add(-10*time.Minute)),
+		FutureRenewedPEM: newLeaf(4, "material-future.example.com", now.Add(12*time.Hour)),
+	}
+}

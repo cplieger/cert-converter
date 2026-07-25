@@ -218,7 +218,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		dest := filepath.Join(dir, "out.pfx")
 		password := "test"
 
-		if err := convert.PairInRoot(t.Context(), data, data, root, "out.pfx", password, convert.EncNameModern2023); err != nil {
+		if _, err := convert.PairInRoot(t.Context(), data, data, root, "out.pfx", password, convert.EncNameModern2023); err != nil {
 			t.Fatalf("PairInRoot rejected a parseable matching certificate and key: %v", err)
 		}
 

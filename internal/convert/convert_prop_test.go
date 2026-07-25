@@ -47,7 +47,7 @@ func TestPairInRoot_password_guard_agrees_with_the_pkcs12_encoder(t *testing.T) 
 		}
 		issues := convert.InspectPasswordEncoding(password)
 
-		err := convert.PairInRoot(rt.Context(), certPEM, keyPEM, root, "out.pfx", password, convert.EncNameModern2023)
+		_, err := convert.PairInRoot(rt.Context(), certPEM, keyPEM, root, "out.pfx", password, convert.EncNameModern2023)
 
 		if issues.NonBMP {
 			if err == nil {

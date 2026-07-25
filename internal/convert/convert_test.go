@@ -597,7 +597,7 @@ func TestPairInRoot_returns_wrapped_error_on_write_failure(t *testing.T) {
 	// write does not create parents, so the atomic temp-file create fails.
 	rel := filepath.Join("missing-subdir", "out.pfx")
 
-	err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, rel, "pw", convert.EncNameModern2023)
+	_, err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, rel, "pw", convert.EncNameModern2023)
 	if err == nil {
 		t.Fatal("convert.PairInRoot(unwritable destination) = nil error, want a wrapped write error")
 	}
@@ -634,7 +634,7 @@ func TestPairInRoot_round_trips_chain_for_every_encoder_profile(t *testing.T) {
 			defer root.Close()
 			rel := name + ".pfx"
 			destPath := filepath.Join(dir, rel)
-			if err := convert.PairInRoot(t.Context(), chainPEM, keyPEM, root, rel, "pw", enc); err != nil {
+			if _, err := convert.PairInRoot(t.Context(), chainPEM, keyPEM, root, rel, "pw", enc); err != nil {
 				t.Fatalf("convert.PairInRoot(%s) = error %v, want nil", name, err)
 			}
 			info, err := os.Stat(destPath)
@@ -681,7 +681,7 @@ func TestPairInRoot_confines_the_write_to_the_output_root(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer root.Close()
-		if err := convert.PairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023); err != nil {
+		if _, err := convert.PairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023); err != nil {
 			t.Fatalf("convert.PairInRoot = error %v, want nil", err)
 		}
 		info, statErr := os.Stat(filepath.Join(dir, "out.pfx"))
@@ -720,7 +720,7 @@ func TestPairInRoot_confines_the_write_to_the_output_root(t *testing.T) {
 		}
 		defer root.Close()
 
-		writeErr := convert.PairInRoot(t.Context(), certPEM, keyPEM, root, "escape/out.pfx", "pw", convert.EncNameModern2023)
+		_, writeErr := convert.PairInRoot(t.Context(), certPEM, keyPEM, root, "escape/out.pfx", "pw", convert.EncNameModern2023)
 		if _, statErr := os.Stat(filepath.Join(outside, "out.pfx")); statErr == nil {
 			t.Error("convert.PairInRoot wrote the PFX outside the output root through a symlinked subdirectory")
 		}
@@ -736,60 +736,101 @@ func TestPairInRoot_confines_the_write_to_the_output_root(t *testing.T) {
 // log matching depends on it) and additionally names the position and subject of
 // the certificate that does match. An unrelated key, where no certificate in the
 // chain matches, must get the base sentence alone and no leaf-last claim.
-func TestPairInRoot_names_the_matching_certificate_for_a_leaf_last_chain(t *testing.T) {
+// TestPairInRoot_resolves_a_leaf_last_chain_structurally pins the behaviour that
+// replaced the old leaf-last DIAGNOSTIC. Identity selection is key-first, so the
+// certificate the private key matches is the identity wherever it sits in the
+// file: a bundle pasted root-first now converts correctly instead of failing with
+// remediation advice, and the reordering is reported as an observation rather
+// than an error. The emitted bundle must still be leaf-first, because PKCS#12
+// stores an ordered bag sequence and decoders (go-pkcs12's own included) read the
+// first certificate as the leaf.
+//
+// An unrelated key, where no certificate matches, still fails — and now says
+// exactly what was examined instead of claiming the chain is misordered.
+func TestPairInRoot_resolves_a_leaf_last_chain_structurally(t *testing.T) {
 	t.Parallel()
 	leafPEM, keyPEM, caPEM, _ := testcerts.GenerateCertChain(t)
 	_, otherKeyPEM := testcerts.GenerateSelfSignedCert(t, "unrelated.example.com", "ecdsa")
 
 	leafLast := append(append([]byte{}, caPEM...), leafPEM...)
 
-	for _, tc := range []struct {
-		name       string
-		certPEM    []byte
-		keyPEM     []byte
-		wantInErr  []string
-		notInError string
-	}{
-		{
-			name:      "leaf-last chain names the certificate that does match",
-			certPEM:   leafLast,
-			keyPEM:    keyPEM,
-			wantInErr: []string{"does not match the private key", "certificate 2 of 2", "leaf.example.com", "ordered leaf-last"},
-		},
-		{
-			name:       "an unrelated key gets the plain mismatch error",
-			certPEM:    leafLast,
-			keyPEM:     otherKeyPEM,
-			wantInErr:  []string{"does not match the private key"},
-			notInError: "leaf-last",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			dir := t.TempDir()
-			root, err := os.OpenRoot(dir)
-			if err != nil {
-				t.Fatalf("setup: os.OpenRoot: %v", err)
-			}
-			defer root.Close()
+	t.Run("a leaf-last chain converts and reports the reordering", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			t.Fatalf("setup: os.OpenRoot: %v", err)
+		}
+		defer root.Close()
 
-			err = convert.PairInRoot(t.Context(), tc.certPEM, tc.keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
-			if err == nil {
-				t.Fatal("convert.PairInRoot(mismatched leaf) = nil error, want a mismatch error")
+		obs, err := convert.PairInRoot(t.Context(), leafLast, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
+		if err != nil {
+			t.Fatalf("convert.PairInRoot(leaf-last chain) = error %v, want nil: the key identifies the leaf regardless of position", err)
+		}
+
+		pfxData, err := os.ReadFile(filepath.Join(dir, "out.pfx"))
+		if err != nil {
+			t.Fatalf("read pfx: %v", err)
+		}
+		_, leaf, cas, err := pkcs12.DecodeChain(pfxData, "pw")
+		if err != nil {
+			t.Fatalf("decode pfx: %v", err)
+		}
+		// DecodeChain treats the FIRST bag as the leaf, so this assertion is also
+		// what proves the emitted order was repaired, not merely accepted.
+		if leaf.Subject.CommonName != "leaf.example.com" {
+			t.Errorf("round-tripped leaf CN = %q, want %q: the bundle was not emitted leaf-first", leaf.Subject.CommonName, "leaf.example.com")
+		}
+		if len(cas) != 1 {
+			t.Fatalf("round-tripped %d CA certs, want 1", len(cas))
+		}
+		if cas[0].Subject.CommonName != "Test CA" {
+			t.Errorf("round-tripped CA CN = %q, want %q", cas[0].Subject.CommonName, "Test CA")
+		}
+
+		if !hasObservation(obs, convert.ObsLeafNotFirst) {
+			t.Errorf("observations = %v, want one of kind %q", obs, convert.ObsLeafNotFirst)
+		}
+	})
+
+	t.Run("an unrelated key reports what was examined", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			t.Fatalf("setup: os.OpenRoot: %v", err)
+		}
+		defer root.Close()
+
+		_, err = convert.PairInRoot(t.Context(), leafLast, otherKeyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
+		if err == nil {
+			t.Fatal("convert.PairInRoot(unrelated key) = nil error, want a no-match error")
+		}
+		got := err.Error()
+		for _, want := range []string{"none of the 1 private key block(s)", "2 certificate(s)"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("error = %q, want it to contain %q", got, want)
 			}
-			for _, want := range tc.wantInErr {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("convert.PairInRoot error = %q, want it to contain %q", err.Error(), want)
-				}
-			}
-			if tc.notInError != "" && strings.Contains(err.Error(), tc.notInError) {
-				t.Errorf("convert.PairInRoot error = %q, want it NOT to contain %q", err.Error(), tc.notInError)
-			}
-			if _, statErr := os.Stat(filepath.Join(dir, "out.pfx")); statErr == nil {
-				t.Error("convert.PairInRoot wrote a pfx for a mismatched pair; want no file written")
-			}
-		})
+		}
+		// The old code guessed "the chain is ordered leaf-last" from any later
+		// match. Nothing may claim an ordering conclusion it did not measure.
+		if strings.Contains(got, "leaf-last") {
+			t.Errorf("error = %q, want no leaf-last claim for a key that matches nothing", got)
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, "out.pfx")); statErr == nil {
+			t.Error("convert.PairInRoot wrote a pfx for a pair with no matching certificate; want no file written")
+		}
+	})
+}
+
+// hasObservation reports whether obs contains one of kind k.
+func hasObservation(obs []convert.Observation, k convert.ObservationKind) bool {
+	for _, o := range obs {
+		if o.Kind == k {
+			return true
+		}
 	}
+	return false
 }
 
 // TestParseCertChain_counts_declarations_the_way_pem_recognises_them pins the
@@ -1022,7 +1063,7 @@ func TestPairInRoot_rejects_a_certificate_whose_public_key_type_is_unverifiable(
 	}
 	defer root.Close()
 
-	err = convert.PairInRoot(t.Context(), patched, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
+	_, err = convert.PairInRoot(t.Context(), patched, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
 	if err == nil {
 		t.Fatal("convert.PairInRoot(certificate with an unknown public key algorithm) = nil error, want an unverifiable-key-type error")
 	}
@@ -1119,7 +1160,7 @@ func TestPairInRoot_rejects_password_outside_BMP_without_writing(t *testing.T) {
 	defer root.Close()
 
 	const password = "safe-\U0001F642-suffix"
-	err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", password, convert.EncNameModern2023)
+	_, err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", password, convert.EncNameModern2023)
 	if err == nil {
 		t.Fatal("convert.PairInRoot(non-BMP password) = nil error, want rejection")
 	}
@@ -1135,34 +1176,41 @@ func TestPairInRoot_rejects_password_outside_BMP_without_writing(t *testing.T) {
 }
 
 // TestPairInRoot_bounds_the_certificate_subject_it_names pins the log-hygiene
-// half of the leaf-last diagnostic: the subject comes out of a PEM file the app
-// does not control and is capped only by MaxFileSize, so an oversized subject
-// must be truncated before it reaches the error every retrying scan logs, and
-// the cut must fall on a rune boundary so the %q form stays readable.
+// rule for certificate-controlled text. A subject comes out of a PEM file the app
+// does not control and is capped only by MaxFileSize, so it must be truncated
+// before it reaches anything logged, and the cut must fall on a rune boundary so
+// the %q form stays readable.
+//
+// The vehicle is the excluded-extras observation, which is where subjects now
+// flow: identity selection is structural, so a certificate that is not an
+// ancestor of the leaf is EXCLUDED from the bundle and named in an observation
+// rather than silently embedded. That doubles as the regression test for the
+// former `caCerts = chain[1:]` behaviour, which put every certificate after
+// position 0 into the PFX whether or not it belonged to the chain.
 func TestPairInRoot_bounds_the_certificate_subject_it_names(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name          string
-		commonName    string
+		extraCN       string
 		wantNotInErr  string
 		wantNoEscapes bool
 	}{
 		{
 			name:         "an oversized subject is truncated before it reaches the log",
-			commonName:   strings.Repeat("a", 300) + ".tail-marker.example.com",
+			extraCN:      strings.Repeat("a", 300) + ".tail-marker.example.com",
 			wantNotInErr: "tail-marker",
 		},
 		{
 			name:          "a multi-byte subject is cut on a rune boundary",
-			commonName:    strings.Repeat("é", 200),
+			extraCN:       strings.Repeat("é", 200),
 			wantNoEscapes: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			matchCertPEM, matchKeyPEM := testcerts.GenerateSelfSignedCert(t, tc.commonName, "ecdsa")
-			otherCertPEM, _ := testcerts.GenerateSelfSignedCert(t, "leaf.example.com", "ecdsa")
-			leafLast := append(append([]byte{}, otherCertPEM...), matchCertPEM...)
+			identityCertPEM, identityKeyPEM := testcerts.GenerateSelfSignedCert(t, "identity.example.com", "ecdsa")
+			extraCertPEM, _ := testcerts.GenerateSelfSignedCert(t, tc.extraCN, "ecdsa")
+			bundle := append(append([]byte{}, identityCertPEM...), extraCertPEM...)
 
 			dir := t.TempDir()
 			root, err := os.OpenRoot(dir)
@@ -1171,28 +1219,48 @@ func TestPairInRoot_bounds_the_certificate_subject_it_names(t *testing.T) {
 			}
 			defer root.Close()
 
-			err = convert.PairInRoot(t.Context(), leafLast, matchKeyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
-			if err == nil {
-				t.Fatal("convert.PairInRoot(leaf-last chain) = nil error, want a mismatch error")
+			obs, err := convert.PairInRoot(t.Context(), bundle, identityKeyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
+			if err != nil {
+				t.Fatalf("convert.PairInRoot(bundle with an unrelated extra cert) = error %v, want nil: the extra is excluded, not fatal", err)
 			}
-			got := err.Error()
-			if !strings.Contains(got, "certificate 2 of 2") {
-				t.Errorf("convert.PairInRoot error = %q, want it to name the matching certificate", got)
+
+			var detail string
+			for _, o := range obs {
+				if o.Kind == convert.ObsExtraCertsExcluded {
+					detail = o.Detail
+				}
 			}
-			if !strings.Contains(got, "...(truncated)") {
-				t.Errorf("convert.PairInRoot error = %q, want the oversized subject marked as truncated", got)
+			if detail == "" {
+				t.Fatalf("observations = %v, want one of kind %q naming the excluded certificate", obs, convert.ObsExtraCertsExcluded)
 			}
-			if len(got) > 600 {
-				t.Errorf("convert.PairInRoot error is %d bytes, want a bounded diagnostic (the subject is capped at 256 bytes)", len(got))
+			if !strings.Contains(detail, "...(truncated)") {
+				t.Errorf("observation detail = %q, want the oversized subject marked as truncated", detail)
 			}
-			if tc.wantNotInErr != "" && strings.Contains(got, tc.wantNotInErr) {
-				t.Errorf("convert.PairInRoot error = %q, want it NOT to contain %q from beyond the subject cap", got, tc.wantNotInErr)
+			if len(detail) > 600 {
+				t.Errorf("observation detail is %d bytes, want a bounded diagnostic (the subject is capped at 256 bytes)", len(detail))
 			}
-			if tc.wantNoEscapes && strings.Contains(got, `\x`) {
-				t.Errorf("convert.PairInRoot error = %q, want no escaped partial rune: the cut must drop it", got)
+			if tc.wantNotInErr != "" && strings.Contains(detail, tc.wantNotInErr) {
+				t.Errorf("observation detail = %q, want it NOT to contain %q from beyond the subject cap", detail, tc.wantNotInErr)
 			}
-			if _, statErr := os.Stat(filepath.Join(dir, "out.pfx")); statErr == nil {
-				t.Error("convert.PairInRoot wrote a pfx for a mismatched pair; want no file written")
+			if tc.wantNoEscapes && strings.Contains(detail, `\x`) {
+				t.Errorf("observation detail = %q, want no escaped partial rune: the cut must drop it", detail)
+			}
+
+			// The unrelated certificate must not reach the bundle: embedding it
+			// would pollute the trust chain the consumer sees.
+			pfxData, err := os.ReadFile(filepath.Join(dir, "out.pfx"))
+			if err != nil {
+				t.Fatalf("read pfx: %v", err)
+			}
+			_, leaf, cas, err := pkcs12.DecodeChain(pfxData, "pw")
+			if err != nil {
+				t.Fatalf("decode pfx: %v", err)
+			}
+			if leaf.Subject.CommonName != "identity.example.com" {
+				t.Errorf("round-tripped leaf CN = %q, want %q", leaf.Subject.CommonName, "identity.example.com")
+			}
+			if len(cas) != 0 {
+				t.Errorf("round-tripped %d CA cert(s), want 0: an unrelated certificate must be excluded, not embedded", len(cas))
 			}
 		})
 	}

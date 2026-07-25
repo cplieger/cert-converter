@@ -565,7 +565,12 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	}
 
 	slog.Debug("converting cert pair", "path", rel)
-	if err := convert.PairInRoot(ctx, certPEM, keyPEM, sw.outHandle, pfxRel, sw.password, sw.enc); err != nil {
+	observations, err := convert.PairInRoot(ctx, certPEM, keyPEM, sw.outHandle, pfxRel, sw.password, sw.enc)
+	// Observations describe the INPUT, so they are worth logging whether or not
+	// the write succeeded: a reordered bundle or a multi-key file is the same
+	// operator-visible fact either way.
+	logConversionObservations(rel, observations)
+	if err != nil {
 		return failEntry(rel, "conversion failed", err)
 	}
 	// Commit the fingerprint at the success boundary: only now is it true that
@@ -574,6 +579,26 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 
 	slog.Info("wrote pfx", "path", pfxRel)
 	return statusConverted
+}
+
+// logConversionObservations surfaces Analyse's non-fatal findings about a pair's
+// input. Every one of them is a CONVERTIBLE condition, so none flips health:
+// health tracks conversion failures, and these all converted. They are logged at
+// WARN because each names something the operator probably did not intend, except
+// the duplicate-block artefact, which is noise at that level.
+//
+// Observations arrive only from an actual conversion, so a pair that is skipped
+// as unchanged does not re-emit them on every scan; a pair that keeps FAILING
+// re-emits them per attempt, which matches how the failure itself is logged.
+// Detail is already bounded by convert, so it needs no further truncation here.
+func logConversionObservations(rel string, observations []convert.Observation) {
+	for _, o := range observations {
+		if o.Kind == convert.ObsDuplicateCerts {
+			slog.Debug("cert input observation", "path", rel, "kind", string(o.Kind), "detail", o.Detail)
+			continue
+		}
+		slog.Warn("cert input observation", "path", rel, "kind", string(o.Kind), "detail", o.Detail)
+	}
 }
 
 // outputIsCurrent reports whether the entry can be skipped as already

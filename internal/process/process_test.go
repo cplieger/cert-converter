@@ -36,7 +36,8 @@ func convertPairToPath(t *testing.T, certPEM, keyPEM []byte, destPath, password 
 		t.Fatalf("setup: os.OpenRoot(%q) = %v", filepath.Dir(destPath), err)
 	}
 	defer func() { _ = root.Close() }()
-	return convert.PairInRoot(t.Context(), certPEM, keyPEM, root, filepath.Base(destPath), password, enc)
+	_, err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, filepath.Base(destPath), password, enc)
+	return err
 }
 
 func TestPairInRoot_rejects_mismatched_cert_and_key(t *testing.T) {
@@ -50,8 +51,8 @@ func TestPairInRoot_rejects_mismatched_cert_and_key(t *testing.T) {
 	if err == nil {
 		t.Fatal("convert.PairInRoot(mismatched cert/key) = nil, want error")
 	}
-	if !strings.Contains(err.Error(), "does not match") {
-		t.Errorf("convert.PairInRoot(mismatched) error = %q, want it to contain %q", err.Error(), "does not match")
+	if !strings.Contains(err.Error(), "matches any of") {
+		t.Errorf("convert.PairInRoot(mismatched) error = %q, want it to contain %q", err.Error(), "matches any of")
 	}
 	if _, statErr := os.Stat(destPath); statErr == nil {
 		t.Errorf("convert.PairInRoot wrote a pfx at %q for a mismatched pair; want no file written", destPath)

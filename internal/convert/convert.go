@@ -242,41 +242,84 @@ func (e boundedTextError) Unwrap() error { return e.err }
 //
 // Unexported for the same reason as parseCertChain: PairInRoot is the package's
 // only production conversion edge.
+//
+// It returns the FIRST usable key. Identity resolution needs every key in the
+// file (a rotation appends the new key beside the old, and only the one matching
+// the leaf is correct), so Analyse calls parsePrivateKeys instead; this wrapper
+// remains for the single-key callers and for the parser's own direct coverage.
 func parsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
+	keys, err := parsePrivateKeys(pemBytes)
+	if err != nil {
+		return nil, err
+	}
+	return keys[0], nil
+}
+
+// keyScan accumulates what one pass over a key file's PEM blocks learned: the
+// usable keys, plus the evidence noPrivateKeyError needs when there are none.
+// Hoisting the loop body onto it keeps parsePrivateKeys a plain drain loop.
+//
+// Field order is chosen for pointer-region packing (govet fieldalignment), not
+// for narrative order: the two pointer-bearing fields lead, then skippedBlocks
+// whose string leads it, then the scalars.
+type keyScan struct {
+	keys          []crypto.PrivateKey
+	firstParseErr error
+	skipped       skippedBlocks
+	decodedBlocks int
+	sawEncrypted  bool
+}
+
+// visit classifies one PEM block, applying the same per-block rules the
+// single-key parser has always used.
+func (s *keyScan) visit(block *pem.Block) {
+	switch block.Type {
+	case pemTypePrivateKey, pemTypeRSAPrivateKey, pemTypeECPrivateKey:
+		s.decodedBlocks++
+		if isEncryptedPEMBlock(block) {
+			s.sawEncrypted = true
+			return
+		}
+		key, err := parsePrivateKeyBlock(block)
+		if err != nil {
+			if s.firstParseErr == nil {
+				s.firstParseErr = err
+			}
+			return
+		}
+		s.keys = append(s.keys, key)
+	case pemTypeEncryptedPrivateKey:
+		s.decodedBlocks++
+		s.sawEncrypted = true
+	default:
+		s.skipped.add(block.Type)
+	}
+}
+
+// parsePrivateKeys extracts EVERY usable private key from PEM data, in file
+// order, applying parsePrivateKey's per-block rules to each block.
+//
+// Returning all of them is what lets identity selection be key-first: with more
+// than one key present, the certificate decides which key is correct, so
+// discarding the later blocks would throw away the evidence. The diagnostics are
+// unchanged and are consulted only when NO block yields a key, so an input that
+// used to produce a key still produces the same first key.
+func parsePrivateKeys(pemBytes []byte) ([]crypto.PrivateKey, error) {
 	declaredKeyBlocks := countDeclaredBlocks(pemBytes, keyBeginMarkers...)
-	var sawEncrypted bool
-	var decodedKeyBlocks int
-	var skipped skippedBlocks
-	var firstParseErr error
+	var scan keyScan
 	for {
 		var block *pem.Block
 		block, pemBytes = pem.Decode(pemBytes)
 		if block == nil {
-			return nil, noPrivateKeyError(firstParseErr, sawEncrypted, skipped, declaredKeyBlocks-decodedKeyBlocks)
+			break
 		}
-
-		switch block.Type {
-		case pemTypePrivateKey, pemTypeRSAPrivateKey, pemTypeECPrivateKey:
-			decodedKeyBlocks++
-			if isEncryptedPEMBlock(block) {
-				sawEncrypted = true
-				continue
-			}
-			key, err := parsePrivateKeyBlock(block)
-			if err != nil {
-				if firstParseErr == nil {
-					firstParseErr = err
-				}
-				continue
-			}
-			return key, nil
-		case pemTypeEncryptedPrivateKey:
-			decodedKeyBlocks++
-			sawEncrypted = true
-		default:
-			skipped.add(block.Type)
-		}
+		scan.visit(block)
 	}
+	if len(scan.keys) == 0 {
+		return nil, noPrivateKeyError(scan.firstParseErr, scan.sawEncrypted, scan.skipped,
+			declaredKeyBlocks-scan.decodedBlocks)
+	}
+	return scan.keys, nil
 }
 
 // noPrivateKeyError explains why parsePrivateKey decoded no usable key, in

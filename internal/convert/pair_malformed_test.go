@@ -22,7 +22,8 @@ func convertPairToPath(t *testing.T, certPEM, keyPEM []byte, destPath, password 
 		t.Fatalf("setup: os.OpenRoot(%q) = %v", filepath.Dir(destPath), err)
 	}
 	defer func() { _ = root.Close() }()
-	return convert.PairInRoot(t.Context(), certPEM, keyPEM, root, filepath.Base(destPath), password, enc)
+	_, err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, filepath.Base(destPath), password, enc)
+	return err
 }
 
 // TestPairInRoot_rejects_malformed_input_without_writing_output pins the

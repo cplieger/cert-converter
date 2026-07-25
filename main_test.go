@@ -46,7 +46,8 @@ func convertPairToPath(ctx context.Context, certPEM, keyPEM []byte, destPath, pa
 		return err
 	}
 	defer func() { _ = root.Close() }()
-	return convert.PairInRoot(ctx, certPEM, keyPEM, root, filepath.Base(destPath), password, enc)
+	_, err = convert.PairInRoot(ctx, certPEM, keyPEM, root, filepath.Base(destPath), password, enc)
+	return err
 }
 
 // writeCertAndKey writes a .crt and .key file pair into dir and returns their paths.
@@ -325,7 +326,7 @@ func TestConvertToPFX_unwritable_dest(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, filepath.Join("no-such-dir", "out.pfx"), "", convert.EncNameModern2023)
+	_, err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, filepath.Join("no-such-dir", "out.pfx"), "", convert.EncNameModern2023)
 	if err == nil {
 		t.Fatal("convert.PairInRoot should fail for an unwritable destination")
 	}
