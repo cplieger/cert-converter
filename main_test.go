@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/x509"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -355,7 +357,7 @@ func TestScanAndSetHealth_clears_marker_when_scan_errors(t *testing.T) {
 	}
 }
 
-func TestRunAndSetHealth_unreadable_subdir_stays_healthy(t *testing.T) {
+func TestScanAndSetHealth_unreadable_subdir_stays_healthy(t *testing.T) {
 	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
 		t.Skip("chmod 0 does not block root / differs on Windows")
 	}
@@ -373,16 +375,56 @@ func TestRunAndSetHealth_unreadable_subdir_stays_healthy(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(bad, 0o755) })
-	result, err := scanner.Run(context.Background())
+	// Establish the precondition (the blocked subdir really is unreadable) with a
+	// throwaway scanner, then drive the production wiring itself so the WARN branch
+	// and the marker decision in scanAndSetHealth are the code under test.
+	precheck, _ := newTestScanner(inDir, outDir, "", pkcs12.Modern2023)
+	result, err := precheck.Run(context.Background())
 	if err != nil {
 		t.Fatalf("scan should not error on an unreadable subdir: %v", err)
 	}
-	marker.Set(healthyAfterScan(result))
 	if result.Unreadable == 0 {
 		t.Fatal("expected Unreadable > 0 from the blocked subdir (test precondition)")
 	}
+	// The remediation hint is the only observable effect of the Unreadable
+	// branch, so capture the default logger to pin it. slog.Default is
+	// process-global; this test is deliberately serial (no t.Parallel).
+	var logs bytes.Buffer
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+
+	scanAndSetHealth(t.Context(), scanner, marker)
+
+	if !strings.Contains(logs.String(), "unreadable") {
+		t.Errorf("scanAndSetHealth should WARN about unreadable /input paths; got logs %q", logs.String())
+	}
 	if _, statErr := os.Stat(markerPath); statErr != nil {
 		t.Fatalf("marker must stay healthy when only Unreadable>0 and no conversion failed: %v", statErr)
+	}
+}
+
+// TestScanAndSetHealth_cancelled_context_leaves_marker_untouched pins the
+// shutdown contract: a cancelled scan is not a conversion failure, so the
+// marker keeps whatever value the last completed scan gave it.
+func TestScanAndSetHealth_cancelled_context_leaves_marker_untouched(t *testing.T) {
+	t.Parallel()
+
+	marker, markerPath := newTestMarker(t)
+	marker.Set(true) // start healthy; a cancellation must not clear it
+
+	inDir, outDir := t.TempDir(), t.TempDir()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "cancelled", "ecdsa")
+	writeCertAndKey(t, inDir, "cancelled", certPEM, keyPEM)
+	scanner, _ := newTestScanner(inDir, outDir, "", pkcs12.Modern2023)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	scanAndSetHealth(ctx, scanner, marker)
+
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Errorf("marker must be left untouched when the scan is cancelled by shutdown: %v", err)
 	}
 }
 

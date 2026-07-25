@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"software.sslmate.com/src/go-pkcs12"
 )
@@ -98,7 +97,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	}
 	defer func() { _ = outHandle.Close() }()
 
-	reapStaleTemps(outRoot)
+	reapStaleTemps(outHandle)
 
 	sw := &scanWalk{
 		scanner:   s,
@@ -130,40 +129,85 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	return result, walkErr
 }
 
+// tempNamePrefix, tempNameSuffix and staleTempAge mirror atomicfile's temp
+// naming (".atomicfile-<digits>.tmp") and the reap cutoff, so the sweep stays
+// matched to the writes and can never delete a caller-owned file.
+const (
+	tempNamePrefix = ".atomicfile-"
+	tempNameSuffix = ".tmp"
+	staleTempAge   = time.Hour
+)
+
+// isStaleTempName reports whether name has exactly atomicfile's temp shape:
+// ".atomicfile-" followed by one or more decimal digits and ".tmp".
+func isStaleTempName(name string) bool {
+	digits, ok := strings.CutPrefix(name, tempNamePrefix)
+	if !ok {
+		return false
+	}
+	digits, ok = strings.CutSuffix(digits, tempNameSuffix)
+	if !ok || digits == "" {
+		return false
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // reapStaleTemps removes PFX temp files orphaned by an interrupted atomic write
-// (a crash between temp-write and rename). WriteFile names temps
-// ".atomicfile-<digits>.tmp" and the default CleanupStaleTemps recognizes
-// exactly that shape, so the sweep stays matched to the writes. The sweep
-// covers the whole output tree, not just its top level: CleanupStaleTemps does
-// not recurse and atomicfile stages its temp in the TARGET directory, so a
-// nested cert (input/example.com/cert.crt) leaves its orphaned temp in the
-// matching nested output directory.
-func reapStaleTemps(outRoot string) {
+// (a crash between temp-write and rename). It matches exactly the
+// ".atomicfile-<digits>.tmp" shape atomicfile stages, so a caller-owned file in
+// /output is never touched. The sweep covers the whole output tree, not just its
+// top level: atomicfile stages its temp in the TARGET directory, so a nested
+// cert (input/example.com/cert.crt) leaves its orphaned temp in the matching
+// nested output directory.
+//
+// Every step — the walk, the stat and the unlink — is root-relative through
+// outHandle, so a co-mounting writer that swaps an output subdirectory for a
+// symlink mid-sweep cannot redirect the deletion outside the mounted volume.
+// Reconstructed ambient paths are deliberately never handed to
+// atomicfile.CleanupStaleTemps: that helper reopens the directory outside the
+// root, which would reintroduce exactly that TOCTOU window.
+func reapStaleTemps(outHandle *os.Root) {
 	total := 0
-	walkErr := filepath.WalkDir(outRoot, func(path string, d fs.DirEntry, err error) error {
+	cutoff := time.Now().Add(-staleTempAge)
+	walkErr := fs.WalkDir(outHandle.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if err != nil {
-			if path == outRoot {
+			if rel == "." {
 				return err
 			}
-			slog.Debug("skipping unreadable output path during temp cleanup", "path", path, "error", err)
+			slog.Debug("skipping unreadable output path during temp cleanup", "path", rel, "error", err)
 			return nil
 		}
-		if !d.IsDir() {
+		if d.IsDir() || !isStaleTempName(d.Name()) {
 			return nil
 		}
-		removed, cleanErr := atomicfile.CleanupStaleTemps(path, time.Hour)
-		if cleanErr != nil {
-			slog.Warn("stale temp cleanup failed", "dir", path, "error", cleanErr)
+		// Re-check through the root before unlinking: only a regular file older
+		// than the cutoff is a reclaimable orphan, and Lstat never follows a
+		// symlink planted under the temp's name.
+		fi, statErr := outHandle.Lstat(rel)
+		if statErr != nil {
+			slog.Debug("skipping unstattable temp during cleanup", "path", rel, "error", statErr)
 			return nil
 		}
-		total += removed
+		if !fi.Mode().IsRegular() || fi.ModTime().After(cutoff) {
+			return nil
+		}
+		if rmErr := outHandle.Remove(rel); rmErr != nil {
+			slog.Warn("stale temp cleanup failed", "path", rel, "error", rmErr)
+			return nil
+		}
+		total++
 		return nil
 	})
 	if walkErr != nil {
-		slog.Warn("stale temp cleanup failed", "dir", outRoot, "error", walkErr)
+		slog.Warn("stale temp cleanup failed", "dir", outHandle.Name(), "error", walkErr)
 	}
 	if total > 0 {
-		slog.Debug("reaped stale temp files", "dir", outRoot, "count", total)
+		slog.Debug("reaped stale temp files", "dir", outHandle.Name(), "count", total)
 	}
 }
 

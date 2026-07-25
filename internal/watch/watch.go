@@ -42,8 +42,6 @@ func WithFallback(d time.Duration) Option {
 // config owns the documented FALLBACK_SCAN_HOURS default, so an un-optioned
 // Watcher has no debounce window and no fallback rescan.
 func New(root string, onChange func(ctx context.Context), opts ...Option) *Watcher {
-	// Timing policy is chosen by the composition root (main.go) and injected via
-	// WithDebounce/WithFallback; config owns the documented FALLBACK_SCAN_HOURS default.
 	w := &Watcher{
 		root:     root,
 		onChange: onChange,

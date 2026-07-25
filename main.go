@@ -144,7 +144,7 @@ func run() int {
 		CertsRoot: certsRootDir,
 		OutRoot:   outputDir,
 		Password:  cfg.Password,
-		Encoder:   cfg.Encoder,
+		Encoder:   convert.EncoderFor(cfg.EncoderName),
 	})
 
 	// runAndSetHealth adapts scanAndSetHealth to the watcher's on-change

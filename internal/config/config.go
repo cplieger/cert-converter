@@ -11,7 +11,6 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/envx"
-	"software.sslmate.com/src/go-pkcs12"
 )
 
 // envFalseValue is the lexical "disabled" marker for env-var parsers.
@@ -22,10 +21,12 @@ const envFalseValue = "false"
 // "false" disables the fallback rescan.
 const defaultFallbackInterval = 6 * time.Hour
 
-// Config holds the runtime configuration for cert-converter.
+// Config holds the runtime configuration for cert-converter. The PFX encoder is
+// carried as the app-owned convert.EncoderType name, not as a go-pkcs12 value:
+// the vendor type stays confined to internal/convert, and the composition root
+// resolves the name with convert.EncoderFor.
 type Config struct {
 	Password         string
-	Encoder          *pkcs12.Encoder
 	EncoderName      convert.EncoderType
 	FallbackInterval time.Duration
 }
@@ -64,11 +65,10 @@ func Load() (Config, error) {
 		return Config{}, ErrEmptyPassword
 	}
 
-	enc, encName := convert.PickEncoder(os.Getenv("PFX_ENCODER"))
+	encName := convert.EncoderName(os.Getenv("PFX_ENCODER"))
 
 	return Config{
 		Password:         password,
-		Encoder:          enc,
 		EncoderName:      encName,
 		FallbackInterval: FallbackInterval(),
 	}, nil

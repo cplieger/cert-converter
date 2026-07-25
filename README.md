@@ -138,7 +138,7 @@ The attack surface is small: the container reads PEM files from one mounted dire
 
 File paths are hardcoded (`/input`, `/output`), not configurable via env vars. Input reads are confined to `/input` through an `os.Root`, so a symlink planted in the input tree cannot redirect a read outside it. Reads are TOCTOU-safe (stat and read from the same handle) with a 10 MB cap, and malformed PEM or key input is rejected and logged rather than converted. PFX writes use an atomic temp-file + rename.
 
-`PFX_PASSWORD` is the only protection on the private key inside every generated `.pfx`, and a compose env value is visible to anyone who can query the Docker daemon (`docker inspect`). Keep it out of a compose file you commit: reference it indirectly with `PFX_PASSWORD: "${PFX_PASSWORD:?}"` and supply the value from a gitignored `.env` beside the compose file (`chmod 600 .env`), an `env_file:` entry, or your secrets manager.
+`PFX_PASSWORD` is the only protection on the private key inside every generated `.pfx`. A literal compose value, `${...}` interpolation, and `env_file:` all become container environment and are visible to anyone who can query the Docker daemon (`docker inspect`). To avoid that exposure, mount a Docker/Podman secret and set `PFX_PASSWORD_FILE` to its in-container path; the file value takes precedence over `PFX_PASSWORD`. If an environment value is acceptable, `PFX_PASSWORD: "${PFX_PASSWORD:?}"` plus a mode-`0600`, gitignored `.env` keeps the value out of the committed compose file, but not out of container inspection.
 
 One accepted scanner finding: semgrep flags the fixed `/tmp/.healthy` health-marker path as a predictable temp file. The path is a deliberate contract between the main process and the `health` probe inside the container's own filesystem, not shared state an attacker can pre-create. Live scan results are on the repository's Security tab.
 
@@ -172,6 +172,7 @@ Updated automatically via [Renovate](https://github.com/renovatebot/renovate) an
 | github.com/cplieger/health         | [GitHub](https://github.com/cplieger/health)                     |
 | github.com/cplieger/slogx          | [GitHub](https://github.com/cplieger/slogx)                      |
 | github.com/cplieger/atomicfile/v2  | [GitHub](https://github.com/cplieger/atomicfile)                 |
+| github.com/cplieger/envx           | [GitHub](https://github.com/cplieger/envx)                       |
 
 ## Credits
 

@@ -22,17 +22,45 @@ const (
 // It lives beside ToPFX, the only other consumer of the PKCS#12 vendor types,
 // so the vendor dependency stays confined to the package that encodes.
 func PickEncoder(raw string) (enc *pkcs12.Encoder, name EncoderType) {
+	name = EncoderName(raw)
+	return EncoderFor(name), name
+}
+
+// EncoderName normalizes a raw PFX_ENCODER value to one of the known encoder
+// names. It is the single validation point for the env value: an unrecognized
+// value warns once here and falls back to modern2023.
+func EncoderName(raw string) EncoderType {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case string(EncNameLegacyRC2):
-		return pkcs12.LegacyRC2, EncNameLegacyRC2
+		return EncNameLegacyRC2
 	case "legacy", string(EncNameLegacyDES):
-		return pkcs12.LegacyDES, EncNameLegacyDES
+		return EncNameLegacyDES
 	case string(EncNameModern2026):
-		return pkcs12.Modern2026, EncNameModern2026
+		return EncNameModern2026
 	case "", "modern", string(EncNameModern2023):
-		return pkcs12.Modern2023, EncNameModern2023
+		return EncNameModern2023
 	default:
 		slog.Warn("unknown PFX_ENCODER, using modern2023", "value", raw)
-		return pkcs12.Modern2023, EncNameModern2023
+		return EncNameModern2023
+	}
+}
+
+// EncoderFor resolves an already-normalized encoder name to its PKCS#12
+// encoder. It never warns (EncoderName owns the env-boundary validation) and
+// never returns nil: an unknown name yields the modern2023 default, so the
+// vendor type stays confined to this package while callers pass the app-owned
+// name around.
+func EncoderFor(name EncoderType) *pkcs12.Encoder {
+	switch name {
+	case EncNameLegacyRC2:
+		return pkcs12.LegacyRC2
+	case EncNameLegacyDES:
+		return pkcs12.LegacyDES
+	case EncNameModern2026:
+		return pkcs12.Modern2026
+	case EncNameModern2023:
+		return pkcs12.Modern2023
+	default:
+		return pkcs12.Modern2023
 	}
 }

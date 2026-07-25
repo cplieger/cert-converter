@@ -13,7 +13,7 @@ import (
 
 // Pair parses an already-read cert chain and private key, verifies the leaf
 // certificate and key correspond, and writes the PFX to destPath. The caller
-// reads the PEM bytes once (see process.Scanner.convertEntry, which reads them
+// reads the PEM bytes once (see process's scanWalk.convertEntry, which reads them
 // through the confined *os.Root); Pair performs no file reads.
 func Pair(ctx context.Context, certPEM, keyPEM []byte, destPath, password string, enc *pkcs12.Encoder) error {
 	leaf, caCerts, privKey, err := parseAndMatch(certPEM, keyPEM)

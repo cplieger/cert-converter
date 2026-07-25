@@ -21,15 +21,18 @@ github.com/cplieger/cert-converter` in `go.mod`). Build output and the
 scan, then hand off to the watcher. The real work lives under
 `internal/`:
 
-- `internal/config`: parses `PFX_PASSWORD`, `PFX_ENCODER`, and
-  `FALLBACK_SCAN_HOURS` from the environment. `PickEncoder` maps the
-  encoder name to a `go-pkcs12` encoder; unknown values warn and fall
-  back to `modern2023`.
+- `internal/config`: parses `PFX_PASSWORD` (or `PFX_PASSWORD_FILE`, via
+  `envx.Secret`), `PFX_ALLOW_EMPTY_PASSWORD`, `PFX_ENCODER`, and
+  `FALLBACK_SCAN_HOURS` from the environment, then delegates encoder
+  selection to `convert.EncoderName`.
 - `internal/convert`: PEM parsing (`ParseCertChain`, `ParsePrivateKey`),
-  PFX encoding (`ToPFX`), and the SHA-256 `HashCache` for
-  skip-unchanged detection. `types.go` holds the `ConversionStatus` /
-  `ConversionResult` value types.
-- `internal/process`: orchestration. `Scanner.Run` walks `/input`,
+  cert/key matching and PFX encoding (`Pair` / `PairInRoot`, `ToPFX` /
+  `ToPFXInRoot`), the encoder-profile mapping (`EncoderName` /
+  `EncoderFor` / `PickEncoder` in `encoder.go`; unknown values warn and
+  fall back to `modern2023`), and the SHA-256 `HashCache` for
+  skip-unchanged detection.
+- `internal/process`: orchestration, plus `types.go` holding the
+  `ConversionStatus` outcome enum. `Scanner.Run` walks `/input`,
   pairs each `*.crt` with its sibling `*.key`, consults the cache, and
   writes PFX files to `/output`, returning a `ScanResult` count summary.
 - `internal/watch`: fsnotify watch loop with a debounce window and a

@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -95,7 +96,16 @@ func TestParseFallbackInterval_permitted_cadence_and_padding_invariant(t *testin
 	})
 }
 
+// isolatePasswordFile clears PFX_PASSWORD_FILE so an ambient value inherited
+// from the host cannot take precedence over the PFX_PASSWORD the test sets:
+// envx.Secret prefers the <KEY>_FILE indirection whenever it is non-empty.
+func isolatePasswordFile(t *testing.T) {
+	t.Helper()
+	t.Setenv("PFX_PASSWORD_FILE", "")
+}
+
 func TestLoad_unset_fallback_uses_six_hour_default(t *testing.T) {
+	isolatePasswordFile(t)
 	t.Setenv("PFX_PASSWORD", "s3cret")
 	t.Setenv("FALLBACK_SCAN_HOURS", "placeholder")
 	os.Unsetenv("FALLBACK_SCAN_HOURS")
@@ -109,6 +119,7 @@ func TestLoad_unset_fallback_uses_six_hour_default(t *testing.T) {
 }
 
 func TestLoad_explicit_fallback_overrides_default(t *testing.T) {
+	isolatePasswordFile(t)
 	t.Setenv("PFX_PASSWORD", "s3cret")
 	t.Setenv("FALLBACK_SCAN_HOURS", "12")
 	cfg, err := Load()
@@ -121,6 +132,7 @@ func TestLoad_explicit_fallback_overrides_default(t *testing.T) {
 }
 
 func TestLoad_empty_fallback_uses_default(t *testing.T) {
+	isolatePasswordFile(t)
 	t.Setenv("PFX_PASSWORD", "s3cret")
 	t.Setenv("FALLBACK_SCAN_HOURS", "")
 	cfg, err := Load()
@@ -135,6 +147,7 @@ func TestLoad_empty_fallback_uses_default(t *testing.T) {
 }
 
 func TestLoad_explicit_zero_disables_polling(t *testing.T) {
+	isolatePasswordFile(t)
 	t.Setenv("PFX_PASSWORD", "s3cret")
 	t.Setenv("FALLBACK_SCAN_HOURS", "0")
 	cfg, err := Load()
@@ -147,6 +160,7 @@ func TestLoad_explicit_zero_disables_polling(t *testing.T) {
 }
 
 func TestLoad_reads_password_and_encoder(t *testing.T) {
+	isolatePasswordFile(t)
 	t.Setenv("PFX_PASSWORD", "s3cret")
 	t.Setenv("PFX_ENCODER", "legacy")
 	t.Setenv("FALLBACK_SCAN_HOURS", "0")
@@ -163,6 +177,7 @@ func TestLoad_reads_password_and_encoder(t *testing.T) {
 }
 
 func TestLoad_empty_password_returns_error(t *testing.T) {
+	isolatePasswordFile(t)
 	t.Setenv("PFX_PASSWORD", "")
 	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
 	if _, err := Load(); !errors.Is(err, ErrEmptyPassword) {
@@ -171,6 +186,7 @@ func TestLoad_empty_password_returns_error(t *testing.T) {
 }
 
 func TestLoad_empty_password_allowed_by_optout(t *testing.T) {
+	isolatePasswordFile(t)
 	t.Setenv("PFX_PASSWORD", "")
 	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "true")
 	cfg, err := Load()
@@ -179,6 +195,56 @@ func TestLoad_empty_password_allowed_by_optout(t *testing.T) {
 	}
 	if cfg.Password != "" {
 		t.Errorf("Load() Password = %q, want empty", cfg.Password)
+	}
+}
+
+func TestLoad_password_file_takes_precedence_over_env(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pfx-password")
+	if err := os.WriteFile(path, []byte("  from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PFX_PASSWORD", "from-env")
+	t.Setenv("PFX_PASSWORD_FILE", path)
+	t.Setenv("PFX_ENCODER", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() with PFX_PASSWORD_FILE = %v, want nil", err)
+	}
+	if cfg.Password != "from-file" {
+		t.Errorf("Load() Password = %q, want %q (file wins over env, whitespace trimmed)",
+			cfg.Password, "from-file")
+	}
+}
+
+func TestLoad_unreadable_password_file_fails_loudly(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T) string
+	}{
+		{"missing file", func(t *testing.T) string {
+			return filepath.Join(t.TempDir(), "absent")
+		}},
+		{"empty file", func(t *testing.T) string {
+			path := filepath.Join(t.TempDir(), "empty")
+			if err := os.WriteFile(path, []byte("   \n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PFX_PASSWORD", "from-env")
+			t.Setenv("PFX_PASSWORD_FILE", tc.setup(t))
+			// The opt-out must not rescue a broken secret file.
+			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "true")
+
+			if _, err := Load(); err == nil {
+				t.Fatal("Load() = nil error, want a startup failure for an unusable PFX_PASSWORD_FILE")
+			} else if errors.Is(err, ErrEmptyPassword) {
+				t.Errorf("Load() = %v, want the underlying secret-file error, not ErrEmptyPassword", err)
+			}
+		})
 	}
 }
 
@@ -198,6 +264,7 @@ func TestLoad_empty_password_optout_requires_literal_true(t *testing.T) {
 		{"on does not allow", "on", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			isolatePasswordFile(t)
 			t.Setenv("PFX_PASSWORD", "")
 			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", tc.optout)
 

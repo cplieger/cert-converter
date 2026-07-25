@@ -14,7 +14,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/testcerts"
@@ -366,6 +368,43 @@ func TestReadBoundedFromRoot(t *testing.T) {
 			t.Fatal("ReadBoundedFromRoot followed a symlink escaping the root; want a confinement error")
 		}
 	})
+
+	t.Run("rejects a non-regular file without blocking", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("mkfifo is not available on Windows")
+		}
+		t.Parallel()
+		// The guarantee of item h-f5: open(2) on a FIFO with no writer blocks
+		// forever, and the scan runs on the watch loop's only goroutine, so a
+		// FIFO planted in the watched tree must be rejected, not waited on.
+		dir := t.TempDir()
+		if err := syscall.Mkfifo(filepath.Join(dir, "evil.crt"), 0o600); err != nil {
+			t.Fatalf("setup: mkfifo: %v", err)
+		}
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+
+		done := make(chan error, 1)
+		go func() {
+			_, readErr := convert.ReadBoundedFromRoot(t.Context(), root, "evil.crt", 1024)
+			done <- readErr
+		}()
+		select {
+		case readErr := <-done:
+			if readErr == nil {
+				t.Fatal("ReadBoundedFromRoot read a FIFO; want a not-a-regular-file error")
+			}
+			if !strings.Contains(readErr.Error(), "not a regular file") {
+				t.Errorf("ReadBoundedFromRoot(FIFO) error = %q, want it to mention %q",
+					readErr.Error(), "not a regular file")
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("ReadBoundedFromRoot blocked on a FIFO; the O_NONBLOCK open regressed")
+		}
+	})
 }
 
 // --- Tests: convert.ToPFX ---
@@ -570,4 +609,78 @@ func TestToPFX_round_trips_chain_for_every_encoder_profile(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestToPFXInRoot_confines_the_write_to_the_output_root pins the guarantee of
+// item h-f8 on the path production actually takes: the confined write must
+// produce the same decodable 0600 PFX as ToPFX, and a symlinked subdirectory
+// under the output root must not redirect the private-key-bearing PFX outside
+// it.
+func TestToPFXInRoot_confines_the_write_to_the_output_root(t *testing.T) {
+	t.Parallel()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "confined", "ecdsa")
+	certs, err := convert.ParseCertChain(certPEM)
+	if err != nil {
+		t.Fatalf("setup: convert.ParseCertChain: %v", err)
+	}
+	privKey, err := convert.ParsePrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("setup: convert.ParsePrivateKey: %v", err)
+	}
+
+	t.Run("writes a decodable pfx at mode 0600", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+		if err := convert.ToPFXInRoot(t.Context(), privKey, certs[0], nil, root, "out.pfx", "pw", pkcs12.Modern2023); err != nil {
+			t.Fatalf("convert.ToPFXInRoot = error %v, want nil", err)
+		}
+		info, statErr := os.Stat(filepath.Join(dir, "out.pfx"))
+		if statErr != nil {
+			t.Fatalf("convert.ToPFXInRoot did not write a file: %v", statErr)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("convert.ToPFXInRoot wrote mode %o, want 600", perm)
+		}
+		pfxData, readErr := os.ReadFile(filepath.Join(dir, "out.pfx"))
+		if readErr != nil {
+			t.Fatalf("read pfx written by convert.ToPFXInRoot: %v", readErr)
+		}
+		_, leaf, _, decErr := pkcs12.DecodeChain(pfxData, "pw")
+		if decErr != nil {
+			t.Fatalf("decode pfx written by convert.ToPFXInRoot: %v", decErr)
+		}
+		if leaf.Subject.CommonName != "confined" {
+			t.Errorf("convert.ToPFXInRoot leaf CN = %q, want %q", leaf.Subject.CommonName, "confined")
+		}
+	})
+
+	t.Run("refuses a subdirectory symlinked outside the root", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlink semantics differ on Windows")
+		}
+		t.Parallel()
+		outside := t.TempDir()
+		dir := t.TempDir()
+		if err := os.Symlink(outside, filepath.Join(dir, "escape")); err != nil {
+			t.Fatal(err)
+		}
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+
+		writeErr := convert.ToPFXInRoot(t.Context(), privKey, certs[0], nil, root, "escape/out.pfx", "pw", pkcs12.Modern2023)
+		if _, statErr := os.Stat(filepath.Join(outside, "out.pfx")); statErr == nil {
+			t.Error("convert.ToPFXInRoot wrote the PFX outside the output root through a symlinked subdirectory")
+		}
+		if writeErr == nil {
+			t.Error("convert.ToPFXInRoot(symlinked subdirectory) = nil error, want a confinement error")
+		}
+	})
 }
