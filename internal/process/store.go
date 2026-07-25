@@ -279,12 +279,18 @@ func ParseLifecycle(raw string) (mode Lifecycle, known bool) {
 // written is never a deletion candidate.
 func (s *store) orphans(seen map[string]struct{}) (found []string, safe bool, err error) {
 	safe = true
+	var unreadable, symlinked int
 	walkErr := fs.WalkDir(s.root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if rel == "." {
 				return err
 			}
-			slog.Warn("skipping unreadable output path while looking for orphans", "path", rel, "error", err)
+			// Debug per path, one aggregate Warn below: the same two-level contract
+			// the input walk and the stale-temp sweep use. This recurs on every scan
+			// for a persistent misconfiguration, so naming each path at the default
+			// level is a permanent log stream for a condition already reported.
+			slog.Debug("skipping unreadable output path while looking for orphans", "path", rel, "error", err)
+			unreadable++
 			safe = false
 			return nil
 		}
@@ -296,8 +302,8 @@ func (s *store) orphans(seen map[string]struct{}) (found []string, safe bool, er
 		// name is not in `seen`, and it reads as an orphan the same scan that
 		// created it. Refuse to reap rather than try to reconcile two namespaces.
 		if d.Type()&fs.ModeSymlink != 0 {
-			slog.Warn("output tree contains a symlink; orphan removal is disabled for this scan because writes and this walk resolve paths differently",
-				"path", rel)
+			slog.Debug("output tree contains a symlink; orphan removal is disabled for this scan", "path", rel)
+			symlinked++
 			safe = false
 			return nil
 		}
@@ -314,7 +320,27 @@ func (s *store) orphans(seen map[string]struct{}) (found []string, safe bool, er
 	if walkErr != nil {
 		return nil, false, fmt.Errorf("walk output tree: %w", walkErr)
 	}
+	s.logOrphanWalkOutcome(unreadable, symlinked)
 	return found, safe, nil
+}
+
+// logOrphanWalkOutcome emits the orphan walk's single aggregate Warn.
+//
+// Both counts disable orphan removal for the scan, which is a decision the operator
+// has to be able to see at the default log level — without it, `OUTPUT_LIFECYCLE=sync`
+// would silently stop reaping and look identical to a tree with nothing to reap. The
+// individual paths stay at Debug.
+func (s *store) logOrphanWalkOutcome(unreadable, symlinked int) {
+	if unreadable > 0 {
+		slog.Warn("some output paths could not be read while looking for orphans; orphan removal is disabled for this scan",
+			"dir", s.root.Name(), "count", unreadable,
+			"remediation", "check /output ownership and permissions for the UID in user:")
+	}
+	if symlinked > 0 {
+		slog.Warn("output tree contains symlinks; orphan removal is disabled for this scan because writes and the orphan walk resolve paths differently",
+			"dir", s.root.Name(), "count", symlinked,
+			"remediation", "mount the real output directory instead of linking to it")
+	}
 }
 
 // reapContext is everything the gate needs to decide whether `seen` can be

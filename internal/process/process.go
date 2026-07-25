@@ -155,7 +155,15 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		if rel == "." {
 			return err
 		}
-		slog.Warn("skipping unreadable path", "path", rel, "error", err)
+		// Debug, not Warn: this is the per-path half of a two-level contract shared
+		// with the /output sweep. An unreadable sub-path is a steady-state
+		// permissions/UID misconfiguration the app deliberately tolerates, and it
+		// recurs on EVERY scan (each debounced fsnotify event and each fallback
+		// tick) — so naming every one at the default level put N lines plus an
+		// aggregate into the log forever for a condition the operator already knows
+		// about. The aggregate Warn in scanAndSetHealth carries the signal and the
+		// remediation hint; LOG_LEVEL=debug names the individual paths.
+		slog.Debug("skipping unreadable path", "path", rel, "error", err)
 		sw.unreadable++
 		return nil
 	}
