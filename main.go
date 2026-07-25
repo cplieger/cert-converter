@@ -160,7 +160,30 @@ func run() int {
 	slog.Info("starting cert watcher",
 		"input", certsRootDir, "output", outputDir,
 		"password", passwordStatus,
-		"fallback_scan", fallbackLogValue(cfg.FallbackInterval), "encoder", cfg.EncoderName)
+		"fallback_scan", fallbackLogValue(cfg.FallbackInterval), "encoder", cfg.EncoderName,
+		"output_lifecycle", string(cfg.Lifecycle))
+
+	// Both volumes must already exist. Nothing in this app creates them, and a
+	// missing one used to surface as a scan-level error on every tick: the
+	// container reported unhealthy and the orchestrator restarted it forever,
+	// because a restart cannot create a directory either. Failing once at startup
+	// with a named path is the actionable form of the same fact, and it matches the
+	// health contract — the marker is reserved for failures a restart could clear.
+	//
+	// Deliberately NOT MkdirAll: silently creating a missing mount point would put
+	// certificates in the container's ephemeral layer, where they vanish on the
+	// next restart, which is worse than refusing to start.
+	for _, dir := range []struct{ role, path string }{
+		{"input", certsRootDir},
+		{"output", outputDir},
+	} {
+		if fi, statErr := os.Stat(dir.path); statErr != nil || !fi.IsDir() {
+			slog.Error("required volume is missing or not a directory; refusing to start",
+				"role", dir.role, "path", dir.path, "error", statErr,
+				"remediation", "mount "+dir.path+" into the container before starting it")
+			return 1
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -170,6 +193,7 @@ func run() int {
 		OutRoot:   outputDir,
 		Password:  cfg.Password,
 		Encoder:   cfg.EncoderName,
+		Lifecycle: cfg.Lifecycle,
 	})
 
 	// runAndSetHealth adapts scanAndSetHealth to the watcher's on-change

@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -42,16 +41,16 @@ type store struct {
 // directory if needed. Every touch goes through the confined root, so a symlink
 // planted under the output directory cannot redirect the private-key-bearing PFX
 // outside the mounted volume.
+// The parent directory is created by atomicfile's own WithMkdirMode rather than
+// by a hand-rolled MkdirAll here. That is the library's job — it creates the
+// directory inside the same confined root, before staging the temp file — and
+// duplicating it locally is what deferred findings l-f41 and l-f18 flagged: the
+// write went through the library while the directory step did not, so the two
+// halves of one operation could drift in mode or in confinement behaviour.
 func (s *store) write(ctx context.Context, rel string, pfx []byte) error {
-	if destDir := filepath.Dir(rel); destDir != "." {
-		if err := s.root.MkdirAll(destDir, pfxDirMode); err != nil {
-			// destDir is filepath.Dir(rel), and the *os.Root error names the
-			// failing component, so the caller's path carries the directory too.
-			return fmt.Errorf("create output directory: %w", err)
-		}
-	}
 	if _, err := atomicfile.WriteFileInRoot(ctx, s.root, rel, pfx,
 		atomicfile.WithMode(pfxFileMode),
+		atomicfile.WithMkdirMode(pfxDirMode),
 	); err != nil {
 		return fmt.Errorf("write pfx: %w", err)
 	}

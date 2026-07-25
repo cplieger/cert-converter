@@ -43,12 +43,16 @@ func TestStoreWrite_creates_the_parent_directory(t *testing.T) {
 	}
 }
 
-// TestStoreWrite_reports_a_directory_it_cannot_create pins the failure branch.
-// This replaces an equivalent assertion that lived against convert's retired
-// write helper: the write half moved to this package, so its error path is tested
-// here. A path component that already exists as a regular file cannot become a
-// directory, and the operator needs the reason named rather than a bare EEXIST.
-func TestStoreWrite_reports_a_directory_it_cannot_create(t *testing.T) {
+// TestStoreWrite_reports_a_parent_it_cannot_create pins the failure branch for an
+// output path whose parent cannot exist. A path component that is already a
+// regular file cannot become a directory.
+//
+// The directory creation is atomicfile's (via WithMkdirMode) rather than a
+// hand-rolled MkdirAll, so the library's own diagnosis surfaces under this
+// package's "write pfx" wrapping. What matters for the operator is that the step
+// is named and the offending path appears; the precise inner wording belongs to
+// the library.
+func TestStoreWrite_reports_a_parent_it_cannot_create(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	// "blocked" is a regular file, so MkdirAll("blocked") must fail.
@@ -66,8 +70,11 @@ func TestStoreWrite_reports_a_directory_it_cannot_create(t *testing.T) {
 	if err == nil {
 		t.Fatal("store.write(into a path blocked by a regular file) = nil error, want a failure")
 	}
-	if !strings.Contains(err.Error(), "create output directory") {
-		t.Errorf("error = %q, want it to name the directory creation step", err.Error())
+	if !strings.Contains(err.Error(), "write pfx") {
+		t.Errorf("error = %q, want it to name the write step", err.Error())
+	}
+	if !strings.Contains(err.Error(), "blocked/cert.pfx") {
+		t.Errorf("error = %q, want it to name the offending path", err.Error())
 	}
 }
 

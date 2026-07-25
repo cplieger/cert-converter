@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/envx"
 	"github.com/cplieger/slogx"
 )
@@ -29,6 +30,7 @@ const defaultFallbackInterval = 6 * time.Hour
 type Config struct {
 	Password         string
 	EncoderName      convert.EncoderType
+	Lifecycle        process.Lifecycle
 	FallbackInterval time.Duration
 }
 
@@ -106,6 +108,12 @@ func Load() (Config, error) {
 		slog.Info("PFX password configured", "source", "PFX_PASSWORD_FILE")
 	}
 
+	rawLifecycle := os.Getenv("OUTPUT_LIFECYCLE")
+	lifecycle, lifecycleKnown := process.ParseLifecycle(rawLifecycle)
+	if !lifecycleKnown {
+		slog.Warn("unknown OUTPUT_LIFECYCLE, using warn", "value", rawLifecycle)
+	}
+
 	rawEncoder := os.Getenv("PFX_ENCODER")
 	encName, known := convert.EncoderName(rawEncoder)
 	if !known {
@@ -115,6 +123,7 @@ func Load() (Config, error) {
 	return Config{
 		Password:         password,
 		EncoderName:      encName,
+		Lifecycle:        lifecycle,
 		FallbackInterval: FallbackInterval(),
 	}, nil
 }
