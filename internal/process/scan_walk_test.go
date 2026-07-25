@@ -183,3 +183,52 @@ func TestScanWalkVisit_cancellation_during_conversion_aborts_the_walk(t *testing
 		t.Error("visit(cancelled during conversion) did not record the entry as seen; an unseen entry would be pruned from the cache")
 	}
 }
+
+// TestNoteUnwalkableSymlink_reports_resolution_outcomes pins both meaningful
+// arms of the symlink notice: a link the confined root refuses to resolve is
+// the only operator-visible signal that a linked certificate subtree is
+// invisible (WARN), while an in-root directory link whose real target the walk
+// reaches anyway is merely tracing detail (DEBUG). Runs serially: it swaps
+// slog.Default().
+func TestNoteUnwalkableSymlink_reports_resolution_outcomes(t *testing.T) {
+	base := t.TempDir()
+	input := filepath.Join(base, "input")
+	outside := filepath.Join(base, "outside")
+	for _, dir := range []string{input, outside, filepath.Join(input, "target")} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, target := range map[string]string{"escape": outside, "inside": "target"} {
+		if err := os.Symlink(target, filepath.Join(input, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := os.OpenRoot(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	sw := &scanWalk{inHandle: root}
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	for _, tt := range []struct{ name, wantMessage, wantLevel string }{
+		{"escape", "skipping symlink that could not be resolved through the input root", "level=WARN"},
+		{"inside", "skipping symlinked directory; its target is walked directly", "level=DEBUG"},
+	} {
+		buf.Reset()
+		fi, err := os.Lstat(filepath.Join(input, tt.name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sw.noteUnwalkableSymlink(tt.name, fs.FileInfoToDirEntry(fi))
+		out := buf.String()
+		if !strings.Contains(out, tt.wantMessage) || !strings.Contains(out, tt.wantLevel) {
+			t.Errorf("noteUnwalkableSymlink(%q) logged %q, want message %q at %s", tt.name, out, tt.wantMessage, tt.wantLevel)
+		}
+	}
+}

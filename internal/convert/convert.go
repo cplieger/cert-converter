@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"unicode/utf8"
 
 	"github.com/cplieger/atomicfile/v2"
 	"software.sslmate.com/src/go-pkcs12"
@@ -314,7 +315,7 @@ func parsePrivateKeyBlock(block *pem.Block) (crypto.PrivateKey, error) {
 // lower-level variant would offer a second write contract with no production
 // consumer.
 func toPFXInRoot(ctx context.Context, privKey crypto.PrivateKey, leaf *x509.Certificate, caCerts []*x509.Certificate, root *os.Root, rel, password string, enc *pkcs12.Encoder) error {
-	if hasNonBMPRune(password) {
+	if InspectPasswordEncoding(password).NonBMP {
 		return errors.New("pfx password contains a character outside the Basic Multilingual Plane, " +
 			"which the PKCS#12 UCS-2 password encoding cannot represent; " +
 			"choose a password made of BMP characters (ASCII is safest)")
@@ -333,17 +334,36 @@ func toPFXInRoot(ctx context.Context, privKey crypto.PrivateKey, leaf *x509.Cert
 	return nil
 }
 
-// hasNonBMPRune reports whether s holds a rune above U+FFFF. PKCS#12 encodes
-// the password as UCS-2 (RFC 7292 appendix B.1), which cannot represent a rune
-// outside the Basic Multilingual Plane, so go-pkcs12 rejects such a password
-// with a message that names neither the password nor the constraint's source.
-// The offending rune is deliberately NOT reported: it is one character of a
-// secret and the diagnostic goes to the container log.
-func hasNonBMPRune(s string) bool {
-	for _, r := range s {
+// PasswordEncodingIssues reports the ways a PFX password cannot survive the
+// PKCS#12 BMPString (UCS-2) password encoding (RFC 7292 appendix B.1). It is
+// the single semantic home for that rule: internal/convert enforces it before
+// encoding, and internal/config reuses the same query for its startup
+// diagnostic, so the two cannot drift. The zero value means the password
+// encodes faithfully.
+type PasswordEncodingIssues struct {
+	// InvalidUTF8 means the password is not valid UTF-8, so every invalid byte
+	// is encoded as U+FFFD and the PFX ends up protected by a different,
+	// lower-entropy password than the configured secret.
+	InvalidUTF8 bool
+	// NonBMP means the password holds a rune above U+FFFF, which UCS-2 cannot
+	// represent at all, so every Encode call fails.
+	NonBMP bool
+}
+
+// InspectPasswordEncoding reports how a PFX password fares under the PKCS#12
+// UCS-2 password encoding. Both shapes are computed in one pass so callers do
+// not re-derive the rule: go-pkcs12 rejects a non-BMP password with a message
+// that names neither the password nor the constraint's source, and it silently
+// replaces invalid UTF-8 rune-by-rune. The offending rune or byte is
+// deliberately never reported: it is part of a secret, and the diagnostics
+// built on this query go to the container log.
+func InspectPasswordEncoding(password string) PasswordEncodingIssues {
+	issues := PasswordEncodingIssues{InvalidUTF8: !utf8.ValidString(password)}
+	for _, r := range password {
 		if r > 0xFFFF {
-			return true
+			issues.NonBMP = true
+			break
 		}
 	}
-	return false
+	return issues
 }

@@ -155,6 +155,25 @@ groups:
             CertConverterScanAborted alert first, since that one names the
             /input problem and fires within 15m. If no scan aborted, the loop is
             wedged: restart the container.
+      - alert: CertConverterInputSymlinkSkipped
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |= `skipping symlink that could not be resolved through the input root` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter skipped an unresolvable /input symlink"
+          description: >
+            A symlink under /input could not be resolved through the input root,
+            so whatever it points to — including every certificate under a
+            linked directory — was not scanned. This outcome is health-neutral:
+            the scan still logs `scan complete` with failed=0 and unreadable=0,
+            so none of the other rules fire and the affected .pfx stays stale or
+            absent indefinitely. Mount the certificate path directly instead of
+            linking to it, or repair the link target's permissions.
 ```
 
 Thresholds and the `severity` label are starting points; adjust the stall
@@ -168,7 +187,9 @@ of reporting a wedged loop — drop it, exactly as the `health` probe drops its
 staleness deadline in that configuration. The same applies at
 `LOG_LEVEL=warn`/`error`, where the `scan complete` heartbeat is filtered out
 of the logs entirely (see the prerequisite above): both conditions invalidate
-the heartbeat rule.
+the heartbeat rule. `CertConverterInputSymlinkSkipped` is the exception to the
+prerequisite: it keys on a WARN line, so it works at `debug`, `info`, or `warn`
+and is suppressed only at `error`.
 
 ## Healthcheck
 

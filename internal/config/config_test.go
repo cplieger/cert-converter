@@ -482,3 +482,50 @@ func TestLoad_unknown_encoder_warns_and_falls_back_to_modern2023(t *testing.T) {
 		})
 	}
 }
+
+// TestWarnUnencodablePassword_reports_the_unrepresentable_shape pins both
+// diagnostic branches of the startup warning: the shape must be named with its
+// remediation, and the secret value must never reach the log. slog.Default is
+// process-global, so this test must not run in parallel.
+func TestWarnUnencodablePassword_reports_the_unrepresentable_shape(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		password        string
+		wantMessage     string
+		wantRemediation string
+		secretNeedle    string
+	}{
+		{
+			name:            "invalid UTF-8",
+			password:        string([]byte{0xff}) + "sentinel-secret",
+			wantMessage:     "not valid UTF-8",
+			wantRemediation: "supply a text secret",
+			secretNeedle:    "sentinel-secret",
+		},
+		{
+			name:            "non-BMP character",
+			password:        "password-\U0001F600",
+			wantMessage:     "outside the Basic Multilingual Plane",
+			wantRemediation: "use a PFX password made only of BMP characters",
+			secretNeedle:    "password-\U0001F600",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			warnUnencodablePassword(tc.password)
+
+			out := buf.String()
+			if !strings.Contains(out, tc.wantMessage) || !strings.Contains(out, tc.wantRemediation) {
+				t.Errorf("warnUnencodablePassword(%q) logged %q, want message %q and remediation %q",
+					tc.password, out, tc.wantMessage, tc.wantRemediation)
+			}
+			if strings.Contains(out, tc.secretNeedle) {
+				t.Errorf("warnUnencodablePassword(%q) leaked the password in %q", tc.password, out)
+			}
+		})
+	}
+}

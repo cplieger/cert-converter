@@ -93,7 +93,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 	}
 	defer watcher.Close()
 
-	slog.Info("fsnotify active", "directories", watcher.WatchList())
+	slog.Info("fsnotify active", "directory_count", len(watcher.WatchList()))
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -251,7 +251,7 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) erro
 
 		case event, ok := <-watcher.Events:
 			if !w.handleEventRecv(ctx, watcher, st, event, ok) {
-				return lostOrShutdown(ctx)
+				return lostOrShutdown(ctx, "fsnotify events channel closed, watcher stopping; process will exit and restart")
 			}
 
 		case <-st.debounceTimer.C:
@@ -262,7 +262,7 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) erro
 
 		case err, ok := <-watcher.Errors:
 			if !w.handleErrorRecv(ctx, watcher, st, err, ok) {
-				return lostOrShutdown(ctx)
+				return lostOrShutdown(ctx, "fsnotify errors channel closed, watcher stopping; process will exit and restart")
 			}
 		}
 	}
@@ -273,21 +273,26 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) erro
 // cancellation is a clean stop, not lost change detection, and must not turn a
 // SIGTERM into exit 1 with an ERROR claiming there was no shutdown signal.
 // watchLoop's select has no ctx precedence of its own (Go picks a ready case at
-// random), so the precedence lives here, at the single translation point.
-func lostOrShutdown(ctx context.Context) error {
+// random), so the precedence lives here, at the single translation point — and
+// so does the operator-facing ERROR for lossMessage, which describes the closed
+// channel: logging it in the receive helpers would announce a restart that is
+// not happening whenever cancellation wins this check.
+func lostOrShutdown(ctx context.Context, lossMessage string) error {
 	if ctx.Err() != nil {
 		return nil
 	}
+	slog.Error(lossMessage)
 	return ErrWatchLost
 }
 
 // handleEventRecv processes one receive from the watcher's event channel and
 // reports whether the loop should keep running. A closed channel means the
 // watcher is dead, so the loop must exit (the process then restarts); otherwise
-// an event classified as interesting arms the debounced rescan.
+// an event classified as interesting arms the debounced rescan. The closure is
+// reported by the return value alone: lostOrShutdown owns the ERROR, so a
+// closure racing a shutdown stays quiet.
 func (w *Watcher) handleEventRecv(ctx context.Context, watcher *fsnotify.Watcher, st *watchState, event fsnotify.Event, ok bool) bool {
 	if !ok {
-		slog.Error("fsnotify events channel closed, watcher stopping; process will exit and restart")
 		return false
 	}
 	if w.handleFsEvent(ctx, watcher, event) {
@@ -298,11 +303,11 @@ func (w *Watcher) handleEventRecv(ctx context.Context, watcher *fsnotify.Watcher
 
 // handleErrorRecv processes one receive from the watcher's error channel and
 // reports whether the loop should keep running. A closed channel means the
-// watcher is dead, so the loop must exit; an event-queue overflow additionally
+// watcher is dead, so the loop must exit (lostOrShutdown logs it, if it is a
+// genuine loss rather than a shutdown); an event-queue overflow additionally
 // re-syncs the watch set.
 func (w *Watcher) handleErrorRecv(ctx context.Context, watcher *fsnotify.Watcher, st *watchState, err error, ok bool) bool {
 	if !ok {
-		slog.Error("fsnotify errors channel closed, watcher stopping; process will exit and restart")
 		return false
 	}
 	if st.handleWatcherError(err) {
@@ -465,7 +470,7 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) error {
 				continue
 			}
 			slog.Info("fsnotify recovered, upgrading from poll to watch",
-				"directories", fw.WatchList())
+				"directory_count", len(fw.WatchList()))
 			// Attach-then-scan: this tick's scan runs with the new watch set
 			// already live, so a renewal landing during it still produces an
 			// event instead of falling into a gap covered by neither mode.

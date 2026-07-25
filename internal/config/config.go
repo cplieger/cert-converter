@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/envx"
@@ -166,22 +165,21 @@ func allowEmptyPassword(raw string) bool {
 // fail, and a byte sequence that is not valid UTF-8 is replaced rune-by-rune
 // with U+FFFD, so the PFX ends up protected by a different, lower-entropy
 // password than the configured secret. Only the shape is reported, never the
-// value.
+// value. The recognition itself is convert.InspectPasswordEncoding's — the
+// package that enforces the same invariant before encoding — so this startup
+// diagnostic cannot drift from the conversion gate.
 func warnUnencodablePassword(password string) {
 	if password == "" {
 		return
 	}
-	if !utf8.ValidString(password) {
+	issues := convert.InspectPasswordEncoding(password)
+	switch {
+	case issues.InvalidUTF8:
 		slog.Warn("PFX_PASSWORD is not valid UTF-8; every invalid byte is encoded as U+FFFD, so generated PFX files are protected by a different, lower-entropy password than the configured secret",
 			"remediation", "supply a text secret (for example base64) instead of raw binary bytes")
-		return
-	}
-	for _, r := range password {
-		if r > 0xFFFF {
-			slog.Warn("PFX_PASSWORD contains a character outside the Basic Multilingual Plane; PKCS#12 cannot encode it, so every conversion will fail",
-				"remediation", "use a PFX password made only of BMP characters (ASCII is safest)")
-			return
-		}
+	case issues.NonBMP:
+		slog.Warn("PFX_PASSWORD contains a character outside the Basic Multilingual Plane; PKCS#12 cannot encode it, so every conversion will fail",
+			"remediation", "use a PFX password made only of BMP characters (ASCII is safest)")
 	}
 }
 

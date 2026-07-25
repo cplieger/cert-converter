@@ -1036,3 +1036,86 @@ func TestPairInRoot_rejects_a_certificate_whose_public_key_type_is_unverifiable(
 		t.Error("convert.PairInRoot wrote a pfx for an unverifiable pair; want no file written")
 	}
 }
+
+// TestInspectPasswordEncoding_classifies_both_unencodable_shapes pins the
+// single home of the PKCS#12 UCS-2 password rule that both the conversion gate
+// (toPFXInRoot) and the config startup diagnostic consume. The two shapes are
+// independent: invalid UTF-8 loses entropy silently, a non-BMP rune makes every
+// Encode call fail, and a password can carry both.
+func TestInspectPasswordEncoding_classifies_both_unencodable_shapes(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		password        string
+		wantInvalidUTF8 bool
+		wantNonBMP      bool
+	}{
+		"empty":               {password: ""},
+		"plain ASCII":         {password: "correct-horse"},
+		"BMP non-ASCII":       {password: "pässwörd-Ω"},
+		"invalid UTF-8":       {password: string([]byte{0xff, 0xfe}) + "tail", wantInvalidUTF8: true},
+		"non-BMP":             {password: "pw-\U0001F600", wantNonBMP: true},
+		"invalid UTF-8 + BMP": {password: string([]byte{0x80}) + "pw", wantInvalidUTF8: true},
+		"invalid UTF-8 + emoji": {
+			password:        string([]byte{0xff}) + "pw-\U0001F600",
+			wantInvalidUTF8: true,
+			wantNonBMP:      true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := convert.InspectPasswordEncoding(tc.password)
+			want := convert.PasswordEncodingIssues{InvalidUTF8: tc.wantInvalidUTF8, NonBMP: tc.wantNonBMP}
+			if got != want {
+				t.Errorf("convert.InspectPasswordEncoding(%q) = %+v, want %+v", tc.password, got, want)
+			}
+		})
+	}
+}
+
+// TestParsePrivateKey_reports_truncated_declared_armour pins the
+// undecoded-key-block arm of the failure message: a file that declares a
+// private-key block encoding/pem silently drops must be diagnosed as damaged
+// armour, not as holding no key at all.
+func TestParsePrivateKey_reports_truncated_declared_armour(t *testing.T) {
+	t.Parallel()
+	truncated := []byte("-----BEGIN PRIVATE KEY-----\nZm9v\n")
+
+	_, err := convert.ParsePrivateKey(truncated)
+	if err == nil {
+		t.Fatal("convert.ParsePrivateKey(truncated declared key) = nil error, want a damaged-armour error")
+	}
+	want := "declares 1 private-key PEM block(s) that could not be decoded"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("convert.ParsePrivateKey(truncated declared key) error = %q, want it to contain %q", err.Error(), want)
+	}
+}
+
+// TestPairInRoot_rejects_password_outside_BMP_without_writing pins the app-owned
+// non-BMP password guard: the rejection must carry the actionable BMP
+// constraint, must not echo the secret character, and must happen before any
+// PFX is written.
+func TestPairInRoot_rejects_password_outside_BMP_without_writing(t *testing.T) {
+	t.Parallel()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "non-bmp-password", "ecdsa")
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	defer root.Close()
+
+	const password = "safe-\U0001F642-suffix"
+	err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", password, convert.EncNameModern2023)
+	if err == nil {
+		t.Fatal("convert.PairInRoot(non-BMP password) = nil error, want rejection")
+	}
+	if !strings.Contains(err.Error(), "outside the Basic Multilingual Plane") {
+		t.Errorf("convert.PairInRoot(non-BMP password) error = %q, want an actionable BMP constraint", err.Error())
+	}
+	if strings.Contains(err.Error(), "\U0001F642") {
+		t.Errorf("convert.PairInRoot(non-BMP password) error = %q, want the secret character omitted", err.Error())
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "out.pfx")); statErr == nil {
+		t.Error("convert.PairInRoot(non-BMP password) wrote a PFX; want no file")
+	}
+}

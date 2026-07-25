@@ -456,6 +456,50 @@ func failEntry(logPath, msg string, err error) conversionStatus {
 
 // --- Per-entry conversion ---
 
+// pairInputs carries the cert and key PEM bytes readPair read through the
+// confined input root, so one return value covers both inputs of a pair.
+type pairInputs struct {
+	certPEM []byte
+	keyPEM  []byte
+}
+
+// readPair resolves and reads the input side of one .crt entry: it classifies
+// the sibling .key (a missing key is a health-neutral orphan; a non-ENOENT stat
+// failure is the same outcome but warned, since it is a diagnosable
+// misconfiguration rather than a genuine "no key") and then performs both
+// bounded reads through inHandle, so every /input byte is read once from within
+// the confined root.
+//
+// The returned conversionStatus is meaningful only when ok is false: it is the
+// outcome convertEntry must propagate for that entry, with the failure already
+// logged. On the ok path it is the zero value and the caller ignores it. Every
+// status and log message is identical to what convertEntry emitted inline.
+func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInputs, conversionStatus, bool) {
+	if _, statErr := sw.inHandle.Stat(keyRel); statErr != nil {
+		if errors.Is(statErr, fs.ErrNotExist) {
+			slog.Debug("skipping cert without matching key", "path", rel)
+		} else {
+			// A non-ENOENT stat failure (a sibling key that is a symlink the
+			// *os.Root refuses because it escapes /input, or a permission/IO
+			// error) is not a genuine "no key" orphan: surface it so the
+			// misconfiguration is diagnosable instead of silently skipped at
+			// debug. Still health-neutral (statusOrphan) and non-invalidating.
+			slog.Warn("skipping cert: cannot stat sibling key", "path", rel, "error", statErr)
+		}
+		return pairInputs{}, statusOrphan, false
+	}
+
+	certPEM, err := convert.ReadBoundedFromRoot(ctx, sw.inHandle, rel, convert.MaxFileSize)
+	if err != nil {
+		return pairInputs{}, failEntry(rel, "failed to read certificate", err), false
+	}
+	keyPEM, err := convert.ReadBoundedFromRoot(ctx, sw.inHandle, keyRel, convert.MaxFileSize)
+	if err != nil {
+		return pairInputs{}, failEntry(rel, "failed to read private key", err), false
+	}
+	return pairInputs{certPEM: certPEM, keyPEM: keyPEM}, 0, true
+}
+
 // convertEntry resolves the outcome for one .crt entry under certsRoot. It
 // reads the cert and its sibling .key exactly once through inHandle, fingerprints
 // them, and either skips (input unchanged and the prior PFX still present),
@@ -472,28 +516,11 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	stem := strings.TrimSuffix(rel, ".crt")
 	keyRel := stem + ".key"
 
-	if _, statErr := sw.inHandle.Stat(keyRel); statErr != nil {
-		if errors.Is(statErr, fs.ErrNotExist) {
-			slog.Debug("skipping cert without matching key", "path", rel)
-		} else {
-			// A non-ENOENT stat failure (a sibling key that is a symlink the
-			// *os.Root refuses because it escapes /input, or a permission/IO
-			// error) is not a genuine "no key" orphan: surface it so the
-			// misconfiguration is diagnosable instead of silently skipped at
-			// debug. Still health-neutral (statusOrphan) and non-invalidating.
-			slog.Warn("skipping cert: cannot stat sibling key", "path", rel, "error", statErr)
-		}
-		return statusOrphan
+	inputs, outcome, ok := sw.readPair(ctx, rel, keyRel)
+	if !ok {
+		return outcome
 	}
-
-	certPEM, err := convert.ReadBoundedFromRoot(ctx, sw.inHandle, rel, convert.MaxFileSize)
-	if err != nil {
-		return failEntry(rel, "failed to read certificate", err)
-	}
-	keyPEM, err := convert.ReadBoundedFromRoot(ctx, sw.inHandle, keyRel, convert.MaxFileSize)
-	if err != nil {
-		return failEntry(rel, "failed to read private key", err)
-	}
+	certPEM, keyPEM := inputs.certPEM, inputs.keyPEM
 
 	pfxRel := stem + ".pfx"
 	fingerprint := pairFingerprint(certPEM, keyPEM)

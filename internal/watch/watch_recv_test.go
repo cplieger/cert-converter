@@ -1,11 +1,14 @@
 package watch
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -242,20 +245,58 @@ func TestHandleErrorRecv_does_not_resync_the_watch_set_for_a_benign_error(t *tes
 // channel-closed translation. watchLoop's select has no ctx precedence of its
 // own (Go picks a ready case at random), so a SIGTERM arriving in the same
 // instant as an fsnotify fd death can take the channel arm: with a live ctx that
-// really is lost change detection and must surface ErrWatchLost so main exits 1
-// for a restart, while under an already-cancelled ctx it is a clean shutdown and
-// must return nil instead of exiting 1 with an ERROR claiming there was no
-// shutdown signal.
+// really is lost change detection and must surface ErrWatchLost — with the
+// operator-facing loss message logged — so main exits 1 for a restart, while
+// under an already-cancelled ctx it is a clean shutdown and must return nil
+// without any ERROR claiming the process is about to exit and restart.
+// Not parallel: it swaps the process-global slog default.
 func TestLostOrShutdown_gives_cancellation_precedence(t *testing.T) {
-	t.Parallel()
+	const lossMessage = "fsnotify events channel closed, watcher stopping; process will exit and restart"
 
-	if got := lostOrShutdown(t.Context()); !errors.Is(got, ErrWatchLost) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	if got := lostOrShutdown(t.Context(), lossMessage); !errors.Is(got, ErrWatchLost) {
 		t.Errorf("lostOrShutdown(live ctx) = %v, want ErrWatchLost (a watcher that dies while the app must keep running is fatal)", got)
 	}
+	if logged := buf.String(); !strings.Contains(logged, lossMessage) {
+		t.Errorf("lostOrShutdown(live ctx) logged %q, want the loss message %q so operators see why the process restarts", logged, lossMessage)
+	}
 
+	buf.Reset()
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if got := lostOrShutdown(cancelled); got != nil {
+	if got := lostOrShutdown(cancelled, lossMessage); got != nil {
 		t.Errorf("lostOrShutdown(cancelled ctx) = %v, want nil (a channel closing during shutdown is a clean stop, not lost change detection)", got)
+	}
+	if logged := buf.String(); logged != "" {
+		t.Errorf("lostOrShutdown(cancelled ctx) logged %q, want no output: a clean shutdown must not claim the process will exit and restart", logged)
+	}
+}
+
+// TestHandleFallbackTick_runs_the_scan_when_resync_fails pins the safety-net
+// half of the fallback tick: when watcher.Add fails while the context is still
+// live, the periodic full scan is the only remaining renewal-detection path, so
+// a failed watch-set repair must warn and still scan rather than skip the tick.
+func TestHandleFallbackTick_runs_the_scan_when_resync_fails(t *testing.T) {
+	t.Parallel()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Skipf("fsnotify unavailable: %v", err)
+	}
+	if err := watcher.Close(); err != nil {
+		t.Fatalf("setup: watcher.Close() = %v", err)
+	}
+	scans := 0
+	w := New(t.TempDir(), func(context.Context) { scans++ }, WithFallback(time.Hour))
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+
+	w.handleFallbackTick(t.Context(), watcher, st)
+
+	if scans != 1 {
+		t.Errorf("handleFallbackTick(resync failing) ran %d scans, want 1: a failed watch-set repair must not disable the polling safety net", scans)
 	}
 }
