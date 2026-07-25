@@ -26,7 +26,7 @@ func TestHandleFsEvent(t *testing.T) {
 		t.Skipf("fsnotify unavailable: %v", err)
 	}
 	defer func() { _ = watcher.Close() }()
-	if err := w.addWatchDirs(watcher, root); err != nil {
+	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("addWatchDirs: %v", err)
 	}
 
@@ -61,7 +61,7 @@ func TestHandleFsEvent(t *testing.T) {
 		{"chmod only is ignored", fsnotify.Event{Name: crtFile, Op: fsnotify.Chmod}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := w.handleFsEvent(watcher, tc.event); got != tc.want {
+			if got := w.handleFsEvent(t.Context(), watcher, tc.event); got != tc.want {
 				t.Errorf("handleFsEvent(%s on %s) = %v, want %v", tc.event.Op, tc.event.Name, got, tc.want)
 			}
 		})

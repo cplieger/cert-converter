@@ -29,7 +29,7 @@ func TestHandleEventRecv_closed_channel_stops_the_loop(t *testing.T) {
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
-	if got := w.handleEventRecv(watcher, st, fsnotify.Event{}, false); got {
+	if got := w.handleEventRecv(t.Context(), watcher, st, fsnotify.Event{}, false); got {
 		t.Error("handleEventRecv(ok=false) = true, want false so watchLoop exits and the process restarts")
 	}
 	if st.pending {
@@ -65,7 +65,7 @@ func TestHandleEventRecv_arms_the_debounce_only_for_interesting_events(t *testin
 			t.Cleanup(st.stop)
 
 			event := fsnotify.Event{Name: filepath.Join(root, tc.file), Op: fsnotify.Write}
-			if got := w.handleEventRecv(watcher, st, event, true); !got {
+			if got := w.handleEventRecv(t.Context(), watcher, st, event, true); !got {
 				t.Errorf("handleEventRecv(%s) = false, want true (a live event must never stop the loop)", tc.file)
 			}
 			if st.pending != tc.wantPending {
@@ -96,13 +96,13 @@ func TestHandleErrorRecv_stops_on_close_and_resyncs_on_overflow(t *testing.T) {
 
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
-	if got := w.handleErrorRecv(watcher, st, nil, false); got {
+	if got := w.handleErrorRecv(t.Context(), watcher, st, nil, false); got {
 		t.Error("handleErrorRecv(ok=false) = true, want false so watchLoop exits and the process restarts")
 	}
 
 	overflowState := newWatchState(w)
 	t.Cleanup(overflowState.stop)
-	if got := w.handleErrorRecv(watcher, overflowState, fsnotify.ErrEventOverflow, true); !got {
+	if got := w.handleErrorRecv(t.Context(), watcher, overflowState, fsnotify.ErrEventOverflow, true); !got {
 		t.Error("handleErrorRecv(ErrEventOverflow) = false, want true (an overflow is recoverable, not fatal)")
 	}
 	if !overflowState.pending {
@@ -115,7 +115,7 @@ func TestHandleErrorRecv_stops_on_close_and_resyncs_on_overflow(t *testing.T) {
 
 	otherState := newWatchState(w)
 	t.Cleanup(otherState.stop)
-	if got := w.handleErrorRecv(watcher, otherState, errors.New("transient watcher failure"), true); !got {
+	if got := w.handleErrorRecv(t.Context(), watcher, otherState, errors.New("transient watcher failure"), true); !got {
 		t.Error("handleErrorRecv(non-overflow error) = false, want true (the loop keeps running)")
 	}
 	if otherState.pending {

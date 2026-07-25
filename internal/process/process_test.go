@@ -149,6 +149,23 @@ func TestScannerRun_returns_error_for_unopenable_input_root(t *testing.T) {
 	}
 }
 
+func TestScannerRun_returns_error_for_unopenable_output_root(t *testing.T) {
+	t.Parallel()
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	scanner := newScanner(t.TempDir(), missing)
+
+	res, err := scanner.Run(t.Context())
+	if err == nil {
+		t.Fatal("Scanner.Run(unopenable output root) = nil error, want a scan error so the container is marked unhealthy")
+	}
+	if !strings.Contains(err.Error(), "open output root") {
+		t.Errorf("Scanner.Run(unopenable output root) error = %q, want it to identify the output root", err)
+	}
+	if (res != process.ScanResult{}) {
+		t.Errorf("Scanner.Run(unopenable output root) result = %+v, want the zero ScanResult", res)
+	}
+}
+
 func TestScannerRun_failed_conversion_is_counted_and_retried(t *testing.T) {
 	t.Parallel()
 	certsRoot := t.TempDir()

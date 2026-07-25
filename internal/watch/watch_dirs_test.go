@@ -36,7 +36,7 @@ func TestAddWatchDirs_watches_whole_subtree_and_fails_on_missing_root(t *testing
 	}
 	w := New(root, func(context.Context) {})
 
-	if err := w.addWatchDirs(watcher, root); err != nil {
+	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("addWatchDirs(%q) = %v, want nil", root, err)
 	}
 
@@ -50,7 +50,7 @@ func TestAddWatchDirs_watches_whole_subtree_and_fails_on_missing_root(t *testing
 		t.Errorf("addWatchDirs added the file %q to the watch list; only directories should be watched", certFile)
 	}
 
-	if err := w.addWatchDirs(watcher, filepath.Join(root, "does-not-exist")); err == nil {
+	if err := w.addWatchDirs(t.Context(), watcher, filepath.Join(root, "does-not-exist")); err == nil {
 		t.Error("addWatchDirs(missing root) = nil, want an error so Run falls back to polling")
 	}
 }
@@ -73,7 +73,7 @@ func TestAddWatchDirs_fails_when_the_root_watch_cannot_be_added(t *testing.T) {
 	}
 	root := t.TempDir()
 
-	if err := New(root, func(context.Context) {}).addWatchDirs(watcher, root); err == nil {
+	if err := New(root, func(context.Context) {}).addWatchDirs(t.Context(), watcher, root); err == nil {
 		t.Error("addWatchDirs(closed watcher) = nil, want an error so Run falls back to polling instead of watching nothing")
 	}
 }

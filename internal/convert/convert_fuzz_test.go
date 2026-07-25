@@ -184,7 +184,19 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		if certErr != nil {
 			return
 		}
-		if _, keyErr := convert.ParsePrivateKey(data); keyErr != nil {
+		parsedKey, keyErr := convert.ParsePrivateKey(data)
+		if keyErr != nil {
+			return
+		}
+		signer, ok := parsedKey.(crypto.Signer)
+		if !ok {
+			t.Fatalf("convert.ParsePrivateKey returned %T, want crypto.Signer", parsedKey)
+		}
+		matcher, ok := certs[0].PublicKey.(interface{ Equal(crypto.PublicKey) bool })
+		if !ok {
+			t.Fatalf("leaf public key %T cannot compare against the parsed private key", certs[0].PublicKey)
+		}
+		if !matcher.Equal(signer.Public()) {
 			return
 		}
 
@@ -204,7 +216,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		password := "test"
 
 		if err := convert.PairInRoot(t.Context(), data, data, root, "out.pfx", password, convert.EncNameModern2023); err != nil {
-			return // parsing, cert/key matching or encoding may legitimately fail
+			t.Fatalf("PairInRoot rejected a parseable matching certificate and key: %v", err)
 		}
 
 		pfxData, err := os.ReadFile(dest)
@@ -212,15 +224,31 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 			t.Fatalf("read pfx: %v", err)
 		}
 
-		_, decodedLeaf, decodedCAs, err := pkcs12.DecodeChain(pfxData, password)
+		decodedKey, decodedLeaf, decodedCAs, err := pkcs12.DecodeChain(pfxData, password)
 		if err != nil {
 			t.Fatalf("decode pfx: %v", err)
 		}
-		if decodedLeaf.Subject.CommonName != leaf.Subject.CommonName {
-			t.Fatalf("CN mismatch: got %q want %q", decodedLeaf.Subject.CommonName, leaf.Subject.CommonName)
+		if !bytes.Equal(decodedLeaf.Raw, leaf.Raw) {
+			t.Fatal("leaf certificate changed across the PFX round trip")
 		}
 		if len(decodedCAs) != len(caCerts) {
 			t.Fatalf("CA count mismatch: got %d want %d", len(decodedCAs), len(caCerts))
+		}
+		for i := range caCerts {
+			if !bytes.Equal(decodedCAs[i].Raw, caCerts[i].Raw) {
+				t.Fatalf("CA certificate %d changed across the PFX round trip", i)
+			}
+		}
+		wantKey, err := x509.MarshalPKCS8PrivateKey(parsedKey)
+		if err != nil {
+			t.Fatalf("marshal input private key: %v", err)
+		}
+		gotKey, err := x509.MarshalPKCS8PrivateKey(decodedKey)
+		if err != nil {
+			t.Fatalf("marshal decoded private key: %v", err)
+		}
+		if !bytes.Equal(gotKey, wantKey) {
+			t.Fatal("private key changed across the PFX round trip")
 		}
 	})
 }

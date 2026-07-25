@@ -87,6 +87,18 @@ this with no configuration) and evaluate these with
 [Loki's ruler](https://grafana.com/docs/loki/latest/alert/); firing alerts
 deliver through your Alertmanager exactly like Prometheus metric alerts.
 
+**Prerequisite: these exact rules require `LOG_LEVEL=info` (the default) or
+`debug`.** The `scan complete` line they key on is logged at INFO even when
+`failed`/`unreadable` are non-zero, so `LOG_LEVEL=warn` or `error` suppresses
+it: `CertConverterConversionFailed` then never fires and
+`CertConverterScanStalled` fires permanently despite healthy fallback scans
+(`error` additionally suppresses the WARN-level `scan aborted before
+completion` line behind `CertConverterScanAborted`). If you run at `warn` or
+`error`, do not deploy the `CertConverterConversionFailed` or
+`CertConverterScanStalled` expressions unchanged — monitor the container health
+state instead, or write replacement rules over the messages your level still
+emits.
+
 ```yaml
 groups:
   - name: cert-converter
@@ -148,7 +160,10 @@ deployment, and route by whatever labels your Alertmanager uses.
 complete` cadence at all (a scan then runs only on a filesystem event, and
 certificates renew every few weeks), so that rule fires permanently instead
 of reporting a wedged loop — drop it, exactly as the `health` probe drops its
-staleness deadline in that configuration.
+staleness deadline in that configuration. The same applies at
+`LOG_LEVEL=warn`/`error`, where the `scan complete` heartbeat is filtered out
+of the logs entirely (see the prerequisite above): both conditions invalidate
+the heartbeat rule.
 
 ## Healthcheck
 

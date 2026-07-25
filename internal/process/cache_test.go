@@ -124,37 +124,37 @@ func TestPrune(t *testing.T) {
 	}
 }
 
-func TestCache_concurrent_callers_are_race_free(t *testing.T) {
+func TestCache_concurrent_callers_preserve_recorded_entries(t *testing.T) {
 	t.Parallel()
 	cache := newHashCache()
 
 	const nKeys = 20
-	keys := make([]string, nKeys)
-	for i := range keys {
-		keys[i] = fmt.Sprintf("key-%d", i)
-	}
-
-	const nGoroutines = 8
 	const iterations = 200
-
+	start := make(chan struct{})
 	var wg sync.WaitGroup
-	for g := range nGoroutines {
-		wg.Add(1)
-		go func(gi int) {
-			defer wg.Done()
-			for i := range iterations {
-				k := keys[(gi*iterations+i)%nKeys]
-				fp := fmt.Sprintf("fp-%d", i)
-				if !cache.matches(k, fp) {
-					cache.record(k, fp)
+	for i := range nKeys {
+		key := fmt.Sprintf("key-%d", i)
+		fingerprint := fmt.Sprintf("fp-%d", i)
+		wg.Go(func() {
+			<-start
+			for range iterations {
+				cache.record(key, fingerprint)
+				if !cache.matches(key, fingerprint) {
+					t.Errorf("matches(%q, %q) = false after concurrent record, want true", key, fingerprint)
+					return
 				}
 			}
-		}(g)
+		})
 	}
+	close(start)
 	wg.Wait()
 
-	if cache.matches("post-concurrent", "fp") {
-		t.Error("matches should return false for a key never recorded during the concurrent run")
+	for i := range nKeys {
+		key := fmt.Sprintf("key-%d", i)
+		fingerprint := fmt.Sprintf("fp-%d", i)
+		if !cache.matches(key, fingerprint) {
+			t.Errorf("matches(%q, %q) = false after concurrent callers completed, want true", key, fingerprint)
+		}
 	}
 }
 
