@@ -100,3 +100,24 @@ func TestWatchState_scans_re_arm_the_fallback_from_the_last_scan(t *testing.T) {
 		}
 	})
 }
+
+// TestRunDebouncedScan_skips_scan_after_shutdown pins runDebouncedScan's
+// cancellation precedence: watchLoop's select has none of its own, so a debounce
+// deadline reached in the same instant as shutdown must not start a scan that
+// would change health state on the way out.
+func TestRunDebouncedScan_skips_scan_after_shutdown(t *testing.T) {
+	t.Parallel()
+	scans := 0
+	w := New(t.TempDir(), func(context.Context) { scans++ }, WithDebounce(time.Hour))
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+	st.scheduleScan()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	st.runDebouncedScan(ctx)
+
+	if scans != 0 {
+		t.Errorf("runDebouncedScan(cancelled ctx) ran %d scans, want 0", scans)
+	}
+}

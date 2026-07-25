@@ -81,3 +81,23 @@ func TestRun_treats_a_shutdown_during_the_walk_as_a_clean_stop(t *testing.T) {
 		t.Errorf("Run(cancelled ctx) logged %q, want no watch-failure WARN: a shutdown mid-walk must not look like a degraded fallback to polling", logged)
 	}
 }
+
+// TestScanThenWatch_skips_scan_after_shutdown pins the shutdown guard shared by
+// both entry points into scanThenWatch: with a watch set already live but ctx
+// already cancelled, no scan may run (it would only log an interrupted scan and
+// touch the health marker on the way out) and the helper returns nil.
+func TestScanThenWatch_skips_scan_after_shutdown(t *testing.T) {
+	t.Parallel()
+	watcher := newTestWatcher(t)
+	scans := 0
+	w := New(t.TempDir(), func(context.Context) { scans++ })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := w.scanThenWatch(ctx, watcher); err != nil {
+		t.Errorf("scanThenWatch(cancelled ctx) = %v, want nil", err)
+	}
+	if scans != 0 {
+		t.Errorf("scanThenWatch(cancelled ctx) ran %d scans, want 0", scans)
+	}
+}

@@ -69,3 +69,30 @@ func TestPollLoopWithUpgrade_upgrades_to_fsnotify_and_scans_first(t *testing.T) 
 		t.Fatal("pollLoopWithUpgrade did not return after ctx cancellation")
 	}
 }
+
+// TestPollTick_stays_in_poll_mode_when_watch_set_rebuild_fails pins the poll
+// tick's independently reachable middle branch: fsnotify constructs fine but the
+// watch set cannot be rebuilt (a missing root), so the tick must stay in poll
+// mode (done=false) and still run the safety-net scan that keeps change
+// detection alive.
+func TestPollTick_stays_in_poll_mode_when_watch_set_rebuild_fails(t *testing.T) {
+	t.Parallel()
+	probe := newTestWatcher(t)
+	if err := probe.Close(); err != nil {
+		t.Fatalf("setup: watcher.Close() = %v", err)
+	}
+	scans := 0
+	missingRoot := filepath.Join(t.TempDir(), "missing")
+	w := New(missingRoot, func(context.Context) { scans++ }, WithFallback(time.Hour))
+
+	done, err := w.pollTick(t.Context())
+	if err != nil {
+		t.Errorf("pollTick(missing root) error = %v, want nil", err)
+	}
+	if done {
+		t.Error("pollTick(missing root) done = true, want false so polling continues")
+	}
+	if scans != 1 {
+		t.Errorf("pollTick(missing root) ran %d scans, want 1", scans)
+	}
+}

@@ -412,29 +412,39 @@ func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
 		"unreadable", result.Unreadable,
 		"failed", result.Failed)
 	slog.Log(ctx, level, msg, attrs...)
-	if walkErr == nil && result.Unreadable == 0 && result.Total > 0 && result.Orphan == result.Total {
-		// Every .crt under /input lacks its sibling .key, so the scan
-		// completed with failed=0 and produced nothing at all. The counts
-		// above carry orphan, but no README Loki rule keys on it and the
-		// per-cert reason is Debug-only, so this steady-state naming
-		// misconfiguration (a key extension that is not .key) is silent at
-		// the default level, exactly like the Total==0 case below. Name it.
-		// Unreadable == 0 is what makes "every certificate" provable: Run
-		// deliberately continues past an unreadable sub-path, so a partial
-		// enumeration cannot know what lies beneath it, and the unreadable-path
-		// WARN already carries the actionable diagnosis for that shape.
-		slog.Warn("every certificate under the input root is missing its sibling .key; no PFX output is being produced",
-			"orphan", result.Orphan,
-			"remediation", "name each private key <name>.key beside its <name>.crt (Caddy's layout)")
+	logInputCoverageWarnings(result, walkErr)
+}
+
+// logInputCoverageWarnings names the two health-neutral outcomes that produce no
+// PFX at all and that the summary counts alone cannot distinguish from a healthy
+// steady state. Both require a completed walk with no unreadable sub-path:
+// Unreadable == 0 is what makes "every certificate" provable, because Run
+// deliberately continues past an unreadable sub-path, so a partial enumeration
+// cannot know what lies beneath it, and the unreadable-path WARN already carries
+// the actionable diagnosis for that shape.
+func logInputCoverageWarnings(result ScanResult, walkErr error) {
+	if walkErr != nil || result.Unreadable > 0 {
+		return
 	}
-	if walkErr == nil && result.Total == 0 && result.Unreadable == 0 {
+	switch {
+	case result.Total == 0:
 		// A completed scan that visited no .crt at all is indistinguishable from
-		// a healthy steady state in the counts above (failed=0 keeps the marker
+		// a healthy steady state in the summary counts (failed=0 keeps the marker
 		// set, and the README's Loki rules match on failed/unreadable or on the
 		// absence of "scan complete"), yet it is the signature of a wrong or
 		// vanished /input mount: no PFX is produced and nothing fires. Name it.
 		slog.Warn("no certificate pairs found under the input root; no PFX output is being produced",
 			"remediation", "check that the /input mount points at the PEM certificate directory")
+	case result.Orphan == result.Total:
+		// Every .crt under /input lacks its sibling .key, so the scan
+		// completed with failed=0 and produced nothing at all. The summary counts
+		// carry orphan, but no README Loki rule keys on it and the
+		// per-cert reason is Debug-only, so this steady-state naming
+		// misconfiguration (a key extension that is not .key) is silent at
+		// the default level, exactly like the Total==0 case above. Name it.
+		slog.Warn("every certificate under the input root is missing its sibling .key; no PFX output is being produced",
+			"orphan", result.Orphan,
+			"remediation", "name each private key <name>.key beside its <name>.crt (Caddy's layout)")
 	}
 }
 

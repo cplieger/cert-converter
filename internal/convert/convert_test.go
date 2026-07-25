@@ -1037,14 +1037,14 @@ func TestPairInRoot_rejects_a_certificate_whose_public_key_type_is_unverifiable(
 	}
 }
 
-// TestInspectPasswordEncoding_classifies_both_unencodable_shapes pins the
+// TestInspectPasswordEncoding_classifies_all_unencodable_shapes pins the
 // single home of the PKCS#12 UCS-2 password rule that both the conversion gate
 // (toPFXInRoot) and the config startup diagnostic consume. The shapes are
 // independent: invalid UTF-8 loses entropy silently, a non-BMP rune makes every
 // Encode call fail, an interior NUL makes the generated PFX unopenable by any
 // consumer that builds the NUL-terminated BMPString itself, and a password can
 // carry several at once.
-func TestInspectPasswordEncoding_classifies_both_unencodable_shapes(t *testing.T) {
+func TestInspectPasswordEncoding_classifies_all_unencodable_shapes(t *testing.T) {
 	t.Parallel()
 	for name, tc := range map[string]struct {
 		password        string

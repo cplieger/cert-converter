@@ -82,6 +82,9 @@ func New(root string, onChange func(ctx context.Context), opts ...Option) *Watch
 func (w *Watcher) Run(ctx context.Context) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil // shutdown arrived during construction; not a watch failure
+		}
 		slog.Warn("fsnotify unavailable, using polling with periodic upgrade attempts", "error", err)
 		return w.pollLoopWithUpgrade(ctx)
 	}
@@ -496,6 +499,9 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) error {
 func (w *Watcher) pollTick(ctx context.Context) (done bool, err error) {
 	fw, newErr := fsnotify.NewWatcher()
 	if newErr != nil {
+		if ctx.Err() != nil {
+			return true, nil // shutdown interrupted the upgrade attempt; not a poll-mode continuation
+		}
 		slog.Info("fsnotify still unavailable, staying in poll mode",
 			"mode", "poll", "retry_interval", w.fallback, "error", newErr)
 		w.onChange(ctx)

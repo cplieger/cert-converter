@@ -452,13 +452,22 @@ func TestLoad_password_file_log_records_source_without_secret_or_path(t *testing
 }
 
 func TestLoad_env_password_logs_no_secret_source(t *testing.T) {
-	t.Setenv("PFX_PASSWORD_FILE", "")
-	t.Setenv("PFX_PASSWORD", "from-env")
+	const (
+		secret       = "sentinel-env-pfx-password"
+		secretSource = "PFX_PASSWORD_FILE"
+	)
+	t.Setenv(secretSource, "")
+	t.Setenv("PFX_PASSWORD", secret)
+	t.Setenv("PFX_ENCODER", "")
 
 	logs := capture.Default(t)
 
-	if _, err := Load(); err != nil {
+	cfg, err := Load()
+	if err != nil {
 		t.Fatalf("Load() = %v, want nil", err)
+	}
+	if cfg.Password != secret {
+		t.Fatalf("Load() Password = %q, want the configured environment value", cfg.Password)
 	}
 
 	if n := logs.Count("PFX password configured"); n != 0 {
@@ -467,17 +476,24 @@ func TestLoad_env_password_logs_no_secret_source(t *testing.T) {
 	// The pre-capture form scanned the whole rendered line, so it also caught the
 	// env var leaking as an ATTR (key or value) under ANY message, not just the
 	// one that happens to carry it today; Count sees messages only. Walk every
-	// captured record end to end to keep that strictly stronger guard: this test
-	// exists for the secret-source channel, not for one message string.
-	const secretEnv = "PFX_PASSWORD_FILE"
+	// captured record end to end to keep that strictly stronger guard, and check
+	// the password VALUE alongside the channel name: the sibling
+	// PFX_PASSWORD_FILE test guards its secret value, and a future diagnostic
+	// that logged the env-sourced password would otherwise keep this test green.
 	for _, r := range logs.Records() {
-		if strings.Contains(r.Message, secretEnv) {
-			t.Errorf("Load() logged message %q, want no %s record when the file channel is unused", r.Message, secretEnv)
+		if strings.Contains(r.Message, secret) {
+			t.Errorf("Load() leaked the environment-sourced PFX password in message %q", r.Message)
+		}
+		if strings.Contains(r.Message, secretSource) {
+			t.Errorf("Load() logged message %q, want no %s record when the file channel is unused", r.Message, secretSource)
 		}
 		r.Attrs(func(a slog.Attr) bool {
-			if strings.Contains(a.Key, secretEnv) || strings.Contains(a.Value.String(), secretEnv) {
+			if strings.Contains(a.Key, secret) || strings.Contains(a.Value.String(), secret) {
+				t.Errorf("Load() leaked the environment-sourced PFX password in attr %s=%v on %q", a.Key, a.Value, r.Message)
+			}
+			if strings.Contains(a.Key, secretSource) || strings.Contains(a.Value.String(), secretSource) {
 				t.Errorf("Load() logged attr %s=%v on %q, want no %s record when the file channel is unused",
-					a.Key, a.Value, r.Message, secretEnv)
+					a.Key, a.Value, r.Message, secretSource)
 			}
 			return true
 		})

@@ -159,37 +159,44 @@ groups:
         expr: |
           sum by (container) (count_over_time(
             {container="cert-converter"}
-            |= `skipping symlink that could not be resolved through the input root` [15m]
+            |~ `(skipping symlink that could not be resolved through the input root|skipping cert: cannot stat sibling key)` [15m]
           )) > 0
         for: 0m
         labels:
           severity: warning
         annotations:
-          summary: "cert-converter skipped an unresolvable /input symlink"
+          summary: "cert-converter skipped an unreachable /input path"
           description: >
             A symlink under /input could not be resolved through the input root,
-            so whatever it points to — including every certificate under a
-            linked directory — was not scanned. This outcome is health-neutral:
-            the scan still logs `scan complete` with failed=0 and unreadable=0,
-            so none of the other rules fire and the affected .pfx stays stale or
-            absent indefinitely. Mount the certificate path directly instead of
-            linking to it, or repair the link target's permissions.
+            or a certificate's sibling `<name>.key` could not be stat'ed (it
+            escapes the input root, or its permissions deny the read), so
+            whatever it points to — including every certificate under a linked
+            directory, or that one certificate — was not converted. This
+            outcome is health-neutral: the scan still logs `scan complete` with
+            failed=0 and unreadable=0, so none of the other rules fire and the
+            affected .pfx stays stale or absent indefinitely. Mount the
+            certificate path directly instead of linking to it, or repair the
+            permissions of the link target and of the sibling key.
       - alert: CertConverterNoCertificatePairs
         expr: |
           sum by (container) (count_over_time(
             {container="cert-converter"}
-            |= `no certificate pairs found under the input root` [15m]
+            |~ `(no certificate pairs found under the input root|every certificate under the input root is missing its sibling \.key)` [15m]
           )) > 0
         for: 0m
         labels:
           severity: warning
         annotations:
-          summary: "cert-converter found no certificate pairs under /input"
+          summary: "cert-converter found no convertible certificate pairs under /input"
           description: >
-            A scan completed without visiting a single `<name>.crt` with a
-            sibling `<name>.key`, so no PFX is produced at all. This is the
-            signature of a wrong or vanished /input mount, or of a certbot-style
-            directory of fullchain.pem/privkey.pem this app does not read. The
+            A scan completed without converting a single `<name>.crt` with a
+            sibling `<name>.key` — either it visited no pair at all, or every
+            `.crt` it visited was an orphan with no sibling key — so no PFX is
+            produced at all. This is the signature of a wrong or vanished
+            /input mount, of a certbot-style
+            directory of fullchain.pem/privkey.pem this app does not read, or
+            of a key-naming layout that does not match the `<name>.key`
+            contract. The
             outcome is health-neutral — the scan still logs `scan complete` with
             failed=0 and unreadable=0 — so none of the other rules fire. Check
             the /input mount and the .crt/.key filename contract. A fresh
@@ -199,7 +206,7 @@ groups:
         expr: |
           sum by (container) (count_over_time(
             {container="cert-converter"}
-            |~ `some (stale output temps could not be inspected or removed|output paths could not be inspected during stale temp cleanup)` [15m]
+            |~ `(stale temp cleanup failed|some stale output temps could not be inspected or removed|some output paths could not be inspected during stale temp cleanup)` [15m]
           )) > 0
         for: 0m
         labels:
@@ -207,7 +214,8 @@ groups:
         annotations:
           summary: "cert-converter cannot clean up stale /output temp files"
           description: >
-            The stale-temp sweep could not inspect or unlink temp files left
+            The stale-temp sweep aborted at the /output root, could not inspect
+            or unlink temp files left
             behind by an interrupted atomic write, or could not enter an /output
             sub-path. Conversions may still succeed, so this is health-neutral
             and no other rule fires, while `.atomicfile-*.tmp` files — each
