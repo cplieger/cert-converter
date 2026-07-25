@@ -114,15 +114,30 @@ func isBlank(password string) bool {
 // a "pfx..v2" filename is refused), an oversized file, and a file whose
 // trimmed content is empty.
 func Load() (Config, error) {
-	password, secretErr := envx.Secret("PFX_PASSWORD")
+	password, source, secretErr := envx.SecretWithSource("PFX_PASSWORD")
 	if secretErr != nil {
 		var missing *envx.MissingError
-		if !errors.As(secretErr, &missing) {
-			// An unreadable, oversized, or empty PFX_PASSWORD_FILE must fail
-			// loudly rather than silently degrade to an empty password.
+		switch {
+		case errors.As(secretErr, &missing):
+			// Neither channel supplied a value: fall through to the blank guard,
+			// which the operator can opt out of.
+			password = ""
+		case errors.Is(secretErr, envx.ErrBlankSecretFile):
+			// A configured secret file whose content is blank. This now goes through
+			// the SAME guard as a blank PFX_PASSWORD, so PFX_ALLOW_EMPTY_PASSWORD
+			// means one thing regardless of how the secret was delivered (deferred
+			// finding l-f5). Previously envx's blank-file error was returned here
+			// verbatim, so a blank file aborted startup even with the opt-out set
+			// while a blank env var was accepted with a warning — the same question
+			// with three homes and three answers.
+			password = ""
+		default:
+			// Unreadable, oversized, or a rejected path: the operator configured a
+			// secret file that cannot be used at all. That is never something the
+			// empty-password opt-out should rescue, because silently degrading to no
+			// password is the outcome the file channel exists to prevent.
 			return Config{}, secretErr
 		}
-		password = "" // fall through to the empty-password guard below
 	}
 	allowEmpty := allowEmptyPassword(os.Getenv("PFX_ALLOW_EMPTY_PASSWORD"))
 	if isBlank(password) && !allowEmpty {
@@ -131,17 +146,20 @@ func Load() (Config, error) {
 	if err := checkPasswordEncodable(password); err != nil {
 		return Config{}, err
 	}
-	if os.Getenv("PFX_PASSWORD_FILE") != "" {
+	if source == envx.SourceFile {
 		// Record the secret's SOURCE (never its value) so an operator can confirm
 		// a mounted secret was actually consumed instead of silently falling back
-		// to PFX_PASSWORD. The configured path is deliberately omitted from this
-		// steady-state line, which every log aggregator retains: it would publish
-		// the secret-mount topology on every healthy startup for no diagnostic
-		// gain. A startup FAILURE is the deliberate exception — the envx error
-		// returned above names the path, and main logs it, because an unusable
-		// secret file cannot be diagnosed without it.
+		// to PFX_PASSWORD. Reported by envx rather than re-derived from the
+		// environment here, so the log cannot disagree with what was actually read.
+		// The configured path is deliberately omitted from this steady-state line,
+		// which every log aggregator retains: it would publish the secret-mount
+		// topology on every healthy startup for no diagnostic gain. A startup
+		// FAILURE is the deliberate exception — the envx error returned above names
+		// the path, and main logs it, because an unusable secret file cannot be
+		// diagnosed without it.
 		slog.Info("PFX password configured", "source", "PFX_PASSWORD_FILE")
 	}
+	warnBothPasswordChannels(source)
 
 	rawLifecycle := os.Getenv("OUTPUT_LIFECYCLE")
 	lifecycle, lifecycleKnown := process.ParseLifecycle(rawLifecycle)
@@ -289,4 +307,25 @@ func parseFallbackInterval(v string) time.Duration {
 			"value", v, "default", defaultFallbackInterval.String())
 		return defaultFallbackInterval
 	}
+}
+
+// warnBothPasswordChannels warns when the operator supplied the PFX password through
+// BOTH channels, because only one of them takes effect (deferred finding d-gpt-u1-2).
+//
+// PFX_PASSWORD_FILE wins by design — the whole point of the file channel is keeping the
+// value out of the process environment — so a PFX_PASSWORD set alongside it is not a
+// fallback and never will be. Without this line an operator who edits the wrong one gets
+// no signal at all: startup succeeds, and every generated bundle carries the OTHER
+// password. The mismatch only surfaces later, when a consumer cannot open a .pfx.
+//
+// Keyed on the source envx actually resolved rather than on os.Getenv, so the warning
+// cannot claim a conflict that did not happen. Neither value is logged, and the path is
+// omitted for the same reason the success line omits it.
+func warnBothPasswordChannels(source envx.SecretSource) {
+	if source != envx.SourceFile || strings.TrimSpace(os.Getenv("PFX_PASSWORD")) == "" {
+		return
+	}
+	slog.Warn("both PFX_PASSWORD and PFX_PASSWORD_FILE are set; the file wins and PFX_PASSWORD is ignored",
+		"source", "PFX_PASSWORD_FILE",
+		"remediation", "remove PFX_PASSWORD from the environment so there is one place to change the secret")
 }

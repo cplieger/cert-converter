@@ -278,13 +278,6 @@ func TestLoad_unreadable_password_file_fails_loudly(t *testing.T) {
 		{"missing file", func(t *testing.T) string {
 			return filepath.Join(t.TempDir(), "absent")
 		}},
-		{"empty file", func(t *testing.T) string {
-			path := filepath.Join(t.TempDir(), "empty")
-			if err := os.WriteFile(path, []byte("   \n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			return path
-		}},
 		// A readable file the operator could reach by hand: envx still refuses
 		// the path, and the refusal must not degrade to PFX_PASSWORD.
 		{"uncleaned path with .. is rejected", func(t *testing.T) string {
@@ -672,5 +665,114 @@ func TestLoad_refuses_an_unencodable_password(t *testing.T) {
 
 	if _, err := Load(); !errors.Is(err, ErrUnencodablePassword) {
 		t.Errorf("Load(non-BMP password) = %v, want ErrUnencodablePassword", err)
+	}
+}
+
+// TestLoad_blank_secret_file_obeys_the_same_optout pins the unification (deferred finding
+// l-f5): PFX_ALLOW_EMPTY_PASSWORD now means ONE thing regardless of how the secret was
+// delivered.
+//
+// Before, the same question had three answers: a blank PFX_PASSWORD was accepted with a
+// warning, a blank PFX_PASSWORD_FILE aborted startup inside envx before the opt-out was
+// ever consulted, and the opt-out governed only the environment channel. An operator who
+// set PFX_ALLOW_EMPTY_PASSWORD=true and mounted an empty secret file got a container that
+// refused to start, for the exact configuration they had just asked for.
+//
+// This is a deliberate behaviour change in BOTH directions: a blank file now starts WITH
+// the opt-out where it previously failed, and fails with ErrEmptyPassword WITHOUT it
+// where it previously failed with envx's error. An unusable file — unreadable, oversized,
+// rejected path — is still never rescued; that is TestLoad_unreadable_password_file_fails_loudly.
+func TestLoad_blank_secret_file_obeys_the_same_optout(t *testing.T) {
+	blankFile := func(t *testing.T) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "blank")
+		if err := os.WriteFile(path, []byte("   \n\t"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	t.Run("blank file without the opt-out is ErrEmptyPassword", func(t *testing.T) {
+		t.Setenv("PFX_PASSWORD", "")
+		t.Setenv("PFX_PASSWORD_FILE", blankFile(t))
+		t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
+
+		if _, err := Load(); !errors.Is(err, ErrEmptyPassword) {
+			t.Errorf("Load(blank file, no opt-out) = %v, want ErrEmptyPassword", err)
+		}
+	})
+
+	t.Run("blank file with the opt-out starts", func(t *testing.T) {
+		t.Setenv("PFX_PASSWORD", "")
+		t.Setenv("PFX_PASSWORD_FILE", blankFile(t))
+		t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "true")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load(blank file, opt-out) = %v, want nil: the opt-out must mean the same thing for both channels", err)
+		}
+		if cfg.Password != "" {
+			t.Errorf("Password = %q, want empty: a blank file must never silently fall back to PFX_PASSWORD", cfg.Password)
+		}
+	})
+
+	t.Run("a blank file never falls back to PFX_PASSWORD", func(t *testing.T) {
+		t.Setenv("PFX_PASSWORD", "from-env")
+		t.Setenv("PFX_PASSWORD_FILE", blankFile(t))
+		t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "true")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load = %v, want nil", err)
+		}
+		if cfg.Password == "from-env" {
+			t.Error("a blank secret file fell back to PFX_PASSWORD; the file channel exists to be authoritative")
+		}
+	})
+}
+
+// TestLoad_warns_when_both_password_channels_are_set pins the ambiguity warning
+// (deferred finding d-gpt-u1-2). PFX_PASSWORD_FILE wins by design, so a PFX_PASSWORD set
+// beside it is silently ignored — an operator who edits the wrong one gets a successful
+// startup and bundles carrying the other password, and only finds out when a consumer
+// cannot open a .pfx. Runs serially: it swaps slog.Default().
+func TestLoad_warns_when_both_password_channels_are_set(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pfx")
+	if err := os.WriteFile(path, []byte("from-file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name, env, file string
+		wantWarn        bool
+	}{
+		{"both set warns", "from-env", path, true},
+		{"file only is quiet", "", path, false},
+		{"env only is quiet", "from-env", "", false},
+		{"whitespace-only env is not a real conflict", "   ", path, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			t.Setenv("PFX_PASSWORD", tc.env)
+			t.Setenv("PFX_PASSWORD_FILE", tc.file)
+			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load = %v, want nil", err)
+			}
+
+			out := buf.String()
+			got := strings.Contains(out, "both PFX_PASSWORD and PFX_PASSWORD_FILE are set")
+			if got != tc.wantWarn {
+				t.Errorf("Load(env=%q file=%q) warned = %v, want %v; log = %q", tc.env, tc.file, got, tc.wantWarn, out)
+			}
+			if strings.Contains(out, "from-env") || strings.Contains(out, "from-file") {
+				t.Errorf("the log leaked a password value: %q", out)
+			}
+		})
 	}
 }
