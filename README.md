@@ -76,7 +76,8 @@ the first start. Unlike an unreadable `/input` sub-path, which is only warned
 about and skipped, an unwritable `/output` fails every conversion and keeps the
 container unhealthy. Generated `.pfx` files are mode `0600` and their
 directories `0750`, both owned by that UID, so whatever consumes them must run
-as the same user or its group.
+as the same UID (or as a privileged process); group membership alone is
+insufficient because mode `0600` grants no group read access.
 
 ## Alerting
 

@@ -57,9 +57,15 @@ func Load() (Config, error) {
 	}
 	rawAllowEmpty := strings.TrimSpace(os.Getenv("PFX_ALLOW_EMPTY_PASSWORD"))
 	allowEmpty := strings.EqualFold(rawAllowEmpty, "true")
-	if rawAllowEmpty != "" && !allowEmpty {
+	// Only literal true opts out, but literal false is the documented (and
+	// default-safe) disabled spelling: warning on it would fire on every
+	// startup of a correctly configured deployment. Warn only on values that
+	// are genuinely unrecognized (1/yes/on), which the literal-true contract
+	// deliberately rejects.
+	explicitFalse := strings.EqualFold(rawAllowEmpty, envFalseValue)
+	if rawAllowEmpty != "" && !allowEmpty && !explicitFalse {
 		slog.Warn("unrecognized PFX_ALLOW_EMPTY_PASSWORD, treating as false",
-			"value", rawAllowEmpty, "expected", "true")
+			"value", rawAllowEmpty, "expected", "true or false")
 	}
 	if password == "" && !allowEmpty {
 		return Config{}, ErrEmptyPassword

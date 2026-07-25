@@ -1,13 +1,15 @@
 package process
 
-// ConversionStatus represents the outcome of a single cert/key pair conversion.
-type ConversionStatus int
+// conversionStatus represents the outcome of a single cert/key pair conversion.
+// It is a Scanner implementation detail — ScanResult is the package's exported
+// outcome surface — so the enum stays package-private.
+type conversionStatus int
 
-// StatusConverted, StatusUnchanged, StatusFailed, and StatusOrphan enumerate
+// statusConverted, statusUnchanged, statusFailed, and statusOrphan enumerate
 // the possible outcomes of converting a single cert/key pair.
 const (
-	StatusConverted ConversionStatus = iota
-	StatusUnchanged
-	StatusFailed
-	StatusOrphan
+	statusConverted conversionStatus = iota
+	statusUnchanged
+	statusFailed
+	statusOrphan
 )

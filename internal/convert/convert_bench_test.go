@@ -5,15 +5,16 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"math/big"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
-	"software.sslmate.com/src/go-pkcs12"
 )
 
-func BenchmarkToPFX(b *testing.B) {
+func BenchmarkPairInRoot(b *testing.B) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		b.Fatal(err)
@@ -30,17 +31,22 @@ func BenchmarkToPFX(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	cert, err := x509.ParseCertificate(derBytes)
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
 		b.Fatal(err)
 	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 
-	enc := pkcs12.Modern2023
-	destPath := b.TempDir() + "/bench.pfx"
+	root, err := os.OpenRoot(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer root.Close()
 
 	b.ReportAllocs()
 	for b.Loop() {
-		if err := convert.ToPFX(b.Context(), key, cert, nil, destPath, "bench", enc); err != nil {
+		if err := convert.PairInRoot(b.Context(), certPEM, keyPEM, root, "bench.pfx", "bench", convert.EncNameModern2023); err != nil {
 			b.Fatal(err)
 		}
 	}

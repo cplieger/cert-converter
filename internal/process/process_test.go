@@ -21,49 +21,64 @@ func newScanner(certsRoot, outRoot string) *process.Scanner {
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
 		Password:  "pw",
-		Encoder:   pkcs12.Modern2023,
+		Encoder:   convert.EncNameModern2023,
 	})
 }
 
-func TestPair_writes_decodable_pfx_for_matched_pair(t *testing.T) {
+// convertPairToPath converts an already-read cert+key pair to a PFX at destPath
+// through PairInRoot, the only PFX-writing entry point convert exposes: it opens
+// an *os.Root over destPath's directory and writes the base name inside it.
+// Tests that assert on an ambient destination path use this instead of an
+// unconfined API, so they exercise exactly the path production takes.
+func convertPairToPath(t *testing.T, certPEM, keyPEM []byte, destPath, password string, enc convert.EncoderType) error {
+	t.Helper()
+	root, err := os.OpenRoot(filepath.Dir(destPath))
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot(%q) = %v", filepath.Dir(destPath), err)
+	}
+	defer func() { _ = root.Close() }()
+	return convert.PairInRoot(t.Context(), certPEM, keyPEM, root, filepath.Base(destPath), password, enc)
+}
+
+func TestPairInRoot_writes_decodable_pfx_for_matched_pair(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "matched.example.com", "ecdsa")
 	destPath := filepath.Join(dir, "matched.pfx")
 
-	if err := convert.Pair(t.Context(), certPEM, keyPEM, destPath, "pw", pkcs12.Modern2023); err != nil {
-		t.Fatalf("convert.Pair(matched pair) = %v, want nil", err)
+	if err := convertPairToPath(t, certPEM, keyPEM, destPath, "pw", convert.EncNameModern2023); err != nil {
+		t.Fatalf("convert.PairInRoot(matched pair) = %v, want nil", err)
 	}
 
 	pfxData, err := os.ReadFile(destPath)
 	if err != nil {
-		t.Fatalf("convert.Pair did not write a readable pfx: %v", err)
+		t.Fatalf("convert.PairInRoot did not write a readable pfx: %v", err)
 	}
 	_, leaf, _, decErr := pkcs12.DecodeChain(pfxData, "pw")
 	if decErr != nil {
-		t.Fatalf("decode pfx written by convert.Pair: %v", decErr)
+		t.Fatalf("decode pfx written by convert.PairInRoot: %v", decErr)
 	}
 	if leaf.Subject.CommonName != "matched.example.com" {
-		t.Errorf("convert.Pair wrote leaf CN = %q, want %q", leaf.Subject.CommonName, "matched.example.com")
+		t.Errorf("convert.PairInRoot wrote leaf CN = %q, want %q", leaf.Subject.CommonName, "matched.example.com")
 	}
 }
 
-func TestPair_rejects_mismatched_cert_and_key(t *testing.T) {
+func TestPairInRoot_rejects_mismatched_cert_and_key(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	certPEM, _ := testcerts.GenerateSelfSignedCert(t, "cert.example.com", "ecdsa")
 	_, keyPEM := testcerts.GenerateSelfSignedCert(t, "other.example.com", "ecdsa")
 	destPath := filepath.Join(dir, "mismatch.pfx")
 
-	err := convert.Pair(t.Context(), certPEM, keyPEM, destPath, "pw", pkcs12.Modern2023)
+	err := convertPairToPath(t, certPEM, keyPEM, destPath, "pw", convert.EncNameModern2023)
 	if err == nil {
-		t.Fatal("convert.Pair(mismatched cert/key) = nil, want error")
+		t.Fatal("convert.PairInRoot(mismatched cert/key) = nil, want error")
 	}
 	if !strings.Contains(err.Error(), "does not match") {
-		t.Errorf("convert.Pair(mismatched) error = %q, want it to contain %q", err.Error(), "does not match")
+		t.Errorf("convert.PairInRoot(mismatched) error = %q, want it to contain %q", err.Error(), "does not match")
 	}
 	if _, statErr := os.Stat(destPath); statErr == nil {
-		t.Errorf("convert.Pair wrote a pfx at %q for a mismatched pair; want no file written", destPath)
+		t.Errorf("convert.PairInRoot wrote a pfx at %q for a mismatched pair; want no file written", destPath)
 	}
 }
 
@@ -220,28 +235,28 @@ func TestScannerRun_records_orphan_crt_without_key(t *testing.T) {
 	}
 }
 
-func TestPair_carries_ca_chain_into_pfx(t *testing.T) {
+func TestPairInRoot_carries_ca_chain_into_pfx(t *testing.T) {
 	t.Parallel()
 	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
 	destPath := filepath.Join(t.TempDir(), "chain.pfx")
 
-	if err := convert.Pair(t.Context(), chainPEM, keyPEM, destPath, "pw", pkcs12.Modern2023); err != nil {
-		t.Fatalf("convert.Pair(leaf+CA chain) = %v, want nil", err)
+	if err := convertPairToPath(t, chainPEM, keyPEM, destPath, "pw", convert.EncNameModern2023); err != nil {
+		t.Fatalf("convert.PairInRoot(leaf+CA chain) = %v, want nil", err)
 	}
 
 	pfxData, err := os.ReadFile(destPath)
 	if err != nil {
-		t.Fatalf("convert.Pair did not write a readable pfx: %v", err)
+		t.Fatalf("convert.PairInRoot did not write a readable pfx: %v", err)
 	}
 	_, leaf, caCerts, decErr := pkcs12.DecodeChain(pfxData, "pw")
 	if decErr != nil {
-		t.Fatalf("decode pfx written by convert.Pair: %v", decErr)
+		t.Fatalf("decode pfx written by convert.PairInRoot: %v", decErr)
 	}
 	if leaf.Subject.CommonName != "leaf.example.com" {
-		t.Errorf("convert.Pair leaf CN = %q, want %q", leaf.Subject.CommonName, "leaf.example.com")
+		t.Errorf("convert.PairInRoot leaf CN = %q, want %q", leaf.Subject.CommonName, "leaf.example.com")
 	}
 	if len(caCerts) != 1 {
-		t.Errorf("convert.Pair PFX CA count = %d, want 1 (the CA from the chain must be carried into the PFX)", len(caCerts))
+		t.Errorf("convert.PairInRoot PFX CA count = %d, want 1 (the CA from the chain must be carried into the PFX)", len(caCerts))
 	}
 }
 

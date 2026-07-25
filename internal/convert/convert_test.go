@@ -407,41 +407,39 @@ func TestReadBoundedFromRoot(t *testing.T) {
 	})
 }
 
-// --- Tests: convert.ToPFX ---
+// --- Tests: convert.PairInRoot ---
 
-// TestToPFX_writes_decodable_pfx exercises the success path end-to-end: a valid
-// key/cert pair must encode without error and land a PKCS#12 file that decodes
-// back to the same leaf. This pins both error checks in ToPFX (encode + write):
-// negating either to `err == nil` turns the success path into a returned error,
-// which this assertion catches.
-func TestToPFX_writes_decodable_pfx(t *testing.T) {
+// TestPairInRoot_writes_decodable_pfx exercises the success path end-to-end: a
+// valid key/cert pair must encode without error and land a PKCS#12 file that
+// decodes back to the same leaf. This pins both error checks in the confined
+// write path (encode + write): negating either to `err == nil` turns the success
+// path into a returned error, which this assertion catches.
+func TestPairInRoot_writes_decodable_pfx(t *testing.T) {
 	t.Parallel()
 
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "topfx-test", "ecdsa")
-	certs, err := convert.ParseCertChain(certPEM)
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
 	if err != nil {
-		t.Fatalf("setup: convert.ParseCertChain: %v", err)
+		t.Fatalf("setup: os.OpenRoot: %v", err)
 	}
-	privKey, err := convert.ParsePrivateKey(keyPEM)
-	if err != nil {
-		t.Fatalf("setup: convert.ParsePrivateKey: %v", err)
-	}
-	destPath := filepath.Join(t.TempDir(), "out.pfx")
+	defer root.Close()
+	destPath := filepath.Join(dir, "out.pfx")
 
-	err = convert.ToPFX(t.Context(), privKey, certs[0], nil, destPath, "pw", pkcs12.Modern2023)
+	err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
 	if err != nil {
-		t.Fatalf("convert.ToPFX(valid key/cert) = error %v, want nil", err)
+		t.Fatalf("convert.PairInRoot(valid key/cert) = error %v, want nil", err)
 	}
 	pfxData, readErr := os.ReadFile(destPath)
 	if readErr != nil {
-		t.Fatalf("convert.ToPFX did not write a readable file: %v", readErr)
+		t.Fatalf("convert.PairInRoot did not write a readable file: %v", readErr)
 	}
 	_, leaf, _, decErr := pkcs12.DecodeChain(pfxData, "pw")
 	if decErr != nil {
-		t.Fatalf("decode pfx written by convert.ToPFX: %v", decErr)
+		t.Fatalf("decode pfx written by convert.PairInRoot: %v", decErr)
 	}
 	if leaf.Subject.CommonName != "topfx-test" {
-		t.Errorf("convert.ToPFX wrote leaf CN = %q, want %q", leaf.Subject.CommonName, "topfx-test")
+		t.Errorf("convert.PairInRoot wrote leaf CN = %q, want %q", leaf.Subject.CommonName, "topfx-test")
 	}
 }
 
@@ -483,150 +481,143 @@ func TestParsePrivateKey_unsupported_pkcs8_type_rejected(t *testing.T) {
 
 func TestParsePrivateKey_traditional_openssl_encrypted_returns_distinct_error(t *testing.T) {
 	t.Parallel()
-	encPEM := pem.EncodeToMemory(&pem.Block{
-		Type: "RSA PRIVATE KEY",
-		Headers: map[string]string{
-			"Proc-Type": "4,ENCRYPTED",
-			"DEK-Info":  "AES-128-CBC,0123456789ABCDEF0123456789ABCDEF",
-		},
-		Bytes: []byte("opaque encrypted key material"),
-	})
-
-	_, err := convert.ParsePrivateKey(encPEM)
-	if err == nil {
-		t.Fatal("convert.ParsePrivateKey(traditional OpenSSL encrypted RSA key) = nil error, want error")
+	tests := map[string]map[string]string{
+		"Proc-Type only with interior space": {"Proc-Type": "4, ENCRYPTED"},
+		"Proc-Type only lowercase with tab":  {"proc-type": "4,\tencrypted"},
+		"DEK-Info only":                      {"DEK-Info": "AES-128-CBC,0123456789ABCDEF0123456789ABCDEF"},
+		"DEK-Info only lowercase":            {"dek-info": "AES-128-CBC,0123456789ABCDEF0123456789ABCDEF"},
 	}
-	if !strings.Contains(err.Error(), "encrypted") {
-		t.Errorf("convert.ParsePrivateKey(encrypted) error = %q, want it to contain %q", err.Error(), "encrypted")
-	}
-}
-
-func TestToPFX_returns_wrapped_error_on_write_failure(t *testing.T) {
-	t.Parallel()
-	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "write-fail", "ecdsa")
-	certs, err := convert.ParseCertChain(certPEM)
-	if err != nil {
-		t.Fatalf("setup: convert.ParseCertChain: %v", err)
-	}
-	privKey, err := convert.ParsePrivateKey(keyPEM)
-	if err != nil {
-		t.Fatalf("setup: convert.ParsePrivateKey: %v", err)
-	}
-	// Destination sits inside a directory that does not exist; ToPFX does
-	// not create parents, so the atomic temp-file create fails.
-	destPath := filepath.Join(t.TempDir(), "missing-subdir", "out.pfx")
-
-	err = convert.ToPFX(t.Context(), privKey, certs[0], nil, destPath, "pw", pkcs12.Modern2023)
-	if err == nil {
-		t.Fatal("convert.ToPFX(unwritable destination) = nil error, want a wrapped write error")
-	}
-	if !strings.Contains(err.Error(), "write pfx") {
-		t.Errorf("convert.ToPFX(unwritable destination) error = %q, want it to contain %q", err.Error(), "write pfx")
-	}
-	if _, statErr := os.Stat(destPath); statErr == nil {
-		t.Errorf("convert.ToPFX wrote a file at an unwritable destination; want none")
-	}
-}
-
-// TestToPFX_encode_failure_is_wrapped pins the encode branch of ToPFX: a
-// private key the PKCS#12 encoder cannot marshal must surface as a wrapped
-// "encode pfx" error and must leave no file at destPath.
-func TestToPFX_encode_failure_is_wrapped(t *testing.T) {
-	t.Parallel()
-	certPEM, _ := testcerts.GenerateSelfSignedCert(t, "encode-fail", "ecdsa")
-	certs, err := convert.ParseCertChain(certPEM)
-	if err != nil {
-		t.Fatalf("setup: convert.ParseCertChain: %v", err)
-	}
-	destPath := filepath.Join(t.TempDir(), "out.pfx")
-
-	// A nil private key cannot be marshalled to PKCS#8, so the encoder fails
-	// before any temp file is created.
-	err = convert.ToPFX(t.Context(), nil, certs[0], nil, destPath, "pw", pkcs12.Modern2023)
-	if err == nil {
-		t.Fatal("convert.ToPFX(nil private key) = nil error, want a wrapped encode error")
-	}
-	if !strings.Contains(err.Error(), "encode pfx") {
-		t.Errorf("convert.ToPFX(nil private key) error = %q, want it to contain %q", err.Error(), "encode pfx")
-	}
-	if _, statErr := os.Stat(destPath); statErr == nil {
-		t.Error("convert.ToPFX wrote a file after an encode failure; want none")
-	}
-}
-
-// TestToPFX_round_trips_chain_for_every_encoder_profile pins the four PFX
-// encoding profiles PFX_ENCODER can select and the CA-chain argument: each
-// profile must produce a PKCS#12 file that decodes back to the same leaf AND
-// the same CA chain, at mode 0600.
-func TestToPFX_round_trips_chain_for_every_encoder_profile(t *testing.T) {
-	t.Parallel()
-	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
-	certs, err := convert.ParseCertChain(chainPEM)
-	if err != nil {
-		t.Fatalf("setup: convert.ParseCertChain: %v", err)
-	}
-	privKey, err := convert.ParsePrivateKey(keyPEM)
-	if err != nil {
-		t.Fatalf("setup: convert.ParsePrivateKey: %v", err)
-	}
-
-	profiles := map[string]*pkcs12.Encoder{
-		"modern2023": pkcs12.Modern2023,
-		"modern2026": pkcs12.Modern2026,
-		"legacydes":  pkcs12.LegacyDES,
-		"legacyrc2":  pkcs12.LegacyRC2,
-	}
-	for name, enc := range profiles {
+	for name, headers := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			destPath := filepath.Join(t.TempDir(), name+".pfx")
-			if err := convert.ToPFX(t.Context(), privKey, certs[0], certs[1:], destPath, "pw", enc); err != nil {
-				t.Fatalf("convert.ToPFX(%s) = error %v, want nil", name, err)
+			encPEM := pem.EncodeToMemory(&pem.Block{
+				Type:    "RSA PRIVATE KEY",
+				Headers: headers,
+				Bytes:   []byte("opaque encrypted key material"),
+			})
+			_, err := convert.ParsePrivateKey(encPEM)
+			if err == nil {
+				t.Fatal("convert.ParsePrivateKey(traditional encrypted key) = nil error, want error")
 			}
-			info, err := os.Stat(destPath)
-			if err != nil {
-				t.Fatalf("convert.ToPFX(%s) did not write a file: %v", name, err)
-			}
-			if perm := info.Mode().Perm(); perm != 0o600 {
-				t.Errorf("convert.ToPFX(%s) wrote mode %o, want 600", name, perm)
-			}
-			pfxData, err := os.ReadFile(destPath)
-			if err != nil {
-				t.Fatalf("read pfx written by convert.ToPFX(%s): %v", name, err)
-			}
-			_, leaf, cas, err := pkcs12.DecodeChain(pfxData, "pw")
-			if err != nil {
-				t.Fatalf("decode pfx written by convert.ToPFX(%s): %v", name, err)
-			}
-			if leaf.Subject.CommonName != "leaf.example.com" {
-				t.Errorf("convert.ToPFX(%s) leaf CN = %q, want %q", name, leaf.Subject.CommonName, "leaf.example.com")
-			}
-			if len(cas) != 1 {
-				t.Fatalf("convert.ToPFX(%s) round-tripped %d CA certs, want 1", name, len(cas))
-			}
-			if cas[0].Subject.CommonName != "Test CA" {
-				t.Errorf("convert.ToPFX(%s) CA CN = %q, want %q", name, cas[0].Subject.CommonName, "Test CA")
+			if !strings.Contains(err.Error(), "encrypted") {
+				t.Errorf("convert.ParsePrivateKey(traditional encrypted key) error = %q, want it to contain %q", err.Error(), "encrypted")
 			}
 		})
 	}
 }
 
-// TestToPFXInRoot_confines_the_write_to_the_output_root pins the guarantee of
+// TestParsePrivateKey_malformed_labelled_block_names_its_own_format pins that
+// the fallback error reports the parser matching the block's own PEM label, not
+// the PKCS8 attempt every block starts with.
+func TestParsePrivateKey_malformed_labelled_block_names_its_own_format(t *testing.T) {
+	t.Parallel()
+	for _, blockType := range []string{"RSA PRIVATE KEY", "EC PRIVATE KEY", "PRIVATE KEY"} {
+		t.Run(blockType, func(t *testing.T) {
+			t.Parallel()
+			keyPEM := pem.EncodeToMemory(&pem.Block{
+				Type:  blockType,
+				Bytes: []byte("this is not valid DER"),
+			})
+			_, err := convert.ParsePrivateKey(keyPEM)
+			if err == nil {
+				t.Fatalf("convert.ParsePrivateKey(malformed %s) = nil error, want error", blockType)
+			}
+			if !strings.Contains(err.Error(), blockType) {
+				t.Errorf("convert.ParsePrivateKey(malformed %s) error = %q, want it to name %q",
+					blockType, err.Error(), blockType)
+			}
+		})
+	}
+}
+
+func TestPairInRoot_returns_wrapped_error_on_write_failure(t *testing.T) {
+	t.Parallel()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "write-fail", "ecdsa")
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	defer root.Close()
+	// Destination sits inside a directory that does not exist; the confined
+	// write does not create parents, so the atomic temp-file create fails.
+	rel := filepath.Join("missing-subdir", "out.pfx")
+
+	err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, rel, "pw", convert.EncNameModern2023)
+	if err == nil {
+		t.Fatal("convert.PairInRoot(unwritable destination) = nil error, want a wrapped write error")
+	}
+	if !strings.Contains(err.Error(), "write pfx") {
+		t.Errorf("convert.PairInRoot(unwritable destination) error = %q, want it to contain %q", err.Error(), "write pfx")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, rel)); statErr == nil {
+		t.Errorf("convert.PairInRoot wrote a file at an unwritable destination; want none")
+	}
+}
+
+// TestPairInRoot_round_trips_chain_for_every_encoder_profile pins the four PFX
+// encoding profiles PFX_ENCODER can select and the CA-chain handling: each
+// profile must produce a PKCS#12 file that decodes back to the same leaf AND
+// the same CA chain, at mode 0600.
+func TestPairInRoot_round_trips_chain_for_every_encoder_profile(t *testing.T) {
+	t.Parallel()
+	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
+
+	profiles := map[string]convert.EncoderType{
+		"modern2023": convert.EncNameModern2023,
+		"modern2026": convert.EncNameModern2026,
+		"legacydes":  convert.EncNameLegacyDES,
+		"legacyrc2":  convert.EncNameLegacyRC2,
+	}
+	for name, enc := range profiles {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			root, rootErr := os.OpenRoot(dir)
+			if rootErr != nil {
+				t.Fatalf("setup: os.OpenRoot: %v", rootErr)
+			}
+			defer root.Close()
+			rel := name + ".pfx"
+			destPath := filepath.Join(dir, rel)
+			if err := convert.PairInRoot(t.Context(), chainPEM, keyPEM, root, rel, "pw", enc); err != nil {
+				t.Fatalf("convert.PairInRoot(%s) = error %v, want nil", name, err)
+			}
+			info, err := os.Stat(destPath)
+			if err != nil {
+				t.Fatalf("convert.PairInRoot(%s) did not write a file: %v", name, err)
+			}
+			if perm := info.Mode().Perm(); perm != 0o600 {
+				t.Errorf("convert.PairInRoot(%s) wrote mode %o, want 600", name, perm)
+			}
+			pfxData, err := os.ReadFile(destPath)
+			if err != nil {
+				t.Fatalf("read pfx written by convert.PairInRoot(%s): %v", name, err)
+			}
+			_, leaf, cas, err := pkcs12.DecodeChain(pfxData, "pw")
+			if err != nil {
+				t.Fatalf("decode pfx written by convert.PairInRoot(%s): %v", name, err)
+			}
+			if leaf.Subject.CommonName != "leaf.example.com" {
+				t.Errorf("convert.PairInRoot(%s) leaf CN = %q, want %q", name, leaf.Subject.CommonName, "leaf.example.com")
+			}
+			if len(cas) != 1 {
+				t.Fatalf("convert.PairInRoot(%s) round-tripped %d CA certs, want 1", name, len(cas))
+			}
+			if cas[0].Subject.CommonName != "Test CA" {
+				t.Errorf("convert.PairInRoot(%s) CA CN = %q, want %q", name, cas[0].Subject.CommonName, "Test CA")
+			}
+		})
+	}
+}
+
+// TestPairInRoot_confines_the_write_to_the_output_root pins the guarantee of
 // item h-f8 on the path production actually takes: the confined write must
-// produce the same decodable 0600 PFX as ToPFX, and a symlinked subdirectory
-// under the output root must not redirect the private-key-bearing PFX outside
-// it.
-func TestToPFXInRoot_confines_the_write_to_the_output_root(t *testing.T) {
+// produce a decodable 0600 PFX, and a symlinked subdirectory under the output
+// root must not redirect the private-key-bearing PFX outside it.
+func TestPairInRoot_confines_the_write_to_the_output_root(t *testing.T) {
 	t.Parallel()
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "confined", "ecdsa")
-	certs, err := convert.ParseCertChain(certPEM)
-	if err != nil {
-		t.Fatalf("setup: convert.ParseCertChain: %v", err)
-	}
-	privKey, err := convert.ParsePrivateKey(keyPEM)
-	if err != nil {
-		t.Fatalf("setup: convert.ParsePrivateKey: %v", err)
-	}
 
 	t.Run("writes a decodable pfx at mode 0600", func(t *testing.T) {
 		t.Parallel()
@@ -636,26 +627,26 @@ func TestToPFXInRoot_confines_the_write_to_the_output_root(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer root.Close()
-		if err := convert.ToPFXInRoot(t.Context(), privKey, certs[0], nil, root, "out.pfx", "pw", pkcs12.Modern2023); err != nil {
-			t.Fatalf("convert.ToPFXInRoot = error %v, want nil", err)
+		if err := convert.PairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023); err != nil {
+			t.Fatalf("convert.PairInRoot = error %v, want nil", err)
 		}
 		info, statErr := os.Stat(filepath.Join(dir, "out.pfx"))
 		if statErr != nil {
-			t.Fatalf("convert.ToPFXInRoot did not write a file: %v", statErr)
+			t.Fatalf("convert.PairInRoot did not write a file: %v", statErr)
 		}
 		if perm := info.Mode().Perm(); perm != 0o600 {
-			t.Errorf("convert.ToPFXInRoot wrote mode %o, want 600", perm)
+			t.Errorf("convert.PairInRoot wrote mode %o, want 600", perm)
 		}
 		pfxData, readErr := os.ReadFile(filepath.Join(dir, "out.pfx"))
 		if readErr != nil {
-			t.Fatalf("read pfx written by convert.ToPFXInRoot: %v", readErr)
+			t.Fatalf("read pfx written by convert.PairInRoot: %v", readErr)
 		}
 		_, leaf, _, decErr := pkcs12.DecodeChain(pfxData, "pw")
 		if decErr != nil {
-			t.Fatalf("decode pfx written by convert.ToPFXInRoot: %v", decErr)
+			t.Fatalf("decode pfx written by convert.PairInRoot: %v", decErr)
 		}
 		if leaf.Subject.CommonName != "confined" {
-			t.Errorf("convert.ToPFXInRoot leaf CN = %q, want %q", leaf.Subject.CommonName, "confined")
+			t.Errorf("convert.PairInRoot leaf CN = %q, want %q", leaf.Subject.CommonName, "confined")
 		}
 	})
 
@@ -675,12 +666,12 @@ func TestToPFXInRoot_confines_the_write_to_the_output_root(t *testing.T) {
 		}
 		defer root.Close()
 
-		writeErr := convert.ToPFXInRoot(t.Context(), privKey, certs[0], nil, root, "escape/out.pfx", "pw", pkcs12.Modern2023)
+		writeErr := convert.PairInRoot(t.Context(), certPEM, keyPEM, root, "escape/out.pfx", "pw", convert.EncNameModern2023)
 		if _, statErr := os.Stat(filepath.Join(outside, "out.pfx")); statErr == nil {
-			t.Error("convert.ToPFXInRoot wrote the PFX outside the output root through a symlinked subdirectory")
+			t.Error("convert.PairInRoot wrote the PFX outside the output root through a symlinked subdirectory")
 		}
 		if writeErr == nil {
-			t.Error("convert.ToPFXInRoot(symlinked subdirectory) = nil error, want a confinement error")
+			t.Error("convert.PairInRoot(symlinked subdirectory) = nil error, want a confinement error")
 		}
 	})
 }

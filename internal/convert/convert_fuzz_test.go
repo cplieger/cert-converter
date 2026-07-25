@@ -110,8 +110,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		if certErr != nil {
 			return
 		}
-		privKey, keyErr := convert.ParsePrivateKey(data)
-		if keyErr != nil {
+		if _, keyErr := convert.ParsePrivateKey(data); keyErr != nil {
 			return
 		}
 
@@ -122,12 +121,16 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		}
 
 		dir := t.TempDir()
+		root, rootErr := os.OpenRoot(dir)
+		if rootErr != nil {
+			t.Fatalf("open root: %v", rootErr)
+		}
+		defer root.Close()
 		dest := filepath.Join(dir, "out.pfx")
 		password := "test"
-		enc := pkcs12.Modern2023
 
-		if err := convert.ToPFX(t.Context(), privKey, leaf, caCerts, dest, password, enc); err != nil {
-			return // encoding may legitimately fail for mismatched key/cert
+		if err := convert.PairInRoot(t.Context(), data, data, root, "out.pfx", password, convert.EncNameModern2023); err != nil {
+			return // parsing, cert/key matching or encoding may legitimately fail
 		}
 
 		pfxData, err := os.ReadFile(dest)

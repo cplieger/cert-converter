@@ -1,15 +1,58 @@
 package config
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"pgregory.net/rapid"
 )
+
+func TestLoad_empty_password_optout_warns_only_on_unrecognized_values(t *testing.T) {
+	// slog.Default is process-global: this test swaps it, so it must not run
+	// in parallel with anything that logs.
+	for _, tc := range []struct {
+		name     string
+		optout   string
+		wantWarn bool
+	}{
+		{"explicit false is silent", "false", false},
+		{"uppercase FALSE is silent", "FALSE", false},
+		{"padded false is silent", "  false  ", false},
+		{"unset is silent", "", false},
+		{"true is silent", "true", false},
+		{"1 warns", "1", true},
+		{"yes warns", "yes", true},
+		{"on warns", "on", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", "pw")
+			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", tc.optout)
+
+			var buf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() = %v, want nil", err)
+			}
+
+			warned := strings.Contains(buf.String(), "unrecognized PFX_ALLOW_EMPTY_PASSWORD")
+			if warned != tc.wantWarn {
+				t.Errorf("Load() with PFX_ALLOW_EMPTY_PASSWORD=%q warned = %v, want %v (log: %q)",
+					tc.optout, warned, tc.wantWarn, buf.String())
+			}
+		})
+	}
+}
 
 func TestParseFallbackInterval(t *testing.T) {
 	for _, tc := range []struct {

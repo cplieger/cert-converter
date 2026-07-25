@@ -68,6 +68,24 @@ func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *hea
 
 // --- Entrypoint ---
 
+// logPasswordStatus emits the appropriate weak-password warning and returns
+// the non-secret status used by the startup log. Keeping the warning and the
+// status in one decision prevents the two predicate trees from drifting apart.
+func logPasswordStatus(password string) string {
+	switch {
+	case password == "":
+		slog.Warn("PFX_PASSWORD is empty; generated PFX files protect the private key with an empty password",
+			"remediation", "set PFX_PASSWORD")
+		return "empty"
+	case strings.TrimSpace(password) == "":
+		slog.Warn("PFX_PASSWORD is whitespace-only; generated PFX files are protected by that whitespace string, which is effectively no protection",
+			"remediation", "set PFX_PASSWORD to a real value (check for stray quotes or spaces in the env file)")
+		return "whitespace-only"
+	default:
+		return "configured"
+	}
+}
+
 func main() {
 	os.Exit(run())
 }
@@ -107,22 +125,7 @@ func run() int {
 		return 1
 	}
 
-	switch {
-	case cfg.Password == "":
-		slog.Warn("PFX_PASSWORD is empty; generated PFX files protect the private key with an empty password",
-			"remediation", "set PFX_PASSWORD")
-	case strings.TrimSpace(cfg.Password) == "":
-		slog.Warn("PFX_PASSWORD is whitespace-only; generated PFX files are protected by that whitespace string, which is effectively no protection",
-			"remediation", "set PFX_PASSWORD to a real value (check for stray quotes or spaces in the env file)")
-	}
-
-	passwordStatus := "configured"
-	switch {
-	case cfg.Password == "":
-		passwordStatus = "empty"
-	case strings.TrimSpace(cfg.Password) == "":
-		passwordStatus = "whitespace-only"
-	}
+	passwordStatus := logPasswordStatus(cfg.Password)
 	fallback := cfg.FallbackInterval.String()
 	if cfg.FallbackInterval <= 0 {
 		fallback = "disabled"
@@ -144,7 +147,7 @@ func run() int {
 		CertsRoot: certsRootDir,
 		OutRoot:   outputDir,
 		Password:  cfg.Password,
-		Encoder:   convert.EncoderFor(cfg.EncoderName),
+		Encoder:   cfg.EncoderName,
 	})
 
 	// runAndSetHealth adapts scanAndSetHealth to the watcher's on-change
