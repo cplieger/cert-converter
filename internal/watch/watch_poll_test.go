@@ -77,10 +77,9 @@ func TestPollLoopWithUpgrade_upgrades_to_fsnotify_and_scans_first(t *testing.T) 
 // detection alive.
 func TestPollTick_stays_in_poll_mode_when_watch_set_rebuild_fails(t *testing.T) {
 	t.Parallel()
-	probe := newTestWatcher(t)
-	if err := probe.Close(); err != nil {
-		t.Fatalf("setup: watcher.Close() = %v", err)
-	}
+	// Availability probe only: skips on hosts without inotify so this test cannot
+	// pass through pollTick's NewWatcher-failure branch instead of the rebuild one.
+	newTestWatcher(t)
 	scans := 0
 	missingRoot := filepath.Join(t.TempDir(), "missing")
 	w := New(missingRoot, func(context.Context) { scans++ }, WithFallback(time.Hour))
