@@ -61,6 +61,12 @@ func WithFallback(d time.Duration) Option {
 // the composition root (main.go) and injected via WithDebounce/WithFallback;
 // config owns the documented FALLBACK_SCAN_HOURS default, so an un-optioned
 // Watcher has no debounce window and no fallback rescan.
+//
+// onChange is REQUIRED. It is not defaulted to a no-op on purpose: a Watcher with no
+// callback runs its loops forever and converts nothing while the health marker stays
+// set, which is the silent-healthy failure mode this package has already been bitten
+// by (see the dead-change-detection path in pollLoopWithUpgrade). A nil callback is a
+// wiring bug and should panic at the first scan rather than run indefinitely.
 func New(root string, onChange func(ctx context.Context), opts ...Option) *Watcher {
 	w := &Watcher{
 		root:     root,
@@ -100,7 +106,21 @@ func (w *Watcher) Run(ctx context.Context) error {
 	defer watcher.Close()
 
 	slog.Info("fsnotify active", "directory_count", len(watcher.WatchList()))
+	logWatchSet(watcher)
 	return w.scanThenWatch(ctx, watcher)
+}
+
+// logWatchSet emits the watched directories at Debug.
+//
+// The default-level records carry only a count (deferred finding l-f8 replaced the
+// full path list with an aggregate, which is right — the list is unbounded in the
+// number of certificate directories). But that left the actual set emitted NOWHERE at
+// any level, so an operator diagnosing an INCOMPLETE watch set — a subdirectory whose
+// watcher.Add failed, whose renewals are then covered only by the fallback rescan —
+// could no longer read it out of the logs. Debug restores the diagnostic without
+// putting it in the steady-state log.
+func logWatchSet(watcher *fsnotify.Watcher) {
+	slog.Debug("fsnotify watch set", "directories", watcher.WatchList())
 }
 
 // scanThenWatch scans once with the watch set already live and then runs the
@@ -198,8 +218,12 @@ func (w *Watcher) addWatchDirs(ctx context.Context, watcher *fsnotify.Watcher, r
 //     fooled the old extension heuristic into skipping it) must still be
 //     reflected in the output. A rescan is cheap: the fingerprint cache skips
 //     unchanged pairs and prunes vanished ones.
-//   - Write: triggers a rescan only for a cert or key file; a metadata-only
-//     Chmod or a write to an unrelated file is ignored.
+//   - Write: triggers a rescan only for a cert or key file; a write to an
+//     unrelated file is ignored.
+//   - Chmod: triggers a rescan only for a cert or key file. This is the recovery
+//     path for a pair whose permissions were fixed after a failed conversion --
+//     without it, recovery waits for the fallback tick (never, with the fallback
+//     disabled).
 func (w *Watcher) handleFsEvent(ctx context.Context, watcher *fsnotify.Watcher, event fsnotify.Event) bool {
 	slog.Debug("fs event", "op", event.Op.String(), "path", event.Name)
 	switch {
@@ -242,6 +266,20 @@ func (w *Watcher) handleFsEvent(ctx context.Context, watcher *fsnotify.Watcher, 
 		// fail, so just rescan.
 		return true
 	case event.Has(fsnotify.Write):
+		return layout.IsRelevant(event.Name)
+	case event.Has(fsnotify.Chmod):
+		// A chmod on a cert or key IS conversion-relevant, and this arm is the
+		// recovery path for the app's most likely operator error (deferred finding
+		// l-f5). A pair the scan could not read fails conversion and clears the
+		// health marker; the operator fixes it with chmod; without this arm that
+		// chmod schedules nothing, so the container stays unhealthy and the .pfx
+		// stays stale until the next fallback tick -- six hours on the documented
+		// cadence, and NEVER when the fallback is disabled.
+		//
+		// Scoped to the naming contract, so a chmod on an unrelated file still
+		// schedules nothing. A chmod storm is absorbed by the debounce, exactly as a
+		// write storm is, and /input is a certificate directory rather than a busy
+		// tree.
 		return layout.IsRelevant(event.Name)
 	}
 	return false
@@ -459,6 +497,21 @@ func (st *watchState) handleWatcherError(err error) bool {
 // blocks until ctx is cancelled. It returns nil on shutdown and propagates
 // ErrWatchLost from the watch loop it upgrades into.
 func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) error {
+	// The initial scan, so Run owns the first scan in BOTH modes (deferred finding
+	// d-u5c6-1). It runs before the fallback check on purpose: when polling is
+	// disabled AND fsnotify is unavailable this function exits for a restart, and
+	// converting whatever is already on disk once before doing so is the only useful
+	// work the process can perform.
+	//
+	// Poll mode previously had NO immediate scan — the ticker's first tick was the
+	// first scan, up to FALLBACK_SCAN_HOURS later (six hours on the documented
+	// cadence). It went unnoticed because main scanned before calling Run, which is
+	// also what made the fsnotify path scan twice on every start.
+	if ctx.Err() != nil {
+		return nil
+	}
+	w.onChange(ctx)
+
 	if w.fallback <= 0 {
 		// Return, do not park. Parking here left the container reporting HEALTHY
 		// forever while converting nothing: the initial scan had already written the
@@ -522,6 +575,7 @@ func (w *Watcher) pollTick(ctx context.Context) (done bool, err error) {
 	}
 	slog.Info("fsnotify recovered, upgrading from poll to watch",
 		"directory_count", len(fw.WatchList()))
+	logWatchSet(fw)
 	loopErr := w.scanThenWatch(ctx, fw)
 	fw.Close()
 	return true, loopErr

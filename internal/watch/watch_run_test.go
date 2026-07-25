@@ -11,11 +11,16 @@ import (
 	"time"
 )
 
-// TestRun_scans_once_with_the_watch_set_live pins the attach-then-scan contract
-// of Run: after the watch set is registered it performs exactly one scan (a
-// renewal landing between main's startup scan and the watch registration would
-// otherwise be missed until the fallback tick), then blocks until shutdown and
-// returns nil.
+// TestRun_scans_once_with_the_watch_set_live pins the attach-then-scan contract of
+// Run: after the watch set is registered it performs EXACTLY one scan, then blocks
+// until shutdown and returns nil.
+//
+// Two separate guarantees, both load-bearing. The scan must happen after the watch
+// set is live, or a renewal landing in the attach window is missed until the fallback
+// tick. And there must be only one: Run now owns the startup scan outright, because
+// main used to scan before calling Run and the fsnotify path therefore scanned /input
+// twice on every container start, writing the health marker twice and emitting a
+// duplicated startup "scan complete" pair (deferred finding d-u5c6-1).
 func TestRun_scans_once_with_the_watch_set_live(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -23,6 +28,8 @@ func TestRun_scans_once_with_the_watch_set_live(t *testing.T) {
 		t.Fatal(err)
 	}
 	scans := make(chan struct{}, 8)
+	// No WithFallback: the periodic rescan is disarmed, so any second scan observed
+	// below is a duplicate startup scan rather than a fallback tick.
 	w := New(root, func(context.Context) { scans <- struct{}{} }, WithDebounce(20*time.Millisecond))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -34,6 +41,14 @@ func TestRun_scans_once_with_the_watch_set_live(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		cancel()
 		t.Fatal("Run did not scan after attaching the watch set; a renewal in the attach window would be missed until the fallback tick")
+	}
+
+	// Nothing has changed under root, so a second scan can only be a duplicate.
+	select {
+	case <-scans:
+		cancel()
+		t.Fatal("Run scanned twice on startup; the startup scan must happen exactly once")
+	case <-time.After(300 * time.Millisecond):
 	}
 
 	cancel()

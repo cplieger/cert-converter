@@ -227,8 +227,11 @@ func run() int {
 		scanAndSetHealth(ctx, scanner, marker)
 	}
 
-	runAndSetHealth(ctx)
-
+	// No scan here: w.Run owns the first scan in both fsnotify and poll mode. In
+	// fsnotify mode it must run AFTER the watch set is attached (so an event landing
+	// during the scan is not missed), which is a sequencing constraint main cannot
+	// honour from outside — scanning here as well meant two full scans of /input and
+	// two health-marker writes on every start.
 	w := watch.New(certsRootDir, runAndSetHealth,
 		watch.WithDebounce(watchDebounce),
 		watch.WithFallback(cfg.FallbackInterval))

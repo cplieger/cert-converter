@@ -80,7 +80,9 @@ func TestHandleFsEvent(t *testing.T) {
 		{"remove domain-named directory triggers rescan", fsnotify.Event{Name: domainDir, Op: fsnotify.Remove}, true},
 		{"remove cert triggers rescan", fsnotify.Event{Name: crtFile, Op: fsnotify.Remove}, true},
 		{"rename triggers rescan", fsnotify.Event{Name: filepath.Join(root, "whatever"), Op: fsnotify.Rename}, true},
-		{"chmod only is ignored", fsnotify.Event{Name: crtFile, Op: fsnotify.Chmod}, false},
+		{"chmod on a cert triggers rescan", fsnotify.Event{Name: crtFile, Op: fsnotify.Chmod}, true},
+		{"chmod on a key triggers rescan", fsnotify.Event{Name: filepath.Join(domainDir, "tls.key"), Op: fsnotify.Chmod}, true},
+		{"chmod on a non-cert is ignored", fsnotify.Event{Name: plainFile, Op: fsnotify.Chmod}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := w.handleFsEvent(t.Context(), watcher, tc.event); got != tc.want {

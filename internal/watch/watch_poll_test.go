@@ -30,21 +30,27 @@ func TestPollLoopWithUpgrade_upgrades_to_fsnotify_and_scans_first(t *testing.T) 
 	done := make(chan error, 1)
 	go func() { done <- w.pollLoopWithUpgrade(ctx) }()
 
+	// The immediate initial scan, which poll mode now performs before entering the
+	// ticker loop (deferred finding d-u5c6-1). It arrives before any tick, so it must
+	// be consumed here or it would be mistaken for the upgrade's scan below.
 	select {
 	case <-scans:
 	case <-time.After(10 * time.Second):
 		cancel()
-		t.Fatal("pollLoopWithUpgrade never scanned; neither the poll tick nor the upgrade path ran")
+		t.Fatal("pollLoopWithUpgrade never ran its initial scan")
 	}
 
-	// Only the upgrade branch logs this, and it logs it before handing off to
-	// watchLoop, so the record exists by the time that first scan lands. A scan
-	// alone proves nothing here: the poll tick and the watch loop's own fallback
-	// tick both scan on the same 20ms interval, so a build that never upgraded
-	// would keep feeding this channel forever.
-	if !logs.Contains("fsnotify recovered, upgrading from poll to watch") {
-		cancel()
-		t.Fatalf("pollLoopWithUpgrade scanned but never upgraded; log = %v", logs.Messages())
+	// Wait for the upgrade itself rather than inferring it from a scan: the poll tick
+	// and the watch loop's fallback tick both scan on the same 20ms interval, so a
+	// build that never upgraded would keep feeding the scans channel forever. Only
+	// the upgrade branch logs this, and it logs it before handing off to watchLoop.
+	deadline := time.Now().Add(10 * time.Second)
+	for !logs.Contains("fsnotify recovered, upgrading from poll to watch") {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("pollLoopWithUpgrade never upgraded; log = %v", logs.Messages())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// The upgrade handed off to watchLoop, so a real cert write is now detected

@@ -102,7 +102,15 @@ func TestWatchLoop_returns_ErrWatchLost_when_the_watcher_dies(t *testing.T) {
 func TestPollLoopWithUpgrade_reports_dead_change_detection(t *testing.T) {
 	t.Parallel()
 
-	w := &Watcher{fallback: 0} // FALLBACK_SCAN_HOURS=0/false
+	// onChange is a required dependency, so it is wired even here: poll mode now runs
+	// one scan before deciding change detection is dead (deferred finding d-u5c6-1),
+	// and converting whatever is already on disk is the only useful work this process
+	// can do before exiting for a restart.
+	scanned := make(chan struct{}, 1)
+	w := &Watcher{ // FALLBACK_SCAN_HOURS=0/false
+		fallback: 0,
+		onChange: func(context.Context) { scanned <- struct{}{} },
+	}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -117,5 +125,11 @@ func TestPollLoopWithUpgrade_reports_dead_change_detection(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		// The defect was precisely that this call never returns.
 		t.Fatal("pollLoopWithUpgrade did not return; it parked on ctx.Done() with change detection dead, which is what let the container report healthy forever")
+	}
+
+	select {
+	case <-scanned:
+	default:
+		t.Error("pollLoopWithUpgrade exited without scanning; main no longer scans before Run, so this is the only conversion the process would perform")
 	}
 }
