@@ -312,3 +312,122 @@ func TestAnalyse_reports_a_key_that_belongs_to_an_issuer(t *testing.T) {
 		t.Errorf("error = %q, want it to name the issuer role", err.Error())
 	}
 }
+
+// TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established pins the
+// additive-only fallback.
+//
+// Structural chain building can fail to prove a relationship that genuinely
+// exists: Go refuses to verify a SHA-1 signature at all, and RFC 5280 permits
+// issuer and subject names to be encoded differently in ways a byte comparison
+// rejects. The first implementation treated "could not prove related" the same as
+// "proved unrelated" and dropped the certificate, silently removing a CA that the
+// previous positional code shipped — which breaks path building at the consumer
+// after nothing more than an image bump.
+//
+// So when no issuer for a non-self-signed identity can be established at all, the
+// remaining certificates are KEPT. That makes the structural rewrite additive: it
+// can improve a chain, never quietly shrink one.
+func TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	// An issuer that is NOT placed in the bundle, so the leaf's issuer name
+	// matches nothing present: the same observable state a signature we cannot
+	// verify produces.
+	absentCAKey := newKey(t)
+	_, absentCACert := mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(80),
+		Subject:               pkix.Name{CommonName: "Absent Issuer CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(48 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &absentCAKey.PublicKey, nil, absentCAKey)
+
+	leafKey := newKey(t)
+	leafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(81),
+		Subject:      pkix.Name{CommonName: "orphaned-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, absentCACert, absentCAKey)
+
+	// Some other certificate sits in the bundle. Under the old positional rule it
+	// would have been embedded; it must still be embedded rather than dropped,
+	// because we cannot show it is off the chain.
+	otherKey := newKey(t)
+	otherPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(82),
+		Subject:               pkix.Name{CommonName: "Possibly Related CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(48 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &otherKey.PublicKey, nil, otherKey)
+
+	got, err := convert.Analyse(concatPEM(leafPEM, otherPEM), keyPEMOf(t, leafKey))
+	if err != nil {
+		t.Fatalf("Analyse(leaf whose issuer is absent) = error %v, want nil", err)
+	}
+	if got.Leaf.Subject.CommonName != "orphaned-leaf.example.com" {
+		t.Errorf("selected identity = %q, want the leaf", got.Leaf.Subject.CommonName)
+	}
+	if len(got.Chain) != 1 {
+		t.Fatalf("chain length = %d, want 1: an unprovable certificate must be kept, not dropped", len(got.Chain))
+	}
+	if got.Chain[0].Subject.CommonName != "Possibly Related CA" {
+		t.Errorf("chain[0] = %q, want the kept certificate", got.Chain[0].Subject.CommonName)
+	}
+	if len(got.Extra) != 0 {
+		t.Errorf("Extra holds %d certificate(s), want 0: nothing was shown to be off the chain", len(got.Extra))
+	}
+	if !hasObservation(got.Observations, convert.ObsChainUnverified) {
+		t.Errorf("observations = %v, want one of kind %q so the operator knows the chain was not verified",
+			got.Observations, convert.ObsChainUnverified)
+	}
+}
+
+// TestAnalyse_still_excludes_an_unrelated_cert_from_a_self_signed_identity keeps
+// the fallback narrow. A self-signed identity has no issuer BY CONSTRUCTION, so
+// an empty chain is proof rather than a failure to prove, and the fallback must
+// not fire — otherwise the unrelated-certificate exclusion (the whole point of
+// replacing `caCerts = chain[1:]`) would be undone for every self-signed input.
+func TestAnalyse_still_excludes_an_unrelated_cert_from_a_self_signed_identity(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	key := newKey(t)
+	identityPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(90),
+		Subject:      pkix.Name{CommonName: "self.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &key.PublicKey, nil, key)
+
+	strangerKey := newKey(t)
+	strangerPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(91),
+		Subject:      pkix.Name{CommonName: "stranger.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &strangerKey.PublicKey, nil, strangerKey)
+
+	got, err := convert.Analyse(concatPEM(identityPEM, strangerPEM), keyPEMOf(t, key))
+	if err != nil {
+		t.Fatalf("Analyse = error %v, want nil", err)
+	}
+	if len(got.Chain) != 0 {
+		t.Errorf("chain length = %d, want 0: a self-signed identity has no chain", len(got.Chain))
+	}
+	if len(got.Extra) != 1 {
+		t.Fatalf("Extra holds %d certificate(s), want 1", len(got.Extra))
+	}
+	if !hasObservation(got.Observations, convert.ObsExtraCertsExcluded) {
+		t.Errorf("observations = %v, want the exclusion reported", got.Observations)
+	}
+	if hasObservation(got.Observations, convert.ObsChainUnverified) {
+		t.Errorf("observations = %v, want NO chain-unverified fallback for a self-signed identity", got.Observations)
+	}
+}

@@ -45,6 +45,10 @@ const (
 	// ObsCAAsIdentity reports that the selected identity asserts IsCA. Legal (a
 	// self-signed CA can serve as an identity) but unusual enough to surface.
 	ObsCAAsIdentity ObservationKind = "ca-as-identity"
+	// ObsChainUnverified reports that no issuer for the selected identity could be
+	// established from the bundle, so the remaining certificates were included
+	// as-is rather than dropped.
+	ObsChainUnverified ObservationKind = "chain-unverified"
 	// ObsIdentityNotYetValid reports a selected identity whose NotBefore is in
 	// the future. Conversion still proceeds; consumers will reject it.
 	ObsIdentityNotYetValid ObservationKind = "identity-not-yet-valid"
@@ -153,7 +157,7 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 	// This is the case a positional "leaf = certs[0]" rule cannot see.
 	if g.isIssuer(identity.cert) {
 		return Analysis{}, fmt.Errorf(
-			"the private key matches %q, which is an issuer of another certificate in this bundle, not an end-entity certificate",
+			"the private key matches %q, which is an issuer of another certificate in this bundle, not an end-entity certificate; if you meant to export that CA itself, remove the certificates it issued from the bundle",
 			boundSubject(leaf.Subject.String()))
 	}
 	if leaf.BasicConstraintsValid && leaf.IsCA {
@@ -172,19 +176,8 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 	}
 	obs = append(obs, validityObservations(leaf, now)...)
 
-	path := g.pathFrom(identity.cert)
-	chain := make([]*x509.Certificate, 0, len(path)-1)
-	for _, i := range path[1:] {
-		chain = append(chain, certs[i])
-	}
-	extra := g.outsidePath(path)
-	if len(extra) > 0 {
-		obs = append(obs, Observation{
-			Kind: ObsExtraCertsExcluded,
-			Detail: fmt.Sprintf("%d certificate(s) are not part of %q's chain and were excluded: %s",
-				len(extra), boundSubject(leaf.Subject.String()), subjectsForLog(extra)),
-		})
-	}
+	chain, extra, chainObs := g.assembleChain(identity.cert, leaf)
+	obs = append(obs, chainObs...)
 
 	return Analysis{
 		Leaf:         leaf,
@@ -203,82 +196,124 @@ type identityMatch struct {
 }
 
 // certGraph holds the certificates plus the issuance relationships derived from
-// them: which certificate signed which, and how far each is from a self-signed
-// root present in the bundle. Every edge is cryptographic evidence, not a naming
-// coincidence.
+// them, in TWO sets of differing strength, plus how far each certificate is from
+// a self-signed root present in the bundle.
 type certGraph struct {
-	now        time.Time
-	certs      []*x509.Certificate
-	parents    [][]int
-	children   [][]int
-	issuer     []bool
-	distToRoot []int
+	now   time.Time
+	certs []*x509.Certificate
+	// verifiedParents[i]: indices whose signature over certs[i] VERIFIED. The
+	// strong signal, used for the issuer role rejection — a hard failure, so it
+	// must rest on proof rather than resemblance.
+	verifiedParents [][]int
+	// candidateParents[i]: indices that are plausibly issuers of certs[i], by key
+	// identifier or by issuer/subject name, whether or not a signature could be
+	// verified. The inclusive signal, used to assemble the emitted chain, where
+	// over-including costs one stray certificate and under-including silently
+	// breaks path building at the consumer.
+	//
+	// The sets diverge for causes unrelated to the chain being wrong: Go refuses
+	// to verify a SHA-1 signature at all (no x509sha1 GODEBUG remains in
+	// go1.26), and RFC 5280 permits issuer and subject names to be encoded
+	// differently in ways a byte comparison rejects. Treating "could not prove
+	// related" as "proved unrelated" is what dropped genuine CA certificates the
+	// previous positional code shipped.
+	candidateParents [][]int
+	children         [][]int
+	issuer           []bool
+	distToRoot       []int
 }
 
-// newCertGraph derives the issuance graph.
+// newCertGraph derives both issuance edge sets.
 //
-// An edge is established by an exact RawIssuer/RawSubject match followed by
-// x509.CheckSignatureFrom. That call is deliberately described as CRYPTOGRAPHIC
-// PARENT EVIDENCE WITH LIMITED CA GATING, not as path validation. Go documents
-// it as performing "very limited checks" and explicitly not being a full path
-// verifier. It does NOT check validity periods, path length, name constraints,
-// EKU nesting, unhandled critical extensions, or revocation; a certificate whose
-// KeyUsage is zero passes its CertSign check; and a v1/v2 certificate with no
+// Signature verification via x509.CheckSignatureFrom is CRYPTOGRAPHIC PARENT
+// EVIDENCE WITH LIMITED CA GATING, not path validation. Go documents it as
+// performing "very limited checks" and explicitly not being a full path verifier.
+// It does NOT check validity periods, path length, name constraints, EKU nesting,
+// unhandled critical extensions, or revocation; a certificate whose KeyUsage is
+// zero passes its CertSign check; and a v1/v2 certificate with no
 // basic-constraints extension is not rejected by its IsCA check. Identity role is
-// therefore enforced separately, by Analyse's own issuer check.
+// therefore enforced separately, by Analyse's own issuer check, and that check
+// reads only the verified set.
 func newCertGraph(certs []*x509.Certificate, now time.Time) *certGraph {
 	g := &certGraph{
-		certs:      certs,
-		parents:    make([][]int, len(certs)),
-		children:   make([][]int, len(certs)),
-		issuer:     make([]bool, len(certs)),
-		distToRoot: make([]int, len(certs)),
-		now:        now,
+		now:              now,
+		certs:            certs,
+		verifiedParents:  make([][]int, len(certs)),
+		candidateParents: make([][]int, len(certs)),
+		children:         make([][]int, len(certs)),
+		issuer:           make([]bool, len(certs)),
+		distToRoot:       make([]int, len(certs)),
 	}
 	for child := range certs {
 		for parent := range certs {
-			if child == parent || !g.isIssuance(child, parent) {
+			if child == parent || !g.plausibleIssuer(child, parent) {
 				continue
 			}
-			g.parents[child] = append(g.parents[child], parent)
+			g.candidateParents[child] = append(g.candidateParents[child], parent)
 			g.children[parent] = append(g.children[parent], child)
-			g.issuer[parent] = true
+			if certs[child].CheckSignatureFrom(certs[parent]) == nil {
+				g.verifiedParents[child] = append(g.verifiedParents[child], parent)
+				g.issuer[parent] = true
+			}
 		}
 	}
 	g.computeDistances()
 	return g
 }
 
-// isIssuance reports whether certs[parent] issued certs[child].
+// plausibleIssuer reports whether certs[parent] could be the issuer of
+// certs[child], on the evidence available without cryptography.
+//
+// Two independent signals, either sufficient. Issuer/subject name chaining is the
+// ordinary one. A key-identifier match (RFC 5280's Authority Key Identifier
+// against the candidate's Subject Key Identifier) is the one that survives a
+// permitted name-encoding difference, and it is a byte comparison rather than a
+// signature check, so it is algorithm-agnostic and keeps working for algorithms
+// Go declines to verify.
 //
 // The key-reuse exclusion is not cosmetic. Two DISTINCT self-signed certificates
-// that share a subject AND a public key — a regenerated self-signed certificate
-// left beside the one it replaces, which `openssl req -x509` produces with
-// basicConstraints CA:TRUE by default — each verify against the other, so a
-// naive rule records a mutual issuance edge. Both then look like issuers, and
-// Analyse's role check rejects the identity outright. Key reuse is not issuance:
-// a certificate cannot meaningfully have issued another certificate holding its
-// own key, so no edge exists between them.
-func (g *certGraph) isIssuance(child, parent int) bool {
+// sharing a subject AND a public key — a regenerated self-signed certificate left
+// beside the one it replaces, which `openssl req -x509` produces with
+// basicConstraints CA:TRUE by default — each verify against the other, so a naive
+// rule records a mutual issuance edge, both then look like issuers, and the role
+// check rejects the identity outright. Key reuse is not issuance: a certificate
+// cannot have issued another certificate carrying its own key.
+func (g *certGraph) plausibleIssuer(child, parent int) bool {
 	c, p := g.certs[child], g.certs[parent]
-	if !bytes.Equal(c.RawIssuer, p.RawSubject) {
-		return false
-	}
 	if bytes.Equal(c.RawSubject, p.RawSubject) && samePublicKey(c.PublicKey, p.PublicKey) {
 		return false
 	}
-	return c.CheckSignatureFrom(p) == nil
+	if len(c.AuthorityKeyId) > 0 && len(p.SubjectKeyId) > 0 &&
+		bytes.Equal(c.AuthorityKeyId, p.SubjectKeyId) {
+		return true
+	}
+	return bytes.Equal(c.RawIssuer, p.RawSubject)
 }
 
-// isIssuer reports whether certs[i] signed another certificate in this bundle.
+// isIssuer reports whether certs[i] verifiably signed another certificate here.
 func (g *certGraph) isIssuer(i int) bool { return g.issuer[i] }
 
-// isSelfSigned reports whether certs[i] signed itself, which is what makes it a
-// root rather than a link. The signature check matters: a certificate whose
-// subject and issuer names merely coincide is not a root.
+// isSelfSigned reports whether certs[i] is its own issuer, which is what makes it
+// a root rather than a link.
+//
+// It verifies the signature with the certificate's OWN public key rather than
+// calling CheckSignatureFrom(self). That distinction is load-bearing:
+// CheckSignatureFrom rejects any v3 certificate acting as a parent when
+// BasicConstraintsValid is false (crypto/x509), and a plain self-signed server
+// certificate — the shape `openssl req -x509` produces without CA flags, and the
+// shape most test fixtures use — sets no basic constraints at all. Routing through
+// CheckSignatureFrom therefore reported every non-CA self-signed certificate as
+// NOT self-signed, which both lost it as a root for the distance walk and made
+// the additive-only chain fallback fire on inputs whose empty chain was correct.
+//
+// CA-ness is irrelevant to the question asked here: a self-signed end-entity
+// certificate is still self-signed.
 func (g *certGraph) isSelfSigned(i int) bool {
-	return bytes.Equal(g.certs[i].RawSubject, g.certs[i].RawIssuer) &&
-		g.certs[i].CheckSignatureFrom(g.certs[i]) == nil
+	c := g.certs[i]
+	if !bytes.Equal(c.RawSubject, c.RawIssuer) {
+		return false
+	}
+	return c.CheckSignature(c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) == nil
 }
 
 // computeDistances fills distToRoot with the fewest parent hops from each
@@ -441,7 +476,7 @@ func (g *certGraph) pathFrom(start int) []int {
 	onPath[start] = true
 	for cur := start; ; {
 		best := -1
-		for _, p := range g.parents[cur] {
+		for _, p := range g.candidateParents[cur] {
 			if onPath[p] {
 				continue
 			}
@@ -467,6 +502,14 @@ func (g *certGraph) pathFrom(start int) []int {
 // one name, so real branches with equal distance and equal NotAfter exist, and
 // with an inert final key the choice fell back to file order.
 func (g *certGraph) betterParent(a, b int) bool {
+	// Validity first. An expired issuer breaks the chain at the consumer no matter
+	// how short its route to a root is, so ranking reachability or path length
+	// ahead of validity could emit an unusable chain while a usable one sat in the
+	// same input. That ordering was an oversight, not a decision.
+	va, vb := validAt(g.certs[a], g.now), validAt(g.certs[b], g.now)
+	if va != vb {
+		return va
+	}
 	ra, rb := g.distToRoot[a] >= 0, g.distToRoot[b] >= 0
 	if ra != rb {
 		return ra
@@ -504,6 +547,46 @@ func samePublicKey(a, b crypto.PublicKey) bool {
 		return false
 	}
 	return matcher.Equal(b)
+}
+
+// assembleChain builds the emitted chain for the selected identity, the
+// certificates deliberately left out of it, and the observations describing
+// either outcome.
+//
+// The additive-only fallback lives here: if NO issuer for the identity could be
+// established even on the inclusive edge signal, the remaining certificates are
+// KEPT rather than dropped. The previous positional code shipped everything after
+// the first block, and silently removing a CA a working deployment relied on is
+// far worse than carrying one it did not need, so exclusion is reserved for
+// certificates positively shown to sit off the chain.
+//
+// A SELF-SIGNED identity is excluded from the fallback: it has no issuer by
+// construction, so an empty chain there is proof rather than a failure to prove,
+// and anything else in the bundle genuinely is unrelated.
+func (g *certGraph) assembleChain(identityCert int, leaf *x509.Certificate) (chain, extra []*x509.Certificate, obs []Observation) {
+	path := g.pathFrom(identityCert)
+	chain = make([]*x509.Certificate, 0, len(path)-1)
+	for _, i := range path[1:] {
+		chain = append(chain, g.certs[i])
+	}
+	extra = g.outsidePath(path)
+
+	if len(chain) == 0 && len(extra) > 0 && !g.isSelfSigned(identityCert) {
+		return extra, nil, []Observation{{
+			Kind: ObsChainUnverified,
+			Detail: fmt.Sprintf("no issuer of %q could be established from the bundle; the other %d certificate(s) were kept rather than dropped",
+				boundSubject(leaf.Subject.String()), len(extra)),
+		}}
+	}
+
+	if len(extra) > 0 {
+		obs = append(obs, Observation{
+			Kind: ObsExtraCertsExcluded,
+			Detail: fmt.Sprintf("%d certificate(s) are not part of %q's chain and were excluded: %s",
+				len(extra), boundSubject(leaf.Subject.String()), subjectsForLog(extra)),
+		})
+	}
+	return chain, extra, obs
 }
 
 // validAt reports whether c is inside its validity window at now.
