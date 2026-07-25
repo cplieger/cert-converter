@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/process"
@@ -21,10 +20,17 @@ import (
 
 // --- Test helpers ---
 
-// newTestScanner creates a fresh cache and scanner for test isolation.
-func newTestScanner() (*process.Scanner, *convert.HashCache) {
+// newTestScanner creates a fresh cache and a scanner over the given roots for
+// test isolation. The scan configuration is process-lifetime, so it is injected
+// at construction.
+func newTestScanner(certsRoot, outRoot, password string, enc *pkcs12.Encoder) (*process.Scanner, *convert.HashCache) {
 	c := convert.NewHashCache()
-	return process.New(c), c
+	return process.New(c, process.Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  password,
+		Encoder:   enc,
+	}), c
 }
 
 // writeCertAndKey writes a .crt and .key file pair into dir and returns their paths.
@@ -63,8 +69,8 @@ func TestConvertToPFX(t *testing.T) {
 		certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "ecdsa-test", "ecdsa")
 		pfxPath := filepath.Join(t.TempDir(), "test.pfx")
 
-		if err := process.ConvertPair(t.Context(), certPEM, keyPEM, pfxPath, "pass", pkcs12.Modern2023); err != nil {
-			t.Fatalf("process.ConvertPair: %v", err)
+		if err := convert.Pair(t.Context(), certPEM, keyPEM, pfxPath, "pass", pkcs12.Modern2023); err != nil {
+			t.Fatalf("convert.Pair: %v", err)
 		}
 
 		privKey, cert, caCerts := decodePFX(t, pfxPath, "pass")
@@ -92,8 +98,8 @@ func TestConvertToPFX(t *testing.T) {
 		certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "rsa-test", "rsa")
 		pfxPath := filepath.Join(t.TempDir(), "test.pfx")
 
-		if err := process.ConvertPair(t.Context(), certPEM, keyPEM, pfxPath, "", pkcs12.Modern2023); err != nil {
-			t.Fatalf("process.ConvertPair: %v", err)
+		if err := convert.Pair(t.Context(), certPEM, keyPEM, pfxPath, "", pkcs12.Modern2023); err != nil {
+			t.Fatalf("convert.Pair: %v", err)
 		}
 
 		privKey, cert, _ := decodePFX(t, pfxPath, "")
@@ -110,8 +116,8 @@ func TestConvertToPFX(t *testing.T) {
 		_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
 		pfxPath := filepath.Join(t.TempDir(), "chain.pfx")
 
-		if err := process.ConvertPair(t.Context(), chainPEM, keyPEM, pfxPath, "chainpass", pkcs12.Modern2023); err != nil {
-			t.Fatalf("process.ConvertPair: %v", err)
+		if err := convert.Pair(t.Context(), chainPEM, keyPEM, pfxPath, "chainpass", pkcs12.Modern2023); err != nil {
+			t.Fatalf("convert.Pair: %v", err)
 		}
 
 		privKey, cert, caCerts := decodePFX(t, pfxPath, "chainpass")
@@ -139,8 +145,8 @@ func TestConvertToPFX(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := process.ConvertPair(t.Context(), certPEM, keyPEM, pfxPath, "", pkcs12.Modern2023); err != nil {
-			t.Fatalf("process.ConvertPair: %v", err)
+		if err := convert.Pair(t.Context(), certPEM, keyPEM, pfxPath, "", pkcs12.Modern2023); err != nil {
+			t.Fatalf("convert.Pair: %v", err)
 		}
 
 		decodePFX(t, pfxPath, "") // panics if still "old data"
@@ -154,48 +160,15 @@ func TestProcessAll(t *testing.T) {
 
 	enc := pkcs12.Modern2023
 
-	t.Run("skips unchanged files", func(t *testing.T) {
-		t.Parallel()
-		scanner, _ := newTestScanner()
-		certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
-		tmpDir := t.TempDir()
-		outDir := t.TempDir()
-		writeCertAndKey(t, tmpDir, "test", certPEM, keyPEM)
-
-		if _, err := scanner.Run(context.Background(), tmpDir, outDir, "", enc); err != nil {
-			t.Fatalf("first scanner.Run: %v", err)
-		}
-
-		pfxPath := filepath.Join(outDir, "test.pfx")
-		info1, err := os.Stat(pfxPath)
-		if err != nil {
-			t.Fatalf("pfx not created: %v", err)
-		}
-
-		time.Sleep(50 * time.Millisecond)
-
-		if _, err := scanner.Run(context.Background(), tmpDir, outDir, "", enc); err != nil {
-			t.Fatalf("second scanner.Run: %v", err)
-		}
-
-		info2, err := os.Stat(pfxPath)
-		if err != nil {
-			t.Fatalf("pfx disappeared: %v", err)
-		}
-		if info2.ModTime() != info1.ModTime() {
-			t.Error("pfx was rewritten despite unchanged input")
-		}
-	})
-
 	t.Run("reconverts on change", func(t *testing.T) {
 		t.Parallel()
-		scanner, _ := newTestScanner()
 		certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
 		tmpDir := t.TempDir()
 		outDir := t.TempDir()
+		scanner, _ := newTestScanner(tmpDir, outDir, "", enc)
 		writeCertAndKey(t, tmpDir, "test", certPEM, keyPEM)
 
-		if _, err := scanner.Run(context.Background(), tmpDir, outDir, "", enc); err != nil {
+		if _, err := scanner.Run(context.Background()); err != nil {
 			t.Fatalf("first scanner.Run: %v", err)
 		}
 
@@ -203,7 +176,7 @@ func TestProcessAll(t *testing.T) {
 		certPEM2, keyPEM2 := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
 		writeCertAndKey(t, tmpDir, "test", certPEM2, keyPEM2)
 
-		if _, err := scanner.Run(context.Background(), tmpDir, outDir, "", enc); err != nil {
+		if _, err := scanner.Run(context.Background()); err != nil {
 			t.Fatalf("second scanner.Run: %v", err)
 		}
 
@@ -212,10 +185,10 @@ func TestProcessAll(t *testing.T) {
 
 	t.Run("preserves nested directory structure", func(t *testing.T) {
 		t.Parallel()
-		scanner, _ := newTestScanner()
 		certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
 		tmpDir := t.TempDir()
 		outDir := t.TempDir()
+		scanner, _ := newTestScanner(tmpDir, outDir, "", enc)
 
 		nestedDir := filepath.Join(tmpDir, "sub", "dir")
 		if err := os.MkdirAll(nestedDir, 0o755); err != nil {
@@ -223,7 +196,7 @@ func TestProcessAll(t *testing.T) {
 		}
 		writeCertAndKey(t, nestedDir, "nested", certPEM, keyPEM)
 
-		if _, err := scanner.Run(context.Background(), tmpDir, outDir, "", enc); err != nil {
+		if _, err := scanner.Run(context.Background()); err != nil {
 			t.Fatalf("scanner.Run: %v", err)
 		}
 
@@ -235,16 +208,16 @@ func TestProcessAll(t *testing.T) {
 
 	t.Run("skips .crt without matching .key", func(t *testing.T) {
 		t.Parallel()
-		scanner, _ := newTestScanner()
 		certPEM, _ := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
 		tmpDir := t.TempDir()
 		outDir := t.TempDir()
+		scanner, _ := newTestScanner(tmpDir, outDir, "", enc)
 
 		if err := os.WriteFile(filepath.Join(tmpDir, "orphan.crt"), certPEM, 0o644); err != nil {
 			t.Fatal(err)
 		}
 
-		if _, err := scanner.Run(context.Background(), tmpDir, outDir, "", enc); err != nil {
+		if _, err := scanner.Run(context.Background()); err != nil {
 			t.Fatalf("scanner.Run: %v", err)
 		}
 
@@ -255,9 +228,9 @@ func TestProcessAll(t *testing.T) {
 
 	t.Run("retries after conversion failure", func(t *testing.T) {
 		t.Parallel()
-		scanner, _ := newTestScanner()
 		tmpDir := t.TempDir()
 		outDir := t.TempDir()
+		scanner, _ := newTestScanner(tmpDir, outDir, "", enc)
 
 		// Write a valid cert but an invalid key to trigger conversion failure.
 		certPEM, _ := testcerts.GenerateSelfSignedCert(t, "retry", "ecdsa")
@@ -271,7 +244,7 @@ func TestProcessAll(t *testing.T) {
 		}
 
 		// First scan: conversion fails (bad key), but should not cache the hash.
-		if _, err := scanner.Run(context.Background(), tmpDir, outDir, "", enc); err != nil {
+		if _, err := scanner.Run(context.Background()); err != nil {
 			t.Fatalf("first scanner.Run: %v", err)
 		}
 		if _, err := os.Stat(filepath.Join(outDir, "retry.pfx")); err == nil {
@@ -288,7 +261,7 @@ func TestProcessAll(t *testing.T) {
 		}
 
 		// Second scan: should retry because hash was invalidated on failure.
-		if _, err := scanner.Run(context.Background(), tmpDir, outDir, "", enc); err != nil {
+		if _, err := scanner.Run(context.Background()); err != nil {
 			t.Fatalf("second scanner.Run: %v", err)
 		}
 		if _, err := os.Stat(filepath.Join(outDir, "retry.pfx")); err != nil {
@@ -297,20 +270,20 @@ func TestProcessAll(t *testing.T) {
 	})
 }
 
-// --- Tests: ConvertPair error paths ---
+// --- Tests: Pair error paths ---
 
-// ConvertPair operates on already-read bytes, so the former "nonexistent
+// Pair operates on already-read bytes, so the former "nonexistent
 // cert/key file" cases moved to the read seam (convert.ReadBoundedFromRoot, see
 // internal/convert) and the scanner's orphan/unreadable handling. What remains
-// here are the parse and write failures ConvertPair itself owns.
+// here are the parse and write failures Pair itself owns.
 
 func TestConvertToPFX_invalid_cert_PEM(t *testing.T) {
 	t.Parallel()
 
 	_, keyPEM := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
-	err := process.ConvertPair(t.Context(), []byte("not a cert"), keyPEM, filepath.Join(t.TempDir(), "out.pfx"), "", pkcs12.Modern2023)
+	err := convert.Pair(t.Context(), []byte("not a cert"), keyPEM, filepath.Join(t.TempDir(), "out.pfx"), "", pkcs12.Modern2023)
 	if err == nil {
-		t.Fatal("process.ConvertPair should fail for invalid cert PEM")
+		t.Fatal("convert.Pair should fail for invalid cert PEM")
 	}
 }
 
@@ -318,9 +291,9 @@ func TestConvertToPFX_invalid_key_PEM(t *testing.T) {
 	t.Parallel()
 
 	certPEM, _ := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
-	err := process.ConvertPair(t.Context(), certPEM, []byte("not a key"), filepath.Join(t.TempDir(), "out.pfx"), "", pkcs12.Modern2023)
+	err := convert.Pair(t.Context(), certPEM, []byte("not a key"), filepath.Join(t.TempDir(), "out.pfx"), "", pkcs12.Modern2023)
 	if err == nil {
-		t.Fatal("process.ConvertPair should fail for invalid key PEM")
+		t.Fatal("convert.Pair should fail for invalid key PEM")
 	}
 }
 
@@ -328,9 +301,9 @@ func TestConvertToPFX_unwritable_dest(t *testing.T) {
 	t.Parallel()
 
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
-	err := process.ConvertPair(t.Context(), certPEM, keyPEM, "/nonexistent/dir/out.pfx", "", pkcs12.Modern2023)
+	err := convert.Pair(t.Context(), certPEM, keyPEM, "/nonexistent/dir/out.pfx", "", pkcs12.Modern2023)
 	if err == nil {
-		t.Fatal("process.ConvertPair should fail for unwritable destination")
+		t.Fatal("convert.Pair should fail for unwritable destination")
 	}
 }
 
@@ -344,52 +317,41 @@ func newTestMarker(t *testing.T) (*health.Marker, string) {
 	return health.NewMarker(path), path
 }
 
-func TestRunAndSetHealth(t *testing.T) {
+func TestScanAndSetHealth_sets_marker_after_failure_free_scan(t *testing.T) {
 	t.Parallel()
 
-	scanner, _ := newTestScanner()
 	marker, markerPath := newTestMarker(t)
 
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "health-test", "ecdsa")
 	inDir := t.TempDir()
 	outDir := t.TempDir()
+	scanner, _ := newTestScanner(inDir, outDir, "", pkcs12.Modern2023)
 	writeCertAndKey(t, inDir, "test", certPEM, keyPEM)
 
-	result, err := scanner.Run(context.Background(), inDir, outDir, "", pkcs12.Modern2023)
-	if err != nil {
-		marker.Set(false)
-	} else {
-		marker.Set(healthyAfterScan(result))
-	}
+	scanAndSetHealth(t.Context(), scanner, marker)
 
 	if _, err := os.Stat(markerPath); err != nil {
-		t.Fatalf("health marker should exist after successful runAndSetHealth: %v", err)
+		t.Errorf("health marker should exist after a failure-free scan: %v", err)
 	}
-
-	pfxPath := filepath.Join(outDir, "test.pfx")
-	if _, err := os.Stat(pfxPath); err != nil {
-		t.Fatalf("PFX should be created: %v", err)
+	if _, err := os.Stat(filepath.Join(outDir, "test.pfx")); err != nil {
+		t.Errorf("PFX should be created: %v", err)
 	}
 }
 
-func TestRunAndSetHealth_failure(t *testing.T) {
+func TestScanAndSetHealth_clears_marker_when_scan_errors(t *testing.T) {
 	t.Parallel()
 
-	scanner, _ := newTestScanner()
 	marker, markerPath := newTestMarker(t)
 
-	// Set healthy first, then trigger a failure to verify it gets cleared.
+	// Start healthy so the assertion proves the scan error cleared it.
 	marker.Set(true)
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	scanner, _ := newTestScanner(missing, t.TempDir(), "", pkcs12.Modern2023)
 
-	result, err := scanner.Run(context.Background(), "/nonexistent/input", "/nonexistent/output", "", pkcs12.Modern2023)
-	if err != nil {
-		marker.Set(false)
-	} else {
-		marker.Set(healthyAfterScan(result))
-	}
+	scanAndSetHealth(t.Context(), scanner, marker)
 
 	if _, err := os.Stat(markerPath); err == nil {
-		t.Fatal("health marker should not exist after failed runAndSetHealth")
+		t.Error("health marker should be cleared when the input root cannot be scanned")
 	}
 }
 
@@ -397,10 +359,10 @@ func TestRunAndSetHealth_unreadable_subdir_stays_healthy(t *testing.T) {
 	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
 		t.Skip("chmod 0 does not block root / differs on Windows")
 	}
-	scanner, _ := newTestScanner()
 	marker, markerPath := newTestMarker(t)
 	marker.Set(false) // start unhealthy; a failure-free scan must restore health
 	inDir, outDir := t.TempDir(), t.TempDir()
+	scanner, _ := newTestScanner(inDir, outDir, "", pkcs12.Modern2023)
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "good", "ecdsa")
 	writeCertAndKey(t, inDir, "good", certPEM, keyPEM)
 	bad := filepath.Join(inDir, "blocked")
@@ -411,7 +373,7 @@ func TestRunAndSetHealth_unreadable_subdir_stays_healthy(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(bad, 0o755) })
-	result, err := scanner.Run(context.Background(), inDir, outDir, "", pkcs12.Modern2023)
+	result, err := scanner.Run(context.Background())
 	if err != nil {
 		t.Fatalf("scan should not error on an unreadable subdir: %v", err)
 	}
@@ -443,8 +405,8 @@ func TestConvertToPFX_round_trip_all_encoders(t *testing.T) {
 			certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "encoder-"+tc.name, "ecdsa")
 			pfxPath := filepath.Join(t.TempDir(), "test.pfx")
 
-			if err := process.ConvertPair(t.Context(), certPEM, keyPEM, pfxPath, "testpass", tc.enc); err != nil {
-				t.Fatalf("process.ConvertPair(%s): %v", tc.name, err)
+			if err := convert.Pair(t.Context(), certPEM, keyPEM, pfxPath, "testpass", tc.enc); err != nil {
+				t.Fatalf("convert.Pair(%s): %v", tc.name, err)
 			}
 
 			_, cert, _ := decodePFX(t, pfxPath, "testpass")
@@ -458,11 +420,11 @@ func TestConvertToPFX_round_trip_all_encoders(t *testing.T) {
 func TestProcessAll_empty_directory(t *testing.T) {
 	t.Parallel()
 
-	scanner, _ := newTestScanner()
 	inDir := t.TempDir()
 	outDir := t.TempDir()
+	scanner, _ := newTestScanner(inDir, outDir, "", pkcs12.Modern2023)
 
-	if _, err := scanner.Run(context.Background(), inDir, outDir, "", pkcs12.Modern2023); err != nil {
+	if _, err := scanner.Run(context.Background()); err != nil {
 		t.Fatalf("scanner.Run(empty dir) = %v, want nil", err)
 	}
 
@@ -479,9 +441,9 @@ func TestProcessAll_empty_directory(t *testing.T) {
 func TestProcessAll_ignores_non_crt_files(t *testing.T) {
 	t.Parallel()
 
-	scanner, _ := newTestScanner()
 	inDir := t.TempDir()
 	outDir := t.TempDir()
+	scanner, _ := newTestScanner(inDir, outDir, "", pkcs12.Modern2023)
 
 	// Write files that aren't .crt — should be ignored.
 	for _, name := range []string{"readme.txt", "config.json", "cert.pem", "key.pem"} {
@@ -490,7 +452,7 @@ func TestProcessAll_ignores_non_crt_files(t *testing.T) {
 		}
 	}
 
-	if _, err := scanner.Run(context.Background(), inDir, outDir, "", pkcs12.Modern2023); err != nil {
+	if _, err := scanner.Run(context.Background()); err != nil {
 		t.Fatalf("scanner.Run = %v, want nil", err)
 	}
 
@@ -506,14 +468,14 @@ func TestProcessAll_ignores_non_crt_files(t *testing.T) {
 func TestProcessAll_prunes_hashes_for_deleted_certs(t *testing.T) {
 	t.Parallel()
 
-	scanner, _ := newTestScanner()
 	inDir := t.TempDir()
 	outDir := t.TempDir()
+	scanner, _ := newTestScanner(inDir, outDir, "", pkcs12.Modern2023)
 
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "prune", "ecdsa")
 	crtPath, keyPath := writeCertAndKey(t, inDir, "prune", certPEM, keyPEM)
 
-	if _, err := scanner.Run(context.Background(), inDir, outDir, "", pkcs12.Modern2023); err != nil {
+	if _, err := scanner.Run(context.Background()); err != nil {
 		t.Fatalf("first scanner.Run: %v", err)
 	}
 
@@ -526,7 +488,7 @@ func TestProcessAll_prunes_hashes_for_deleted_certs(t *testing.T) {
 	}
 
 	// Second scan should prune the stale hash entry.
-	if _, err := scanner.Run(context.Background(), inDir, outDir, "", pkcs12.Modern2023); err != nil {
+	if _, err := scanner.Run(context.Background()); err != nil {
 		t.Fatalf("second scanner.Run: %v", err)
 	}
 
@@ -535,7 +497,7 @@ func TestProcessAll_prunes_hashes_for_deleted_certs(t *testing.T) {
 	certPEM2, keyPEM2 := testcerts.GenerateSelfSignedCert(t, "prune-v2", "ecdsa")
 	writeCertAndKey(t, inDir, "prune", certPEM2, keyPEM2)
 
-	if _, err := scanner.Run(context.Background(), inDir, outDir, "", pkcs12.Modern2023); err != nil {
+	if _, err := scanner.Run(context.Background()); err != nil {
 		t.Fatalf("third scanner.Run: %v", err)
 	}
 
@@ -553,8 +515,8 @@ func TestConvertToPFX_with_password_containing_special_chars(t *testing.T) {
 	pfxPath := filepath.Join(t.TempDir(), "test.pfx")
 
 	password := "p@$$w0rd!#%&*(){}[]|\\:\";<>?,./~`"
-	if err := process.ConvertPair(t.Context(), certPEM, keyPEM, pfxPath, password, pkcs12.Modern2023); err != nil {
-		t.Fatalf("process.ConvertPair(special password): %v", err)
+	if err := convert.Pair(t.Context(), certPEM, keyPEM, pfxPath, password, pkcs12.Modern2023); err != nil {
+		t.Fatalf("convert.Pair(special password): %v", err)
 	}
 
 	_, cert, _ := decodePFX(t, pfxPath, password)
@@ -566,9 +528,9 @@ func TestConvertToPFX_with_password_containing_special_chars(t *testing.T) {
 func TestProcessAll_multiple_cert_pairs(t *testing.T) {
 	t.Parallel()
 
-	scanner, _ := newTestScanner()
 	inDir := t.TempDir()
 	outDir := t.TempDir()
+	scanner, _ := newTestScanner(inDir, outDir, "pass", pkcs12.Modern2023)
 
 	// Create 3 cert/key pairs.
 	for _, name := range []string{"alpha", "beta", "gamma"} {
@@ -576,7 +538,7 @@ func TestProcessAll_multiple_cert_pairs(t *testing.T) {
 		writeCertAndKey(t, inDir, name, certPEM, keyPEM)
 	}
 
-	if _, err := scanner.Run(context.Background(), inDir, outDir, "pass", pkcs12.Modern2023); err != nil {
+	if _, err := scanner.Run(context.Background()); err != nil {
 		t.Fatalf("scanner.Run = %v", err)
 	}
 
@@ -596,8 +558,8 @@ func TestConvertToPFX_single_cert_has_no_CA_certs(t *testing.T) {
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "single", "ecdsa")
 	pfxPath := filepath.Join(t.TempDir(), "test.pfx")
 
-	if err := process.ConvertPair(t.Context(), certPEM, keyPEM, pfxPath, "pass", pkcs12.Modern2023); err != nil {
-		t.Fatalf("process.ConvertPair: %v", err)
+	if err := convert.Pair(t.Context(), certPEM, keyPEM, pfxPath, "pass", pkcs12.Modern2023); err != nil {
+		t.Fatalf("convert.Pair: %v", err)
 	}
 
 	_, _, caCerts := decodePFX(t, pfxPath, "pass")
@@ -611,9 +573,9 @@ func TestConvertToPFX_single_cert_has_no_CA_certs(t *testing.T) {
 func TestProcessAll_returns_error_when_root_missing(t *testing.T) {
 	t.Parallel()
 
-	scanner, _ := newTestScanner()
 	outDir := t.TempDir()
-	_, err := scanner.Run(context.Background(), "/nonexistent/input/dir", outDir, "", pkcs12.Modern2023)
+	scanner, _ := newTestScanner("/nonexistent/input/dir", outDir, "", pkcs12.Modern2023)
+	_, err := scanner.Run(context.Background())
 	if err == nil {
 		t.Fatal("scanner.Run should return error for nonexistent root dir")
 	}
@@ -626,9 +588,9 @@ func TestProcessAll_skips_unreadable_subdirectory(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("skipping as root: chmod 0 does not block root")
 	}
-	scanner, _ := newTestScanner()
 	inDir := t.TempDir()
 	outDir := t.TempDir()
+	scanner, _ := newTestScanner(inDir, outDir, "", pkcs12.Modern2023)
 
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "good", "ecdsa")
 	writeCertAndKey(t, inDir, "good", certPEM, keyPEM)
@@ -642,7 +604,7 @@ func TestProcessAll_skips_unreadable_subdirectory(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(badDir, 0o755) })
 
-	_, err := scanner.Run(context.Background(), inDir, outDir, "", pkcs12.Modern2023)
+	_, err := scanner.Run(context.Background())
 	if err != nil {
 		t.Errorf("scanner.Run should skip unreadable subdir, got error: %v", err)
 	}
@@ -654,9 +616,9 @@ func TestProcessAll_skips_unreadable_subdirectory(t *testing.T) {
 func TestProcessAll_invalidates_hash_when_mkdir_fails(t *testing.T) {
 	t.Parallel()
 
-	scanner, _ := newTestScanner()
 	inDir := t.TempDir()
 	outDir := t.TempDir()
+	scanner, _ := newTestScanner(inDir, outDir, "", pkcs12.Modern2023)
 
 	nested := filepath.Join(inDir, "conflict")
 	if err := os.MkdirAll(nested, 0o755); err != nil {
@@ -673,7 +635,7 @@ func TestProcessAll_invalidates_hash_when_mkdir_fails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := scanner.Run(context.Background(), inDir, outDir, "", pkcs12.Modern2023); err != nil {
+	if _, err := scanner.Run(context.Background()); err != nil {
 		t.Fatalf("scanner.Run: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(outDir, "conflict", "cert.pfx")); err == nil {
@@ -684,7 +646,7 @@ func TestProcessAll_invalidates_hash_when_mkdir_fails(t *testing.T) {
 	if err := os.Remove(blockingFile); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := scanner.Run(context.Background(), inDir, outDir, "", pkcs12.Modern2023); err != nil {
+	if _, err := scanner.Run(context.Background()); err != nil {
 		t.Fatalf("scanner.Run (second run): %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(outDir, "conflict", "cert.pfx")); err != nil {
@@ -709,9 +671,9 @@ func TestConvertToPFX_cleans_up_tmp_on_rename_failure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := process.ConvertPair(t.Context(), certPEM, keyPEM, destPath, "", pkcs12.Modern2023)
+	err := convert.Pair(t.Context(), certPEM, keyPEM, destPath, "", pkcs12.Modern2023)
 	if err == nil {
-		t.Fatal("process.ConvertPair should fail when destPath is a directory")
+		t.Fatal("convert.Pair should fail when destPath is a directory")
 	}
 
 	// Verify no leaked tmp files (atomicfile names temps ".atomicfile-<digits>.tmp").

@@ -20,7 +20,7 @@ corrupting it, even when fed malformed input, on a least-privilege runtime.
 
 | Threat                                                               | Mitigation                                                                | Evidence                                                 |
 | -------------------------------------------------------------------- | ------------------------------------------------------------------------- | -------------------------------------------------------- |
-| Malformed/hostile PEM or key input crashing or exploiting the parser | parsing via Go `crypto/x509` + `encoding/pem` stdlib; hardened under fuzz | `internal/convert/fuzz_parse_test.go`, `convert_test.go` |
+| Malformed/hostile PEM or key input crashing or exploiting the parser | parsing via Go `crypto/x509` + `encoding/pem` stdlib; hardened under fuzz | `convert_fuzz_test.go`, `convert_test.go`                |
 | Partial/corrupt output on crash or concurrent write                  | atomic write (temp → fsync → rename) via the `atomicfile` library         | `internal/process`, atomicfile                           |
 | Unnecessary re-emission / churn                                      | SHA-256 content comparison, skip-unchanged                                | `process.go`                                             |
 | Privilege/escape at runtime                                          | distroless, non-root, no shell; CLI `health` probe (no network listener)  | Dockerfile, healthcheck                                  |

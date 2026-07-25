@@ -173,3 +173,31 @@ func TestChanged_invariant_idempotent_between_changes(t *testing.T) {
 		}
 	})
 }
+
+// TestFingerprint_boundary_shift_property generalises the single hardcoded
+// "ab"+"c" vs "a"+"bc" case: for arbitrary bytes, ANY two distinct split
+// points of the same joined buffer must produce different fingerprints (the
+// cert/key boundary is unambiguous), and the same split must be deterministic.
+// A concatenate-then-hash implementation fails this for every distinct pair.
+func TestFingerprint_boundary_shift_property(t *testing.T) {
+	t.Parallel()
+	rapid.Check(t, func(t *rapid.T) {
+		joined := rapid.SliceOfN(rapid.Byte(), 2, 64).Draw(t, "joined")
+		i := rapid.IntRange(0, len(joined)).Draw(t, "split_a")
+		j := rapid.IntRange(0, len(joined)).Draw(t, "split_b")
+
+		fpA := convert.Fingerprint(joined[:i], joined[i:])
+		fpB := convert.Fingerprint(joined[:j], joined[j:])
+
+		if i == j {
+			if fpA != fpB {
+				t.Fatalf("Fingerprint not deterministic at split %d: %q != %q", i, fpA, fpB)
+			}
+			return
+		}
+		if fpA == fpB {
+			t.Fatalf("Fingerprint collided across the cert/key boundary: splits %d and %d of %q both gave %q",
+				i, j, joined, fpA)
+		}
+	})
+}

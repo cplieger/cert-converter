@@ -2,6 +2,7 @@
 package testcerts
 
 import (
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -25,6 +26,16 @@ type FatalTB interface {
 // pemTypeCert is the PEM block type for X.509 certificates.
 const pemTypeCert = "CERTIFICATE"
 
+// signCert signs template with parent (parent == template yields a self-signed
+// certificate) and returns both the DER bytes and the PEM encoding.
+func signCert(tb FatalTB, template, parent *x509.Certificate, pub crypto.PublicKey, priv crypto.Signer) (der, pemBytes []byte) {
+	der, err := x509.CreateCertificate(rand.Reader, template, parent, pub, priv)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return der, pem.EncodeToMemory(&pem.Block{Type: pemTypeCert, Bytes: der})
+}
+
 // GenerateSelfSignedCert creates a self-signed certificate with the given
 // key type ("rsa" or "ecdsa") and common name. Returns PEM-encoded cert and key.
 func GenerateSelfSignedCert(tb FatalTB, cn, keyType string) (certPEM, keyPEM []byte) {
@@ -41,11 +52,7 @@ func GenerateSelfSignedCert(tb FatalTB, cn, keyType string) (certPEM, keyPEM []b
 		if err != nil {
 			tb.Fatal(err)
 		}
-		certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-		if err != nil {
-			tb.Fatal(err)
-		}
-		certPEM = pem.EncodeToMemory(&pem.Block{Type: pemTypeCert, Bytes: certDER})
+		_, certPEM = signCert(tb, template, template, &key.PublicKey, key)
 		keyDER, err := x509.MarshalPKCS8PrivateKey(key)
 		if err != nil {
 			tb.Fatal(err)
@@ -57,11 +64,7 @@ func GenerateSelfSignedCert(tb FatalTB, cn, keyType string) (certPEM, keyPEM []b
 		if err != nil {
 			tb.Fatal(err)
 		}
-		certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-		if err != nil {
-			tb.Fatal(err)
-		}
-		certPEM = pem.EncodeToMemory(&pem.Block{Type: pemTypeCert, Bytes: certDER})
+		_, certPEM = signCert(tb, template, template, &key.PublicKey, key)
 		keyPEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 
 	default:
@@ -89,11 +92,8 @@ func GenerateCertChain(tb testing.TB) (leafPEM, keyPEM, caPEM, chainPEM []byte) 
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign,
 	}
-	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	caPEM = pem.EncodeToMemory(&pem.Block{Type: pemTypeCert, Bytes: caDER})
+	caDER, caPEMBytes := signCert(tb, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	caPEM = caPEMBytes
 	caCert, err := x509.ParseCertificate(caDER)
 	if err != nil {
 		tb.Fatal(err)
@@ -109,11 +109,7 @@ func GenerateCertChain(tb testing.TB) (leafPEM, keyPEM, caPEM, chainPEM []byte) 
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().Add(time.Hour),
 	}
-	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	leafPEM = pem.EncodeToMemory(&pem.Block{Type: pemTypeCert, Bytes: leafDER})
+	_, leafPEM = signCert(tb, leafTemplate, caCert, &leafKey.PublicKey, caKey)
 
 	keyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
 	if err != nil {

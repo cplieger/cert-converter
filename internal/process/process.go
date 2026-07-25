@@ -3,8 +3,6 @@ package process
 
 import (
 	"context"
-	"crypto"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -29,6 +27,10 @@ type CacheChecker interface {
 	Prune(seen map[string]struct{})
 }
 
+// Compile-time assertion: *convert.HashCache, the production implementation, satisfies
+// CacheChecker.
+var _ CacheChecker = (*convert.HashCache)(nil)
+
 // ScanResult carries per-pair outcome summary counts from a scan run.
 type ScanResult struct {
 	Total      int
@@ -39,38 +41,72 @@ type ScanResult struct {
 	Unreadable int
 }
 
+// Options carries the process-lifetime scan configuration the composition root
+// chooses once at startup: the confined input and output roots, the password
+// embedded in generated PFX files, and the PKCS#12 encoder profile. These
+// values never vary between Run calls, so they are injected at construction
+// rather than re-supplied per scan. Field order is pointer-first to satisfy
+// govet's fieldalignment.
+type Options struct {
+	Encoder   *pkcs12.Encoder
+	CertsRoot string
+	OutRoot   string
+	Password  string
+}
+
 // Scanner walks a certificate directory, checks for changes via a hash cache,
 // and dispatches conversion of cert/key pairs to PFX format.
+//
+// A Scanner is NOT safe for concurrent Run calls sharing a cache. Each CacheChecker
+// method is individually atomic, but the per-entry Changed -> convert -> Invalidate
+// sequence is not: overlapping scans could let one skip a pair as unchanged on the
+// strength of a fingerprint the other recorded for a conversion still in flight (or
+// already failed), and one scan's Prune can drop the other's live fingerprints. Run
+// every scan from a single goroutine, as main.go does (initial scan, then the
+// watcher's synchronous onChange callback).
 type Scanner struct {
 	cache CacheChecker
+	opts  Options
 }
 
-// New constructs a Scanner with the given hash cache.
-func New(cache CacheChecker) *Scanner {
-	return &Scanner{cache: cache}
+// New constructs a Scanner with the given hash cache and process-lifetime scan
+// configuration.
+func New(cache CacheChecker, opts Options) *Scanner {
+	return &Scanner{cache: cache, opts: opts}
 }
 
-// Run walks certsRoot, converts changed .crt/.key pairs to PFX in outRoot, and
-// returns a ScanResult with outcome counts plus any walk-level error. Every
+// Run walks the configured certs root, converts changed .crt/.key pairs to PFX
+// in the configured output root, and returns a ScanResult with outcome counts
+// plus any walk-level error. Every
 // /input read is confined to certsRoot through an *os.Root, so a symlink in the
-// watched tree cannot redirect a read outside it. A certsRoot that cannot be
-// opened as a root is a hard error (the caller marks the container unhealthy).
-func (s *Scanner) Run(ctx context.Context, certsRoot, outRoot, password string, enc *pkcs12.Encoder) (ScanResult, error) {
+// watched tree cannot redirect a read outside it, and every /output stat,
+// directory creation and PFX write is confined to outRoot the same way, so a
+// symlink planted there cannot redirect the private-key-bearing PFX outside the
+// mounted volume. A certsRoot or outRoot that cannot be opened as a root is a
+// hard error (the caller marks the container unhealthy).
+func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
+	certsRoot, outRoot := s.opts.CertsRoot, s.opts.OutRoot
 	root, err := os.OpenRoot(certsRoot)
 	if err != nil {
 		return ScanResult{}, fmt.Errorf("open input root %q: %w", certsRoot, err)
 	}
 	defer func() { _ = root.Close() }()
 
+	outHandle, err := os.OpenRoot(outRoot)
+	if err != nil {
+		return ScanResult{}, fmt.Errorf("open output root %q: %w", outRoot, err)
+	}
+	defer func() { _ = outHandle.Close() }()
+
 	reapStaleTemps(outRoot)
 
 	sw := &scanWalk{
 		scanner:   s,
 		root:      root,
+		outHandle: outHandle,
 		certsRoot: certsRoot,
-		outRoot:   outRoot,
-		password:  password,
-		enc:       enc,
+		password:  s.opts.Password,
+		enc:       s.opts.Encoder,
 		seen:      make(map[string]struct{}),
 	}
 	walkErr := filepath.WalkDir(certsRoot, func(path string, d fs.DirEntry, err error) error {
@@ -83,24 +119,51 @@ func (s *Scanner) Run(ctx context.Context, certsRoot, outRoot, password string, 
 	// fingerprints and forces a full, timestamp-churning reconversion on the
 	// next clean cycle. Prune only after a complete walk -- a genuinely
 	// removed pair is reaped on the next successful scan.
-	if walkErr == nil {
+	// An unreadable sub-path leaves `seen` incomplete for the certs beneath
+	// it in exactly the same way, so it gets the same treatment.
+	if walkErr == nil && sw.unreadable == 0 {
 		s.cache.Prune(sw.seen)
 	}
 
 	result := countResults(sw.results, sw.unreadable)
-	logScanOutcome(result, walkErr)
+	logScanOutcome(ctx, result, walkErr)
 	return result, walkErr
 }
 
 // reapStaleTemps removes PFX temp files orphaned by an interrupted atomic write
 // (a crash between temp-write and rename). WriteFile names temps
 // ".atomicfile-<digits>.tmp" and the default CleanupStaleTemps recognizes
-// exactly that shape, so the sweep stays matched to the writes.
+// exactly that shape, so the sweep stays matched to the writes. The sweep
+// covers the whole output tree, not just its top level: CleanupStaleTemps does
+// not recurse and atomicfile stages its temp in the TARGET directory, so a
+// nested cert (input/example.com/cert.crt) leaves its orphaned temp in the
+// matching nested output directory.
 func reapStaleTemps(outRoot string) {
-	if removed, err := atomicfile.CleanupStaleTemps(outRoot, time.Hour); err != nil {
-		slog.Warn("stale temp cleanup failed", "dir", outRoot, "error", err)
-	} else if removed > 0 {
-		slog.Debug("reaped stale temp files", "dir", outRoot, "count", removed)
+	total := 0
+	walkErr := filepath.WalkDir(outRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if path == outRoot {
+				return err
+			}
+			slog.Debug("skipping unreadable output path during temp cleanup", "path", path, "error", err)
+			return nil
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		removed, cleanErr := atomicfile.CleanupStaleTemps(path, time.Hour)
+		if cleanErr != nil {
+			slog.Warn("stale temp cleanup failed", "dir", path, "error", cleanErr)
+			return nil
+		}
+		total += removed
+		return nil
+	})
+	if walkErr != nil {
+		slog.Warn("stale temp cleanup failed", "dir", outRoot, "error", walkErr)
+	}
+	if total > 0 {
+		slog.Debug("reaped stale temp files", "dir", outRoot, "count", total)
 	}
 }
 
@@ -111,19 +174,20 @@ func reapStaleTemps(outRoot string) {
 type scanWalk struct {
 	scanner    *Scanner
 	root       *os.Root
+	outHandle  *os.Root
 	enc        *pkcs12.Encoder
 	seen       map[string]struct{}
 	certsRoot  string
-	outRoot    string
 	password   string
-	results    []convert.ConversionResult
+	results    []ConversionStatus
 	unreadable int
 }
 
-// visit is the WalkDir callback. A walk error at the root, or a cancelled
-// context, aborts the walk; an error below the root marks one unreadable
-// sub-path and continues. Directories and non-.crt files are ignored; every
-// .crt entry is recorded as seen and dispatched to convertEntry.
+// visit is the WalkDir callback. The context is checked before and after each
+// entry: a walk error at the root, or a cancelled context, aborts the walk; an
+// error below the root marks one unreadable sub-path and continues. Directories
+// and non-.crt files are ignored; every .crt entry is recorded as seen and
+// dispatched to convertEntry.
 func (sw *scanWalk) visit(ctx context.Context, path string, d fs.DirEntry, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -140,69 +204,82 @@ func (sw *scanWalk) visit(ctx context.Context, path string, d fs.DirEntry, err e
 		return nil
 	}
 	sw.seen[path] = struct{}{}
-	sw.results = append(sw.results,
-		sw.scanner.convertEntry(ctx, sw.root, path, sw.certsRoot, sw.outRoot, sw.password, sw.enc))
+	sw.results = append(sw.results, sw.convertEntry(ctx, path))
+	// A cancellation that landed *during* the conversion above already turned
+	// that entry into StatusFailed (the bounded read and the atomic write both
+	// return ctx.Err()). Re-check here so the walk aborts and Run reports the
+	// cancellation, instead of returning a "completed" scan whose failed count
+	// is really a shutdown artifact.
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	return nil
 }
 
 // logScanOutcome emits the end-of-scan summary. A completed walk logs at Info;
 // a walk aborted by shutdown (context cancellation or deadline) logs at Debug;
 // any other abort logs at Warn so an operator sees the partial scan and its
-// error.
-func logScanOutcome(result ScanResult, walkErr error) {
-	if walkErr == nil {
-		slog.Info("scan complete",
-			"total", result.Total,
-			"converted", result.Converted,
-			"unchanged", result.Unchanged,
-			"orphan", result.Orphan,
-			"unreadable", result.Unreadable,
-			"failed", result.Failed)
-		return
+// error. The count attributes are identical in all three cases (the README's Loki
+// alert matches on them), so they are built once.
+func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
+	level, msg := slog.LevelInfo, "scan complete"
+	if walkErr != nil {
+		level, msg = slog.LevelWarn, "scan aborted before completion"
+		if errors.Is(walkErr, context.Canceled) || errors.Is(walkErr, context.DeadlineExceeded) {
+			level, msg = slog.LevelDebug, "scan cancelled during shutdown"
+		}
 	}
-	if errors.Is(walkErr, context.Canceled) || errors.Is(walkErr, context.DeadlineExceeded) {
-		slog.Debug("scan cancelled during shutdown",
-			"error", walkErr,
-			"total", result.Total,
-			"converted", result.Converted,
-			"unchanged", result.Unchanged,
-			"orphan", result.Orphan,
-			"unreadable", result.Unreadable,
-			"failed", result.Failed)
-		return
+	attrs := make([]any, 0, 14)
+	if walkErr != nil {
+		attrs = append(attrs, "error", walkErr)
 	}
-	slog.Warn("scan aborted before completion",
-		"error", walkErr,
+	attrs = append(attrs,
 		"total", result.Total,
 		"converted", result.Converted,
 		"unchanged", result.Unchanged,
 		"orphan", result.Orphan,
 		"unreadable", result.Unreadable,
 		"failed", result.Failed)
+	slog.Log(ctx, level, msg, attrs...)
+}
+
+// logEntryFailure logs a per-entry failure. A failure caused by shutdown
+// (context cancellation or deadline) logs at Debug -- it is not an operator
+// actionable conversion error -- while every real failure logs at Error, the
+// same split logScanOutcome applies to the walk-level error.
+func logEntryFailure(msg, logPath string, err error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		slog.Debug(msg+" (shutdown)", "path", logPath, "error", err)
+		return
+	}
+	slog.Error(msg, "path", logPath, "error", err)
 }
 
 // convertEntry resolves the outcome for one .crt entry under certsRoot. It
 // reads the cert and its sibling .key exactly once through root, fingerprints
 // them, and either skips (input unchanged and the prior PFX still present),
 // regenerates (input unchanged but the output went missing), or converts
-// (input changed). It invalidates the cache on every failure path so the next
-// scan retries. All per-cert logs use the certsRoot-relative path for a stable,
-// non-leaky identifier (the absolute path appears only when the relative path
-// cannot be derived).
-func (s *Scanner) convertEntry(ctx context.Context, root *os.Root, path, certsRoot, outRoot, password string, enc *pkcs12.Encoder) convert.ConversionResult {
-	rel, relErr := filepath.Rel(certsRoot, path)
+// (input changed). Every output touch — the stat, the directory creation and
+// the atomic write — is confined to outHandle, so a symlink planted under the
+// output tree cannot redirect the private-key-bearing PFX outside it. It
+// invalidates the cache on every failure path so the next scan retries. All
+// per-cert logs use the certsRoot-relative path for a stable, non-leaky
+// identifier (the absolute path appears only when the relative path cannot be
+// derived).
+func (sw *scanWalk) convertEntry(ctx context.Context, path string) ConversionStatus {
+	rel, relErr := filepath.Rel(sw.certsRoot, path)
 	if relErr != nil {
 		// Without a root-relative key the file cannot be read through root;
 		// fail the entry. rel is unavailable, so this one log uses the
 		// absolute path.
 		slog.Error("failed to compute relative path", "path", path, "error", relErr)
-		s.cache.Invalidate(path)
-		return convert.ConversionResult{Status: convert.StatusFailed}
+		sw.scanner.cache.Invalidate(path)
+		return StatusFailed
 	}
 	logPath := rel
 	keyRel := strings.TrimSuffix(rel, ".crt") + ".key"
 
-	if _, statErr := root.Stat(keyRel); statErr != nil {
+	if _, statErr := sw.root.Stat(keyRel); statErr != nil {
 		if errors.Is(statErr, fs.ErrNotExist) {
 			slog.Debug("skipping cert without matching key", "path", logPath)
 		} else {
@@ -213,73 +290,83 @@ func (s *Scanner) convertEntry(ctx context.Context, root *os.Root, path, certsRo
 			// debug. Still health-neutral (StatusOrphan) and non-invalidating.
 			slog.Warn("skipping cert: cannot stat sibling key", "path", logPath, "error", statErr)
 		}
-		return convert.ConversionResult{Status: convert.StatusOrphan}
+		return StatusOrphan
 	}
 
-	certPEM, err := convert.ReadBoundedFromRoot(ctx, root, rel, convert.MaxFileSize)
+	certPEM, err := convert.ReadBoundedFromRoot(ctx, sw.root, rel, convert.MaxFileSize)
 	if err != nil {
-		slog.Error("failed to read certificate", "path", logPath, "error", err)
-		s.cache.Invalidate(path)
-		return convert.ConversionResult{Status: convert.StatusFailed}
+		logEntryFailure("failed to read certificate", logPath, err)
+		sw.scanner.cache.Invalidate(path)
+		return StatusFailed
 	}
-	keyPEM, err := convert.ReadBoundedFromRoot(ctx, root, keyRel, convert.MaxFileSize)
+	keyPEM, err := convert.ReadBoundedFromRoot(ctx, sw.root, keyRel, convert.MaxFileSize)
 	if err != nil {
-		slog.Error("failed to read private key", "path", logPath, "error", err)
-		s.cache.Invalidate(path)
-		return convert.ConversionResult{Status: convert.StatusFailed}
+		logEntryFailure("failed to read private key", logPath, err)
+		sw.scanner.cache.Invalidate(path)
+		return StatusFailed
 	}
 
 	pfxRel := strings.TrimSuffix(rel, ".crt") + ".pfx"
-	destPath := filepath.Join(outRoot, pfxRel)
 
-	if !s.cache.Changed(path, convert.Fingerprint(certPEM, keyPEM)) {
-		// The cache fingerprints inputs only, so a PFX deleted out of band is
-		// never regenerated while the input stays unchanged (until a renewal or
-		// process restart), and a skip-only scan still counts as a healthy
-		// cycle, masking the missing file from monitoring. Reconvert when the
-		// prior output is gone.
-		_, statErr := os.Stat(destPath)
-		if statErr == nil {
-			slog.Debug("skipping unchanged cert pair", "path", logPath)
-			return convert.ConversionResult{Status: convert.StatusUnchanged}
-		}
-		if errors.Is(statErr, fs.ErrNotExist) {
-			slog.Warn("unchanged input but output PFX missing; regenerating", "path", logPath)
-		} else {
-			slog.Warn("unchanged input but output PFX stat failed; regenerating", "path", logPath, "error", statErr)
-		}
+	if sw.outputIsCurrent(path, pfxRel, logPath, certPEM, keyPEM) {
+		return StatusUnchanged
 	}
 
-	destDir := filepath.Dir(destPath)
-	if err := os.MkdirAll(destDir, 0o750); err != nil {
-		slog.Error("failed to create output directory", "path", destDir, "error", err)
-		s.cache.Invalidate(path)
-		return convert.ConversionResult{Status: convert.StatusFailed}
+	if destDir := filepath.Dir(pfxRel); destDir != "." {
+		if err := sw.outHandle.MkdirAll(destDir, 0o750); err != nil {
+			slog.Error("failed to create output directory", "path", destDir, "error", err)
+			sw.scanner.cache.Invalidate(path)
+			return StatusFailed
+		}
 	}
 
 	slog.Debug("converting cert pair", "path", logPath)
-	if err := ConvertPair(ctx, certPEM, keyPEM, destPath, password, enc); err != nil {
-		slog.Error("conversion failed", "path", logPath, "error", err)
-		s.cache.Invalidate(path)
-		return convert.ConversionResult{Status: convert.StatusFailed}
+	if err := convert.PairInRoot(ctx, certPEM, keyPEM, sw.outHandle, pfxRel, sw.password, sw.enc); err != nil {
+		logEntryFailure("conversion failed", logPath, err)
+		sw.scanner.cache.Invalidate(path)
+		return StatusFailed
 	}
 
 	slog.Info("wrote pfx", "path", pfxRel)
-	return convert.ConversionResult{Status: convert.StatusConverted}
+	return StatusConverted
+}
+
+// outputIsCurrent reports whether the entry can be skipped as already
+// converted: the cert+key fingerprint is unchanged AND the prior PFX is still
+// present under outHandle. The cache fingerprints inputs only, so a PFX deleted
+// out of band would otherwise never be regenerated while the input stays
+// unchanged (until a renewal or process restart), and a skip-only scan still
+// counts as a healthy cycle, masking the missing file from monitoring; hence the
+// output stat, which forces a reconvert when the prior output is gone.
+func (sw *scanWalk) outputIsCurrent(path, pfxRel, logPath string, certPEM, keyPEM []byte) bool {
+	if sw.scanner.cache.Changed(path, convert.Fingerprint(certPEM, keyPEM)) {
+		return false
+	}
+	_, statErr := sw.outHandle.Stat(pfxRel)
+	if statErr == nil {
+		slog.Debug("skipping unchanged cert pair", "path", logPath)
+		return true
+	}
+	if errors.Is(statErr, fs.ErrNotExist) {
+		slog.Warn("unchanged input but output PFX missing; regenerating", "path", logPath)
+	} else {
+		slog.Warn("unchanged input but output PFX stat failed; regenerating", "path", logPath, "error", statErr)
+	}
+	return false
 }
 
 // countResults derives summary counts from typed results.
-func countResults(results []convert.ConversionResult, unreadable int) ScanResult {
+func countResults(results []ConversionStatus, unreadable int) ScanResult {
 	var converted, unchanged, orphan, failed int
 	for _, r := range results {
-		switch r.Status {
-		case convert.StatusConverted:
+		switch r {
+		case StatusConverted:
 			converted++
-		case convert.StatusUnchanged:
+		case StatusUnchanged:
 			unchanged++
-		case convert.StatusOrphan:
+		case StatusOrphan:
 			orphan++
-		case convert.StatusFailed:
+		case StatusFailed:
 			failed++
 		}
 	}
@@ -291,36 +378,4 @@ func countResults(results []convert.ConversionResult, unreadable int) ScanResult
 		Failed:     failed,
 		Unreadable: unreadable,
 	}
-}
-
-// ConvertPair parses an already-read cert chain and private key, verifies the
-// leaf certificate and key correspond, and writes the PFX to destPath. The
-// caller reads the PEM bytes once (see Scanner.convertEntry, which reads them
-// through the confined *os.Root); ConvertPair performs no file reads.
-func ConvertPair(ctx context.Context, certPEM, keyPEM []byte, destPath, password string, enc *pkcs12.Encoder) error {
-	chain, err := convert.ParseCertChain(certPEM)
-	if err != nil {
-		return fmt.Errorf("parse cert chain: %w", err)
-	}
-	leaf := chain[0]
-	var caCerts []*x509.Certificate
-	if len(chain) > 1 {
-		caCerts = chain[1:]
-	}
-	privKey, err := convert.ParsePrivateKey(keyPEM)
-	if err != nil {
-		return fmt.Errorf("parse private key: %w", err)
-	}
-	signer, ok := privKey.(crypto.Signer)
-	if !ok {
-		return fmt.Errorf("private key type %T does not implement crypto.Signer", privKey)
-	}
-	matcher, ok := leaf.PublicKey.(interface{ Equal(crypto.PublicKey) bool })
-	if !ok {
-		return fmt.Errorf("leaf certificate public key type %T cannot be verified against the private key", leaf.PublicKey)
-	}
-	if !matcher.Equal(signer.Public()) {
-		return errors.New("leaf certificate public key does not match the private key")
-	}
-	return convert.ToPFX(ctx, privKey, leaf, caCerts, destPath, password, enc)
 }

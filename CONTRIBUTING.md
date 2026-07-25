@@ -27,7 +27,7 @@ scan, then hand off to the watcher. The real work lives under
   back to `modern2023`.
 - `internal/convert`: PEM parsing (`ParseCertChain`, `ParsePrivateKey`),
   PFX encoding (`ToPFX`), and the SHA-256 `HashCache` for
-  skip-unchanged detection. `types.go` holds the `CertPair` /
+  skip-unchanged detection. `types.go` holds the `ConversionStatus` /
   `ConversionResult` value types.
 - `internal/process`: orchestration. `Scanner.Run` walks `/input`,
   pairs each `*.crt` with its sibling `*.key`, consults the cache, and
@@ -51,10 +51,13 @@ health marker (any failure clears it; a clean cycle sets it).
 - **Paths are hardcoded on purpose.** `/input` and `/output` are
   constants in `main.go`, not env vars. Don't add env knobs for them;
   the container contract relies on the fixed mounts.
-- **Reads are bounded.** Cert/key reads go through
-  `convert.ReadFileWithLimit` / the cache hasher with a 10 MB cap
-  (`MaxFileSize`). PFX writes are atomic (temp + rename) via
-  `cplieger/atomicfile`. Keep new file I/O on these helpers.
+- **Reads are bounded and confined.** Cert/key reads go through
+  `convert.ReadBoundedFromRoot`, which opens each file through the `/input`
+  `*os.Root` and reads it under the 10 MB cap (`MaxFileSize`), so a symlink
+  planted in the watched tree cannot redirect the read outside it. The hash
+  cache does no file I/O of its own: the scanner reads each input once and
+  passes the bytes to `convert.Fingerprint`. PFX writes are atomic (temp +
+  rename) via `cplieger/atomicfile`. Keep new file I/O on these helpers.
 - **The watcher loop and poll fallback are not unit-tested.** They are
   event-driven I/O paths validated by the Docker healthcheck in
   production. Logic worth testing belongs in `config`, `convert`, or
@@ -86,7 +89,7 @@ golangci-lint fmt
 
 Tests are property-based ([rapid](https://github.com/flyingmutant/rapid))
 plus table-driven, and there are fuzz targets in `internal/convert`
-(`fuzz_parse_test.go`). Run a fuzz target directly when touching the
+(`convert_fuzz_test.go`). Run a fuzz target directly when touching the
 parsers:
 
 ```sh

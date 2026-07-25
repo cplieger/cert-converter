@@ -488,3 +488,86 @@ func TestToPFX_returns_wrapped_error_on_write_failure(t *testing.T) {
 		t.Errorf("convert.ToPFX wrote a file at an unwritable destination; want none")
 	}
 }
+
+// TestToPFX_encode_failure_is_wrapped pins the encode branch of ToPFX: a
+// private key the PKCS#12 encoder cannot marshal must surface as a wrapped
+// "encode pfx" error and must leave no file at destPath.
+func TestToPFX_encode_failure_is_wrapped(t *testing.T) {
+	t.Parallel()
+	certPEM, _ := testcerts.GenerateSelfSignedCert(t, "encode-fail", "ecdsa")
+	certs, err := convert.ParseCertChain(certPEM)
+	if err != nil {
+		t.Fatalf("setup: convert.ParseCertChain: %v", err)
+	}
+	destPath := filepath.Join(t.TempDir(), "out.pfx")
+
+	// A nil private key cannot be marshalled to PKCS#8, so the encoder fails
+	// before any temp file is created.
+	err = convert.ToPFX(t.Context(), nil, certs[0], nil, destPath, "pw", pkcs12.Modern2023)
+	if err == nil {
+		t.Fatal("convert.ToPFX(nil private key) = nil error, want a wrapped encode error")
+	}
+	if !strings.Contains(err.Error(), "encode pfx") {
+		t.Errorf("convert.ToPFX(nil private key) error = %q, want it to contain %q", err.Error(), "encode pfx")
+	}
+	if _, statErr := os.Stat(destPath); statErr == nil {
+		t.Error("convert.ToPFX wrote a file after an encode failure; want none")
+	}
+}
+
+// TestToPFX_round_trips_chain_for_every_encoder_profile pins the four PFX
+// encoding profiles PFX_ENCODER can select and the CA-chain argument: each
+// profile must produce a PKCS#12 file that decodes back to the same leaf AND
+// the same CA chain, at mode 0600.
+func TestToPFX_round_trips_chain_for_every_encoder_profile(t *testing.T) {
+	t.Parallel()
+	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
+	certs, err := convert.ParseCertChain(chainPEM)
+	if err != nil {
+		t.Fatalf("setup: convert.ParseCertChain: %v", err)
+	}
+	privKey, err := convert.ParsePrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("setup: convert.ParsePrivateKey: %v", err)
+	}
+
+	profiles := map[string]*pkcs12.Encoder{
+		"modern2023": pkcs12.Modern2023,
+		"modern2026": pkcs12.Modern2026,
+		"legacydes":  pkcs12.LegacyDES,
+		"legacyrc2":  pkcs12.LegacyRC2,
+	}
+	for name, enc := range profiles {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			destPath := filepath.Join(t.TempDir(), name+".pfx")
+			if err := convert.ToPFX(t.Context(), privKey, certs[0], certs[1:], destPath, "pw", enc); err != nil {
+				t.Fatalf("convert.ToPFX(%s) = error %v, want nil", name, err)
+			}
+			info, err := os.Stat(destPath)
+			if err != nil {
+				t.Fatalf("convert.ToPFX(%s) did not write a file: %v", name, err)
+			}
+			if perm := info.Mode().Perm(); perm != 0o600 {
+				t.Errorf("convert.ToPFX(%s) wrote mode %o, want 600", name, perm)
+			}
+			pfxData, err := os.ReadFile(destPath)
+			if err != nil {
+				t.Fatalf("read pfx written by convert.ToPFX(%s): %v", name, err)
+			}
+			_, leaf, cas, err := pkcs12.DecodeChain(pfxData, "pw")
+			if err != nil {
+				t.Fatalf("decode pfx written by convert.ToPFX(%s): %v", name, err)
+			}
+			if leaf.Subject.CommonName != "leaf.example.com" {
+				t.Errorf("convert.ToPFX(%s) leaf CN = %q, want %q", name, leaf.Subject.CommonName, "leaf.example.com")
+			}
+			if len(cas) != 1 {
+				t.Fatalf("convert.ToPFX(%s) round-tripped %d CA certs, want 1", name, len(cas))
+			}
+			if cas[0].Subject.CommonName != "Test CA" {
+				t.Errorf("convert.ToPFX(%s) CA CN = %q, want %q", name, cas[0].Subject.CommonName, "Test CA")
+			}
+		})
+	}
+}

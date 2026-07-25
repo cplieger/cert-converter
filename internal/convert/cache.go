@@ -11,8 +11,7 @@ import (
 // file I/O: the scanner reads each cert and key once (through a confined
 // *os.Root), derives a fingerprint with Fingerprint, and asks Changed whether
 // it differs from the last seen value. Keeping the cache I/O-free is what lets
-// a scan read each input exactly once — the previous design hashed the files
-// here and the converter then read them again.
+// a scan read each input exactly once.
 type HashCache struct {
 	fingerprints map[string]string
 	mu           sync.Mutex

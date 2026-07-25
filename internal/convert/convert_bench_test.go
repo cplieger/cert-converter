@@ -38,8 +38,8 @@ func BenchmarkToPFX(b *testing.B) {
 	enc := pkcs12.Modern2023
 	destPath := b.TempDir() + "/bench.pfx"
 
-	b.ResetTimer()
-	for range b.N {
+	b.ReportAllocs()
+	for b.Loop() {
 		if err := convert.ToPFX(b.Context(), key, cert, nil, destPath, "bench", enc); err != nil {
 			b.Fatal(err)
 		}

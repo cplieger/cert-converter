@@ -9,18 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/envx"
 	"software.sslmate.com/src/go-pkcs12"
-)
-
-// EncoderType is a typed string for PFX encoding selection.
-type EncoderType string
-
-// Encoder name constants for PFX encoding selection.
-const (
-	EncNameModern2023 EncoderType = "modern2023"
-	EncNameModern2026 EncoderType = "modern2026"
-	EncNameLegacyDES  EncoderType = "legacydes"
-	EncNameLegacyRC2  EncoderType = "legacyrc2"
 )
 
 // envFalseValue is the lexical "disabled" marker for env-var parsers.
@@ -35,7 +26,7 @@ const defaultFallbackInterval = 6 * time.Hour
 type Config struct {
 	Password         string
 	Encoder          *pkcs12.Encoder
-	EncoderName      EncoderType
+	EncoderName      convert.EncoderType
 	FallbackInterval time.Duration
 }
 
@@ -45,18 +36,35 @@ type Config struct {
 var ErrEmptyPassword = errors.New(
 	"PFX_PASSWORD is empty; set it or set PFX_ALLOW_EMPTY_PASSWORD=true")
 
-// Load reads environment variables and returns a populated Config. It returns
-// ErrEmptyPassword when PFX_PASSWORD is empty unless PFX_ALLOW_EMPTY_PASSWORD
-// is set to true.
+// Load reads environment variables and returns a populated Config. The PFX
+// password follows the Docker-secrets convention: when PFX_PASSWORD_FILE is
+// set the secret is read from that file (bounded, whitespace-trimmed) so it
+// never appears in the process environment; otherwise PFX_PASSWORD is used. It
+// returns ErrEmptyPassword when neither supplies a value unless
+// PFX_ALLOW_EMPTY_PASSWORD is set to true, and it fails loudly when a
+// configured PFX_PASSWORD_FILE cannot be read.
 func Load() (Config, error) {
-	password := os.Getenv("PFX_PASSWORD")
-	allowEmpty := strings.EqualFold(
-		strings.TrimSpace(os.Getenv("PFX_ALLOW_EMPTY_PASSWORD")), "true")
+	password, secretErr := envx.Secret("PFX_PASSWORD")
+	if secretErr != nil {
+		var missing *envx.MissingError
+		if !errors.As(secretErr, &missing) {
+			// An unreadable, oversized, or empty PFX_PASSWORD_FILE must fail
+			// loudly rather than silently degrade to an empty password.
+			return Config{}, secretErr
+		}
+		password = "" // fall through to the empty-password guard below
+	}
+	rawAllowEmpty := strings.TrimSpace(os.Getenv("PFX_ALLOW_EMPTY_PASSWORD"))
+	allowEmpty := strings.EqualFold(rawAllowEmpty, "true")
+	if rawAllowEmpty != "" && !allowEmpty {
+		slog.Warn("unrecognized PFX_ALLOW_EMPTY_PASSWORD, treating as false",
+			"value", rawAllowEmpty, "expected", "true")
+	}
 	if password == "" && !allowEmpty {
 		return Config{}, ErrEmptyPassword
 	}
 
-	enc, encName := pickEncoder(os.Getenv("PFX_ENCODER"))
+	enc, encName := convert.PickEncoder(os.Getenv("PFX_ENCODER"))
 
 	return Config{
 		Password:         password,
@@ -73,10 +81,7 @@ func Load() (Config, error) {
 // load, which would fail on a missing PFX_PASSWORD the probe does not
 // need.
 func FallbackInterval() time.Duration {
-	if v, ok := os.LookupEnv("FALLBACK_SCAN_HOURS"); ok {
-		return parseFallbackInterval(v)
-	}
-	return defaultFallbackInterval
+	return parseFallbackInterval(os.Getenv("FALLBACK_SCAN_HOURS"))
 }
 
 // parseFallbackInterval parses a FALLBACK_SCAN_HOURS value into a re-scan
@@ -108,22 +113,5 @@ func parseFallbackInterval(v string) time.Duration {
 		slog.Warn("invalid FALLBACK_SCAN_HOURS, using default",
 			"value", v, "default", defaultFallbackInterval.String())
 		return defaultFallbackInterval
-	}
-}
-
-// pickEncoder returns the PFX encoder and its name based on the raw env value.
-func pickEncoder(raw string) (enc *pkcs12.Encoder, name EncoderType) {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case string(EncNameLegacyRC2):
-		return pkcs12.LegacyRC2, EncNameLegacyRC2
-	case "legacy", string(EncNameLegacyDES):
-		return pkcs12.LegacyDES, EncNameLegacyDES
-	case string(EncNameModern2026):
-		return pkcs12.Modern2026, EncNameModern2026
-	case "", "modern", string(EncNameModern2023):
-		return pkcs12.Modern2023, EncNameModern2023
-	default:
-		slog.Warn("unknown PFX_ENCODER, using modern2023", "value", raw)
-		return pkcs12.Modern2023, EncNameModern2023
 	}
 }

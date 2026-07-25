@@ -6,35 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cplieger/cert-converter/internal/convert"
 	"pgregory.net/rapid"
 )
-
-func TestPickEncoder(t *testing.T) {
-	for _, tc := range []struct {
-		env      string
-		wantName EncoderType
-	}{
-		{"", EncNameModern2023},
-		{"modern2023", EncNameModern2023},
-		{"Modern", EncNameModern2023},
-		{"modern2026", EncNameModern2026},
-		{"Modern2026", EncNameModern2026},
-		{"legacy", EncNameLegacyDES},
-		{"legacyrc2", EncNameLegacyRC2},
-		{"LegacyDES", EncNameLegacyDES},
-		{"unknown", EncNameModern2023},
-	} {
-		t.Run(tc.env, func(t *testing.T) {
-			enc, name := pickEncoder(tc.env)
-			if enc == nil {
-				t.Fatal("pickEncoder returned nil encoder")
-			}
-			if name != tc.wantName {
-				t.Errorf("pickEncoder name = %q, want %q", name, tc.wantName)
-			}
-		})
-	}
-}
 
 func TestParseFallbackInterval(t *testing.T) {
 	for _, tc := range []struct {
@@ -91,30 +65,32 @@ func TestParseFallbackInterval_clamps_excessive_values(t *testing.T) {
 	}
 }
 
-func TestParseFallbackInterval_never_panics(t *testing.T) {
+func TestParseFallbackInterval_permitted_cadence_and_padding_invariant(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		v := rapid.String().Draw(t, "env_value")
+		// A plain rapid.String() generator almost never produces the values that
+		// decide this parser ("0", "false", a numeric string), so the interesting
+		// inputs are drawn explicitly alongside arbitrary text.
+		v := rapid.OneOf(
+			rapid.SampledFrom([]string{"", " ", "0", "00", "+0", "false", "FALSE", "-1", "1", "6", "12", "87600", "87601"}),
+			rapid.StringMatching(`[ \t]*[-+]?[0-9]{0,7}[ \t]*`),
+			rapid.String(),
+		).Draw(t, "env_value")
 		got := parseFallbackInterval(v)
-		if got < 0 {
-			t.Errorf("parseFallbackInterval(%q) = %v, want non-negative", v, got)
-		}
-	})
-}
 
-func TestPickEncoder_never_returns_nil(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		v := rapid.String().Draw(t, "env_value")
-		enc, name := pickEncoder(v)
-		if enc == nil {
-			t.Errorf("pickEncoder(%q) returned nil encoder", v)
+		// Surrounding whitespace is trimmed, so padding can never change the
+		// decision: a padded "0" still disables, a padded number still parses,
+		// and a padded blank still takes the default.
+		if padded := parseFallbackInterval(" \t" + v + "\n "); padded != got {
+			t.Errorf("parseFallbackInterval(%q) = %v but padded variant = %v, want padding-invariant", v, got, padded)
 		}
-		if name == "" {
-			t.Errorf("pickEncoder(%q) returned empty name", v)
-		}
-		switch name {
-		case EncNameModern2023, EncNameModern2026, EncNameLegacyDES, EncNameLegacyRC2:
+
+		// Every accepted value is either "disabled", the default, or a whole
+		// number of hours no greater than the 10-year overflow ceiling.
+		switch {
+		case got == 0 || got == defaultFallbackInterval:
+		case got > 0 && got <= 87600*time.Hour && got%time.Hour == 0:
 		default:
-			t.Errorf("pickEncoder(%q) returned unknown name %q", v, name)
+			t.Errorf("parseFallbackInterval(%q) = %v, want 0, %v, or whole hours in (0, 87600h]", v, got, defaultFallbackInterval)
 		}
 	})
 }
@@ -181,8 +157,8 @@ func TestLoad_reads_password_and_encoder(t *testing.T) {
 	if cfg.Password != "s3cret" {
 		t.Errorf("Load() Password = %q, want %q", cfg.Password, "s3cret")
 	}
-	if cfg.EncoderName != EncNameLegacyDES {
-		t.Errorf("Load() EncoderName = %q, want %q", cfg.EncoderName, EncNameLegacyDES)
+	if cfg.EncoderName != convert.EncNameLegacyDES {
+		t.Errorf("Load() EncoderName = %q, want %q", cfg.EncoderName, convert.EncNameLegacyDES)
 	}
 }
 
@@ -203,29 +179,6 @@ func TestLoad_empty_password_allowed_by_optout(t *testing.T) {
 	}
 	if cfg.Password != "" {
 		t.Errorf("Load() Password = %q, want empty", cfg.Password)
-	}
-}
-
-func TestPickEncoder_trims_surrounding_whitespace(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		raw      string
-		wantName EncoderType
-	}{
-		{"padded legacy", "  legacy  ", EncNameLegacyDES},
-		{"padded modern2026", "  modern2026  ", EncNameModern2026},
-		{"padded legacyrc2", " legacyrc2 ", EncNameLegacyRC2},
-		{"whitespace only is default", "  ", EncNameModern2023},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			enc, name := pickEncoder(tc.raw)
-			if enc == nil {
-				t.Fatalf("pickEncoder(%q) returned nil encoder", tc.raw)
-			}
-			if name != tc.wantName {
-				t.Errorf("pickEncoder(%q) name = %q, want %q", tc.raw, name, tc.wantName)
-			}
-		})
 	}
 }
 

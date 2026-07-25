@@ -4,7 +4,7 @@ services:
     image: ghcr.io/cplieger/cert-converter:latest
     container_name: cert-converter
     restart: unless-stopped
-    user: "1000:1000"  # match your host user
+    user: "1000:1000"  # match your host user; it must own the /output host dir
 
     environment:
       PFX_PASSWORD: "your-pfx-password"  # required

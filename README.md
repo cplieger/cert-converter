@@ -57,6 +57,7 @@ services:
 | Variable | Description | Default | Required |
 | --- | --- | --- | --- |
 | `PFX_PASSWORD` | Password embedded in generated PFX files. The container refuses to start when this is empty unless `PFX_ALLOW_EMPTY_PASSWORD=true` is set. | - | Yes |
+| `PFX_PASSWORD_FILE` | Path to a file holding the PFX password (Docker/Podman secret). When set it takes precedence over `PFX_PASSWORD`, keeping the secret out of the container environment and out of `docker inspect`. The file is read once, bounded at 1 MB, and trimmed of surrounding whitespace; an unreadable or empty file is a startup failure. | - | No |
 | `PFX_ALLOW_EMPTY_PASSWORD` | Set to `true` to let the container start with an empty `PFX_PASSWORD`. Generated PFX files then protect the embedded private key with an empty password (effectively no protection); not recommended. | `false` | No |
 | `FALLBACK_SCAN_HOURS` | Hours between full directory re-scans, the fallback for fsnotify events missed on network mounts and similar edge cases. Only an explicit `0` or `false` disables it, leaving a missed event unrecovered until the next change. An empty, whitespace, or invalid value uses the 6h default, so a blank never silently disables the safety net; a value above `87600` (10 years) is clamped to that ceiling and logs a WARN. | `6` | No |
 | `PFX_ENCODER` | PFX encoding profile: modern2023 (AES-256-CBC + SHA-256, default), modern2026 (AES-256-CBC + PBMAC1, requires OpenSSL 3.4.0+), legacy (3DES + SHA-1 for older devices), or legacyrc2 (RC2-40 + SHA-1, only for very old devices). `modern` is an alias for `modern2023`, and `legacy` is recorded as `legacydes` in startup logs. See the [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables). | `modern2023` | No |
@@ -66,8 +67,16 @@ services:
 
 | Mount | Description |
 | --- | --- |
-| `/input` | PEM certificate directory (read-only) |
-| `/output` | PFX output directory |
+| `/input` | PEM certificate directory (read-only). Must be readable by the UID in `user:`; Caddy's certificate directory is often root-owned and mode `0700`, so either `chgrp`/`chmod` it for that UID or run the container as a UID that can read it. |
+| `/output` | PFX output directory; must be writable by the UID in `user:` |
+
+Create the host output directory owned by the UID you set in `user:`
+(`mkdir -p /path/to/pfx/output && chown 1000:1000 /path/to/pfx/output`) before
+the first start. Unlike an unreadable `/input` sub-path, which is only warned
+about and skipped, an unwritable `/output` fails every conversion and keeps the
+container unhealthy. Generated `.pfx` files are mode `0600` and their
+directories `0750`, both owned by that UID, so whatever consumes them must run
+as the same user or its group.
 
 ## Alerting
 
@@ -117,7 +126,7 @@ deployment, and route by whatever labels your Alertmanager uses.
 
 ## Healthcheck
 
-The image bakes in a health probe. After each processing cycle with no conversion failures, the main process writes a marker file at `/tmp/.healthy`. The `health` subcommand (`/cert-watcher health`) exits 0 when the marker exists and, while the fallback rescan is enabled, is fresher than three `FALLBACK_SCAN_HOURS` intervals. A staler marker means the watch loop is wedged, so the probe fails and the orchestrator restarts the container. Setting `FALLBACK_SCAN_HOURS` to `0`/`false` disables both the fallback and this staleness deadline.
+The image bakes in a health probe. After each processing cycle with no conversion failures, the main process writes a marker file at `/tmp/.healthy`. The `health` subcommand (`/cert-watcher health`) exits 0 when the marker exists and, while the fallback rescan is enabled, is fresher than three `FALLBACK_SCAN_HOURS` intervals. A staler marker means the watch loop is wedged, so the probe fails and the container is reported `unhealthy`. Docker Engine does not act on health status by itself: an orchestrator that does (Swarm, Kubernetes) restarts the container, while under plain Docker Compose the `unhealthy` state is a signal to monitor — see the `CertConverterScanStalled` rule under [Alerting](#alerting) — and the restart is yours to perform. Setting `FALLBACK_SCAN_HOURS` to `0`/`false` disables both the fallback and this staleness deadline.
 
 Health answers one question: should an orchestrator restart this container? It therefore tracks only failures a restart could plausibly clear. The container becomes **unhealthy** when the `/input` root itself cannot be read or a certificate fails to convert (PEM or key parse error, cert/key mismatch, or PFX write failure). It **auto-recovers** on the next clean cycle (fsnotify event or fallback timer) without a restart.
 
@@ -129,7 +138,25 @@ The attack surface is small: the container reads PEM files from one mounted dire
 
 File paths are hardcoded (`/input`, `/output`), not configurable via env vars. Input reads are confined to `/input` through an `os.Root`, so a symlink planted in the input tree cannot redirect a read outside it. Reads are TOCTOU-safe (stat and read from the same handle) with a 10 MB cap, and malformed PEM or key input is rejected and logged rather than converted. PFX writes use an atomic temp-file + rename.
 
+`PFX_PASSWORD` is the only protection on the private key inside every generated `.pfx`, and a compose env value is visible to anyone who can query the Docker daemon (`docker inspect`). Keep it out of a compose file you commit: reference it indirectly with `PFX_PASSWORD: "${PFX_PASSWORD:?}"` and supply the value from a gitignored `.env` beside the compose file (`chmod 600 .env`), an `env_file:` entry, or your secrets manager.
+
 One accepted scanner finding: semgrep flags the fixed `/tmp/.healthy` health-marker path as a predictable temp file. The path is a deliberate contract between the main process and the `health` probe inside the container's own filesystem, not shared state an attacker can pre-create. Live scan results are on the repository's Security tab.
+
+### Hardened deployment
+
+To lock the container down further, layer these directives onto the Quick start service:
+
+```yaml
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - "/tmp:size=1m,mode=1777,noexec,nosuid,nodev"
+```
+
+`read_only: true` requires the file-marker health probe to have a writable `/tmp`; the tmpfs supplies it. `size=1m` is ample: the marker is the only thing cert-converter writes outside `/output`.
 
 ## Dependencies
 

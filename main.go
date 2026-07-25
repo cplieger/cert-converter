@@ -31,7 +31,7 @@ const (
 // the only outcome a restart could plausibly clear (a transient mount glitch,
 // a half-written renewal). Unreadable /input sub-paths are deliberately NOT a
 // health input: they are a steady-state permissions/UID misconfiguration that
-// a restart cannot fix, so they are surfaced as a WARN in runAndSetHealth
+// a restart cannot fix, so they are surfaced as a WARN in scanAndSetHealth
 // rather than flapping the container unhealthy in a restart loop. It is the
 // single source of truth for the health boundary so the gate can be
 // unit-tested without reimplementing it.
@@ -42,9 +42,54 @@ func healthyAfterScan(r process.ScanResult) bool {
 // watchDebounce is the debounce window for the watcher.
 const watchDebounce = 2 * time.Second
 
+// scanAndSetHealth runs one scan with the scanner's configured input and output
+// roots and flips the health marker via healthyAfterScan (zero conversion
+// failures). A shutdown cancellation leaves the marker untouched; any other
+// scan error clears it. Unreadable input sub-paths are logged as a WARN but
+// never affect health — see healthyAfterScan.
+func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *health.Marker) {
+	result, err := scanner.Run(ctx)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			slog.Info("scan interrupted by shutdown", "reason", err)
+			return
+		}
+		slog.Error("processing failed", "error", err)
+		marker.Set(false)
+		return
+	}
+	if result.Unreadable > 0 {
+		slog.Warn("some /input paths were unreadable and were skipped; health is unaffected",
+			"unreadable", result.Unreadable,
+			"remediation", "fix /input permissions or run as a UID that can read it")
+	}
+	marker.Set(healthyAfterScan(result))
+}
+
 // --- Entrypoint ---
 
 func main() {
+	os.Exit(run())
+}
+
+// run is the real entrypoint: it returns the process exit code instead of
+// calling os.Exit itself, so every deferred cleanup registered below (the
+// signal-context stop, the health-marker removal) actually runs on the failure
+// paths too.
+func run() int {
+	rawLevel := os.Getenv("LOG_LEVEL")
+	lvl, ok := slogx.ParseLevel(rawLevel, slog.LevelInfo)
+	slogx.Setup(slogx.Options{Level: lvl})
+	if !ok {
+		slog.Warn("invalid LOG_LEVEL, using default", "value", rawLevel, "default", "info")
+	}
+
+	if len(os.Args) > 1 && os.Args[1] != "health" {
+		// Not an error (the watcher takes no arguments), but a mistyped probe
+		// invocation would otherwise silently start a second watcher.
+		slog.Warn("unrecognized argument, starting the watcher",
+			"argument", os.Args[1], "known_subcommands", "health")
+	}
 	if len(os.Args) > 1 && os.Args[1] == "health" {
 		// The fallback rescan is the marker's guaranteed refresh floor
 		// (fs events refresh it sooner), so a marker older than 3 fallback
@@ -56,27 +101,27 @@ func main() {
 			health.WithMaxAge(3*config.FallbackInterval()))
 	}
 
-	rawLevel := os.Getenv("LOG_LEVEL")
-	lvl, ok := slogx.ParseLevel(rawLevel, slog.LevelInfo)
-	slogx.Setup(slogx.Options{Level: lvl})
-	if !ok {
-		slog.Warn("invalid LOG_LEVEL, using default", "value", rawLevel, "default", "info")
-	}
-
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("invalid configuration", "error", err)
-		os.Exit(1)
+		return 1
 	}
 
-	if strings.TrimSpace(cfg.Password) == "" {
+	switch {
+	case cfg.Password == "":
 		slog.Warn("PFX_PASSWORD is empty; generated PFX files protect the private key with an empty password",
 			"remediation", "set PFX_PASSWORD")
+	case strings.TrimSpace(cfg.Password) == "":
+		slog.Warn("PFX_PASSWORD is whitespace-only; generated PFX files are protected by that whitespace string, which is effectively no protection",
+			"remediation", "set PFX_PASSWORD to a real value (check for stray quotes or spaces in the env file)")
 	}
 
-	passwordStatus := "empty"
-	if strings.TrimSpace(cfg.Password) != "" {
-		passwordStatus = "configured"
+	passwordStatus := "configured"
+	switch {
+	case cfg.Password == "":
+		passwordStatus = "empty"
+	case strings.TrimSpace(cfg.Password) == "":
+		passwordStatus = "whitespace-only"
 	}
 	fallback := cfg.FallbackInterval.String()
 	if cfg.FallbackInterval <= 0 {
@@ -95,30 +140,17 @@ func main() {
 	defer marker.Cleanup()
 
 	cache := convert.NewHashCache()
-	scanner := process.New(cache)
+	scanner := process.New(cache, process.Options{
+		CertsRoot: certsRootDir,
+		OutRoot:   outputDir,
+		Password:  cfg.Password,
+		Encoder:   cfg.Encoder,
+	})
 
-	// runAndSetHealth runs a scan and flips the health marker via
-	// healthyAfterScan (zero conversion failures). Unreadable /input
-	// sub-paths are logged as a WARN but never affect health — see
-	// healthyAfterScan. Shared by the initial run and the watcher's
-	// on-change callback.
+	// runAndSetHealth adapts scanAndSetHealth to the watcher's on-change
+	// callback signature.
 	runAndSetHealth := func(ctx context.Context) {
-		result, err := scanner.Run(ctx, certsRootDir, outputDir, cfg.Password, cfg.Encoder)
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				slog.Info("scan interrupted by shutdown", "reason", err)
-				return
-			}
-			slog.Error("processing failed", "error", err)
-			marker.Set(false)
-			return
-		}
-		if result.Unreadable > 0 {
-			slog.Warn("some /input paths were unreadable and were skipped; health is unaffected",
-				"unreadable", result.Unreadable,
-				"remediation", "fix /input permissions or run as a UID that can read it")
-		}
-		marker.Set(healthyAfterScan(result))
+		scanAndSetHealth(ctx, scanner, marker)
 	}
 
 	runAndSetHealth(ctx)
@@ -128,5 +160,17 @@ func main() {
 		watch.WithFallback(cfg.FallbackInterval))
 	w.Run(ctx)
 
+	if ctx.Err() == nil {
+		// Run returned without a shutdown signal: the fsnotify channels closed,
+		// so change detection is dead and only a restart can recover it. Exit
+		// non-zero so restart: on-failure deployments restart too; the deferred
+		// marker.Cleanup drops the marker on the way out, so a probe cannot
+		// report healthy after this point.
+		slog.Error("watcher stopped without a shutdown signal; " +
+			"change detection is dead, exiting for a restart")
+		return 1
+	}
+
 	slog.Info("shutting down", "reason", context.Cause(ctx))
+	return 0
 }

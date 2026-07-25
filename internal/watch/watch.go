@@ -14,13 +14,6 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// Runner is the minimal contract main.go depends on.
-type Runner interface {
-	Run(ctx context.Context)
-}
-
-var _ Runner = (*Watcher)(nil)
-
 // Watcher monitors a directory tree for cert/key changes and invokes a callback.
 type Watcher struct {
 	onChange func(ctx context.Context)
@@ -37,18 +30,23 @@ func WithDebounce(d time.Duration) Option {
 	return func(w *Watcher) { w.debounce = d }
 }
 
-// WithFallback sets the periodic poll/fallback interval. Zero disables it.
+// WithFallback sets the periodic poll/fallback interval. Zero or a negative duration
+// disables it: in fsnotify mode no safety-net rescan is armed, and in poll mode there is
+// no interval to poll on, so change detection is inactive until the process restarts.
 func WithFallback(d time.Duration) Option {
 	return func(w *Watcher) { w.fallback = d }
 }
 
-// New creates a Watcher for the given root directory.
+// New creates a Watcher for the given root directory. Timing policy is chosen by
+// the composition root (main.go) and injected via WithDebounce/WithFallback;
+// config owns the documented FALLBACK_SCAN_HOURS default, so an un-optioned
+// Watcher has no debounce window and no fallback rescan.
 func New(root string, onChange func(ctx context.Context), opts ...Option) *Watcher {
+	// Timing policy is chosen by the composition root (main.go) and injected via
+	// WithDebounce/WithFallback; config owns the documented FALLBACK_SCAN_HOURS default.
 	w := &Watcher{
 		root:     root,
 		onChange: onChange,
-		debounce: 2 * time.Second,
-		fallback: 6 * time.Hour,
 	}
 	for _, o := range opts {
 		o(w)
@@ -115,10 +113,14 @@ func (w *Watcher) handleFsEvent(watcher *fsnotify.Watcher, event fsnotify.Event)
 	slog.Debug("fs event", "op", event.Op.String(), "path", event.Name)
 	switch {
 	case event.Has(fsnotify.Create):
-		if err := w.addWatchDirs(watcher, event.Name); err != nil {
-			slog.Warn("failed to watch new directory subtree", "path", event.Name, "error", err)
-		}
+		// Only a directory needs watches added. Stat first so a transient file (an
+		// atomic-write temp created and renamed away before this event is handled)
+		// cannot produce a spurious "failed to watch" WARN from WalkDir failing to
+		// lstat a path that is already gone.
 		if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+			if addErr := w.addWatchDirs(watcher, event.Name); addErr != nil {
+				slog.Warn("failed to watch new directory subtree", "path", event.Name, "error", addErr)
+			}
 			return true
 		}
 		return isCertFile(event.Name)
@@ -154,7 +156,7 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) {
 
 		case event, ok := <-watcher.Events:
 			if !ok {
-				slog.Warn("fsnotify events channel closed, watcher stopping; process will exit and restart")
+				slog.Error("fsnotify events channel closed, watcher stopping; process will exit and restart")
 				return
 			}
 			if w.handleFsEvent(watcher, event) {
@@ -169,7 +171,7 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) {
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
-				slog.Warn("fsnotify errors channel closed, watcher stopping; process will exit and restart")
+				slog.Error("fsnotify errors channel closed, watcher stopping; process will exit and restart")
 				return
 			}
 			st.handleWatcherError(err)
@@ -261,10 +263,13 @@ func (st *watchState) handleWatcherError(err error) {
 }
 
 // pollLoopWithUpgrade polls on the fallback interval and attempts to
-// upgrade to fsnotify on every tick.
+// upgrade to fsnotify on every tick. With the fallback disabled (<= 0) there is no
+// interval to poll on, so it logs an error once that change detection is inactive and
+// blocks until ctx is cancelled.
 func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) {
 	if w.fallback <= 0 {
-		slog.Warn("polling disabled and fsnotify unavailable; change detection inactive until restart")
+		slog.Error("polling disabled and fsnotify unavailable; change detection inactive until restart",
+			"remediation", "unset FALLBACK_SCAN_HOURS (or set it above 0) so the periodic rescan covers the missing fsnotify watch")
 		<-ctx.Done()
 		return
 	}

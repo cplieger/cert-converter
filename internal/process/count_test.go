@@ -2,15 +2,13 @@ package process
 
 import (
 	"testing"
-
-	"github.com/cplieger/cert-converter/internal/convert"
 )
 
 func TestCountResults(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name       string
-		results    []convert.ConversionResult
+		results    []ConversionStatus
 		unreadable int
 		want       ScanResult
 	}{
@@ -22,27 +20,27 @@ func TestCountResults(t *testing.T) {
 		},
 		{
 			name: "mixed statuses",
-			results: []convert.ConversionResult{
-				{Status: convert.StatusConverted},
-				{Status: convert.StatusConverted},
-				{Status: convert.StatusUnchanged},
-				{Status: convert.StatusOrphan},
-				{Status: convert.StatusFailed},
+			results: []ConversionStatus{
+				StatusConverted,
+				StatusConverted,
+				StatusUnchanged,
+				StatusOrphan,
+				StatusFailed,
 			},
 			unreadable: 3,
 			want:       ScanResult{Total: 5, Converted: 2, Unchanged: 1, Orphan: 1, Failed: 1, Unreadable: 3},
 		},
 		{
 			name:       "unreadable not counted in total",
-			results:    []convert.ConversionResult{{Status: convert.StatusConverted}},
+			results:    []ConversionStatus{StatusConverted},
 			unreadable: 7,
 			want:       ScanResult{Total: 1, Converted: 1, Unreadable: 7},
 		},
 		{
 			name: "all converted",
-			results: []convert.ConversionResult{
-				{Status: convert.StatusConverted},
-				{Status: convert.StatusConverted},
+			results: []ConversionStatus{
+				StatusConverted,
+				StatusConverted,
 			},
 			unreadable: 0,
 			want:       ScanResult{Total: 2, Converted: 2},

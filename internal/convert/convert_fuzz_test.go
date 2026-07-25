@@ -153,6 +153,8 @@ func FuzzReadBoundedFromRoot(f *testing.F) {
 	f.Add([]byte("hello world"), int64(5))
 	f.Add([]byte{}, int64(0))
 	f.Add([]byte("x"), int64(1))
+	f.Add([]byte("x"), int64(0))
+	f.Add(bytes.Repeat([]byte("a"), 4096), int64(4095))
 
 	f.Fuzz(func(t *testing.T, content []byte, limit int64) {
 		if limit < 0 {
@@ -169,11 +171,18 @@ func FuzzReadBoundedFromRoot(f *testing.F) {
 		defer root.Close()
 
 		data, err := convert.ReadBoundedFromRoot(t.Context(), root, "input", limit)
+		oversized := int64(len(content)) > limit
 		if err != nil {
+			if !oversized {
+				t.Fatalf("ReadBoundedFromRoot(%d bytes, limit %d) = error %v, want nil", len(content), limit, err)
+			}
 			return
 		}
-		if int64(len(data)) > limit {
-			t.Fatalf("returned %d bytes exceeding limit %d", len(data), limit)
+		if oversized {
+			t.Fatalf("ReadBoundedFromRoot returned %d bytes for limit %d; want the size cap to reject it", len(data), limit)
+		}
+		if !bytes.Equal(data, content) {
+			t.Fatalf("ReadBoundedFromRoot returned %d bytes that differ from the %d bytes written", len(data), len(content))
 		}
 	})
 }

@@ -15,8 +15,8 @@ func BenchmarkFingerprint(b *testing.B) {
 	}
 
 	b.SetBytes(int64(len(cert) + len(key)))
-	b.ResetTimer()
-	for range b.N {
+	b.ReportAllocs()
+	for b.Loop() {
 		_ = convert.Fingerprint(cert, key)
 	}
 }
