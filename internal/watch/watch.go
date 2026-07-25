@@ -1,4 +1,16 @@
 // Package watch provides filesystem watching with fsnotify and poll fallback.
+//
+// Paths in this package are AMBIENT: inotify registration takes a path, not a
+// directory handle, so there is no *os.Root-confined equivalent of
+// watcher.Add. Every filesystem call here is therefore ambient —
+// filepath.WalkDir over the watched tree, watcher.Add per directory, and
+// handleFsEvent's os.Lstat — unlike every /input and /output touch in
+// internal/process, which goes through an *os.Root. That is bounded only
+// because nothing here reads file CONTENT: it stats and registers watches, and
+// every conversion an event triggers runs through internal/process's
+// root-confined scan of the /input *os.Root. Any future read of a watched file
+// MUST go through that confined root (convert.ReadBoundedFromRoot); never build
+// an ambient path here and read it. See addWatchDirs for the full reasoning.
 package watch
 
 import (
@@ -13,6 +25,11 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 )
+
+// ErrWatchLost reports that change detection ended for a reason other than
+// shutdown: the fsnotify watcher died and cannot be recovered in-process, so
+// the caller must exit non-zero for a restart.
+var ErrWatchLost = errors.New("change detection lost")
 
 // Watcher monitors a directory tree for cert/key changes and invokes a callback.
 type Watcher struct {
@@ -54,32 +71,30 @@ func New(root string, onChange func(ctx context.Context), opts ...Option) *Watch
 
 // Run starts watching. It tries fsnotify first; if unavailable it falls back to
 // polling with periodic upgrade attempts. It normally blocks until ctx is
-// cancelled, but it ALSO returns early when the fsnotify watcher dies (its
-// Events or Errors channel closes): change detection is then gone for good, so
-// the caller must treat a return with a live ctx as fatal and exit non-zero for
-// a restart, as main.go does.
-func (w *Watcher) Run(ctx context.Context) {
+// cancelled and then returns nil, but it ALSO returns early when the fsnotify
+// watcher dies (its Events or Errors channel closes): change detection is then
+// gone for good, so it returns ErrWatchLost and the caller must exit non-zero
+// for a restart, as main.go does.
+func (w *Watcher) Run(ctx context.Context) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		slog.Warn("fsnotify unavailable, using polling with periodic upgrade attempts", "error", err)
-		w.pollLoopWithUpgrade(ctx)
-		return
+		return w.pollLoopWithUpgrade(ctx)
 	}
 
 	if err := w.addWatchDirs(ctx, watcher, w.root); err != nil {
 		watcher.Close() // release fd + readEvents goroutine before long-lived fallback
 		if ctx.Err() != nil {
-			return // shutdown interrupted the walk; not a watch failure
+			return nil // shutdown interrupted the walk; not a watch failure
 		}
 		slog.Warn("failed to watch directories, using polling with periodic upgrade attempts", "error", err)
-		w.pollLoopWithUpgrade(ctx)
-		return
+		return w.pollLoopWithUpgrade(ctx)
 	}
 	defer watcher.Close()
 
 	slog.Info("fsnotify active", "directories", watcher.WatchList())
 	if ctx.Err() != nil {
-		return
+		return nil
 	}
 	// Attach-then-scan: main's startup scan ran before these watches existed, so
 	// a renewal landing in that window produced no event. Scanning once with the
@@ -87,7 +102,7 @@ func (w *Watcher) Run(ctx context.Context) {
 	// no-op when nothing changed, and events arriving during it stay queued and
 	// trigger the normal debounced follow-up.
 	w.onChange(ctx)
-	w.watchLoop(ctx, watcher)
+	return w.watchLoop(ctx, watcher)
 }
 
 // addWatchDirs recursively adds all directories under root to the watcher. Only
@@ -179,7 +194,21 @@ func (w *Watcher) handleFsEvent(ctx context.Context, watcher *fsnotify.Watcher, 
 		// watching through one would register inotify watches on a tree outside
 		// /input whose certs can never be converted — and a symlink to a large tree
 		// would burn the watch quota.
-		if info, err := os.Lstat(event.Name); err == nil && info.IsDir() {
+		info, err := os.Lstat(event.Name)
+		if err != nil {
+			// A vanished path is the expected case (an atomic-write temp created and
+			// renamed away before this event was handled), so it stays silent. Any
+			// other error means the created path could NOT be classified: if it was a
+			// directory it is now outside the watch set, and its renewals are covered
+			// only by the periodic fallback re-sync (never, with the fallback
+			// disabled). That is a degraded state an operator must be able to see.
+			if !errors.Is(err, fs.ErrNotExist) {
+				slog.Warn("cannot classify a created path; if it is a directory it stays unwatched until the next fallback re-sync",
+					"path", event.Name, "error", err)
+			}
+			return isCertFile(event.Name)
+		}
+		if info.IsDir() {
 			if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
 				slog.Warn("failed to watch new directory subtree", "path", event.Name, "error", addErr)
 			}
@@ -206,19 +235,21 @@ func isCertFile(name string) bool {
 }
 
 // watchLoop uses fsnotify for immediate reaction to cert changes,
-// with a periodic full scan as a safety net.
-func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) {
+// with a periodic full scan as a safety net. It returns nil when ctx is
+// cancelled and ErrWatchLost when the watcher's Events or Errors channel
+// closes, which ends change detection for the life of the process.
+func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) error {
 	st := newWatchState(w)
 	defer st.stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 
 		case event, ok := <-watcher.Events:
 			if !w.handleEventRecv(ctx, watcher, st, event, ok) {
-				return
+				return ErrWatchLost
 			}
 
 		case <-st.debounceTimer.C:
@@ -229,7 +260,7 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) {
 
 		case err, ok := <-watcher.Errors:
 			if !w.handleErrorRecv(ctx, watcher, st, err, ok) {
-				return
+				return ErrWatchLost
 			}
 		}
 	}
@@ -374,20 +405,22 @@ func (st *watchState) handleWatcherError(err error) bool {
 		st.scheduleScan()
 		return true
 	}
-	slog.Warn("watcher error", "error", err)
+	slog.Warn("watcher error; the watch loop continues and a change missed because of it is recovered by the periodic fallback rescan (if enabled)",
+		"root", st.w.root, "error", err)
 	return false
 }
 
 // pollLoopWithUpgrade polls on the fallback interval and attempts to
 // upgrade to fsnotify on every tick. With the fallback disabled (<= 0) there is no
 // interval to poll on, so it logs an error once that change detection is inactive and
-// blocks until ctx is cancelled.
-func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) {
+// blocks until ctx is cancelled. It returns nil on shutdown and propagates
+// ErrWatchLost from the watch loop it upgrades into.
+func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) error {
 	if w.fallback <= 0 {
 		slog.Error("polling disabled and fsnotify unavailable; change detection inactive until restart",
 			"remediation", "unset FALLBACK_SCAN_HOURS (or set it above 0) so the periodic rescan covers the missing fsnotify watch")
 		<-ctx.Done()
-		return
+		return nil
 	}
 
 	ticker := time.NewTicker(w.fallback)
@@ -396,7 +429,7 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-ticker.C:
 			slog.Debug("poll scan triggered", "interval", w.fallback)
 			fw, err := fsnotify.NewWatcher()
@@ -409,7 +442,7 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) {
 			if addErr := w.addWatchDirs(ctx, fw, w.root); addErr != nil {
 				fw.Close()
 				if ctx.Err() != nil {
-					return // shutdown interrupted the walk; not an upgrade failure
+					return nil // shutdown interrupted the walk; not an upgrade failure
 				}
 				slog.Info("fsnotify available but the watch set could not be rebuilt, staying in poll mode",
 					"mode", "poll", "retry_interval", w.fallback, "error", addErr)
@@ -422,9 +455,9 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) {
 			// already live, so a renewal landing during it still produces an
 			// event instead of falling into a gap covered by neither mode.
 			w.onChange(ctx)
-			w.watchLoop(ctx, fw)
+			loopErr := w.watchLoop(ctx, fw)
 			fw.Close()
-			return
+			return loopErr
 		}
 	}
 }

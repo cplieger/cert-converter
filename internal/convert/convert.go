@@ -78,7 +78,7 @@ func ReadBoundedFromRoot(ctx context.Context, root *os.Root, rel string, limit i
 // that bypasses those invariants with no production consumer. The package's own
 // tests reach it through export_test.go.
 func parseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
-	declaredCertBlocks := countDeclaredCertBlocks(pemBytes)
+	declaredCertBlocks := countDeclaredBlocks(pemBytes, certBeginMarker)
 	var certs []*x509.Certificate
 	var skipped int
 
@@ -112,10 +112,28 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
 	return certs, nil
 }
 
-// certBeginMarker is the PEM declaration line that opens a CERTIFICATE block.
-var certBeginMarker = []byte("-----BEGIN CERTIFICATE-----")
+// pemBeginMarker builds the PEM declaration line that opens a block of the
+// given type, exactly as encoding/pem writes it. Deriving the markers from the
+// pemType* constants keeps them in lockstep with the block types the decode
+// loops switch on (and keeps literal PEM key headers out of the source).
+func pemBeginMarker(blockType string) []byte {
+	return []byte("-----BEGIN " + blockType + "-----")
+}
 
-// countDeclaredCertBlocks counts CERTIFICATE declarations the way encoding/pem
+// certBeginMarker is the PEM declaration line that opens a CERTIFICATE block.
+var certBeginMarker = pemBeginMarker(pemTypeCertificate)
+
+// keyBeginMarkers are the PEM declaration lines that open a private-key block
+// parsePrivateKey knows about, including the encrypted forms it diagnoses
+// rather than decodes.
+var keyBeginMarkers = [][]byte{
+	pemBeginMarker(pemTypePrivateKey),
+	pemBeginMarker(pemTypeRSAPrivateKey),
+	pemBeginMarker(pemTypeECPrivateKey),
+	pemBeginMarker(pemTypeEncryptedPrivateKey),
+}
+
+// countDeclaredBlocks counts the declarations in markers the way encoding/pem
 // recognises them: a marker declares a block only when it occupies a complete
 // line, so the same text embedded in surrounding prose (which pem.Decode
 // ignores entirely) is not counted and cannot make a valid chain look
@@ -128,13 +146,16 @@ var certBeginMarker = []byte("-----BEGIN CERTIFICATE-----")
 // final line too, so a file whose last line is "-----BEGIN CERTIFICATE-----\r"
 // still counts as a declaration and is reported as a truncated chain instead of
 // being silently ignored.
-func countDeclaredCertBlocks(pemBytes []byte) int {
+func countDeclaredBlocks(pemBytes []byte, markers ...[]byte) int {
 	var n int
 	for line := range bytes.Lines(pemBytes) {
 		line = bytes.TrimSuffix(line, []byte("\n"))
 		line = bytes.TrimRight(bytes.TrimSuffix(line, []byte("\r")), " \t")
-		if bytes.Equal(line, certBeginMarker) {
-			n++
+		for _, marker := range markers {
+			if bytes.Equal(line, marker) {
+				n++
+				break
+			}
 		}
 	}
 	return n
@@ -152,23 +173,30 @@ func countDeclaredCertBlocks(pemBytes []byte) int {
 // from "the only key blocks are encrypted" so the caller surfaces actionable
 // guidance: both a PKCS#8 ENCRYPTED PRIVATE KEY block and a traditional OpenSSL
 // key carrying "Proc-Type: 4,ENCRYPTED" + "DEK-Info" headers hold ciphertext
-// none of the parsers can decode.
+// none of the parsers can decode. It also counts the private-key declarations
+// the file carries (the same line-accurate accounting parseCertChain applies to
+// CERTIFICATE blocks) so a key file whose armour encoding/pem silently dropped
+// is diagnosed as damaged rather than as holding no key at all. Unlike the
+// chain, a partially decodable key file is NOT rejected: a usable later block
+// still wins, and the count only enriches the failure message.
 //
 // Unexported for the same reason as parseCertChain: PairInRoot is the package's
 // only production conversion edge.
 func parsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
+	declaredKeyBlocks := countDeclaredBlocks(pemBytes, keyBeginMarkers...)
 	var sawEncrypted bool
-	var skipped int
+	var skipped, decodedKeyBlocks int
 	var firstParseErr error
 	for {
 		var block *pem.Block
 		block, pemBytes = pem.Decode(pemBytes)
 		if block == nil {
-			return nil, noPrivateKeyError(firstParseErr, sawEncrypted, skipped)
+			return nil, noPrivateKeyError(firstParseErr, sawEncrypted, skipped, declaredKeyBlocks-decodedKeyBlocks)
 		}
 
 		switch block.Type {
 		case pemTypePrivateKey, pemTypeRSAPrivateKey, pemTypeECPrivateKey:
+			decodedKeyBlocks++
 			if isEncryptedPEMBlock(block) {
 				sawEncrypted = true
 				continue
@@ -182,6 +210,7 @@ func parsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 			}
 			return key, nil
 		case pemTypeEncryptedPrivateKey:
+			decodedKeyBlocks++
 			sawEncrypted = true
 		default:
 			skipped++
@@ -192,18 +221,27 @@ func parsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 // noPrivateKeyError explains why parsePrivateKey decoded no usable key, in
 // order of specificity: a DER parse failure from a key-labelled block outranks
 // "everything was encrypted", which outranks "there were PEM blocks, none of
-// them a key", which outranks "no PEM block at all".
-func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped int) error {
+// them a key", which outranks "no PEM block at all". The last two are further
+// qualified by undecodedKeyBlocks, the number of private-key declarations the
+// file carries that encoding/pem dropped (truncated armour, a corrupt body, or
+// a run-together END/BEGIN line), so a damaged key file is not reported with
+// the same sentence as a file that genuinely holds no key. The base sentence is
+// kept as the prefix so existing log matching is unaffected.
+func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped, undecodedKeyBlocks int) error {
 	switch {
 	case firstParseErr != nil:
 		return firstParseErr
 	case sawEncrypted:
 		return errors.New("private key PEM block is encrypted; decrypt it before use")
-	case skipped > 0:
-		return fmt.Errorf("no private key PEM block found (skipped %d PEM block(s))", skipped)
-	default:
-		return errors.New("no private key PEM block found")
 	}
+	msg := "no private key PEM block found"
+	if skipped > 0 {
+		msg = fmt.Sprintf("%s (skipped %d PEM block(s))", msg, skipped)
+	}
+	if undecodedKeyBlocks > 0 {
+		msg = fmt.Sprintf("%s; the file declares %d private-key PEM block(s) that could not be decoded (truncated armour or a corrupt body)", msg, undecodedKeyBlocks)
+	}
+	return errors.New(msg)
 }
 
 // isEncryptedPEMBlock reports whether a traditional OpenSSL private-key block
@@ -276,6 +314,12 @@ func parsePrivateKeyBlock(block *pem.Block) (crypto.PrivateKey, error) {
 // lower-level variant would offer a second write contract with no production
 // consumer.
 func toPFXInRoot(ctx context.Context, privKey crypto.PrivateKey, leaf *x509.Certificate, caCerts []*x509.Certificate, root *os.Root, rel, password string, enc *pkcs12.Encoder) error {
+	if hasNonBMPRune(password) {
+		return errors.New("pfx password contains a character outside the Basic Multilingual Plane, " +
+			"which the PKCS#12 UCS-2 password encoding cannot represent; " +
+			"choose a password made of BMP characters (ASCII is safest)")
+	}
+
 	pfxData, err := enc.Encode(privKey, leaf, caCerts, password)
 	if err != nil {
 		return fmt.Errorf("encode pfx: %w", err)
@@ -287,4 +331,19 @@ func toPFXInRoot(ctx context.Context, privKey crypto.PrivateKey, leaf *x509.Cert
 		return fmt.Errorf("write pfx: %w", err)
 	}
 	return nil
+}
+
+// hasNonBMPRune reports whether s holds a rune above U+FFFF. PKCS#12 encodes
+// the password as UCS-2 (RFC 7292 appendix B.1), which cannot represent a rune
+// outside the Basic Multilingual Plane, so go-pkcs12 rejects such a password
+// with a message that names neither the password nor the constraint's source.
+// The offending rune is deliberately NOT reported: it is one character of a
+// secret and the diagnostic goes to the container log.
+func hasNonBMPRune(s string) bool {
+	for _, r := range s {
+		if r > 0xFFFF {
+			return true
+		}
+	}
+	return false
 }

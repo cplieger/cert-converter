@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/envx"
@@ -93,6 +94,7 @@ func Load() (Config, error) {
 	if ClassifyPassword(password) == PasswordEmpty && !allowEmpty {
 		return Config{}, ErrEmptyPassword
 	}
+	warnUnencodablePassword(password)
 	if os.Getenv("PFX_PASSWORD_FILE") != "" {
 		// Record the secret's SOURCE (never its value) so an operator can confirm
 		// a mounted secret was actually consumed instead of silently falling back
@@ -155,6 +157,32 @@ func allowEmptyPassword(raw string) bool {
 			"value", trimmed, "expected", "true or false")
 	}
 	return false
+}
+
+// warnUnencodablePassword warns when the PFX password cannot survive the
+// PKCS#12 BMPString (UCS-2) encoding go-pkcs12 applies to it. Two shapes are
+// diagnosed, and neither is rejected here because the value is the operator's
+// choice: a rune outside the Basic Multilingual Plane makes every Encode call
+// fail, and a byte sequence that is not valid UTF-8 is replaced rune-by-rune
+// with U+FFFD, so the PFX ends up protected by a different, lower-entropy
+// password than the configured secret. Only the shape is reported, never the
+// value.
+func warnUnencodablePassword(password string) {
+	if password == "" {
+		return
+	}
+	if !utf8.ValidString(password) {
+		slog.Warn("PFX_PASSWORD is not valid UTF-8; every invalid byte is encoded as U+FFFD, so generated PFX files are protected by a different, lower-entropy password than the configured secret",
+			"remediation", "supply a text secret (for example base64) instead of raw binary bytes")
+		return
+	}
+	for _, r := range password {
+		if r > 0xFFFF {
+			slog.Warn("PFX_PASSWORD contains a character outside the Basic Multilingual Plane; PKCS#12 cannot encode it, so every conversion will fail",
+				"remediation", "use a PFX password made only of BMP characters (ASCII is safest)")
+			return
+		}
+	}
 }
 
 // parseFallbackInterval parses a FALLBACK_SCAN_HOURS value into a re-scan

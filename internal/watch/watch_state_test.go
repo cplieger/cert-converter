@@ -2,12 +2,9 @@ package watch
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"testing/synctest"
 	"time"
-
-	"github.com/fsnotify/fsnotify"
 )
 
 // TestNewWatchState_leaves_nothing_armed_when_fallback_disabled pins the
@@ -102,26 +99,4 @@ func TestWatchState_scans_re_arm_the_fallback_from_the_last_scan(t *testing.T) {
 			t.Errorf("onChange called %d times, want 2 (one debounced scan plus one fallback scan)", scans)
 		}
 	})
-}
-
-// TestWatchState_handleWatcherError_rescans_only_on_overflow pins the recovery
-// contract for fsnotify errors: an event-queue overflow dropped events, so a
-// rescan must be scheduled to recover a missed renewal, while any other watcher
-// error is logged without forcing a scan.
-func TestWatchState_handleWatcherError_rescans_only_on_overflow(t *testing.T) {
-	t.Parallel()
-
-	overflow := newWatchState(New("/input", func(context.Context) {}))
-	defer overflow.stop()
-	overflow.handleWatcherError(fsnotify.ErrEventOverflow)
-	if !overflow.pending {
-		t.Error("handleWatcherError(ErrEventOverflow) did not schedule a scan; dropped events would silently skip a renewal")
-	}
-
-	other := newWatchState(New("/input", func(context.Context) {}))
-	defer other.stop()
-	other.handleWatcherError(errors.New("transient watcher failure"))
-	if other.pending {
-		t.Error("handleWatcherError(non-overflow error) scheduled a scan; want the error logged only")
-	}
 }

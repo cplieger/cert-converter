@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -70,18 +71,16 @@ func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *hea
 // the non-secret status used by the startup log. Keeping the warning and the
 // status in one decision prevents the two predicate trees from drifting apart.
 func logPasswordStatus(password string) string {
-	switch config.ClassifyPassword(password) {
+	status := config.ClassifyPassword(password)
+	switch status {
 	case config.PasswordEmpty:
 		slog.Warn("PFX_PASSWORD is empty; generated PFX files protect the private key with an empty password",
 			"remediation", "set PFX_PASSWORD, or point PFX_PASSWORD_FILE at a mounted secret")
-		return string(config.PasswordEmpty)
 	case config.PasswordWhitespaceOnly:
 		slog.Warn("PFX_PASSWORD is whitespace-only; generated PFX files are protected by that whitespace string, which is effectively no protection",
 			"remediation", "set PFX_PASSWORD to a real value (check for stray quotes or spaces in the env file)")
-		return string(config.PasswordWhitespaceOnly)
-	default:
-		return string(config.PasswordConfigured)
 	}
+	return string(status)
 }
 
 func main() {
@@ -96,7 +95,7 @@ func run() int {
 	lvl, rawLevel, ok := config.LogLevel()
 	slogx.Setup(slogx.Options{Level: lvl})
 	if !ok {
-		slog.Warn("invalid LOG_LEVEL, using default", "value", rawLevel, "default", "info")
+		slog.Warn("invalid LOG_LEVEL, using default", "value", rawLevel, "default", strings.ToLower(lvl.String()))
 	}
 
 	if len(os.Args) > 1 {
@@ -166,14 +165,12 @@ func run() int {
 	w := watch.New(certsRootDir, runAndSetHealth,
 		watch.WithDebounce(watchDebounce),
 		watch.WithFallback(cfg.FallbackInterval))
-	w.Run(ctx)
-
-	if ctx.Err() == nil {
-		// Run returned without a shutdown signal: the fsnotify channels closed,
-		// so change detection is dead and only a restart can recover it. Exit
-		// non-zero so restart: on-failure deployments restart too; the deferred
-		// marker.Cleanup drops the marker on the way out, so a probe cannot
-		// report healthy after this point.
+	if runErr := w.Run(ctx); runErr != nil {
+		// Run reported that change detection ended for a reason other than
+		// shutdown: the fsnotify channels closed, so only a restart can recover
+		// it. Exit non-zero so restart: on-failure deployments restart too; the
+		// deferred marker.Cleanup drops the marker on the way out, so a probe
+		// cannot report healthy after this point.
 		slog.Error("watcher stopped without a shutdown signal; " +
 			"change detection is dead, exiting for a restart")
 		return 1

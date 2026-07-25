@@ -2,6 +2,7 @@ package watch
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -75,5 +76,29 @@ func TestAddWatchDirs_fails_when_the_root_watch_cannot_be_added(t *testing.T) {
 
 	if err := New(root, func(context.Context) {}).addWatchDirs(t.Context(), watcher, root); err == nil {
 		t.Error("addWatchDirs(closed watcher) = nil, want an error so Run falls back to polling instead of watching nothing")
+	}
+}
+
+func TestAddWatchDirs_reports_shutdown_instead_of_a_watch_failure(t *testing.T) {
+	t.Parallel()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Skipf("fsnotify unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = watcher.Close() })
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "example.com"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = New(root, func(context.Context) {}).addWatchDirs(ctx, watcher, root)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("addWatchDirs(cancelled ctx) = %v, want context.Canceled so Run treats it as shutdown rather than falling back to polling", err)
+	}
+	if watched := watcher.WatchList(); len(watched) != 0 {
+		t.Errorf("addWatchDirs(cancelled ctx) registered %v, want no watches once shutdown has started", watched)
 	}
 }

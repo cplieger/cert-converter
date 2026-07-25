@@ -287,6 +287,26 @@ func TestLoad_unreadable_password_file_fails_loudly(t *testing.T) {
 			}
 			return path
 		}},
+		// A readable file the operator could reach by hand: envx still refuses
+		// the path, and the refusal must not degrade to PFX_PASSWORD.
+		{"uncleaned path with .. is rejected", func(t *testing.T) string {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "pfx"), []byte("from-file"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(filepath.Join(dir, "sub"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			// Built by concatenation: filepath.Join would clean the ".." away.
+			return dir + "/sub/../pfx"
+		}},
+		{"filename holding two consecutive dots is rejected", func(t *testing.T) string {
+			path := filepath.Join(t.TempDir(), "pfx..v2")
+			if err := os.WriteFile(path, []byte("from-file"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("PFX_PASSWORD", "from-env")
@@ -417,5 +437,48 @@ func TestLoad_env_password_logs_no_secret_source(t *testing.T) {
 
 	if out := buf.String(); strings.Contains(out, "PFX_PASSWORD_FILE") {
 		t.Errorf("Load() logged %q, want no secret-source record when PFX_PASSWORD_FILE is unset", out)
+	}
+}
+
+func TestLoad_unknown_encoder_warns_and_falls_back_to_modern2023(t *testing.T) {
+	// slog.Default is process-global: this test swaps it, so it must not run
+	// in parallel with anything that logs.
+	for _, tc := range []struct {
+		name     string
+		raw      string
+		wantName convert.EncoderType
+		wantWarn bool
+	}{
+		{"unrecognized value warns and falls back", "modern2029", convert.EncNameModern2023, true},
+		{"typo in a known name warns", "legcy", convert.EncNameModern2023, true},
+		{"unset is silent and defaults", "", convert.EncNameModern2023, false},
+		{"recognized alias is silent", "modern", convert.EncNameModern2023, false},
+		{"recognized legacy is silent", "legacy", convert.EncNameLegacyDES, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", "pw")
+			t.Setenv("PFX_ENCODER", tc.raw)
+
+			var buf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() with PFX_ENCODER=%q = %v, want nil (an unknown value must not fail startup)", tc.raw, err)
+			}
+			if cfg.EncoderName != tc.wantName {
+				t.Errorf("Load() with PFX_ENCODER=%q EncoderName = %q, want %q", tc.raw, cfg.EncoderName, tc.wantName)
+			}
+			warned := strings.Contains(buf.String(), "unknown PFX_ENCODER")
+			if warned != tc.wantWarn {
+				t.Errorf("Load() with PFX_ENCODER=%q warned = %v, want %v (log: %q)", tc.raw, warned, tc.wantWarn, buf.String())
+			}
+			if tc.wantWarn && !strings.Contains(buf.String(), tc.raw) {
+				t.Errorf("Load() with PFX_ENCODER=%q logged %q, want the rejected value named so an operator can spot the typo", tc.raw, buf.String())
+			}
+		})
 	}
 }

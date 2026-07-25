@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // PairInRoot parses an already-read cert chain and private key, verifies the
@@ -69,10 +70,27 @@ func leafKeyMismatchError(chain []*x509.Certificate, signer crypto.Signer) error
 		if matched, _ := publicKeyMatches(c.PublicKey, signer); matched {
 			return fmt.Errorf(
 				"%s; certificate %d of %d (subject %q) does match, so the chain is ordered leaf-last: concatenate it leaf-first",
-				base, i+2, len(chain), c.Subject.String())
+				base, i+2, len(chain), boundSubject(c.Subject.String()))
 		}
 	}
 	return errors.New(base)
+}
+
+// maxSubjectLogLen bounds the certificate-controlled subject interpolated into
+// the mismatch diagnostic. The subject is parsed out of a PEM file the app does
+// not control and is capped only by MaxFileSize (10 MB), so an unbounded
+// interpolation puts a multi-megabyte line into the logs of every scan that
+// retries the pair.
+const maxSubjectLogLen = 256
+
+// boundSubject truncates a certificate subject to maxSubjectLogLen bytes for a
+// log-bound diagnostic, dropping the partial rune the cut may leave behind so
+// the %q form stays readable.
+func boundSubject(subject string) string {
+	if len(subject) <= maxSubjectLogLen {
+		return subject
+	}
+	return strings.ToValidUTF8(subject[:maxSubjectLogLen], "") + "...(truncated)"
 }
 
 // publicKeyMatches reports whether pub is the public half of signer's private

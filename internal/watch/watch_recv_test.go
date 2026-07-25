@@ -154,3 +154,86 @@ func TestHandleFallbackTick_resyncs_the_watch_set_before_scanning(t *testing.T) 
 		t.Errorf("handleFallbackTick did not re-sync the watch set; %q missing from %v", nested, watched)
 	}
 }
+
+// TestHandleFallbackTick_skips_the_scan_when_shutdown_cut_the_resync_short pins
+// the shutdown half of the fallback tick: a re-sync cut short by cancellation
+// must not go on to start a full /input scan whose result would still drive the
+// health marker while the loop is already returning.
+func TestHandleFallbackTick_skips_the_scan_when_shutdown_cut_the_resync_short(t *testing.T) {
+	t.Parallel()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Skipf("fsnotify unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = watcher.Close() })
+	root := t.TempDir()
+	scans := 0
+	w := New(root, func(context.Context) { scans++ }, WithFallback(time.Hour))
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	w.handleFallbackTick(ctx, watcher, st)
+
+	if scans != 0 {
+		t.Errorf("handleFallbackTick(cancelled ctx) ran %d scans, want 0 (the loop is about to return; a shutdown must not start a scan)", scans)
+	}
+}
+
+// TestHandleErrorRecv_keeps_the_loop_running_when_the_overflow_resync_fails
+// pins the liveness half of the overflow recovery: a failed watch-set re-sync
+// is warned about and the loop keeps running, because treating it as fatal
+// would exit Run and restart the container on a recoverable overflow.
+func TestHandleErrorRecv_keeps_the_loop_running_when_the_overflow_resync_fails(t *testing.T) {
+	t.Parallel()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Skipf("fsnotify unavailable: %v", err)
+	}
+	if err := watcher.Close(); err != nil {
+		t.Fatalf("setup: watcher.Close() = %v", err)
+	}
+	root := t.TempDir()
+	w := New(root, func(context.Context) {})
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+
+	if got := w.handleErrorRecv(t.Context(), watcher, st, fsnotify.ErrEventOverflow, true); !got {
+		t.Error("handleErrorRecv(overflow, re-sync failing) = false, want true: a failed re-sync is warned about, not fatal to the loop")
+	}
+	if !st.pending {
+		t.Error("handleErrorRecv(overflow, re-sync failing) did not schedule the recovery rescan; a renewal in the dropped events would be missed")
+	}
+}
+
+// TestHandleErrorRecv_does_not_resync_the_watch_set_for_a_benign_error pins the
+// negative half of the recovery contract: only an event-queue overflow warrants
+// a full tree re-walk, so a directory created after the watch set was built
+// must NOT appear in the watch list after a benign watcher error.
+func TestHandleErrorRecv_does_not_resync_the_watch_set_for_a_benign_error(t *testing.T) {
+	t.Parallel()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Skipf("fsnotify unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = watcher.Close() })
+	root := t.TempDir()
+	w := New(root, func(context.Context) {})
+	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
+		t.Fatalf("setup: addWatchDirs = %v", err)
+	}
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+	late := filepath.Join(root, "late.example.com")
+	if err := os.MkdirAll(late, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := w.handleErrorRecv(t.Context(), watcher, st, errors.New("transient watcher failure"), true); !got {
+		t.Error("handleErrorRecv(non-overflow error) = false, want true (the loop keeps running)")
+	}
+	if watched := watcher.WatchList(); slices.Contains(watched, late) {
+		t.Errorf("handleErrorRecv(non-overflow error) re-walked the tree and picked up %q; only an event-queue overflow warrants a full re-sync", late)
+	}
+}

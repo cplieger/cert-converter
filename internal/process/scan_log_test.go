@@ -75,7 +75,7 @@ func TestLogEntryFailure_levels(t *testing.T) {
 			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 			t.Cleanup(func() { slog.SetDefault(prev) })
 
-			logEntryFailure("conversion failed", "example.com/tls.crt", tt.err)
+			logEntryFailure("example.com/tls.crt", "conversion failed", tt.err)
 
 			out := buf.String()
 			if !strings.Contains(out, tt.wantMsg) {

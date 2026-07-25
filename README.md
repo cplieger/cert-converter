@@ -67,7 +67,7 @@ services:
 
 | Mount | Description |
 | --- | --- |
-| `/input` | PEM certificate directory (read-only). Must be readable by the UID in `user:`; Caddy's certificate directory is often root-owned and mode `0700`, so either `chgrp`/`chmod` it for that UID or run the container as a UID that can read it. |
+| `/input` | PEM certificate directory (read-only). Each certificate must be named `<name>.crt` with its private key as the sibling `<name>.key` in the same directory (Caddy's layout); files with any other extension are ignored, so a certbot-style directory of `fullchain.pem`/`privkey.pem` produces no output and logs `no certificate pairs found under the input root`. Sub-directories are scanned recursively and mirrored under `/output` as `<name>.pfx`. Must be readable by the UID in `user:`; Caddy's certificate directory is often root-owned and mode `0700`, so either `chgrp`/`chmod` it for that UID or run the container as a UID that can read it. |
 | `/output` | PFX output directory; must be writable by the UID in `user:` |
 
 Create the host output directory owned by the UID you set in `user:`

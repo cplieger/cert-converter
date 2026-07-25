@@ -79,3 +79,31 @@ func TestNew_applies_debounce_and_fallback_options(t *testing.T) {
 		t.Errorf("New(WithFallback(3h)) fallback = %v, want %v", w.fallback, 3*time.Hour)
 	}
 }
+
+// TestHandleFsEvent_rescans_even_when_the_new_subtree_cannot_be_watched pins the
+// return value of the Create-directory path when addWatchDirs fails: the event
+// must still report true so the debounced rescan converts a cert pair that
+// already exists inside the new directory even though its subtree could not be
+// watched.
+func TestHandleFsEvent_rescans_even_when_the_new_subtree_cannot_be_watched(t *testing.T) {
+	t.Parallel()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Skipf("fsnotify unavailable: %v", err)
+	}
+	if err := watcher.Close(); err != nil {
+		t.Fatalf("setup: watcher.Close() = %v", err)
+	}
+	root := t.TempDir()
+	newDir := filepath.Join(root, "example.com")
+	if err := os.MkdirAll(newDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	w := New(root, func(context.Context) {})
+
+	got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: newDir, Op: fsnotify.Create})
+
+	if !got {
+		t.Error("handleFsEvent(Create dir, unwatchable) = false, want true: a cert pair already inside the new directory would otherwise wait for the fallback rescan")
+	}
+}

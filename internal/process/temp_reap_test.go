@@ -46,8 +46,8 @@ func TestTempReapVisit_classifies_walk_errors(t *testing.T) {
 		if tr.unreadable != 1 {
 			t.Errorf("visit(\"sub\", err) unreadable = %d, want 1", tr.unreadable)
 		}
-		if tr.failed != 0 || tr.total != 0 {
-			t.Errorf("visit(\"sub\", err) failed/total = %d/%d, want 0/0", tr.failed, tr.total)
+		if tr.failed != 0 || tr.reaped != 0 {
+			t.Errorf("visit(\"sub\", err) failed/reaped = %d/%d, want 0/0", tr.failed, tr.reaped)
 		}
 	})
 

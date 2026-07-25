@@ -937,3 +937,102 @@ func TestParsePrivateKey_reports_the_most_specific_reason(t *testing.T) {
 		})
 	}
 }
+
+// TestParsePrivateKey_a_non_encryption_pem_header_still_parses pins the negative
+// half of the encrypted-block detection: only "Proc-Type: 4,ENCRYPTED" and a
+// NON-EMPTY DEK-Info mark ciphertext, so an RFC 1421 header carrying any other
+// Proc-Type value (MIC-ONLY, CRL) or an empty DEK-Info must leave the block
+// parseable and yield the key it actually holds, not the
+// "decrypt it before use" diagnosis.
+func TestParsePrivateKey_a_non_encryption_pem_header_still_parses(t *testing.T) {
+	t.Parallel()
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ecDER, err := x509.MarshalECPrivateKey(ecKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for name, headers := range map[string]map[string]string{
+		"Proc-Type 4,MIC-ONLY": {"Proc-Type": "4,MIC-ONLY"},
+		"Proc-Type 4,CRL":      {"Proc-Type": "4,CRL"},
+		"empty DEK-Info value": {"DEK-Info": ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Headers: headers, Bytes: ecDER})
+			key, keyErr := convert.ParsePrivateKey(keyPEM)
+			if keyErr != nil {
+				t.Fatalf("convert.ParsePrivateKey(%s) = error %v, want the key the block holds", name, keyErr)
+			}
+			parsed, ok := key.(*ecdsa.PrivateKey)
+			if !ok {
+				t.Fatalf("convert.ParsePrivateKey(%s) returned %T, want *ecdsa.PrivateKey", name, key)
+			}
+			if !parsed.Equal(ecKey) {
+				t.Errorf("convert.ParsePrivateKey(%s) returned a different key than the block held", name)
+			}
+		})
+	}
+}
+
+// TestPairInRoot_rejects_a_certificate_whose_public_key_type_is_unverifiable pins
+// the supported=false half of the leaf/key correspondence check: crypto/x509
+// leaves Certificate.PublicKey nil for an SPKI algorithm OID it does not
+// recognise, so no Equal(crypto.PublicKey) method is available and the pair
+// cannot be verified either way. Such a pair must be rejected as unverifiable --
+// never silently treated as a match and encoded into a PFX, and never reported as
+// a plain mismatch, which would send the operator after the wrong file -- and no
+// file may be written.
+func TestPairInRoot_rejects_a_certificate_whose_public_key_type_is_unverifiable(t *testing.T) {
+	t.Parallel()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "unverifiable", "ecdsa")
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		t.Fatal("setup: the generated certificate PEM did not decode")
+	}
+	// id-ecPublicKey (1.2.840.10045.2.1) as DER, with its final arc bumped to an
+	// unassigned value so crypto/x509 reports UnknownPublicKeyAlgorithm and leaves
+	// PublicKey nil. ParseCertificate does not verify the signature, so patching
+	// the SPKI OID in place is enough to build the input.
+	ecPublicKeyOID := []byte{0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01}
+	unknownOID := []byte{0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x09}
+	if n := bytes.Count(block.Bytes, ecPublicKeyOID); n != 1 {
+		t.Fatalf("setup: found %d id-ecPublicKey OIDs in the certificate DER, want exactly 1", n)
+	}
+	patched := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: bytes.Replace(block.Bytes, ecPublicKeyOID, unknownOID, 1),
+	})
+	patchedBlock, _ := pem.Decode(patched)
+	parsed, err := x509.ParseCertificate(patchedBlock.Bytes)
+	if err != nil {
+		t.Fatalf("setup: x509.ParseCertificate(patched cert) = error %v, want nil", err)
+	}
+	if parsed.PublicKey != nil {
+		t.Fatalf("setup: patched certificate still carries a %T public key; the OID patch no longer yields an unknown algorithm", parsed.PublicKey)
+	}
+
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	defer root.Close()
+
+	err = convert.PairInRoot(t.Context(), patched, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
+	if err == nil {
+		t.Fatal("convert.PairInRoot(certificate with an unknown public key algorithm) = nil error, want an unverifiable-key-type error")
+	}
+	if !strings.Contains(err.Error(), "cannot be verified against the private key") {
+		t.Errorf("convert.PairInRoot error = %q, want it to report the public key type as unverifiable", err.Error())
+	}
+	if strings.Contains(err.Error(), "does not match the private key") {
+		t.Errorf("convert.PairInRoot error = %q, want the unverifiable-type error, not the plain mismatch error", err.Error())
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "out.pfx")); statErr == nil {
+		t.Error("convert.PairInRoot wrote a pfx for an unverifiable pair; want no file written")
+	}
+}

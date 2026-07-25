@@ -232,7 +232,7 @@ func reapStaleTemps(ctx context.Context, outHandle *os.Root) {
 type tempReap struct {
 	outHandle  *os.Root
 	cutoff     time.Time
-	total      int
+	reaped     int
 	failed     int
 	unreadable int
 }
@@ -257,7 +257,7 @@ func (tr *tempReap) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 	}
 	removed, didFail := reapStaleTemp(tr.outHandle, rel, d, tr.cutoff)
 	if removed {
-		tr.total++
+		tr.reaped++
 	}
 	if didFail {
 		tr.failed++
@@ -282,11 +282,11 @@ func (tr *tempReap) logOutcome(walkErr error) {
 			slog.Warn("stale temp cleanup failed", "dir", tr.outHandle.Name(), "error", walkErr)
 		}
 	}
-	if tr.total > 0 {
+	if tr.reaped > 0 {
 		// A reclaimed orphan is evidence of an earlier interrupted write (a
 		// crash or a kill between temp-write and rename), so it belongs in the
 		// default-level log rather than only under LOG_LEVEL=debug.
-		slog.Info("reaped stale temp files", "dir", tr.outHandle.Name(), "count", tr.total)
+		slog.Info("reaped stale temp files", "dir", tr.outHandle.Name(), "count", tr.reaped)
 	}
 	if tr.failed > 0 {
 		slog.Warn("some stale output temps could not be inspected or removed", "dir", tr.outHandle.Name(),
@@ -334,6 +334,7 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		return nil
 	}
 	if d.IsDir() || !strings.HasSuffix(rel, ".crt") {
+		sw.noteUnwalkableSymlink(rel, d)
 		return nil
 	}
 	sw.seen[rel] = struct{}{}
@@ -347,6 +348,34 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		return ctx.Err()
 	}
 	return nil
+}
+
+// noteUnwalkableSymlink reports a symlink under the input root that the walk
+// cannot follow. fs.WalkDir never descends a symlinked directory, and a link
+// whose target lies outside the root cannot be resolved through the confined
+// handle at all, so every certificate beneath such a link is invisible to the
+// scan: it is counted in nothing, no PFX is produced, and health stays green.
+// An /input populated with symlinks to other certificate directories would
+// otherwise fail silently. The .crt/.key pair names are excluded because
+// convertEntry already classifies and logs those (an unreadable .crt fails the
+// entry, a sibling .key that cannot be stat-ed is a warned orphan), so warning
+// here as well would double-report one condition. A dangling link (ENOENT)
+// hides nothing and stays silent.
+func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
+	if d.Type()&fs.ModeSymlink == 0 || strings.HasSuffix(rel, ".crt") || strings.HasSuffix(rel, ".key") {
+		return
+	}
+	fi, err := sw.inHandle.Stat(rel)
+	switch {
+	case err != nil && !errors.Is(err, fs.ErrNotExist):
+		slog.Warn("skipping symlink that does not resolve inside the input root; any certificates under it are not scanned",
+			"path", rel, "error", err,
+			"remediation", "mount that certificate directory into /input directly instead of linking to it")
+	case err == nil && fi.IsDir():
+		// The target is inside the root, so the walk reaches those
+		// certificates through the real directory; nothing is missed.
+		slog.Debug("skipping symlinked directory; its target is walked directly", "path", rel)
+	}
 }
 
 // --- Logging policy ---
@@ -400,7 +429,7 @@ func isShutdown(err error) bool {
 // (context cancellation or deadline) logs at Debug -- it is not an operator
 // actionable conversion error -- while every real failure logs at Error, the
 // same split logScanOutcome applies to the walk-level error.
-func logEntryFailure(msg, logPath string, err error) {
+func logEntryFailure(logPath, msg string, err error) {
 	if isShutdown(err) {
 		slog.Debug(msg+" (shutdown)", "path", logPath, "error", err)
 		return
@@ -414,7 +443,7 @@ func logEntryFailure(msg, logPath string, err error) {
 // conversion, so a failed entry leaves the previous (or absent) fingerprint in
 // place and the next scan retries the pair.
 func failEntry(logPath, msg string, err error) conversionStatus {
-	logEntryFailure(msg, logPath, err)
+	logEntryFailure(logPath, msg, err)
 	return statusFailed
 }
 
@@ -432,7 +461,9 @@ func failEntry(logPath, msg string, err error) conversionStatus {
 // per-cert logs use the certsRoot-relative path for a stable, non-leaky
 // identifier.
 func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStatus {
-	keyRel := strings.TrimSuffix(rel, ".crt") + ".key"
+	// One stem for every sibling name derived from this .crt entry.
+	stem := strings.TrimSuffix(rel, ".crt")
+	keyRel := stem + ".key"
 
 	if _, statErr := sw.inHandle.Stat(keyRel); statErr != nil {
 		if errors.Is(statErr, fs.ErrNotExist) {
@@ -457,7 +488,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		return failEntry(rel, "failed to read private key", err)
 	}
 
-	pfxRel := strings.TrimSuffix(rel, ".crt") + ".pfx"
+	pfxRel := stem + ".pfx"
 	fingerprint := pairFingerprint(certPEM, keyPEM)
 
 	if sw.outputIsCurrent(rel, pfxRel, fingerprint) {
