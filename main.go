@@ -7,12 +7,10 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/config"
-	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/health"
@@ -72,17 +70,17 @@ func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *hea
 // the non-secret status used by the startup log. Keeping the warning and the
 // status in one decision prevents the two predicate trees from drifting apart.
 func logPasswordStatus(password string) string {
-	switch {
-	case password == "":
+	switch config.ClassifyPassword(password) {
+	case config.PasswordEmpty:
 		slog.Warn("PFX_PASSWORD is empty; generated PFX files protect the private key with an empty password",
 			"remediation", "set PFX_PASSWORD, or point PFX_PASSWORD_FILE at a mounted secret")
-		return "empty"
-	case strings.TrimSpace(password) == "":
+		return string(config.PasswordEmpty)
+	case config.PasswordWhitespaceOnly:
 		slog.Warn("PFX_PASSWORD is whitespace-only; generated PFX files are protected by that whitespace string, which is effectively no protection",
 			"remediation", "set PFX_PASSWORD to a real value (check for stray quotes or spaces in the env file)")
-		return "whitespace-only"
+		return string(config.PasswordWhitespaceOnly)
 	default:
-		return "configured"
+		return string(config.PasswordConfigured)
 	}
 }
 
@@ -150,8 +148,7 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cache := convert.NewHashCache()
-	scanner := process.New(cache, process.Options{
+	scanner := process.New(process.Options{
 		CertsRoot: certsRootDir,
 		OutRoot:   outputDir,
 		Password:  cfg.Password,

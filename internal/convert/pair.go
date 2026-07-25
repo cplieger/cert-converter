@@ -23,7 +23,7 @@ func PairInRoot(ctx context.Context, certPEM, keyPEM []byte, outRoot *os.Root, r
 	if err != nil {
 		return err
 	}
-	return toPFXInRoot(ctx, privKey, leaf, caCerts, outRoot, rel, password, EncoderFor(encName))
+	return toPFXInRoot(ctx, privKey, leaf, caCerts, outRoot, rel, password, encoderFor(encName))
 }
 
 // parseAndMatch parses an already-read cert chain and private key and verifies
@@ -47,11 +47,11 @@ func parseAndMatch(certPEM, keyPEM []byte) (leaf *x509.Certificate, caCerts []*x
 	if !ok {
 		return nil, nil, nil, fmt.Errorf("private key type %T does not implement crypto.Signer", privKey)
 	}
-	matcher, ok := leaf.PublicKey.(interface{ Equal(crypto.PublicKey) bool })
-	if !ok {
+	matched, supported := publicKeyMatches(leaf.PublicKey, signer)
+	if !supported {
 		return nil, nil, nil, fmt.Errorf("leaf certificate public key type %T cannot be verified against the private key", leaf.PublicKey)
 	}
-	if !matcher.Equal(signer.Public()) {
+	if !matched {
 		return nil, nil, nil, leafKeyMismatchError(chain, signer)
 	}
 	return leaf, caCerts, privKey, nil
@@ -66,12 +66,24 @@ func parseAndMatch(certPEM, keyPEM []byte) (leaf *x509.Certificate, caCerts []*x
 func leafKeyMismatchError(chain []*x509.Certificate, signer crypto.Signer) error {
 	const base = "leaf certificate public key does not match the private key"
 	for i, c := range chain[1:] {
-		matcher, ok := c.PublicKey.(interface{ Equal(crypto.PublicKey) bool })
-		if ok && matcher.Equal(signer.Public()) {
+		if matched, _ := publicKeyMatches(c.PublicKey, signer); matched {
 			return fmt.Errorf(
 				"%s; certificate %d of %d (subject %q) does match, so the chain is ordered leaf-last: concatenate it leaf-first",
 				base, i+2, len(chain), c.Subject.String())
 		}
 	}
 	return errors.New(base)
+}
+
+// publicKeyMatches reports whether pub is the public half of signer's private
+// key. supported is false when pub's type does not provide the
+// Equal(crypto.PublicKey) bool method every crypto/x509 public key type
+// implements, in which case matched carries no meaning and the caller must
+// report the key type as unverifiable rather than as a mismatch.
+func publicKeyMatches(pub crypto.PublicKey, signer crypto.Signer) (matched, supported bool) {
+	matcher, ok := pub.(interface{ Equal(crypto.PublicKey) bool })
+	if !ok {
+		return false, false
+	}
+	return matcher.Equal(signer.Public()), true
 }

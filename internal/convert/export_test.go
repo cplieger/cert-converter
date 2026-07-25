@@ -11,4 +11,5 @@ package convert
 var (
 	ParseCertChain  = parseCertChain
 	ParsePrivateKey = parsePrivateKey
+	EncoderFor      = encoderFor
 )

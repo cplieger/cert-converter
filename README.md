@@ -39,14 +39,14 @@ services:
     image: ghcr.io/cplieger/cert-converter:latest
     container_name: cert-converter
     restart: unless-stopped
-    user: "1000:1000"  # match your host user
+    user: "1000:1000"  # match your host user; it must own the /output host dir
 
     environment:
       PFX_PASSWORD: "${PFX_PASSWORD:-}"  # set this or configure PFX_PASSWORD_FILE; empty is rejected
       PFX_ENCODER: "modern2023"  # modern2023, modern2026, legacy, or legacyrc2
 
     volumes:
-      - "/path/to/pem/certificates:/input:ro"
+      - "/path/to/pem/certificates:/input:ro"  # must be readable by the UID above; see README "Healthcheck"
       - "/path/to/pfx/output:/output"
 ```
 
@@ -57,7 +57,7 @@ services:
 | Variable | Description | Default | Required |
 | --- | --- | --- | --- |
 | `PFX_PASSWORD` | Password embedded in generated PFX files. The container refuses to start when this is empty unless `PFX_ALLOW_EMPTY_PASSWORD=true` is set. | - | Yes |
-| `PFX_PASSWORD_FILE` | Path to a file holding the PFX password (Docker/Podman secret). When set it takes precedence over `PFX_PASSWORD`, keeping the secret out of the container environment and out of `docker inspect`. The file is read once, bounded at 1 MB, and trimmed of surrounding whitespace; an unreadable or empty file is a startup failure. | - | No |
+| `PFX_PASSWORD_FILE` | Path to a file holding the PFX password (Docker/Podman secret). When set it takes precedence over `PFX_PASSWORD`, keeping the secret out of the container environment and out of `docker inspect`. The file is read once, bounded at 1 MB, and trimmed of surrounding whitespace. The path must already be in cleaned form and contain no `..` component, so `/run/secrets/../secrets/pfx` is refused even when it is readable, as are a redundant `//`, a `./` prefix, and a trailing `/`; an unreadable, oversized, empty, whitespace-only, or rejected-path file is a startup failure, and `PFX_ALLOW_EMPTY_PASSWORD=true` does not rescue it — a configured but unusable file never falls back to `PFX_PASSWORD`. | - | No |
 | `PFX_ALLOW_EMPTY_PASSWORD` | Set to `true` to let the container start with an empty `PFX_PASSWORD`. Generated PFX files then protect the embedded private key with an empty password (effectively no protection); not recommended. | `false` | No |
 | `FALLBACK_SCAN_HOURS` | Hours between full directory re-scans, the fallback for fsnotify events missed on network mounts and similar edge cases. Only an explicit `0` or `false` disables it, leaving a missed event unrecovered until the next change. An empty, whitespace, or invalid value uses the 6h default, so a blank never silently disables the safety net; a value above `87600` (10 years) is clamped to that ceiling and logs a WARN. | `6` | No |
 | `PFX_ENCODER` | PFX encoding profile: modern2023 (AES-256-CBC + SHA-256, default), modern2026 (AES-256-CBC + PBMAC1, requires OpenSSL 3.4.0+), legacy (3DES + SHA-1 for older devices), or legacyrc2 (RC2-40 + SHA-1, only for very old devices). `modern` is an alias for `modern2023`, and `legacy` is recorded as `legacydes` in startup logs. See the [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables). | `modern2023` | No |
@@ -143,6 +143,12 @@ groups:
 Thresholds and the `severity` label are starting points; adjust the stall
 window to your `FALLBACK_SCAN_HOURS` and the `container` selector to your
 deployment, and route by whatever labels your Alertmanager uses.
+`CertConverterScanStalled` assumes the fallback rescan is enabled: with
+`FALLBACK_SCAN_HOURS` set to `0`/`false` there is no guaranteed `scan
+complete` cadence at all (a scan then runs only on a filesystem event, and
+certificates renew every few weeks), so that rule fires permanently instead
+of reporting a wedged loop — drop it, exactly as the `health` probe drops its
+staleness deadline in that configuration.
 
 ## Healthcheck
 

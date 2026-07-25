@@ -102,6 +102,20 @@ func FuzzParsePrivateKey(f *testing.F) {
 	f.Add(ecPEM)
 
 	f.Add([]byte("garbage"))
+	// The diagnosis branches the parser grew, kept reachable from the committed
+	// corpus: a PKCS#8 encrypted container, a traditional OpenSSL key carrying
+	// encryption headers, a malformed block labelled with its own format, and a
+	// malformed block followed by a usable key (the later-block recovery path).
+	// The weekly fuzz corpus is discarded after every run, so these seeds are the
+	// durable reach into those branches.
+	f.Add(pem.EncodeToMemory(&pem.Block{Type: "ENCRYPTED PRIVATE KEY", Bytes: []byte("opaque-ciphertext")}))
+	f.Add(pem.EncodeToMemory(&pem.Block{
+		Type:    "RSA PRIVATE KEY",
+		Headers: map[string]string{"Proc-Type": "4,ENCRYPTED", "DEK-Info": "AES-128-CBC,0123456789ABCDEF0123456789ABCDEF"},
+		Bytes:   []byte("opaque encrypted key material"),
+	}))
+	f.Add(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: []byte("this is not valid DER")}))
+	f.Add(append(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("this is not valid DER")}), ecPEM...))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		key, err := convert.ParsePrivateKey(data)
@@ -136,6 +150,34 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 	keyBytes, _ := x509.MarshalPKCS8PrivateKey(key)
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes})
 	f.Add(append(certPEM, keyPEM...))
+
+	// A CA-signed leaf beside its own key: the only seed that reaches the
+	// CA-count invariant below, which a self-signed seed leaves at 0 == 0.
+	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: "roundtrip CA"},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	caDER, _ := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	caCert, _ := x509.ParseCertificate(caDER)
+	leafKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject:      pkix.Name{CommonName: "roundtrip leaf"},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	leafDER, _ := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, &leafKey.PublicKey, caKey)
+	leafKeyDER, _ := x509.MarshalPKCS8PrivateKey(leafKey)
+	chainSeed := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
+	chainSeed = append(chainSeed, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})...)
+	chainSeed = append(chainSeed, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: leafKeyDER})...)
+	f.Add(chainSeed)
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		certs, certErr := convert.ParseCertChain(data)

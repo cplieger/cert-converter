@@ -1,12 +1,10 @@
-package convert_test
+package process
 
 import (
 	"testing"
-
-	"github.com/cplieger/cert-converter/internal/convert"
 )
 
-func BenchmarkFingerprint(b *testing.B) {
+func BenchmarkPairFingerprint(b *testing.B) {
 	cert := make([]byte, 4096)
 	key := make([]byte, 4096)
 	for i := range cert {
@@ -17,6 +15,6 @@ func BenchmarkFingerprint(b *testing.B) {
 	b.SetBytes(int64(len(cert) + len(key)))
 	b.ReportAllocs()
 	for b.Loop() {
-		_ = convert.Fingerprint(cert, key)
+		_ = pairFingerprint(cert, key)
 	}
 }

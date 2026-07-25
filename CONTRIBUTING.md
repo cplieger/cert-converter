@@ -26,20 +26,22 @@ scan, then hand off to the watcher. The real work lives under
   `FALLBACK_SCAN_HOURS`, and `LOG_LEVEL` (via `config.LogLevel`, exported
   separately from `Load` so `main` can install the logger before the
   config load emits its own WARN lines) from the environment, then
-  delegates encoder selection to `convert.EncoderName`.
+  delegates encoder selection to `convert.EncoderName` (an unknown
+  `PFX_ENCODER` value warns here and falls back to `modern2023`).
 - `internal/convert`: PEM parsing (package-internal; reached through
   `PairInRoot`, which is the package's only production conversion edge —
   the parsers are exposed to the package's own tests via
   `export_test.go`), cert/key matching and confined PFX encoding
   (`PairInRoot`, the only PFX-writing entry point; its encoder helper is
   package-internal), the encoder-profile mapping (`EncoderName` /
-  `EncoderFor` / `PickEncoder` in `encoder.go`; unknown values warn and
-  fall back to `modern2023`), and the SHA-256 `HashCache` for
-  skip-unchanged detection (a read-only `Matches` query plus a `Record`
-  commit applied only after a successful conversion).
+  `PickEncoder` in `encoder.go`; `EncoderName` normalizes the value and
+  reports whether it was recognized).
 - `internal/process`: orchestration, plus `types.go` holding the
   package-private `conversionStatus` outcome enum (`ScanResult` is the
-  package's only exported outcome surface). `Scanner.Run` walks `/input`,
+  package's only exported outcome surface), and the package-private
+  SHA-256 fingerprint cache for skip-unchanged detection (`cache.go`: a
+  read-only `matches` query plus a `record` commit applied only after a
+  successful conversion). `Scanner.Run` walks `/input`,
   pairs each `*.crt` with its sibling `*.key`, consults the cache, and
   writes PFX files to `/output`, returning a `ScanResult` count summary.
 - `internal/watch`: fsnotify watch loop with a debounce window and a
@@ -66,8 +68,8 @@ health marker (any failure clears it; a clean cycle sets it).
   `*os.Root` and reads it under the 10 MB cap (`MaxFileSize`), so a symlink
   planted in the watched tree cannot redirect the read outside it. The hash
   cache does no file I/O of its own: the scanner reads each input once and
-  passes the bytes to `convert.Fingerprint`. PFX writes are atomic (temp +
-  rename) via `cplieger/atomicfile`. Keep new file I/O on these helpers.
+  passes the bytes to `process`'s own `pairFingerprint`. PFX writes are atomic
+  (temp + rename) via `cplieger/atomicfile`. Keep new file I/O on these helpers.
 - **The watcher loop and poll fallback are not unit-tested.** They are
   event-driven I/O paths validated by the Docker healthcheck in
   production. Logic worth testing belongs in `config`, `convert`, or

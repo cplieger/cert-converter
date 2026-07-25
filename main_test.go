@@ -22,17 +22,16 @@ import (
 
 // --- Test helpers ---
 
-// newTestScanner creates a fresh cache and a scanner over the given roots for
-// test isolation. The scan configuration is process-lifetime, so it is injected
-// at construction.
-func newTestScanner(certsRoot, outRoot, password string, enc convert.EncoderType) (*process.Scanner, *convert.HashCache) {
-	c := convert.NewHashCache()
-	return process.New(c, process.Options{
+// newTestScanner creates a scanner (with its own fresh fingerprint cache) over
+// the given roots for test isolation. The scan configuration is
+// process-lifetime, so it is injected at construction.
+func newTestScanner(certsRoot, outRoot, password string, enc convert.EncoderType) *process.Scanner {
+	return process.New(process.Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
 		Password:  password,
 		Encoder:   enc,
-	}), c
+	})
 }
 
 // convertPairToPath converts an already-read cert+key pair to a PFX at destPath
@@ -181,7 +180,7 @@ func TestProcessAll(t *testing.T) {
 		certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
 		tmpDir := t.TempDir()
 		outDir := t.TempDir()
-		scanner, _ := newTestScanner(tmpDir, outDir, "", enc)
+		scanner := newTestScanner(tmpDir, outDir, "", enc)
 		writeCertAndKey(t, tmpDir, "test", certPEM, keyPEM)
 
 		if _, err := scanner.Run(context.Background()); err != nil {
@@ -204,7 +203,7 @@ func TestProcessAll(t *testing.T) {
 		certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
 		tmpDir := t.TempDir()
 		outDir := t.TempDir()
-		scanner, _ := newTestScanner(tmpDir, outDir, "", enc)
+		scanner := newTestScanner(tmpDir, outDir, "", enc)
 
 		nestedDir := filepath.Join(tmpDir, "sub", "dir")
 		if err := os.MkdirAll(nestedDir, 0o755); err != nil {
@@ -227,7 +226,7 @@ func TestProcessAll(t *testing.T) {
 		certPEM, _ := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
 		tmpDir := t.TempDir()
 		outDir := t.TempDir()
-		scanner, _ := newTestScanner(tmpDir, outDir, "", enc)
+		scanner := newTestScanner(tmpDir, outDir, "", enc)
 
 		if err := os.WriteFile(filepath.Join(tmpDir, "orphan.crt"), certPEM, 0o644); err != nil {
 			t.Fatal(err)
@@ -246,7 +245,7 @@ func TestProcessAll(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
 		outDir := t.TempDir()
-		scanner, _ := newTestScanner(tmpDir, outDir, "", enc)
+		scanner := newTestScanner(tmpDir, outDir, "", enc)
 
 		// Write a valid cert but an invalid key to trigger conversion failure.
 		certPEM, _ := testcerts.GenerateSelfSignedCert(t, "retry", "ecdsa")
@@ -395,7 +394,7 @@ func TestScanAndSetHealth_sets_marker_after_failure_free_scan(t *testing.T) {
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "health-test", "ecdsa")
 	inDir := t.TempDir()
 	outDir := t.TempDir()
-	scanner, _ := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
+	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 	writeCertAndKey(t, inDir, "test", certPEM, keyPEM)
 
 	scanAndSetHealth(t.Context(), scanner, marker)
@@ -416,7 +415,7 @@ func TestScanAndSetHealth_clears_marker_when_scan_errors(t *testing.T) {
 	// Start healthy so the assertion proves the scan error cleared it.
 	marker.Set(true)
 	missing := filepath.Join(t.TempDir(), "does-not-exist")
-	scanner, _ := newTestScanner(missing, t.TempDir(), "", convert.EncNameModern2023)
+	scanner := newTestScanner(missing, t.TempDir(), "", convert.EncNameModern2023)
 
 	scanAndSetHealth(t.Context(), scanner, marker)
 
@@ -432,7 +431,7 @@ func TestScanAndSetHealth_unreadable_subdir_stays_healthy(t *testing.T) {
 	marker, markerPath := newTestMarker(t)
 	marker.Set(false) // start unhealthy; a failure-free scan must restore health
 	inDir, outDir := t.TempDir(), t.TempDir()
-	scanner, _ := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
+	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "good", "ecdsa")
 	writeCertAndKey(t, inDir, "good", certPEM, keyPEM)
 	bad := filepath.Join(inDir, "blocked")
@@ -446,7 +445,7 @@ func TestScanAndSetHealth_unreadable_subdir_stays_healthy(t *testing.T) {
 	// Establish the precondition (the blocked subdir really is unreadable) with a
 	// throwaway scanner, then drive the production wiring itself so the WARN branch
 	// and the marker decision in scanAndSetHealth are the code under test.
-	precheck, _ := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
+	precheck := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 	result, err := precheck.Run(context.Background())
 	if err != nil {
 		t.Fatalf("scan should not error on an unreadable subdir: %v", err)
@@ -489,7 +488,7 @@ func TestScanAndSetHealth_cancelled_context_leaves_marker_untouched(t *testing.T
 			inDir, outDir := t.TempDir(), t.TempDir()
 			certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "cancelled", "ecdsa")
 			writeCertAndKey(t, inDir, "cancelled", certPEM, keyPEM)
-			scanner, _ := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
+			scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
@@ -541,7 +540,7 @@ func TestProcessAll_empty_directory(t *testing.T) {
 
 	inDir := t.TempDir()
 	outDir := t.TempDir()
-	scanner, _ := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
+	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 
 	if _, err := scanner.Run(context.Background()); err != nil {
 		t.Fatalf("scanner.Run(empty dir) = %v, want nil", err)
@@ -562,7 +561,7 @@ func TestProcessAll_ignores_non_crt_files(t *testing.T) {
 
 	inDir := t.TempDir()
 	outDir := t.TempDir()
-	scanner, _ := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
+	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 
 	// Write files that aren't .crt — should be ignored.
 	for _, name := range []string{"readme.txt", "config.json", "cert.pem", "key.pem"} {
@@ -589,7 +588,7 @@ func TestProcessAll_prunes_hashes_for_deleted_certs(t *testing.T) {
 
 	inDir := t.TempDir()
 	outDir := t.TempDir()
-	scanner, _ := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
+	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "prune", "ecdsa")
 	crtPath, keyPath := writeCertAndKey(t, inDir, "prune", certPEM, keyPEM)
@@ -649,7 +648,7 @@ func TestProcessAll_multiple_cert_pairs(t *testing.T) {
 
 	inDir := t.TempDir()
 	outDir := t.TempDir()
-	scanner, _ := newTestScanner(inDir, outDir, "pass", convert.EncNameModern2023)
+	scanner := newTestScanner(inDir, outDir, "pass", convert.EncNameModern2023)
 
 	// Create 3 cert/key pairs.
 	for _, name := range []string{"alpha", "beta", "gamma"} {
@@ -693,7 +692,7 @@ func TestProcessAll_returns_error_when_root_missing(t *testing.T) {
 	t.Parallel()
 
 	outDir := t.TempDir()
-	scanner, _ := newTestScanner("/nonexistent/input/dir", outDir, "", convert.EncNameModern2023)
+	scanner := newTestScanner("/nonexistent/input/dir", outDir, "", convert.EncNameModern2023)
 	_, err := scanner.Run(context.Background())
 	if err == nil {
 		t.Fatal("scanner.Run should return error for nonexistent root dir")
@@ -709,7 +708,7 @@ func TestProcessAll_skips_unreadable_subdirectory(t *testing.T) {
 	}
 	inDir := t.TempDir()
 	outDir := t.TempDir()
-	scanner, _ := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
+	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "good", "ecdsa")
 	writeCertAndKey(t, inDir, "good", certPEM, keyPEM)
@@ -737,7 +736,7 @@ func TestProcessAll_invalidates_hash_when_mkdir_fails(t *testing.T) {
 
 	inDir := t.TempDir()
 	outDir := t.TempDir()
-	scanner, _ := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
+	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 
 	nested := filepath.Join(inDir, "conflict")
 	if err := os.MkdirAll(nested, 0o755); err != nil {

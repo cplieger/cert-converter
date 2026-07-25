@@ -25,7 +25,7 @@ const defaultFallbackInterval = 6 * time.Hour
 // Config holds the runtime configuration for cert-converter. The PFX encoder is
 // carried as the app-owned convert.EncoderType name, not as a go-pkcs12 value:
 // the vendor type stays confined to internal/convert, which resolves the name
-// with EncoderFor inside PairInRoot; main and process only carry the name.
+// with encoderFor inside PairInRoot; main and process only carry the name.
 type Config struct {
 	Password         string
 	EncoderName      convert.EncoderType
@@ -39,13 +39,44 @@ var ErrEmptyPassword = errors.New(
 	"PFX_PASSWORD is empty; set it, point PFX_PASSWORD_FILE at a secret file, " +
 		"or set PFX_ALLOW_EMPTY_PASSWORD=true")
 
+// PasswordStatus is a non-secret classification of how well PFX_PASSWORD
+// protects the private key inside every generated PFX file.
+type PasswordStatus string
+
+// The PFX password classifications reported by ClassifyPassword.
+const (
+	// PasswordEmpty means no password at all was supplied.
+	PasswordEmpty PasswordStatus = "empty"
+	// PasswordWhitespaceOnly means the password consists only of whitespace,
+	// which is effectively no protection.
+	PasswordWhitespaceOnly PasswordStatus = "whitespace-only"
+	// PasswordConfigured means a real password was supplied.
+	PasswordConfigured PasswordStatus = "configured"
+)
+
+// ClassifyPassword classifies a PFX password. It is the single home for the
+// blank-password predicate: Load's empty-password guard and the caller's
+// startup log both derive their decision from it, so the two cannot drift.
+func ClassifyPassword(password string) PasswordStatus {
+	switch {
+	case password == "":
+		return PasswordEmpty
+	case strings.TrimSpace(password) == "":
+		return PasswordWhitespaceOnly
+	default:
+		return PasswordConfigured
+	}
+}
+
 // Load reads environment variables and returns a populated Config. The PFX
 // password follows the Docker-secrets convention: when PFX_PASSWORD_FILE is
 // set the secret is read from that file (bounded, whitespace-trimmed) so it
 // never appears in the process environment; otherwise PFX_PASSWORD is used. It
 // returns ErrEmptyPassword when neither supplies a value unless
 // PFX_ALLOW_EMPTY_PASSWORD is set to true, and it fails loudly when a
-// configured PFX_PASSWORD_FILE cannot be read.
+// configured PFX_PASSWORD_FILE cannot be used — including a path envx
+// rejects (it must already be cleaned and carry no ".." component), an
+// oversized file, and a file whose trimmed content is empty.
 func Load() (Config, error) {
 	password, secretErr := envx.Secret("PFX_PASSWORD")
 	if secretErr != nil {
@@ -58,18 +89,26 @@ func Load() (Config, error) {
 		password = "" // fall through to the empty-password guard below
 	}
 	allowEmpty := allowEmptyPassword(os.Getenv("PFX_ALLOW_EMPTY_PASSWORD"))
-	if password == "" && !allowEmpty {
+	if ClassifyPassword(password) == PasswordEmpty && !allowEmpty {
 		return Config{}, ErrEmptyPassword
 	}
 	if os.Getenv("PFX_PASSWORD_FILE") != "" {
-		// Record the secret's SOURCE (never its value, and never the configured
-		// path — that would export the internal secret-mount topology to every
-		// log reader) so an operator can confirm a mounted secret was actually
-		// consumed instead of silently falling back to PFX_PASSWORD.
+		// Record the secret's SOURCE (never its value) so an operator can confirm
+		// a mounted secret was actually consumed instead of silently falling back
+		// to PFX_PASSWORD. The configured path is deliberately omitted from this
+		// steady-state line, which every log aggregator retains: it would publish
+		// the secret-mount topology on every healthy startup for no diagnostic
+		// gain. A startup FAILURE is the deliberate exception — the envx error
+		// returned above names the path, and main logs it, because an unusable
+		// secret file cannot be diagnosed without it.
 		slog.Info("PFX password configured", "source", "PFX_PASSWORD_FILE")
 	}
 
-	encName := convert.EncoderName(os.Getenv("PFX_ENCODER"))
+	rawEncoder := os.Getenv("PFX_ENCODER")
+	encName, known := convert.EncoderName(rawEncoder)
+	if !known {
+		slog.Warn("unknown PFX_ENCODER, using modern2023", "value", rawEncoder)
+	}
 
 	return Config{
 		Password:         password,

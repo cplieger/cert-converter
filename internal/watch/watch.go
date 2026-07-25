@@ -52,8 +52,12 @@ func New(root string, onChange func(ctx context.Context), opts ...Option) *Watch
 	return w
 }
 
-// Run starts watching. It tries fsnotify first; if unavailable it falls
-// back to polling. Blocks until ctx is cancelled.
+// Run starts watching. It tries fsnotify first; if unavailable it falls back to
+// polling with periodic upgrade attempts. It normally blocks until ctx is
+// cancelled, but it ALSO returns early when the fsnotify watcher dies (its
+// Events or Errors channel closes): change detection is then gone for good, so
+// the caller must treat a return with a live ctx as fatal and exit non-zero for
+// a restart, as main.go does.
 func (w *Watcher) Run(ctx context.Context) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -81,6 +85,17 @@ func (w *Watcher) Run(ctx context.Context) {
 // exhausted — is warned about and skipped, exactly as an unreadable sub-path
 // is, so one mis-permissioned certificate directory cannot cost the whole tree
 // its real-time watch.
+//
+// Paths here are AMBIENT (filepath.WalkDir plus watcher.Add), unlike every
+// /input and /output touch in internal/process, which runs through an *os.Root.
+// The divergence is deliberate and bounded: inotify registration takes a path,
+// not a directory handle, so there is no root-confined equivalent of
+// watcher.Add, and nothing in this package reads file CONTENT — filepath.WalkDir
+// stats with Lstat and never descends a symlinked directory, and handleFsEvent's
+// os.Lstat does not follow one either, so no watch is ever registered outside
+// the real tree. Any future read of a watched file must go through
+// internal/process's confined root (convert.ReadBoundedFromRoot); never build an
+// ambient path here and read it.
 func (w *Watcher) addWatchDirs(watcher *fsnotify.Watcher, root string) error {
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -181,7 +196,7 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) {
 			st.runDebouncedScan(ctx)
 
 		case <-st.fallbackChan():
-			st.runFallbackScan(ctx)
+			w.handleFallbackTick(ctx, watcher, st)
 
 		case err, ok := <-watcher.Errors:
 			if !w.handleErrorRecv(watcher, st, err, ok) {
@@ -226,6 +241,22 @@ func (w *Watcher) handleErrorRecv(watcher *fsnotify.Watcher, st *watchState, err
 		}
 	}
 	return true
+}
+
+// handleFallbackTick runs the periodic safety-net rescan, re-asserting the
+// watch set first. addWatchDirs is idempotent for a directory already watched,
+// so this only restores what was lost: a directory whose watcher.Add failed
+// while it was unreadable (or while fs.inotify.max_user_watches was exhausted)
+// and whose condition has since been repaired, or one whose Create event never
+// arrived. Without it such a directory stays outside the watch set for the life
+// of the process and its renewals are detected only on the fallback cadence.
+// Re-attaching before the scan also means a change landing during the scan is
+// still reported as an event.
+func (w *Watcher) handleFallbackTick(ctx context.Context, watcher *fsnotify.Watcher, st *watchState) {
+	if addErr := w.addWatchDirs(watcher, w.root); addErr != nil {
+		slog.Warn("failed to re-sync the watch set during the periodic fallback scan", "error", addErr)
+	}
+	st.runFallbackScan(ctx)
 }
 
 // watchState carries the mutable accounting for one watchLoop run: the pending

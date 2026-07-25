@@ -16,7 +16,7 @@ import (
 // shared test password and the default modern encoder. The scan configuration
 // is process-lifetime, so it is injected at construction.
 func newScanner(certsRoot, outRoot string) *process.Scanner {
-	return process.New(convert.NewHashCache(), process.Options{
+	return process.New(process.Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
 		Password:  "pw",

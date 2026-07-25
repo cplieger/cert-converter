@@ -497,40 +497,6 @@ func TestReadBoundedFromRoot(t *testing.T) {
 
 // --- Tests: convert.PairInRoot ---
 
-// TestPairInRoot_writes_decodable_pfx exercises the success path end-to-end: a
-// valid key/cert pair must encode without error and land a PKCS#12 file that
-// decodes back to the same leaf. This pins both error checks in the confined
-// write path (encode + write): negating either to `err == nil` turns the success
-// path into a returned error, which this assertion catches.
-func TestPairInRoot_writes_decodable_pfx(t *testing.T) {
-	t.Parallel()
-
-	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "topfx-test", "ecdsa")
-	dir := t.TempDir()
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
-	destPath := filepath.Join(dir, "out.pfx")
-
-	err = convert.PairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
-	if err != nil {
-		t.Fatalf("convert.PairInRoot(valid key/cert) = error %v, want nil", err)
-	}
-	pfxData, readErr := os.ReadFile(destPath)
-	if readErr != nil {
-		t.Fatalf("convert.PairInRoot did not write a readable file: %v", readErr)
-	}
-	_, leaf, _, decErr := pkcs12.DecodeChain(pfxData, "pw")
-	if decErr != nil {
-		t.Fatalf("decode pfx written by convert.PairInRoot: %v", decErr)
-	}
-	if leaf.Subject.CommonName != "topfx-test" {
-		t.Errorf("convert.PairInRoot wrote leaf CN = %q, want %q", leaf.Subject.CommonName, "topfx-test")
-	}
-}
-
 func TestParsePrivateKey_encrypted_block_returns_distinct_error(t *testing.T) {
 	t.Parallel()
 	encPEM := pem.EncodeToMemory(&pem.Block{
@@ -762,4 +728,212 @@ func TestPairInRoot_confines_the_write_to_the_output_root(t *testing.T) {
 			t.Error("convert.PairInRoot(symlinked subdirectory) = nil error, want a confinement error")
 		}
 	})
+}
+
+// TestPairInRoot_names_the_matching_certificate_for_a_leaf_last_chain pins the
+// leaf-last chain diagnosis: when a LATER certificate in the chain matches the
+// private key, the mismatch error keeps the base sentence as its prefix (existing
+// log matching depends on it) and additionally names the position and subject of
+// the certificate that does match. An unrelated key, where no certificate in the
+// chain matches, must get the base sentence alone and no leaf-last claim.
+func TestPairInRoot_names_the_matching_certificate_for_a_leaf_last_chain(t *testing.T) {
+	t.Parallel()
+	leafPEM, keyPEM, caPEM, _ := testcerts.GenerateCertChain(t)
+	_, otherKeyPEM := testcerts.GenerateSelfSignedCert(t, "unrelated.example.com", "ecdsa")
+
+	leafLast := append(append([]byte{}, caPEM...), leafPEM...)
+
+	for _, tc := range []struct {
+		name       string
+		certPEM    []byte
+		keyPEM     []byte
+		wantInErr  []string
+		notInError string
+	}{
+		{
+			name:      "leaf-last chain names the certificate that does match",
+			certPEM:   leafLast,
+			keyPEM:    keyPEM,
+			wantInErr: []string{"does not match the private key", "certificate 2 of 2", "leaf.example.com", "ordered leaf-last"},
+		},
+		{
+			name:       "an unrelated key gets the plain mismatch error",
+			certPEM:    leafLast,
+			keyPEM:     otherKeyPEM,
+			wantInErr:  []string{"does not match the private key"},
+			notInError: "leaf-last",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatalf("setup: os.OpenRoot: %v", err)
+			}
+			defer root.Close()
+
+			err = convert.PairInRoot(t.Context(), tc.certPEM, tc.keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023)
+			if err == nil {
+				t.Fatal("convert.PairInRoot(mismatched leaf) = nil error, want a mismatch error")
+			}
+			for _, want := range tc.wantInErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("convert.PairInRoot error = %q, want it to contain %q", err.Error(), want)
+				}
+			}
+			if tc.notInError != "" && strings.Contains(err.Error(), tc.notInError) {
+				t.Errorf("convert.PairInRoot error = %q, want it NOT to contain %q", err.Error(), tc.notInError)
+			}
+			if _, statErr := os.Stat(filepath.Join(dir, "out.pfx")); statErr == nil {
+				t.Error("convert.PairInRoot wrote a pfx for a mismatched pair; want no file written")
+			}
+		})
+	}
+}
+
+// TestParseCertChain_counts_declarations_the_way_pem_recognises_them pins the
+// line-normalisation half of the declared-block guard: a marker declares a block
+// only when it occupies a complete line the way encoding/pem's getLine reads one,
+// so CRLF armour and a marker line padded with trailing spaces or tabs must parse
+// as a valid single-certificate chain, while a doubled carriage return, a
+// carriage return followed by a space, and an indented marker must not be counted
+// as declarations. The one deliberate divergence from getLine is also pinned: an
+// unterminated final marker line still counts, so a truncated chain is reported
+// rather than silently ignored.
+func TestParseCertChain_counts_declarations_the_way_pem_recognises_them(t *testing.T) {
+	t.Parallel()
+	certPEM, _ := testcerts.GenerateSelfSignedCert(t, "line-endings", "ecdsa")
+	crlfPEM := bytes.ReplaceAll(certPEM, []byte("\n"), []byte("\r\n"))
+	spacedPEM := bytes.Replace(certPEM,
+		[]byte("-----BEGIN CERTIFICATE-----\n"),
+		[]byte("-----BEGIN CERTIFICATE----- \t \n"), 1)
+
+	accepted := map[string][]byte{
+		"CRLF armour counts as one declaration":            crlfPEM,
+		"trailing spaces and tabs are stripped":            spacedPEM,
+		"a doubled carriage return is no declaration":      append(append([]byte{}, certPEM...), []byte("-----BEGIN CERTIFICATE-----\r\r\n")...),
+		"a carriage return then a space is no declaration": append(append([]byte{}, certPEM...), []byte("-----BEGIN CERTIFICATE-----\r \n")...),
+		"an indented marker is no declaration":             append(append([]byte{}, certPEM...), []byte("  -----BEGIN CERTIFICATE-----\n")...),
+	}
+	for name, in := range accepted {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			certs, err := convert.ParseCertChain(in)
+			if err != nil {
+				t.Fatalf("convert.ParseCertChain(%s) = error %v, want nil", name, err)
+			}
+			if len(certs) != 1 {
+				t.Fatalf("convert.ParseCertChain(%s) returned %d certs, want 1", name, len(certs))
+			}
+			if certs[0].Subject.CommonName != "line-endings" {
+				t.Errorf("convert.ParseCertChain(%s) CN = %q, want %q", name, certs[0].Subject.CommonName, "line-endings")
+			}
+		})
+	}
+
+	rejected := map[string][]byte{
+		"unterminated final marker":                 append(append([]byte{}, certPEM...), []byte("-----BEGIN CERTIFICATE-----")...),
+		"unterminated final marker with a CR":       append(append([]byte{}, certPEM...), []byte("-----BEGIN CERTIFICATE-----\r")...),
+		"unterminated CRLF marker after CRLF chain": append(append([]byte{}, crlfPEM...), []byte("-----BEGIN CERTIFICATE-----\r\n")...),
+	}
+	for name, in := range rejected {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			certs, err := convert.ParseCertChain(in)
+			if err == nil {
+				t.Fatalf("convert.ParseCertChain(%s) = %d certs, nil error; want a malformed-chain error", name, len(certs))
+			}
+			if !strings.Contains(err.Error(), "decoded 1 of 2 declared") {
+				t.Errorf("convert.ParseCertChain(%s) error = %q, want it to report %q", name, err.Error(), "decoded 1 of 2 declared")
+			}
+		})
+	}
+}
+
+// TestParsePrivateKey_recovers_from_an_unusable_first_key_block pins the
+// documented multi-block contract: block selection and DER validation share one
+// loop, so a key file whose first key-labelled block is unusable (malformed DER,
+// an unsupported PKCS#8 key type, or encryption headers) must still yield the
+// usable key from a later block, and the first parse failure must be reported
+// only when no block decodes.
+func TestParsePrivateKey_recovers_from_an_unusable_first_key_block(t *testing.T) {
+	t.Parallel()
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ecDER, err := x509.MarshalECPrivateKey(ecKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usable := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: ecDER})
+	malformed := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("this is not valid DER")})
+	encrypted := pem.EncodeToMemory(&pem.Block{Type: "ENCRYPTED PRIVATE KEY", Bytes: []byte("opaque-ciphertext")})
+
+	for _, tc := range []struct {
+		name string
+		in   []byte
+	}{
+		{"malformed block before a usable key", append(append([]byte{}, malformed...), usable...)},
+		{"encrypted block before a usable key", append(append([]byte{}, encrypted...), usable...)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			key, keyErr := convert.ParsePrivateKey(tc.in)
+			if keyErr != nil {
+				t.Fatalf("convert.ParsePrivateKey(%s) = error %v, want the usable later key", tc.name, keyErr)
+			}
+			parsed, ok := key.(*ecdsa.PrivateKey)
+			if !ok {
+				t.Fatalf("convert.ParsePrivateKey(%s) returned %T, want *ecdsa.PrivateKey", tc.name, key)
+			}
+			if !parsed.Equal(ecKey) {
+				t.Errorf("convert.ParsePrivateKey(%s) returned a different key than the usable block held", tc.name)
+			}
+		})
+	}
+}
+
+// TestParsePrivateKey_reports_the_most_specific_reason pins the documented
+// precedence of the no-usable-key diagnosis: a DER parse failure outranks "every
+// key block was encrypted", which outranks "there were PEM blocks, none a key".
+func TestParsePrivateKey_reports_the_most_specific_reason(t *testing.T) {
+	t.Parallel()
+	certPEM, _ := testcerts.GenerateSelfSignedCert(t, "precedence", "ecdsa")
+	malformed := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("this is not valid DER")})
+	encrypted := pem.EncodeToMemory(&pem.Block{Type: "ENCRYPTED PRIVATE KEY", Bytes: []byte("opaque-ciphertext")})
+
+	for _, tc := range []struct {
+		name    string
+		in      []byte
+		wantErr string
+	}{
+		{
+			name:    "a parse failure outranks an encrypted block",
+			in:      append(append([]byte{}, malformed...), encrypted...),
+			wantErr: "failed to parse private key",
+		},
+		{
+			name:    "an encrypted block outranks a skipped certificate",
+			in:      append(append([]byte{}, certPEM...), encrypted...),
+			wantErr: "encrypted",
+		},
+		{
+			name:    "a skipped certificate is named when nothing else applies",
+			in:      certPEM,
+			wantErr: "skipped 1 PEM block(s)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := convert.ParsePrivateKey(tc.in)
+			if err == nil {
+				t.Fatalf("convert.ParsePrivateKey(%s) = nil error, want %q", tc.name, tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("convert.ParsePrivateKey(%s) error = %q, want it to contain %q", tc.name, err.Error(), tc.wantErr)
+			}
+		})
+	}
 }

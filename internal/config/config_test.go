@@ -159,6 +159,9 @@ func isolatePasswordFile(t *testing.T) {
 func TestLoad_unset_fallback_uses_six_hour_default(t *testing.T) {
 	isolatePasswordFile(t)
 	t.Setenv("PFX_PASSWORD", "s3cret")
+	// t.Setenv first so its registered Cleanup restores whatever the host had,
+	// then Unsetenv to reach the genuinely-unset case: t.Setenv cannot express
+	// "absent", and a bare os.Unsetenv would leak into every later test.
 	t.Setenv("FALLBACK_SCAN_HOURS", "placeholder")
 	os.Unsetenv("FALLBACK_SCAN_HOURS")
 	cfg, err := Load()
@@ -329,5 +332,90 @@ func TestLoad_empty_password_optout_requires_literal_true(t *testing.T) {
 				t.Errorf("Load() with PFX_ALLOW_EMPTY_PASSWORD=%q got err %v, want ErrEmptyPassword (only literal true opts out)", tc.optout, err)
 			}
 		})
+	}
+}
+
+func TestLogLevel(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		raw    string
+		want   slog.Level
+		wantOK bool
+	}{
+		{"unset uses info default", "", slog.LevelInfo, true},
+		{"debug", "debug", slog.LevelDebug, true},
+		{"uppercase INFO", "INFO", slog.LevelInfo, true},
+		{"padded warn", "  warn  ", slog.LevelWarn, true},
+		{"warning alias", "warning", slog.LevelWarn, true},
+		{"error", "error", slog.LevelError, true},
+		{"slog offset", "info+2", slog.LevelInfo + 2, true},
+		{"unparseable reports not ok and keeps info", "loud", slog.LevelInfo, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("LOG_LEVEL", tc.raw)
+
+			lvl, raw, ok := LogLevel()
+
+			if lvl != tc.want || ok != tc.wantOK {
+				t.Errorf("LogLevel() with LOG_LEVEL=%q = (%v, %v), want (%v, %v)",
+					tc.raw, lvl, ok, tc.want, tc.wantOK)
+			}
+			if raw != tc.raw {
+				t.Errorf("LogLevel() with LOG_LEVEL=%q raw = %q, want %q (reported verbatim for the WARN)",
+					tc.raw, raw, tc.raw)
+			}
+		})
+	}
+}
+
+func TestLoad_password_file_log_records_source_without_secret_or_path(t *testing.T) {
+	const secret = "sup3r-s3cret-pfx-value"
+	path := filepath.Join(t.TempDir(), "pfx-password")
+	if err := os.WriteFile(path, []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PFX_PASSWORD", "")
+	t.Setenv("PFX_PASSWORD_FILE", path)
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() with PFX_PASSWORD_FILE = %v, want nil", err)
+	}
+	if cfg.Password != secret {
+		t.Fatalf("Load() Password = %q, want the file's contents", cfg.Password)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "source=PFX_PASSWORD_FILE") {
+		t.Errorf("Load() logged %q, want a record naming PFX_PASSWORD_FILE as the secret source", out)
+	}
+	if strings.Contains(out, secret) {
+		t.Errorf("Load() leaked the PFX password into the log: %q", out)
+	}
+	if strings.Contains(out, path) {
+		t.Errorf("Load() leaked the secret-mount path into the log: %q", out)
+	}
+}
+
+func TestLoad_env_password_logs_no_secret_source(t *testing.T) {
+	t.Setenv("PFX_PASSWORD_FILE", "")
+	t.Setenv("PFX_PASSWORD", "from-env")
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() = %v, want nil", err)
+	}
+
+	if out := buf.String(); strings.Contains(out, "PFX_PASSWORD_FILE") {
+		t.Errorf("Load() logged %q, want no secret-source record when PFX_PASSWORD_FILE is unset", out)
 	}
 }

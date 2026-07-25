@@ -54,3 +54,26 @@ func TestAddWatchDirs_watches_whole_subtree_and_fails_on_missing_root(t *testing
 		t.Error("addWatchDirs(missing root) = nil, want an error so Run falls back to polling")
 	}
 }
+
+// TestAddWatchDirs_fails_when_the_root_watch_cannot_be_added pins the second
+// fatal case of the watch-set build: the root directory walks fine but the
+// watch itself is refused (a closed or exhausted watcher). That must propagate
+// as an error, because it is the signal Run uses to fall back to polling; a
+// swallowed failure would leave Run believing fsnotify is active while no watch
+// exists, so renewals would be detected only by the fallback rescan (or not at
+// all when it is disabled).
+func TestAddWatchDirs_fails_when_the_root_watch_cannot_be_added(t *testing.T) {
+	t.Parallel()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Skipf("fsnotify unavailable: %v", err)
+	}
+	if err := watcher.Close(); err != nil {
+		t.Fatalf("setup: watcher.Close() = %v", err)
+	}
+	root := t.TempDir()
+
+	if err := New(root, func(context.Context) {}).addWatchDirs(watcher, root); err == nil {
+		t.Error("addWatchDirs(closed watcher) = nil, want an error so Run falls back to polling instead of watching nothing")
+	}
+}
