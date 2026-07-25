@@ -172,9 +172,9 @@ groups:
             converted. Either a symlink could not be resolved through the input
             root, or a certificate's sibling `<name>.key` could not be stat'ed —
             which covers a path escaping the input root, a permission denial, and
-            any other IO error, not only a symlink. Whatever was skipped —
-            every certificate under a linked directory, or that one certificate —
-            was not converted. This outcome is health-neutral: the scan still
+            any other IO error, not only a symlink. Whatever was skipped — every
+            certificate under a linked directory, or that one certificate — was
+            not converted. This outcome is health-neutral: the scan still
             logs `scan complete` with failed=0 and unreadable=0, so none of the
             other rules fire and the affected .pfx stays stale or absent
             indefinitely. Mount the certificate path directly instead of linking
