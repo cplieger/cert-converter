@@ -1,9 +1,13 @@
 package convert
 
 import (
+	"bytes"
 	"crypto"
+	"crypto/x509"
 	"errors"
 	"fmt"
+
+	"software.sslmate.com/src/go-pkcs12"
 )
 
 // Encode produces the PKCS#12 bytes for an analysed certificate/key pair.
@@ -62,4 +66,78 @@ func publicKeyMatches(pub crypto.PublicKey, signer crypto.Signer) (matched, supp
 		return false, false
 	}
 	return matcher.Equal(signer.Public()), true
+}
+
+// Decoded is what a previously written PFX yields when read back.
+type Decoded struct {
+	// Leaf is the end-entity certificate stored in the first bag.
+	Leaf *x509.Certificate
+	// Key is the private key stored alongside it.
+	Key crypto.PrivateKey
+	// CACerts are the remaining certificate bags, in stored order. They are
+	// returned rather than discarded because a currency check that compared only
+	// the leaf and key would report a bundle as up to date after an intermediate
+	// was renewed, a chain was corrected, or a cross-sign was replaced.
+	CACerts []*x509.Certificate
+}
+
+// Decode reads a PKCS#12 bundle back into its parts.
+//
+// It exists so the output tree's owner can answer "is the file on disk still the
+// right bundle for these inputs?" by reading the file rather than by remembering
+// what it wrote. Decoding is codec work, so it belongs here; deciding what the
+// answer means belongs to the caller.
+//
+// A decode failure is a legitimate, expected outcome — a rotated password, a
+// truncated file, a foreign file at that path — and is NOT diagnosed further. The
+// library's ErrIncorrectPassword also fires on a MAC failure from corruption, so
+// "wrong password" and "damaged file" are not distinguishable, and the caller
+// needs the same response either way: treat the output as stale and rewrite it.
+func Decode(pfx []byte, password string) (Decoded, error) {
+	key, leaf, caCerts, err := pkcs12.DecodeChain(pfx, password)
+	if err != nil {
+		return Decoded{}, fmt.Errorf("decode pfx: %w", err)
+	}
+	return Decoded{Leaf: leaf, Key: key, CACerts: caCerts}, nil
+}
+
+// MatchesAnalysis reports whether d is the bundle a would produce: the same
+// end-entity certificate, the same private key, and the same chain in the same
+// order.
+//
+// Order is compared, not just membership, because PKCS#12 stores an ordered
+// SEQUENCE of bags (RFC 7292 §4.2) and decoders read it positionally. A bundle
+// whose chain is correct but differently ordered is not the bundle this app emits
+// today, and rewriting it makes the output match its own contract.
+//
+// What this deliberately does NOT compare is the encoder profile: telling
+// Modern2023 from LegacyDES would require algorithm-OID introspection the pinned
+// library does not expose. Changing PFX_ENCODER therefore does not by itself
+// trigger a rewrite; that limitation is documented for the operator rather than
+// worked around here.
+func (d Decoded) MatchesAnalysis(a *Analysis) bool {
+	if d.Leaf == nil || a.Leaf == nil || !bytes.Equal(d.Leaf.Raw, a.Leaf.Raw) {
+		return false
+	}
+	if len(d.CACerts) != len(a.Chain) {
+		return false
+	}
+	for i := range a.Chain {
+		if !bytes.Equal(d.CACerts[i].Raw, a.Chain[i].Raw) {
+			return false
+		}
+	}
+	return sameKey(d.Key, a.Key)
+}
+
+// sameKey reports whether two private keys are the same key, compared through
+// their public halves: every key type crypto/x509 parses is a crypto.Signer, and
+// a public half is safe to compare without touching secret material.
+func sameKey(a, b crypto.PrivateKey) bool {
+	sa, aok := a.(crypto.Signer)
+	sb, bok := b.(crypto.Signer)
+	if !aok || !bok {
+		return false
+	}
+	return samePublicKey(sa.Public(), sb.Public())
 }

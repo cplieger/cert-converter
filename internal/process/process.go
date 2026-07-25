@@ -15,6 +15,10 @@ import (
 
 // ScanResult carries per-pair outcome summary counts from a scan run.
 type ScanResult struct {
+	// Removed counts outputs deleted because their input pair is gone. It is
+	// reported for visibility only and never affects health: a reap is the
+	// operator's configured intent, not a failure.
+	Removed    int
 	Total      int
 	Converted  int
 	Unchanged  int
@@ -32,6 +36,7 @@ type ScanResult struct {
 // than re-supplied per scan.
 type Options struct {
 	Encoder   convert.EncoderType
+	Lifecycle Lifecycle
 	CertsRoot string
 	OutRoot   string
 	Password  string
@@ -48,14 +53,16 @@ type Options struct {
 // fingerprints. Run every scan from a single goroutine, as main.go does (initial
 // scan, then the watcher's synchronous onChange callback).
 type Scanner struct {
-	cache *hashCache
-	opts  Options
+	opts Options
 }
 
 // New constructs a Scanner with the given process-lifetime scan configuration
 // and a fresh fingerprint cache.
-func New(opts Options) *Scanner {
-	return &Scanner{cache: newHashCache(), opts: opts}
+// The options are taken by pointer only because the struct is large enough that
+// copying it is wasteful (gocritic hugeParam); New does not retain the pointer's
+// identity, it copies the value into the Scanner.
+func New(opts *Options) *Scanner {
+	return &Scanner{opts: *opts}
 }
 
 // Run walks the configured certs root, converts changed .crt/.key pairs to PFX
@@ -85,7 +92,6 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	out.sweepStaleTemps(ctx)
 
 	sw := &scanWalk{
-		cache:    s.cache,
 		src:      &source{root: inHandle},
 		out:      out,
 		password: s.opts.Password,
@@ -100,19 +106,9 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		return sw.visit(ctx, rel, d, err)
 	})
 
-	// A non-nil walkErr means WalkDir aborted before visiting every entry
-	// (e.g. the /input root briefly became unreadable on a network mount),
-	// so `seen` is incomplete; pruning against a partial set drops live
-	// fingerprints and forces a full, timestamp-churning reconversion on the
-	// next clean cycle. Prune only after a complete walk -- a genuinely
-	// removed pair is reaped on the next successful scan.
-	// An unreadable sub-path leaves `seen` incomplete for the certs beneath
-	// it in exactly the same way, so it gets the same treatment.
-	if walkErr == nil && sw.unreadable == 0 {
-		s.cache.prune(sw.seen)
-	}
-
 	result := countResults(sw.results, sw.unreadable)
+	result.Removed = out.reconcile(s.opts.Lifecycle, sw.seen, result.Total, sw.unreadable, walkErr == nil)
+
 	logScanOutcome(ctx, result, walkErr)
 	return result, walkErr
 }
@@ -122,7 +118,6 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 // unreadable sub-paths, and the set of cert paths seen (for cache pruning).
 // Hoisting the WalkDir callback onto this struct keeps Scanner.Run flat.
 type scanWalk struct {
-	cache      *hashCache
 	src        *source
 	out        *store
 	seen       map[string]struct{}
@@ -366,24 +361,31 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	certPEM, keyPEM := inputs.certPEM, inputs.keyPEM
 
 	pfxRel := layout.OutputFor(rel)
-	fingerprint := pairFingerprint(certPEM, keyPEM)
 
-	if sw.outputIsCurrent(rel, pfxRel, fingerprint) {
-		return statusUnchanged
-	}
-
-	slog.Debug("converting cert pair", "path", rel)
-
-	// Three separated steps: the codec resolves the pair, the codec encodes it,
-	// and the output owner writes it. Observations describe the INPUT, so they are
-	// logged whether or not the write succeeds — a reordered bundle or a multi-key
-	// file is the same operator-visible fact either way.
+	// Resolve the pair BEFORE consulting the output: currency is now "is the file
+	// on disk the bundle these inputs produce?", which cannot be asked until the
+	// bundle those inputs produce is known. Observations describe the INPUT, so
+	// they are logged either way — a reordered bundle or a multi-key file is the
+	// same operator-visible fact whether or not a write follows.
 	analysis, err := convert.Analyse(certPEM, keyPEM)
 	if err != nil {
 		return failEntry(rel, "conversion failed", err)
 	}
 	logConversionObservations(rel, analysis.Observations)
 
+	current, err := sw.out.isCurrent(ctx, pfxRel, &analysis, sw.password)
+	if err != nil {
+		// A read or confinement failure on the output tree is a real failure, never
+		// silently "stale": treating it as stale would hide a broken output mount
+		// behind an endless stream of rewrites.
+		return failEntry(rel, "failed to inspect existing pfx", err)
+	}
+	if current {
+		slog.Debug("skipping unchanged cert pair", "path", rel)
+		return statusUnchanged
+	}
+
+	slog.Debug("converting cert pair", "path", rel)
 	pfxData, err := convert.Encode(&analysis, sw.enc, sw.password)
 	if err != nil {
 		return failEntry(rel, "conversion failed", err)
@@ -391,9 +393,6 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	if err := sw.out.write(ctx, pfxRel, pfxData); err != nil {
 		return failEntry(rel, "conversion failed", err)
 	}
-	// Commit the fingerprint at the success boundary: only now is it true that
-	// the output under pfxRel was produced from these bytes.
-	sw.cache.record(rel, fingerprint)
 
 	slog.Info("wrote pfx", "path", pfxRel)
 	return statusConverted
@@ -417,47 +416,6 @@ func logConversionObservations(rel string, observations []convert.Observation) {
 		}
 		slog.Warn("cert input observation", "path", rel, "kind", string(o.Kind), "detail", o.Detail)
 	}
-}
-
-// outputIsCurrent reports whether the entry can be skipped as already
-// converted: the cert+key fingerprint matches the one recorded for the last
-// successful conversion AND the prior PFX is still present under outHandle as a
-// regular file. The cache fingerprints inputs only, so a PFX deleted out of band
-// would otherwise never be regenerated while the input stays unchanged (until a
-// renewal or process restart), and a skip-only scan still counts as a healthy
-// cycle, masking the missing file from monitoring; hence the output stat, which
-// forces a reconvert when the prior output is gone or is no longer a usable PFX
-// file.
-//
-// It is a pure query: neither the cache lookup nor the stat mutates state, so a
-// false result carries no caller obligation — convertEntry may exit on any
-// failure path between here and the write without the cache ever claiming the
-// pair is current.
-func (sw *scanWalk) outputIsCurrent(rel, pfxRel, fingerprint string) bool {
-	if !sw.cache.matches(rel, fingerprint) {
-		return false
-	}
-	// The store lstats rather than stats, so a symlink planted under the output
-	// name is not accepted as the prior PFX (it would let unrelated content
-	// satisfy the cache-coherence gate). Only a regular file is a usable PFX;
-	// anything else -- a directory, a symlink, a device node -- means the output
-	// contract is broken, so force a reconvert whose confined atomic write either
-	// restores a regular PFX or fails the entry and reports unhealthy.
-	fi, statErr := sw.out.lstat(pfxRel)
-	if statErr == nil && fi.Mode().IsRegular() {
-		slog.Debug("skipping unchanged cert pair", "path", rel)
-		return true
-	}
-	switch {
-	case statErr == nil:
-		slog.Warn("unchanged input but output PFX is not a regular file; regenerating",
-			"path", rel, "type", fi.Mode().Type().String())
-	case errors.Is(statErr, fs.ErrNotExist):
-		slog.Warn("unchanged input but output PFX missing; regenerating", "path", rel)
-	default:
-		slog.Warn("unchanged input but output PFX stat failed; regenerating", "path", rel, "error", statErr)
-	}
-	return false
 }
 
 // countResults derives summary counts from typed results.

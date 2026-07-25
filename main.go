@@ -165,7 +165,7 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	scanner := process.New(process.Options{
+	scanner := process.New(&process.Options{
 		CertsRoot: certsRootDir,
 		OutRoot:   outputDir,
 		Password:  cfg.Password,

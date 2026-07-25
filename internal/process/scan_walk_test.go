@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cplieger/cert-converter/internal/convert"
 )
 
 // TestScanWalkVisit_classifies_walk_errors pins the /input walk's error triage
@@ -95,28 +97,18 @@ func TestOutputIsCurrent_regenerates_when_the_output_stat_fails(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = outHandle.Close() })
 
-	const (
-		certRel     = "swapped/tls.crt"
-		pfxRel      = "swapped/tls.pfx"
-		fingerprint = "cafebabe"
-	)
-	sw := &scanWalk{cache: newHashCache(), out: &store{root: outHandle}}
-	sw.cache.record(certRel, fingerprint)
+	s := &store{root: outHandle}
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-
-	if sw.outputIsCurrent(certRel, pfxRel, fingerprint) {
-		t.Error("outputIsCurrent(refused output path) = true, want false: an output the confined root refuses to stat must never satisfy the skip gate")
+	// A stat the confined root REFUSES is not evidence that the output is stale —
+	// it is evidence that the output tree cannot be inspected. isCurrent returns an
+	// error so convertEntry fails the entry and health reports it, rather than
+	// silently rewriting on every scan and hiding a broken output mount.
+	_, err = s.isCurrent(t.Context(), "swapped/tls.pfx", &convert.Analysis{}, "pw")
+	if err == nil {
+		t.Fatal("store.isCurrent(output path the confined root refuses) = nil error, want a failure")
 	}
-	out := buf.String()
-	if !strings.Contains(out, "output PFX stat failed") {
-		t.Errorf("outputIsCurrent(refused output path) logged %q, want the distinct stat-failure line (not the missing-output one)", out)
-	}
-	if !strings.Contains(out, "level=WARN") {
-		t.Errorf("outputIsCurrent(refused output path) logged %q, want level WARN", out)
+	if !strings.Contains(err.Error(), "stat prior pfx") {
+		t.Errorf("store.isCurrent error = %q, want it to name the stat step", err.Error())
 	}
 }
 
@@ -169,7 +161,7 @@ func TestScanWalkVisit_cancellation_during_conversion_aborts_the_walk(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	sw := &scanWalk{cache: newHashCache(), src: &source{root: inHandle}, out: &store{root: outHandle}, seen: make(map[string]struct{})}
+	sw := &scanWalk{src: &source{root: inHandle}, out: &store{root: outHandle}, seen: make(map[string]struct{})}
 
 	got := sw.visit(&cancelAfterFirstCheck{}, "late.crt", fs.FileInfoToDirEntry(fi), nil)
 

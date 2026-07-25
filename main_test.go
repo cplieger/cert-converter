@@ -28,7 +28,7 @@ import (
 // the given roots for test isolation. The scan configuration is
 // process-lifetime, so it is injected at construction.
 func newTestScanner(certsRoot, outRoot, password string, enc convert.EncoderType) *process.Scanner {
-	return process.New(process.Options{
+	return process.New(&process.Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
 		Password:  password,
