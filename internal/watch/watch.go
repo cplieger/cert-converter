@@ -98,7 +98,7 @@ func (w *Watcher) addWatchDirs(watcher *fsnotify.Watcher, root string) error {
 			if path == root {
 				return addErr
 			}
-			slog.Warn("skipping unwatchable directory; renewals under it are only picked up by the fallback rescan",
+			slog.Warn("skipping unwatchable directory; renewals under it require a full rescan (periodic fallback if enabled)",
 				"path", path, "error", addErr)
 			return nil
 		}
@@ -130,10 +130,11 @@ func (w *Watcher) handleFsEvent(watcher *fsnotify.Watcher, event fsnotify.Event)
 		// file (an atomic-write temp created and renamed away before this event is
 		// handled) cannot produce a spurious "failed to watch" WARN from WalkDir
 		// failing to lstat a path that is already gone; and a SYMLINK to a directory
-		// is not followed. Neither addWatchDirs nor the scanner's filepath.WalkDir
-		// descends a symlinked directory, so watching through one would register
-		// inotify watches on a tree outside /input whose certs can never be
-		// converted — and a symlink to a large tree would burn the watch quota.
+		// is not followed. Neither addWatchDirs nor the scanner's root-confined walk
+		// (fs.WalkDir over the /input os.Root) descends a symlinked directory, so
+		// watching through one would register inotify watches on a tree outside
+		// /input whose certs can never be converted — and a symlink to a large tree
+		// would burn the watch quota.
 		if info, err := os.Lstat(event.Name); err == nil && info.IsDir() {
 			if addErr := w.addWatchDirs(watcher, event.Name); addErr != nil {
 				slog.Warn("failed to watch new directory subtree", "path", event.Name, "error", addErr)

@@ -22,9 +22,11 @@ scan, then hand off to the watcher. The real work lives under
 `internal/`:
 
 - `internal/config`: parses `PFX_PASSWORD` (or `PFX_PASSWORD_FILE`, via
-  `envx.Secret`), `PFX_ALLOW_EMPTY_PASSWORD`, `PFX_ENCODER`, and
-  `FALLBACK_SCAN_HOURS` from the environment, then delegates encoder
-  selection to `convert.EncoderName`.
+  `envx.Secret`), `PFX_ALLOW_EMPTY_PASSWORD`, `PFX_ENCODER`,
+  `FALLBACK_SCAN_HOURS`, and `LOG_LEVEL` (via `config.LogLevel`, exported
+  separately from `Load` so `main` can install the logger before the
+  config load emits its own WARN lines) from the environment, then
+  delegates encoder selection to `convert.EncoderName`.
 - `internal/convert`: PEM parsing (`ParseCertChain`, `ParsePrivateKey`),
   cert/key matching and confined PFX encoding (`PairInRoot`, the only
   PFX-writing entry point; its encoder helper is package-internal), the

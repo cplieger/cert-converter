@@ -119,9 +119,9 @@ groups:
           description: >
             The /input root itself could not be walked (unreadable mount, wrong
             permissions, or a mid-scan unmount), so the scan returned early and
-            the container is unhealthy. An aborted scan emits no `scan complete`
-            line, so neither of the other rules covers it. Check the /input
-            mount and its permissions.
+            the container is unhealthy. The conversion-failure rule does not
+            cover this outcome, and the stall rule identifies it only after its
+            eight-hour window. Check the /input mount and its permissions.
       - alert: CertConverterScanStalled
         expr: |
           absent_over_time({container="cert-converter"} |= `scan complete` [8h])

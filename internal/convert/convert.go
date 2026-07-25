@@ -113,11 +113,15 @@ var certBeginMarker = []byte("-----BEGIN CERTIFICATE-----")
 // recognises them: a marker declares a block only when it occupies a complete
 // line, so the same text embedded in surrounding prose (which pem.Decode
 // ignores entirely) is not counted and cannot make a valid chain look
-// malformed. Line endings are normalised exactly as pem's own getLine does —
-// the line terminator, then at most ONE trailing carriage return, then trailing
-// spaces and tabs — so CRLF input counts identically and a line pem does NOT
-// accept as a declaration (a doubled "\r\r", or a "\r" followed by a space) is
-// not counted either.
+// malformed. Line endings are normalised the way pem's getLine does — the line
+// terminator, then at most ONE trailing carriage return, then trailing spaces
+// and tabs — so CRLF input counts identically and a line pem does NOT accept as
+// a declaration (a doubled "\r\r", or a "\r" followed by a space) is not
+// counted either. One deliberate divergence: getLine strips the carriage return
+// only on a newline-terminated line, while this strips it on an unterminated
+// final line too, so a file whose last line is "-----BEGIN CERTIFICATE-----\r"
+// still counts as a declaration and is reported as a truncated chain instead of
+// being silently ignored.
 func countDeclaredCertBlocks(pemBytes []byte) int {
 	var n int
 	for line := range bytes.Lines(pemBytes) {

@@ -39,8 +39,11 @@ func FuzzParseCertChain(f *testing.F) {
 	// Prose that merely mentions the marker mid-line is not a declaration, so a
 	// valid chain beside it must still parse.
 	f.Add(append(append([]byte{}, validPEM...), []byte("see -----BEGIN CERTIFICATE----- above\n")...))
-	// Two concatenated certs whose join lost its newline: pem.Decode drops the
-	// second block, and the declaration count must notice.
+	// Two concatenated certs whose join lost its newline: the run-together
+	// "-----END CERTIFICATE----------BEGIN CERTIFICATE-----" line is neither a
+	// valid END line nor a declaration, so pem decodes nothing while one
+	// declaration is still counted and the declared-count guard rejects the
+	// file.
 	f.Add(append(append([]byte{}, bytes.TrimRight(validPEM, "\n")...), validPEM...))
 	// CRLF armour must count identically to LF armour.
 	f.Add(bytes.ReplaceAll(validPEM, []byte("\n"), []byte("\r\n")))
