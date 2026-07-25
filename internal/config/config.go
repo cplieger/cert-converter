@@ -124,7 +124,9 @@ func allowEmptyPassword(raw string) bool {
 // An empty or whitespace-only value — or any unparseable value — yields
 // defaultFallbackInterval, matching an unset variable, so a blank
 // FALLBACK_SCAN_HOURS never silently disables the safety-net rescan. A value
-// above maxFallbackHours is clamped to it.
+// above maxFallbackHours is clamped to it, including a valid decimal too large
+// for int64: a positive out-of-range number counts as above-ceiling, not as
+// malformed input.
 func parseFallbackInterval(v string) time.Duration {
 	// maxFallbackHours keeps time.Duration(n)*time.Hour from overflowing int64;
 	// 10y is far beyond any real re-scan cadence.
@@ -138,10 +140,15 @@ func parseFallbackInterval(v string) time.Duration {
 		return defaultFallbackInterval
 	default:
 		n, err := strconv.ParseInt(trimmed, 10, 64)
-		// A value too large for int64 is still a positive above-ceiling value:
-		// clamp it like 87601 instead of misreading overflow as malformed input.
+		// A valid decimal too large for int64 is still a positive
+		// above-ceiling value: clamp it like 87601 instead of misreading
+		// overflow as malformed input. strconv reports ErrRange (not
+		// ErrSyntax) for an overflowing digit prefix followed by junk too, so
+		// the digits-only check keeps "1e40x" malformed rather than clamping
+		// it; an optional leading "+" is still a valid decimal.
+		digits := strings.TrimPrefix(trimmed, "+")
 		positiveOverflow := errors.Is(err, strconv.ErrRange) &&
-			!strings.HasPrefix(trimmed, "-")
+			digits != "" && strings.Trim(digits, "0123456789") == ""
 		if positiveOverflow || (err == nil && n > maxFallbackHours) {
 			slog.Warn("FALLBACK_SCAN_HOURS too large, clamping",
 				"value", v, "max_hours", maxFallbackHours)

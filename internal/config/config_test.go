@@ -75,6 +75,10 @@ func TestParseFallbackInterval(t *testing.T) {
 		{"non-canonical zero", "00", 6 * time.Hour},
 		{"signed zero", "+0", 6 * time.Hour},
 		{"non-numeric", "abc", 6 * time.Hour},
+		// strconv reports ErrRange (not ErrSyntax) once the digit prefix
+		// overflows, even when junk follows, so a malformed value must stay
+		// malformed instead of being mistaken for an above-ceiling number.
+		{"overflowing prefix with junk", "999999999999999999999999999999x", 6 * time.Hour},
 		{"leading spaces", "  12", 12 * time.Hour},
 		{"trailing spaces", "12  ", 12 * time.Hour},
 		{"padded zero", " 0 ", 0},
@@ -100,9 +104,11 @@ func TestParseFallbackInterval_clamps_excessive_values(t *testing.T) {
 		{"at ceiling unclamped", "87600", 87600 * time.Hour},
 		{"one above ceiling clamped", "87601", 87600 * time.Hour},
 		{"far above ceiling clamped", "1000000", 87600 * time.Hour},
-		// Beyond int64: overflow is still a positive above-ceiling value, so it
-		// clamps rather than falling through to the 6h default.
+		// Beyond int64: a valid decimal that overflows is still a positive
+		// above-ceiling value, so it clamps rather than falling through to the
+		// 6h default. An optional leading "+" is still a valid decimal.
 		{"beyond int64 clamped", "999999999999999999999999999999", 87600 * time.Hour},
+		{"signed beyond int64 clamped", "+999999999999999999999999999999", 87600 * time.Hour},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := parseFallbackInterval(tc.val); got != tc.want {
