@@ -20,9 +20,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
+	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -225,7 +225,7 @@ func (w *Watcher) handleFsEvent(ctx context.Context, watcher *fsnotify.Watcher, 
 				slog.Warn("cannot classify a created path; if it is a directory it stays unwatched until the next fallback re-sync",
 					"path", event.Name, "error", err)
 			}
-			return isCertFile(event.Name)
+			return layout.IsRelevant(event.Name)
 		}
 		if info.IsDir() {
 			if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
@@ -233,7 +233,7 @@ func (w *Watcher) handleFsEvent(ctx context.Context, watcher *fsnotify.Watcher, 
 			}
 			return true
 		}
-		return isCertFile(event.Name)
+		return layout.IsRelevant(event.Name)
 	case event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename):
 		// event.Name is already gone on Remove/Rename (inotify reports the old
 		// name), so there is nothing to add to the watch set: fsnotify drops the
@@ -242,15 +242,9 @@ func (w *Watcher) handleFsEvent(ctx context.Context, watcher *fsnotify.Watcher, 
 		// fail, so just rescan.
 		return true
 	case event.Has(fsnotify.Write):
-		return isCertFile(event.Name)
+		return layout.IsRelevant(event.Name)
 	}
 	return false
-}
-
-// isCertFile reports whether name is a certificate or private-key file by
-// extension — the only inputs cert-converter acts on.
-func isCertFile(name string) bool {
-	return strings.HasSuffix(name, ".crt") || strings.HasSuffix(name, ".key")
 }
 
 // watchLoop uses fsnotify for immediate reaction to cert changes,

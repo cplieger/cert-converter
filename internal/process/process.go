@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/layout"
 )
 
 // ScanResult carries per-pair outcome summary counts from a scan run.
@@ -334,7 +335,7 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		sw.unreadable++
 		return nil
 	}
-	if d.IsDir() || !strings.HasSuffix(rel, ".crt") {
+	if d.IsDir() || !layout.IsCert(rel) {
 		sw.noteUnwalkableSymlink(rel, d)
 		return nil
 	}
@@ -364,7 +365,7 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 // here as well would double-report one condition. A dangling link (ENOENT)
 // hides nothing and stays silent.
 func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
-	if d.Type()&fs.ModeSymlink == 0 || strings.HasSuffix(rel, ".crt") || strings.HasSuffix(rel, ".key") {
+	if d.Type()&fs.ModeSymlink == 0 || layout.IsRelevant(rel) {
 		return
 	}
 	fi, err := sw.inHandle.Stat(rel)
@@ -538,9 +539,9 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 // per-cert logs use the certsRoot-relative path for a stable, non-leaky
 // identifier.
 func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStatus {
-	// One stem for every sibling name derived from this .crt entry.
-	stem := strings.TrimSuffix(rel, ".crt")
-	keyRel := stem + ".key"
+	// Both sibling names come from layout, so this package and internal/watch
+	// derive the pairing rule from one place instead of two copies that can drift.
+	keyRel := layout.KeyFor(rel)
 
 	inputs, outcome, ok := sw.readPair(ctx, rel, keyRel)
 	if !ok {
@@ -548,7 +549,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	}
 	certPEM, keyPEM := inputs.certPEM, inputs.keyPEM
 
-	pfxRel := stem + ".pfx"
+	pfxRel := layout.OutputFor(rel)
 	fingerprint := pairFingerprint(certPEM, keyPEM)
 
 	if sw.outputIsCurrent(rel, pfxRel, fingerprint) {
