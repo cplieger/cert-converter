@@ -157,16 +157,57 @@ func (s *skippedBlocks) firstTypeForLog() string {
 // it is truncated before it reaches the log.
 const maxBlockTypeLogLen = 64
 
-// boundLogText truncates s to limit bytes for a log-bound diagnostic built from
-// operator-supplied file content, dropping the partial rune the cut may leave
-// behind so the %q form stays readable. It is the single home for that rule:
-// every diagnostic in this package that interpolates input-derived text (a
-// certificate subject, a PEM block label) goes through it.
+// boundLogText makes input-derived text safe and bounded for a log-bound
+// diagnostic. It is the single home for that rule: every diagnostic in this package
+// that interpolates text taken from a file the app does not control (a certificate
+// subject, a PEM block label) goes through it.
+//
+// Two jobs. It bounds the text, because the source file is capped only by
+// MaxFileSize (10 MB) and an unbounded interpolation would put a multi-megabyte line
+// into the log of every scan that retries the pair. And it drops what cannot safely
+// reach a log line, which is a SHORT list — verified against log/slog directly rather
+// than assumed:
+//
+// slog's TextHandler already escapes far more than it looks like it does. Any value
+// containing a rune that fails unicode.IsPrint gets strconv.Quote'd, which covers C0
+// controls, the C1 block (U+0080-U+009F escape introducers), Unicode Bidi_Control
+// (the Trojan-Source reordering class) and U+2028/U+2029; invalid UTF-8 is caught the
+// same way through RuneError. JSONHandler, the other slogx option, escapes them too.
+//
+// The one exception is U+007F DEL: it is below utf8.RuneSelf and sits in slog's
+// safeSet, so it reaches the log raw. That is the only rune this function has to
+// remove on the handler's behalf.
 func boundLogText(s string, limit int) string {
-	if len(s) <= limit {
-		return s
+	cut := len(s) > limit
+	if cut {
+		s = s[:limit]
 	}
-	return strings.ToValidUTF8(s[:limit], "") + "...(truncated)"
+	// Applied on BOTH paths, not only the truncating one. The previous shape
+	// sanitized only the text it had just cut, so a string SHORTER than the limit
+	// carrying invalid UTF-8 or a DEL was returned untouched — the asymmetry meant
+	// the function's own contract held only for oversized input.
+	s = strings.Map(dropUnloggable, strings.ToValidUTF8(s, ""))
+	if cut {
+		// The marker is appended after the cut, so the result exceeds limit by its
+		// own length. That is deliberate: the bound exists to stop multi-megabyte
+		// lines, and a caller reading a truncated diagnostic needs to know it was
+		// truncated more than it needs the total to be exactly limit bytes.
+		return s + truncationMarker
+	}
+	return s
+}
+
+// truncationMarker is appended to text boundLogText had to cut, so a reader can tell
+// a diagnostic that ends mid-subject from one that genuinely ends there.
+const truncationMarker = "...(truncated)"
+
+// dropUnloggable removes the runes slog's handlers do not escape themselves. See
+// boundLogText for why that is U+007F alone.
+func dropUnloggable(r rune) rune {
+	if r == 0x7f {
+		return -1
+	}
+	return r
 }
 
 // boundedTextError caps the rendered text of a certificate-derived error. The
