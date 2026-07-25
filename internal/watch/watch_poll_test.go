@@ -6,15 +6,18 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/cplieger/slogx/capture"
 )
 
 // TestPollLoopWithUpgrade_upgrades_to_fsnotify_and_scans_first pins the poll
 // mode recovery path: on a tick where fsnotify becomes available again the
 // watch set is rebuilt, a scan runs with it already live (attach-then-scan, so a
 // renewal during the scan still produces an event), and control hands off to the
-// watch loop, which returns nil on shutdown.
+// watch loop, which returns nil on shutdown. Runs serially (no t.Parallel): it
+// swaps the process-global slog default to read the upgrade log line.
 func TestPollLoopWithUpgrade_upgrades_to_fsnotify_and_scans_first(t *testing.T) {
-	t.Parallel()
+	logs := capture.Default(t)
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "example.com"), 0o750); err != nil {
 		t.Fatal(err)
@@ -32,6 +35,16 @@ func TestPollLoopWithUpgrade_upgrades_to_fsnotify_and_scans_first(t *testing.T) 
 	case <-time.After(10 * time.Second):
 		cancel()
 		t.Fatal("pollLoopWithUpgrade never scanned; neither the poll tick nor the upgrade path ran")
+	}
+
+	// Only the upgrade branch logs this, and it logs it before handing off to
+	// watchLoop, so the record exists by the time that first scan lands. A scan
+	// alone proves nothing here: the poll tick and the watch loop's own fallback
+	// tick both scan on the same 20ms interval, so a build that never upgraded
+	// would keep feeding this channel forever.
+	if !logs.Contains("fsnotify recovered, upgrading from poll to watch") {
+		cancel()
+		t.Fatalf("pollLoopWithUpgrade scanned but never upgraded; log = %v", logs.Messages())
 	}
 
 	// The upgrade handed off to watchLoop, so a real cert write is now detected

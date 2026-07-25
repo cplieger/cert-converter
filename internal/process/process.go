@@ -412,13 +412,17 @@ func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
 		"unreadable", result.Unreadable,
 		"failed", result.Failed)
 	slog.Log(ctx, level, msg, attrs...)
-	if walkErr == nil && result.Total > 0 && result.Orphan == result.Total {
+	if walkErr == nil && result.Unreadable == 0 && result.Total > 0 && result.Orphan == result.Total {
 		// Every .crt under /input lacks its sibling .key, so the scan
 		// completed with failed=0 and produced nothing at all. The counts
 		// above carry orphan, but no README Loki rule keys on it and the
 		// per-cert reason is Debug-only, so this steady-state naming
 		// misconfiguration (a key extension that is not .key) is silent at
 		// the default level, exactly like the Total==0 case below. Name it.
+		// Unreadable == 0 is what makes "every certificate" provable: Run
+		// deliberately continues past an unreadable sub-path, so a partial
+		// enumeration cannot know what lies beneath it, and the unreadable-path
+		// WARN already carries the actionable diagnosis for that shape.
 		slog.Warn("every certificate under the input root is missing its sibling .key; no PFX output is being produced",
 			"orphan", result.Orphan,
 			"remediation", "name each private key <name>.key beside its <name>.crt (Caddy's layout)")

@@ -464,6 +464,24 @@ func TestLoad_env_password_logs_no_secret_source(t *testing.T) {
 	if n := logs.Count("PFX password configured"); n != 0 {
 		t.Errorf("Load() logged %v, want no secret-source record when PFX_PASSWORD_FILE is unset", logs.Messages())
 	}
+	// The pre-capture form scanned the whole rendered line, so it also caught the
+	// env var leaking as an ATTR (key or value) under ANY message, not just the
+	// one that happens to carry it today; Count sees messages only. Walk every
+	// captured record end to end to keep that strictly stronger guard: this test
+	// exists for the secret-source channel, not for one message string.
+	const secretEnv = "PFX_PASSWORD_FILE"
+	for _, r := range logs.Records() {
+		if strings.Contains(r.Message, secretEnv) {
+			t.Errorf("Load() logged message %q, want no %s record when the file channel is unused", r.Message, secretEnv)
+		}
+		r.Attrs(func(a slog.Attr) bool {
+			if strings.Contains(a.Key, secretEnv) || strings.Contains(a.Value.String(), secretEnv) {
+				t.Errorf("Load() logged attr %s=%v on %q, want no %s record when the file channel is unused",
+					a.Key, a.Value, r.Message, secretEnv)
+			}
+			return true
+		})
+	}
 }
 
 func TestLoad_unknown_encoder_warns_and_falls_back_to_modern2023(t *testing.T) {

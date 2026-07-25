@@ -346,14 +346,19 @@ func (w *Watcher) handleErrorRecv(ctx context.Context, watcher *fsnotify.Watcher
 // arrived. Without it such a directory stays outside the watch set for the life
 // of the process and its renewals are detected only on the fallback cadence.
 // Re-attaching before the scan also means a change landing during the scan is
-// still reported as an event. A re-sync cut short by shutdown skips the scan
-// entirely: the loop is about to return anyway.
+// still reported as an event. A stop request skips the scan entirely, whether
+// it cut the re-sync short or arrived while the re-sync succeeded: the loop is
+// about to return anyway.
 func (w *Watcher) handleFallbackTick(ctx context.Context, watcher *fsnotify.Watcher, st *watchState) {
-	if addErr := w.addWatchDirs(ctx, watcher, w.root); addErr != nil {
-		if ctx.Err() != nil {
-			return
-		}
+	if addErr := w.addWatchDirs(ctx, watcher, w.root); addErr != nil && ctx.Err() == nil {
 		slog.Warn("failed to re-sync the watch set during the periodic fallback scan", "error", addErr)
+	}
+	// Same stop-request rule as runDebouncedScan, on the success path too: the
+	// select has no ctx precedence, so a fallback deadline reached in the same
+	// instant as cancellation can win over ctx.Done. The loop is about to
+	// return anyway, so a scan started here is pure spurious work.
+	if ctx.Err() != nil {
+		return
 	}
 	st.runFallbackScan(ctx)
 }

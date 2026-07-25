@@ -833,6 +833,99 @@ func TestFallbackLogValue(t *testing.T) {
 	}
 }
 
+// TestDispatchArgs pins the argv policy behind the runProbe seam: the health
+// subcommand probes the marker at health.DefaultPath, an unknown argument warns
+// and falls through to the watcher, and a bare invocation does neither. No
+// t.Parallel: it swaps the package-level runProbe var and slog.Default().
+func TestDispatchArgs(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		args      []string
+		wantProbe bool
+		wantWarn  bool
+	}{
+		{"no argument starts the watcher", []string{"cert-watcher"}, false, false},
+		{"health probes the marker", []string{"cert-watcher", "health"}, true, false},
+		{"typo warns and starts the watcher", []string{"cert-watcher", "helth"}, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := capture.Default(t)
+
+			gotPath, probed := "", false
+			prev := runProbe
+			runProbe = func(path string, _ ...health.ProbeOption) {
+				probed, gotPath = true, path
+			}
+			t.Cleanup(func() { runProbe = prev })
+
+			dispatchArgs(tc.args)
+
+			if probed != tc.wantProbe {
+				t.Errorf("dispatchArgs(%q) probed = %v, want %v", tc.args, probed, tc.wantProbe)
+			}
+			if tc.wantProbe && gotPath != health.DefaultPath {
+				t.Errorf("dispatchArgs(%q) probed %q, want %q", tc.args, gotPath, health.DefaultPath)
+			}
+			if warned := logs.CountLevel(slog.LevelWarn, "unrecognized argument") > 0; warned != tc.wantWarn {
+				t.Errorf("dispatchArgs(%q) warned = %v, want %v (log: %v)", tc.args, warned, tc.wantWarn, logs.Messages())
+			}
+		})
+	}
+}
+
+// TestDispatchArgs_arms_the_marker_lease pins the staleness deadline the health
+// subcommand hands the probe: three fallback intervals (18h on the default 6h
+// cadence), and no deadline at all when FALLBACK_SCAN_HOURS disables the
+// fallback rescan, because watch-only mode has no guaranteed refresh cadence.
+// The captured options are applied with health.ProbeCheck to markers whose
+// mtimes straddle the deadline, so a wrong multiplier or a dropped option fails
+// here rather than in production. No t.Parallel: it swaps runProbe and mutates
+// the environment.
+func TestDispatchArgs_arms_the_marker_lease(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		fallbackHours string
+		markerAge     time.Duration
+		wantCode      int
+	}{
+		{"default cadence keeps a marker inside the 18h lease healthy", "", 17 * time.Hour, 0},
+		{"default cadence fails a marker past the 18h lease", "", 19 * time.Hour, 1},
+		{"a disabled fallback disarms the lease entirely", "0", 100 * time.Hour, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("FALLBACK_SCAN_HOURS", tc.fallbackHours)
+
+			var gotOpts []health.ProbeOption
+			probed := false
+			prev := runProbe
+			runProbe = func(_ string, opts ...health.ProbeOption) {
+				probed, gotOpts = true, opts
+			}
+			t.Cleanup(func() { runProbe = prev })
+
+			dispatchArgs([]string{"cert-watcher", "health"})
+
+			if !probed {
+				t.Fatalf("dispatchArgs([health]) did not probe with FALLBACK_SCAN_HOURS=%q", tc.fallbackHours)
+			}
+
+			marker := filepath.Join(t.TempDir(), ".healthy")
+			if err := os.WriteFile(marker, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			aged := time.Now().Add(-tc.markerAge)
+			if err := os.Chtimes(marker, aged, aged); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := health.ProbeCheck(marker, gotOpts...); got != tc.wantCode {
+				t.Errorf("ProbeCheck(marker aged %v, opts from FALLBACK_SCAN_HOURS=%q) = %d, want %d",
+					tc.markerAge, tc.fallbackHours, got, tc.wantCode)
+			}
+		})
+	}
+}
+
 func TestHealthyAfterScan(t *testing.T) {
 	t.Parallel()
 

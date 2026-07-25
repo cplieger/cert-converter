@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/fsnotify/fsnotify"
 )
 
 // TestWatchLoop_converts_a_real_cert_write_through_the_debounce is the first
@@ -61,10 +59,7 @@ func TestWatchLoop_converts_a_real_cert_write_through_the_debounce(t *testing.T)
 // watcher instead of running forever with no change detection.
 func TestWatchLoop_returns_ErrWatchLost_when_the_watcher_dies(t *testing.T) {
 	t.Parallel()
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		t.Skipf("fsnotify unavailable: %v", err)
-	}
+	watcher := newTestWatcher(t)
 	root := t.TempDir()
 	w := New(root, func(context.Context) {}, WithDebounce(20*time.Millisecond))
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {

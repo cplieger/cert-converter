@@ -203,3 +203,50 @@ func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing
 		})
 	}
 }
+
+// TestLogScanOutcome_flags_an_input_tree_whose_certs_all_lack_a_key pins the
+// all-orphan notice: a scan that visited certs but converted nothing because
+// every .crt lacks its sibling .key reports failed=0, so the health marker
+// stays set and the per-cert reason is Debug-only -- this WARN is the only
+// default-level evidence of the naming misconfiguration. It must fire for
+// exactly that shape and stay quiet otherwise, or it becomes noise on every
+// fsnotify event and every fallback tick. An incomplete enumeration
+// (Unreadable > 0) must stay quiet too: Run continues past an unreadable
+// sub-path, so "every certificate" is unproven and the unreadable-path WARN
+// already carries the actionable diagnosis. Runs serially: it swaps
+// slog.Default().
+func TestLogScanOutcome_flags_an_input_tree_whose_certs_all_lack_a_key(t *testing.T) {
+	const wantMsg = "every certificate under the input root is missing its sibling .key"
+	tests := []struct {
+		walkErr  error
+		name     string
+		result   ScanResult
+		wantWarn bool
+	}{
+		{nil, "an all-orphan tree is named", ScanResult{Total: 2, Orphan: 2}, true},
+		{nil, "an all-orphan tree with an unreadable sub-path stays quiet", ScanResult{Total: 1, Orphan: 1, Unreadable: 1}, false},
+		{nil, "a partially converted tree stays quiet", ScanResult{Total: 2, Converted: 1, Orphan: 1}, false},
+		{nil, "an empty tree stays quiet (the Total==0 notice owns it)", ScanResult{}, false},
+		{errors.New("permission denied"), "an aborted scan stays quiet", ScanResult{Total: 2, Orphan: 2}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			logScanOutcome(t.Context(), tt.result, tt.walkErr)
+
+			out := buf.String()
+			if got := strings.Contains(out, wantMsg); got != tt.wantWarn {
+				t.Errorf("logScanOutcome(%+v, %v) logged %q; all-orphan notice present = %v, want %v",
+					tt.result, tt.walkErr, out, got, tt.wantWarn)
+			}
+			if tt.wantWarn && !strings.Contains(out, "level=WARN") {
+				t.Errorf("logScanOutcome(%+v, nil) logged %q, want the all-orphan notice at level WARN", tt.result, out)
+			}
+		})
+	}
+}

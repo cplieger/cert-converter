@@ -70,12 +70,14 @@ health marker (any failure clears it; a clean cycle sets it).
   cache does no file I/O of its own: the scanner reads each input once and
   passes the bytes to `process`'s own `pairFingerprint`. PFX writes are atomic
   (temp + rename) via `cplieger/atomicfile`. Keep new file I/O on these helpers.
-- **The watch loop's `select` and the poll fallback are not unit-tested.**
-  `Run`'s fsnotify-vs-poll mode selection, `watchLoop`'s `select`, and
-  `pollLoopWithUpgrade` are event-driven I/O paths validated by the Docker
-  healthcheck in production; a test cannot make `fsnotify.NewWatcher` fail.
-  Everything reachable without that seam IS unit-tested here: event
-  classification (`handleFsEvent`), watch-set construction (`addWatchDirs`),
+- **Only the fsnotify-unavailable fallback is not unit-tested.** A test cannot
+  make `fsnotify.NewWatcher` itself fail, so the arm of `Run` that degrades to
+  polling on that error is validated by the Docker healthcheck in production.
+  Everything else IS unit-tested here, including the event-driven loops:
+  `Run` end to end (`watch_run_test.go`), `watchLoop`'s `select` over a real
+  cert write and a dead watcher (`watch_loop_test.go`), the poll tick and its
+  upgrade handoff (`watch_poll_test.go`), event classification
+  (`handleFsEvent`), watch-set construction (`addWatchDirs`),
   the per-arm receive helpers (`handleEventRecv`, `handleErrorRecv`,
   `handleFallbackTick`), the channel-closed-vs-shutdown translation
   (`lostOrShutdown`), and the debounce/fallback timer accounting
