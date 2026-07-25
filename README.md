@@ -95,9 +95,14 @@ it: `CertConverterConversionFailed` then never fires and
 (`error` additionally suppresses the WARN-level `scan aborted before
 completion` line behind `CertConverterScanAborted`). If you run at `warn` or
 `error`, do not deploy the `CertConverterConversionFailed` or
-`CertConverterScanStalled` expressions unchanged — monitor the container health
-state instead, or write replacement rules over the messages your level still
-emits.
+`CertConverterScanStalled` expressions unchanged. Container health covers
+conversion failures and aborted scans (and, with the fallback rescan enabled, a
+stalled watch loop through the marker's freshness deadline), but it deliberately
+ignores `unreadable>0` — an unreadable `/input` sub-path stays healthy — so at
+`warn` also alert on the WARN line `some /input paths were unreadable and were
+skipped` to keep that coverage. At `error` that WARN is suppressed too, so use a
+lower log level if you need equivalent unreadable-path alerting. Otherwise write
+replacement rules over the messages your level still emits.
 
 ```yaml
 groups:

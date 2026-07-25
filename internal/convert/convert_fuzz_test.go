@@ -192,9 +192,12 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		if !ok {
 			t.Fatalf("convert.ParsePrivateKey returned %T, want crypto.Signer", parsedKey)
 		}
+		// crypto/x509 leaves PublicKey nil for an unrecognised SPKI algorithm OID,
+		// and PairInRoot rejects that pair (publicKeyMatches: supported=false), so the
+		// round-trip invariant does not apply to such input.
 		matcher, ok := certs[0].PublicKey.(interface{ Equal(crypto.PublicKey) bool })
 		if !ok {
-			t.Fatalf("leaf public key %T cannot compare against the parsed private key", certs[0].PublicKey)
+			return
 		}
 		if !matcher.Equal(signer.Public()) {
 			return
