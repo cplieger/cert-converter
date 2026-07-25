@@ -11,6 +11,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/envx"
+	"github.com/cplieger/slogx"
 )
 
 // envFalseValue is the lexical "disabled" marker for env-var parsers.
@@ -35,7 +36,8 @@ type Config struct {
 // opt-out (PFX_ALLOW_EMPTY_PASSWORD=true) is not set. A PFX generated with an
 // empty password protects the embedded private key with no password at all.
 var ErrEmptyPassword = errors.New(
-	"PFX_PASSWORD is empty; set it or set PFX_ALLOW_EMPTY_PASSWORD=true")
+	"PFX_PASSWORD is empty; set it, point PFX_PASSWORD_FILE at a secret file, " +
+		"or set PFX_ALLOW_EMPTY_PASSWORD=true")
 
 // Load reads environment variables and returns a populated Config. The PFX
 // password follows the Docker-secrets convention: when PFX_PASSWORD_FILE is
@@ -55,20 +57,15 @@ func Load() (Config, error) {
 		}
 		password = "" // fall through to the empty-password guard below
 	}
-	rawAllowEmpty := strings.TrimSpace(os.Getenv("PFX_ALLOW_EMPTY_PASSWORD"))
-	allowEmpty := strings.EqualFold(rawAllowEmpty, "true")
-	// Only literal true opts out, but literal false is the documented (and
-	// default-safe) disabled spelling: warning on it would fire on every
-	// startup of a correctly configured deployment. Warn only on values that
-	// are genuinely unrecognized (1/yes/on), which the literal-true contract
-	// deliberately rejects.
-	explicitFalse := strings.EqualFold(rawAllowEmpty, envFalseValue)
-	if rawAllowEmpty != "" && !allowEmpty && !explicitFalse {
-		slog.Warn("unrecognized PFX_ALLOW_EMPTY_PASSWORD, treating as false",
-			"value", rawAllowEmpty, "expected", "true or false")
-	}
+	allowEmpty := allowEmptyPassword(os.Getenv("PFX_ALLOW_EMPTY_PASSWORD"))
 	if password == "" && !allowEmpty {
 		return Config{}, ErrEmptyPassword
+	}
+	if path := os.Getenv("PFX_PASSWORD_FILE"); path != "" {
+		// Record the secret's SOURCE (never its value) so an operator can
+		// confirm a mounted secret was actually consumed instead of silently
+		// falling back to PFX_PASSWORD.
+		slog.Info("PFX password read from PFX_PASSWORD_FILE", "path", path)
 	}
 
 	encName := convert.EncoderName(os.Getenv("PFX_ENCODER"))
@@ -90,8 +87,39 @@ func FallbackInterval() time.Duration {
 	return parseFallbackInterval(os.Getenv("FALLBACK_SCAN_HOURS"))
 }
 
+// LogLevel returns the effective LOG_LEVEL as a slog level, the raw value as
+// configured, and whether it parsed. Exported separately from Load so the
+// logger can be installed before Load runs (Load emits WARN lines that must
+// honour the configured level), while the LOG_LEVEL name and its info default
+// stay in the config layer — the same reason FallbackInterval is exported.
+func LogLevel() (lvl slog.Level, raw string, ok bool) {
+	raw = os.Getenv("LOG_LEVEL")
+	lvl, ok = slogx.ParseLevel(raw, slog.LevelInfo)
+	return lvl, raw, ok
+}
+
+// allowEmptyPassword reports whether PFX_ALLOW_EMPTY_PASSWORD opts out of the
+// empty-password guard. Only a literal "true" (trimmed, case-insensitive) opts
+// out. Literal "false" is the documented, default-safe spelling and is accepted
+// silently — warning on it would fire on every startup of a correctly
+// configured deployment — while any other non-empty value warns and is treated
+// as false, because the literal-true contract deliberately rejects 1/yes/on.
+func allowEmptyPassword(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if strings.EqualFold(trimmed, "true") {
+		return true
+	}
+	if trimmed != "" && !strings.EqualFold(trimmed, envFalseValue) {
+		slog.Warn("unrecognized PFX_ALLOW_EMPTY_PASSWORD, treating as false",
+			"value", trimmed, "expected", "true or false")
+	}
+	return false
+}
+
 // parseFallbackInterval parses a FALLBACK_SCAN_HOURS value into a re-scan
-// cadence. Only an explicit "0" or "false" disables the fallback (returns 0).
+// cadence. Surrounding whitespace is trimmed first, so " 12 " parses as 12
+// hours. Only an explicit "0" or "false" disables the fallback (returns 0),
+// matched case-insensitively, so "FALSE" and " 0 " disable it too.
 // An empty or whitespace-only value — or any unparseable value — yields
 // defaultFallbackInterval, matching an unset variable, so a blank
 // FALLBACK_SCAN_HOURS never silently disables the safety-net rescan. A value

@@ -106,6 +106,22 @@ groups:
             A scan logged failed>0 or unreadable>0 (PEM parse, PFX write, or
             input read failure); the affected .pfx is stale or missing. Check
             /input permissions and the certificate chain.
+      - alert: CertConverterScanAborted
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"} |= `scan aborted before completion` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter aborted a scan before completion"
+          description: >
+            The /input root itself could not be walked (unreadable mount, wrong
+            permissions, or a mid-scan unmount), so the scan returned early and
+            the container is unhealthy. An aborted scan emits no `scan complete`
+            line, so neither of the other rules covers it. Check the /input
+            mount and its permissions.
       - alert: CertConverterScanStalled
         expr: |
           absent_over_time({container="cert-converter"} |= `scan complete` [8h])
@@ -117,8 +133,11 @@ groups:
           description: >
             cert-converter emits a `scan complete` line at least every
             FALLBACK_SCAN_HOURS (default 6h). None in 8h while the container is
-            up means the fsnotify watch and the fallback timer are both wedged;
-            certificates silently stop converting. Restart the container.
+            up means either the fsnotify watch and the fallback timer are both
+            wedged, or every scan is aborting early — check for a
+            CertConverterScanAborted alert first, since that one names the
+            /input problem and fires within 15m. If no scan aborted, the loop is
+            wedged: restart the container.
 ```
 
 Thresholds and the `severity` label are starting points; adjust the stall

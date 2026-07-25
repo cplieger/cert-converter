@@ -10,7 +10,6 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/testcerts"
-	"software.sslmate.com/src/go-pkcs12"
 )
 
 // newScanner constructs a Scanner over the given input/output roots with the
@@ -38,29 +37,6 @@ func convertPairToPath(t *testing.T, certPEM, keyPEM []byte, destPath, password 
 	}
 	defer func() { _ = root.Close() }()
 	return convert.PairInRoot(t.Context(), certPEM, keyPEM, root, filepath.Base(destPath), password, enc)
-}
-
-func TestPairInRoot_writes_decodable_pfx_for_matched_pair(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "matched.example.com", "ecdsa")
-	destPath := filepath.Join(dir, "matched.pfx")
-
-	if err := convertPairToPath(t, certPEM, keyPEM, destPath, "pw", convert.EncNameModern2023); err != nil {
-		t.Fatalf("convert.PairInRoot(matched pair) = %v, want nil", err)
-	}
-
-	pfxData, err := os.ReadFile(destPath)
-	if err != nil {
-		t.Fatalf("convert.PairInRoot did not write a readable pfx: %v", err)
-	}
-	_, leaf, _, decErr := pkcs12.DecodeChain(pfxData, "pw")
-	if decErr != nil {
-		t.Fatalf("decode pfx written by convert.PairInRoot: %v", decErr)
-	}
-	if leaf.Subject.CommonName != "matched.example.com" {
-		t.Errorf("convert.PairInRoot wrote leaf CN = %q, want %q", leaf.Subject.CommonName, "matched.example.com")
-	}
 }
 
 func TestPairInRoot_rejects_mismatched_cert_and_key(t *testing.T) {
@@ -232,31 +208,6 @@ func TestScannerRun_records_orphan_crt_without_key(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(outRoot, "orphan.pfx")); statErr == nil {
 		t.Errorf("an orphan .crt produced a pfx; want no output file")
-	}
-}
-
-func TestPairInRoot_carries_ca_chain_into_pfx(t *testing.T) {
-	t.Parallel()
-	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
-	destPath := filepath.Join(t.TempDir(), "chain.pfx")
-
-	if err := convertPairToPath(t, chainPEM, keyPEM, destPath, "pw", convert.EncNameModern2023); err != nil {
-		t.Fatalf("convert.PairInRoot(leaf+CA chain) = %v, want nil", err)
-	}
-
-	pfxData, err := os.ReadFile(destPath)
-	if err != nil {
-		t.Fatalf("convert.PairInRoot did not write a readable pfx: %v", err)
-	}
-	_, leaf, caCerts, decErr := pkcs12.DecodeChain(pfxData, "pw")
-	if decErr != nil {
-		t.Fatalf("decode pfx written by convert.PairInRoot: %v", decErr)
-	}
-	if leaf.Subject.CommonName != "leaf.example.com" {
-		t.Errorf("convert.PairInRoot leaf CN = %q, want %q", leaf.Subject.CommonName, "leaf.example.com")
-	}
-	if len(caCerts) != 1 {
-		t.Errorf("convert.PairInRoot PFX CA count = %d, want 1 (the CA from the chain must be carried into the PFX)", len(caCerts))
 	}
 }
 
@@ -453,7 +404,6 @@ func TestScannerRun_reconverts_cert_recreated_after_removal(t *testing.T) {
 	}
 }
 
-
 // TestScannerRun_regenerates_pfx_when_output_is_not_a_regular_file pins the
 // output-TYPE half of the cache-coherence gate: an unchanged input whose prior
 // PFX has been replaced by a non-regular file must not be reported as an
@@ -496,5 +446,45 @@ func TestScannerRun_regenerates_pfx_when_output_is_not_a_regular_file(t *testing
 	}
 	if res2.Failed != 1 {
 		t.Errorf("second Run Failed = %d, want 1 (a broken output contract must be reported so health goes unhealthy)", res2.Failed)
+	}
+}
+
+// TestScannerRun_counts_non_regular_key_as_failed pins the classification of a
+// sibling key that exists but cannot be read as PEM: root.Stat succeeds, so the
+// pair is not an orphan, while the confined bounded read refuses a non-regular
+// file. That must surface as a conversion failure so health reports it, and it
+// must be retried on the next scan rather than cached as a success.
+func TestScannerRun_counts_non_regular_key_as_failed(t *testing.T) {
+	t.Parallel()
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+	certPEM, _ := testcerts.GenerateSelfSignedCert(t, "badkey.example.com", "ecdsa")
+	if err := os.WriteFile(filepath.Join(certsRoot, "badkey.crt"), certPEM, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A directory in the sibling key's place: it stats fine, so the pair is not
+	// an orphan, but it is not a readable PEM file either.
+	if err := os.Mkdir(filepath.Join(certsRoot, "badkey.key"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	scanner := newScanner(certsRoot, outRoot)
+
+	res1, err := scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("first Run(non-regular key) = %v, want nil (a per-cert failure is not a scan error)", err)
+	}
+	if res1.Failed != 1 || res1.Orphan != 0 || res1.Converted != 0 {
+		t.Fatalf("first Run(non-regular key) = %+v, want Failed 1 Orphan 0 Converted 0", res1)
+	}
+	if _, statErr := os.Stat(filepath.Join(outRoot, "badkey.pfx")); statErr == nil {
+		t.Errorf("Run(non-regular key) wrote a pfx; want no output file")
+	}
+
+	res2, err := scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("second Run(non-regular key) = %v, want nil", err)
+	}
+	if res2.Failed != 1 || res2.Unchanged != 0 {
+		t.Errorf("second Run(non-regular key) = %+v, want Failed 1 Unchanged 0 (a failed pair must be retried, never cached as a success)", res2)
 	}
 }

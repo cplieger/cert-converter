@@ -78,3 +78,58 @@ func TestPickEncoder_never_returns_nil(t *testing.T) {
 		}
 	})
 }
+
+func TestEncoderFor(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		in   convert.EncoderType
+		want *pkcs12.Encoder
+	}{
+		"modern2023":                             {convert.EncNameModern2023, pkcs12.Modern2023},
+		"modern2026":                             {convert.EncNameModern2026, pkcs12.Modern2026},
+		"legacydes":                              {convert.EncNameLegacyDES, pkcs12.LegacyDES},
+		"legacyrc2":                              {convert.EncNameLegacyRC2, pkcs12.LegacyRC2},
+		"unknown name falls back to modern2023":  {convert.EncoderType("modern2029"), pkcs12.Modern2023},
+		"empty name falls back to modern2023":    {convert.EncoderType(""), pkcs12.Modern2023},
+		"raw env alias is not a normalized name": {convert.EncoderType("legacy"), pkcs12.Modern2023},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := convert.EncoderFor(tc.in)
+			if got == nil {
+				t.Fatalf("convert.EncoderFor(%q) = nil, want a non-nil encoder", tc.in)
+			}
+			if got != tc.want {
+				t.Errorf("convert.EncoderFor(%q) = %p, want %p", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEncoderFor_unknown_names_fall_back_to_modern2023 generalises the table:
+// for an arbitrary name, EncoderFor must return one of the four vendor encoders
+// and exactly pkcs12.Modern2023 for anything outside the known set, so a caller
+// can never hand a nil encoder to pkcs12.Encode.
+func TestEncoderFor_unknown_names_fall_back_to_modern2023(t *testing.T) {
+	t.Parallel()
+	known := map[convert.EncoderType]*pkcs12.Encoder{
+		convert.EncNameModern2023: pkcs12.Modern2023,
+		convert.EncNameModern2026: pkcs12.Modern2026,
+		convert.EncNameLegacyDES:  pkcs12.LegacyDES,
+		convert.EncNameLegacyRC2:  pkcs12.LegacyRC2,
+	}
+	rapid.Check(t, func(t *rapid.T) {
+		name := convert.EncoderType(rapid.String().Draw(t, "name"))
+		got := convert.EncoderFor(name)
+		if got == nil {
+			t.Fatalf("convert.EncoderFor(%q) = nil; the documented contract is that it never returns nil", name)
+		}
+		want, isKnown := known[name]
+		if !isKnown {
+			want = pkcs12.Modern2023
+		}
+		if got != want {
+			t.Errorf("convert.EncoderFor(%q) = %p, want %p", name, got, want)
+		}
+	})
+}

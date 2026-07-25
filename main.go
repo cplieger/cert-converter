@@ -25,6 +25,9 @@ const (
 	outputDir    = "/output"
 )
 
+// watchDebounce is the debounce window for the watcher.
+const watchDebounce = 2 * time.Second
+
 // healthyAfterScan reports whether a completed scan should keep the container
 // healthy. Health answers one operational question — "should an orchestrator
 // restart this container?" — so it is driven solely by conversion failures,
@@ -38,9 +41,6 @@ const (
 func healthyAfterScan(r process.ScanResult) bool {
 	return r.Failed == 0
 }
-
-// watchDebounce is the debounce window for the watcher.
-const watchDebounce = 2 * time.Second
 
 // scanAndSetHealth runs one scan with the scanner's configured input and output
 // roots and flips the health marker via healthyAfterScan (zero conversion
@@ -75,7 +75,7 @@ func logPasswordStatus(password string) string {
 	switch {
 	case password == "":
 		slog.Warn("PFX_PASSWORD is empty; generated PFX files protect the private key with an empty password",
-			"remediation", "set PFX_PASSWORD")
+			"remediation", "set PFX_PASSWORD, or point PFX_PASSWORD_FILE at a mounted secret")
 		return "empty"
 	case strings.TrimSpace(password) == "":
 		slog.Warn("PFX_PASSWORD is whitespace-only; generated PFX files are protected by that whitespace string, which is effectively no protection",
@@ -95,29 +95,41 @@ func main() {
 // signal-context stop, the health-marker removal) actually runs on the failure
 // paths too.
 func run() int {
-	rawLevel := os.Getenv("LOG_LEVEL")
-	lvl, ok := slogx.ParseLevel(rawLevel, slog.LevelInfo)
+	lvl, rawLevel, ok := config.LogLevel()
 	slogx.Setup(slogx.Options{Level: lvl})
 	if !ok {
 		slog.Warn("invalid LOG_LEVEL, using default", "value", rawLevel, "default", "info")
 	}
 
-	if len(os.Args) > 1 && os.Args[1] != "health" {
-		// Not an error (the watcher takes no arguments), but a mistyped probe
-		// invocation would otherwise silently start a second watcher.
-		slog.Warn("unrecognized argument, starting the watcher",
-			"argument", os.Args[1], "known_subcommands", "health")
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "health":
+			// The fallback rescan is the marker's guaranteed refresh floor
+			// (fs events refresh it sooner), so a marker older than 3 fallback
+			// intervals means the watch loop is wedged and a restart fixes it.
+			// FALLBACK_SCAN_HOURS=0/false disables the fallback and with it
+			// the deadline (WithMaxAge(0) is a no-op): watch-only mode has no
+			// guaranteed refresh cadence to hold the marker to.
+			// RunProbe exits the process, so this never falls through to the
+			// watcher below.
+			health.RunProbe(health.DefaultPath,
+				health.WithMaxAge(3*config.FallbackInterval()))
+		default:
+			// Not an error (the watcher takes no arguments), but a mistyped probe
+			// invocation would otherwise silently start a second watcher.
+			slog.Warn("unrecognized argument, starting the watcher",
+				"argument", os.Args[1], "known_subcommands", "health")
+		}
 	}
-	if len(os.Args) > 1 && os.Args[1] == "health" {
-		// The fallback rescan is the marker's guaranteed refresh floor
-		// (fs events refresh it sooner), so a marker older than 3 fallback
-		// intervals means the watch loop is wedged and a restart fixes it.
-		// FALLBACK_SCAN_HOURS=0/false disables the fallback and with it
-		// the deadline (WithMaxAge(0) is a no-op): watch-only mode has no
-		// guaranteed refresh cadence to hold the marker to.
-		health.RunProbe(health.DefaultPath,
-			health.WithMaxAge(3*config.FallbackInterval()))
-	}
+
+	// Clear any marker left by a previous run BEFORE the first failure exit:
+	// /tmp/.healthy lives in the container's writable layer and survives a
+	// restart, so an early return here would leave a stale healthy marker for a
+	// process that never validated its configuration. The health subcommand has
+	// already exited by this point, so the probe is unaffected.
+	marker := health.NewMarker(health.DefaultPath)
+	marker.Set(false)
+	defer marker.Cleanup()
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -137,10 +149,6 @@ func run() int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	marker := health.NewMarker(health.DefaultPath)
-	marker.Set(false)
-	defer marker.Cleanup()
 
 	cache := convert.NewHashCache()
 	scanner := process.New(cache, process.Options{

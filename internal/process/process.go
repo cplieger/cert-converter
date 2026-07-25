@@ -86,16 +86,19 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	reapStaleTemps(ctx, outHandle)
 
 	sw := &scanWalk{
-		scanner:   s,
+		cache:     s.cache,
 		root:      root,
 		outHandle: outHandle,
-		certsRoot: certsRoot,
 		password:  s.opts.Password,
 		enc:       s.opts.Encoder,
 		seen:      make(map[string]struct{}),
 	}
-	walkErr := filepath.WalkDir(certsRoot, func(path string, d fs.DirEntry, err error) error {
-		return sw.visit(ctx, path, d, err)
+	// Enumerate the input tree THROUGH the root handle, exactly as the
+	// /output stale-temp sweep does: every step is an openat-relative
+	// syscall and every path handed downstream is root-relative, so no
+	// ambient absolute path exists for a later read to reach for.
+	walkErr := fs.WalkDir(root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
+		return sw.visit(ctx, rel, d, err)
 	})
 
 	// A non-nil walkErr means WalkDir aborted before visiting every entry
@@ -146,33 +149,37 @@ func isStaleTempName(name string) bool {
 // reapStaleTemp handles one candidate entry of the reapStaleTemps walk: it
 // filters non-candidates, re-checks the entry through the root before unlinking
 // (only a regular file older than cutoff is a reclaimable orphan, and Lstat
-// never follows a symlink planted under the temp's name) and removes it,
-// reporting whether a file was reaped. Every operation stays root-relative
-// through outHandle, so the confinement invariant is identical to doing the work
-// inline in the callback.
-func reapStaleTemp(outHandle *os.Root, rel string, d fs.DirEntry, cutoff time.Time) bool {
+// never follows a symlink planted under the temp's name) and removes it. Every
+// operation stays root-relative through outHandle, so the confinement invariant
+// is identical to doing the work inline in the callback. It reports whether a
+// file was reaped and whether a non-benign unlink failure occurred (the caller
+// aggregates both).
+func reapStaleTemp(outHandle *os.Root, rel string, d fs.DirEntry, cutoff time.Time) (didRemove, didFail bool) {
 	if d.IsDir() || !isStaleTempName(d.Name()) {
-		return false
+		return false, false
 	}
 	fi, err := outHandle.Lstat(rel)
 	if err != nil {
 		slog.Debug("skipping unstattable temp during cleanup", "path", rel, "error", err)
-		return false
+		return false, false
 	}
 	if !fi.Mode().IsRegular() || fi.ModTime().After(cutoff) {
-		return false
+		return false, false
 	}
 	if err := outHandle.Remove(rel); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			// The temp vanished between the Lstat and the unlink (a co-mounting
 			// reaper, or the write it belonged to finishing its rename). Benign,
 			// exactly as atomicfile's own CleanupStaleTemps treats it.
-			return false
+			return false, false
 		}
-		slog.Warn("stale temp cleanup failed", "path", rel, "error", err)
-		return false
+		// One unlink failure is not actionable on its own; the aggregate Warn
+		// in reapStaleTemps carries the operator signal, matching
+		// atomicfile.CleanupStaleTemps' per-entry Debug policy.
+		slog.Debug("stale temp remove failed", "path", rel, "error", err)
+		return false, true
 	}
-	return true
+	return true, false
 }
 
 // reapStaleTemps removes PFX temp files orphaned by an interrupted atomic write
@@ -195,35 +202,71 @@ func reapStaleTemp(outHandle *os.Root, rel string, d fs.DirEntry, cutoff time.Ti
 // entries instead of traversing (and unlinking across) a large tree while
 // SIGTERM handling waits.
 func reapStaleTemps(ctx context.Context, outHandle *os.Root) {
-	total := 0
-	cutoff := time.Now().Add(-staleTempAge)
+	tr := &tempReap{outHandle: outHandle, cutoff: time.Now().Add(-staleTempAge)}
 	walkErr := fs.WalkDir(outHandle.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err != nil {
-			if rel == "." {
-				return err
-			}
-			slog.Debug("skipping unreadable output path during temp cleanup", "path", rel, "error", err)
-			return nil
-		}
-		if reapStaleTemp(outHandle, rel, d, cutoff) {
-			total++
-		}
-		return nil
+		return tr.visit(ctx, rel, d, err)
 	})
+	tr.logOutcome(walkErr)
+}
+
+// tempReap carries the confined output root, the staleness cutoff and the
+// mutable accounting for one reapStaleTemps walk (files reaped, non-benign
+// unlink failures). Hoisting the WalkDir callback onto this struct keeps
+// reapStaleTemps flat, mirroring scanWalk's role for the input walk.
+type tempReap struct {
+	outHandle *os.Root
+	cutoff    time.Time
+	total     int
+	failed    int
+}
+
+// visit is the reapStaleTemps WalkDir callback. A cancelled context aborts the
+// sweep between entries; a walk error at the root (".") aborts it too, while an
+// error below the root is logged and skipped. Every surviving entry goes to
+// reapStaleTemp, whose two outcomes are aggregated here.
+func (tr *tempReap) visit(ctx context.Context, rel string, d fs.DirEntry, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil {
+		if rel == "." {
+			return err
+		}
+		slog.Debug("skipping unreadable output path during temp cleanup", "path", rel, "error", err)
+		return nil
+	}
+	removed, didFail := reapStaleTemp(tr.outHandle, rel, d, tr.cutoff)
+	if removed {
+		tr.total++
+	}
+	if didFail {
+		tr.failed++
+	}
+	return nil
+}
+
+// logOutcome emits the end-of-sweep logs: the walk error (Debug for a shutdown
+// cancellation, Warn otherwise), the reclaimed-orphan count, and the count of
+// temps that could not be removed.
+func (tr *tempReap) logOutcome(walkErr error) {
 	if walkErr != nil {
 		if errors.Is(walkErr, context.Canceled) || errors.Is(walkErr, context.DeadlineExceeded) {
 			// Shutdown, not an operator-actionable cleanup failure; the input
 			// walk's own context check reports the cancellation to the caller.
-			slog.Debug("stale temp cleanup cancelled during shutdown", "dir", outHandle.Name(), "error", walkErr)
+			slog.Debug("stale temp cleanup cancelled during shutdown", "dir", tr.outHandle.Name(), "error", walkErr)
 		} else {
-			slog.Warn("stale temp cleanup failed", "dir", outHandle.Name(), "error", walkErr)
+			slog.Warn("stale temp cleanup failed", "dir", tr.outHandle.Name(), "error", walkErr)
 		}
 	}
-	if total > 0 {
-		slog.Debug("reaped stale temp files", "dir", outHandle.Name(), "count", total)
+	if tr.total > 0 {
+		// A reclaimed orphan is evidence of an earlier interrupted write (a
+		// crash or a kill between temp-write and rename), so it belongs in the
+		// default-level log rather than only under LOG_LEVEL=debug.
+		slog.Info("reaped stale temp files", "dir", tr.outHandle.Name(), "count", tr.total)
+	}
+	if tr.failed > 0 {
+		slog.Warn("some stale output temps could not be removed", "dir", tr.outHandle.Name(),
+			"count", tr.failed, "remediation", "check /output ownership and permissions for the UID in user:")
 	}
 }
 
@@ -232,39 +275,39 @@ func reapStaleTemps(ctx context.Context, outHandle *os.Root) {
 // unreadable sub-paths, and the set of cert paths seen (for cache pruning).
 // Hoisting the WalkDir callback onto this struct keeps Scanner.Run flat.
 type scanWalk struct {
-	scanner    *Scanner
+	cache      *convert.HashCache
 	root       *os.Root
 	outHandle  *os.Root
 	seen       map[string]struct{}
 	enc        convert.EncoderType
-	certsRoot  string
 	password   string
 	results    []conversionStatus
 	unreadable int
 }
 
 // visit is the WalkDir callback. The context is checked before and after each
-// entry: a walk error at the root, or a cancelled context, aborts the walk; an
-// error below the root marks one unreadable sub-path and continues. Directories
+// entry: a walk error at the root ("."), or a cancelled context, aborts the
+// walk; an error below the root marks one unreadable sub-path and continues.
+// Every path is root-relative (the walk runs through the *os.Root). Directories
 // and non-.crt files are ignored; every .crt entry is recorded as seen and
 // dispatched to convertEntry.
-func (sw *scanWalk) visit(ctx context.Context, path string, d fs.DirEntry, err error) error {
+func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	if err != nil {
-		if path == sw.certsRoot {
+		if rel == "." {
 			return err
 		}
-		slog.Warn("skipping unreadable path", "path", path, "error", err)
+		slog.Warn("skipping unreadable path", "path", rel, "error", err)
 		sw.unreadable++
 		return nil
 	}
-	if d.IsDir() || !strings.HasSuffix(path, ".crt") {
+	if d.IsDir() || !strings.HasSuffix(rel, ".crt") {
 		return nil
 	}
-	sw.seen[path] = struct{}{}
-	sw.results = append(sw.results, sw.convertEntry(ctx, path))
+	sw.seen[rel] = struct{}{}
+	sw.results = append(sw.results, sw.convertEntry(ctx, rel))
 	// A cancellation that landed *during* the conversion above already turned
 	// that entry into statusFailed (the bounded read and the atomic write both
 	// return ctx.Err()). Re-check here so the walk aborts and Run reports the
@@ -315,6 +358,15 @@ func logEntryFailure(msg, logPath string, err error) {
 	slog.Error(msg, "path", logPath, "error", err)
 }
 
+// failEntry records one per-entry failure: it logs via logEntryFailure, drops
+// the cached fingerprint for cacheKey so the next scan retries the pair, and
+// returns the failed status for the caller to propagate.
+func (sw *scanWalk) failEntry(cacheKey, logPath, msg string, err error) conversionStatus {
+	logEntryFailure(msg, logPath, err)
+	sw.cache.Invalidate(cacheKey)
+	return statusFailed
+}
+
 // convertEntry resolves the outcome for one .crt entry under certsRoot. It
 // reads the cert and its sibling .key exactly once through root, fingerprints
 // them, and either skips (input unchanged and the prior PFX still present),
@@ -324,18 +376,8 @@ func logEntryFailure(msg, logPath string, err error) {
 // output tree cannot redirect the private-key-bearing PFX outside it. It
 // invalidates the cache on every failure path so the next scan retries. All
 // per-cert logs use the certsRoot-relative path for a stable, non-leaky
-// identifier (the absolute path appears only when the relative path cannot be
-// derived).
-func (sw *scanWalk) convertEntry(ctx context.Context, path string) conversionStatus {
-	rel, relErr := filepath.Rel(sw.certsRoot, path)
-	if relErr != nil {
-		// Without a root-relative key the file cannot be read through root;
-		// fail the entry. rel is unavailable, so this one log uses the
-		// absolute path.
-		slog.Error("failed to compute relative path", "path", path, "error", relErr)
-		sw.scanner.cache.Invalidate(path)
-		return statusFailed
-	}
+// identifier.
+func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStatus {
 	logPath := rel
 	keyRel := strings.TrimSuffix(rel, ".crt") + ".key"
 
@@ -355,36 +397,28 @@ func (sw *scanWalk) convertEntry(ctx context.Context, path string) conversionSta
 
 	certPEM, err := convert.ReadBoundedFromRoot(ctx, sw.root, rel, convert.MaxFileSize)
 	if err != nil {
-		logEntryFailure("failed to read certificate", logPath, err)
-		sw.scanner.cache.Invalidate(path)
-		return statusFailed
+		return sw.failEntry(rel, logPath, "failed to read certificate", err)
 	}
 	keyPEM, err := convert.ReadBoundedFromRoot(ctx, sw.root, keyRel, convert.MaxFileSize)
 	if err != nil {
-		logEntryFailure("failed to read private key", logPath, err)
-		sw.scanner.cache.Invalidate(path)
-		return statusFailed
+		return sw.failEntry(rel, logPath, "failed to read private key", err)
 	}
 
 	pfxRel := strings.TrimSuffix(rel, ".crt") + ".pfx"
 
-	if sw.outputIsCurrent(path, pfxRel, logPath, certPEM, keyPEM) {
+	if sw.outputIsCurrent(rel, pfxRel, logPath, certPEM, keyPEM) {
 		return statusUnchanged
 	}
 
 	if destDir := filepath.Dir(pfxRel); destDir != "." {
 		if err := sw.outHandle.MkdirAll(destDir, 0o750); err != nil {
-			slog.Error("failed to create output directory", "path", destDir, "error", err)
-			sw.scanner.cache.Invalidate(path)
-			return statusFailed
+			return sw.failEntry(rel, destDir, "failed to create output directory", err)
 		}
 	}
 
 	slog.Debug("converting cert pair", "path", logPath)
 	if err := convert.PairInRoot(ctx, certPEM, keyPEM, sw.outHandle, pfxRel, sw.password, sw.enc); err != nil {
-		logEntryFailure("conversion failed", logPath, err)
-		sw.scanner.cache.Invalidate(path)
-		return statusFailed
+		return sw.failEntry(rel, logPath, "conversion failed", err)
 	}
 
 	slog.Info("wrote pfx", "path", pfxRel)
@@ -399,8 +433,18 @@ func (sw *scanWalk) convertEntry(ctx context.Context, path string) conversionSta
 // skip-only scan still counts as a healthy cycle, masking the missing file from
 // monitoring; hence the output stat, which forces a reconvert when the prior
 // output is gone or is no longer a usable PFX file.
-func (sw *scanWalk) outputIsCurrent(path, pfxRel, logPath string, certPEM, keyPEM []byte) bool {
-	if sw.scanner.cache.Changed(path, convert.Fingerprint(certPEM, keyPEM)) {
+//
+// It is a query with a side effect: the cache.Changed call RECORDS the new
+// fingerprint whenever the input differs (that is how skip-unchanged works), so
+// a false result carries a caller obligation — every failure path after it must
+// Invalidate the same key, or the next scan would treat the failed pair as
+// already current and never retry it. convertEntry discharges that obligation
+// on all of its failure exits; a new exit added between here and the successful
+// write must do the same. Calling this twice for one entry, or calling it
+// without following through to a conversion, breaks the cache-coherence
+// contract for that pair.
+func (sw *scanWalk) outputIsCurrent(rel, pfxRel, logPath string, certPEM, keyPEM []byte) bool {
+	if sw.cache.Changed(rel, convert.Fingerprint(certPEM, keyPEM)) {
 		return false
 	}
 	// Lstat, not Stat: a symlink planted under the output name must not be

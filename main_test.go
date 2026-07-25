@@ -331,6 +331,52 @@ func TestConvertToPFX_unwritable_dest(t *testing.T) {
 	}
 }
 
+// --- Tests: logPasswordStatus ---
+
+// TestLogPasswordStatus pins the startup password-status decision: the returned
+// status string and the WARN branch must agree, and a real password must produce
+// no log record at all (the value is a secret). slog.Default is process-global,
+// so this test is deliberately serial (no t.Parallel).
+func TestLogPasswordStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		password    string
+		wantStatus  string
+		wantWarnSub string
+	}{
+		{"empty reports empty", "", "empty", "PFX_PASSWORD is empty"},
+		{"single space is whitespace-only", " ", "whitespace-only", "PFX_PASSWORD is whitespace-only"},
+		{"tab and newline are whitespace-only", "\t\n ", "whitespace-only", "PFX_PASSWORD is whitespace-only"},
+		{"real value is configured", "s3cret", "configured", ""},
+		{"padded value is configured", "  s3cret  ", "configured", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := capture.Default(t)
+
+			got := logPasswordStatus(tc.password)
+
+			if got != tc.wantStatus {
+				t.Errorf("logPasswordStatus(%q) = %q, want %q", tc.password, got, tc.wantStatus)
+			}
+			if tc.wantWarnSub == "" {
+				if logs.Len() != 0 {
+					t.Errorf("logPasswordStatus(%q) logged %v, want no log records for a real password",
+						tc.password, logs.Messages())
+				}
+				return
+			}
+			if n := logs.CountLevel(slog.LevelWarn, tc.wantWarnSub); n != 1 {
+				t.Errorf("logPasswordStatus(%q) logged %d WARN records matching %q, want 1 (logs %v)",
+					tc.password, n, tc.wantWarnSub, logs.Messages())
+			}
+			if !logs.AttrContains(tc.wantWarnSub, "remediation", "PFX_PASSWORD") {
+				t.Errorf("logPasswordStatus(%q) WARN is missing an actionable remediation attr (logs %v)",
+					tc.password, logs.Messages())
+			}
+		})
+	}
+}
+
 // --- Tests: runAndSetHealth ---
 
 // newTestMarker constructs a marker rooted in a fresh TempDir so tests

@@ -33,6 +33,17 @@ func FuzzParseCertChain(f *testing.F) {
 	validPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	f.Add(validPEM)
 	f.Add([]byte("not a pem"))
+	// A declaration encoding/pem drops silently (BEGIN line, no END) must be
+	// rejected rather than yielding a chain shorter than the file declares.
+	f.Add(append(append([]byte{}, validPEM...), []byte("-----BEGIN CERTIFICATE-----\nZm9v\n")...))
+	// Prose that merely mentions the marker mid-line is not a declaration, so a
+	// valid chain beside it must still parse.
+	f.Add(append(append([]byte{}, validPEM...), []byte("see -----BEGIN CERTIFICATE----- above\n")...))
+	// Two concatenated certs whose join lost its newline: pem.Decode drops the
+	// second block, and the declaration count must notice.
+	f.Add(append(append([]byte{}, bytes.TrimRight(validPEM, "\n")...), validPEM...))
+	// CRLF armour must count identically to LF armour.
+	f.Add(bytes.ReplaceAll(validPEM, []byte("\n"), []byte("\r\n")))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		certs, err := convert.ParseCertChain(data)
@@ -42,6 +53,7 @@ func FuzzParseCertChain(f *testing.F) {
 		if len(certs) == 0 {
 			t.Fatal("no error but zero certs returned")
 		}
+		var reEncoded []byte
 		for i, c := range certs {
 			if len(c.Raw) == 0 {
 				t.Fatalf("cert[%d].Raw is empty", i)
@@ -53,6 +65,23 @@ func FuzzParseCertChain(f *testing.F) {
 			}
 			if !bytes.Equal(reparsed.Raw, c.Raw) {
 				t.Fatalf("cert[%d] re-parsed Raw differs", i)
+			}
+			reEncoded = append(reEncoded, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Raw})...)
+		}
+		// Chain-level round trip: a chain ParseCertChain accepts must survive
+		// its own canonical re-encoding with the same certificates in the same
+		// order. This pins the declared-block accounting end to end, which the
+		// per-certificate checks above cannot see.
+		reParsed, reErr := convert.ParseCertChain(reEncoded)
+		if reErr != nil {
+			t.Fatalf("re-parse of the re-encoded chain of %d cert(s) failed: %v", len(certs), reErr)
+		}
+		if len(reParsed) != len(certs) {
+			t.Fatalf("re-parsed chain has %d cert(s), want %d", len(reParsed), len(certs))
+		}
+		for i := range certs {
+			if !bytes.Equal(reParsed[i].Raw, certs[i].Raw) {
+				t.Fatalf("cert[%d] changed across the chain round trip", i)
 			}
 		}
 	})

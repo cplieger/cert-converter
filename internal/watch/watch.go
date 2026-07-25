@@ -74,7 +74,13 @@ func (w *Watcher) Run(ctx context.Context) {
 	w.watchLoop(ctx, watcher)
 }
 
-// addWatchDirs recursively adds all directories under root to the watcher.
+// addWatchDirs recursively adds all directories under root to the watcher. Only
+// a failure on root itself is fatal (Run uses it to fall back to polling); a
+// directory below root that cannot be watched — unreadable to this UID, or a
+// watch descriptor the kernel refuses once fs.inotify.max_user_watches is
+// exhausted — is warned about and skipped, exactly as an unreadable sub-path
+// is, so one mis-permissioned certificate directory cannot cost the whole tree
+// its real-time watch.
 func (w *Watcher) addWatchDirs(watcher *fsnotify.Watcher, root string) error {
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -85,7 +91,16 @@ func (w *Watcher) addWatchDirs(watcher *fsnotify.Watcher, root string) error {
 			return nil
 		}
 		if d.IsDir() {
-			return watcher.Add(path)
+			addErr := watcher.Add(path)
+			if addErr == nil {
+				return nil
+			}
+			if path == root {
+				return addErr
+			}
+			slog.Warn("skipping unwatchable directory; renewals under it are only picked up by the fallback rescan",
+				"path", path, "error", addErr)
+			return nil
 		}
 		return nil
 	})
@@ -111,11 +126,15 @@ func (w *Watcher) handleFsEvent(watcher *fsnotify.Watcher, event fsnotify.Event)
 	slog.Debug("fs event", "op", event.Op.String(), "path", event.Name)
 	switch {
 	case event.Has(fsnotify.Create):
-		// Only a directory needs watches added. Stat first so a transient file (an
-		// atomic-write temp created and renamed away before this event is handled)
-		// cannot produce a spurious "failed to watch" WARN from WalkDir failing to
-		// lstat a path that is already gone.
-		if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+		// Only a directory needs watches added. Lstat, for two reasons: a transient
+		// file (an atomic-write temp created and renamed away before this event is
+		// handled) cannot produce a spurious "failed to watch" WARN from WalkDir
+		// failing to lstat a path that is already gone; and a SYMLINK to a directory
+		// is not followed. Neither addWatchDirs nor the scanner's filepath.WalkDir
+		// descends a symlinked directory, so watching through one would register
+		// inotify watches on a tree outside /input whose certs can never be
+		// converted — and a symlink to a large tree would burn the watch quota.
+		if info, err := os.Lstat(event.Name); err == nil && info.IsDir() {
 			if addErr := w.addWatchDirs(watcher, event.Name); addErr != nil {
 				slog.Warn("failed to watch new directory subtree", "path", event.Name, "error", addErr)
 			}
@@ -153,12 +172,8 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) {
 			return
 
 		case event, ok := <-watcher.Events:
-			if !ok {
-				slog.Error("fsnotify events channel closed, watcher stopping; process will exit and restart")
+			if !w.handleEventRecv(watcher, st, event, ok) {
 				return
-			}
-			if w.handleFsEvent(watcher, event) {
-				st.scheduleScan()
 			}
 
 		case <-st.debounceTimer.C:
@@ -168,13 +183,48 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) {
 			st.runFallbackScan(ctx)
 
 		case err, ok := <-watcher.Errors:
-			if !ok {
-				slog.Error("fsnotify errors channel closed, watcher stopping; process will exit and restart")
+			if !w.handleErrorRecv(watcher, st, err, ok) {
 				return
 			}
-			st.handleWatcherError(err)
 		}
 	}
+}
+
+// handleEventRecv processes one receive from the watcher's event channel and
+// reports whether the loop should keep running. A closed channel means the
+// watcher is dead, so the loop must exit (the process then restarts); otherwise
+// an event classified as interesting arms the debounced rescan.
+func (w *Watcher) handleEventRecv(watcher *fsnotify.Watcher, st *watchState, event fsnotify.Event, ok bool) bool {
+	if !ok {
+		slog.Error("fsnotify events channel closed, watcher stopping; process will exit and restart")
+		return false
+	}
+	if w.handleFsEvent(watcher, event) {
+		st.scheduleScan()
+	}
+	return true
+}
+
+// handleErrorRecv processes one receive from the watcher's error channel and
+// reports whether the loop should keep running. A closed channel means the
+// watcher is dead, so the loop must exit; an event-queue overflow additionally
+// re-syncs the watch set.
+func (w *Watcher) handleErrorRecv(watcher *fsnotify.Watcher, st *watchState, err error, ok bool) bool {
+	if !ok {
+		slog.Error("fsnotify errors channel closed, watcher stopping; process will exit and restart")
+		return false
+	}
+	if st.handleWatcherError(err) {
+		// The dropped events may have included the Create of a new
+		// directory, which would otherwise stay unwatched for the rest of
+		// the process's life. watcher.Add is idempotent for a directory
+		// already in the watch set, so re-walking the tree only
+		// re-attaches what the overflow lost.
+		if addErr := w.addWatchDirs(watcher, w.root); addErr != nil {
+			slog.Warn("failed to re-sync the watch set after an event-queue overflow", "error", addErr)
+		}
+	}
+	return true
 }
 
 // watchState carries the mutable accounting for one watchLoop run: the pending
@@ -249,15 +299,18 @@ func (st *watchState) runFallbackScan(ctx context.Context) {
 }
 
 // handleWatcherError reacts to an fsnotify error: an event-queue overflow
-// dropped events, so force a rescan to recover any missed renewal; any other
-// error is logged and the loop continues.
-func (st *watchState) handleWatcherError(err error) {
+// dropped events, so force a rescan to recover any missed renewal and report
+// true so the caller also re-syncs the watch set (a dropped directory Create
+// would otherwise leave that subtree unwatched until the process restarts); any
+// other error is logged, the loop continues, and it reports false.
+func (st *watchState) handleWatcherError(err error) bool {
 	if errors.Is(err, fsnotify.ErrEventOverflow) {
 		slog.Warn("fsnotify event queue overflowed; events were dropped, forcing a rescan to recover any missed renewal", "error", err)
 		st.scheduleScan()
-		return
+		return true
 	}
 	slog.Warn("watcher error", "error", err)
+	return false
 }
 
 // pollLoopWithUpgrade polls on the fallback interval and attempts to
@@ -282,16 +335,22 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) {
 		case <-ticker.C:
 			slog.Debug("poll scan triggered", "interval", w.fallback)
 			w.onChange(ctx)
-			if fw, err := fsnotify.NewWatcher(); err == nil {
-				if addErr := w.addWatchDirs(fw, w.root); addErr == nil {
-					slog.Info("fsnotify recovered, upgrading from poll to watch",
-						"directories", fw.WatchList())
-					w.watchLoop(ctx, fw)
-					fw.Close()
-					return
-				}
-				fw.Close()
+			fw, err := fsnotify.NewWatcher()
+			if err != nil {
+				slog.Debug("fsnotify still unavailable, staying in poll mode", "error", err)
+				continue
 			}
+			if addErr := w.addWatchDirs(fw, w.root); addErr != nil {
+				slog.Debug("fsnotify available but the watch set could not be rebuilt, staying in poll mode",
+					"error", addErr)
+				fw.Close()
+				continue
+			}
+			slog.Info("fsnotify recovered, upgrading from poll to watch",
+				"directories", fw.WatchList())
+			w.watchLoop(ctx, fw)
+			fw.Close()
+			return
 		}
 	}
 }

@@ -177,3 +177,33 @@ func TestScannerRun_reaps_only_exact_stale_temp_names(t *testing.T) {
 		})
 	}
 }
+
+// TestScannerRun_spares_a_directory_wearing_a_stale_temp_name pins the
+// non-regular-file half of the sweep's eligibility check: only a regular file is
+// a reclaimable atomicfile orphan, so an aged directory whose name has the exact
+// temp shape must survive even though Remove would succeed on it while empty.
+func TestScannerRun_spares_a_directory_wearing_a_stale_temp_name(t *testing.T) {
+	t.Parallel()
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+	lookalike := filepath.Join(outRoot, ".atomicfile-424242.tmp")
+	if err := os.Mkdir(lookalike, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(lookalike, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := newScanner(certsRoot, outRoot).Run(t.Context()); err != nil {
+		t.Fatalf("Run = %v, want nil", err)
+	}
+
+	fi, err := os.Lstat(lookalike)
+	if err != nil {
+		t.Fatalf("os.Lstat(%q) = %v, want nil (only a regular file is a reclaimable atomicfile temp)", lookalike, err)
+	}
+	if !fi.IsDir() {
+		t.Errorf("os.Lstat(%q) mode = %v, want the directory left untouched", lookalike, fi.Mode())
+	}
+}

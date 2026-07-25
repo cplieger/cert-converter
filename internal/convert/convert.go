@@ -25,12 +25,14 @@ const MaxFileSize = 10 << 20
 
 // PEM block type constants.
 const (
-	PEMTypeCertificate         = "CERTIFICATE"
-	PEMTypePrivateKey          = "PRIVATE KEY"
-	PEMTypeRSAPrivateKey       = "RSA PRIVATE KEY"
-	PEMTypeECPrivateKey        = "EC PRIVATE KEY"
-	PEMTypeEncryptedPrivateKey = "ENCRYPTED PRIVATE KEY"
+	pemTypeCertificate         = "CERTIFICATE"
+	pemTypePrivateKey          = "PRIVATE KEY"
+	pemTypeRSAPrivateKey       = "RSA PRIVATE KEY"
+	pemTypeECPrivateKey        = "EC PRIVATE KEY"
+	pemTypeEncryptedPrivateKey = "ENCRYPTED PRIVATE KEY"
 )
+
+// --- Confined bounded input reads ---
 
 // ReadBoundedFromRoot opens rel within root and reads it under a size limit,
 // confining the read to root's tree: a symlink or ".." component in rel can
@@ -60,6 +62,8 @@ func ReadBoundedFromRoot(ctx context.Context, root *os.Root, rel string, limit i
 	return atomicfile.ReadBoundedFile(ctx, f, limit)
 }
 
+// --- Certificate chain parsing ---
+
 // ParseCertChain decodes all CERTIFICATE PEM blocks from pemBytes, returning
 // them in order. Blocks of any other type (the private key of a combined
 // cert+key file, for instance) are skipped. It returns an error if no
@@ -78,7 +82,7 @@ func ParseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
 		if block == nil {
 			break
 		}
-		if block.Type != PEMTypeCertificate {
+		if block.Type != pemTypeCertificate {
 			skipped++
 			continue
 		}
@@ -109,17 +113,24 @@ var certBeginMarker = []byte("-----BEGIN CERTIFICATE-----")
 // recognises them: a marker declares a block only when it occupies a complete
 // line, so the same text embedded in surrounding prose (which pem.Decode
 // ignores entirely) is not counted and cannot make a valid chain look
-// malformed. Trailing carriage returns, spaces and tabs are stripped first,
-// mirroring pem's own line handling so CRLF input counts identically.
+// malformed. Line endings are normalised exactly as pem's own getLine does —
+// the line terminator, then at most ONE trailing carriage return, then trailing
+// spaces and tabs — so CRLF input counts identically and a line pem does NOT
+// accept as a declaration (a doubled "\r\r", or a "\r" followed by a space) is
+// not counted either.
 func countDeclaredCertBlocks(pemBytes []byte) int {
 	var n int
-	for _, line := range bytes.Split(pemBytes, []byte("\n")) {
-		if bytes.Equal(bytes.TrimRight(line, " \t\r"), certBeginMarker) {
+	for line := range bytes.Lines(pemBytes) {
+		line = bytes.TrimSuffix(line, []byte("\n"))
+		line = bytes.TrimRight(bytes.TrimSuffix(line, []byte("\r")), " \t")
+		if bytes.Equal(line, certBeginMarker) {
 			n++
 		}
 	}
 	return n
 }
+
+// --- Private key parsing ---
 
 // ParsePrivateKey extracts a private key from PEM data, trying PKCS8
 // first, then falling back to PKCS1 (RSA) and SEC1 (EC) formats.
@@ -144,7 +155,7 @@ func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 		}
 
 		switch block.Type {
-		case PEMTypePrivateKey, PEMTypeRSAPrivateKey, PEMTypeECPrivateKey:
+		case pemTypePrivateKey, pemTypeRSAPrivateKey, pemTypeECPrivateKey:
 			if isEncryptedPEMBlock(block) {
 				sawEncrypted = true
 				continue
@@ -157,7 +168,7 @@ func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 				continue
 			}
 			return key, nil
-		case PEMTypeEncryptedPrivateKey:
+		case pemTypeEncryptedPrivateKey:
 			sawEncrypted = true
 		default:
 			skipped++
@@ -215,7 +226,7 @@ func parsePrivateKeyBlock(block *pem.Block) (crypto.PrivateKey, error) {
 		case *rsa.PrivateKey, *ecdsa.PrivateKey, ed25519.PrivateKey:
 			return key, nil
 		default:
-			return nil, errors.New("unsupported private key type in PKCS8 container")
+			return nil, fmt.Errorf("unsupported private key type in PKCS8 container: %T (supported: RSA, ECDSA, Ed25519)", key)
 		}
 	}
 
@@ -233,14 +244,16 @@ func parsePrivateKeyBlock(block *pem.Block) (crypto.PrivateKey, error) {
 	// which would point the operator at the wrong encoding.
 	parseErr := pkcs8Err
 	switch block.Type {
-	case PEMTypeRSAPrivateKey:
+	case pemTypeRSAPrivateKey:
 		parseErr = pkcs1Err
-	case PEMTypeECPrivateKey:
+	case pemTypeECPrivateKey:
 		parseErr = sec1Err
 	}
 	return nil, fmt.Errorf("failed to parse private key from %s block (tried PKCS8, PKCS1, SEC1): %w",
 		block.Type, parseErr)
 }
+
+// --- Confined PFX encoding and write ---
 
 // toPFXInRoot encodes a private key, leaf certificate, and optional CA chain as
 // PKCS#12 and writes the result atomically under root's tree, so a symlink

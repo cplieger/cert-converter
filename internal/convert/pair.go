@@ -52,7 +52,26 @@ func parseAndMatch(certPEM, keyPEM []byte) (leaf *x509.Certificate, caCerts []*x
 		return nil, nil, nil, fmt.Errorf("leaf certificate public key type %T cannot be verified against the private key", leaf.PublicKey)
 	}
 	if !matcher.Equal(signer.Public()) {
-		return nil, nil, nil, errors.New("leaf certificate public key does not match the private key")
+		return nil, nil, nil, leafKeyMismatchError(chain, signer)
 	}
 	return leaf, caCerts, privKey, nil
+}
+
+// leafKeyMismatchError builds the leaf/key mismatch error. When a LATER
+// certificate in the chain does match the private key, the chain was
+// concatenated with the leaf last (a CA bundle pasted root-first is the common
+// cause), so the error names that instead of leaving the operator to inspect a
+// key file that is in fact correct. The base sentence is kept as the prefix so
+// existing log matching is unaffected.
+func leafKeyMismatchError(chain []*x509.Certificate, signer crypto.Signer) error {
+	const base = "leaf certificate public key does not match the private key"
+	for i, c := range chain[1:] {
+		matcher, ok := c.PublicKey.(interface{ Equal(crypto.PublicKey) bool })
+		if ok && matcher.Equal(signer.Public()) {
+			return fmt.Errorf(
+				"%s; certificate %d of %d (subject %q) does match, so the chain is ordered leaf-last: concatenate it leaf-first",
+				base, i+2, len(chain), c.Subject.String())
+		}
+	}
+	return errors.New(base)
 }

@@ -97,6 +97,25 @@ func TestParseCertChain_corrupted_DER(t *testing.T) {
 	}
 }
 
+func TestParseCertChain_rejects_a_declared_block_pem_drops_silently(t *testing.T) {
+	t.Parallel()
+	certPEM, _ := testcerts.GenerateSelfSignedCert(t, "truncated-chain", "ecdsa")
+	// The second block declares itself on a whole line but never terminates, so
+	// pem.Decode drops it silently. Without the declared-count guard the caller
+	// gets a chain one certificate shorter than the file declares, and the PFX
+	// built from it fails validation obscurely at the consumer instead of here.
+	truncated := append(append([]byte{}, certPEM...), []byte("-----BEGIN CERTIFICATE-----\nZm9v\n")...)
+
+	certs, err := convert.ParseCertChain(truncated)
+	if err == nil {
+		t.Fatalf("convert.ParseCertChain(cert + unterminated armour) = %d certs, nil error; want a malformed-chain error", len(certs))
+	}
+	if !strings.Contains(err.Error(), "decoded 1 of 2 declared") {
+		t.Errorf("convert.ParseCertChain(cert + unterminated armour) error = %q, want it to report %q",
+			err.Error(), "decoded 1 of 2 declared")
+	}
+}
+
 func TestParseCertChain_skips_non_certificate_blocks(t *testing.T) {
 	t.Parallel()
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "mixed", "ecdsa")
@@ -151,6 +170,23 @@ func TestParseCertChain_empty_input(t *testing.T) {
 	if !strings.Contains(err.Error(), "no certificate") {
 		t.Errorf("convert.ParseCertChain(empty) error = %q, want it to contain %q",
 			err.Error(), "no certificate")
+	}
+}
+
+func TestParseCertChain_key_only_input_reports_the_skipped_blocks(t *testing.T) {
+	t.Parallel()
+	_, keyPEM := testcerts.GenerateSelfSignedCert(t, "key-only", "ecdsa")
+
+	// A key-only file declares no CERTIFICATE block, so the declared-count check
+	// passes and the "no certificate" error must name how many PEM blocks were
+	// skipped: that count is what tells the operator the .crt holds the key.
+	_, err := convert.ParseCertChain(keyPEM)
+	if err == nil {
+		t.Fatal("convert.ParseCertChain(key-only PEM) = nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "skipped 1 non-certificate PEM block(s)") {
+		t.Errorf("convert.ParseCertChain(key-only PEM) error = %q, want it to contain %q",
+			err.Error(), "skipped 1 non-certificate PEM block(s)")
 	}
 }
 
@@ -390,6 +426,34 @@ func TestReadBoundedFromRoot(t *testing.T) {
 		defer root.Close()
 		if _, err := convert.ReadBoundedFromRoot(t.Context(), root, "leak.pem", 1024); err == nil {
 			t.Fatal("ReadBoundedFromRoot followed a symlink escaping the root; want a confinement error")
+		}
+	})
+
+	t.Run("refuses a parent-directory traversal in rel", func(t *testing.T) {
+		t.Parallel()
+		// The other half of the confinement contract: the read must not escape
+		// through a ".." component either, which is why the open goes through
+		// the *os.Root instead of filepath.Join + os.Open.
+		outside := t.TempDir()
+		if err := os.WriteFile(filepath.Join(outside, "secret.pem"), []byte("top secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		dir, err := os.MkdirTemp(outside, "watched")
+		if err != nil {
+			t.Fatal(err)
+		}
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+
+		data, err := convert.ReadBoundedFromRoot(t.Context(), root, "../secret.pem", 1024)
+		if err == nil {
+			t.Fatalf("convert.ReadBoundedFromRoot(%q) read %d bytes; want a confinement error", "../secret.pem", len(data))
+		}
+		if bytes.Contains(data, []byte("top secret")) {
+			t.Error("convert.ReadBoundedFromRoot returned content from outside the root")
 		}
 	})
 
