@@ -388,7 +388,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	if err != nil {
 		return failEntry(rel, "conversion failed", err)
 	}
-	current, err := sw.out.isCurrent(ctx, pfxRel, &analysis, sw.password)
+	current, err := sw.out.isCurrent(ctx, pfxRel, &analysis, sw.enc, sw.password)
 	if err != nil {
 		// A read or confinement failure on the output tree is a real failure, never
 		// silently "stale": treating it as stale would hide a broken output mount

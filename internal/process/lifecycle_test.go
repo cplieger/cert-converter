@@ -4,6 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/testcerts"
 )
 
 // TestParseLifecycle pins the knob's normalisation, including that an
@@ -132,4 +135,74 @@ func TestStoreReconcile(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestStoreIsCurrent_rewrites_on_an_encoder_change pins the currency half of the
+// preflight, which is the reason it exists.
+//
+// A bundle's leaf, key and chain are unchanged by a PFX_ENCODER switch, so
+// comparing only those reports the bundle CURRENT and the operator's deliberate
+// change silently applies to nothing: every file keeps its old algorithms while the
+// startup log announces the new profile, until some certificate happens to renew.
+func TestStoreIsCurrent_rewrites_on_an_encoder_change(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	defer root.Close()
+	s := &store{root: root}
+
+	written, err := convert.Encode(&analysis, convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+	if err := s.write(t.Context(), "out.pfx", written); err != nil {
+		t.Fatalf("setup: write: %v", err)
+	}
+
+	// Same configured profile: current, nothing to do.
+	current, err := s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("isCurrent(same profile) = error %v, want nil", err)
+	}
+	if !current {
+		t.Error("isCurrent(same profile) = false, want true: nothing about this bundle changed")
+	}
+
+	// Every other profile must read as stale, including the sibling that shares an
+	// encryption algorithm (modern2026) and the sibling that shares a MAC (legacyrc2
+	// vs legacydes) — the pair of fields is what discriminates them.
+	for _, other := range []convert.EncoderType{
+		convert.EncNameModern2026,
+		convert.EncNameLegacyDES,
+		convert.EncNameLegacyRC2,
+	} {
+		t.Run(string(other), func(t *testing.T) {
+			current, err := s.isCurrent(t.Context(), "out.pfx", &analysis, other, "pw")
+			if err != nil {
+				t.Fatalf("isCurrent(configured %s) = error %v, want nil", other, err)
+			}
+			if current {
+				t.Errorf("isCurrent(configured %s over a modern2023 bundle) = true, want false: the encoder change must take effect", other)
+			}
+		})
+	}
+}
+
+// concatPEM joins PEM blobs. Duplicated from the convert test package because the
+// two live in different packages and a shared test helper module is not worth it.
+func concatPEM(blobs ...[]byte) []byte {
+	var out []byte
+	for _, b := range blobs {
+		out = append(out, b...)
+	}
+	return out
 }

@@ -273,15 +273,6 @@ func (tr *tempReap) logOutcome(walkErr error) {
 // would let one crafted file spend arbitrary CPU on the scan's only goroutine.
 const maxPFXSize = 2*maxFileSize + 64<<10
 
-// decodeTimeout bounds one prior-output decode.
-//
-// go-pkcs12's Decode is not context-aware and honours the file's own iteration
-// counts, so a hostile file cannot be interrupted from the inside. Running it
-// under a deadline means one pathological file costs one timeout rather than
-// wedging every future scan. Defence in depth: the output tree is this app's own
-// volume and it is the only intended writer.
-const decodeTimeout = 5 * time.Second
-
 // isCurrent reports whether the output at rel is already the bundle want would
 // produce, by READING it rather than by remembering what was written.
 //
@@ -297,7 +288,9 @@ const decodeTimeout = 5 * time.Second
 // Any decode failure means stale: rewrite. A read or confinement failure is a
 // hard error and is never silently treated as stale, because that would hide a
 // broken output mount behind a stream of rewrites.
-func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysis, password string) (bool, error) {
+func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysis,
+	wantEncoder convert.EncoderType, password string,
+) (bool, error) {
 	fi, err := s.lstat(rel)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -320,13 +313,33 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 		return false, fmt.Errorf("read prior pfx: %w", err)
 	}
 
-	decoded, err := decodeWithin(ctx, prior, password)
-	switch {
-	case err != nil && ctx.Err() != nil:
-		// Shutdown is a third category, neither current nor stale. Treating it as
-		// stale would make every in-flight pair rewrite on the way out.
-		return false, fmt.Errorf("inspect prior pfx: %w", ctx.Err())
-	case err != nil:
+	// Preflight BEFORE any derivation: it bounds the iteration counts the file
+	// itself dictates, and it names the encoder profile the file was written with,
+	// which decoding cannot reveal.
+	insp, err := convert.Inspect(prior)
+	if err != nil {
+		slog.Debug("prior pfx failed preflight; regenerating", "path", rel, "error", err)
+		return false, nil
+	}
+	if insp.Profile != wantEncoder {
+		// A deliberate PFX_ENCODER change. Without this the switch would rewrite
+		// nothing: the leaf, key and chain all still match, so the bundle would keep
+		// its old algorithms indefinitely while the startup log announced the new
+		// profile.
+		slog.Info("prior pfx uses a different encoder profile; regenerating",
+			"path", rel, "found", string(insp.Profile), "configured", string(wantEncoder))
+		return false, nil
+	}
+
+	// Synchronous: the preflight has already bounded the work, so there is nothing
+	// to time out and no goroutine to abandon.
+	decoded, err := convert.Decode(prior, password)
+	if err != nil {
+		if ctx.Err() != nil {
+			// Shutdown is a third category, neither current nor stale. Treating it as
+			// stale would make every in-flight pair rewrite on the way out.
+			return false, fmt.Errorf("inspect prior pfx: %w", ctx.Err())
+		}
 		// Expected and non-fatal: a rotated password, a truncated file, a foreign
 		// file at that path. All mean the same thing — rewrite it.
 		slog.Debug("prior pfx did not decode; regenerating", "path", rel, "error", err)
@@ -343,35 +356,6 @@ func (s *store) readBoundedPFX(ctx context.Context, rel string) ([]byte, error) 
 	}
 	defer f.Close()
 	return atomicfile.ReadBoundedFile(ctx, f, maxPFXSize)
-}
-
-// decodeWithin runs a PKCS#12 decode under a deadline.
-//
-// The decode happens on its own goroutine because go-pkcs12 cannot be cancelled
-// mid-derivation. On timeout the caller moves on and the goroutine is left to
-// finish and exit on its own; it holds only the bytes it was given, and the
-// buffered channel means it never blocks on a receiver that has gone away.
-func decodeWithin(ctx context.Context, pfx []byte, password string) (convert.Decoded, error) {
-	type result struct {
-		err     error
-		decoded convert.Decoded
-	}
-	done := make(chan result, 1)
-	go func() {
-		decoded, err := convert.Decode(pfx, password)
-		done <- result{decoded: decoded, err: err}
-	}()
-
-	timer := time.NewTimer(decodeTimeout)
-	defer timer.Stop()
-	select {
-	case r := <-done:
-		return r.decoded, r.err
-	case <-timer.C:
-		return convert.Decoded{}, fmt.Errorf("decode exceeded %s", decodeTimeout)
-	case <-ctx.Done():
-		return convert.Decoded{}, ctx.Err()
-	}
 }
 
 // --- Output lifecycle ---

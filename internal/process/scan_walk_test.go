@@ -103,7 +103,7 @@ func TestOutputIsCurrent_regenerates_when_the_output_stat_fails(t *testing.T) {
 	// it is evidence that the output tree cannot be inspected. isCurrent returns an
 	// error so convertEntry fails the entry and health reports it, rather than
 	// silently rewriting on every scan and hiding a broken output mount.
-	_, err = s.isCurrent(t.Context(), "swapped/tls.pfx", &convert.Analysis{}, "pw")
+	_, err = s.isCurrent(t.Context(), "swapped/tls.pfx", &convert.Analysis{}, convert.EncNameModern2023, "pw")
 	if err == nil {
 		t.Fatal("store.isCurrent(output path the confined root refuses) = nil error, want a failure")
 	}
