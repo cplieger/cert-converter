@@ -319,8 +319,9 @@ type scanWalk struct {
 // entry: a walk error at the root ("."), or a cancelled context, aborts the
 // walk; an error below the root marks one unreadable sub-path and continues.
 // Every path is root-relative (the walk runs through the *os.Root). Directories
-// and non-.crt files are ignored; every .crt entry is recorded as seen and
-// dispatched to convertEntry.
+// and non-.crt files convert nothing; they are only inspected by
+// noteUnwalkableSymlink, which reports a symlink the walk cannot follow. Every
+// .crt entry is recorded as seen and dispatched to convertEntry.
 func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -352,8 +353,9 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 
 // noteUnwalkableSymlink reports a symlink under the input root that the walk
 // cannot follow. fs.WalkDir never descends a symlinked directory, and a link
-// whose target lies outside the root cannot be resolved through the confined
-// handle at all, so every certificate beneath such a link is invisible to the
+// the confined handle cannot resolve at all (a target outside the root, or an
+// unreadable component of an in-root target) tells us nothing about what it
+// points to, so every certificate beneath such a link is invisible to the
 // scan: it is counted in nothing, no PFX is produced, and health stays green.
 // An /input populated with symlinks to other certificate directories would
 // otherwise fail silently. The .crt/.key pair names are excluded because
@@ -368,9 +370,14 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 	fi, err := sw.inHandle.Stat(rel)
 	switch {
 	case err != nil && !errors.Is(err, fs.ErrNotExist):
-		slog.Warn("skipping symlink that does not resolve inside the input root; any certificates under it are not scanned",
+		// The error is the only evidence of the cause here (a target outside the
+		// root, or an unreadable component inside it), so name the consequence and
+		// let the error carry the cause. The target's type is unknown on this arm
+		// (fi is unusable when err != nil), so the message covers a linked file as
+		// well as a linked directory.
+		slog.Warn("skipping symlink that could not be resolved through the input root; anything it points to, including certificates under a linked directory, is not scanned",
 			"path", rel, "error", err,
-			"remediation", "mount that certificate directory into /input directly instead of linking to it")
+			"remediation", "mount that certificate path into /input directly instead of linking to it, or fix the permissions on the link target")
 	case err == nil && fi.IsDir():
 		// The target is inside the root, so the walk reaches those
 		// certificates through the real directory; nothing is missed.

@@ -74,7 +74,8 @@ func New(root string, onChange func(ctx context.Context), opts ...Option) *Watch
 // cancelled and then returns nil, but it ALSO returns early when the fsnotify
 // watcher dies (its Events or Errors channel closes): change detection is then
 // gone for good, so it returns ErrWatchLost and the caller must exit non-zero
-// for a restart, as main.go does.
+// for a restart, as main.go does. A closure observed after ctx is already
+// cancelled is part of shutdown, not lost change detection, and returns nil.
 func (w *Watcher) Run(ctx context.Context) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -236,8 +237,9 @@ func isCertFile(name string) bool {
 
 // watchLoop uses fsnotify for immediate reaction to cert changes,
 // with a periodic full scan as a safety net. It returns nil when ctx is
-// cancelled and ErrWatchLost when the watcher's Events or Errors channel
-// closes, which ends change detection for the life of the process.
+// cancelled and ErrWatchLost when the watcher's Events or Errors channel closes
+// under a live ctx, which ends change detection for the life of the process; a
+// closure observed after cancellation is a shutdown and also returns nil.
 func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) error {
 	st := newWatchState(w)
 	defer st.stop()
@@ -249,7 +251,7 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) erro
 
 		case event, ok := <-watcher.Events:
 			if !w.handleEventRecv(ctx, watcher, st, event, ok) {
-				return ErrWatchLost
+				return lostOrShutdown(ctx)
 			}
 
 		case <-st.debounceTimer.C:
@@ -260,10 +262,23 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) erro
 
 		case err, ok := <-watcher.Errors:
 			if !w.handleErrorRecv(ctx, watcher, st, err, ok) {
-				return ErrWatchLost
+				return lostOrShutdown(ctx)
 			}
 		}
 	}
+}
+
+// lostOrShutdown maps a watcher-death exit to nil when the process is already
+// shutting down: an Events/Errors channel closing in the same instant as
+// cancellation is a clean stop, not lost change detection, and must not turn a
+// SIGTERM into exit 1 with an ERROR claiming there was no shutdown signal.
+// watchLoop's select has no ctx precedence of its own (Go picks a ready case at
+// random), so the precedence lives here, at the single translation point.
+func lostOrShutdown(ctx context.Context) error {
+	if ctx.Err() != nil {
+		return nil
+	}
+	return ErrWatchLost
 }
 
 // handleEventRecv processes one receive from the watcher's event channel and

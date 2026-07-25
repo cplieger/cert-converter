@@ -237,3 +237,25 @@ func TestHandleErrorRecv_does_not_resync_the_watch_set_for_a_benign_error(t *tes
 		t.Errorf("handleErrorRecv(non-overflow error) re-walked the tree and picked up %q; only an event-queue overflow warrants a full re-sync", late)
 	}
 }
+
+// TestLostOrShutdown_gives_cancellation_precedence pins both halves of the
+// channel-closed translation. watchLoop's select has no ctx precedence of its
+// own (Go picks a ready case at random), so a SIGTERM arriving in the same
+// instant as an fsnotify fd death can take the channel arm: with a live ctx that
+// really is lost change detection and must surface ErrWatchLost so main exits 1
+// for a restart, while under an already-cancelled ctx it is a clean shutdown and
+// must return nil instead of exiting 1 with an ERROR claiming there was no
+// shutdown signal.
+func TestLostOrShutdown_gives_cancellation_precedence(t *testing.T) {
+	t.Parallel()
+
+	if got := lostOrShutdown(t.Context()); !errors.Is(got, ErrWatchLost) {
+		t.Errorf("lostOrShutdown(live ctx) = %v, want ErrWatchLost (a watcher that dies while the app must keep running is fatal)", got)
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := lostOrShutdown(cancelled); got != nil {
+		t.Errorf("lostOrShutdown(cancelled ctx) = %v, want nil (a channel closing during shutdown is a clean stop, not lost change detection)", got)
+	}
+}
