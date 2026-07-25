@@ -431,3 +431,118 @@ func TestAnalyse_still_excludes_an_unrelated_cert_from_a_self_signed_identity(t 
 		t.Errorf("observations = %v, want NO chain-unverified fallback for a self-signed identity", got.Observations)
 	}
 }
+
+// TestAnalyse_prefers_the_certificate_that_actually_signed_the_leaf pins edge
+// STRENGTH as the top ranking key in chain assembly.
+//
+// The inclusive candidate signal (name chaining or key-identifier match) exists so
+// a relationship we cannot verify — a SHA-1 signature Go refuses, a permitted
+// name-encoding difference — does not cause a real CA to be dropped. But it also
+// admits an IMPOSTOR: a certificate sharing the issuer's subject while holding a
+// different key satisfies name chaining without having signed anything. Ranking
+// only on validity, root distance and NotAfter let such a certificate win, emitting
+// a chain no consumer can verify. Reproduced by the GPT adversary.
+func TestAnalyse_prefers_the_certificate_that_actually_signed_the_leaf(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	realKey := newKey(t)
+	realTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(100),
+		Subject:               pkix.Name{CommonName: "Contested CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	realPEM, realCert := mint(t, realTmpl, &realKey.PublicKey, nil, realKey)
+
+	// Same subject, different key, and a LATER NotAfter so every ranking key below
+	// edge strength would prefer it.
+	impostorKey := newKey(t)
+	impostorPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(101),
+		Subject:               pkix.Name{CommonName: "Contested CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(72 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &impostorKey.PublicKey, nil, impostorKey)
+
+	leafKey := newKey(t)
+	leafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(102),
+		Subject:      pkix.Name{CommonName: "contested-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, realCert, realKey)
+
+	for _, order := range []struct {
+		name  string
+		certs [][]byte
+	}{
+		{"impostor first", [][]byte{leafPEM, impostorPEM, realPEM}},
+		{"real first", [][]byte{leafPEM, realPEM, impostorPEM}},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := convert.Analyse(concatPEM(order.certs...), keyPEMOf(t, leafKey))
+			if err != nil {
+				t.Fatalf("Analyse = error %v, want nil", err)
+			}
+			if len(got.Chain) == 0 {
+				t.Fatal("chain is empty; want the issuing CA")
+			}
+			if got.Chain[0].SerialNumber.Cmp(big.NewInt(100)) != 0 {
+				t.Errorf("chain[0] serial = %s, want 100 (the certificate that actually signed the leaf, not the same-subject impostor with the later NotAfter)",
+					got.Chain[0].SerialNumber)
+			}
+		})
+	}
+}
+
+// TestAnalyse_role_check_ignores_an_unverified_claim keeps the strict signal strict
+// in the other direction: an identity must not be rejected because some unrelated
+// certificate merely NAMES it as issuer. Only a verified signature makes a
+// certificate an issuer.
+func TestAnalyse_role_check_ignores_an_unverified_claim(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	// A perfectly ordinary self-signed identity.
+	idKey := newKey(t)
+	idPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(110),
+		Subject:      pkix.Name{CommonName: "Claimed Issuer"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &idKey.PublicKey, nil, idKey)
+
+	// A stranger that CLAIMS the identity as its issuer by name but was signed by
+	// its own key. Name chaining alone would make the identity look like an issuer
+	// and reject it.
+	strangerKey := newKey(t)
+	strangerTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(111),
+		Subject:      pkix.Name{CommonName: "Freeloader"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}
+	strangerSelf := &x509.Certificate{
+		SerialNumber: big.NewInt(111),
+		Subject:      pkix.Name{CommonName: "Claimed Issuer"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}
+	strangerPEM, _ := mint(t, strangerTmpl, &strangerKey.PublicKey, strangerSelf, strangerKey)
+
+	got, err := convert.Analyse(concatPEM(idPEM, strangerPEM), keyPEMOf(t, idKey))
+	if err != nil {
+		t.Fatalf("Analyse = error %v, want nil: a certificate merely CLAIMING this one as issuer must not make it an issuer", err)
+	}
+	if got.Leaf.SerialNumber.Cmp(big.NewInt(110)) != 0 {
+		t.Errorf("selected identity serial = %s, want 110", got.Leaf.SerialNumber)
+	}
+}

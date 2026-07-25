@@ -40,15 +40,13 @@ func TestStoreReconcile(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		mode        Lifecycle
-		scanTotal   int
-		unreadable  int
-		walkDone    bool
+		rc          reapContext
 		wantDeleted int
 		wantPresent bool
 	}{
 		{
 			name: "sync removes an orphan after a clean complete scan",
-			mode: LifecycleSync, scanTotal: 1, walkDone: true,
+			mode: LifecycleSync, rc: reapContext{scanTotal: 1, walkCompleted: true},
 			wantDeleted: 1, wantPresent: false,
 		},
 		{
@@ -56,27 +54,42 @@ func TestStoreReconcile(t *testing.T) {
 			// produces a clean, complete walk, so without this the first scan after
 			// a slow or wrong mount would delete every bundle.
 			name: "sync refuses when the scan found no pairs at all",
-			mode: LifecycleSync, scanTotal: 0, walkDone: true,
+			mode: LifecycleSync, rc: reapContext{scanTotal: 0, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
 			name: "sync refuses when the walk did not complete",
-			mode: LifecycleSync, scanTotal: 1, walkDone: false,
+			mode: LifecycleSync, rc: reapContext{scanTotal: 1, walkCompleted: false},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
 			name: "sync refuses when a sub-path was unreadable",
-			mode: LifecycleSync, scanTotal: 1, unreadable: 1, walkDone: true,
+			mode: LifecycleSync, rc: reapContext{scanTotal: 1, unreadable: 1, walkCompleted: true},
+			wantDeleted: 0, wantPresent: true,
+		},
+		{
+			// An input symlink the confined root cannot resolve may hide certificates,
+			// so `seen` is incomplete even though the walk reported no error and
+			// nothing was unreadable. Reproduced as a live-bundle deletion.
+			name: "sync refuses when an input symlink could not be resolved",
+			mode: LifecycleSync, rc: reapContext{scanTotal: 1, unresolved: 1, walkCompleted: true},
+			wantDeleted: 0, wantPresent: true,
+		},
+		{
+			// The design promised this rail and the first implementation dropped it: a
+			// scan already failing conversions must not also delete.
+			name: "sync refuses when a conversion failed",
+			mode: LifecycleSync, rc: reapContext{scanTotal: 1, failed: 1, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
 			name: "warn, the default, reports but never deletes",
-			mode: LifecycleWarn, scanTotal: 1, walkDone: true,
+			mode: LifecycleWarn, rc: reapContext{scanTotal: 1, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
 			name: "keep is silent and never deletes",
-			mode: LifecycleKeep, scanTotal: 1, walkDone: true,
+			mode: LifecycleKeep, rc: reapContext{scanTotal: 1, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 	} {
@@ -101,7 +114,7 @@ func TestStoreReconcile(t *testing.T) {
 			s := &store{root: root}
 			seen := map[string]struct{}{"live.crt": {}}
 
-			got := s.reconcile(tc.mode, seen, tc.scanTotal, tc.unreadable, tc.walkDone)
+			got := s.reconcile(tc.mode, seen, tc.rc)
 			if got != tc.wantDeleted {
 				t.Errorf("reconcile = %d deleted, want %d", got, tc.wantDeleted)
 			}

@@ -107,7 +107,13 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	})
 
 	result := countResults(sw.results, sw.unreadable)
-	result.Removed = out.reconcile(s.opts.Lifecycle, sw.seen, result.Total, sw.unreadable, walkErr == nil)
+	result.Removed = out.reconcile(s.opts.Lifecycle, sw.seen, reapContext{
+		scanTotal:     result.Total,
+		failed:        result.Failed,
+		unreadable:    sw.unreadable,
+		unresolved:    sw.unresolved,
+		walkCompleted: walkErr == nil,
+	})
 
 	logScanOutcome(ctx, result, walkErr)
 	return result, walkErr
@@ -125,6 +131,13 @@ type scanWalk struct {
 	password   string
 	results    []conversionStatus
 	unreadable int
+	// unresolved counts input symlinks the confined root could not resolve. Each
+	// one may hide certificates, so `seen` is NOT a complete enumeration of the
+	// input tree afterwards. It is deliberately separate from `unreadable`, which
+	// is a documented ScanResult field feeding the README's alert attributes:
+	// conflating them would change an operator-visible signal to fix an internal
+	// precondition.
+	unresolved int
 }
 
 // visit is the WalkDir callback. The context is checked before and after each
@@ -187,6 +200,10 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 		// let the error carry the cause. The target's type is unknown on this arm
 		// (fi is unusable when err != nil), so the message covers a linked file as
 		// well as a linked directory.
+		// The walk KNOWS it is blind here, which is exactly the state that must
+		// block orphan reaping: a certificate behind this link still exists but
+		// will not appear in `seen`.
+		sw.unresolved++
 		slog.Warn("skipping symlink that could not be resolved through the input root; anything it points to, including certificates under a linked directory, is not scanned",
 			"path", rel, "error", err,
 			"remediation", "mount that certificate path into /input directly instead of linking to it, or fix the permissions on the link target")
@@ -371,8 +388,6 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	if err != nil {
 		return failEntry(rel, "conversion failed", err)
 	}
-	logConversionObservations(rel, analysis.Observations)
-
 	current, err := sw.out.isCurrent(ctx, pfxRel, &analysis, sw.password)
 	if err != nil {
 		// A read or confinement failure on the output tree is a real failure, never
@@ -381,10 +396,16 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		return failEntry(rel, "failed to inspect existing pfx", err)
 	}
 	if current {
+		// Observations are deliberately NOT logged here. Analyse now runs before the
+		// currency check (it has to: currency is "is the file on disk the bundle
+		// these inputs produce?"), so logging them unconditionally would re-emit a
+		// WARN for every unchanged pair on every fsnotify event and every fallback
+		// tick — turning a one-off notice into permanent log noise.
 		slog.Debug("skipping unchanged cert pair", "path", rel)
 		return statusUnchanged
 	}
 
+	logConversionObservations(rel, analysis.Observations)
 	slog.Debug("converting cert pair", "path", rel)
 	pfxData, err := convert.Encode(&analysis, sw.enc, sw.password)
 	if err != nil {
@@ -404,9 +425,11 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 // WARN because each names something the operator probably did not intend, except
 // the duplicate-block artefact, which is noise at that level.
 //
-// Observations arrive only from an actual conversion, so a pair that is skipped
-// as unchanged does not re-emit them on every scan; a pair that keeps FAILING
-// re-emits them per attempt, which matches how the failure itself is logged.
+// Observations are emitted only on the conversion path, which is what keeps them
+// from becoming noise: a pair skipped as unchanged returns before this is called,
+// so an odd-but-convertible input is reported when it is converted rather than on
+// every scan for the life of the deployment. A pair that keeps FAILING re-emits per
+// attempt, matching how the failure itself is logged.
 // Detail is already bounded by convert, so it needs no further truncation here.
 func logConversionObservations(rel string, observations []convert.Observation) {
 	for _, o := range observations {

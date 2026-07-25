@@ -201,10 +201,13 @@ type identityMatch struct {
 type certGraph struct {
 	now   time.Time
 	certs []*x509.Certificate
-	// verifiedParents[i]: indices whose signature over certs[i] VERIFIED. The
-	// strong signal, used for the issuer role rejection — a hard failure, so it
-	// must rest on proof rather than resemblance.
-	verifiedParents [][]int
+	// verified memoises signature checks, keyed by (child, parent). Verification is
+	// LAZY: an eager all-pairs pass cost O(n^2) real signature verifications on the
+	// scan goroutine, and only two places ever need the answer — chain assembly, at
+	// the few candidates of one hop, and the role check, on the selected identity's
+	// candidate children. Both are O(candidates), so the quadratic term is gone
+	// without capping how many certificates a bundle may hold.
+	verified map[[2]int]bool
 	// candidateParents[i]: indices that are plausibly issuers of certs[i], by key
 	// identifier or by issuer/subject name, whether or not a signature could be
 	// verified. The inclusive signal, used to assemble the emitted chain, where
@@ -219,7 +222,6 @@ type certGraph struct {
 	// previous positional code shipped.
 	candidateParents [][]int
 	children         [][]int
-	issuer           []bool
 	distToRoot       []int
 }
 
@@ -238,11 +240,10 @@ func newCertGraph(certs []*x509.Certificate, now time.Time) *certGraph {
 	g := &certGraph{
 		now:              now,
 		certs:            certs,
-		verifiedParents:  make([][]int, len(certs)),
 		candidateParents: make([][]int, len(certs)),
 		children:         make([][]int, len(certs)),
-		issuer:           make([]bool, len(certs)),
 		distToRoot:       make([]int, len(certs)),
+		verified:         make(map[[2]int]bool),
 	}
 	for child := range certs {
 		for parent := range certs {
@@ -251,10 +252,6 @@ func newCertGraph(certs []*x509.Certificate, now time.Time) *certGraph {
 			}
 			g.candidateParents[child] = append(g.candidateParents[child], parent)
 			g.children[parent] = append(g.children[parent], child)
-			if certs[child].CheckSignatureFrom(certs[parent]) == nil {
-				g.verifiedParents[child] = append(g.verifiedParents[child], parent)
-				g.issuer[parent] = true
-			}
 		}
 	}
 	g.computeDistances()
@@ -290,8 +287,32 @@ func (g *certGraph) plausibleIssuer(child, parent int) bool {
 	return bytes.Equal(c.RawIssuer, p.RawSubject)
 }
 
-// isIssuer reports whether certs[i] verifiably signed another certificate here.
-func (g *certGraph) isIssuer(i int) bool { return g.issuer[i] }
+// verifies reports whether certs[parent]'s signature over certs[child] checks out,
+// memoised. This is the STRONG signal: a candidate edge only says the two names or
+// key identifiers line up, which an impostor sharing a subject can also satisfy.
+func (g *certGraph) verifies(child, parent int) bool {
+	key := [2]int{child, parent}
+	if got, ok := g.verified[key]; ok {
+		return got
+	}
+	got := g.certs[child].CheckSignatureFrom(g.certs[parent]) == nil
+	g.verified[key] = got
+	return got
+}
+
+// isIssuer reports whether certs[i] VERIFIABLY signed another certificate here.
+//
+// Only a verified signature counts. A name match alone would reject an identity
+// because some unrelated certificate happens to claim it as issuer, which an
+// attacker or a careless paste could arrange.
+func (g *certGraph) isIssuer(i int) bool {
+	for _, child := range g.children[i] {
+		if g.verifies(child, i) {
+			return true
+		}
+	}
+	return false
+}
 
 // isSelfSigned reports whether certs[i] is its own issuer, which is what makes it
 // a root rather than a link.
@@ -475,15 +496,7 @@ func (g *certGraph) pathFrom(start int) []int {
 	onPath := make([]bool, len(g.certs))
 	onPath[start] = true
 	for cur := start; ; {
-		best := -1
-		for _, p := range g.candidateParents[cur] {
-			if onPath[p] {
-				continue
-			}
-			if best == -1 || g.betterParent(p, best) {
-				best = p
-			}
-		}
+		best := g.bestParent(cur, onPath)
 		if best == -1 {
 			return path
 		}
@@ -491,6 +504,33 @@ func (g *certGraph) pathFrom(start int) []int {
 		onPath[best] = true
 		cur = best
 	}
+}
+
+// bestParent picks the next hop from cur, or -1 when the chain ends here.
+//
+// Edge STRENGTH outranks every other ranking key. A candidate edge is only a name
+// or key-identifier match, which a same-subject certificate holding a different key
+// also satisfies; ranking such an impostor above the certificate that actually
+// signed this one would emit a chain a consumer cannot verify. So verified parents
+// are considered alone whenever any exists, and unverified candidates only when
+// none does — which is the SHA-1 and name-encoding case the inclusive set exists
+// for.
+func (g *certGraph) bestParent(cur int, onPath []bool) int {
+	for _, verifiedOnly := range []bool{true, false} {
+		best := -1
+		for _, p := range g.candidateParents[cur] {
+			if onPath[p] || g.verifies(cur, p) != verifiedOnly {
+				continue
+			}
+			if best == -1 || g.betterParent(p, best) {
+				best = p
+			}
+		}
+		if best != -1 {
+			return best
+		}
+	}
+	return -1
 }
 
 // betterParent ranks two candidate issuers at a branch point.

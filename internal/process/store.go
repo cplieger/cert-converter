@@ -259,13 +259,19 @@ func (tr *tempReap) logOutcome(walkErr error) {
 
 // maxPFXSize bounds a prior output the store reads back before decoding it.
 //
-// A legitimate PFX for a certificate chain is single-digit kilobytes, so 1 MiB is
-// already generous; the 10 MiB input cap would be far too loose here. The bound
-// matters because decoding feeds the FILE'S OWN key-derivation iteration counts
-// into PBKDF2, so an oversized or crafted file could otherwise spend arbitrary
-// CPU on the scan's only goroutine. Anything over the cap is treated as stale and
-// rewritten, which self-heals.
-const maxPFXSize = 1 << 20
+// It MUST exceed the largest bundle this app can itself produce. A cap tuned to a
+// typical PFX (single-digit kilobytes) looks reasonable and is a trap: an input
+// pair near the read limit encodes to a bundle over the cap, so the store declares
+// its OWN output unreadable, reports it stale, rewrites it, and does that again on
+// every scan forever — a permanent write loop with a fresh mtime each time, which
+// in the documented deployment re-replicates the file downstream. The bound is
+// therefore derived from the input limit rather than from what a normal bundle
+// looks like: two inputs plus PKCS#12 framing, with headroom.
+//
+// It still bounds a hostile file, which is its other purpose: decoding feeds the
+// FILE'S OWN key-derivation iteration counts into PBKDF2, so an unbounded read
+// would let one crafted file spend arbitrary CPU on the scan's only goroutine.
+const maxPFXSize = 2*maxFileSize + 64<<10
 
 // decodeTimeout bounds one prior-output decode.
 //
@@ -315,7 +321,12 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 	}
 
 	decoded, err := decodeWithin(ctx, prior, password)
-	if err != nil {
+	switch {
+	case err != nil && ctx.Err() != nil:
+		// Shutdown is a third category, neither current nor stale. Treating it as
+		// stale would make every in-flight pair rewrite on the way out.
+		return false, fmt.Errorf("inspect prior pfx: %w", ctx.Err())
+	case err != nil:
 		// Expected and non-fatal: a rotated password, a truncated file, a foreign
 		// file at that path. All mean the same thing — rewrite it.
 		slog.Debug("prior pfx did not decode; regenerating", "path", rel, "error", err)
@@ -402,57 +413,71 @@ func ParseLifecycle(raw string) (mode Lifecycle, known bool) {
 // seen is the set of input .crt paths a COMPLETE walk found. Only paths matching
 // the app's own output shape are considered, so a file the app would never have
 // written is never a deletion candidate.
-func (s *store) orphans(seen map[string]struct{}) ([]string, error) {
-	var found []string
-	err := fs.WalkDir(s.root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
+func (s *store) orphans(seen map[string]struct{}) (found []string, safe bool, err error) {
+	safe = true
+	walkErr := fs.WalkDir(s.root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if rel == "." {
 				return err
 			}
 			slog.Warn("skipping unreadable output path while looking for orphans", "path", rel, "error", err)
+			safe = false
 			return nil
 		}
-		if d.IsDir() || !strings.HasSuffix(rel, layout.PFXExt) {
+		// A symlink anywhere in the output tree makes this walk and the WRITE path
+		// disagree about where a bundle lives: writes resolve through *os.Root,
+		// which follows a symlink that stays inside the root, while fs.WalkDir does
+		// not follow symlinks at all. So a bundle written through a symlinked
+		// directory is enumerated here under its PHYSICAL path, whose derived input
+		// name is not in `seen`, and it reads as an orphan the same scan that
+		// created it. Refuse to reap rather than try to reconcile two namespaces.
+		if d.Type()&fs.ModeSymlink != 0 {
+			slog.Warn("output tree contains a symlink; orphan removal is disabled for this scan because writes and this walk resolve paths differently",
+				"path", rel)
+			safe = false
 			return nil
 		}
-		// Map the output back to the input that would have produced it. layout owns
-		// both directions of the naming contract, so this cannot drift from the
-		// forward derivation used at write time.
-		certRel := strings.TrimSuffix(rel, layout.PFXExt) + layout.CertExt
-		if _, ok := seen[certRel]; !ok {
+		if d.IsDir() || !layout.IsOutput(rel) {
+			return nil
+		}
+		// layout owns both directions of the naming contract, so the reverse
+		// derivation cannot drift from the forward one used at write time.
+		if _, ok := seen[layout.CertForOutput(rel)]; !ok {
 			found = append(found, rel)
 		}
 		return nil
 	})
-	if err != nil {
-		return nil, fmt.Errorf("walk output tree: %w", err)
+	if walkErr != nil {
+		return nil, false, fmt.Errorf("walk output tree: %w", walkErr)
 	}
-	return found, nil
+	return found, safe, nil
 }
 
-// reconcile applies the lifecycle mode to the outputs whose inputs are gone, and
-// returns how many were deleted.
-//
-// The gate is strict and every condition is load-bearing:
-//
-//   - scanTotal == 0 blocks reaping outright. An /input that is mounted empty but
-//     readable produces a clean, complete walk, so without this the first scan
-//     after a slow or wrong mount would delete every bundle. Known residual: a
-//     wrong but POPULATED mount passes this, which is why deletion is opt-in.
-//   - walkComplete and unreadable == 0 mean the seen set is a full enumeration.
-//     Pruning against a partial set would delete live bundles.
-//   - failed == 0 keeps a scan that is already in trouble from also deleting.
-//
-// This is deliberately stricter than anything the (now removed) fingerprint cache
-// needed: getting a prune wrong cost one spurious reconversion, whereas getting a
-// deletion wrong destroys private key material — and in the documented deployment
-// the output tree is replicated onward, so a mistake propagates to a second host.
-func (s *store) reconcile(mode Lifecycle, seen map[string]struct{}, scanTotal, unreadable int, walkComplete bool) int {
+// reapContext is everything the gate needs to decide whether `seen` can be
+// trusted as a COMPLETE enumeration of the input tree. It is a struct rather than
+// five positional parameters because every field is a veto and a caller must not
+// be able to transpose two of them silently.
+type reapContext struct {
+	scanTotal     int
+	failed        int
+	unreadable    int
+	unresolved    int
+	walkCompleted bool
+}
+
+// safeToReap reports whether the input enumeration is complete enough to justify
+// deleting anything.
+func (r reapContext) safeToReap() bool {
+	return r.walkCompleted && r.unreadable == 0 && r.unresolved == 0 &&
+		r.failed == 0 && r.scanTotal > 0
+}
+
+func (s *store) reconcile(mode Lifecycle, seen map[string]struct{}, rc reapContext) int {
 	if mode == LifecycleKeep {
 		return 0
 	}
 
-	orphaned, err := s.orphans(seen)
+	orphaned, walkSafe, err := s.orphans(seen)
 	if err != nil {
 		slog.Warn("could not enumerate output orphans", "error", err)
 		return 0
@@ -461,7 +486,7 @@ func (s *store) reconcile(mode Lifecycle, seen map[string]struct{}, scanTotal, u
 		return 0
 	}
 
-	reapable := walkComplete && unreadable == 0 && scanTotal > 0
+	reapable := rc.safeToReap() && walkSafe
 	if mode != LifecycleSync || !reapable {
 		slog.Warn("output bundles have no matching input",
 			"count", len(orphaned), "paths", strings.Join(orphaned, ","),

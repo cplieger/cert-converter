@@ -46,6 +46,26 @@ func IsRelevant(name string) bool {
 	return IsCert(name) || strings.HasSuffix(name, KeyExt)
 }
 
+// IsOutput reports whether name is a converted bundle.
+func IsOutput(name string) bool {
+	return strings.HasSuffix(name, PFXExt)
+}
+
+// CertForOutput is the REVERSE of OutputFor: the certificate path that would have
+// produced this bundle.
+//
+// It lives here so both directions of the contract have one home. A caller
+// reconciling the output tree against the input tree needs the reverse mapping,
+// and deriving it locally with its own TrimSuffix is exactly the drift this
+// package exists to prevent — the forward and reverse rules could then disagree
+// about a name and a live bundle would read as an orphan.
+//
+// The argument must satisfy IsOutput; the same precondition reasoning as KeyFor
+// applies.
+func CertForOutput(pfxPath string) string {
+	return strings.TrimSuffix(pfxPath, PFXExt) + CertExt
+}
+
 // KeyFor returns the sibling private-key path for a certificate path.
 //
 // The argument must satisfy IsCert; callers reach this only after a walk or an
