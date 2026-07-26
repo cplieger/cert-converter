@@ -4,16 +4,9 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/x509"
-	"errors"
 	"fmt"
 	"time"
 )
-
-// timeNow is the clock the renewed-certificate tie-break consults. It is a
-// package var solely so tests can pin a scan time; nothing else in this package
-// reads the clock, and every other part of Analyse is a pure function of its
-// input bytes.
-var timeNow = time.Now
 
 // ObservationKind classifies a non-fatal fact Analyse noticed about its input.
 //
@@ -122,7 +115,7 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 	// One clock read for the whole analysis. Ranking and the validity
 	// observations must agree with each other, and a comparator that re-reads
 	// the time can stop being transitive mid-reduction.
-	now := timeNow()
+	now := time.Now()
 
 	var obs []Observation
 
@@ -134,11 +127,7 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 		})
 	}
 
-	signers, nonSigners := splitSigners(keys)
-	if len(signers) == 0 {
-		return Analysis{}, unusableKeyError(nonSigners)
-	}
-	signers = dedupeSigners(signers)
+	signers := dedupeSigners(keys)
 	if len(signers) > 1 {
 		obs = append(obs, Observation{
 			Kind:   ObsMultipleKeys,
@@ -206,12 +195,13 @@ type identityMatch struct {
 type certGraph struct {
 	now   time.Time
 	certs []*x509.Certificate
-	// verified memoises signature checks, keyed by (child, parent). Verification is
-	// LAZY: an eager all-pairs pass cost O(n^2) real signature verifications on the
-	// scan goroutine, and only two places ever need the answer — chain assembly, at
-	// the few candidates of one hop, and the role check, on the selected identity's
-	// candidate children. Both are O(candidates), so the quadratic term is gone
-	// without capping how many certificates a bundle may hold.
+	// verified memoises signature checks, keyed by (child, parent). Checks are made
+	// per CANDIDATE EDGE, never for all pairs: an eager all-pairs pass cost O(n^2)
+	// real signature verifications on the scan goroutine, while the plausible-issuer
+	// filter leaves only the edges that could matter. Three places ask — the
+	// verified-distance walk, chain assembly at the few candidates of one hop, and
+	// the role check on the selected identity's candidate children — and the memo
+	// means an edge is verified at most once for all of them.
 	verified map[[2]int]bool
 	// candidateParents[i]: indices that are plausibly issuers of certs[i], by key
 	// identifier or by issuer/subject name, whether or not a signature could be
@@ -227,7 +217,22 @@ type certGraph struct {
 	// previous positional code shipped.
 	candidateParents [][]int
 	children         [][]int
-	distToRoot       []int
+	// distToRoot[i]: fewest parent hops from certs[i] to a self-signed certificate
+	// in this bundle over the INCLUSIVE candidate edges, or -1 when none is
+	// reachable. Kept for the documented SHA-1 and name-encoding fallback, where no
+	// signature can be checked at all.
+	distToRoot []int
+	// verifiedDistToRoot[i]: the same distance measured over VERIFIED edges only,
+	// or -1 when no root is reachable by signatures alone.
+	//
+	// The inclusive measure cannot tell a parent with a real route to a root apart
+	// from one whose route depends on an unverifiable hop: two intermediates sharing
+	// a subject and a key, one continuing to an included root that actually signed
+	// it and one naming an impostor root of the same name holding a DIFFERENT key,
+	// score identically. Ranking on the inclusive measure alone therefore emitted a
+	// chain whose selected intermediate did not verify under the root beside it,
+	// while the fully verified alternative sat in the same input.
+	verifiedDistToRoot []int
 }
 
 // newCertGraph derives both issuance edge sets.
@@ -247,7 +252,6 @@ func newCertGraph(certs []*x509.Certificate, now time.Time) *certGraph {
 		certs:            certs,
 		candidateParents: make([][]int, len(certs)),
 		children:         make([][]int, len(certs)),
-		distToRoot:       make([]int, len(certs)),
 		verified:         make(map[[2]int]bool),
 	}
 	for child := range certs {
@@ -342,11 +346,10 @@ func (g *certGraph) isSelfSigned(i int) bool {
 	return c.CheckSignature(c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) == nil
 }
 
-// computeDistances fills distToRoot with the fewest parent hops from each
-// certificate to a self-signed certificate in this bundle, or -1 when none is
-// reachable.
+// computeDistances fills both distance maps: distToRoot over the inclusive
+// candidate edges, and verifiedDistToRoot over the verified edges only.
 //
-// It is a multi-source breadth-first walk DOWNWARD from every root over the
+// Both are multi-source breadth-first walks DOWNWARD from every root over the
 // children edges. The obvious alternative — a memoised depth-first walk upward
 // with an on-path cycle guard — is subtly wrong, and both adversarial reviews
 // reproduced the failure: the guard's -1 gets memoised for a node that was merely
@@ -356,27 +359,43 @@ func (g *certGraph) isSelfSigned(i int) bool {
 // PKIs with bidirectional cross-certification, and RFC 5280 permits several
 // certificates for one CA name. BFS from the roots has no path state to leak, so
 // it is cycle-safe and order-independent by construction.
+//
+// The verified walk costs at most one signature check per candidate edge, all
+// memoised in g.verified and reused by chain assembly and the role check. It is
+// bounded by the plausible-issuer filter, not by the number of pairs.
 func (g *certGraph) computeDistances() {
-	for i := range g.certs {
-		g.distToRoot[i] = -1
+	g.distToRoot = g.distancesFromRoots(nil)
+	g.verifiedDistToRoot = g.distancesFromRoots(g.verifies)
+}
+
+// distancesFromRoots runs the root-down BFS, traversing only the child edges
+// edgeOK accepts. A nil edgeOK accepts every candidate edge.
+func (g *certGraph) distancesFromRoots(edgeOK func(child, parent int) bool) []int {
+	dist := make([]int, len(g.certs))
+	for i := range dist {
+		dist[i] = -1
 	}
 	queue := make([]int, 0, len(g.certs))
 	for i := range g.certs {
 		if g.isSelfSigned(i) {
-			g.distToRoot[i] = 0
+			dist[i] = 0
 			queue = append(queue, i)
 		}
 	}
 	for head := 0; head < len(queue); head++ {
 		cur := queue[head]
 		for _, child := range g.children[cur] {
-			if g.distToRoot[child] != -1 {
+			if dist[child] != -1 {
 				continue // already reached by an equal-or-shorter route
 			}
-			g.distToRoot[child] = g.distToRoot[cur] + 1
+			if edgeOK != nil && !edgeOK(child, cur) {
+				continue // this hop is not evidence of the route being asked about
+			}
+			dist[child] = dist[cur] + 1
 			queue = append(queue, child)
 		}
 	}
+	return dist
 }
 
 // selectIdentity resolves which certificate and key form the identity, matching
@@ -491,11 +510,12 @@ func (g *certGraph) betterIdentity(a, b int) bool {
 // The first element is start itself.
 //
 // At a branch point (a cross-signed certificate has more than one issuer here)
-// the choice is deterministic: prefer a parent from which a self-signed root in
-// this bundle is reachable, then the shorter route to that root, then the later
-// NotAfter, then a byte comparison of the subject. One path is emitted rather
-// than every ancestor, because a consumer reading the bag sequence positionally
-// should see one coherent chain; alternatives land in Extra.
+// the choice is deterministic: prefer a parent that is currently valid, then one
+// with a route to a self-signed root in this bundle that verifies by signature at
+// every hop, then the shorter such route, then the inclusive route, then the later
+// NotAfter, then a byte comparison of the certificate DER. One path is emitted
+// rather than every ancestor, because a consumer reading the bag sequence
+// positionally should see one coherent chain; alternatives land in Extra.
 func (g *certGraph) pathFrom(start int) []int {
 	path := []int{start}
 	onPath := make([]bool, len(g.certs))
@@ -563,6 +583,20 @@ func (g *certGraph) betterParent(a, b int) bool {
 	va, vb := validAt(g.certs[a], g.now), validAt(g.certs[b], g.now)
 	if va != vb {
 		return va
+	}
+	// Then route STRENGTH, ahead of the inclusive measure, for the same reason edge
+	// strength outranks everything in bestParent: a candidate whose route to a root
+	// is only a chain of NAME matches may be an impostor's, and preferring it over a
+	// candidate that verifies all the way to an included root emits a chain the
+	// consumer cannot validate. The inclusive ranking below is consulted only when
+	// neither candidate has a fully verified route — the SHA-1 and name-encoding
+	// case, where no signature can be checked at all.
+	vra, vrb := g.verifiedDistToRoot[a] >= 0, g.verifiedDistToRoot[b] >= 0
+	if vra != vrb {
+		return vra
+	}
+	if vra && g.verifiedDistToRoot[a] != g.verifiedDistToRoot[b] {
+		return g.verifiedDistToRoot[a] < g.verifiedDistToRoot[b]
 	}
 	ra, rb := g.distToRoot[a] >= 0, g.distToRoot[b] >= 0
 	if ra != rb {
@@ -695,21 +729,6 @@ func dedupeCerts(certs []*x509.Certificate) (kept []*x509.Certificate, keptAt []
 	return kept, keptAt, dropped
 }
 
-// splitSigners partitions parsed keys into those usable for identity matching
-// and those whose type cannot be compared against a certificate's public key.
-// Only a crypto.Signer exposes the public half, so a non-signer key can never be
-// matched to a certificate.
-func splitSigners(keys []crypto.PrivateKey) (signers []crypto.Signer, nonSigners []crypto.PrivateKey) {
-	for _, k := range keys {
-		if s, ok := k.(crypto.Signer); ok {
-			signers = append(signers, s)
-			continue
-		}
-		nonSigners = append(nonSigners, k)
-	}
-	return signers, nonSigners
-}
-
 // dedupeSigners removes keys with an identical public half, keeping input order.
 // Two blocks holding the same key are one key.
 func dedupeSigners(signers []crypto.Signer) []crypto.Signer {
@@ -727,14 +746,6 @@ func dedupeSigners(signers []crypto.Signer) []crypto.Signer {
 		}
 	}
 	return out
-}
-
-// unusableKeyError explains that no parsed key can be matched to a certificate.
-func unusableKeyError(nonSigners []crypto.PrivateKey) error {
-	if len(nonSigners) == 1 {
-		return fmt.Errorf("private key type %T does not implement crypto.Signer, so it cannot be matched against a certificate", nonSigners[0])
-	}
-	return errors.New("no parsed private key implements crypto.Signer, so none can be matched against a certificate")
 }
 
 // countDistinctKeys counts how many distinct key indices appear in matches.

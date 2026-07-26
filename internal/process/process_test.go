@@ -215,9 +215,6 @@ func TestScannerRun_counts_non_regular_key_as_unreadable(t *testing.T) {
 	if res1.Unreadable != 1 || res1.Failed != 0 || res1.Orphan != 0 || res1.Converted != 0 {
 		t.Fatalf("first Run(non-regular key) = %+v, want Unreadable 1 Failed 0 Orphan 0 Converted 0", res1)
 	}
-	if !healthNeutral(res1) {
-		t.Errorf("Run(non-regular key) = %+v flips health; a layout condition no restart can fix must not", res1)
-	}
 	if _, statErr := os.Stat(filepath.Join(outRoot, "badkey.pfx")); statErr == nil {
 		t.Errorf("Run(non-regular key) wrote a pfx; want no output file")
 	}
@@ -230,8 +227,3 @@ func TestScannerRun_counts_non_regular_key_as_unreadable(t *testing.T) {
 		t.Errorf("second Run(non-regular key) = %+v, want Unreadable 1 Unchanged 0 (an unreadable pair must be retried, never cached as a success)", res2)
 	}
 }
-
-// healthNeutral mirrors main.healthyAfterScan: health is driven solely by conversion
-// failures. Duplicated here rather than imported because package main cannot be
-// imported; the duplication is asserted against by TestHealthyAfterScan in main_test.go.
-func healthNeutral(r process.ScanResult) bool { return r.Failed == 0 }

@@ -8,12 +8,11 @@ import (
 	"pgregory.net/rapid"
 )
 
-// TestNamingContract exercises the contract as a whole rather than each function
-// separately: for one input name it asserts every predicate and every derived
-// name together. A per-function test can pass while the set is inconsistent (a
-// name IsCert says yes to but KeyFor derives nonsense from), and that
-// inconsistency is the defect this package exists to prevent.
-func TestNamingContract(t *testing.T) {
+// TestNamingPredicates pins the two classification predicates on concrete names.
+// It asserts only what the predicates promise, for any input at all: they are the
+// package's only functions whose contract admits arbitrary file names, because
+// they are what a scan applies to every entry it finds.
+func TestNamingPredicates(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -21,81 +20,15 @@ func TestNamingContract(t *testing.T) {
 		input      string
 		isCert     bool
 		isRelevant bool
-		wantKey    string
-		wantOutput string
 	}{
-		{
-			name:       "flat certificate",
-			input:      "example.com.crt",
-			isCert:     true,
-			isRelevant: true,
-			wantKey:    "example.com.key",
-			wantOutput: "example.com.pfx",
-		},
-		{
-			name:       "certificate in a domain directory keeps its prefix",
-			input:      "example.com/cert.crt",
-			isCert:     true,
-			isRelevant: true,
-			wantKey:    "example.com/cert.key",
-			wantOutput: "example.com/cert.pfx",
-		},
-		{
-			name:       "nested directories are preserved, not flattened",
-			input:      "a/b/c/leaf.crt",
-			isCert:     true,
-			isRelevant: true,
-			wantKey:    "a/b/c/leaf.key",
-			wantOutput: "a/b/c/leaf.pfx",
-		},
-		{
-			name:       "private key is relevant but is not a conversion trigger",
-			input:      "example.com.key",
-			isCert:     false,
-			isRelevant: true,
-			wantKey:    "example.com.key.key",
-			wantOutput: "example.com.key.pfx",
-		},
-		{
-			name:       "an unrelated file is neither",
-			input:      "README.md",
-			isCert:     false,
-			isRelevant: false,
-			wantKey:    "README.md.key",
-			wantOutput: "README.md.pfx",
-		},
-		{
-			name:       "an already-converted bundle is not an input",
-			input:      "example.com.pfx",
-			isCert:     false,
-			isRelevant: false,
-			wantKey:    "example.com.pfx.key",
-			wantOutput: "example.com.pfx.pfx",
-		},
-		{
-			name:       "the extension alone is treated as a certificate named empty",
-			input:      ".crt",
-			isCert:     true,
-			isRelevant: true,
-			wantKey:    ".key",
-			wantOutput: ".pfx",
-		},
-		{
-			name:       "a name merely containing the extension is not a certificate",
-			input:      "cert.crt.bak",
-			isCert:     false,
-			isRelevant: false,
-			wantKey:    "cert.crt.bak.key",
-			wantOutput: "cert.crt.bak.pfx",
-		},
-		{
-			name:       "extension matching is case sensitive",
-			input:      "example.com.CRT",
-			isCert:     false,
-			isRelevant: false,
-			wantKey:    "example.com.CRT.key",
-			wantOutput: "example.com.CRT.pfx",
-		},
+		{"flat certificate", "example.com.crt", true, true},
+		{"certificate in a domain directory", "example.com/cert.crt", true, true},
+		{"private key is relevant but is not a conversion trigger", "example.com.key", false, true},
+		{"an unrelated file is neither", "README.md", false, false},
+		{"an already-converted bundle is not an input", "example.com.pfx", false, false},
+		{"the extension alone is treated as a certificate named empty", ".crt", true, true},
+		{"a name merely containing the extension is not a certificate", "cert.crt.bak", false, false},
+		{"extension matching is case sensitive", "example.com.CRT", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -106,6 +39,37 @@ func TestNamingContract(t *testing.T) {
 			if got := layout.IsRelevant(tc.input); got != tc.isRelevant {
 				t.Errorf("IsRelevant(%q) = %v, want %v", tc.input, got, tc.isRelevant)
 			}
+		})
+	}
+}
+
+// TestCertificateDerivedNames pins both derived names together on inputs that
+// satisfy the documented precondition of KeyFor and OutputFor: the argument must
+// be a certificate name. Asserting the two together is the point — a per-function
+// test can pass while the pair is inconsistent, and that inconsistency is the
+// defect this package exists to prevent.
+//
+// Non-certificate inputs are deliberately absent. Both functions document IsCert
+// as their precondition, so today's TrimSuffix behaviour on a README or a .pfx is
+// unspecified; pinning it would fail a future implementation that enforced the
+// precondition instead, without any production behaviour having changed.
+func TestCertificateDerivedNames(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		input      string
+		wantKey    string
+		wantOutput string
+	}{
+		{"flat certificate", "example.com.crt", "example.com.key", "example.com.pfx"},
+		{"certificate in a domain directory keeps its prefix", "example.com/cert.crt", "example.com/cert.key", "example.com/cert.pfx"},
+		{"nested directories are preserved, not flattened", "a/b/c/leaf.crt", "a/b/c/leaf.key", "a/b/c/leaf.pfx"},
+		{"the extension alone", ".crt", ".key", ".pfx"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			if got := layout.KeyFor(tc.input); got != tc.wantKey {
 				t.Errorf("KeyFor(%q) = %q, want %q", tc.input, got, tc.wantKey)
 			}
@@ -194,35 +158,56 @@ func TestOutputAndCertNamesAreInverses(t *testing.T) {
 	})
 }
 
-// TestIsOutputAndCertForOutput pins the two output-side names on concrete paths,
-// including the negatives the reconciliation walk depends on: an input
-// certificate, its key and a differently-cased extension are NOT bundles, so the
-// walk must not consider them reapable output.
-func TestIsOutputAndCertForOutput(t *testing.T) {
+// TestIsOutput pins the output predicate on concrete paths, including the
+// negatives the reconciliation walk depends on: an input certificate, its key and
+// a differently-cased extension are NOT bundles, so the walk must not consider
+// them reapable output.
+func TestIsOutput(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name     string
-		input    string
-		isOutput bool
-		wantCert string
+		name  string
+		input string
+		want  bool
 	}{
-		{"a flat bundle", "example.com.pfx", true, "example.com.crt"},
-		{"a nested bundle keeps its prefix", "example.com/cert.pfx", true, "example.com/cert.crt"},
-		{"deeply nested is preserved, not flattened", "a/b/c/leaf.pfx", true, "a/b/c/leaf.crt"},
-		{"the extension alone", ".pfx", true, ".crt"},
-		{"an input certificate is not an output", "example.com.crt", false, "example.com.crt.crt"},
-		{"a private key is not an output", "example.com.key", false, "example.com.key.crt"},
-		{"extension matching is case sensitive", "example.com.PFX", false, "example.com.PFX.crt"},
-		{"a name merely containing the extension", "bundle.pfx.bak", false, "bundle.pfx.bak.crt"},
+		{"a flat bundle", "example.com.pfx", true},
+		{"a nested bundle keeps its prefix", "example.com/cert.pfx", true},
+		{"the extension alone", ".pfx", true},
+		{"an input certificate is not an output", "example.com.crt", false},
+		{"a private key is not an output", "example.com.key", false},
+		{"extension matching is case sensitive", "example.com.PFX", false},
+		{"a name merely containing the extension", "bundle.pfx.bak", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := layout.IsOutput(tc.input); got != tc.isOutput {
-				t.Errorf("IsOutput(%q) = %v, want %v", tc.input, got, tc.isOutput)
+			if got := layout.IsOutput(tc.input); got != tc.want {
+				t.Errorf("IsOutput(%q) = %v, want %v", tc.input, got, tc.want)
 			}
-			if got := layout.CertForOutput(tc.input); got != tc.wantCert {
-				t.Errorf("CertForOutput(%q) = %q, want %q", tc.input, got, tc.wantCert)
+		})
+	}
+}
+
+// TestCertForOutput pins the reverse mapping on inputs that satisfy its
+// documented precondition — IsOutput must hold — because that is the only case
+// the reconciliation walk ever asks about: it calls CertForOutput on names it has
+// already classified as bundles.
+func TestCertForOutput(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"a flat bundle", "example.com.pfx", "example.com.crt"},
+		{"a nested bundle keeps its prefix", "example.com/cert.pfx", "example.com/cert.crt"},
+		{"deeply nested is preserved, not flattened", "a/b/c/leaf.pfx", "a/b/c/leaf.crt"},
+		{"the extension alone", ".pfx", ".crt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := layout.CertForOutput(tc.input); got != tc.want {
+				t.Errorf("CertForOutput(%q) = %q, want %q", tc.input, got, tc.want)
 			}
 		})
 	}

@@ -175,3 +175,105 @@ func TestRun_falls_back_to_polling_when_fsnotify_is_unavailable(t *testing.T) {
 		t.Errorf("Run(fsnotify unavailable) ran %d scans, want 1: poll mode must still convert what is already on disk", scans)
 	}
 }
+
+// TestRun_treats_shutdown_during_fsnotify_construction_failure_as_a_clean_stop
+// pins the cancellation precedence in Run's constructor-failure branch: the
+// sibling addWatchDirs branch is already pinned for shutdown, and this one must
+// behave the same way. Without the guard a SIGTERM arriving while inotify is
+// exhausted enters poll mode, reports ErrWatchLost, and turns a graceful stop
+// into exit 1 with the critical dead-change-detection alert.
+// Not parallel: it swaps the package-level newFSWatcher seam.
+func TestRun_treats_shutdown_during_fsnotify_construction_failure_as_a_clean_stop(t *testing.T) {
+	prev := newFSWatcher
+	newFSWatcher = func() (*fsnotify.Watcher, error) { return nil, errors.New("inotify exhausted") }
+	t.Cleanup(func() { newFSWatcher = prev })
+
+	scans := 0
+	w := New(t.TempDir(), func(context.Context) { scans++ })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := w.Run(ctx); err != nil {
+		t.Errorf("Run(cancelled ctx, fsnotify unavailable) = %v, want nil", err)
+	}
+	if scans != 0 {
+		t.Errorf("Run(cancelled ctx, fsnotify unavailable) ran %d scans, want 0", scans)
+	}
+}
+
+// TestPollTick_stays_in_poll_mode_when_fsnotify_remains_unavailable pins the
+// third of pollTick's arms, the one the newFSWatcher seam exists for: with the
+// constructor still failing, the tick must stay in poll mode (done=false) and
+// still run the polling scan that is then the only live change detection.
+// Not parallel: it swaps the package-level newFSWatcher seam.
+func TestPollTick_stays_in_poll_mode_when_fsnotify_remains_unavailable(t *testing.T) {
+	prev := newFSWatcher
+	newFSWatcher = func() (*fsnotify.Watcher, error) { return nil, errors.New("inotify exhausted") }
+	t.Cleanup(func() { newFSWatcher = prev })
+
+	scans := 0
+	w := New(t.TempDir(), func(context.Context) { scans++ }, WithFallback(time.Hour))
+
+	done, err := w.pollTick(t.Context())
+	if err != nil {
+		t.Errorf("pollTick(fsnotify unavailable) error = %v, want nil", err)
+	}
+	if done {
+		t.Error("pollTick(fsnotify unavailable) done = true, want false so polling continues")
+	}
+	if scans != 1 {
+		t.Errorf("pollTick(fsnotify unavailable) ran %d scans, want 1", scans)
+	}
+}
+
+// TestPollTick_treats_shutdown_during_fsnotify_retry_as_a_stop pins the
+// cancellation precedence of the same arm: a shutdown arriving during the retry
+// must stop the poll loop (done=true) without a scan that would still drive the
+// health marker on the way out.
+// Not parallel: it swaps the package-level newFSWatcher seam.
+func TestPollTick_treats_shutdown_during_fsnotify_retry_as_a_stop(t *testing.T) {
+	prev := newFSWatcher
+	newFSWatcher = func() (*fsnotify.Watcher, error) { return nil, errors.New("inotify exhausted") }
+	t.Cleanup(func() { newFSWatcher = prev })
+
+	scans := 0
+	w := New(t.TempDir(), func(context.Context) { scans++ }, WithFallback(time.Hour))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done, err := w.pollTick(ctx)
+	if err != nil {
+		t.Errorf("pollTick(cancelled ctx, fsnotify unavailable) error = %v, want nil", err)
+	}
+	if !done {
+		t.Error("pollTick(cancelled ctx, fsnotify unavailable) done = false, want true so polling stops")
+	}
+	if scans != 0 {
+		t.Errorf("pollTick(cancelled ctx, fsnotify unavailable) ran %d scans, want 0", scans)
+	}
+}
+
+// TestPollLoopWithUpgrade_treats_shutdown_during_the_initial_scan_as_a_clean_stop
+// pins the ctx guard AFTER the initial scan, distinct from the one before it: a
+// SIGTERM arriving while that scan runs is still a clean stop. A callback that
+// cancels the context models the race deterministically, with no sleeps. Without
+// the guard the disabled-fallback path returns ErrWatchLost and main emits the
+// false critical change-detection-dead alert on a graceful stop.
+func TestPollLoopWithUpgrade_treats_shutdown_during_the_initial_scan_as_a_clean_stop(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	scans := 0
+	// No WithFallback: the dead-change-detection configuration, where a live ctx
+	// after the initial scan returns ErrWatchLost.
+	w := New(t.TempDir(), func(context.Context) {
+		scans++
+		cancel()
+	})
+
+	if err := w.pollLoopWithUpgrade(ctx); err != nil {
+		t.Errorf("pollLoopWithUpgrade(ctx cancelled during initial scan) = %v, want nil", err)
+	}
+	if scans != 1 {
+		t.Errorf("pollLoopWithUpgrade(ctx cancelled during initial scan) ran %d scans, want 1", scans)
+	}
+}

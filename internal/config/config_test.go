@@ -117,6 +117,37 @@ func TestParseFallbackInterval_clamps_excessive_values(t *testing.T) {
 	}
 }
 
+// TestParseFallbackInterval_warns_when_input_is_repaired pins the two repair
+// diagnostics: an invalid value and an above-ceiling value are both silently
+// repaired, so the WARN naming the rejected value is the operator's only way to
+// tell an intended cadence from a default or a clamp.
+func TestParseFallbackInterval_warns_when_input_is_repaired(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		raw     string
+		want    time.Duration
+		message string
+	}{
+		{"invalid value uses default", "abc", 6 * time.Hour, "invalid FALLBACK_SCAN_HOURS, using default"},
+		{"excessive value is clamped", "87601", 87600 * time.Hour, "FALLBACK_SCAN_HOURS too large, clamping"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := capture.Default(t)
+
+			if got := parseFallbackInterval(tc.raw); got != tc.want {
+				t.Errorf("parseFallbackInterval(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+			if n := logs.CountLevel(slog.LevelWarn, tc.message); n != 1 {
+				t.Errorf("parseFallbackInterval(%q) logged %d WARN records matching %q, want 1 (logs %v)",
+					tc.raw, n, tc.message, logs.Messages())
+			}
+			if !logs.AttrContains(tc.message, "value", tc.raw) {
+				t.Errorf("parseFallbackInterval(%q) WARN does not name the rejected value (logs %v)", tc.raw, logs.Messages())
+			}
+		})
+	}
+}
+
 func TestParseFallbackInterval_permitted_cadence_and_padding_invariant(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		// A plain rapid.String() generator almost never produces the values that
@@ -155,23 +186,6 @@ func isolatePasswordFile(t *testing.T) {
 	t.Setenv("PFX_PASSWORD_FILE", "")
 }
 
-func TestLoad_unset_fallback_uses_six_hour_default(t *testing.T) {
-	isolatePasswordFile(t)
-	t.Setenv("PFX_PASSWORD", "s3cret")
-	// t.Setenv first so its registered Cleanup restores whatever the host had,
-	// then Unsetenv to reach the genuinely-unset case: t.Setenv cannot express
-	// "absent", and a bare os.Unsetenv would leak into every later test.
-	t.Setenv("FALLBACK_SCAN_HOURS", "placeholder")
-	os.Unsetenv("FALLBACK_SCAN_HOURS")
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.FallbackInterval != 6*time.Hour {
-		t.Errorf("Load() FallbackInterval = %v, want %v", cfg.FallbackInterval, 6*time.Hour)
-	}
-}
-
 func TestLoad_explicit_fallback_overrides_default(t *testing.T) {
 	isolatePasswordFile(t)
 	t.Setenv("PFX_PASSWORD", "s3cret")
@@ -182,34 +196,6 @@ func TestLoad_explicit_fallback_overrides_default(t *testing.T) {
 	}
 	if cfg.FallbackInterval != 12*time.Hour {
 		t.Errorf("Load() FallbackInterval = %v, want %v", cfg.FallbackInterval, 12*time.Hour)
-	}
-}
-
-func TestLoad_empty_fallback_uses_default(t *testing.T) {
-	isolatePasswordFile(t)
-	t.Setenv("PFX_PASSWORD", "s3cret")
-	t.Setenv("FALLBACK_SCAN_HOURS", "")
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	// A set-but-empty value must use the default, NOT silently disable the
-	// safety-net rescan. Only an explicit "0"/"false" disables it.
-	if cfg.FallbackInterval != 6*time.Hour {
-		t.Errorf("Load() FallbackInterval = %v, want %v (empty must use default)", cfg.FallbackInterval, 6*time.Hour)
-	}
-}
-
-func TestLoad_explicit_zero_disables_polling(t *testing.T) {
-	isolatePasswordFile(t)
-	t.Setenv("PFX_PASSWORD", "s3cret")
-	t.Setenv("FALLBACK_SCAN_HOURS", "0")
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.FallbackInterval != 0 {
-		t.Errorf("Load() FallbackInterval = %v, want 0 (explicit 0 disables)", cfg.FallbackInterval)
 	}
 }
 
@@ -800,6 +786,29 @@ func TestLoad_blank_secret_file_obeys_the_same_optout(t *testing.T) {
 			t.Error("a blank secret file fell back to PFX_PASSWORD; the file channel exists to be authoritative")
 		}
 	})
+}
+
+// TestLoad_blank_secret_file_error_names_configured_path pins the startup
+// diagnostic: a blank secret file must fail as ErrEmptyPassword AND name the
+// configured path, which is the only way an operator can tell which mounted
+// secret to repair. Classifying the error alone stays green if Load stops
+// wrapping envx's path-bearing ErrBlankSecretFile.
+func TestLoad_blank_secret_file_error_names_configured_path(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blank-pfx-password")
+	if err := os.WriteFile(path, []byte("  \n\t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PFX_PASSWORD", "")
+	t.Setenv("PFX_PASSWORD_FILE", path)
+	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
+
+	_, err := Load()
+	if !errors.Is(err, ErrEmptyPassword) {
+		t.Fatalf("Load(blank password file) = %v, want ErrEmptyPassword", err)
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("Load(blank password file) error = %q, want configured path %q", err, path)
+	}
 }
 
 // TestLoad_warns_when_the_env_password_is_padded pins the whitespace diagnostic:

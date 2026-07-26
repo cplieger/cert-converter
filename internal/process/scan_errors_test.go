@@ -30,6 +30,23 @@ func TestScannerRun_reports_an_unopenable_input_root(t *testing.T) {
 	}
 }
 
+// TestScannerRun_reports_an_unopenable_output_root is the symmetric half: Run
+// documents both root opens as hard errors, and an output tree that cannot be
+// opened leaves the process nowhere confined to write PFX files, so it must flip
+// health rather than report a clean scan.
+func TestScannerRun_reports_an_unopenable_output_root(t *testing.T) {
+	t.Parallel()
+	scanner := newScanner(t.TempDir(), filepath.Join(t.TempDir(), "never-created"))
+
+	res, err := scanner.Run(t.Context())
+	if err == nil {
+		t.Fatalf("Run(missing output root) = %+v, nil; want a hard error so health flips", res)
+	}
+	if !strings.Contains(err.Error(), "open output root") {
+		t.Errorf("Run(missing output root) error = %v, want it to name the output root", err)
+	}
+}
+
 // TestScannerRun_counts_an_unparseable_pair_as_failed pins that a cert whose PEM
 // cannot be analysed is a counted entry failure, not a scan-wide error: the rest of
 // the tree still converts, and the failure count is what flips health. A pair that

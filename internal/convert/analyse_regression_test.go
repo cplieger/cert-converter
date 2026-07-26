@@ -546,3 +546,101 @@ func TestAnalyse_role_check_ignores_an_unverified_claim(t *testing.T) {
 		t.Errorf("selected identity serial = %s, want 110", got.Leaf.SerialNumber)
 	}
 }
+
+// TestAnalyse_prefers_the_issuer_whose_route_to_a_root_verifies is the verified
+// -distance case: a candidate whose DIRECT signature over the child checks out can
+// still have an unverifiable continuation above it.
+//
+// Two intermediates share a subject AND a public key, so both genuinely verify
+// their signature over the leaf and the branch is real. Only one of them was signed
+// by a root included in the bundle; the other names a same-subject root whose
+// included certificate holds a different key. Ranking on the inclusive, name-based
+// distance to a root cannot tell them apart, so the later-expiring decoy won and
+// the emitted chain carried an intermediate that does not verify under the root
+// shipped beside it — while the fully verified path sat in the same input.
+func TestAnalyse_prefers_the_issuer_whose_route_to_a_root_verifies(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	const (
+		sharedRootCN  = "Shared Root"
+		sharedInterCN = "Shared Intermediate"
+	)
+
+	ca := func(serial int64, cn string, notAfter time.Time) *x509.Certificate {
+		return &x509.Certificate{
+			SerialNumber:          big.NewInt(serial),
+			Subject:               pkix.Name{CommonName: cn},
+			NotBefore:             notBefore,
+			NotAfter:              notAfter,
+			IsCA:                  true,
+			BasicConstraintsValid: true,
+			KeyUsage:              x509.KeyUsageCertSign,
+		}
+	}
+
+	// The root that actually signed the good intermediate.
+	realRootKey := newKey(t)
+	realRootPEM, realRootCert := mint(t, ca(200, sharedRootCN, notBefore.Add(240*time.Hour)),
+		&realRootKey.PublicKey, nil, realRootKey)
+
+	// A same-named root holding a DIFFERENT key. Present in the bundle, so a
+	// name-only walk reaches a "root" through it, but it signed nothing here.
+	fakeRootKey := newKey(t)
+	fakeRootPEM, _ := mint(t, ca(201, sharedRootCN, notBefore.Add(240*time.Hour)),
+		&fakeRootKey.PublicKey, nil, fakeRootKey)
+
+	// A third same-named root that is NOT in the bundle. It signs the decoy
+	// intermediate, so no included certificate can verify that intermediate.
+	absentRootKey := newKey(t)
+	_, absentRootCert := mint(t, ca(202, sharedRootCN, notBefore.Add(240*time.Hour)),
+		&absentRootKey.PublicKey, nil, absentRootKey)
+
+	// One key across both intermediates: that is what makes both of them verify the
+	// leaf, so edge strength at the leaf's own hop cannot separate them.
+	interKey := newKey(t)
+	goodInterPEM, goodInterCert := mint(t, ca(203, sharedInterCN, notBefore.Add(24*time.Hour)),
+		&interKey.PublicKey, realRootCert, realRootKey)
+	// The decoy expires LATER, so every ranking key below route strength prefers it.
+	decoyInterPEM, _ := mint(t, ca(204, sharedInterCN, notBefore.Add(72*time.Hour)),
+		&interKey.PublicKey, absentRootCert, absentRootKey)
+
+	leafKey := newKey(t)
+	leafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(205),
+		Subject:      pkix.Name{CommonName: "verified-route-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, goodInterCert, interKey)
+
+	for _, order := range []struct {
+		name  string
+		certs [][]byte
+	}{
+		{"decoy first", [][]byte{leafPEM, decoyInterPEM, fakeRootPEM, goodInterPEM, realRootPEM}},
+		{"verified first", [][]byte{leafPEM, goodInterPEM, realRootPEM, decoyInterPEM, fakeRootPEM}},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := convert.Analyse(concatPEM(order.certs...), keyPEMOf(t, leafKey))
+			if err != nil {
+				t.Fatalf("Analyse = error %v, want nil", err)
+			}
+			if len(got.Chain) != 2 {
+				t.Fatalf("chain length = %d, want 2 (the verified intermediate and the root that signed it)", len(got.Chain))
+			}
+			if got.Chain[0].SerialNumber.Cmp(big.NewInt(203)) != 0 {
+				t.Errorf("chain[0] serial = %s, want 203 (the intermediate whose route to an included root verifies, not the later-expiring decoy)",
+					got.Chain[0].SerialNumber)
+			}
+			// The contract the ranking exists to protect: every emitted hop verifies,
+			// so a consumer can build a path out of the bundle it was handed.
+			if err := got.Leaf.CheckSignatureFrom(got.Chain[0]); err != nil {
+				t.Errorf("leaf does not verify under chain[0] (serial %s): %v", got.Chain[0].SerialNumber, err)
+			}
+			if err := got.Chain[0].CheckSignatureFrom(got.Chain[1]); err != nil {
+				t.Errorf("chain[0] (serial %s) does not verify under chain[1] (serial %s): %v; the emitted chain cannot be validated by a consumer",
+					got.Chain[0].SerialNumber, got.Chain[1].SerialNumber, err)
+			}
+		})
+	}
+}

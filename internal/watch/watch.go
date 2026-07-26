@@ -192,31 +192,49 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 // registrations. Callers must treat a ctx error as shutdown rather than a watch
 // failure (no WARN, no fallback to polling, no follow-up scan).
 func (w *Watcher) addWatchDirs(ctx context.Context, watcher *fsnotify.Watcher, root string) error {
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		if err != nil {
-			if path == root {
-				return err
-			}
-			slog.Warn("skipping unwatchable path", "path", path, "error", err)
-			return nil
-		}
-		if d.IsDir() {
-			addErr := watcher.Add(path)
-			if addErr == nil {
-				return nil
-			}
-			if path == root {
-				return addErr
-			}
-			slog.Warn("skipping unwatchable directory; renewals under it require a full rescan (periodic fallback if enabled)",
-				"path", path, "fallback_scan", w.fallbackStatus(), "error", addErr)
-			return nil
-		}
-		return nil
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		return w.visitWatchPath(ctx, watcher, root, path, d, walkErr)
 	})
+}
+
+// visitWatchPath handles one entry of addWatchDirs' traversal: it honours
+// cancellation first, then applies the walk-error policy (fatal at the root,
+// warn-and-skip below it), and registers a watch for every directory. Only
+// directories are registered; a regular file is watched through its parent
+// directory.
+func (w *Watcher) visitWatchPath(
+	ctx context.Context, watcher *fsnotify.Watcher, root, path string, d fs.DirEntry, walkErr error,
+) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if walkErr != nil {
+		if path == root {
+			return walkErr
+		}
+		slog.Warn("skipping unwatchable path", "path", path, "error", walkErr)
+		return nil
+	}
+	if !d.IsDir() {
+		return nil
+	}
+	if addErr := watcher.Add(path); addErr != nil {
+		return w.handleWatchAddError(root, path, addErr)
+	}
+	return nil
+}
+
+// handleWatchAddError classifies a failed watch registration: the root failing
+// is fatal (it is the signal Run uses to fall back to polling), while a child
+// directory failing is warned about and skipped so one mis-permissioned
+// certificate directory cannot cost the whole tree its real-time watch.
+func (w *Watcher) handleWatchAddError(root, path string, addErr error) error {
+	if path == root {
+		return addErr
+	}
+	slog.Warn("skipping unwatchable directory; renewals under it require a full rescan (periodic fallback if enabled)",
+		"path", path, "fallback_scan", w.fallbackStatus(), "error", addErr)
+	return nil
 }
 
 // handleFsEvent processes a single fsnotify event, keeping the watch set in
@@ -315,7 +333,24 @@ func (w *Watcher) handleChmod(ctx context.Context, watcher *fsnotify.Watcher, ev
 	// symlink to a directory still takes the file arm and the containment guard
 	// holds.
 	info, err := os.Lstat(event.Name)
-	if err == nil && info.IsDir() {
+	if err != nil {
+		// A vanished path stays quiet and is classified by name: the chmod
+		// target is already gone, so there is nothing left to re-attach.
+		if errors.Is(err, fs.ErrNotExist) {
+			return layout.IsRelevant(event.Name)
+		}
+		// Any other error means the path could NOT be classified, so the
+		// directory case cannot be ruled out. Falling through to the
+		// suffix-only classifier would silently drop a repaired
+		// domain-named directory back into the file arm, leaving it
+		// unwatched until the next fallback tick (never, with the fallback
+		// disabled). Rescan conservatively and make the degraded state
+		// visible.
+		slog.Warn("cannot classify a path whose permissions changed; rescanning because it may be an unwatched directory",
+			"path", event.Name, "fallback_scan", w.fallbackStatus(), "error", err)
+		return true
+	}
+	if info.IsDir() {
 		if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
 			slog.Warn("failed to watch a directory whose permissions changed", "path", event.Name, "error", addErr)
 		}
@@ -351,6 +386,18 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) erro
 			return nil
 
 		case event, ok := <-watcher.Events:
+			// Losing the watch on the ROOT itself is not an ordinary path
+			// removal: the root's parent is not watched, so no Create event
+			// can ever announce a replacement, and fsnotify leaves both
+			// channels open (so the closure checks below never fire). With the
+			// periodic rescan disabled nothing can reattach it, so change
+			// detection is dead and only a restart recovers it. With the
+			// fallback enabled the next tick rebuilds the watch set, so the
+			// ordinary rescan path stays correct.
+			if ok && w.fallback <= 0 && filepath.Clean(event.Name) == filepath.Clean(w.root) &&
+				(event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename)) {
+				return lostOrShutdown(ctx, "fsnotify root watch removed while the periodic rescan is disabled; change detection is inactive, process will exit and restart")
+			}
 			if !w.handleEventRecv(ctx, watcher, st, event, ok) {
 				return lostOrShutdown(ctx, "fsnotify events channel closed, watcher stopping; process will exit and restart")
 			}

@@ -134,8 +134,8 @@ func dispatchArgs(args []string) int {
 	if len(args) <= 1 {
 		return continueToWatcher
 	}
-	switch args[1] {
-	case "health":
+	switch {
+	case len(args) == 2 && args[1] == "health":
 		// The fallback rescan is the marker's guaranteed refresh floor
 		// (fs events refresh it sooner), so a marker older than 3 fallback
 		// intervals means the watch loop is wedged and a restart fixes it.
@@ -159,7 +159,11 @@ func dispatchArgs(args []string) int {
 		//
 		// The ENTRYPOINT takes no arguments, so anything here is a mistake and a
 		// usage error is the honest response.
-		fmt.Fprintf(os.Stderr, "cert-watcher: unrecognized argument %q\n", args[1])
+		if len(args) == 2 {
+			fmt.Fprintf(os.Stderr, "cert-watcher: unrecognized argument %q\n", args[1])
+		} else {
+			fmt.Fprintf(os.Stderr, "cert-watcher: unexpected trailing arguments %q\n", args[2:])
+		}
 		fmt.Fprintln(os.Stderr, "usage: cert-watcher            start the watcher (no arguments)")
 		fmt.Fprintln(os.Stderr, "       cert-watcher health     probe the health marker")
 		return exitUsage

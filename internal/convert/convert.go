@@ -255,7 +255,7 @@ func (e boundedTextError) Unwrap() error { return e.err }
 // for narrative order: the two pointer-bearing fields lead, then skippedBlocks
 // whose string leads it, then the scalars.
 type keyScan struct {
-	keys          []crypto.PrivateKey
+	keys          []crypto.Signer
 	firstParseErr error
 	skipped       skippedBlocks
 	decodedBlocks int
@@ -311,7 +311,12 @@ func (s *keyScan) visit(block *pem.Block) {
 // discarding the later blocks would throw away the evidence. The diagnostics are
 // unchanged and are consulted only when NO block yields a key, so an input that
 // used to produce a key still produces the same first key.
-func parsePrivateKeys(pemBytes []byte) ([]crypto.PrivateKey, error) {
+//
+// The result element type is crypto.Signer, not crypto.PrivateKey, because that
+// is what the allowlist below actually admits: every accepted key type exposes a
+// public half, which is what identity matching compares. Naming the narrower type
+// here means no caller has to handle a key that cannot be matched.
+func parsePrivateKeys(pemBytes []byte) ([]crypto.Signer, error) {
 	declaredKeyBlocks := countDeclaredBlocks(pemBytes, keyBeginMarkers...)
 	if declaredKeyBlocks > maxKeyBlocks {
 		return nil, fmt.Errorf("private key PEM file declares %d key block(s), more than the %d this app reads",
@@ -388,12 +393,19 @@ func isEncryptedPEMBlock(block *pem.Block) bool {
 // trying PKCS8 first, then falling back to PKCS1 (RSA) and SEC1 (EC). A PKCS8
 // container holding a key type cert-converter does not support is rejected with
 // a distinct error rather than reported as unparseable.
-func parsePrivateKeyBlock(block *pem.Block) (crypto.PrivateKey, error) {
+//
+// The return type is crypto.Signer: every accepted type implements it, so the
+// caller never has to consider a key whose public half cannot be read.
+func parsePrivateKeyBlock(block *pem.Block) (crypto.Signer, error) {
 	key, pkcs8Err := x509.ParsePKCS8PrivateKey(block.Bytes)
 	if pkcs8Err == nil {
-		switch key.(type) {
-		case *rsa.PrivateKey, *ecdsa.PrivateKey, ed25519.PrivateKey:
-			return key, nil
+		switch k := key.(type) {
+		case *rsa.PrivateKey:
+			return k, nil
+		case *ecdsa.PrivateKey:
+			return k, nil
+		case ed25519.PrivateKey:
+			return k, nil
 		default:
 			return nil, fmt.Errorf("unsupported private key type in PKCS8 container: %T (supported: RSA, ECDSA, Ed25519)", key)
 		}

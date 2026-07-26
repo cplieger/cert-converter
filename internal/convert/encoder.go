@@ -21,26 +21,37 @@ const (
 
 // profile is one row of the encoder-profile contract: the app-owned name, the
 // spellings accepted for it, the go-pkcs12 encoder it selects, and the (MAC,
-// certificate-encryption) algorithm pair that encoder emits. One row per profile
-// so the forward mapping (name -> encoder) and the reverse one (algorithm pair ->
-// name, profileFor) cannot disagree: adding a profile here is the single edit,
-// where previously the same knowledge lived in three hand-maintained switches and
-// a missed one made Inspect reject this app's own output.
+// certificate-encryption, key-encryption) algorithm triple that encoder emits.
+// One row per profile so the forward mapping (name -> encoder) and the reverse one
+// (algorithm triple -> name, profileFor) cannot disagree: adding a profile here is
+// the single edit, where previously the same knowledge lived in three
+// hand-maintained switches and a missed one made Inspect reject this app's own
+// output.
+//
+// All three algorithms are part of a profile's identity because they vary
+// independently: legacyrc2 encrypts certificates with RC2-40 but its private key
+// with 3DES, so a bundle carrying a modern MAC and PBES2 certificates over a
+// 3DES-encrypted key is NOT a bundle any profile here emits. Recording only the
+// first two would report such a mixed bundle as modern2023 and leave a weakly
+// protected private key on disk.
 type profile struct {
 	name       EncoderType
 	aliases    []string
 	encoder    *pkcs12.Encoder
 	macOID     asn1.ObjectIdentifier
 	certEncOID asn1.ObjectIdentifier
+	keyEncOID  asn1.ObjectIdentifier
 }
 
 // profiles is the one home of the encoder-profile contract. The OID values it
-// names are declared in profile.go beside the rest of the preflight's OIDs.
+// names are declared in profile.go beside the rest of the preflight's OIDs. The
+// triples match the pinned go-pkcs12 v0.7.3 encoders (pkcs12.go:96-188), whose
+// macAlgorithm/certAlgorithm/keyAlgorithm fields these three columns mirror.
 var profiles = []profile{
-	{EncNameModern2023, []string{"", "modern"}, pkcs12.Modern2023, oidSHA256, oidPBES2},
-	{EncNameModern2026, nil, pkcs12.Modern2026, oidPBMAC1, oidPBES2},
-	{EncNameLegacyDES, []string{"legacy"}, pkcs12.LegacyDES, oidSHA1, oidPBEWithSHAAnd3KeyTripleDESCBC},
-	{EncNameLegacyRC2, nil, pkcs12.LegacyRC2, oidSHA1, oidPBEWithSHAAnd40BitRC2CBC},
+	{EncNameModern2023, []string{"", "modern"}, pkcs12.Modern2023, oidSHA256, oidPBES2, oidPBES2},
+	{EncNameModern2026, nil, pkcs12.Modern2026, oidPBMAC1, oidPBES2, oidPBES2},
+	{EncNameLegacyDES, []string{"legacy"}, pkcs12.LegacyDES, oidSHA1, oidPBEWithSHAAnd3KeyTripleDESCBC, oidPBEWithSHAAnd3KeyTripleDESCBC},
+	{EncNameLegacyRC2, nil, pkcs12.LegacyRC2, oidSHA1, oidPBEWithSHAAnd40BitRC2CBC, oidPBEWithSHAAnd3KeyTripleDESCBC},
 }
 
 // EncoderName normalizes a raw PFX_ENCODER value to one of the known encoder

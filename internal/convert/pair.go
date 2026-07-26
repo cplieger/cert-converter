@@ -111,11 +111,11 @@ func Decode(pfx []byte, password string) (Decoded, error) {
 // whose chain is correct but differently ordered is not the bundle this app emits
 // today, and rewriting it makes the output match its own contract.
 //
-// What this deliberately does NOT compare is the encoder profile: telling
-// Modern2023 from LegacyDES would require algorithm-OID introspection the pinned
-// library does not expose. Changing PFX_ENCODER therefore does not by itself
-// trigger a rewrite; that limitation is documented for the operator rather than
-// worked around here.
+// Encoder profile is deliberately outside this method because Decoded contains
+// only decoded material, not the algorithm identifiers. A currency caller must
+// compare Inspect(pfx).Profile with the configured EncoderType before Decode and
+// MatchesAnalysis; internal/process.store.isCurrent performs that sequence so a
+// PFX_ENCODER change triggers a rewrite.
 func (d Decoded) MatchesAnalysis(a *Analysis) bool {
 	if d.Leaf == nil || a.Leaf == nil || !bytes.Equal(d.Leaf.Raw, a.Leaf.Raw) {
 		return false

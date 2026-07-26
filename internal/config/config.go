@@ -43,18 +43,14 @@ var ErrEmptyPassword = errors.New(
 	"PFX_PASSWORD is empty or blank; set it, point PFX_PASSWORD_FILE at a secret file, " +
 		"or set PFX_ALLOW_EMPTY_PASSWORD=true")
 
-// ErrUnencodablePassword is returned when the configured password cannot survive
-// the PKCS#12 BMPString (UCS-2) encoding intact.
+// ErrUnencodablePassword indicates the configured password contains invalid UTF-8,
+// a non-BMP rune, or an embedded NUL and cannot be represented safely by PKCS#12.
 //
-// This is a startup refusal rather than a warning because every one of the three
-// shapes is unconditionally broken and no scan can recover from it (deferred findings
-// l-f12, l-f14, l-f2). Warning and continuing produced two failure modes, both worse
-// than refusing to start: a non-BMP rune fails every Encode, so the container starts
-// and is then permanently unhealthy with an identical failure on every fsnotify event
-// and every fallback tick; while invalid UTF-8 or an embedded NUL SUCCEEDS and reports
-// healthy, silently writing bundles protected by a password no consumer can reproduce.
-// The second is the dangerous one — the operator's only signal was a single startup
-// WARN, and the Loki rules key on failure counts that stay at zero.
+// It is a startup refusal rather than a warning because every one of the three shapes
+// is unconditionally broken and no scan recovers from it: a non-BMP rune fails every
+// Encode, so the container would be permanently unhealthy, while invalid UTF-8 and an
+// embedded NUL SUCCEED and report healthy, silently writing bundles protected by a
+// password no consumer can reproduce.
 var ErrUnencodablePassword = errors.New("PFX_PASSWORD cannot be encoded by PKCS#12")
 
 // PasswordStatus is a non-secret classification of how well PFX_PASSWORD
@@ -87,20 +83,14 @@ func classifyPassword(password string) PasswordStatus {
 	}
 }
 
-// isBlank reports whether a password offers no real protection, treating an
-// all-whitespace value the same as an empty one.
+// isBlank reports whether a password is empty or entirely Unicode whitespace, and
+// therefore offers no real protection.
 //
-// This is the single blankness rule for BOTH delivery channels (deferred finding
-// l-f5). The same question previously had three homes and three answers: a
-// whitespace-only PFX_PASSWORD was accepted with a warning, a whitespace-only
-// PFX_PASSWORD_FILE aborted startup inside envx, and PFX_ALLOW_EMPTY_PASSWORD
-// governed only the environment channel — so the opt-out meant different things
-// depending on how the secret arrived. It now means one thing either way.
-//
-// PFX_PASSWORD=" " (a quoting slip in a compose file or .env) is therefore REJECTED
-// where it previously started and embedded a single space into every bundle. That is
-// the intended behaviour change: README documents the guard as refusing to start when
-// the password is empty, which an operator reasonably reads as covering a blank value.
+// This is the single blankness rule for BOTH delivery channels, so
+// PFX_ALLOW_EMPTY_PASSWORD means one thing regardless of how the secret arrived.
+// PFX_PASSWORD=" " (a quoting slip in a compose file or .env) is therefore REJECTED:
+// README documents the guard as refusing to start when the password is empty, which an
+// operator reasonably reads as covering a blank value.
 func isBlank(password string) bool {
 	return classifyPassword(password) != PasswordConfigured
 }
@@ -126,13 +116,9 @@ func Load() (Config, error) {
 			// which the operator can opt out of.
 			password = ""
 		case errors.Is(secretErr, envx.ErrBlankSecretFile):
-			// A configured secret file whose content is blank. This now goes through
-			// the SAME guard as a blank PFX_PASSWORD, so PFX_ALLOW_EMPTY_PASSWORD
-			// means one thing regardless of how the secret was delivered (deferred
-			// finding l-f5). Previously envx's blank-file error was returned here
-			// verbatim, so a blank file aborted startup even with the opt-out set
-			// while a blank env var was accepted with a warning — the same question
-			// with three homes and three answers.
+			// Route a blank secret file through the same opt-out as a blank
+			// environment value, so PFX_ALLOW_EMPTY_PASSWORD means one thing
+			// regardless of how the secret was delivered.
 			password, blankSecretFile = "", secretErr
 		default:
 			// Unreadable, oversized, or a rejected path: the operator configured a
@@ -228,17 +214,13 @@ func allowEmptyPassword(raw string) bool {
 	return false
 }
 
-// checkPasswordEncodable rejects a password PKCS#12 cannot carry intact.
+// checkPasswordEncodable rejects password shapes that PKCS#12 cannot carry intact.
+// Empty passwords are handled separately by PFX_ALLOW_EMPTY_PASSWORD.
 //
-// This replaces a warn-and-continue that was documented as deliberate ("neither is
-// rejected here because the value is the operator's choice"). That choice was wrong for
-// all three shapes, and go.md's config rule says so directly: validate at startup, fail
-// fast, do not discover invalid config at request time. Each shape is unconditionally
-// broken and no scan recovers from it:
+// Each shape is unconditionally broken and no scan recovers from it:
 //
-//   - NonBMP: UCS-2 cannot represent the rune, so every Encode call fails. The
-//     container started, then reported unhealthy forever with an identical failure on
-//     every event and every fallback tick — a restart cannot clear it.
+//   - NonBMP: UCS-2 cannot represent the rune, so every Encode call fails and the
+//     container reports unhealthy on every event and every fallback tick.
 //   - InvalidUTF8: go-pkcs12's bmpString ranges over the string, so each invalid byte
 //     becomes U+FFFD and Encode SUCCEEDS. Bundles are written, the scan counts them
 //     converted, health stays green — and no consumer can open them with the configured
@@ -248,13 +230,13 @@ func allowEmptyPassword(raw string) bool {
 //     Also succeeds silently.
 //
 // The last two are the dangerous ones: nothing in the conversion path, the scan
-// summary, or health reflected them, and the README's Loki rules key on failure counts
-// that stay at zero. The only signal was one startup WARN an operator had to notice.
+// summary, or health reflects them, and the README's Loki rules key on failure counts
+// that stay at zero. Hence a startup refusal, per go.md's config rule: validate at
+// startup, fail fast, do not discover invalid config at request time.
 //
-// An empty password is not inspected — that is the allowEmptyPassword opt-out's
-// business, and it is reached only when the operator asked for it. Only the SHAPE is
-// reported, never the value. Recognition is convert.InspectPasswordEncoding's, the same
-// package that encodes, so this gate cannot drift from the encoder.
+// Only the SHAPE is reported, never the value. Recognition is
+// convert.InspectPasswordEncoding's, the same package that encodes, so this gate cannot
+// drift from the encoder.
 func checkPasswordEncodable(password string) error {
 	if password == "" {
 		return nil
@@ -318,13 +300,13 @@ func parseFallbackInterval(v string) time.Duration {
 }
 
 // warnBothPasswordChannels warns when the operator supplied the PFX password through
-// BOTH channels, because only one of them takes effect (deferred finding d-gpt-u1-2).
+// BOTH channels, because only one of them takes effect.
 //
 // PFX_PASSWORD_FILE wins by design — the whole point of the file channel is keeping the
 // value out of the process environment — so a PFX_PASSWORD set alongside it is not a
-// fallback and never will be. Without this line an operator who edits the wrong one gets
-// no signal at all: startup succeeds, and every generated bundle carries the OTHER
-// password. The mismatch only surfaces later, when a consumer cannot open a .pfx.
+// fallback. Without this line an operator who edits the wrong one gets no signal at all:
+// startup succeeds, and every generated bundle carries the OTHER password. The mismatch
+// only surfaces later, when a consumer cannot open a .pfx.
 //
 // Keyed on the source envx actually resolved rather than on os.Getenv, so the warning
 // cannot claim a conflict that did not happen. Neither value is logged, and the path is

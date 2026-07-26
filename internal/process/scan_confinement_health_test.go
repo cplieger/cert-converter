@@ -123,3 +123,58 @@ func TestScannerRun_unreadable_pair_does_not_authorise_reaping(t *testing.T) {
 		t.Errorf("the prior .pfx was deleted (%v); an unreadable input must not become a deleted output", statErr)
 	}
 }
+
+// TestScannerRun_directory_in_cert_path_does_not_authorise_reaping pins the
+// classification of a DIRECTORY occupying a <name>.crt path. The walk cannot read a
+// certificate out of it, so it is one unreadable sub-path: health-neutral (no restart
+// clears it) but enough to prove the input enumeration is incomplete.
+//
+// The reaping half is why this matters. A second, valid pair in the same tree means the
+// scan otherwise looks complete, so under OUTPUT_LIFECYCLE=sync reconciliation would see
+// blocked.pfx with no matching seen certificate and delete a still-live bundle whose
+// source path does exist — just in an unusable shape.
+func TestScannerRun_directory_in_cert_path_does_not_authorise_reaping(t *testing.T) {
+	t.Parallel()
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+
+	// A valid pair, so the scan has something to convert and the tree does not look
+	// empty: without it, reconciliation would have no reason to consider itself complete.
+	anchorCert, anchorKey := testcerts.GenerateSelfSignedCert(t, "anchor.example.com", "ecdsa")
+	if err := os.WriteFile(filepath.Join(certsRoot, "anchor.crt"), anchorCert, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(certsRoot, "anchor.key"), anchorKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(certsRoot, "blocked.crt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// A prior output for the blocked name, as if it had converted before the directory
+	// took its place.
+	prior := filepath.Join(outRoot, "blocked.pfx")
+	if err := os.WriteFile(prior, []byte("prior bundle"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := newSyncScanner(certsRoot, outRoot).Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run = %v, want nil (a directory in a cert path is not a scan error)", err)
+	}
+	if res.Unreadable != 1 {
+		t.Errorf("Unreadable = %d, want 1: a directory in a <name>.crt path is a cert the scan could not read", res.Unreadable)
+	}
+	if res.Failed != 0 {
+		t.Errorf("Failed = %d, want 0: a layout condition no restart can clear must not flip health", res.Failed)
+	}
+	if res.Removed != 0 {
+		t.Errorf("Removed = %d, want 0: an incomplete input enumeration must never authorise reaping", res.Removed)
+	}
+	if _, statErr := os.Stat(prior); statErr != nil {
+		t.Errorf("blocked.pfx was deleted (%v); a cert path the scan could not read must not become a deleted output", statErr)
+	}
+	if res.Converted != 1 {
+		t.Errorf("Converted = %d, want 1: the unrelated valid pair must still convert", res.Converted)
+	}
+}

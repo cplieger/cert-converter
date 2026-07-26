@@ -144,6 +144,38 @@ func TestStoreReconcile(t *testing.T) {
 	}
 }
 
+// TestStoreRemoveOrphans_cancelled_context_stops_before_deletion pins
+// removeOrphans' own shutdown guard: a scan cancelled by SIGTERM must delete no
+// key material and must report the cancellation, so the caller can classify the
+// scan as a shutdown instead of a clean reap.
+func TestStoreRemoveOrphans_cancelled_context_stops_before_deletion(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, "orphan.pfx")
+	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	s := &store{root: root}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	deleted, err := s.removeOrphans(ctx, []string{"orphan.pfx"})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("removeOrphans(cancelled context) error = %v, want context.Canceled", err)
+	}
+	if deleted != 0 {
+		t.Errorf("removeOrphans(cancelled context) deleted = %d, want 0", deleted)
+	}
+	if _, err := os.Stat(orphan); err != nil {
+		t.Errorf("orphan was removed after shutdown cancellation: %v", err)
+	}
+}
+
 // TestStoreIsCurrent_rewrites_on_an_encoder_change pins the currency half of the
 // preflight, which is the reason it exists.
 //

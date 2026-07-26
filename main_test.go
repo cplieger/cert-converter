@@ -92,47 +92,80 @@ func TestScanAndSetHealth_clears_marker_when_scan_errors(t *testing.T) {
 	}
 }
 
-func TestScanAndSetHealth_unreadable_subdir_stays_healthy(t *testing.T) {
-	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
-		t.Skip("chmod 0 does not block root / differs on Windows")
+// TestScanAndSetHealth_unreadable_pair_stays_healthy pins the health-neutral
+// half of scanAndSetHealth: an /input path the scan could not read is WARNed
+// about but must never flip the marker unhealthy, because no restart can clear
+// a permissions/layout misconfiguration.
+//
+// The unreadable input is an escaping symlink pair (the certbot live/ ->
+// archive/ layout with only live/ mounted), which the confined /input root
+// refuses on every Linux UID. The previous chmod(000) construction skipped
+// whenever the suite ran as root, which is exactly where this assertion is
+// needed: both halves — Unreadable staying healthy and the aggregate WARN —
+// could regress unobserved there.
+// Serial (no t.Parallel): it swaps the process-global slog default.
+func TestScanAndSetHealth_unreadable_pair_stays_healthy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Root symlink-confinement behavior is Linux-specific")
 	}
+
 	marker, markerPath := newTestMarker(t)
 	marker.Set(false) // start unhealthy; a failure-free scan must restore health
-	inDir, outDir := t.TempDir(), t.TempDir()
-	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
-	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "good", "ecdsa")
-	writeCertAndKey(t, inDir, "good", certPEM, keyPEM)
-	bad := filepath.Join(inDir, "blocked")
-	if err := os.MkdirAll(bad, 0o755); err != nil {
+
+	base := t.TempDir()
+	inDir := filepath.Join(base, "live")
+	archive := filepath.Join(base, "archive")
+	outDir := t.TempDir()
+	if err := os.Mkdir(inDir, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(bad, 0o000); err != nil {
+	if err := os.Mkdir(archive, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(bad, 0o755) })
-	// Establish the precondition (the blocked subdir really is unreadable) with a
-	// throwaway scanner, then drive the production wiring itself so the WARN branch
-	// and the marker decision in scanAndSetHealth are the code under test.
-	precheck := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
-	result, err := precheck.Run(context.Background())
-	if err != nil {
-		t.Fatalf("scan should not error on an unreadable subdir: %v", err)
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "unreadable", "ecdsa")
+	certPath, keyPath := writeCertAndKey(t, archive, "unreadable", certPEM, keyPEM)
+	if err := os.Symlink(certPath, filepath.Join(inDir, "unreadable.crt")); err != nil {
+		t.Fatal(err)
 	}
-	if result.Unreadable == 0 {
-		t.Fatal("expected Unreadable > 0 from the blocked subdir (test precondition)")
+	if err := os.Symlink(keyPath, filepath.Join(inDir, "unreadable.key")); err != nil {
+		t.Fatal(err)
 	}
+
 	// The remediation hint is the only observable effect of the Unreadable
-	// branch, so capture the default logger to pin it. slog.Default is
-	// process-global; this test is deliberately serial (no t.Parallel).
+	// branch, so capture the default logger to pin it.
 	logs := capture.Default(t)
+	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 
 	scanAndSetHealth(t.Context(), scanner, marker)
 
 	if logs.CountLevel(slog.LevelWarn, "unreadable") == 0 {
 		t.Errorf("scanAndSetHealth should WARN about unreadable /input paths; got logs %q", logs.Messages())
 	}
-	if _, statErr := os.Stat(markerPath); statErr != nil {
-		t.Fatalf("marker must stay healthy when only Unreadable>0 and no conversion failed: %v", statErr)
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("marker must stay healthy when only Unreadable>0 and no conversion failed: %v", err)
+	}
+}
+
+// TestScanAndSetHealth_clears_marker_after_conversion_failure pins the
+// composition scanAndSetHealth performs between Scanner.Run, healthyAfterScan
+// and Marker.Set on the result.Failed > 0, err == nil path: malformed
+// certificate material converts nothing and must clear the marker. Without it,
+// replacing marker.Set(healthyAfterScan(result)) with marker.Set(true) keeps
+// every other test in this file green.
+func TestScanAndSetHealth_clears_marker_after_conversion_failure(t *testing.T) {
+	t.Parallel()
+
+	marker, markerPath := newTestMarker(t)
+	marker.Set(true) // start healthy so the assertion proves the failure cleared it
+	inDir := t.TempDir()
+	outDir := t.TempDir()
+	writeCertAndKey(t, inDir, "broken", []byte("not a certificate"), []byte("not a private key"))
+	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
+
+	scanAndSetHealth(t.Context(), scanner, marker)
+
+	if _, err := os.Stat(markerPath); err == nil {
+		t.Error("health marker should be cleared when a certificate conversion fails")
 	}
 }
 
@@ -217,6 +250,10 @@ func TestDispatchArgs(t *testing.T) {
 		// watcher's health marker and started a second watcher over the same
 		// output tree. It is now a usage error that never reaches the marker.
 		{"typo is a usage error and never starts a watcher", []string{"cert-watcher", "helth"}, false, exitUsage},
+		// h-f1: `health` plus a trailing operand used to enter the health case
+		// and probe while silently ignoring the extra argument. The subcommand
+		// must consume the whole of argv or the invocation is a usage error.
+		{"health with a trailing argument is a usage error", []string{"cert-watcher", "health", "typo"}, false, exitUsage},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
