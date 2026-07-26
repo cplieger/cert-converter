@@ -44,6 +44,9 @@ services:
 
     environment:
       PFX_PASSWORD: "${PFX_PASSWORD:-}"  # set this or configure PFX_PASSWORD_FILE; empty is rejected
+      # Orphaned output: warn (default, keeps it) | sync (deletes) | keep (silent).
+      # Use sync only once /input is your single source of truth.
+      OUTPUT_LIFECYCLE: "${OUTPUT_LIFECYCLE:-warn}"
       PFX_ENCODER: "modern2023"  # modern2023, modern2026, legacy, or legacyrc2
 
     volumes:
@@ -62,6 +65,7 @@ services:
 | `PFX_ALLOW_EMPTY_PASSWORD` | Set to `true` to let the container start with an empty `PFX_PASSWORD`. Generated PFX files then protect the embedded private key with an empty password (effectively no protection); not recommended. | `false` | No |
 | `FALLBACK_SCAN_HOURS` | Hours between full directory re-scans, the fallback for fsnotify events missed on network mounts and similar edge cases. Only an explicit `0` or `false` disables it, leaving a missed event unrecovered until the next change. An empty, whitespace, or invalid value uses the 6h default, so a blank never silently disables the safety net; a value above `87600` (10 years) is clamped to that ceiling and logs a WARN. | `6` | No |
 | `PFX_ENCODER` | PFX encoding profile: modern2023 (AES-256-CBC + SHA-256, default), modern2026 (AES-256-CBC + PBMAC1, requires OpenSSL 3.4.0+), legacy (3DES + SHA-1 for older devices), or legacyrc2 (RC2-40 + SHA-1, a last-resort interop escape: a 40-bit RC2 key is brute-forceable, so the private key in such a bundle is protected only nominally — use it when a device accepts nothing else, and treat the output as sensitive). `modern` is an alias for `modern2023`, and `legacy` is recorded as `legacydes` in startup logs. See the [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables). | `modern2023` | No |
+| `OUTPUT_LIFECYCLE` | What happens to a `.pfx` whose certificate has been removed from `/input`. `warn` (default) logs the orphan and leaves the file in place; `sync` deletes it so `/output` tracks `/input`; `keep` is silent and never deletes. `sync` only ever removes files matching this app's own output shape, and it refuses to delete anything at all unless the scan proves it enumerated `/input` completely: at least one certificate found, the walk finished, and no unreadable path, unresolvable symlink, or conversion failure. A scan that cannot make that proof logs `orphan removal is disabled for this scan` and reaps nothing, so a broken or empty mount can never be read as "every certificate was deleted". An unrecognized value logs a WARN and uses `warn`. | `warn` | No |
 | `LOG_LEVEL` | Minimum log level: `debug`, `info`, `warn`, or `error` (case-insensitive; slog offsets such as `info+2` work). `debug` surfaces per-certificate skip reasons (orphan, unchanged, unreadable subdir) and filesystem-event detail. An unrecognized value falls back to `info`. | `info` | No |
 
 ### Volumes
@@ -163,6 +167,32 @@ groups:
             CertConverterScanAborted alert first, since that one names the
             /input problem and fires within 15m. If no scan aborted, the loop is
             wedged: restart the container.
+      - alert: CertConverterChangeDetectionDead
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |~ `change detection is (dead|inactive)` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "cert-converter lost change detection and is exiting for a restart"
+          description: >
+            The watch loop ended for a reason other than shutdown, so the process
+            exited non-zero to be restarted. Two causes: fsnotify's channels
+            closed under a live container, or fsnotify was unavailable AND
+            FALLBACK_SCAN_HOURS is 0/false, leaving no mechanism to notice
+            a renewal at all. Exiting is deliberate — the alternative was a
+            container that sat healthy forever while converting nothing, because
+            the startup scan had already written the health marker and disabling
+            the fallback also disables the marker's freshness deadline. Critical
+            rather than warning: with no restart policy the container stays down
+            and every renewal is silently missed. Ensure the deployment restarts
+            it (`restart: unless-stopped`), and if the log names the disabled
+            fallback, unset FALLBACK_SCAN_HOURS or set it above 0 so the periodic
+            rescan covers the missing watch. Exhausted inotify instances on the
+            host are the usual root cause and are often transient.
       - alert: CertConverterInputPathUnreachable
         expr: |
           sum by (container) (count_over_time(
