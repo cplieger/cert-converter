@@ -125,6 +125,42 @@ func TestInspect_rejects_an_oversized_identifier(t *testing.T) {
 	}
 }
 
+// TestInspect_rejects_an_oversized_safe_bag_identifier completes the allocation
+// bound over the LAST untrusted identifier field: a safe bag's own id, reached
+// through the plaintext-safe walk rather than through decodeOID in isolation.
+// Production is correct today (safeBag.ID is an asn1.RawValue and keyBagAlgorithm
+// decodes it under the bound), but changing that field back to
+// asn1.ObjectIdentifier, or bypassing decodeOID at the bag site, leaves every
+// other identifier case and all four own-profile round trips green while
+// restoring the large pre-authentication allocation.
+func TestInspect_rejects_an_oversized_safe_bag_identifier(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(append(append([]byte{}, m.LeafPEM...), m.CAPEM...), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+	var preamble pfxPreamble
+	testASN1Unmarshal(t, pfx, &preamble)
+	mutateTestAuthenticatedSafe(t, &preamble, oidDataContentType, func(safe *contentInfo) {
+		var inner []byte
+		testASN1Unmarshal(t, safe.Content.Bytes, &inner)
+		var bags []safeBag
+		testASN1Unmarshal(t, inner, &bags)
+		bags[0].ID = oversizedOID()
+		safeDER := testASN1Marshal(t, bags)
+		safe.Content.Bytes = testASN1Marshal(t, safeDER)
+		safe.Content.FullBytes = nil
+	})
+	if _, err := Inspect(testASN1Marshal(t, preamble)); !errors.Is(err, ErrProfileUnknown) {
+		t.Errorf("Inspect(bundle with oversized safe-bag identifier) = %v, want ErrProfileUnknown", err)
+	}
+}
+
 // TestInspect_rejects_excessive_iterations_in_every_derivation_location pins the
 // bound at EVERY location the decoder would honour a stored iteration count, not
 // just the modern2023 MAC integer the exported test patches.

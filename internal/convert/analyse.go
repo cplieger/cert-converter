@@ -360,27 +360,37 @@ func (g *certGraph) isSelfSigned(i int) bool {
 // certificates for one CA name. BFS from the roots has no path state to leak, so
 // it is cycle-safe and order-independent by construction.
 //
-// The verified walk costs at most one signature check per candidate edge, all
-// memoised in g.verified and reused by chain assembly and the role check. It is
-// bounded by the plausible-issuer filter, not by the number of pairs.
+// The verified walk costs at most one signature check per CANDIDATE edge, all
+// memoised in g.verified and reused by chain assembly and the role check. That is
+// far below all pairs for an ordinary bundle, but it is not a smaller bound in
+// principle: plausibleIssuer accepts on an issuer/subject name match alone, so a
+// bundle whose certificates all share one issuer name still yields O(n^2) edges,
+// and unlike the pre-rewrite lazy scheme this walk pays for them eagerly.
 func (g *certGraph) computeDistances() {
-	g.distToRoot = g.distancesFromRoots(nil)
-	g.verifiedDistToRoot = g.distancesFromRoots(g.verifies)
+	// One self-signature check per certificate, shared by both walks: the root set
+	// is the same for either edge predicate, and isSelfSigned is a real signature
+	// verification.
+	var roots []int
+	for i := range g.certs {
+		if g.isSelfSigned(i) {
+			roots = append(roots, i)
+		}
+	}
+	g.distToRoot = g.distancesFromRoots(roots, nil)
+	g.verifiedDistToRoot = g.distancesFromRoots(roots, g.verifies)
 }
 
-// distancesFromRoots runs the root-down BFS, traversing only the child edges
-// edgeOK accepts. A nil edgeOK accepts every candidate edge.
-func (g *certGraph) distancesFromRoots(edgeOK func(child, parent int) bool) []int {
+// distancesFromRoots runs the root-down BFS from roots, traversing only the child
+// edges edgeOK accepts. A nil edgeOK accepts every candidate edge.
+func (g *certGraph) distancesFromRoots(roots []int, edgeOK func(child, parent int) bool) []int {
 	dist := make([]int, len(g.certs))
 	for i := range dist {
 		dist[i] = -1
 	}
 	queue := make([]int, 0, len(g.certs))
-	for i := range g.certs {
-		if g.isSelfSigned(i) {
-			dist[i] = 0
-			queue = append(queue, i)
-		}
+	for _, i := range roots {
+		dist[i] = 0
+		queue = append(queue, i)
 	}
 	for head := 0; head < len(queue); head++ {
 		cur := queue[head]

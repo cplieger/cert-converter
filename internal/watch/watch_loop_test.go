@@ -187,3 +187,38 @@ func TestWatchLoop_runs_the_periodic_fallback_scan_without_any_event(t *testing.
 		t.Fatal("watchLoop did not return after ctx cancellation")
 	}
 }
+
+// TestWatchLoop_reports_lost_change_detection_when_the_root_watch_disappears
+// pins the h-f10 branch: with the periodic rescan disabled, losing the watch on
+// the root itself is unrecoverable in-process (no Create can announce a
+// replacement, and both fsnotify channels stay open), so the loop must exit with
+// ErrWatchLost for a restart rather than schedule a rescan.
+func TestWatchLoop_reports_lost_change_detection_when_the_root_watch_disappears(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "input")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	watcher := newTestWatcher(t)
+	// No WithFallback: the disabled-rescan configuration is the only one where
+	// root loss is terminal.
+	w := New(root, func(context.Context) {})
+	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
+		t.Fatalf("addWatchDirs: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- w.watchLoop(t.Context(), watcher) }()
+
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrWatchLost) {
+			t.Errorf("watchLoop(root removed, fallback disabled) = %v, want ErrWatchLost", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("watchLoop did not return after the root watch was removed")
+	}
+}

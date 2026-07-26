@@ -68,7 +68,10 @@ func TestHandleFsEvent(t *testing.T) {
 	}
 	// A DIRECTORY whose name ends in a cert extension: layout.IsRelevant is a
 	// suffix-only classifier, so this is the path that must not be misread as a file.
-	crtDir := filepath.Join(domainDir, "archive.crt")
+	// Deliberately NOT under domainDir: the "chmod on a domain directory" case walks
+	// domainDir's whole subtree, so a crtDir inside it would already be watched by
+	// the time the WatchList assertion runs and the oracle could never fail.
+	crtDir := filepath.Join(root, "archive.crt")
 	if err := os.MkdirAll(crtDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

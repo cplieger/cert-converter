@@ -47,12 +47,14 @@ type Options struct {
 // date by reading the bundle already on disk, and dispatches their conversion to
 // PFX format.
 //
-// A Scanner's input-observation cache and output tree require Run to be called
-// from a single goroutine. Concurrent scans would both read
-// the same prior bundle, both would decide it is stale, and both would rewrite it
-// with fresh KDF salts (churning mtimes and re-replicating downstream), and one
-// scan's orphan reap could race the other's write of the same path. main.go does
-// this (initial scan, then the watcher's synchronous onChange callback).
+// A Scanner's input-observation cache and output tree require Run to be called from a
+// single goroutine. The cache is a plain map, so two concurrent scans is a fatal
+// "concurrent map writes" throw, not merely wasted work; and on the output tree they
+// would both read the same prior bundle, both would decide it is stale, and both
+// would rewrite it with fresh KDF salts (churning mtimes and re-replicating
+// downstream), and one scan's orphan reap could race the other's write of the same
+// path. main.go does this (initial scan, then the watcher's synchronous onChange
+// callback).
 type Scanner struct {
 	observedInputs map[string][sha256.Size]byte
 	opts           Options
@@ -435,12 +437,14 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 	return pairInputs{certPEM: certPEM, keyPEM: keyPEM}, statusUnset, true
 }
 
-// noteUnreadableInput logs a failed read of an /input file the same way readPair's
-// sibling-key stat does: Debug when the file simply vanished, Warn otherwise. The
-// caller returns the health-neutral statusUnreadable, kept at the call site so the
-// outcome is visible where the branch is taken.
+// noteUnreadableInput logs a failed read of an /input file: Debug when the read was
+// cancelled by shutdown, Debug when the file simply vanished, and Warn otherwise --
+// the last matching readPair's sibling-key stat. The caller returns the
+// health-neutral statusUnreadable, kept at the call site so the outcome is visible
+// where the branch is taken.
 //
-// Every reason a read fails here is a steady-state condition a restart cannot clear
+// Every OPERATOR-ACTIONABLE reason a read fails here is a steady-state condition a
+// restart cannot clear
 // (deferred finding h-f9). A confinement refusal in particular cannot be identified by
 // sentinel — os.Root reports "path escapes from parent", which matches none of
 // fs.ErrPermission, fs.ErrNotExist, fs.ErrInvalid, syscall.ELOOP or syscall.EXDEV — so

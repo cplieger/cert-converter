@@ -6,8 +6,8 @@ import (
 	"fmt"
 )
 
-// maxKDFIterations caps every password-based key-derivation iteration count this
-// app is willing to run when reading a bundle back.
+// maxKDFIterations caps every password-based key-derivation iteration count the
+// preflight can read before this app runs it.
 //
 // The four profiles this app writes use 1 (legacy MAC) or 2048 (everything else),
 // so 10000 leaves ample headroom for a file written by some other tool while still
@@ -16,6 +16,11 @@ import (
 // output could spend arbitrary CPU on the scan's only goroutine. The read-size cap
 // and a decode deadline do not help — they bound how long the caller waits, not
 // how much work is done.
+//
+// One count is out of reach: a pkcs8ShroudedKeyBag nested inside an encryptedData
+// safe is still ciphertext while the preflight runs, so DecodeChain honours its
+// stored count unbounded. Closing that needs go-pkcs12's unexported pbDecrypt, so
+// it is a known limit of this gate rather than something it enforces.
 const maxKDFIterations = 10000
 
 // Object identifiers of the algorithms the four encoder profiles emit. Values
@@ -40,17 +45,18 @@ var (
 	oidPBEWithSHAAnd40BitRC2CBC      = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 12, 1, 6}
 )
 
-// ErrProfileUnknown reports a bundle whose algorithm pair is not one this app
+// ErrProfileUnknown reports a bundle whose algorithm triple is not one this app
 // emits. Callers treat it like any other inspection failure: the file is not one
 // of ours, so replace it.
 var ErrProfileUnknown = errors.New("pkcs12 bundle was not written by a known encoder profile")
 
 // --- Minimal PKCS#12 shapes, for the preflight only ---
 //
-// These deliberately model just enough of RFC 7292 to read two algorithm
-// identifiers and the iteration counts, with `asn1.RawValue` standing in for every
-// part that is not needed. Full decoding stays go-pkcs12's job; parsing here is a
-// GATE that runs before the expensive work, so an unparseable file costs nothing.
+// These deliberately model just enough of RFC 7292 to read the three algorithm
+// identifiers that identify a profile and the iteration counts, with
+// `asn1.RawValue` standing in for every part that is not needed. Full decoding
+// stays go-pkcs12's job; parsing here is a GATE that runs before the expensive
+// work, so an unparseable file costs nothing.
 
 // pfxPreamble models just enough of the PFX PDU to reach the MAC algorithm and the
 // authSafe. Field order is the DER SEQUENCE order from RFC 7292 and cannot be
@@ -259,9 +265,12 @@ type safeAlgorithms struct {
 // is the one that identifies the profile. The bound, however, cannot stop there:
 // the decoder decrypts every encrypted safe (go-pkcs12 v0.7.3 pkcs12.go:604-616)
 // and derives separately for the shrouded key bag, which for every profile sits in
-// the PLAINTEXT safe. Every one of those counts is checked here. Exactly one
-// shrouded key bag must be present: none, or a second one, is not a shape this app
-// writes and the decoder would reject it after paying for the derivation.
+// the PLAINTEXT safe. Every count VISIBLE without decrypting a safe is checked
+// here; a shrouded key bag nested INSIDE an encryptedData safe stays ciphertext
+// until DecodeChain decrypts it, so its own stored count is out of reach from here
+// (see maxKDFIterations). Exactly one VISIBLE shrouded key bag must be present:
+// none, or a second one, is not a shape this app writes and the decoder would
+// reject it after paying for the derivation.
 func bundleAlgorithms(authSafe *contentInfo) (safeAlgorithms, error) {
 	contentType, err := authSafe.contentTypeOID()
 	if err != nil {

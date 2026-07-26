@@ -99,10 +99,9 @@ func New(root string, onChange func(ctx context.Context), opts ...Option) *Watch
 // non-zero for a restart, as main.go does: the fsnotify watcher dies (its Events or
 // Errors channel closes), or no fsnotify watch could be established at all -- its
 // constructor failed, or the watch set could not be built on the root -- while the
-// periodic fallback is disabled, leaving no mechanism that could notice a renewal. A
-// channel closure
-// observed after ctx is already cancelled is part of shutdown, not lost change
-// detection, and returns nil.
+// periodic fallback is disabled, leaving no mechanism that could notice a
+// renewal. A channel closure observed after ctx is already cancelled is part of
+// shutdown, not lost change detection, and returns nil.
 func (w *Watcher) Run(ctx context.Context) error {
 	watcher, err := newFSWatcher()
 	if err != nil {
