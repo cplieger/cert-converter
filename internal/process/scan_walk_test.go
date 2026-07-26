@@ -67,16 +67,23 @@ func TestScanWalkVisit_classifies_walk_errors(t *testing.T) {
 	})
 }
 
-// TestOutputIsCurrent_regenerates_when_the_output_stat_fails pins the third arm
-// of the output-side skip gate. A fingerprint hit whose output Lstat fails for a
-// reason other than ENOENT -- an output subdirectory swapped for a symlink out
-// of the volume, which the confined root refuses -- must force a reconvert (so
-// the write either restores a real PFX or fails the entry and reports
-// unhealthy) and must say so distinctly: the return value is identical to the
-// "missing" arm, so the log line is the only observable difference and the only
-// thing that tells an operator the path was refused rather than absent. Runs
-// serially: it swaps slog.Default().
-func TestOutputIsCurrent_regenerates_when_the_output_stat_fails(t *testing.T) {
+// TestOutputIsCurrent_degrades_when_the_output_cannot_be_inspected pins a DELIBERATE
+// reversal. This test previously required an ERROR when the confined root refused to stat
+// a prior output, on the reasoning that a refusal is evidence the output tree cannot be
+// inspected and should therefore be reported rather than papered over.
+//
+// The reversal: isCurrent answers exactly one question — "is the file on disk already the
+// bundle these inputs produce?" — and "I cannot tell" answers it. Treating it as stale and
+// rewriting is both correct and self-healing for the realistic cause, a root-owned .pfx
+// left by a deployment that predates the user: mapping. Erroring instead flipped the pair
+// to statusFailed and pinned the container unhealthy over something the app can fix itself.
+//
+// The old objection — that this silently rewrites forever and hides a broken output mount
+// — does not hold, and the second half of this test is why: the WRITE goes through the
+// same confined root, so a genuinely broken tree fails at the write, which DOES flip
+// health. The honest signal moves from the read to the write rather than disappearing.
+// Runs serially: it swaps slog.Default().
+func TestOutputIsCurrent_degrades_when_the_output_cannot_be_inspected(t *testing.T) {
 	base := t.TempDir()
 	outDir := filepath.Join(base, "out")
 	outside := filepath.Join(base, "outside")
@@ -99,16 +106,18 @@ func TestOutputIsCurrent_regenerates_when_the_output_stat_fails(t *testing.T) {
 
 	s := &store{root: outHandle}
 
-	// A stat the confined root REFUSES is not evidence that the output is stale —
-	// it is evidence that the output tree cannot be inspected. isCurrent returns an
-	// error so convertEntry fails the entry and health reports it, rather than
-	// silently rewriting on every scan and hiding a broken output mount.
-	_, err = s.isCurrent(t.Context(), "swapped/tls.pfx", &convert.Analysis{}, convert.EncNameModern2023, "pw")
-	if err == nil {
-		t.Fatal("store.isCurrent(output path the confined root refuses) = nil error, want a failure")
+	current, err := s.isCurrent(t.Context(), "swapped/tls.pfx", &convert.Analysis{}, convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("isCurrent(uninspectable output) = %v, want nil: an unreadable prior output is stale, not fatal", err)
 	}
-	if !strings.Contains(err.Error(), "stat prior pfx") {
-		t.Errorf("store.isCurrent error = %q, want it to name the stat step", err.Error())
+	if current {
+		t.Error("isCurrent(uninspectable output) = true; a bundle that cannot be inspected must never be reported current")
+	}
+
+	// The other half: the tree really is broken, so the rewrite this returns false to
+	// authorise must itself fail. That is what keeps health honest.
+	if writeErr := s.write(t.Context(), "swapped/tls.pfx", []byte("bundle")); writeErr == nil {
+		t.Error("store.write(through a symlink out of the root) = nil error; the confined write must refuse it, or the degrade WOULD hide a broken output mount")
 	}
 }
 

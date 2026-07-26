@@ -82,7 +82,7 @@ const staleTempAge = time.Hour
 // sweepStaleTemps removes PFX temp files orphaned by an interrupted atomic write
 // (a crash between temp-write and rename), then narrates the outcome.
 //
-// atomicfile owns the mechanics — the confined recursive walk, the temp-name match,
+// atomicfile owns the mechanics — the confined walk (recursive via WithRecursive), the temp-name match,
 // the re-stat before each unlink, and the cancellation. All three properties this
 // sweep needs are the library's guarantees rather than this app's code (deferred
 // finding l-f16): the walk is root-relative so a co-mounting writer that swaps an
@@ -96,7 +96,7 @@ const staleTempAge = time.Hour
 // What stays here is the operator-facing half: which counts are actionable for THIS
 // app, and the /output ownership hint that goes with them.
 func (s *store) sweepStaleTemps(ctx context.Context) {
-	res, walkErr := atomicfile.CleanupStaleTempsInRoot(ctx, s.root, staleTempAge)
+	res, walkErr := atomicfile.CleanupStaleTempsInRoot(ctx, s.root, staleTempAge, atomicfile.WithRecursive())
 	s.logSweepOutcome(res, walkErr)
 }
 
@@ -176,7 +176,18 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 	case errors.Is(err, fs.ErrNotExist):
 		return false, nil
 	case err != nil:
-		return false, fmt.Errorf("stat prior pfx: %w", err)
+		// Degrade rather than fail the pair. This question is only "is the file on disk
+		// already the bundle these inputs produce?", and "I cannot tell" answers it: treat
+		// it as stale and rewrite. Failing here instead flipped the pair to statusFailed
+		// and pinned the container unhealthy over something the app can fix ITSELF — the
+		// realistic cause is a root-owned .pfx left behind by an earlier deployment before
+		// the user: mapping changed. If the rewrite genuinely cannot happen, THAT failure
+		// flips health, which is the honest signal. Consistent with the oversized case
+		// below, which already regenerates.
+		slog.Warn("cannot stat prior pfx; regenerating",
+			"path", rel, "error", err,
+			"remediation", "check /output ownership and permissions for the UID in user:")
+		return false, nil
 	case !fi.Mode().IsRegular():
 		// A directory, symlink or device node at the output name is not a usable
 		// prior bundle, and a symlink must never be followed here or unrelated
@@ -190,7 +201,17 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 
 	prior, err := s.readBoundedPFX(ctx, rel)
 	if err != nil {
-		return false, fmt.Errorf("read prior pfx: %w", err)
+		if ctx.Err() != nil {
+			// Shutdown, not an unreadable output: propagate so the scan reports the
+			// cancellation rather than rewriting on the way out.
+			return false, fmt.Errorf("read prior pfx: %w", err)
+		}
+		// Same reasoning as the stat failure above: unreadable means "cannot tell",
+		// which resolves to stale.
+		slog.Warn("cannot read prior pfx; regenerating",
+			"path", rel, "error", err,
+			"remediation", "check /output ownership and permissions for the UID in user:")
+		return false, nil
 	}
 
 	// Preflight BEFORE any derivation: it bounds the iteration counts the file
