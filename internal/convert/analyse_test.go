@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"math/big"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/testcerts"
@@ -289,4 +292,86 @@ func subjectCNs(certs []*x509.Certificate) []string {
 		out = append(out, c.Subject.CommonName)
 	}
 	return out
+}
+
+// TestAnalyse_reports_an_out_of_window_identity_without_refusing_it pins the
+// documented non-gate: validity is never a reason to refuse a conversion (an
+// operator migrating an expired certificate is a supported case), so the
+// observation is the ONLY signal that the bundle just written is out of window.
+// Both arms are asserted against each other, so swapping them -- or dropping
+// either -- fails here instead of silently converting an expired certificate with
+// no record.
+func TestAnalyse_reports_an_out_of_window_identity_without_refusing_it(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+
+	for _, tc := range []struct {
+		name      string
+		notBefore time.Time
+		notAfter  time.Time
+		want      convert.ObservationKind
+		unwanted  convert.ObservationKind
+	}{
+		{
+			name:      "an expired identity still converts, loudly",
+			notBefore: now.Add(-48 * time.Hour),
+			notAfter:  now.Add(-24 * time.Hour),
+			want:      convert.ObsIdentityExpired,
+			unwanted:  convert.ObsIdentityNotYetValid,
+		},
+		{
+			name:      "a not-yet-valid identity still converts, loudly",
+			notBefore: now.Add(24 * time.Hour),
+			notAfter:  now.Add(48 * time.Hour),
+			want:      convert.ObsIdentityNotYetValid,
+			unwanted:  convert.ObsIdentityExpired,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			key := newKey(t)
+			certPEM, _ := mint(t, &x509.Certificate{
+				SerialNumber: big.NewInt(120),
+				Subject:      pkix.Name{CommonName: "window.example.com"},
+				NotBefore:    tc.notBefore,
+				NotAfter:     tc.notAfter,
+			}, &key.PublicKey, nil, key)
+
+			got, err := convert.Analyse(certPEM, keyPEMOf(t, key))
+			if err != nil {
+				t.Fatalf("Analyse(%s) = error %v, want nil: validity is never a gate", tc.name, err)
+			}
+			if !hasObservation(got.Observations, tc.want) {
+				t.Errorf("Analyse(%s) observations = %v, want one of kind %q", tc.name, got.Observations, tc.want)
+			}
+			if hasObservation(got.Observations, tc.unwanted) {
+				t.Errorf("Analyse(%s) observations = %v, want NO observation of kind %q", tc.name, got.Observations, tc.unwanted)
+			}
+		})
+	}
+}
+
+// TestAnalyse_reports_no_validity_observation_for_a_current_identity is the
+// negative half: a certificate inside its window must produce neither validity
+// observation, so an operator's log filter on those kinds means what it says.
+func TestAnalyse_reports_no_validity_observation_for_a_current_identity(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	key := newKey(t)
+	certPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(121),
+		Subject:      pkix.Name{CommonName: "current.example.com"},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(time.Hour),
+	}, &key.PublicKey, nil, key)
+
+	got, err := convert.Analyse(certPEM, keyPEMOf(t, key))
+	if err != nil {
+		t.Fatalf("Analyse = error %v, want nil", err)
+	}
+	for _, kind := range []convert.ObservationKind{convert.ObsIdentityExpired, convert.ObsIdentityNotYetValid} {
+		if hasObservation(got.Observations, kind) {
+			t.Errorf("Analyse(a currently valid identity) observations = %v, want no %q", got.Observations, kind)
+		}
+	}
 }

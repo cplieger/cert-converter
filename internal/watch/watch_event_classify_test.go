@@ -1,14 +1,13 @@
 package watch
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
+	"github.com/cplieger/slogx/capture"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -44,19 +43,16 @@ func TestHandleFsEvent_classifies_a_create_it_cannot_stat(t *testing.T) {
 		{"an unclassifiable unrelated path is ignored but warns", filepath.Join(notADir, "notes.txt"), false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			prev := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-			t.Cleanup(func() { slog.SetDefault(prev) })
+			logs := capture.Default(t)
 
 			got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: tc.path, Op: fsnotify.Create})
 
 			if got != tc.want {
 				t.Errorf("handleFsEvent(Create %s) = %v, want %v", tc.path, got, tc.want)
 			}
-			warned := strings.Contains(buf.String(), "cannot classify a created path")
+			warned := logs.CountLevel(slog.LevelWarn, "cannot classify a created path") > 0
 			if warned != tc.wantWarn {
-				t.Errorf("handleFsEvent(Create %s) warned = %v, want %v; log = %q", tc.path, warned, tc.wantWarn, buf.String())
+				t.Errorf("handleFsEvent(Create %s) warned = %v, want %v; log = %v", tc.path, warned, tc.wantWarn, logs.Messages())
 			}
 		})
 	}

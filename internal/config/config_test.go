@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/slogx/capture"
 	"pgregory.net/rapid"
 )
@@ -346,7 +347,7 @@ func TestLoad_empty_password_optout_requires_literal_true(t *testing.T) {
 	}
 }
 
-// TestClassifyPassword pins the exported blank-password predicate directly in
+// TestClassifyPassword pins the blank-password predicate directly in
 // its owning package: Load only ever asks whether the status is
 // PasswordEmpty, so the whitespace-only branch is never exercised by any test
 // in this package. No t.Parallel: every test in this file mutates process
@@ -370,8 +371,63 @@ func TestClassifyPassword(t *testing.T) {
 		{"NUL byte is configured", "\x00", PasswordConfigured},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := ClassifyPassword(tc.password); got != tc.want {
-				t.Errorf("ClassifyPassword(%q) = %q, want %q", tc.password, got, tc.want)
+			if got := classifyPassword(tc.password); got != tc.want {
+				t.Errorf("classifyPassword(%q) = %q, want %q", tc.password, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_password_status_agrees_with_its_warning pins the startup
+// password-status decision where it now lives: the Config.PasswordStatus main
+// reports and the WARN branch must agree, and a real password must produce no
+// log record at all (the value is a secret). Moved here from main_test.go with
+// Load as the entry point, so the warning and the status stay pinned in the
+// package that owns both. No t.Parallel: it mutates env and slog.Default.
+func TestLoad_password_status_agrees_with_its_warning(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		password    string
+		wantStatus  PasswordStatus
+		wantWarnSub string
+	}{
+		{"empty reports empty", "", PasswordEmpty, "PFX_PASSWORD is empty"},
+		{"single space is whitespace-only", " ", PasswordWhitespaceOnly, "PFX_PASSWORD is whitespace-only"},
+		{"tab and newline are whitespace-only", "\t\n ", PasswordWhitespaceOnly, "PFX_PASSWORD is whitespace-only"},
+		{"real value is configured", "s3cret", PasswordConfigured, ""},
+		{"padded value is configured", "  s3cret  ", PasswordConfigured, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", tc.password)
+			// A blank password only reaches the warning with the opt-out set;
+			// without it Load refuses to start (ErrEmptyPassword).
+			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "true")
+
+			logs := capture.Default(t)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() = %v, want nil", err)
+			}
+
+			if cfg.PasswordStatus != tc.wantStatus {
+				t.Errorf("Load() with PFX_PASSWORD=%q status = %q, want %q", tc.password, cfg.PasswordStatus, tc.wantStatus)
+			}
+			if tc.wantWarnSub == "" {
+				if logs.Contains("PFX_PASSWORD is ") {
+					t.Errorf("Load() with PFX_PASSWORD=%q logged %v, want no password warning for a real password",
+						tc.password, logs.Messages())
+				}
+				return
+			}
+			if n := logs.CountLevel(slog.LevelWarn, tc.wantWarnSub); n != 1 {
+				t.Errorf("Load() with PFX_PASSWORD=%q logged %d WARN records matching %q, want 1 (logs %v)",
+					tc.password, n, tc.wantWarnSub, logs.Messages())
+			}
+			if !logs.AttrContains(tc.wantWarnSub, "remediation", "PFX_PASSWORD") {
+				t.Errorf("Load() with PFX_PASSWORD=%q WARN is missing an actionable remediation attr (logs %v)",
+					tc.password, logs.Messages())
 			}
 		})
 	}
@@ -775,4 +831,82 @@ func TestLoad_warns_when_both_password_channels_are_set(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLoad_wires_output_lifecycle pins the OUTPUT_LIFECYCLE knob end to end:
+// Load must carry the parsed mode into Config.Lifecycle (nothing else reads the
+// env var, so a dropped assignment would silently revert every deployment to
+// warn and leave orphaned .pfx files behind forever), and an unrecognised value
+// must warn while still starting. Serial: it swaps slog.Default().
+func TestLoad_wires_output_lifecycle(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		raw      string
+		want     process.Lifecycle
+		wantWarn bool
+	}{
+		{"unset defaults to warn", "", process.LifecycleWarn, false},
+		{"explicit warn", "warn", process.LifecycleWarn, false},
+		{"sync is wired through", "sync", process.LifecycleSync, false},
+		{"keep is wired through", "keep", process.LifecycleKeep, false},
+		{"padded mixed case is normalised", "  SyNc  ", process.LifecycleSync, false},
+		{"unknown value warns and falls back to warn", "delete", process.LifecycleWarn, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", "pw")
+			t.Setenv("OUTPUT_LIFECYCLE", tc.raw)
+
+			logs := capture.Default(t)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() with OUTPUT_LIFECYCLE=%q = %v, want nil (an unknown value must not fail startup)", tc.raw, err)
+			}
+			if cfg.Lifecycle != tc.want {
+				t.Errorf("Load() with OUTPUT_LIFECYCLE=%q Lifecycle = %q, want %q", tc.raw, cfg.Lifecycle, tc.want)
+			}
+			warned := logs.CountLevel(slog.LevelWarn, "unknown OUTPUT_LIFECYCLE") > 0
+			if warned != tc.wantWarn {
+				t.Errorf("Load() with OUTPUT_LIFECYCLE=%q warned = %v, want %v (log: %v)", tc.raw, warned, tc.wantWarn, logs.Messages())
+			}
+			if tc.wantWarn && !logs.AttrContains("unknown OUTPUT_LIFECYCLE", "value", tc.raw) {
+				t.Errorf("Load() with OUTPUT_LIFECYCLE=%q logged %v, want the rejected value named so an operator can spot the typo", tc.raw, logs.Messages())
+			}
+		})
+	}
+}
+
+// FuzzCheckPasswordEncodable_gate_matches_the_recognizer pins the two contracts
+// the startup gate owns over arbitrary secret bytes: it refuses exactly the
+// shapes convert.InspectPasswordEncoding recognises (a dropped or reordered
+// branch would let a silently-unopenable bundle ship), and its error never
+// carries the secret into the startup log every aggregator retains.
+func FuzzCheckPasswordEncodable_gate_matches_the_recognizer(f *testing.F) {
+	for _, seed := range []string{
+		"", " ", "hunter2", "pässwörd-Ünicode", "日本語パスワード",
+		string([]byte{0xff}), string([]byte{0xff}) + "pw-\U0001F600",
+		"pw-\U0001F600", "sentinel\x00secret", "\uFFFD",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, password string) {
+		issues := convert.InspectPasswordEncoding(password)
+		unusable := issues.InvalidUTF8 || issues.NonBMP || issues.EmbeddedNUL
+
+		err := checkPasswordEncodable(password)
+		if unusable != (err != nil) {
+			t.Fatalf("checkPasswordEncodable(%q) = %v, but InspectPasswordEncoding reports %+v: the gate must refuse exactly the shapes the encoder cannot carry",
+				password, err, issues)
+		}
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, ErrUnencodablePassword) {
+			t.Errorf("checkPasswordEncodable(%q) = %v, want it to wrap ErrUnencodablePassword", password, err)
+		}
+		if strings.Contains(err.Error(), password) {
+			t.Errorf("checkPasswordEncodable leaked the password into %q", err.Error())
+		}
+	})
 }

@@ -2,6 +2,7 @@ package process
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"os"
@@ -74,7 +75,7 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 
 		buf := captureLogs(t)
 		s := &store{root: root}
-		_, safe, err := s.orphans(map[string]struct{}{})
+		_, safe, err := s.orphans(context.Background(), map[string]struct{}{})
 		if err != nil {
 			t.Fatalf("orphans = %v, want nil: one unreadable sub-path must not abort the walk", err)
 		}
@@ -100,7 +101,7 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 
 		buf := captureLogs(t)
 		s := &store{root: root}
-		_, safe, err := s.orphans(map[string]struct{}{})
+		_, safe, err := s.orphans(context.Background(), map[string]struct{}{})
 		if err != nil {
 			t.Fatalf("orphans = %v, want nil", err)
 		}
@@ -179,7 +180,7 @@ func TestWalkLogPolicy_quiet_when_nothing_is_wrong(t *testing.T) {
 
 	buf := captureLogs(t)
 	s := &store{root: root}
-	if _, safe, orphanErr := s.orphans(map[string]struct{}{}); orphanErr != nil || !safe {
+	if _, safe, orphanErr := s.orphans(context.Background(), map[string]struct{}{}); orphanErr != nil || !safe {
 		t.Fatalf("orphans(clean tree) = safe %v, err %v; want true, nil", safe, orphanErr)
 	}
 	if out := buf.String(); out != "" {

@@ -25,9 +25,10 @@ import (
 // copying it per call is wasteful (gocritic hugeParam); Encode does not mutate it.
 func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 	// Defensive: config.Load rejects a password PKCS#12 cannot represent at
-	// startup, so this should be unreachable in production. It stays because a
-	// password delivered by file can be rotated at runtime, and because an
-	// exported entry point should not depend on a caller having validated for it.
+	// startup and the password is read once there (a rotated PFX_PASSWORD_FILE
+	// takes effect only on restart), so this is unreachable in production. It
+	// stays because an exported entry point should not depend on a caller having
+	// validated for it.
 	if InspectPasswordEncoding(password).NonBMP {
 		return nil, errors.New("pfx password contains a character outside the Basic Multilingual Plane, " +
 			"which the PKCS#12 UCS-2 password encoding cannot represent; " +

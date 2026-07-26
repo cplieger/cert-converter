@@ -1,14 +1,13 @@
 package watch
 
 import (
-	"bytes"
 	"context"
-	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/cplieger/slogx/capture"
 )
 
 // TestRun_scans_once_with_the_watch_set_live pins the attach-then-scan contract of
@@ -72,10 +71,7 @@ func TestRun_scans_once_with_the_watch_set_live(t *testing.T) {
 // directories could not be watched.
 // Not parallel: it swaps the process-global slog default.
 func TestRun_treats_a_shutdown_during_the_walk_as_a_clean_stop(t *testing.T) {
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	logs := capture.Default(t)
 
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "example.com"), 0o750); err != nil {
@@ -92,8 +88,8 @@ func TestRun_treats_a_shutdown_during_the_walk_as_a_clean_stop(t *testing.T) {
 	if scans != 0 {
 		t.Errorf("Run(cancelled ctx) ran %d scans, want 0", scans)
 	}
-	if logged := buf.String(); strings.Contains(logged, "failed to watch directories") {
-		t.Errorf("Run(cancelled ctx) logged %q, want no watch-failure WARN: a shutdown mid-walk must not look like a degraded fallback to polling", logged)
+	if logs.Count("failed to watch directories") != 0 {
+		t.Errorf("Run(cancelled ctx) logged %v, want no watch-failure WARN: a shutdown mid-walk must not look like a degraded fallback to polling", logs.Messages())
 	}
 }
 

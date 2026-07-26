@@ -3,8 +3,8 @@ package convert
 import "crypto"
 
 // Test-only handles on the package-internal PEM parsers. Analyse is the
-// package's only production conversion edge (it owns the cert/key match, the
-// leaf/chain split and the PFX write), so parseCertChain and parsePrivateKey
+// package's only production conversion edge (it owns the cert/key match and the
+// leaf/chain split), so parseCertChain and parsePrivateKeys
 // stay unexported: no production package outside internal/convert may bypass
 // those invariants. Their direct unit, property and fuzz coverage still matters,
 // and the standard-library export_test.go idiom keeps that coverage available to

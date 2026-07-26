@@ -30,6 +30,11 @@ var (
 	oidSHA256 = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}
 	oidPBMAC1 = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 14}
 
+	// oidPKCS8ShroudedKeyBag identifies the encrypted private-key bag
+	// (RFC 7292 §4.2.2). Verified against the pinned go-pkcs12 v0.7.3
+	// (safebags.go:19).
+	oidPKCS8ShroudedKeyBag = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 12, 10, 1, 2}
+
 	oidPBES2                         = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 13}
 	oidPBEWithSHAAnd3KeyTripleDESCBC = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 12, 1, 3}
 	oidPBEWithSHAAnd40BitRC2CBC      = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 12, 1, 6}
@@ -47,9 +52,11 @@ var ErrProfileUnknown = errors.New("pkcs12 bundle was not written by a known enc
 // part that is not needed. Full decoding stays go-pkcs12's job; parsing here is a
 // GATE that runs before the expensive work, so an unparseable file costs nothing.
 
+// pfxPreamble models just enough of the PFX PDU to reach the MAC algorithm and the
+// authSafe. Field order is the DER SEQUENCE order from RFC 7292 and cannot be
 // reordered for struct packing: encoding/asn1 maps fields positionally.
 //
-//nolint:govet // Field order is the DER SEQUENCE order from RFC 7292 and cannot be
+//nolint:govet // DER SEQUENCE order (RFC 7292); see the doc comment above.
 type pfxPreamble struct {
 	Version  int
 	AuthSafe contentInfo
@@ -87,6 +94,20 @@ type encryptedContentInfo struct {
 	ContentType                asn1.ObjectIdentifier
 	ContentEncryptionAlgorithm algorithmIdentifier
 	EncryptedContent           asn1.RawValue `asn1:"tag:0,optional"`
+}
+
+// safeBag models RFC 7292 §4.2's SafeBag only as far as the bag payload;
+// attributes are irrelevant to the preflight.
+type safeBag struct {
+	ID         asn1.ObjectIdentifier
+	Value      asn1.RawValue `asn1:"tag:0,explicit"`
+	Attributes asn1.RawValue `asn1:"set,optional"`
+}
+
+// encryptedPrivateKeyInfo is the pkcs8ShroudedKeyBag payload (RFC 5208 §6).
+type encryptedPrivateKeyInfo struct {
+	Algorithm     algorithmIdentifier
+	EncryptedData []byte
 }
 
 // legacyPBEParams is the pkcs-12PbeParams of the SHA1-based profiles.
@@ -160,13 +181,20 @@ func Inspect(pfx []byte) (Inspection, error) {
 	return Inspection{Profile: profile}, nil
 }
 
-// certBagAlgorithm reaches the certificate bag's content-encryption algorithm.
+// certBagAlgorithm reaches the certificate bag's content-encryption algorithm,
+// and bounds every derivation count the decoder would honour on the way.
 //
 // authSafe wraps an OCTET STRING holding the DER of AuthenticatedSafe, a SEQUENCE
 // OF ContentInfo whose members are the plaintext bag (holding the shrouded key) and
 // the encrypted bag (holding the certificates). Only the latter names an encryption
 // algorithm, which is the field that separates the two legacy profiles from each
 // other.
+//
+// The returned algorithm is the FIRST encrypted safe's, because that is the one
+// that identifies the profile. The bound, however, cannot stop there: the decoder
+// decrypts every encrypted safe (go-pkcs12 v0.7.3 pkcs12.go:604-616) and derives
+// separately for the shrouded key bag, which for the modern profiles sits in the
+// PLAINTEXT safe. Every one of those counts is checked here.
 func certBagAlgorithm(authSafe *contentInfo) (algorithmIdentifier, error) {
 	if !authSafe.ContentType.Equal(oidDataContentType) {
 		return algorithmIdentifier{}, fmt.Errorf("%w: authSafe is not a data ContentInfo", ErrProfileUnknown)
@@ -179,38 +207,93 @@ func certBagAlgorithm(authSafe *contentInfo) (algorithmIdentifier, error) {
 	if _, err := asn1.Unmarshal(inner, &safes); err != nil {
 		return algorithmIdentifier{}, fmt.Errorf("parse authenticated safe: %w", err)
 	}
-	for _, safe := range safes {
-		if !safe.ContentType.Equal(oidEncryptedDataContentType) {
-			continue
+	var certAlg algorithmIdentifier
+	found := false
+	for i := range safes {
+		alg, isCertBag, err := boundedSafeAlgorithm(&safes[i])
+		if err != nil {
+			return algorithmIdentifier{}, err
 		}
+		if isCertBag && !found {
+			certAlg, found = alg, true
+		}
+	}
+	if !found {
+		return algorithmIdentifier{}, fmt.Errorf("%w: no encrypted certificate bag", ErrProfileUnknown)
+	}
+	return certAlg, nil
+}
+
+// boundedSafeAlgorithm bounds every derivation count a single authenticated safe
+// would make the decoder honour, and reports that safe's content-encryption
+// algorithm when it is an encrypted one — the field that identifies the profile.
+// A plaintext safe names no encryption algorithm of its own, so isCertBag is
+// false there and only its shrouded key bag is bounded.
+func boundedSafeAlgorithm(safe *contentInfo) (alg algorithmIdentifier, isCertBag bool, err error) {
+	switch {
+	case safe.ContentType.Equal(oidEncryptedDataContentType):
 		var enc encryptedData
 		if _, err := asn1.Unmarshal(safe.Content.Bytes, &enc); err != nil {
-			return algorithmIdentifier{}, fmt.Errorf("parse encrypted safe contents: %w", err)
+			return algorithmIdentifier{}, false, fmt.Errorf("parse encrypted safe contents: %w", err)
 		}
-		return enc.EncryptedContentInfo.ContentEncryptionAlgorithm, nil
+		certEnc := enc.EncryptedContentInfo.ContentEncryptionAlgorithm
+		// Every encrypted safe is decrypted by the decoder, not just the
+		// first, so every one of them must be bounded here.
+		if err := checkEncryptionIterations(&certEnc); err != nil {
+			return algorithmIdentifier{}, false, err
+		}
+		return certEnc, true, nil
+	case safe.ContentType.Equal(oidDataContentType):
+		if err := checkKeyBagIterations(safe.Content.Bytes); err != nil {
+			return algorithmIdentifier{}, false, err
+		}
 	}
-	return algorithmIdentifier{}, fmt.Errorf("%w: no encrypted certificate bag", ErrProfileUnknown)
+	return algorithmIdentifier{}, false, nil
+}
+
+// checkKeyBagIterations bounds the derivation count of a shrouded private-key
+// bag. The decoder derives with the count stored in the bag itself
+// (go-pkcs12 v0.7.3 pkcs12.go:487), and for the modern profiles that bag sits
+// in the PLAINTEXT safe, so it is invisible to the encrypted-safe check.
+func checkKeyBagIterations(content []byte) error {
+	var inner []byte
+	if _, err := asn1.Unmarshal(content, &inner); err != nil {
+		return fmt.Errorf("parse plaintext safe content: %w", err)
+	}
+	var bags []safeBag
+	if _, err := asn1.Unmarshal(inner, &bags); err != nil {
+		return fmt.Errorf("parse plaintext safe bags: %w", err)
+	}
+	for i := range bags {
+		bag := &bags[i]
+		if !bag.ID.Equal(oidPKCS8ShroudedKeyBag) {
+			continue
+		}
+		var info encryptedPrivateKeyInfo
+		if _, err := asn1.Unmarshal(bag.Value.Bytes, &info); err != nil {
+			return fmt.Errorf("parse shrouded key bag: %w", err)
+		}
+		if err := checkEncryptionIterations(&info.Algorithm); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // profileFor maps the (MAC, certificate-encryption) algorithm pair onto the
-// encoder that produces it.
+// encoder that produces it, reading the same profiles table encoderFor does so
+// the two directions of the contract cannot drift apart.
 //
 // The pair is needed, not just the MAC: modern2023 and modern2026 differ only in
 // their MAC, while legacydes and legacyrc2 share a SHA-1 MAC and differ only in
 // their encryption. Either field alone leaves two profiles indistinguishable.
 func profileFor(macAlg, certAlg asn1.ObjectIdentifier) (EncoderType, error) {
-	switch {
-	case macAlg.Equal(oidSHA256) && certAlg.Equal(oidPBES2):
-		return EncNameModern2023, nil
-	case macAlg.Equal(oidPBMAC1) && certAlg.Equal(oidPBES2):
-		return EncNameModern2026, nil
-	case macAlg.Equal(oidSHA1) && certAlg.Equal(oidPBEWithSHAAnd3KeyTripleDESCBC):
-		return EncNameLegacyDES, nil
-	case macAlg.Equal(oidSHA1) && certAlg.Equal(oidPBEWithSHAAnd40BitRC2CBC):
-		return EncNameLegacyRC2, nil
-	default:
-		return "", fmt.Errorf("%w: mac %v with encryption %v", ErrProfileUnknown, macAlg, certAlg)
+	for _, p := range profiles {
+		if macAlg.Equal(p.macOID) && certAlg.Equal(p.certEncOID) {
+			return p.name, nil
+		}
 	}
+	return "", fmt.Errorf("%w: mac %v with encryption %v", ErrProfileUnknown, macAlg, certAlg)
 }
 
 // checkMACIterations bounds the MAC's derivation count.

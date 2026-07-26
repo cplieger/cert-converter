@@ -170,3 +170,60 @@ func TestDerivedNamesShareOneStem(t *testing.T) {
 		}
 	})
 }
+
+// TestOutputAndCertNamesAreInverses pins the forward and reverse halves of the
+// naming contract against each other. The output tree's reconciliation asks
+// CertForOutput which certificate would have produced a bundle and reaps the
+// bundle when that certificate is absent, so a drift between the two rules — one
+// gaining a directory prefix, an extension changing on one side only — makes a
+// LIVE bundle read as an orphan and be deleted.
+func TestOutputAndCertNamesAreInverses(t *testing.T) {
+	t.Parallel()
+
+	rapid.Check(t, func(t *rapid.T) {
+		stem := rapid.String().Draw(t, "stem")
+		certPath := stem + layout.CertExt
+
+		out := layout.OutputFor(certPath)
+		if !layout.IsOutput(out) {
+			t.Fatalf("IsOutput(%q) is false for a name OutputFor produced", out)
+		}
+		if got := layout.CertForOutput(out); got != certPath {
+			t.Errorf("CertForOutput(OutputFor(%q)) = %q, want the original certificate path", certPath, got)
+		}
+	})
+}
+
+// TestIsOutputAndCertForOutput pins the two output-side names on concrete paths,
+// including the negatives the reconciliation walk depends on: an input
+// certificate, its key and a differently-cased extension are NOT bundles, so the
+// walk must not consider them reapable output.
+func TestIsOutputAndCertForOutput(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		input    string
+		isOutput bool
+		wantCert string
+	}{
+		{"a flat bundle", "example.com.pfx", true, "example.com.crt"},
+		{"a nested bundle keeps its prefix", "example.com/cert.pfx", true, "example.com/cert.crt"},
+		{"deeply nested is preserved, not flattened", "a/b/c/leaf.pfx", true, "a/b/c/leaf.crt"},
+		{"the extension alone", ".pfx", true, ".crt"},
+		{"an input certificate is not an output", "example.com.crt", false, "example.com.crt.crt"},
+		{"a private key is not an output", "example.com.key", false, "example.com.key.crt"},
+		{"extension matching is case sensitive", "example.com.PFX", false, "example.com.PFX.crt"},
+		{"a name merely containing the extension", "bundle.pfx.bak", false, "bundle.pfx.bak.crt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := layout.IsOutput(tc.input); got != tc.isOutput {
+				t.Errorf("IsOutput(%q) = %v, want %v", tc.input, got, tc.isOutput)
+			}
+			if got := layout.CertForOutput(tc.input); got != tc.wantCert {
+				t.Errorf("CertForOutput(%q) = %q, want %q", tc.input, got, tc.wantCert)
+			}
+		})
+	}
+}

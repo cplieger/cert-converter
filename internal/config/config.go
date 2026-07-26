@@ -32,6 +32,7 @@ type Config struct {
 	Password         string
 	EncoderName      convert.EncoderType
 	Lifecycle        process.Lifecycle
+	PasswordStatus   PasswordStatus
 	FallbackInterval time.Duration
 }
 
@@ -60,7 +61,7 @@ var ErrUnencodablePassword = errors.New("PFX_PASSWORD cannot be encoded by PKCS#
 // protects the private key inside every generated PFX file.
 type PasswordStatus string
 
-// The PFX password classifications reported by ClassifyPassword.
+// The PFX password classifications reported by classifyPassword.
 const (
 	// PasswordEmpty means no password at all was supplied.
 	PasswordEmpty PasswordStatus = "empty"
@@ -71,10 +72,11 @@ const (
 	PasswordConfigured PasswordStatus = "configured"
 )
 
-// ClassifyPassword classifies a PFX password. It is the single home for the
-// blank-password predicate: Load's empty-password guard and the caller's
-// startup log both derive their decision from it, so the two cannot drift.
-func ClassifyPassword(password string) PasswordStatus {
+// classifyPassword classifies a PFX password. It is the single home for the
+// blank-password predicate: Load's empty-password guard, Load's weak-password
+// WARN, and the Config.PasswordStatus the startup log reports all derive their
+// decision from it, so they cannot drift.
+func classifyPassword(password string) PasswordStatus {
 	switch {
 	case password == "":
 		return PasswordEmpty
@@ -100,7 +102,7 @@ func ClassifyPassword(password string) PasswordStatus {
 // the intended behaviour change: README documents the guard as refusing to start when
 // the password is empty, which an operator reasonably reads as covering a blank value.
 func isBlank(password string) bool {
-	return ClassifyPassword(password) != PasswordConfigured
+	return classifyPassword(password) != PasswordConfigured
 }
 
 // Load reads environment variables and returns a populated Config. The PFX
@@ -114,6 +116,7 @@ func isBlank(password string) bool {
 // a "pfx..v2" filename is refused), an oversized file, and a file whose
 // trimmed content is empty.
 func Load() (Config, error) {
+	var blankSecretFile error
 	password, source, secretErr := envx.SecretWithSource("PFX_PASSWORD")
 	if secretErr != nil {
 		var missing *envx.MissingError
@@ -130,7 +133,7 @@ func Load() (Config, error) {
 			// verbatim, so a blank file aborted startup even with the opt-out set
 			// while a blank env var was accepted with a warning — the same question
 			// with three homes and three answers.
-			password = ""
+			password, blankSecretFile = "", secretErr
 		default:
 			// Unreadable, oversized, or a rejected path: the operator configured a
 			// secret file that cannot be used at all. That is never something the
@@ -141,25 +144,22 @@ func Load() (Config, error) {
 	}
 	allowEmpty := allowEmptyPassword(os.Getenv("PFX_ALLOW_EMPTY_PASSWORD"))
 	if isBlank(password) && !allowEmpty {
+		if blankSecretFile != nil {
+			// A blank secret FILE is not "no password supplied": name the envx error,
+			// which carries the configured path. A startup FAILURE is the deliberate
+			// exception to omitting the secret-mount path from the logs.
+			return Config{}, fmt.Errorf("%w: %w", ErrEmptyPassword, blankSecretFile)
+		}
 		return Config{}, ErrEmptyPassword
 	}
+	// The classification and its WARN tree live together in this package (see
+	// warnPasswordStrength), alongside every other configuration warning.
+	status := classifyPassword(password)
+	warnPasswordStrength(status)
 	if err := checkPasswordEncodable(password); err != nil {
 		return Config{}, err
 	}
-	if source == envx.SourceFile {
-		// Record the secret's SOURCE (never its value) so an operator can confirm
-		// a mounted secret was actually consumed instead of silently falling back
-		// to PFX_PASSWORD. Reported by envx rather than re-derived from the
-		// environment here, so the log cannot disagree with what was actually read.
-		// The configured path is deliberately omitted from this steady-state line,
-		// which every log aggregator retains: it would publish the secret-mount
-		// topology on every healthy startup for no diagnostic gain. A startup
-		// FAILURE is the deliberate exception — the envx error returned above names
-		// the path, and main logs it, because an unusable secret file cannot be
-		// diagnosed without it.
-		slog.Info("PFX password configured", "source", "PFX_PASSWORD_FILE")
-	}
-	warnBothPasswordChannels(source)
+	logPasswordDelivery(source, password, blankSecretFile)
 
 	rawLifecycle := os.Getenv("OUTPUT_LIFECYCLE")
 	lifecycle, lifecycleKnown := process.ParseLifecycle(rawLifecycle)
@@ -178,6 +178,7 @@ func Load() (Config, error) {
 		EncoderName:      encName,
 		Lifecycle:        lifecycle,
 		FallbackInterval: FallbackInterval(),
+		PasswordStatus:   status,
 	}, nil
 }
 
@@ -328,4 +329,55 @@ func warnBothPasswordChannels(source envx.SecretSource) {
 	slog.Warn("both PFX_PASSWORD and PFX_PASSWORD_FILE are set; the file wins and PFX_PASSWORD is ignored",
 		"source", "PFX_PASSWORD_FILE",
 		"remediation", "remove PFX_PASSWORD from the environment so there is one place to change the secret")
+}
+
+// warnPasswordStrength emits the operator-facing warning for a password that
+// offers no real protection. Every other configuration warning is emitted from
+// Load's package, so this one is too: keeping the classification and its WARN
+// tree in one place means a new PasswordStatus cannot gain a case without its
+// warning being considered in the same edit.
+func warnPasswordStrength(status PasswordStatus) {
+	switch status {
+	case PasswordEmpty:
+		slog.Warn("PFX_PASSWORD is empty; generated PFX files protect the private key with an empty password",
+			"remediation", "set PFX_PASSWORD, or point PFX_PASSWORD_FILE at a mounted secret")
+	case PasswordWhitespaceOnly:
+		slog.Warn("PFX_PASSWORD is whitespace-only; generated PFX files are protected by that whitespace string, which is effectively no protection",
+			"remediation", "set PFX_PASSWORD to a real value (check for stray quotes or spaces in the env file)")
+	case PasswordConfigured:
+		// A real password is the healthy case: the value is a secret, so nothing
+		// is logged about it beyond the non-secret status in the startup line.
+	}
+}
+
+// logPasswordDelivery reports how the PFX password reached the process, never
+// what it is: the resolved source, a blank mounted secret the opt-out let
+// through, a conflicting pair of channels, and surrounding whitespace that
+// silently becomes part of the password.
+//
+// The secret's SOURCE is recorded so an operator can confirm a mounted secret was
+// actually consumed instead of silently falling back to PFX_PASSWORD. It is the
+// source envx reported rather than one re-derived from the environment here, so the
+// log cannot disagree with what was actually read. The configured path is
+// deliberately omitted from these steady-state lines, which every log aggregator
+// retains: it would publish the secret-mount topology on every healthy startup for
+// no diagnostic gain. A startup FAILURE is the deliberate exception — the envx error
+// Load returns names the path, and main logs it, because an unusable secret file
+// cannot be diagnosed without it.
+func logPasswordDelivery(source envx.SecretSource, password string, blankSecretFile error) {
+	if source == envx.SourceFile {
+		if blankSecretFile != nil {
+			slog.Warn("PFX_PASSWORD_FILE is blank; starting with an empty PFX password because PFX_ALLOW_EMPTY_PASSWORD is set",
+				"source", "PFX_PASSWORD_FILE",
+				"remediation", "write the secret into the mounted file so generated PFX files protect the private key")
+		} else {
+			slog.Info("PFX password configured", "source", "PFX_PASSWORD_FILE")
+		}
+	}
+	warnBothPasswordChannels(source)
+	if source == envx.SourceEnv && password != strings.TrimSpace(password) &&
+		strings.TrimSpace(password) != "" {
+		slog.Warn("PFX_PASSWORD has leading or trailing whitespace, which is part of the password embedded in every PFX file",
+			"remediation", "remove the surrounding whitespace, or note that PFX_PASSWORD_FILE trims it, so the same value delivered as a mounted secret yields a different password")
+	}
 }

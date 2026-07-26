@@ -50,7 +50,7 @@ func healthyAfterScan(r process.ScanResult) bool {
 func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *health.Marker) {
 	result, err := scanner.Run(ctx)
 	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if process.IsShutdown(err) {
 			slog.Info("scan interrupted by shutdown", "reason", err)
 			return
 		}
@@ -68,22 +68,6 @@ func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *hea
 
 // --- Entrypoint ---
 
-// logPasswordStatus emits the appropriate weak-password warning and returns
-// the non-secret status used by the startup log. Keeping the warning and the
-// status in one decision prevents the two predicate trees from drifting apart.
-func logPasswordStatus(password string) string {
-	status := config.ClassifyPassword(password)
-	switch status {
-	case config.PasswordEmpty:
-		slog.Warn("PFX_PASSWORD is empty; generated PFX files protect the private key with an empty password",
-			"remediation", "set PFX_PASSWORD, or point PFX_PASSWORD_FILE at a mounted secret")
-	case config.PasswordWhitespaceOnly:
-		slog.Warn("PFX_PASSWORD is whitespace-only; generated PFX files are protected by that whitespace string, which is effectively no protection",
-			"remediation", "set PFX_PASSWORD to a real value (check for stray quotes or spaces in the env file)")
-	}
-	return string(status)
-}
-
 // fallbackLogValue renders the fallback rescan cadence for the startup log.
 // A non-positive interval means the rescan is switched off, which is reported
 // as "disabled" rather than as a bare "0s" duration: the value is the
@@ -96,14 +80,56 @@ func fallbackLogValue(d time.Duration) string {
 	return d.String()
 }
 
+// volumeDir is a required mount point and the role it plays in the startup log.
+type volumeDir struct {
+	role, path string
+}
+
+// volumesReady reports whether every required volume is already mounted as a
+// directory, logging the first offender at ERROR with its role, path and
+// remediation.
+//
+// Both volumes must already exist. Nothing in this app creates them, and a
+// missing one used to surface as a scan-level error on every tick: the
+// container reported unhealthy and the orchestrator restarted it forever,
+// because a restart cannot create a directory either. Failing once at startup
+// with a named path is the actionable form of the same fact, and it matches the
+// health contract — the marker is reserved for failures a restart could clear.
+//
+// Deliberately NOT MkdirAll: silently creating a missing mount point would put
+// certificates in the container's ephemeral layer, where they vanish on the
+// next restart, which is worse than refusing to start. A path that exists but
+// is not a directory (a file bind-mounted over /input, a stray touch) is the
+// same fact and is refused the same way.
+func volumesReady(dirs []volumeDir) bool {
+	for _, dir := range dirs {
+		fi, statErr := os.Stat(dir.path)
+		if statErr == nil && fi.IsDir() {
+			continue
+		}
+		if statErr == nil {
+			// os.Stat succeeded, so the path exists and is a file, symlink to a file,
+			// FIFO, or device. Without this the log carried error=<nil> and the two
+			// causes were indistinguishable, though their remedies differ: an absent
+			// path is a missing mount, a non-directory is a bind-mounted FILE.
+			statErr = errors.New("path exists but is not a directory")
+		}
+		slog.Error("required volume is missing or not a directory; refusing to start",
+			"role", dir.role, "path", dir.path, "error", statErr,
+			"remediation", "mount "+dir.path+" into the container before starting it")
+		return false
+	}
+	return true
+}
+
 // runProbe is a seam: health.RunProbe exits the process, so tests replace it.
 var runProbe = health.RunProbe
 
 // dispatchArgs runs the health probe when argv requests it and REJECTS an
-// unrecognized argument. It returns only when the watcher should start.
-// It returns the process exit code, or continueToWatcher when argv asks for the
-// watcher. Returning rather than calling os.Exit keeps the decision testable and
-// keeps every exit on one path through run().
+// unrecognized argument. It returns the process exit code, or
+// continueToWatcher when argv asks for the watcher. Returning rather than
+// calling os.Exit keeps the decision testable and keeps every exit on one path
+// through run().
 func dispatchArgs(args []string) int {
 	if len(args) <= 1 {
 		return continueToWatcher
@@ -181,33 +207,15 @@ func run() int {
 		return 1
 	}
 
-	passwordStatus := logPasswordStatus(cfg.Password)
+	passwordStatus := string(cfg.PasswordStatus)
 	slog.Info("starting cert watcher",
 		"input", certsRootDir, "output", outputDir,
 		"password", passwordStatus,
 		"fallback_scan", fallbackLogValue(cfg.FallbackInterval), "encoder", cfg.EncoderName,
 		"output_lifecycle", string(cfg.Lifecycle))
 
-	// Both volumes must already exist. Nothing in this app creates them, and a
-	// missing one used to surface as a scan-level error on every tick: the
-	// container reported unhealthy and the orchestrator restarted it forever,
-	// because a restart cannot create a directory either. Failing once at startup
-	// with a named path is the actionable form of the same fact, and it matches the
-	// health contract — the marker is reserved for failures a restart could clear.
-	//
-	// Deliberately NOT MkdirAll: silently creating a missing mount point would put
-	// certificates in the container's ephemeral layer, where they vanish on the
-	// next restart, which is worse than refusing to start.
-	for _, dir := range []struct{ role, path string }{
-		{"input", certsRootDir},
-		{"output", outputDir},
-	} {
-		if fi, statErr := os.Stat(dir.path); statErr != nil || !fi.IsDir() {
-			slog.Error("required volume is missing or not a directory; refusing to start",
-				"role", dir.role, "path", dir.path, "error", statErr,
-				"remediation", "mount "+dir.path+" into the container before starting it")
-			return 1
-		}
+	if !volumesReady([]volumeDir{{"input", certsRootDir}, {"output", outputDir}}) {
+		return 1
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

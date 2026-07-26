@@ -101,3 +101,52 @@ func TestPollTick_stays_in_poll_mode_when_watch_set_rebuild_fails(t *testing.T) 
 		t.Errorf("pollTick(missing root) ran %d scans, want 1", scans)
 	}
 }
+
+// TestPollLoopWithUpgrade_treats_shutdown_before_the_first_scan_as_a_clean_stop
+// pins the ctx guard that opens pollLoopWithUpgrade: a shutdown arriving before
+// the initial scan outranks the dead-change-detection exit.
+func TestPollLoopWithUpgrade_treats_shutdown_before_the_first_scan_as_a_clean_stop(t *testing.T) {
+	t.Parallel()
+	scans := 0
+	// No WithFallback, i.e. the dead-change-detection configuration: a live ctx
+	// here returns ErrWatchLost, so this pins that shutdown outranks that exit.
+	w := New(t.TempDir(), func(context.Context) { scans++ })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := w.pollLoopWithUpgrade(ctx); err != nil {
+		t.Errorf("pollLoopWithUpgrade(cancelled ctx) = %v, want nil: a SIGTERM must not exit 1 claiming change detection is dead", err)
+	}
+	if scans != 0 {
+		t.Errorf("pollLoopWithUpgrade(cancelled ctx) ran %d scans, want 0: a shutdown must not start a scan that still drives the health marker", scans)
+	}
+}
+
+// TestPollTick_treats_shutdown_during_the_watch_set_rebuild_as_a_stop pins the
+// ctx check inside pollTick's rebuild-failure branch: a shutdown mid-walk stops
+// the poll loop instead of logging a degraded upgrade failure and scanning again.
+func TestPollTick_treats_shutdown_during_the_watch_set_rebuild_as_a_stop(t *testing.T) {
+	t.Parallel()
+	// Availability probe only: skips on hosts without inotify, so this test cannot
+	// pass through pollTick's NewWatcher-failure branch instead of the rebuild one.
+	newTestWatcher(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "example.com"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	scans := 0
+	w := New(root, func(context.Context) { scans++ }, WithFallback(time.Hour))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done, err := w.pollTick(ctx)
+	if err != nil {
+		t.Errorf("pollTick(cancelled ctx) error = %v, want nil (a shutdown mid-walk is not an upgrade failure)", err)
+	}
+	if !done {
+		t.Error("pollTick(cancelled ctx) done = false, want true so the poll loop returns instead of logging a degraded upgrade failure")
+	}
+	if scans != 0 {
+		t.Errorf("pollTick(cancelled ctx) ran %d scans, want 0: a shutdown must not start a scan that still drives the health marker", scans)
+	}
+}

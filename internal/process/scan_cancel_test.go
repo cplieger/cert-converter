@@ -10,13 +10,13 @@ import (
 	"github.com/cplieger/cert-converter/internal/testcerts"
 )
 
-// TestScannerRun_cancelled_context_aborts_and_keeps_cache pins the shutdown
-// path: a cancelled context aborts the walk with context.Canceled, converts
-// nothing, and -- because the walk never completed -- must NOT prune the
-// fingerprint cache. Pruning against a partial seen set would drop live
-// fingerprints and force a full, timestamp-churning reconversion on the next
-// clean cycle, so the follow-up scan must still report the pair as unchanged.
-func TestScannerRun_cancelled_context_aborts_and_keeps_cache(t *testing.T) {
+// TestScannerRun_cancelled_context_aborts_and_keeps_prior_output pins the
+// shutdown path: a cancelled context aborts the walk with context.Canceled,
+// converts nothing, and leaves the bundle already on disk untouched. An aborted
+// scan that rewrote or removed output would force a full, timestamp-churning
+// reconversion on the next clean cycle (and re-replicate every bundle
+// downstream), so the follow-up scan must still report the pair as unchanged.
+func TestScannerRun_cancelled_context_aborts_and_keeps_prior_output(t *testing.T) {
 	t.Parallel()
 	certsRoot := t.TempDir()
 	outRoot := t.TempDir()
@@ -52,6 +52,6 @@ func TestScannerRun_cancelled_context_aborts_and_keeps_cache(t *testing.T) {
 		t.Fatalf("Run after cancellation = %v, want nil", err)
 	}
 	if res3.Unchanged != 1 || res3.Converted != 0 {
-		t.Errorf("Run after a cancelled scan = %+v, want Unchanged 1 Converted 0 (an aborted walk must not prune live fingerprints)", res3)
+		t.Errorf("Run after a cancelled scan = %+v, want Unchanged 1 Converted 0 (an aborted walk must leave the prior bundle current)", res3)
 	}
 }

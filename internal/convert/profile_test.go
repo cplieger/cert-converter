@@ -108,7 +108,7 @@ func TestInspect_bounds_iteration_counts(t *testing.T) {
 
 	encoded2048 := []byte{0x02, 0x02, 0x08, 0x00}
 	if n := bytes.Count(pfx, encoded2048); n == 0 {
-		t.Skip("could not locate the DER-encoded iteration count in this bundle; the encoder's framing changed")
+		t.Fatalf("no DER-encoded 2048-iteration count found in a modern2023 bundle: the pinned encoder's framing changed, so this test no longer verifies the KDF iteration bound at all")
 	}
 	huge := bytes.Replace(bytes.Clone(pfx), encoded2048, []byte{0x02, 0x02, 0x7f, 0xff}, 1)
 

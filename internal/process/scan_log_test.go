@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cplieger/cert-converter/internal/convert"
 )
 
 // TestLogScanOutcome_levels pins the level and message of the end-of-scan
@@ -254,6 +257,96 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_all_lack_a_key(t *testin
 			}
 			if tt.wantWarn && !strings.Contains(out, "level=WARN") {
 				t.Errorf("logScanOutcome(%+v, nil) logged %q, want the all-orphan notice at level WARN", tt.result, out)
+			}
+		})
+	}
+}
+
+// TestLogConversionObservations_levels pins the one observation-reporting split
+// this package makes: a duplicate-block artefact is noise and stays at Debug,
+// while every other observation names something the operator probably did not
+// intend and must reach the default level. Inverting it would either bury a
+// reordered bundle, a multi-key file or an expired identity under
+// LOG_LEVEL=debug, or WARN on every conversion of a bundle whose only oddity is a
+// repeated certificate. Runs serially: it swaps slog.Default().
+func TestLogConversionObservations_levels(t *testing.T) {
+	for _, tc := range []struct {
+		kind      convert.ObservationKind
+		wantLevel string
+	}{
+		{convert.ObsDuplicateCerts, "level=DEBUG"},
+		{convert.ObsLeafNotFirst, "level=WARN"},
+		{convert.ObsMultipleKeys, "level=WARN"},
+		{convert.ObsIdentityExpired, "level=WARN"},
+		{convert.ObsChainUnverified, "level=WARN"},
+	} {
+		t.Run(string(tc.kind), func(t *testing.T) {
+			buf := captureLogs(t)
+			logConversionObservations("example.com/tls.crt", []convert.Observation{
+				{Kind: tc.kind, Detail: "detail text"},
+			})
+			line := recordWith(buf.String(), "cert input observation")
+			if line == "" {
+				t.Fatalf("logConversionObservations(%s) logged %q, want a record", tc.kind, buf.String())
+			}
+			if !strings.Contains(line, tc.wantLevel) {
+				t.Errorf("logConversionObservations(%s) = %q, want %s", tc.kind, line, tc.wantLevel)
+			}
+			for _, want := range []string{"kind=" + string(tc.kind), "path=example.com/tls.crt", "detail"} {
+				if !strings.Contains(line, want) {
+					t.Errorf("logConversionObservations(%s) = %q, want it to carry %q", tc.kind, line, want)
+				}
+			}
+		})
+	}
+}
+
+// TestLogConversionObservations_is_silent_without_observations pins the steady
+// state: a clean pair converts without a single observation line. This runs on
+// every conversion, so a guard that logged an empty summary would add a line per
+// cert per renewal. Runs serially: it swaps slog.Default().
+func TestLogConversionObservations_is_silent_without_observations(t *testing.T) {
+	buf := captureLogs(t)
+	logConversionObservations("example.com/tls.crt", nil)
+	if out := buf.String(); out != "" {
+		t.Errorf("logConversionObservations(no observations) logged %q, want no output at all", out)
+	}
+}
+
+// TestNoteUnreadableInput_levels pins the benign-race half of the unreadable-input
+// notice, which the escaping-symlink tests only exercise from the Warn side. A
+// file that vanished between readdir and the read is a normal renewal race — the
+// next scan converts the replacement — so it stays at Debug and carries no
+// remediation hint. Promoting it would put an operator-facing warning, pointing at
+// /input permissions, into the log every time a certificate is atomically
+// replaced. Runs serially: it swaps slog.Default().
+func TestNoteUnreadableInput_levels(t *testing.T) {
+	for _, tc := range []struct {
+		err       error
+		name      string
+		what      string
+		wantMsg   string
+		wantLevel string
+	}{
+		{fs.ErrNotExist, "a vanished certificate is a benign race", "certificate", "certificate vanished during the scan", "level=DEBUG"},
+		{fs.ErrNotExist, "a vanished key is a benign race", "private key", "private key vanished during the scan", "level=DEBUG"},
+		{errors.New("permission denied"), "an unreadable certificate warns", "certificate", "cannot read certificate", "level=WARN"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := captureLogs(t)
+			noteUnreadableInput("example.com/tls.crt", tc.what, tc.err)
+			out := buf.String()
+			if !strings.Contains(out, tc.wantMsg) || !strings.Contains(out, tc.wantLevel) {
+				t.Fatalf("noteUnreadableInput(%v) logged %q, want %q at %s", tc.err, out, tc.wantMsg, tc.wantLevel)
+			}
+			if !strings.Contains(out, "path=example.com/tls.crt") {
+				t.Errorf("noteUnreadableInput(%v) logged %q, want the cert's relative path", tc.err, out)
+			}
+			// The remediation hint belongs to the actionable arm only: on the benign
+			// race there is nothing for the operator to do.
+			hasHint := strings.Contains(out, "remediation=")
+			if wantHint := tc.wantLevel == "level=WARN"; hasHint != wantHint {
+				t.Errorf("noteUnreadableInput(%v) remediation hint present = %v, want %v: %q", tc.err, hasHint, wantHint, out)
 			}
 		})
 	}

@@ -44,56 +44,6 @@ func writeCertAndKey(t *testing.T, dir, base string, certPEM, keyPEM []byte) (cr
 	return crtPath, keyPath
 }
 
-// --- Tests: scan pipeline (process.Scanner.Run) ---
-
-// --- Tests: Pair error paths ---
-
-// --- Tests: logPasswordStatus ---
-
-// TestLogPasswordStatus pins the startup password-status decision: the returned
-// status string and the WARN branch must agree, and a real password must produce
-// no log record at all (the value is a secret). slog.Default is process-global,
-// so this test is deliberately serial (no t.Parallel).
-func TestLogPasswordStatus(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		password    string
-		wantStatus  string
-		wantWarnSub string
-	}{
-		{"empty reports empty", "", "empty", "PFX_PASSWORD is empty"},
-		{"single space is whitespace-only", " ", "whitespace-only", "PFX_PASSWORD is whitespace-only"},
-		{"tab and newline are whitespace-only", "\t\n ", "whitespace-only", "PFX_PASSWORD is whitespace-only"},
-		{"real value is configured", "s3cret", "configured", ""},
-		{"padded value is configured", "  s3cret  ", "configured", ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			logs := capture.Default(t)
-
-			got := logPasswordStatus(tc.password)
-
-			if got != tc.wantStatus {
-				t.Errorf("logPasswordStatus(%q) = %q, want %q", tc.password, got, tc.wantStatus)
-			}
-			if tc.wantWarnSub == "" {
-				if logs.Len() != 0 {
-					t.Errorf("logPasswordStatus(%q) logged %v, want no log records for a real password",
-						tc.password, logs.Messages())
-				}
-				return
-			}
-			if n := logs.CountLevel(slog.LevelWarn, tc.wantWarnSub); n != 1 {
-				t.Errorf("logPasswordStatus(%q) logged %d WARN records matching %q, want 1 (logs %v)",
-					tc.password, n, tc.wantWarnSub, logs.Messages())
-			}
-			if !logs.AttrContains(tc.wantWarnSub, "remediation", "PFX_PASSWORD") {
-				t.Errorf("logPasswordStatus(%q) WARN is missing an actionable remediation attr (logs %v)",
-					tc.password, logs.Messages())
-			}
-		})
-	}
-}
-
 // --- Tests: runAndSetHealth ---
 
 // newTestMarker constructs a marker rooted in a fresh TempDir so tests
@@ -222,10 +172,6 @@ func TestScanAndSetHealth_cancelled_context_leaves_marker_untouched(t *testing.T
 	}
 }
 
-// --- Tests: scan pipeline error branches ---
-
-// --- Tests: convertPair rename failure ---
-
 // TestFallbackLogValue pins the startup log's rendering of the fallback
 // cadence, the one operator-visible decision left in run(): a disabled
 // rescan must read "disabled", never a bare "0s".
@@ -253,23 +199,24 @@ func TestFallbackLogValue(t *testing.T) {
 }
 
 // TestDispatchArgs pins the argv policy behind the runProbe seam: the health
-// subcommand probes the marker at health.DefaultPath, an unknown argument warns
-// and falls through to the watcher, and a bare invocation does neither. No
-// t.Parallel: it swaps the package-level runProbe var and slog.Default().
+// subcommand probes the marker at health.DefaultPath, an unrecognized argument
+// is a usage error that never probes and never starts a watcher, and a bare
+// invocation starts the watcher. The usage error is written to stderr, so argv
+// dispatch must emit no log records at all. No t.Parallel: it swaps the
+// package-level runProbe var and slog.Default().
 func TestDispatchArgs(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		args      []string
 		wantProbe bool
-		wantWarn  bool
 		wantCode  int
 	}{
-		{"no argument starts the watcher", []string{"cert-watcher"}, false, false, continueToWatcher},
-		{"health probes the marker", []string{"cert-watcher", "health"}, true, false, continueToWatcher},
+		{"no argument starts the watcher", []string{"cert-watcher"}, false, continueToWatcher},
+		{"health probes the marker", []string{"cert-watcher", "health"}, true, continueToWatcher},
 		// A typo used to WARN and fall through, which unlinked the resident
 		// watcher's health marker and started a second watcher over the same
 		// output tree. It is now a usage error that never reaches the marker.
-		{"typo is a usage error and never starts a watcher", []string{"cert-watcher", "helth"}, false, false, exitUsage},
+		{"typo is a usage error and never starts a watcher", []string{"cert-watcher", "helth"}, false, exitUsage},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
@@ -289,8 +236,8 @@ func TestDispatchArgs(t *testing.T) {
 			if tc.wantProbe && gotPath != health.DefaultPath {
 				t.Errorf("dispatchArgs(%q) probed %q, want %q", tc.args, gotPath, health.DefaultPath)
 			}
-			if warned := logs.CountLevel(slog.LevelWarn, "unrecognized argument") > 0; warned != tc.wantWarn {
-				t.Errorf("dispatchArgs(%q) warned = %v, want %v (log: %v)", tc.args, warned, tc.wantWarn, logs.Messages())
+			if logs.Len() != 0 {
+				t.Errorf("dispatchArgs(%q) logged %v, want no log records: the usage error goes to stderr", tc.args, logs.Messages())
 			}
 			if gotCode != tc.wantCode {
 				t.Errorf("dispatchArgs(%q) = %d, want %d", tc.args, gotCode, tc.wantCode)
@@ -370,6 +317,60 @@ func TestHealthyAfterScan(t *testing.T) {
 			t.Parallel()
 			if got := healthyAfterScan(tc.in); got != tc.want {
 				t.Errorf("healthyAfterScan(%+v) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestVolumesReady pins the startup volume guard, the one decision in run()
+// that decides between a single actionable refusal and an endless
+// restart-unhealthy loop: every required mount must already exist AND be a
+// directory, the first offender is named at ERROR with its role and a
+// remediation, and a fully-mounted pair starts silently. Serial: it swaps
+// slog.Default().
+func TestVolumesReady(t *testing.T) {
+	existingDir := t.TempDir()
+	regularFile := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(regularFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	absent := filepath.Join(t.TempDir(), "absent")
+
+	for _, tc := range []struct {
+		name     string
+		dirs     []volumeDir
+		want     bool
+		wantRole string
+	}{
+		{"both mounted", []volumeDir{{"input", existingDir}, {"output", existingDir}}, true, ""},
+		{"missing input", []volumeDir{{"input", absent}, {"output", existingDir}}, false, "input"},
+		{"missing output", []volumeDir{{"input", existingDir}, {"output", absent}}, false, "output"},
+		{"input is a regular file", []volumeDir{{"input", regularFile}, {"output", existingDir}}, false, "input"},
+		{"output is a regular file", []volumeDir{{"input", existingDir}, {"output", regularFile}}, false, "output"},
+		{"no volumes required", nil, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := capture.Default(t)
+
+			if got := volumesReady(tc.dirs); got != tc.want {
+				t.Errorf("volumesReady(%+v) = %v, want %v", tc.dirs, got, tc.want)
+			}
+			if tc.want {
+				if logs.Len() != 0 {
+					t.Errorf("volumesReady(%+v) logged %v, want silence when every volume is mounted", tc.dirs, logs.Messages())
+				}
+				return
+			}
+			const msg = "required volume is missing or not a directory"
+			if n := logs.CountLevel(slog.LevelError, msg); n != 1 {
+				t.Fatalf("volumesReady(%+v) logged %d ERROR records matching %q, want exactly 1 (logs %v)",
+					tc.dirs, n, msg, logs.Messages())
+			}
+			if !logs.AttrContains(msg, "role", tc.wantRole) {
+				t.Errorf("volumesReady(%+v) ERROR does not name role %q (logs %v)", tc.dirs, tc.wantRole, logs.Messages())
+			}
+			if !logs.AttrContains(msg, "remediation", "mount ") {
+				t.Errorf("volumesReady(%+v) ERROR is missing an actionable remediation attr (logs %v)", tc.dirs, logs.Messages())
 			}
 		})
 	}

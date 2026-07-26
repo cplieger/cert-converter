@@ -1,17 +1,16 @@
 package watch
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/cplieger/slogx/capture"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -223,27 +222,26 @@ func TestHandleErrorRecv_does_not_resync_the_watch_set_for_a_benign_error(t *tes
 func TestLostOrShutdown_gives_cancellation_precedence(t *testing.T) {
 	const lossMessage = "fsnotify events channel closed, watcher stopping; process will exit and restart"
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-
-	if got := lostOrShutdown(t.Context(), lossMessage); !errors.Is(got, ErrWatchLost) {
-		t.Errorf("lostOrShutdown(live ctx) = %v, want ErrWatchLost (a watcher that dies while the app must keep running is fatal)", got)
-	}
-	if logged := buf.String(); !strings.Contains(logged, lossMessage) {
-		t.Errorf("lostOrShutdown(live ctx) logged %q, want the loss message %q so operators see why the process restarts", logged, lossMessage)
-	}
-
-	buf.Reset()
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()
-	if got := lostOrShutdown(cancelled, lossMessage); got != nil {
-		t.Errorf("lostOrShutdown(cancelled ctx) = %v, want nil (a channel closing during shutdown is a clean stop, not lost change detection)", got)
-	}
-	if logged := buf.String(); logged != "" {
-		t.Errorf("lostOrShutdown(cancelled ctx) logged %q, want no output: a clean shutdown must not claim the process will exit and restart", logged)
-	}
+	t.Run("a live ctx is lost change detection", func(t *testing.T) {
+		logs := capture.Default(t)
+		if got := lostOrShutdown(t.Context(), lossMessage); !errors.Is(got, ErrWatchLost) {
+			t.Errorf("lostOrShutdown(live ctx) = %v, want ErrWatchLost (a watcher that dies while the app must keep running is fatal)", got)
+		}
+		if logs.CountLevel(slog.LevelError, lossMessage) != 1 {
+			t.Errorf("lostOrShutdown(live ctx) logged %v, want one ERROR %q so operators see why the process restarts", logs.Messages(), lossMessage)
+		}
+	})
+	t.Run("a cancelled ctx is a clean stop", func(t *testing.T) {
+		logs := capture.Default(t)
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		if got := lostOrShutdown(cancelled, lossMessage); got != nil {
+			t.Errorf("lostOrShutdown(cancelled ctx) = %v, want nil (a channel closing during shutdown is a clean stop, not lost change detection)", got)
+		}
+		if logs.Len() != 0 {
+			t.Errorf("lostOrShutdown(cancelled ctx) logged %v, want no output: a clean shutdown must not claim the process will exit and restart", logs.Messages())
+		}
+	})
 }
 
 // TestHandleFallbackTick_runs_the_scan_when_resync_fails pins the safety-net

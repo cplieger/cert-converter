@@ -133,3 +133,57 @@ func TestPollLoopWithUpgrade_reports_dead_change_detection(t *testing.T) {
 		t.Error("pollLoopWithUpgrade exited without scanning; main no longer scans before Run, so this is the only conversion the process would perform")
 	}
 }
+
+func TestRun_falls_back_to_polling_when_the_watch_set_cannot_be_built(t *testing.T) {
+	t.Parallel()
+	scans := 0
+	missingRoot := filepath.Join(t.TempDir(), "missing")
+	// No WithFallback: poll mode then has no interval, so it scans once and returns
+	// ErrWatchLost -- an outcome reachable only through the poll fallback.
+	w := New(missingRoot, func(context.Context) { scans++ })
+
+	err := w.Run(t.Context())
+
+	if !errors.Is(err, ErrWatchLost) {
+		t.Errorf("Run(unwatchable root) = %v, want ErrWatchLost via the poll fallback: an unwatchable /input must degrade to polling, not abort the watcher", err)
+	}
+	if scans != 1 {
+		t.Errorf("Run(unwatchable root) ran %d scans, want 1: poll mode must still convert what is already on disk", scans)
+	}
+}
+
+func TestWatchLoop_runs_the_periodic_fallback_scan_without_any_event(t *testing.T) {
+	t.Parallel()
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	scans := make(chan struct{}, 8)
+	// A one-hour debounce: nothing is written under root, and even a stray event
+	// could not produce a scan on this timescale, so the scan below can only come
+	// from the fallback arm.
+	w := New(root, func(context.Context) { scans <- struct{}{} },
+		WithDebounce(time.Hour), WithFallback(20*time.Millisecond))
+	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
+		t.Fatalf("setup: addWatchDirs = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.watchLoop(ctx, watcher) }()
+
+	select {
+	case <-scans:
+	case <-time.After(10 * time.Second):
+		cancel()
+		t.Fatal("watchLoop never ran the periodic fallback scan; the safety net that covers network mounts and missed fsnotify events is not wired into the select")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("watchLoop(cancelled ctx) = %v, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("watchLoop did not return after ctx cancellation")
+	}
+}

@@ -68,16 +68,27 @@ func TestParseCertChain(t *testing.T) {
 	t.Run("excessive PEM blocks", func(t *testing.T) {
 		t.Parallel()
 		certPEM, _ := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
-		var bulkPEM []byte
-		for range 100 {
-			bulkPEM = append(bulkPEM, certPEM...)
+		bulk := func(n int) []byte {
+			var out []byte
+			for range n {
+				out = append(out, certPEM...)
+			}
+			return out
 		}
-		certs, err := convert.ParseCertChain(bulkPEM)
+		// At the bound the chain still parses: the limit exists to keep Analyse's
+		// superlinear graph work bounded, not to reject a large-but-plausible chain.
+		certs, err := convert.ParseCertChain(bulk(64))
 		if err != nil {
-			t.Fatalf("convert.ParseCertChain: %v", err)
+			t.Fatalf("convert.ParseCertChain(64 blocks): %v", err)
 		}
-		if len(certs) != 100 {
-			t.Errorf("got %d certs, want 100", len(certs))
+		if len(certs) != 64 {
+			t.Errorf("got %d certs, want 64", len(certs))
+		}
+		// Past the bound the file is refused before any DER work: one 10 MB input
+		// can otherwise declare ~19,000 certificates and spend hours of CPU in the
+		// all-pairs candidate graph on the scan's only goroutine.
+		if _, err := convert.ParseCertChain(bulk(100)); err == nil {
+			t.Error("convert.ParseCertChain(100 blocks) = nil error, want a refusal past the block bound")
 		}
 	})
 }
@@ -185,31 +196,6 @@ func TestParseCertChain_key_only_input_reports_the_skipped_blocks(t *testing.T) 
 	if !strings.Contains(err.Error(), "skipped 1 non-certificate PEM block(s)") {
 		t.Errorf("convert.ParseCertChain(key-only PEM) error = %q, want it to contain %q",
 			err.Error(), "skipped 1 non-certificate PEM block(s)")
-	}
-}
-
-func TestParseCertChain_round_trip(t *testing.T) {
-	t.Parallel()
-	certPEM, _ := testcerts.GenerateSelfSignedCert(t, "round-trip", "ecdsa")
-
-	certs, err := convert.ParseCertChain(certPEM)
-	if err != nil {
-		t.Fatalf("convert.ParseCertChain: %v", err)
-	}
-	if len(certs) != 1 {
-		t.Fatalf("got %d certs, want 1", len(certs))
-	}
-
-	reEncoded := pem.EncodeToMemory(&pem.Block{
-		Type:  "CERTIFICATE",
-		Bytes: certs[0].Raw,
-	})
-	certs2, err := convert.ParseCertChain(reEncoded)
-	if err != nil {
-		t.Fatalf("convert.ParseCertChain(re-encoded): %v", err)
-	}
-	if certs2[0].Subject.CommonName != "round-trip" {
-		t.Errorf("round trip CN = %q, want %q", certs2[0].Subject.CommonName, "round-trip")
 	}
 }
 
@@ -980,7 +966,8 @@ func TestConvertPair_rejects_password_outside_BMP_without_writing(t *testing.T) 
 
 // TestConvertPair_bounds_the_certificate_subject_it_names pins the log-hygiene
 // rule for certificate-controlled text. A subject comes out of a PEM file the app
-// does not control and is capped only by MaxFileSize, so it must be truncated
+// does not control and is capped only by the 10 MB input read bound
+// internal/process applies, so it must be truncated
 // before it reaches anything logged, and the cut must fall on a rune boundary so
 // the %q form stays readable.
 //

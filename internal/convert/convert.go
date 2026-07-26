@@ -26,6 +26,20 @@ const (
 
 // --- Certificate chain parsing ---
 
+// maxChainCerts bounds how many CERTIFICATE blocks one input file may declare. A
+// real chain is a leaf plus a handful of issuers; the bound exists because
+// Analyse's graph work is superlinear in the certificate count (all-pairs
+// candidate edges, and a path walk that verifies up to n^2/2 signatures), so one
+// file inside the reader's 10 MB cap could otherwise hold ~19,000 certificates
+// and spend hours of CPU plus gigabytes of adjacency state on the scan's only
+// goroutine.
+const maxChainCerts = 64
+
+// maxKeyBlocks bounds how many private-key blocks one key file may declare.
+// Rotation appends a second key; nothing legitimate appends thousands, and every
+// extra key multiplies identity matching.
+const maxKeyBlocks = 16
+
 // parseCertChain decodes all CERTIFICATE PEM blocks from pemBytes, returning
 // them in order. Blocks of any other type (the private key of a combined
 // cert+key file, for instance) are skipped, and the "no certificate" diagnostic
@@ -43,6 +57,10 @@ const (
 // tests reach it through export_test.go.
 func parseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
 	declaredCertBlocks := countDeclaredBlocks(pemBytes, certBeginMarker)
+	if declaredCertBlocks > maxChainCerts {
+		return nil, fmt.Errorf("certificate PEM chain declares %d CERTIFICATE block(s), more than the %d this app converts",
+			declaredCertBlocks, maxChainCerts)
+	}
 	var certs []*x509.Certificate
 	var skipped skippedBlocks
 
@@ -91,7 +109,7 @@ func pemBeginMarker(blockType string) []byte {
 var certBeginMarker = pemBeginMarker(pemTypeCertificate)
 
 // keyBeginMarkers are the PEM declaration lines that open a private-key block
-// parsePrivateKey knows about, including the encrypted forms it diagnoses
+// parsePrivateKeys knows about, including the encrypted forms it diagnoses
 // rather than decodes.
 var keyBeginMarkers = [][]byte{
 	pemBeginMarker(pemTypePrivateKey),
@@ -147,13 +165,15 @@ func (s *skippedBlocks) add(blockType string) {
 }
 
 // firstTypeForLog returns the first skipped label bounded for a log line: the
-// PEM type is operator-supplied text capped only by MaxFileSize.
+// PEM type is operator-supplied text capped only by the 10 MB input read bound
+// internal/process applies (source.go maxFileSize).
 func (s *skippedBlocks) firstTypeForLog() string {
 	return boundLogText(s.firstType, maxBlockTypeLogLen)
 }
 
 // maxBlockTypeLogLen bounds the PEM block label a parse diagnostic names. A PEM
-// type line is arbitrary operator-supplied text bounded only by MaxFileSize, so
+// type line is arbitrary operator-supplied text bounded only by the caller's 10 MB
+// input read bound (internal/process source.go maxFileSize), so
 // it is truncated before it reaches the log.
 const maxBlockTypeLogLen = 64
 
@@ -163,7 +183,8 @@ const maxBlockTypeLogLen = 64
 // subject, a PEM block label) goes through it.
 //
 // Two jobs. It bounds the text, because the source file is capped only by
-// MaxFileSize (10 MB) and an unbounded interpolation would put a multi-megabyte line
+// the caller's input read bound (10 MB, internal/process source.go maxFileSize) and
+// an unbounded interpolation would put a multi-megabyte line
 // into the log of every scan that retries the pair. And it drops what cannot safely
 // reach a log line, which is a SHORT list — verified against log/slog directly rather
 // than assumed:
@@ -213,7 +234,8 @@ func dropUnloggable(r rune) rune {
 // boundedTextError caps the rendered text of a certificate-derived error. The
 // crypto/x509 parser interpolates certificate-controlled fields into several of
 // its messages with %q (a SAN URI, a name constraint, an extension OID), and a
-// certificate is capped only by MaxFileSize (10 MB), so the unbounded text would
+// certificate is capped only by the caller's input read bound (10 MB), so the
+// unbounded text would
 // put a multi-megabyte line into the log of every scan that retries the pair.
 // It shares the same bound (maxSubjectLogLen) and the same partial-rune handling
 // as every other certificate-controlled interpolation in this package. Unwrap is
@@ -225,23 +247,6 @@ func (e boundedTextError) Unwrap() error { return e.err }
 
 // --- Private key parsing ---
 
-// parsePrivateKey extracts a private key from PEM data, trying PKCS8
-// first, then falling back to PKCS1 (RSA) and SEC1 (EC) formats.
-//
-// Block selection and DER validation share one loop, so a key file whose first
-// key-labelled block is malformed (or holds an unsupported PKCS#8 key type)
-// still yields a usable key from a later block; the first parse failure is
-// reported only when no block decodes. It distinguishes "no key block at all"
-// from "the only key blocks are encrypted" so the caller surfaces actionable
-// guidance: both a PKCS#8 ENCRYPTED PRIVATE KEY block and a traditional OpenSSL
-// key carrying "Proc-Type: 4,ENCRYPTED" + "DEK-Info" headers hold ciphertext
-// none of the parsers can decode. It also counts the private-key declarations
-// the file carries (the same line-accurate accounting parseCertChain applies to
-// CERTIFICATE blocks) so a key file whose armour encoding/pem silently dropped
-// is diagnosed as damaged rather than as holding no key at all. Unlike the
-// chain, a partially decodable key file is NOT rejected: a usable later block
-// still wins, and the count only enriches the failure message.
-//
 // keyScan accumulates what one pass over a key file's PEM blocks learned: the
 // usable keys, plus the evidence noPrivateKeyError needs when there are none.
 // Hoisting the loop body onto it keeps parsePrivateKeys a plain drain loop.
@@ -284,7 +289,22 @@ func (s *keyScan) visit(block *pem.Block) {
 }
 
 // parsePrivateKeys extracts EVERY usable private key from PEM data, in file
-// order, applying parsePrivateKey's per-block rules to each block.
+// order, trying PKCS8 first for each block, then falling back to PKCS1 (RSA)
+// and SEC1 (EC).
+//
+// Block selection and DER validation share one loop, so a key file whose first
+// key-labelled block is malformed (or holds an unsupported PKCS#8 key type)
+// still yields a usable key from a later block; the first parse failure is
+// reported only when no block decodes. It distinguishes "no key block at all"
+// from "the only key blocks are encrypted" so the caller surfaces actionable
+// guidance: both a PKCS#8 ENCRYPTED PRIVATE KEY block and a traditional OpenSSL
+// key carrying "Proc-Type: 4,ENCRYPTED" + "DEK-Info" headers hold ciphertext
+// none of the parsers can decode. It also counts the private-key declarations
+// the file carries (the same line-accurate accounting parseCertChain applies to
+// CERTIFICATE blocks) so a key file whose armour encoding/pem silently dropped
+// is diagnosed as damaged rather than as holding no key at all. Unlike the
+// chain, a partially decodable key file is NOT rejected: a usable later block
+// still wins, and the count only enriches the failure message.
 //
 // Returning all of them is what lets identity selection be key-first: with more
 // than one key present, the certificate decides which key is correct, so
@@ -293,6 +313,10 @@ func (s *keyScan) visit(block *pem.Block) {
 // used to produce a key still produces the same first key.
 func parsePrivateKeys(pemBytes []byte) ([]crypto.PrivateKey, error) {
 	declaredKeyBlocks := countDeclaredBlocks(pemBytes, keyBeginMarkers...)
+	if declaredKeyBlocks > maxKeyBlocks {
+		return nil, fmt.Errorf("private key PEM file declares %d key block(s), more than the %d this app reads",
+			declaredKeyBlocks, maxKeyBlocks)
+	}
 	var scan keyScan
 	for {
 		var block *pem.Block
@@ -309,7 +333,7 @@ func parsePrivateKeys(pemBytes []byte) ([]crypto.PrivateKey, error) {
 	return scan.keys, nil
 }
 
-// noPrivateKeyError explains why parsePrivateKey decoded no usable key, in
+// noPrivateKeyError explains why parsePrivateKeys decoded no usable key, in
 // order of specificity: a DER parse failure from a key-labelled block outranks
 // "everything was encrypted", which outranks "there were PEM blocks, none of
 // them a key" (which names the first skipped block's label, bounded, so an

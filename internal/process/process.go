@@ -42,22 +42,21 @@ type Options struct {
 	Password  string
 }
 
-// Scanner walks a certificate directory, checks for changes via a hash cache,
-// and dispatches conversion of cert/key pairs to PFX format.
+// Scanner walks a certificate directory, decides which cert/key pairs are out of
+// date by reading the bundle already on disk, and dispatches their conversion to
+// PFX format.
 //
-// A Scanner is NOT safe for concurrent Run calls: they share the Scanner's own
-// fingerprint cache. Each cache method is individually atomic, but the per-entry
-// matches -> convert -> record sequence is not: overlapping scans could let one
-// skip a pair as unchanged on the strength of a fingerprint the other recorded
-// for a different set of bytes, and one scan's prune can drop the other's live
-// fingerprints. Run every scan from a single goroutine, as main.go does (initial
-// scan, then the watcher's synchronous onChange callback).
+// A Scanner holds no mutable state, but Run must still be called from a single
+// goroutine: concurrent scans share the OUTPUT TREE, not a cache. Both would read
+// the same prior bundle, both would decide it is stale, and both would rewrite it
+// with fresh KDF salts (churning mtimes and re-replicating downstream), and one
+// scan's orphan reap could race the other's write of the same path. main.go does
+// this (initial scan, then the watcher's synchronous onChange callback).
 type Scanner struct {
 	opts Options
 }
 
-// New constructs a Scanner with the given process-lifetime scan configuration
-// and a fresh fingerprint cache.
+// New constructs a Scanner with the given process-lifetime scan configuration.
 // The options are taken by pointer only because the struct is large enough that
 // copying it is wasteful (gocritic hugeParam); New does not retain the pointer's
 // identity, it copies the value into the Scanner.
@@ -107,7 +106,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	})
 
 	result := countResults(sw.results, sw.unreadable)
-	result.Removed = out.reconcile(s.opts.Lifecycle, sw.seen, reapContext{
+	result.Removed = out.reconcile(ctx, s.opts.Lifecycle, sw.seen, reapContext{
 		scanTotal: result.Total,
 		failed:    result.Failed,
 		// result.Unreadable, not sw.unreadable: it also carries the per-entry
@@ -117,6 +116,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		unreadable:    result.Unreadable,
 		unresolved:    sw.unresolved,
 		walkCompleted: walkErr == nil,
+		shutdown:      walkErr != nil && IsShutdown(walkErr),
 	})
 
 	logScanOutcome(ctx, result, walkErr)
@@ -125,7 +125,8 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 
 // scanWalk carries the read-only conversion parameters and the mutable
 // accounting for one Scanner.Run tree walk: the per-pair results, the count of
-// unreadable sub-paths, and the set of cert paths seen (for cache pruning).
+// unreadable sub-paths, and the set of cert paths seen (the input enumeration
+// store.reconcile checks the output tree against).
 // Hoisting the WalkDir callback onto this struct keeps Scanner.Run flat.
 type scanWalk struct {
 	src        *source
@@ -237,11 +238,11 @@ func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
 	level, msg := slog.LevelInfo, "scan complete"
 	if walkErr != nil {
 		level, msg = slog.LevelWarn, "scan aborted before completion"
-		if isShutdown(walkErr) {
+		if IsShutdown(walkErr) {
 			level, msg = slog.LevelDebug, "scan cancelled during shutdown"
 		}
 	}
-	attrs := make([]any, 0, 14)
+	attrs := make([]any, 0, 16)
 	if walkErr != nil {
 		attrs = append(attrs, "error", walkErr)
 	}
@@ -251,6 +252,7 @@ func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
 		"unchanged", result.Unchanged,
 		"orphan", result.Orphan,
 		"unreadable", result.Unreadable,
+		"removed", result.Removed,
 		"failed", result.Failed)
 	slog.Log(ctx, level, msg, attrs...)
 	logInputCoverageWarnings(result, walkErr)
@@ -289,12 +291,15 @@ func logInputCoverageWarnings(result ScanResult, walkErr error) {
 	}
 }
 
-// isShutdown reports whether err is the process shutting down (context
+// IsShutdown reports whether err is the process shutting down (context
 // cancellation or a deadline) rather than an operator-actionable failure. It is
 // the single decision behind every Debug-instead-of-Warn/Error downgrade in
-// this file, so the walk-level, sweep-level and per-entry logs cannot drift
-// apart.
-func isShutdown(err error) bool {
+// this package AND behind the composition root's choice to leave the health
+// marker untouched on a shutdown, so the walk-level, sweep-level, per-entry and
+// health-marker decisions cannot drift apart. Exported for the composition
+// root; Run returns the walk error unwrapped, so main classifies the same value
+// this package does.
+func IsShutdown(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
@@ -302,21 +307,24 @@ func isShutdown(err error) bool {
 // (context cancellation or deadline) logs at Debug -- it is not an operator
 // actionable conversion error -- while every real failure logs at Error, the
 // same split logScanOutcome applies to the walk-level error.
-func logEntryFailure(logPath, msg string, err error) {
-	if isShutdown(err) {
-		slog.Debug(msg+" (shutdown)", "path", logPath, "error", err)
+// Callers may pass extra slog key/value pairs (a remediation hint, the output
+// path) for failures whose cause is not evident from the input path alone.
+func logEntryFailure(logPath, msg string, err error, extra ...any) {
+	attrs := append([]any{"path", logPath, "error", err}, extra...)
+	if IsShutdown(err) {
+		slog.Debug(msg+" (shutdown)", attrs...)
 		return
 	}
-	slog.Error(msg, "path", logPath, "error", err)
+	slog.Error(msg, attrs...)
 }
 
 // failEntry records one per-entry failure: it logs via logEntryFailure and
-// returns the failed status for the caller to propagate. It carries no cache
-// obligation: the cache's record method commits a fingerprint only after a successful
-// conversion, so a failed entry leaves the previous (or absent) fingerprint in
-// place and the next scan retries the pair.
-func failEntry(logPath, msg string, err error) conversionStatus {
-	logEntryFailure(logPath, msg, err)
+// returns the failed status for the caller to propagate. It carries no rollback
+// obligation: currency is derived from the output file itself, so a failed entry
+// leaves the previous bundle (or nothing) at the output path and the next scan
+// reaches the same verdict and retries the pair.
+func failEntry(logPath, msg string, err error, extra ...any) conversionStatus {
+	logEntryFailure(logPath, msg, err, extra...)
 	return statusFailed
 }
 
@@ -330,17 +338,16 @@ type pairInputs struct {
 }
 
 // readPair resolves and reads the input side of one .crt entry: it classifies
-// the sibling .key (a missing key is a health-neutral orphan; a non-ENOENT stat
-// failure is the same outcome but warned, since it is a diagnosable
-// misconfiguration rather than a genuine "no key") and then performs both
-// bounded reads through inHandle, so every /input byte is read once from within
-// the confined root.
+// the sibling .key (a missing key is a health-neutral statusOrphan; a non-ENOENT
+// stat failure is statusUnreadable instead, because the key is there and cannot
+// be read — health-neutral too, but it also blocks orphan reaping, which an
+// orphan does not) and then performs both bounded reads through the input
+// source, so every /input byte is read once from within the confined root.
 //
 // The returned conversionStatus is meaningful only when ok is false: it is the
 // outcome convertEntry must propagate for that entry, with the failure already
 // logged. On the ok path it is statusUnset, which is not an outcome, so a status
 // propagated from a successful read can never be mistaken for a conversion.
-// Every status and log message is identical to what convertEntry emitted inline.
 func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInputs, conversionStatus, bool) {
 	if _, statErr := sw.src.stat(keyRel); statErr != nil {
 		if errors.Is(statErr, fs.ErrNotExist) {
@@ -403,16 +410,16 @@ func noteUnreadableInput(rel, what string, err error) {
 }
 
 // convertEntry resolves the outcome for one .crt entry under certsRoot. It
-// reads the cert and its sibling .key exactly once through inHandle, fingerprints
-// them, and either skips (input unchanged and the prior PFX still present),
-// regenerates (input unchanged but the output went missing), or converts
-// (input changed). Every output touch — the stat, the directory creation and
-// the atomic write — is confined to outHandle, so a symlink planted under the
-// output tree cannot redirect the private-key-bearing PFX outside it. The
-// fingerprint is committed to the cache only after the write succeeds, so every
-// failure path leaves the pair due for a retry without needing a rollback. All
-// per-cert logs use the certsRoot-relative path for a stable, non-leaky
-// identifier.
+// reads the cert and its sibling .key exactly once through the input source,
+// analyses the pair, and either skips it (the bundle on disk is already the one
+// these inputs produce) or converts and writes it (it is not, whether because the
+// inputs changed, the output went missing or was replaced, or the encoder profile
+// or password changed). Every output touch — the prior-bundle read, the directory
+// creation and the atomic write — is confined to the store's root, so a symlink
+// planted under the output tree cannot redirect the private-key-bearing PFX
+// outside it. Nothing is recorded anywhere on success, so every failure path
+// leaves the pair due for a retry without needing a rollback. All per-cert logs
+// use the certsRoot-relative path for a stable, non-leaky identifier.
 func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStatus {
 	// Both sibling names come from layout, so this package and internal/watch
 	// derive the pairing rule from one place instead of two copies that can drift.
@@ -437,9 +444,11 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	}
 	current, err := sw.out.isCurrent(ctx, pfxRel, &analysis, sw.enc, sw.password)
 	if err != nil {
-		// A read or confinement failure on the output tree is a real failure, never
-		// silently "stale": treating it as stale would hide a broken output mount
-		// behind an endless stream of rewrites.
+		// Only shutdown gets here: isCurrent resolves every unreadable-output case to
+		// "stale" itself and reserves an error for cancellation, which is neither
+		// current nor stale. failEntry logs it at Debug, and visit's post-conversion
+		// context check turns it into the walk-level cancellation the caller reports,
+		// so this entry's statusFailed never reaches the health marker.
 		return failEntry(rel, "failed to inspect existing pfx", err)
 	}
 	if current {
@@ -459,7 +468,11 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		return failEntry(rel, "conversion failed", err)
 	}
 	if err := sw.out.write(ctx, pfxRel, pfxData); err != nil {
-		return failEntry(rel, "conversion failed", err)
+		// The message is unchanged (an operator's log query keys on it); the
+		// remediation names the two steady-state output-side causes.
+		return failEntry(rel, "conversion failed", err, "output_path", pfxRel,
+			"remediation", "check /output ownership and permissions for the UID in user:, "+
+				"and that no symlink is planted at the output path")
 	}
 
 	slog.Info("wrote pfx", "path", pfxRel)

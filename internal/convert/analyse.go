@@ -75,6 +75,11 @@ type Analysis struct {
 	// an ordered SEQUENCE of bags and decoders read it positionally (go-pkcs12's
 	// own decoder assumes the first certificate is the leaf), so this order is a
 	// contract rather than an implementation detail.
+	//
+	// One exception, always accompanied by ObsChainUnverified: when no issuer of
+	// Leaf could be established from the bundle, Chain carries the remaining
+	// certificates in INPUT order instead. There is no ancestry to order them by,
+	// and carrying a CA a deployment may rely on beats emitting an empty chain.
 	Chain []*x509.Certificate
 	// Key is the private half of Leaf.
 	Key crypto.PrivateKey
@@ -121,7 +126,7 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 
 	var obs []Observation
 
-	certs, dupCerts := dedupeCerts(certs)
+	certs, certAt, dupCerts := dedupeCerts(certs)
 	if dupCerts > 0 {
 		obs = append(obs, Observation{
 			Kind:   ObsDuplicateCerts,
@@ -171,7 +176,7 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 		obs = append(obs, Observation{
 			Kind: ObsLeafNotFirst,
 			Detail: fmt.Sprintf("the end-entity certificate is block %d of %d, not the first; the bundle was reordered leaf-first",
-				identity.cert+1, len(certs)),
+				certAt[identity.cert]+1, len(certs)+dupCerts),
 		})
 	}
 	obs = append(obs, validityObservations(leaf, now)...)
@@ -496,6 +501,15 @@ func (g *certGraph) pathFrom(start int) []int {
 	onPath := make([]bool, len(g.certs))
 	onPath[start] = true
 	for cur := start; ; {
+		// A self-signed certificate has no issuer BY CONSTRUCTION, so the walk must
+		// end here. Without this the unverified-candidate fallback in bestParent can
+		// attach a same-subject stranger (a regenerated self-signed certificate
+		// holding a DIFFERENT key) as the identity's issuer, which assembleChain's
+		// own self-signed carve-out is written to prevent but never sees, because it
+		// only fires on an EMPTY chain.
+		if g.isSelfSigned(cur) {
+			return path
+		}
 		best := g.bestParent(cur, onPath)
 		if best == -1 {
 			return path
@@ -655,11 +669,15 @@ func validityObservations(leaf *x509.Certificate, now time.Time) []Observation {
 }
 
 // dedupeCerts removes byte-identical certificates, keeping input order, and
-// reports how many were dropped. A repeated certificate is a copy-paste artefact
-// that would otherwise create a spurious self-edge candidate in the graph.
-func dedupeCerts(certs []*x509.Certificate) (kept []*x509.Certificate, dropped int) {
+// reports how many were dropped plus, for each kept certificate, its ORIGINAL
+// index in the input slice. A repeated certificate is a copy-paste artefact
+// that would otherwise create a spurious self-edge candidate in the graph. The
+// kept-at mapping is what lets an observation name the block number an operator
+// will find in their file rather than a post-dedupe position.
+func dedupeCerts(certs []*x509.Certificate) (kept []*x509.Certificate, keptAt []int, dropped int) {
 	kept = make([]*x509.Certificate, 0, len(certs))
-	for _, c := range certs {
+	keptAt = make([]int, 0, len(certs))
+	for i, c := range certs {
 		dup := false
 		for _, k := range kept {
 			if bytes.Equal(k.Raw, c.Raw) {
@@ -672,8 +690,9 @@ func dedupeCerts(certs []*x509.Certificate) (kept []*x509.Certificate, dropped i
 			continue
 		}
 		kept = append(kept, c)
+		keptAt = append(keptAt, i)
 	}
-	return kept, dropped
+	return kept, keptAt, dropped
 }
 
 // splitSigners partitions parsed keys into those usable for identity matching

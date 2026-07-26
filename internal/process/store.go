@@ -79,6 +79,11 @@ func (s *store) lstat(rel string) (os.FileInfo, error) {
 // an interrupted write rather than staged by one still in flight.
 const staleTempAge = time.Hour
 
+// maxLoggedOrphans caps how many orphan paths one report names. The count is the
+// actionable number; the paths are a sample, and an unbounded list on a per-scan
+// WARN is a permanent multi-kilobyte log line.
+const maxLoggedOrphans = 20
+
 // sweepStaleTemps removes PFX temp files orphaned by an interrupted atomic write
 // (a crash between temp-write and rename), then narrates the outcome.
 //
@@ -109,7 +114,7 @@ func (s *store) sweepStaleTemps(ctx context.Context) {
 func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
 	const remediation = "check /output ownership and permissions for the UID in user:"
 	if walkErr != nil {
-		if isShutdown(walkErr) {
+		if IsShutdown(walkErr) {
 			// Shutdown, not an operator-actionable cleanup failure; the input
 			// walk's own context check reports the cancellation to the caller.
 			slog.Debug("stale temp cleanup cancelled during shutdown", "dir", s.root.Name(), "error", walkErr)
@@ -165,9 +170,13 @@ const maxPFXSize = 2*maxFileSize + 64<<10
 // Deriving currency from the output answers all three, and needs no persistent
 // state to survive a restart.
 //
-// Any decode failure means stale: rewrite. A read or confinement failure is a
-// hard error and is never silently treated as stale, because that would hide a
-// broken output mount behind a stream of rewrites.
+// Every "I cannot tell what is on disk" outcome resolves to stale: rewrite. That
+// covers a decode failure (Debug: a rotated password, a truncated or foreign file)
+// and, at WARN with a remediation hint, a stat failure, an oversized file, or an
+// unreadable file — the app can fix all of those itself by rewriting, and if the
+// rewrite genuinely cannot happen THAT failure flips health, which is the honest
+// signal. Only shutdown is a hard error: it is neither current nor stale, and
+// treating it as stale would rewrite every in-flight pair on the way out.
 func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysis,
 	wantEncoder convert.EncoderType, password string,
 ) (bool, error) {
@@ -192,6 +201,14 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 		// A directory, symlink or device node at the output name is not a usable
 		// prior bundle, and a symlink must never be followed here or unrelated
 		// content could satisfy the check.
+		return false, nil
+	case fi.Mode().Perm() != pfxFileMode:
+		// The bundle carries a private key, so pfxFileMode is this app's policy for
+		// it, not just the mode of a fresh write. A file whose contents already match
+		// would otherwise keep a laxer mode forever, because currency is decided on
+		// content alone. Rewriting converges it: atomicfile chmods to the exact mode.
+		slog.Warn("prior pfx has an unexpected file mode; regenerating",
+			"path", rel, "mode", fi.Mode().Perm().String(), "want", os.FileMode(pfxFileMode).String())
 		return false, nil
 	case fi.Size() > maxPFXSize:
 		slog.Warn("prior pfx exceeds the readable bound; regenerating",
@@ -250,13 +267,16 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 }
 
 // readBoundedPFX reads rel from inside the output tree under maxPFXSize.
+//
+// atomicfile owns the confined read: it opens through the root non-blocking (so a
+// FIFO or device node planted at an output name is rejected rather than wedging
+// the scan's only goroutine in open(2) forever), requires a regular file, and
+// stats the OPEN HANDLE rather than the path — closing the window between
+// isCurrent's lstat and this open on a volume other containers write to. Those
+// are the same three guarantees the input side already delegates in
+// source.readBoundedLimit.
 func (s *store) readBoundedPFX(ctx context.Context, rel string) ([]byte, error) {
-	f, err := s.root.Open(rel)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return atomicfile.ReadBoundedFile(ctx, f, maxPFXSize)
+	return atomicfile.ReadBoundedInRoot(ctx, s.root, rel, maxPFXSize)
 }
 
 // --- Output lifecycle ---
@@ -298,10 +318,16 @@ func ParseLifecycle(raw string) (mode Lifecycle, known bool) {
 // seen is the set of input .crt paths a COMPLETE walk found. Only paths matching
 // the app's own output shape are considered, so a file the app would never have
 // written is never a deletion candidate.
-func (s *store) orphans(seen map[string]struct{}) (found []string, safe bool, err error) {
+func (s *store) orphans(ctx context.Context, seen map[string]struct{}) (found []string, safe bool, err error) {
 	safe = true
 	var unreadable, symlinked int
 	walkErr := fs.WalkDir(s.root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
+		// Same per-entry cancellation contract the input walk and the stale-temp
+		// sweep already honour: this walk runs on the shutdown path, because the
+		// scan is driven synchronously from the watcher's onChange callback.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
 			if rel == "." {
 				return err
@@ -374,23 +400,54 @@ type reapContext struct {
 	unreadable    int
 	unresolved    int
 	walkCompleted bool
+	// shutdown is true when the walk ended because the process is stopping, which
+	// is not an operator-actionable incomplete enumeration.
+	shutdown bool
+}
+
+// enumeratedInput reports whether `seen` can be trusted as a COMPLETE enumeration
+// of the input tree. It is the precondition for calling an output an orphan AT ALL,
+// not just for deleting one: without it every bundle whose cert the scan never
+// reached reads as an orphan.
+func (r reapContext) enumeratedInput() bool {
+	return r.walkCompleted && r.unreadable == 0 && r.unresolved == 0 && r.scanTotal > 0
 }
 
 // safeToReap reports whether the input enumeration is complete enough to justify
 // deleting anything.
 func (r reapContext) safeToReap() bool {
-	return r.walkCompleted && r.unreadable == 0 && r.unresolved == 0 &&
-		r.failed == 0 && r.scanTotal > 0
+	return r.enumeratedInput() && r.failed == 0
 }
 
-func (s *store) reconcile(mode Lifecycle, seen map[string]struct{}, rc reapContext) int {
+func (s *store) reconcile(ctx context.Context, mode Lifecycle, seen map[string]struct{}, rc reapContext) int {
 	if mode == LifecycleKeep {
 		return 0
 	}
-
-	orphaned, walkSafe, err := s.orphans(seen)
+	if !rc.enumeratedInput() {
+		// Without a complete input enumeration, "this output has no matching input"
+		// is not a claim the scan can make: a bundle whose cert the walk never
+		// reached is indistinguishable from one whose cert was deleted.
+		if rc.shutdown {
+			slog.Debug("skipping orphan reconciliation; scan cancelled during shutdown")
+			return 0
+		}
+		slog.Warn("orphan removal is disabled for this scan: the scan did not fully enumerate the input tree, so no output can be proven orphaned",
+			"walk_completed", rc.walkCompleted, "unreadable", rc.unreadable,
+			"unresolved", rc.unresolved, "total", rc.scanTotal,
+			"remediation", "check the /input mount and the unreadable-path warnings above")
+		return 0
+	}
+	orphaned, walkSafe, err := s.orphans(ctx, seen)
 	if err != nil {
-		slog.Warn("could not enumerate output orphans", "error", err)
+		if IsShutdown(err) {
+			// Shutdown, not a broken output tree; the input walk already reports the
+			// cancellation to the caller.
+			slog.Debug("orphan enumeration cancelled during shutdown", "error", err)
+			return 0
+		}
+		slog.Warn("could not enumerate output orphans; orphan removal is disabled for this scan",
+			"error", err, "dir", s.root.Name(),
+			"remediation", "check /output ownership and permissions for the UID in user:")
 		return 0
 	}
 	if len(orphaned) == 0 {
@@ -400,14 +457,26 @@ func (s *store) reconcile(mode Lifecycle, seen map[string]struct{}, rc reapConte
 	reapable := rc.safeToReap() && walkSafe
 	if mode != LifecycleSync || !reapable {
 		slog.Warn("output bundles have no matching input",
-			"count", len(orphaned), "paths", strings.Join(orphaned, ","),
+			"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),
 			"action", lifecycleInaction(mode),
 			"remediation", "remove them from the output volume, or set OUTPUT_LIFECYCLE=sync to have this app do it")
 		return 0
 	}
 
+	return s.removeOrphans(ctx, orphaned)
+}
+
+// removeOrphans deletes each named output bundle, stopping early on shutdown and
+// skipping (never aborting on) an individual removal failure. Returns how many
+// were actually deleted.
+func (s *store) removeOrphans(ctx context.Context, orphaned []string) int {
 	var deleted int
 	for _, rel := range orphaned {
+		if ctx.Err() != nil {
+			slog.Debug("orphan removal interrupted by shutdown",
+				"removed", deleted, "remaining", len(orphaned)-deleted)
+			break
+		}
 		if err := s.root.Remove(rel); err != nil {
 			slog.Warn("could not remove orphaned output", "path", rel, "error", err)
 			continue
@@ -420,14 +489,26 @@ func (s *store) reconcile(mode Lifecycle, seen map[string]struct{}, rc reapConte
 	return deleted
 }
 
+// sampleOrphanPaths renders at most maxLoggedOrphans paths, naming how many were
+// elided so the log line stays bounded without hiding the scale.
+func sampleOrphanPaths(paths []string) string {
+	if len(paths) <= maxLoggedOrphans {
+		return strings.Join(paths, ",")
+	}
+	return strings.Join(paths[:maxLoggedOrphans], ",") +
+		fmt.Sprintf(" (+%d more)", len(paths)-maxLoggedOrphans)
+}
+
 // lifecycleInaction explains why an orphan was reported rather than removed. It
 // is only called when no deletion happened, so the mode alone determines which of
 // the two reasons applies: any mode other than sync reports by configuration, and
-// sync reports only when the scan could not prove the input tree was fully
-// enumerated.
+// sync reports only when the scan could not prove every candidate is genuinely
+// orphaned — reconcile now returns before this point when the INPUT enumeration is
+// incomplete, so the sync arm is reached via a failed conversion or an unsafe
+// OUTPUT walk.
 func lifecycleInaction(mode Lifecycle) string {
 	if mode != LifecycleSync {
 		return "reported only (OUTPUT_LIFECYCLE=" + string(mode) + ")"
 	}
-	return "kept: this scan did not fully enumerate the input tree, so deleting could remove a live bundle"
+	return "kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle"
 }

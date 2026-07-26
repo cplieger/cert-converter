@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/testcerts"
 	"software.sslmate.com/src/go-pkcs12"
 )
 
@@ -273,6 +274,74 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		}
 		if !bytes.Equal(gotKey, wantKey) {
 			t.Fatal("private key changed across the PFX round trip")
+		}
+	})
+}
+
+// FuzzInspect_boundedProfile fuzzes the preflight that runs over a PKCS#12 file
+// found in the output tree -- bytes this app did not necessarily write -- before
+// any key derivation happens. Inspect is the gate that keeps a crafted file from
+// spending arbitrary CPU on the scan's only goroutine, so it must survive
+// arbitrary input and report a bounded verdict.
+//
+// The invariants are stronger than "does not panic": a rejected bundle must carry
+// no profile (a caller that read Profile past an error would act on a fabricated
+// one), an accepted bundle's profile must be one of the four this app emits, the
+// verdict must be deterministic for the same bytes, and Inspect must not mutate
+// the slice its caller then hands to Decode.
+func FuzzInspect_boundedProfile(f *testing.F) {
+	m := testcerts.GenerateChainMaterial(f)
+	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		f.Fatalf("setup: Analyse: %v", err)
+	}
+	// A real bundle from every profile, plus the two mutations that reach the
+	// preamble and trailing-byte rejections. The weekly fuzz corpus is discarded
+	// after each run, so these committed seeds are the durable reach.
+	for _, enc := range []convert.EncoderType{
+		convert.EncNameModern2023,
+		convert.EncNameModern2026,
+		convert.EncNameLegacyDES,
+		convert.EncNameLegacyRC2,
+	} {
+		pfx, encErr := convert.Encode(&analysis, enc, "pw")
+		if encErr != nil {
+			f.Fatalf("setup: Encode(%s): %v", enc, encErr)
+		}
+		f.Add(pfx)
+		f.Add(pfx[:len(pfx)/2])
+		f.Add(append(bytes.Clone(pfx), 0xff, 0xff))
+	}
+	f.Add([]byte(nil))
+	f.Add([]byte("not a pkcs12 bundle"))
+	// A DER SEQUENCE header whose length overruns the buffer.
+	f.Add([]byte{0x30, 0x7f, 0x02, 0x01, 0x03})
+
+	known := map[convert.EncoderType]bool{
+		convert.EncNameModern2023: true,
+		convert.EncNameModern2026: true,
+		convert.EncNameLegacyDES:  true,
+		convert.EncNameLegacyRC2:  true,
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		before := bytes.Clone(data)
+		got, inspectErr := convert.Inspect(data)
+		if !bytes.Equal(before, data) {
+			t.Fatal("Inspect mutated its input; the caller passes the same bytes on to Decode")
+		}
+		if inspectErr != nil {
+			if got.Profile != "" {
+				t.Fatalf("Inspect = profile %q with error %v; a rejected bundle must carry no profile", got.Profile, inspectErr)
+			}
+			return
+		}
+		if !known[got.Profile] {
+			t.Fatalf("Inspect accepted a bundle and reported profile %q, which is not one of the four this app emits", got.Profile)
+		}
+		again, againErr := convert.Inspect(data)
+		if againErr != nil || again != got {
+			t.Fatalf("Inspect is not deterministic: second call = (%+v, %v), first = (%+v, nil)", again, againErr, got)
 		}
 	})
 }
