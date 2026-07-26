@@ -419,9 +419,14 @@ func (r reapContext) safeToReap() bool {
 	return r.enumeratedInput() && r.failed == 0
 }
 
-func (s *store) reconcile(ctx context.Context, mode Lifecycle, seen map[string]struct{}, rc reapContext) int {
+// reconcile compares the output tree against the input enumeration and, in sync
+// mode, deletes the bundles that no longer have an input. It returns how many were
+// removed plus a cancellation error when the process is shutting down: the walk
+// caller folds that error into the scan's outcome, so a scan interrupted after the
+// input walk finished is not reported as a clean, complete scan.
+func (s *store) reconcile(ctx context.Context, mode Lifecycle, seen map[string]struct{}, rc reapContext) (int, error) {
 	if mode == LifecycleKeep {
-		return 0
+		return 0, nil
 	}
 	if !rc.enumeratedInput() {
 		// Without a complete input enumeration, "this output has no matching input"
@@ -429,29 +434,40 @@ func (s *store) reconcile(ctx context.Context, mode Lifecycle, seen map[string]s
 		// reached is indistinguishable from one whose cert was deleted.
 		if rc.shutdown {
 			slog.Debug("skipping orphan reconciliation; scan cancelled during shutdown")
-			return 0
+			return 0, nil
+		}
+		if rc.walkCompleted && rc.unreadable == 0 && rc.unresolved == 0 {
+			// A complete walk that found no pair at all: the enumeration did not fail, there
+			// is simply nothing to compare the output tree against. logInputCoverageWarnings
+			// already names this at WARN with the /input-mount remediation, and the operator
+			// alert on "orphan removal is disabled for this scan" points at /output, so
+			// repeating it here would fire that alert with the wrong diagnosis on every scan
+			// of a deployment whose first certificate has not been issued yet.
+			slog.Debug("skipping orphan reconciliation; the scan found no certificate pairs to compare the output tree against")
+			return 0, nil
 		}
 		slog.Warn("orphan removal is disabled for this scan: the scan did not fully enumerate the input tree, so no output can be proven orphaned",
 			"walk_completed", rc.walkCompleted, "unreadable", rc.unreadable,
 			"unresolved", rc.unresolved, "total", rc.scanTotal,
 			"remediation", "check the /input mount and the unreadable-path warnings above")
-		return 0
+		return 0, nil
 	}
 	orphaned, walkSafe, err := s.orphans(ctx, seen)
 	if err != nil {
 		if IsShutdown(err) {
-			// Shutdown, not a broken output tree; the input walk already reports the
-			// cancellation to the caller.
+			// Shutdown, not a broken output tree. The input walk usually reports the
+			// cancellation itself, but not when it finished cleanly before the signal
+			// arrived, so the error is returned here too rather than only logged.
 			slog.Debug("orphan enumeration cancelled during shutdown", "error", err)
-			return 0
+			return 0, err
 		}
 		slog.Warn("could not enumerate output orphans; orphan removal is disabled for this scan",
 			"error", err, "dir", s.root.Name(),
 			"remediation", "check /output ownership and permissions for the UID in user:")
-		return 0
+		return 0, nil
 	}
 	if len(orphaned) == 0 {
-		return 0
+		return 0, nil
 	}
 
 	reapable := rc.safeToReap() && walkSafe
@@ -460,7 +476,7 @@ func (s *store) reconcile(ctx context.Context, mode Lifecycle, seen map[string]s
 			"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),
 			"action", lifecycleInaction(mode),
 			"remediation", "remove them from the output volume, or set OUTPUT_LIFECYCLE=sync to have this app do it")
-		return 0
+		return 0, nil
 	}
 
 	return s.removeOrphans(ctx, orphaned)
@@ -468,14 +484,15 @@ func (s *store) reconcile(ctx context.Context, mode Lifecycle, seen map[string]s
 
 // removeOrphans deletes each named output bundle, stopping early on shutdown and
 // skipping (never aborting on) an individual removal failure. Returns how many
-// were actually deleted.
-func (s *store) removeOrphans(ctx context.Context, orphaned []string) int {
+// were actually deleted, plus the context's cancellation error when shutdown cut
+// the loop short so the caller does not report the scan as complete.
+func (s *store) removeOrphans(ctx context.Context, orphaned []string) (int, error) {
 	var deleted int
 	for _, rel := range orphaned {
-		if ctx.Err() != nil {
+		if err := ctx.Err(); err != nil {
 			slog.Debug("orphan removal interrupted by shutdown",
 				"removed", deleted, "remaining", len(orphaned)-deleted)
-			break
+			return deleted, err
 		}
 		if err := s.root.Remove(rel); err != nil {
 			slog.Warn("could not remove orphaned output", "path", rel, "error", err)
@@ -486,7 +503,7 @@ func (s *store) removeOrphans(ctx context.Context, orphaned []string) int {
 		slog.Info("removed orphaned output whose input is gone", "path", rel)
 		deleted++
 	}
-	return deleted
+	return deleted, nil
 }
 
 // sampleOrphanPaths renders at most maxLoggedOrphans paths, naming how many were

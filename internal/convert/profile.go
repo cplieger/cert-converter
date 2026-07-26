@@ -175,9 +175,10 @@ func Inspect(pfx []byte) (Inspection, error) {
 	if err != nil {
 		return Inspection{}, err
 	}
-	if err := checkEncryptionIterations(&certAlg); err != nil {
-		return Inspection{}, err
-	}
+	// The encryption iteration counts are bounded during the authenticated-safe
+	// walk (certBagAlgorithm -> boundedSafeAlgorithm), which covers EVERY
+	// encrypted safe plus the plaintext safe's shrouded key bag, not just the
+	// one that identifies the profile. Re-checking certAlg here would be dead.
 	return Inspection{Profile: profile}, nil
 }
 

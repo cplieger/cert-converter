@@ -106,7 +106,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	})
 
 	result := countResults(sw.results, sw.unreadable)
-	result.Removed = out.reconcile(ctx, s.opts.Lifecycle, sw.seen, reapContext{
+	removed, reconcileErr := out.reconcile(ctx, s.opts.Lifecycle, sw.seen, reapContext{
 		scanTotal: result.Total,
 		failed:    result.Failed,
 		// result.Unreadable, not sw.unreadable: it also carries the per-entry
@@ -118,6 +118,14 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		walkCompleted: walkErr == nil,
 		shutdown:      walkErr != nil && IsShutdown(walkErr),
 	})
+	result.Removed = removed
+	// A shutdown that arrives after the input walk completed cancels reconciliation
+	// instead, and that scan is NOT complete: without folding the error in, the
+	// caller would log "scan complete" and mark the container healthy on a scan that
+	// stopped halfway through the output tree.
+	if walkErr == nil {
+		walkErr = reconcileErr
+	}
 
 	logScanOutcome(ctx, result, walkErr)
 	return result, walkErr

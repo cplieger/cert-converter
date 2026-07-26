@@ -2,12 +2,14 @@ package watch
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/cplieger/slogx/capture"
+	"github.com/fsnotify/fsnotify"
 )
 
 // TestPollLoopWithUpgrade_upgrades_to_fsnotify_and_scans_first pins the poll
@@ -148,5 +150,28 @@ func TestPollTick_treats_shutdown_during_the_watch_set_rebuild_as_a_stop(t *test
 	}
 	if scans != 0 {
 		t.Errorf("pollTick(cancelled ctx) ran %d scans, want 0: a shutdown must not start a scan that still drives the health marker", scans)
+	}
+}
+
+// TestRun_falls_back_to_polling_when_fsnotify_is_unavailable drives the seam
+// l-f46 exists for: with the constructor failing, Run must degrade to polling
+// rather than abort, which is unreachable on a host where inotify works.
+// Not parallel: it swaps the package-level newFSWatcher seam.
+func TestRun_falls_back_to_polling_when_fsnotify_is_unavailable(t *testing.T) {
+	prev := newFSWatcher
+	newFSWatcher = func() (*fsnotify.Watcher, error) { return nil, errors.New("inotify exhausted") }
+	t.Cleanup(func() { newFSWatcher = prev })
+
+	scans := 0
+	// No WithFallback: poll mode then has no interval, so Run scans once and
+	// returns ErrWatchLost -- reachable only through the unavailable-fsnotify
+	// dispatch.
+	w := New(t.TempDir(), func(context.Context) { scans++ })
+
+	if err := w.Run(t.Context()); !errors.Is(err, ErrWatchLost) {
+		t.Errorf("Run(fsnotify unavailable, no fallback) = %v, want ErrWatchLost", err)
+	}
+	if scans != 1 {
+		t.Errorf("Run(fsnotify unavailable) ran %d scans, want 1: poll mode must still convert what is already on disk", scans)
 	}
 }

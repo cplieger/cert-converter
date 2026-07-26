@@ -153,9 +153,13 @@ func Load() (Config, error) {
 		return Config{}, ErrEmptyPassword
 	}
 	// The classification and its WARN tree live together in this package (see
-	// warnPasswordStrength), alongside every other configuration warning.
+	// warnPasswordStrength), alongside every other configuration warning. The
+	// status is classified next to the guard that consumes it, but its WARN is
+	// emitted last, immediately before Load returns: that keeps the baseline
+	// startup log order (delivery and channel diagnostics, then lifecycle,
+	// encoder and fallback diagnostics, then the weak-password warning, then
+	// main's "starting cert watcher" record).
 	status := classifyPassword(password)
-	warnPasswordStrength(status)
 	if err := checkPasswordEncodable(password); err != nil {
 		return Config{}, err
 	}
@@ -173,11 +177,14 @@ func Load() (Config, error) {
 		slog.Warn("unknown PFX_ENCODER, using modern2023", "value", rawEncoder)
 	}
 
+	fallbackInterval := FallbackInterval()
+	warnPasswordStrength(status)
+
 	return Config{
 		Password:         password,
 		EncoderName:      encName,
 		Lifecycle:        lifecycle,
-		FallbackInterval: FallbackInterval(),
+		FallbackInterval: fallbackInterval,
 		PasswordStatus:   status,
 	}, nil
 }

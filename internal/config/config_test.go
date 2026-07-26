@@ -348,10 +348,10 @@ func TestLoad_empty_password_optout_requires_literal_true(t *testing.T) {
 }
 
 // TestClassifyPassword pins the blank-password predicate directly in
-// its owning package: Load only ever asks whether the status is
-// PasswordEmpty, so the whitespace-only branch is never exercised by any test
-// in this package. No t.Parallel: every test in this file mutates process
-// state (env / slog default) and the file is deliberately serial.
+// its owning package, covering every classification without going through
+// Load's guards (TestLoad_password_status_agrees_with_its_warning covers the
+// same statuses end to end). No t.Parallel: every test in this file mutates
+// process state (env / slog default) and the file is deliberately serial.
 func TestClassifyPassword(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -381,9 +381,13 @@ func TestClassifyPassword(t *testing.T) {
 // TestLoad_password_status_agrees_with_its_warning pins the startup
 // password-status decision where it now lives: the Config.PasswordStatus main
 // reports and the WARN branch must agree, and a real password must produce no
-// log record at all (the value is a secret). Moved here from main_test.go with
-// Load as the entry point, so the warning and the status stay pinned in the
-// package that owns both. No t.Parallel: it mutates env and slog.Default.
+// password-quality warning (the value is a secret, so nothing about it is
+// logged beyond the non-secret status). Load emits other startup records --
+// including the padded-value whitespace WARN -- so the assertion is scoped to
+// the "PFX_PASSWORD is ..." family rather than to total silence. Moved here
+// from main_test.go with Load as the entry point, so the warning and the status
+// stay pinned in the package that owns both. No t.Parallel: it mutates env and
+// slog.Default.
 func TestLoad_password_status_agrees_with_its_warning(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -763,12 +767,23 @@ func TestLoad_blank_secret_file_obeys_the_same_optout(t *testing.T) {
 		t.Setenv("PFX_PASSWORD_FILE", blankFile(t))
 		t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "true")
 
+		logs := capture.Default(t)
+
 		cfg, err := Load()
 		if err != nil {
 			t.Fatalf("Load(blank file, opt-out) = %v, want nil: the opt-out must mean the same thing for both channels", err)
 		}
 		if cfg.Password != "" {
 			t.Errorf("Password = %q, want empty: a blank file must never silently fall back to PFX_PASSWORD", cfg.Password)
+		}
+		// The blank FILE must say so: an INFO "PFX password configured" here
+		// reported a secret that was never configured.
+		if n := logs.CountLevel(slog.LevelWarn, "PFX_PASSWORD_FILE is blank"); n != 1 {
+			t.Errorf("Load(blank file, opt-out) logged %d WARN records naming the blank secret file, want 1 (logs %v)",
+				n, logs.Messages())
+		}
+		if logs.Contains("PFX password configured") {
+			t.Errorf("Load(blank file, opt-out) logged the configured-secret INFO for a blank file (logs %v)", logs.Messages())
 		}
 	})
 
@@ -785,6 +800,40 @@ func TestLoad_blank_secret_file_obeys_the_same_optout(t *testing.T) {
 			t.Error("a blank secret file fell back to PFX_PASSWORD; the file channel exists to be authoritative")
 		}
 	})
+}
+
+// TestLoad_warns_when_the_env_password_is_padded pins the whitespace diagnostic:
+// envx trims a PFX_PASSWORD_FILE secret but PFX_PASSWORD is used verbatim, so a
+// padded env value silently yields a different password than the same secret
+// delivered as a file. The WARN is the only signal an operator gets. Serial: it
+// swaps slog.Default().
+func TestLoad_warns_when_the_env_password_is_padded(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		password string
+		wantWarn bool
+	}{
+		{"padded value warns", "  s3cret  ", true},
+		{"clean value is quiet", "s3cret", false},
+		{"inner spaces are not padding", "two words", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", tc.password)
+			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
+
+			logs := capture.Default(t)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() with PFX_PASSWORD=%q = %v, want nil", tc.password, err)
+			}
+			const msg = "PFX_PASSWORD has leading or trailing whitespace"
+			if warned := logs.CountLevel(slog.LevelWarn, msg) > 0; warned != tc.wantWarn {
+				t.Errorf("Load() with PFX_PASSWORD=%q warned = %v, want %v (logs %v)",
+					tc.password, warned, tc.wantWarn, logs.Messages())
+			}
+		})
+	}
 }
 
 // TestLoad_warns_when_both_password_channels_are_set pins the ambiguity warning

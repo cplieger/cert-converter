@@ -243,6 +243,28 @@ func TestParsePrivateKey(t *testing.T) {
 	})
 }
 
+// TestParsePrivateKey_bounds_the_declared_key_blocks pins the key-side half of
+// the declaration bound. At the bound the file still parses; past it the file is
+// refused before any DER work, because every extra key multiplies identity
+// matching against every certificate in the chain.
+func TestParsePrivateKey_bounds_the_declared_key_blocks(t *testing.T) {
+	t.Parallel()
+	_, keyPEM := testcerts.GenerateSelfSignedCert(t, "bounded", "ecdsa")
+	bulk := func(n int) []byte {
+		var out []byte
+		for range n {
+			out = append(out, keyPEM...)
+		}
+		return out
+	}
+	if _, err := convert.ParsePrivateKey(bulk(16)); err != nil {
+		t.Fatalf("convert.ParsePrivateKey(16 blocks) = %v, want nil at the bound", err)
+	}
+	if _, err := convert.ParsePrivateKey(bulk(17)); err == nil {
+		t.Error("convert.ParsePrivateKey(17 blocks) = nil error, want a refusal past the block bound")
+	}
+}
+
 func TestParsePrivateKey_EC_SEC1(t *testing.T) {
 	t.Parallel()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

@@ -121,7 +121,10 @@ func TestStoreReconcile(t *testing.T) {
 			s := &store{root: root}
 			seen := map[string]struct{}{"live.crt": {}}
 
-			got := s.reconcile(context.Background(), tc.mode, seen, tc.rc)
+			got, err := s.reconcile(context.Background(), tc.mode, seen, tc.rc)
+			if err != nil {
+				t.Errorf("reconcile = error %v, want nil: only a cancelled scan reports one", err)
+			}
 			if got != tc.wantDeleted {
 				t.Errorf("reconcile = %d deleted, want %d", got, tc.wantDeleted)
 			}
@@ -227,7 +230,10 @@ func TestStoreReconcile_sync_spares_a_nested_live_bundle(t *testing.T) {
 	s := &store{root: root}
 	seen := map[string]struct{}{filepath.Join("acme-v02", "example.com", "live.crt"): {}}
 
-	got := s.reconcile(context.Background(), LifecycleSync, seen, reapContext{scanTotal: 1, walkCompleted: true})
+	got, reconcileErr := s.reconcile(context.Background(), LifecycleSync, seen, reapContext{scanTotal: 1, walkCompleted: true})
+	if reconcileErr != nil {
+		t.Errorf("reconcile(nested output tree) = error %v, want nil", reconcileErr)
+	}
 	if got != 1 {
 		t.Errorf("reconcile(nested output tree) = %d deleted, want 1", got)
 	}
@@ -380,6 +386,70 @@ func TestStoreIsCurrent_regenerates_an_oversized_prior(t *testing.T) {
 	if !strings.Contains(out, "level=WARN") {
 		t.Errorf("isCurrent(oversized prior) logged %q, want level WARN", out)
 	}
+}
+
+// TestStoreIsCurrent_regenerates_a_prior_with_a_lax_mode pins the file-mode arm of
+// the currency check. A bundle carries a private key, so pfxFileMode is this app's
+// policy for the file that is ON DISK, not just for the write that created it: a
+// content-identical bundle restored by cp/tar at 0644 would otherwise keep the lax
+// mode forever, because currency is decided on content alone. Regenerating converges
+// it (atomicfile chmods to the exact mode), and it must resolve to STALE rather than
+// to an error -- failing the pair would flip health over a file the app repairs
+// itself. Runs serially: it swaps slog.Default().
+func TestStoreIsCurrent_regenerates_a_prior_with_a_lax_mode(t *testing.T) {
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	defer root.Close()
+	s := &store{root: root}
+	if err := s.write(t.Context(), "out.pfx", mustEncode(t, &analysis)); err != nil {
+		t.Fatalf("setup: write: %v", err)
+	}
+
+	// The app's own write must converge the mode, or every scan would rewrite every
+	// bundle forever.
+	current, err := s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+	if err != nil || !current {
+		t.Fatalf("isCurrent(freshly written bundle) = (%v, %v), want (true, nil): the mode arm must not"+
+			" fire on this app's own write", current, err)
+	}
+
+	// Same bytes, laxer mode: a cp/tar restore of the output volume.
+	if err := os.Chmod(filepath.Join(dir, "out.pfx"), 0o644); err != nil {
+		t.Fatalf("setup: Chmod: %v", err)
+	}
+	buf := captureLogs(t)
+	current, err = s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("isCurrent(lax mode) = error %v, want nil: it must resolve to stale, not fail the pair", err)
+	}
+	if current {
+		t.Error("isCurrent(lax mode) = true, want false: a bundle holding a private key must not keep a" +
+			" laxer mode just because its contents match")
+	}
+	out := buf.String()
+	for _, want := range []string{"prior pfx has an unexpected file mode", "level=WARN", "-rw-r--r--", "-rw-------"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("isCurrent(lax mode) logged %q, want it to carry %q", out, want)
+		}
+	}
+}
+
+// mustEncode encodes analysis with the suite's standard profile and password.
+func mustEncode(t *testing.T, analysis *convert.Analysis) []byte {
+	t.Helper()
+	pfx, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+	return pfx
 }
 
 // concatPEM joins PEM blobs. Duplicated from the convert test package because the

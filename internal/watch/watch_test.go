@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -65,6 +66,12 @@ func TestHandleFsEvent(t *testing.T) {
 	if err := os.WriteFile(plainFile, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// A DIRECTORY whose name ends in a cert extension: layout.IsRelevant is a
+	// suffix-only classifier, so this is the path that must not be misread as a file.
+	crtDir := filepath.Join(domainDir, "archive.crt")
+	if err := os.MkdirAll(crtDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, tc := range []struct {
 		name  string
@@ -82,13 +89,28 @@ func TestHandleFsEvent(t *testing.T) {
 		{"rename triggers rescan", fsnotify.Event{Name: filepath.Join(root, "whatever"), Op: fsnotify.Rename}, true},
 		{"chmod on a cert triggers rescan", fsnotify.Event{Name: crtFile, Op: fsnotify.Chmod}, true},
 		{"chmod on a key triggers rescan", fsnotify.Event{Name: filepath.Join(domainDir, "tls.key"), Op: fsnotify.Chmod}, true},
-		{"chmod on a non-cert is ignored", fsnotify.Event{Name: plainFile, Op: fsnotify.Chmod}, false},
+		{"chmod on a non-cert file is ignored", fsnotify.Event{Name: plainFile, Op: fsnotify.Chmod}, false},
+		// h-f9: a chmod on a DIRECTORY is the permission-repair recovery path --
+		// it re-attaches the subtree's watches and rescans, instead of waiting
+		// for the fallback tick (never, with the fallback disabled).
+		{"chmod on a domain directory rescans", fsnotify.Event{Name: domainDir, Op: fsnotify.Chmod}, true},
+		// The directory test runs before the suffix test, so a cert-named DIRECTORY
+		// takes the recovery path rather than the file path.
+		{"chmod on a cert-named directory rescans", fsnotify.Event{Name: crtDir, Op: fsnotify.Chmod}, true},
+		{"chmod on a vanished path is ignored", fsnotify.Event{Name: filepath.Join(root, "gone"), Op: fsnotify.Chmod}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := w.handleFsEvent(t.Context(), watcher, tc.event); got != tc.want {
 				t.Errorf("handleFsEvent(%s on %s) = %v, want %v", tc.event.Op, tc.event.Name, got, tc.want)
 			}
 		})
+	}
+
+	// Rescanning is only half of the repaired-directory contract: without the
+	// re-attached watch, the immediate scan converts what is on disk now and every
+	// later renewal underneath the directory is missed.
+	if !slices.Contains(watcher.WatchList(), crtDir) {
+		t.Errorf("after a chmod on %s the watch list is %v, want the repaired directory watched", crtDir, watcher.WatchList())
 	}
 }
 

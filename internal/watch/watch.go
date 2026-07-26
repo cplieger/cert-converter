@@ -97,8 +97,10 @@ func New(root string, onChange func(ctx context.Context), opts ...Option) *Watch
 // cancelled and then returns nil, but it ALSO returns ErrWatchLost early in the two
 // states where change detection is gone for good, and the caller must then exit
 // non-zero for a restart, as main.go does: the fsnotify watcher dies (its Events or
-// Errors channel closes), or fsnotify is unavailable while the periodic fallback is
-// disabled, leaving no mechanism that could notice a renewal. A channel closure
+// Errors channel closes), or no fsnotify watch could be established at all -- its
+// constructor failed, or the watch set could not be built on the root -- while the
+// periodic fallback is disabled, leaving no mechanism that could notice a renewal. A
+// channel closure
 // observed after ctx is already cancelled is part of shutdown, not lost change
 // detection, and returns nil.
 func (w *Watcher) Run(ctx context.Context) error {
@@ -297,19 +299,23 @@ func (w *Watcher) handleCreate(ctx context.Context, watcher *fsnotify.Watcher, e
 // handleChmod is handleFsEvent's Chmod arm: the recovery path for a permission
 // repair on a cert, on a key, or on a directory the watch set had to skip.
 func (w *Watcher) handleChmod(ctx context.Context, watcher *fsnotify.Watcher, event fsnotify.Event) bool {
-	if !layout.IsRelevant(event.Name) {
-		// A chmod on a DIRECTORY is the same recovery path one step up: an
-		// /input sub-directory the watch set had to skip because this UID
-		// could not read it (README: "Fix the directory permissions") has
-		// just become readable, so re-attach its subtree and rescan now
-		// instead of at the next fallback tick (never, with the fallback
-		// disabled). Unlike the file case this outcome is health-neutral
-		// (ScanResult.Unreadable), so nothing else signals the operator that
-		// the repair has not taken effect yet.
-		info, err := os.Lstat(event.Name)
-		if err != nil || !info.IsDir() {
-			return false
-		}
+	// A chmod on a DIRECTORY is the same recovery path one step up: an
+	// /input sub-directory the watch set had to skip because this UID
+	// could not read it (README: "Fix the directory permissions") has
+	// just become readable, so re-attach its subtree and rescan now
+	// instead of at the next fallback tick (never, with the fallback
+	// disabled). Unlike the file case this outcome is health-neutral
+	// (ScanResult.Unreadable), so nothing else signals the operator that
+	// the repair has not taken effect yet.
+	//
+	// The directory test comes FIRST because layout.IsRelevant is a suffix-only
+	// classifier: a legitimately nested directory named "archive.crt" would
+	// otherwise take the file arm, schedule one rescan, and never regain its
+	// watches, so every later renewal underneath it would be missed. Lstat, so a
+	// symlink to a directory still takes the file arm and the containment guard
+	// holds.
+	info, err := os.Lstat(event.Name)
+	if err == nil && info.IsDir() {
 		if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
 			slog.Warn("failed to watch a directory whose permissions changed", "path", event.Name, "error", addErr)
 		}
