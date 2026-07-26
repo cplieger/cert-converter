@@ -3,7 +3,7 @@ module github.com/cplieger/cert-converter
 go 1.26.5
 
 require (
-	github.com/cplieger/atomicfile/v2 v2.3.0
+	github.com/cplieger/atomicfile/v2 v2.4.0
 	github.com/cplieger/health v1.4.0
 	github.com/cplieger/slogx v1.4.0
 	github.com/fsnotify/fsnotify v1.10.1
