@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -184,6 +185,34 @@ func TestHandleFsEvent_does_not_watch_through_a_symlinked_directory(t *testing.T
 	for _, watched := range watcher.WatchList() {
 		if watched == link || strings.HasPrefix(watched, outside) {
 			t.Errorf("watch registered through a symlink: %q; watch list = %v", watched, watcher.WatchList())
+		}
+	}
+}
+
+// TestHandleRootWatchLoss_reattaches_the_watch_set_when_the_fallback_is_enabled
+// pins the recoverable half of the root-watch-loss contract. The terminal half is
+// pinned by TestWatchLoop_reports_lost_change_detection_when_the_root_watch_
+// disappears, which builds its Watcher with no WithFallback. With the fallback
+// enabled the arm must report true (change detection is still live, so the process
+// must not exit) AND re-attach the watch set, because the root's removal took every
+// descendant watch with it and waiting for the next tick means up to six hours with
+// no real-time detection on the documented cadence.
+func TestHandleRootWatchLoss_reattaches_the_watch_set_when_the_fallback_is_enabled(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	child := filepath.Join(root, "example.com")
+	if err := os.MkdirAll(child, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	watcher := newTestWatcher(t)
+	w := New(root, func(context.Context) {}, WithFallback(time.Hour))
+
+	if !w.handleRootWatchLoss(t.Context(), watcher, fsnotify.Event{Name: root, Op: fsnotify.Remove}) {
+		t.Fatal("handleRootWatchLoss(root Remove, fallback enabled) = false, want true: the periodic rescan still covers renewals, so the process must not exit for a restart")
+	}
+	for _, want := range []string{root, child} {
+		if !slices.Contains(watcher.WatchList(), want) {
+			t.Errorf("watch list after the root watch was lost = %v, want %q re-attached", watcher.WatchList(), want)
 		}
 	}
 }

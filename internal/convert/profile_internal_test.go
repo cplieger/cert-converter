@@ -3,6 +3,7 @@ package convert
 import (
 	"encoding/asn1"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/testcerts"
@@ -128,6 +129,11 @@ func TestInspect_rejects_an_oversized_identifier(t *testing.T) {
 // TestInspect_rejects_an_oversized_safe_bag_identifier completes the allocation
 // bound over the LAST untrusted identifier field: a safe bag's own id, reached
 // through the plaintext-safe walk rather than through decodeOID in isolation.
+// The oversized identifier rides on an EXTRA bag beside the intact key bag,
+// because overwriting the key bag's own id cannot pin the bound: without it the
+// oversized id merely decodes to something that is not a shrouded key bag, the bag
+// is skipped, and "no shrouded private-key bag" is ErrProfileUnknown too. With the
+// intact key bag still present, only the bound itself can produce a refusal.
 // Production is correct today (safeBag.ID is an asn1.RawValue and keyBagAlgorithm
 // decodes it under the bound), but changing that field back to
 // asn1.ObjectIdentifier, or bypassing decodeOID at the bag site, leaves every
@@ -151,7 +157,9 @@ func TestInspect_rejects_an_oversized_safe_bag_identifier(t *testing.T) {
 		testASN1Unmarshal(t, safe.Content.Bytes, &inner)
 		var bags []safeBag
 		testASN1Unmarshal(t, inner, &bags)
-		bags[0].ID = oversizedOID()
+		oversized := bags[0]
+		oversized.ID = oversizedOID()
+		bags = append(bags, oversized)
 		safeDER := testASN1Marshal(t, bags)
 		safe.Content.Bytes = testASN1Marshal(t, safeDER)
 		safe.Content.FullBytes = nil
@@ -385,13 +393,20 @@ func TestInspect_rejects_more_than_one_shrouded_key_bag(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name    string
-		mutate  func(*testing.T, []contentInfo) []contentInfo
-		wantErr bool
+		name string
+		// wantErrText is the guard-specific fragment the refusal must carry.
+		// errors.Is(ErrProfileUnknown) alone cannot pin these guards: with any one
+		// of them deleted, Inspect still fails ErrProfileUnknown from a later arm
+		// (a missing certificate or key bag), so the subtest would pass for the
+		// wrong reason. Empty means the case must be accepted.
+		wantErrText string
+		mutate      func(*testing.T, []contentInfo) []contentInfo
 	}{
-		{"the control: re-encoded unchanged", func(_ *testing.T, safes []contentInfo) []contentInfo { return safes }, false},
-		{"a second bag inside one plaintext safe", duplicateTestKeyBag, true},
-		{"a second plaintext safe carrying its own bag", duplicateTestPlaintextSafe, true},
+		{"the control: re-encoded unchanged", "", func(_ *testing.T, safes []contentInfo) []contentInfo { return safes }},
+		{"a second bag inside one plaintext safe", "more than one shrouded private-key bag in one safe", duplicateTestKeyBag},
+		{"a second plaintext safe carrying its own bag", "more than one shrouded private-key bag", duplicateTestPlaintextSafe},
+		{"a second encrypted certificate safe", "more than one encrypted certificate bag", duplicateTestEncryptedSafe},
+		{"more authenticated safes than the preflight admits", "more than 2 element(s)", appendTestPlaintextSafe},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -399,7 +414,7 @@ func TestInspect_rejects_more_than_one_shrouded_key_bag(t *testing.T) {
 			testASN1Unmarshal(t, pfx, &preamble)
 			setTestAuthenticatedSafes(t, &preamble, tc.mutate(t, testAuthenticatedSafes(t, &preamble)))
 			got, err := Inspect(testASN1Marshal(t, preamble))
-			if !tc.wantErr {
+			if tc.wantErrText == "" {
 				if err != nil {
 					t.Fatalf("Inspect(%s) = %v, want nil", tc.name, err)
 				}
@@ -409,7 +424,11 @@ func TestInspect_rejects_more_than_one_shrouded_key_bag(t *testing.T) {
 				return
 			}
 			if !errors.Is(err, ErrProfileUnknown) {
-				t.Errorf("Inspect(bundle with %s) = %v, want ErrProfileUnknown", tc.name, err)
+				t.Fatalf("Inspect(bundle with %s) = %v, want ErrProfileUnknown", tc.name, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrText) {
+				t.Errorf("Inspect(bundle with %s) = %v, want the refusal to come from the guard naming %q, not a later arm",
+					tc.name, err, tc.wantErrText)
 			}
 		})
 	}
@@ -475,9 +494,77 @@ func duplicateTestKeyBag(t *testing.T, safes []contentInfo) []contentInfo {
 	return nil
 }
 
-// duplicateTestPlaintextSafe adds a SECOND plaintext safe carrying its own copy of
-// the shrouded key bag, which is the cross-safe case merge refuses.
+// duplicateTestPlaintextSafe REPLACES the safe list with two copies of the
+// plaintext safe, so the bundle carries two shrouded key bags in two safes while
+// staying inside maxAuthenticatedSafes. Appending a third element instead would
+// trip sequenceElements' element-count bound before merge ever saw the duplicate.
 func duplicateTestPlaintextSafe(t *testing.T, safes []contentInfo) []contentInfo {
 	t.Helper()
+	plaintext := safes[plaintextTestSafeIndex(t, safes)]
+	return []contentInfo{plaintext, plaintext}
+}
+
+// duplicateTestEncryptedSafe replaces the safe list with two copies of the
+// encrypted certificate safe: the shape merge refuses because a bundle's
+// certificate-encryption identity would otherwise be read from one safe while the
+// certificates lived in the other. Two elements, so the element-count bound is not
+// what rejects it.
+func duplicateTestEncryptedSafe(t *testing.T, safes []contentInfo) []contentInfo {
+	t.Helper()
+	for i := range safes {
+		got, err := decodeOID(safes[i].ContentType)
+		if err != nil {
+			t.Fatalf("setup: decode safe content type: %v", err)
+		}
+		if got.Equal(oidEncryptedDataContentType) {
+			return []contentInfo{safes[i], safes[i]}
+		}
+	}
+	t.Fatal("setup: no encrypted safe in the bundle")
+	return nil
+}
+
+// appendTestPlaintextSafe pushes the bundle one element PAST
+// maxAuthenticatedSafes, pinning sequenceElements' element-count bound
+// deliberately rather than as an accident of another case.
+func appendTestPlaintextSafe(t *testing.T, safes []contentInfo) []contentInfo {
+	t.Helper()
 	return append(safes, safes[plaintextTestSafeIndex(t, safes)])
+}
+
+// TestInspect_rejects_a_weaker_pbes2_cipher pins checkPBES2Cipher. The profile
+// identity is the (MAC, certificate, key) OID triple, and PBES2 names its cipher in
+// its PARAMETERS, so without this arm a bundle whose PBES2 wraps AES-128-CBC reads
+// as modern2023 and store.isCurrent keeps it as current indefinitely. The positive
+// direction is already covered by the own-profile round trips, which is what proves
+// the check does not over-reject this app's own output.
+func TestInspect_rejects_a_weaker_pbes2_cipher(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(append(append([]byte{}, m.LeafPEM...), m.CAPEM...), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+	var preamble pfxPreamble
+	testASN1Unmarshal(t, pfx, &preamble)
+	mutateTestEncryptedSafe(t, &preamble, func(alg *algorithmIdentifier) {
+		// aes-128-CBC: a cipher go-pkcs12 decodes happily and no profile emits.
+		setTestPBES2Cipher(t, alg, asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 2})
+	})
+	if _, err := Inspect(testASN1Marshal(t, preamble)); !errors.Is(err, ErrProfileUnknown) {
+		t.Errorf("Inspect(bundle whose PBES2 wraps AES-128-CBC) = %v, want ErrProfileUnknown", err)
+	}
+}
+
+// setTestPBES2Cipher rewrites the encryption scheme of a PBES2 parameter block.
+func setTestPBES2Cipher(t *testing.T, alg *algorithmIdentifier, scheme asn1.ObjectIdentifier) {
+	t.Helper()
+	var params pbes2Params
+	testASN1Unmarshal(t, alg.Parameters.FullBytes, &params)
+	params.EncryptionScheme.Algorithm = asn1.RawValue{FullBytes: testASN1Marshal(t, scheme)}
+	alg.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, params)}
 }

@@ -447,6 +447,12 @@ func (o *observationLog) forget(seen map[string]struct{}) {
 	}
 }
 
+// inputPermRemediation is the one remediation hint every /input-side WARN in this
+// package carries, the mirror of store.go's outputPermRemediation: both WARNs name
+// the SAME operator action for the same root cause, so an operator who sees the
+// cert-side and the key-side line in one scan must not read two variants of it.
+const inputPermRemediation = "check /input permissions and that the path is a regular file inside the mount, not a symlink out of it"
+
 // readPair resolves and reads the input side of one .crt entry: it classifies
 // the sibling .key (a missing key is a health-neutral statusOrphan; a non-ENOENT
 // stat failure is statusUnreadable instead, because the key is there and cannot
@@ -473,7 +479,7 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 		// reads below produce for the same class of condition. Health-neutral either
 		// way; the message is unchanged because an alert rule keys on it.
 		slog.Warn("skipping cert: cannot stat sibling key", "path", rel, "error", statErr,
-			"remediation", "check /input permissions and that the path is a regular file inside the mount, not a symlink out of it")
+			"remediation", inputPermRemediation)
 		return pairInputs{}, statusUnreadable, false
 	}
 
@@ -526,7 +532,7 @@ func noteUnreadableInput(rel, what string, err error) {
 	}
 	slog.Warn("skipping cert: cannot read "+what,
 		"path", rel, "error", err,
-		"remediation", "check /input permissions and that the path is a regular file inside the mount, not a symlink out of it")
+		"remediation", inputPermRemediation)
 }
 
 // convertEntry resolves the outcome for one .crt entry under certsRoot. It

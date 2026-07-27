@@ -134,10 +134,19 @@ func FuzzParsePrivateKey(f *testing.F) {
 		default:
 			t.Fatalf("unexpected key type: %T", key)
 		}
-		// A key with no public half cannot be matched against a certificate, which
-		// is the only thing identity selection has to work with.
-		if signer.Public() == nil {
-			t.Fatalf("parsed %T reports a nil public half", key)
+		// The public half must support the Equal-based comparison identity selection
+		// depends on: publicKeyMatches treats a public key WITHOUT
+		// Equal(crypto.PublicKey) bool as unverifiable, which fails the conversion
+		// with an "unsupported algorithm" diagnosis rather than a mismatch. A nil
+		// check cannot fail here - every accepted type returns a typed, non-nil
+		// interface - so assert the property that can.
+		pub := signer.Public()
+		matcher, hasEqual := pub.(interface{ Equal(crypto.PublicKey) bool })
+		if !hasEqual {
+			t.Fatalf("parsed %T has a public half of type %T with no Equal method, so identity matching reports it unverifiable", key, pub)
+		}
+		if !matcher.Equal(pub) {
+			t.Fatalf("public half %T is not equal to itself, so no certificate can ever match this key", pub)
 		}
 		// Round trip: a key this parser accepted must survive its own canonical
 		// PKCS#8 re-encoding unchanged. A marshal refusal is a stdlib limit on a

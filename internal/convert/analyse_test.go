@@ -402,6 +402,52 @@ func TestAnalyse_reports_no_validity_observation_for_a_current_identity(t *testi
 	}
 }
 
+// TestAnalyse_reports_an_out_of_window_chain_certificate pins the chain half of the
+// validity report. The historically real shape is a still-valid leaf beside an EXPIRED
+// issuing intermediate (the ISRG X1 cross-sign class of event): the identity check sees a
+// leaf inside its window and says nothing, the bundle is written, the scan reports a clean
+// conversion, and without this observation no signal anywhere names the link that will fail
+// path validation at the consumer.
+func TestAnalyse_reports_an_out_of_window_chain_certificate(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+
+	caKey := newKey(t)
+	caPEM, caCert := mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(140),
+		Subject:               pkix.Name{CommonName: "Expired Intermediate"},
+		NotBefore:             now.Add(-72 * time.Hour),
+		NotAfter:              now.Add(-24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &caKey.PublicKey, nil, caKey)
+
+	leafKey := newKey(t)
+	leafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(141),
+		Subject:      pkix.Name{CommonName: "valid-leaf.example.com"},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(time.Hour),
+	}, &leafKey.PublicKey, caCert, caKey)
+
+	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), keyPEMOf(t, leafKey))
+	if err != nil {
+		t.Fatalf("Analyse(valid leaf + expired issuer) = error %v, want nil: validity is never a gate", err)
+	}
+	if len(got.Chain) != 1 {
+		t.Fatalf("Analyse chain = %d certificate(s), want the expired issuer emitted", len(got.Chain))
+	}
+	if !hasObservation(got.Observations, convert.ObsChainCertOutOfWindow) {
+		t.Errorf("observations = %v, want one of kind %q naming the expired issuer",
+			got.Observations, convert.ObsChainCertOutOfWindow)
+	}
+	if hasObservation(got.Observations, convert.ObsIdentityExpired) {
+		t.Errorf("observations = %v, want NO %q: the identity itself is inside its window",
+			got.Observations, convert.ObsIdentityExpired)
+	}
+}
+
 // TestAnalyse_caps_the_subjects_it_names_in_the_exclusion_observation pins the
 // count cap on the excluded-certificate observation. Subjects are
 // certificate-controlled text bounded only by the 10 MB input read bound, and

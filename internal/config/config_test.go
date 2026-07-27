@@ -669,8 +669,12 @@ func TestLoad_refuses_an_unencodable_password(t *testing.T) {
 	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
 	t.Setenv("PFX_PASSWORD_FILE", "")
 
-	if _, err := Load(); !errors.Is(err, ErrUnencodablePassword) {
-		t.Errorf("Load(non-BMP password) = %v, want ErrUnencodablePassword", err)
+	_, err := Load()
+	if !errors.Is(err, ErrUnencodablePassword) {
+		t.Fatalf("Load(non-BMP password) = %v, want ErrUnencodablePassword", err)
+	}
+	if !strings.Contains(err.Error(), "supplied via PFX_PASSWORD") {
+		t.Errorf("Load(non-BMP env password) = %v, want the refusal to name the channel that supplied the secret", err)
 	}
 }
 
@@ -892,5 +896,70 @@ func TestLoad_wires_output_lifecycle(t *testing.T) {
 				t.Errorf("Load() with OUTPUT_LIFECYCLE=%q logged %v, want the rejected value named so an operator can spot the typo", tc.raw, logs.Messages())
 			}
 		})
+	}
+}
+
+// TestLoad_warns_when_the_password_contains_a_control_character pins the
+// interior-control-character diagnostic, the one shape both existing guards
+// miss: envx trims only surrounding whitespace and PKCS#12 encodes a newline or
+// tab verbatim, so the bundle is written, health stays green, and the password
+// cannot be typed into the consumers that need it. The clean case is what keeps
+// the WARN from firing on every healthy startup. Serial: it swaps slog.Default().
+func TestLoad_warns_when_the_password_contains_a_control_character(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		password string
+		wantWarn bool
+	}{
+		{"an interior newline warns", "line1\nline2", true},
+		{"an interior tab warns", "pw\tsecret", true},
+		{"a clean password is silent", "hunter2", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", tc.password)
+			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
+
+			logs := capture.Default(t)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() = %v, want nil: a control character is a WARN, not a startup refusal", err)
+			}
+			const msg = "contains a control character"
+			warned := logs.CountLevel(slog.LevelWarn, msg) > 0
+			if warned != tc.wantWarn {
+				t.Errorf("Load(%s) control-character WARN = %v, want %v (logs %v)", tc.name, warned, tc.wantWarn, logs.Messages())
+			}
+			if tc.wantWarn && !logs.AttrContains(msg, "source", "env") {
+				t.Errorf("control-character WARN does not name the delivery channel (logs %v)", logs.Messages())
+			}
+		})
+	}
+}
+
+// TestLoad_unencodable_secret_file_names_the_file_channel pins the half of the
+// refusal that actually redirects the operator: when the rejected secret came
+// from the mounted file, the error must name PFX_PASSWORD_FILE, because the
+// file-wins rule means editing PFX_PASSWORD would change nothing. The secret
+// value itself must stay out of the startup log.
+func TestLoad_unencodable_secret_file_names_the_file_channel(t *testing.T) {
+	const secret = "pw-\U0001F600"
+	path := filepath.Join(t.TempDir(), "pfx-password")
+	if err := os.WriteFile(path, []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PFX_PASSWORD", "")
+	t.Setenv("PFX_PASSWORD_FILE", path)
+	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
+
+	_, err := Load()
+	if !errors.Is(err, ErrUnencodablePassword) {
+		t.Fatalf("Load(unencodable secret file) = %v, want ErrUnencodablePassword", err)
+	}
+	if !strings.Contains(err.Error(), "supplied via PFX_PASSWORD_FILE") {
+		t.Errorf("Load(unencodable secret file) = %v, want it to name PFX_PASSWORD_FILE, not the ignored env variable", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("Load(unencodable secret file) leaked the secret into %q", err.Error())
 	}
 }

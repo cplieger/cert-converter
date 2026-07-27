@@ -174,22 +174,28 @@ func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing
 func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing.T) {
 	const wantMsg = "no certificate pairs found under the input root"
 	tests := []struct {
-		walkErr  error
-		name     string
-		result   ScanResult
-		wantWarn bool
+		walkErr    error
+		name       string
+		result     ScanResult
+		unresolved int
+		wantWarn   bool
 	}{
-		{nil, "an empty input tree is named", ScanResult{}, true},
-		{nil, "a scan that converted a pair stays quiet", ScanResult{Total: 1, Converted: 1}, false},
-		{nil, "an unreadable sub-path already explains the empty result", ScanResult{Unreadable: 1}, false},
-		{errors.New("permission denied"), "an aborted scan stays quiet", ScanResult{}, false},
+		{nil, "an empty input tree is named", ScanResult{}, 0, true},
+		{nil, "a scan that converted a pair stays quiet", ScanResult{Total: 1, Converted: 1}, 0, false},
+		{nil, "an unreadable sub-path already explains the empty result", ScanResult{Unreadable: 1}, 0, false},
+		// An unresolved input symlink hides part of the tree, so "no certificate
+		// pairs" is not a claim this scan can make. The symlink WARN one flow
+		// earlier already carries the correct diagnosis; repeating it here fires
+		// the README's CertConverterNoCertificatePairs alert with the wrong one.
+		{nil, "an unresolved symlink already explains the empty result", ScanResult{}, 1, false},
+		{errors.New("permission denied"), "an aborted scan stays quiet", ScanResult{}, 0, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), tt.result, 0, tt.walkErr)
+			logScanOutcome(t.Context(), tt.result, tt.unresolved, tt.walkErr)
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; empty-input notice present = %v, want %v",

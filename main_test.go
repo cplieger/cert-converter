@@ -405,7 +405,7 @@ func TestHealthyAfterScan(t *testing.T) {
 // TestVolumesReady pins the startup volume guard, the one decision in run()
 // that decides between a single actionable refusal and an endless
 // restart-unhealthy loop: every required mount must already exist AND be a
-// directory, the first offender is named at ERROR with its role and a
+// directory, EVERY offender is named at ERROR with its role and a
 // remediation, and a fully-mounted pair starts silently. Serial: it swaps
 // slog.Default().
 func TestVolumesReady(t *testing.T) {
@@ -453,5 +453,30 @@ func TestVolumesReady(t *testing.T) {
 				t.Errorf("volumesReady(%+v) ERROR is missing an actionable remediation attr (logs %v)", tc.dirs, logs.Messages())
 			}
 		})
+	}
+}
+
+// TestVolumesReady_names_every_missing_volume pins the whole point of the
+// all-offenders sweep: an operator who omitted the volumes block entirely has
+// both mounts missing, and a report naming only /input costs a restart to
+// discover /output. Serial: it swaps slog.Default().
+func TestVolumesReady_names_every_missing_volume(t *testing.T) {
+	absentInput := filepath.Join(t.TempDir(), "absent-input")
+	absentOutput := filepath.Join(t.TempDir(), "absent-output")
+
+	logs := capture.Default(t)
+
+	if volumesReady([]volumeDir{{"input", absentInput}, {"output", absentOutput}}) {
+		t.Fatal("volumesReady(both absent) = true, want false")
+	}
+	const msg = "required volume is missing or not a directory"
+	if n := logs.CountLevel(slog.LevelError, msg); n != 2 {
+		t.Fatalf("volumesReady(both absent) logged %d ERROR records matching %q, want 2 so one start attempt names the whole misconfiguration (logs %v)",
+			n, msg, logs.Messages())
+	}
+	for _, role := range []string{"input", "output"} {
+		if !logs.AttrContains(msg, "role", role) {
+			t.Errorf("volumesReady(both absent) ERROR set does not name role %q (logs %v)", role, logs.Messages())
+		}
 	}
 }

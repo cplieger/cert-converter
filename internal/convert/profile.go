@@ -157,12 +157,15 @@ const (
 	// turns a ~20 MiB file into ~1.3 GiB of live heap, inside store.isCurrent,
 	// before any authentication, on the scan's only goroutine.
 	//
-	// Neither bound can refuse a bundle this app wrote or one the decoder would
-	// accept: go-pkcs12 v0.7.3's Encode writes exactly two safes with the single
-	// shrouded key bag alone in the plaintext one (pkcs12.go 'var
-	// authenticatedSafe [2]contentInfo'), and DecodeChain refuses an
-	// authenticated safe outside 1..2 items before it decrypts anything
-	// (pkcs12.go:591, called with 1, 2).
+	// Neither bound can refuse a bundle this app wrote: go-pkcs12 v0.7.3's Encode
+	// writes exactly two safes with the single shrouded key bag alone in the
+	// plaintext one (pkcs12.go 'var authenticatedSafe [2]contentInfo').
+	// maxAuthenticatedSafes also matches the decoder exactly — DecodeChain
+	// refuses an authenticated safe outside 1..2 items before it decrypts
+	// anything (pkcs12.go:591, called with 1, 2) — while maxSafeBags is
+	// stricter than the decoder, which walks a safe's bags unbounded: a 65-bag
+	// safe is decodable but is not a shape this app emits, so refusing it means
+	// the file is regenerated, which is what every Inspect failure means.
 	maxAuthenticatedSafes = 2
 	maxSafeBags           = 64
 )

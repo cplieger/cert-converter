@@ -38,9 +38,18 @@ func FuzzBoundLogText_bounded_and_loggable(f *testing.F) {
 		if strings.ContainsRune(got, 0x7f) {
 			t.Fatalf("boundLogText(%q) = %q, kept U+007F, which slog emits raw", s, got)
 		}
+		// Only the forward direction is a contract. The reverse is not assertable from
+		// the result alone: an input that legitimately ENDS with the marker text is
+		// returned unchanged when it fits, so a biconditional fails on correct output.
+		// The not-cut direction is pinned by length instead, which input content cannot
+		// forge - and it is what catches the off-by-one the seeds exist for, because a
+		// `>=` cut test appends the marker to an exactly-limit input and blows this bound.
 		cut := len(s) > maxSubjectLogLen
-		if cut != strings.HasSuffix(got, truncationMarker) {
-			t.Fatalf("boundLogText(%d bytes) = %q, marker presence disagrees with whether the text was cut", len(s), got)
+		if cut && !strings.HasSuffix(got, truncationMarker) {
+			t.Fatalf("boundLogText(%d bytes) = %q, cut text must be marked", len(s), got)
+		}
+		if !cut && len(got) > maxSubjectLogLen {
+			t.Fatalf("boundLogText(%d bytes) is %d bytes, want no growth for text that fits", len(s), len(got))
 		}
 		if len(got) > maxSubjectLogLen+len(truncationMarker) {
 			t.Fatalf("boundLogText(%d bytes) is %d bytes, want at most %d",

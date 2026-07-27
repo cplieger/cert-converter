@@ -161,3 +161,35 @@ func TestHandleFsEvent_rescans_when_a_repaired_directory_cannot_be_rewatched(t *
 		t.Error("handleFsEvent(Chmod dir, unwatchable) = false, want true: the permission repair would otherwise convert nothing until the next fallback tick, and never with the fallback disabled")
 	}
 }
+
+// TestAddWatchDirs_refuses_a_non_directory_root pins the non-directory-root
+// branch: filepath.WalkDir Lstats its root and does not follow it, so a
+// regular-file root and a symlinked root each visit exactly one non-directory
+// entry. Reporting that is what routes the case into Run's degraded paths (poll
+// mode, or ErrWatchLost with the fallback disabled); returning nil would leave Run
+// logging "fsnotify active" over an empty watch set, parked in a loop no event can
+// reach while the scan keeps the health marker green.
+func TestAddWatchDirs_refuses_a_non_directory_root(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	fileRoot := filepath.Join(base, "input")
+	if err := os.WriteFile(fileRoot, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	realDir := filepath.Join(base, "real")
+	if err := os.MkdirAll(realDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	linkRoot := filepath.Join(base, "linked")
+	if err := os.Symlink(realDir, linkRoot); err != nil {
+		t.Skipf("symlinks unavailable on this filesystem: %v", err)
+	}
+	watcher := newTestWatcher(t)
+
+	for _, root := range []string{fileRoot, linkRoot} {
+		w := New(root, func(context.Context) {})
+		if err := w.addWatchDirs(t.Context(), watcher, root); err == nil {
+			t.Errorf("addWatchDirs(%q) = nil, want an error: the watch set is %v, so no event could ever arrive", root, watcher.WatchList())
+		}
+	}
+}
