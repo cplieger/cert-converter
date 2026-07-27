@@ -94,10 +94,10 @@ func TestRun_treats_a_shutdown_during_the_walk_as_a_clean_stop(t *testing.T) {
 	}
 }
 
-// TestScanThenWatch_skips_scan_after_shutdown pins the shutdown guard shared by
-// both entry points into scanThenWatch: with a watch set already live but ctx
-// already cancelled, no scan may run (it would only log an interrupted scan and
-// touch the health marker on the way out) and the helper returns nil.
+// TestScanThenWatch_skips_scan_after_shutdown pins the shutdown guard:
+// with a watch set already live but ctx already cancelled, no scan may run
+// (it would only log an interrupted scan and touch the health marker on the
+// way out) and the helper returns nil.
 func TestScanThenWatch_skips_scan_after_shutdown(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)

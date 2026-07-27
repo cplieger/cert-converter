@@ -23,8 +23,9 @@ import (
 // (TextHandler) escapes it, so stripping it here would rewrite legitimate text for
 // no gain. Delegating widens the policy to the whole unsafe set, which is the
 // accepted cost of a sanitizer that is correct under either handler rather than
-// under the one currently wired up — see boundLogText's doc comment for the
-// per-handler measurements.
+// under the one currently wired up. Which class each handler emits raw is recorded
+// per row in the table below, and asserted end-to-end by
+// TestBoundLogText_output_is_safe_under_either_slog_handler.
 //
 // Every fixture is well under maxSubjectLogLen, so this also pins the asymmetry
 // the function once carried: it sanitized only the text it had just truncated, and

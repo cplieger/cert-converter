@@ -9,17 +9,23 @@ import (
 	"github.com/cplieger/cert-converter/internal/testcerts"
 )
 
-// hugeMACIterations rewrites the MAC iteration count of a modern2023 bundle to a
-// two-byte maximum, which is the shape of the attack the preflight exists to stop:
-// the file names the derivation work and the decoder honours it.
+// hugeKDFIterations rewrites the FIRST key-derivation iteration count of a
+// modern2023 bundle to a two-byte maximum, which is the shape of the attack the
+// preflight exists to stop: the file names the derivation work and the decoder
+// honours it.
 //
-// modern2023 writes a count of 2048, which DER-encodes as 02 02 08 00. The
-// replacement keeps the encoding length identical, so the surrounding structure
-// stays valid and only the count changes. Patching the count also invalidates the
-// MAC, which is what makes the bundle a usable ORDER detector: the preflight
-// refuses it before any derivation, while a decoder handed it first would derive
-// 32767 rounds and then fail the MAC — a different, observable outcome.
-func hugeMACIterations(t *testing.T, pfx []byte) []byte {
+// modern2023 writes 2048 for both its MAC and its encryption, which DER-encodes as
+// 02 02 08 00, and authSafe precedes macData in a PFX (RFC 7292 SEQUENCE order), so
+// the patched count is an authSafe one — the preflight bounds every count it can
+// read, so which one it is does not change the outcome. The replacement keeps the
+// encoding length identical, so the surrounding structure stays valid and only the
+// count changes.
+//
+// Patching the count also invalidates the MAC, which is what makes the bundle a
+// usable ORDER detector: the preflight refuses it before any derivation, while a
+// decoder handed it first reports a decode failure instead — a different,
+// observable reason.
+func hugeKDFIterations(t *testing.T, pfx []byte) []byte {
 	t.Helper()
 	encoded2048 := []byte{0x02, 0x02, 0x08, 0x00}
 	if n := bytes.Count(pfx, encoded2048); n == 0 {
@@ -66,7 +72,7 @@ func TestCheckCurrency_runs_the_preflight_and_profile_check_before_the_decode(t 
 		wantReason  convert.CurrencyReason
 	}{
 		"an out-of-range iteration count is refused by the preflight, not by the decoder": {
-			pfx: hugeMACIterations(t, good), password: "pw",
+			pfx: hugeKDFIterations(t, good), password: "pw",
 			wantEncoder: convert.EncNameModern2023,
 			wantReason:  convert.CurrencyPreflightFailed,
 		},
@@ -109,7 +115,7 @@ func TestCheckCurrency_preflight_refusal_is_the_bounded_one(t *testing.T) {
 		t.Fatalf("setup: Encode: %v", err)
 	}
 
-	res := convert.CheckCurrency(hugeMACIterations(t, good), "pw", &analysis, convert.EncNameModern2023)
+	res := convert.CheckCurrency(hugeKDFIterations(t, good), "pw", &analysis, convert.EncNameModern2023)
 	if res.Reason != convert.CurrencyPreflightFailed {
 		t.Fatalf("CheckCurrency reason = %q, want %q", res.Reason, convert.CurrencyPreflightFailed)
 	}

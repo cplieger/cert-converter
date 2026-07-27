@@ -28,10 +28,12 @@ scan, then hand off to the watcher. The real work lives under
   config load emits its own WARN lines) from the environment, then
   delegates encoder selection to `convert.EncoderName` (an unknown
   `PFX_ENCODER` value warns here and falls back to `modern2023`).
-  Every configuration WARN is emitted during `Load` (directly or through
-  its helpers), once per process start: the parsers themselves are pure,
-  because `config.FallbackInterval` is also called by the `health`
-  subcommand and a WARN there would repeat on every healthcheck.
+  Every configuration WARN except the invalid-`LOG_LEVEL` one is emitted
+  during `Load` (directly or through its helpers), once per process start;
+  that one belongs to `main`, which must install the logger before `Load`
+  runs. The parsers themselves are pure, because `config.FallbackInterval`
+  and `config.LogLevel` are also read outside `Load` (the former by the
+  `health` subcommand, where a WARN would repeat on every healthcheck).
 - `internal/convert`: PEM parsing (package-internal; reached through
   `PairInRoot`, which is the package's only production conversion edge —
   the parsers are exposed to the package's own tests via

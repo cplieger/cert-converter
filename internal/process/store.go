@@ -31,8 +31,8 @@ const (
 
 // outputPermRemediation is the shared remediation hint for /output permission and
 // inspection WARNs. It is a single const rather than a literal per call site because
-// all five name the SAME operator action, and an operator who sees two of them in
-// one scan must not read two different pieces of advice for one cause.
+// every one of them names the SAME operator action, and an operator who sees two of
+// them in one scan must not read two different pieces of advice for one cause.
 const outputPermRemediation = "check /output ownership and permissions for the UID in user:"
 
 // store owns every touch of the output tree.

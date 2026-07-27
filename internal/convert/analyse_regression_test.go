@@ -837,18 +837,21 @@ func TestAnalyse_ranks_verified_issuers_by_validity_then_expiry(t *testing.T) {
 		firstNotAfter   time.Time
 		secondNotBefore time.Time
 		secondNotAfter  time.Time
+		wantSerial      int64
 	}{
 		"a current issuer outranks a future-dated issuer with a later expiry": {
 			firstNotBefore:  now.Add(48 * time.Hour),
 			firstNotAfter:   now.Add(72 * time.Hour),
 			secondNotBefore: now.Add(-time.Hour),
 			secondNotAfter:  now.Add(24 * time.Hour),
+			wantSerial:      221,
 		},
 		"the later expiry breaks a tie between two current issuers": {
 			firstNotBefore:  now.Add(-time.Hour),
-			firstNotAfter:   now.Add(24 * time.Hour),
+			firstNotAfter:   now.Add(48 * time.Hour),
 			secondNotBefore: now.Add(-time.Hour),
-			secondNotAfter:  now.Add(48 * time.Hour),
+			secondNotAfter:  now.Add(24 * time.Hour),
+			wantSerial:      220,
 		},
 	}
 
@@ -887,8 +890,8 @@ func TestAnalyse_ranks_verified_issuers_by_validity_then_expiry(t *testing.T) {
 			if len(got.Chain()) != 1 {
 				t.Fatalf("chain length = %d, want 1", len(got.Chain()))
 			}
-			if got.Chain()[0].SerialNumber.Cmp(big.NewInt(221)) != 0 {
-				t.Errorf("chain[0] serial = %s, want 221", got.Chain()[0].SerialNumber)
+			if got.Chain()[0].SerialNumber.Cmp(big.NewInt(tt.wantSerial)) != 0 {
+				t.Errorf("chain[0] serial = %s, want %d", got.Chain()[0].SerialNumber, tt.wantSerial)
 			}
 		})
 	}

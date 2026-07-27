@@ -632,6 +632,31 @@ func TestInspect_rejects_a_weaker_nested_modern_algorithm(t *testing.T) {
 			},
 		},
 		{
+			name:        "certificate safe deriving with a salt that is not an OCTET STRING",
+			enc:         EncNameModern2023,
+			wantErrText: "pbes2 PBKDF2 salt is not a primitive OCTET STRING",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
+					setTestPBKDF2Params(t, alg, func(kdf *pbkdf2Params) {
+						// A PrintableString where the specified-OCTET-STRING arm of
+						// the CHOICE belongs: structurally valid DER the decoder
+						// refuses too.
+						kdf.Salt = asn1.RawValue{FullBytes: testASN1Marshal(t, "not-an-octet-string")}
+					})
+				})
+			},
+		},
+		{
+			name:        "certificate safe naming a key derivation that is not PBKDF2",
+			enc:         EncNameModern2023,
+			wantErrText: "pbes2 key derivation is 1.2.840.113549.1.5.13, want PBKDF2",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
+					setTestPBKDF2Algorithm(t, alg, asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 13})
+				})
+			},
+		},
+		{
 			name:        "PBMAC1 derived with HMAC-SHA1",
 			enc:         EncNameModern2026,
 			wantErrText: "pbmac1 PBKDF2 PRF is 1.2.840.113549.2.7",
@@ -703,6 +728,16 @@ func setTestPBKDF2PRF(t *testing.T, alg *algorithmIdentifier, prf asn1.ObjectIde
 func setTestPBKDF2KeyLength(t *testing.T, alg *algorithmIdentifier, octets int) {
 	t.Helper()
 	setTestPBKDF2Params(t, alg, func(kdf *pbkdf2Params) { kdf.KeyLength = octets })
+}
+
+// setTestPBKDF2Algorithm rewrites the key-derivation function a PBES2 or PBMAC1
+// block names, leaving its parameters in place.
+func setTestPBKDF2Algorithm(t *testing.T, alg *algorithmIdentifier, kdfOID asn1.ObjectIdentifier) {
+	t.Helper()
+	var params pbes2Params
+	testASN1Unmarshal(t, alg.Parameters.FullBytes, &params)
+	params.KeyDerivationFunc.Algorithm = rawOID(t, kdfOID)
+	alg.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, params)}
 }
 
 // setTestPBKDF2Params applies mutate to the PBKDF2 parameters nested in a PBES2 or

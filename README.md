@@ -76,7 +76,7 @@ services:
 | `/output` | PFX output directory; must be writable by the UID in `user:` |
 
 Create the host output directory owned by the UID you set in `user:`
-(`mkdir -p /path/to/pfx/output && chown 1000:1000 /path/to/pfx/output`) before
+(`mkdir -p /path/to/pfx/output && chown "${PUID:-1000}:${PGID:-1000}" /path/to/pfx/output`) before
 the first start. Unlike anything under `/input` the scan cannot read, which is
 only warned about and skipped, an unwritable `/output` fails every conversion and
 keeps the container unhealthy. Generated `.pfx` files are mode `0600` and their
@@ -182,10 +182,12 @@ groups:
             The watch loop ended for a reason other than shutdown, so the process
             exited non-zero to be restarted. The announcement is emitted once,
             by the process that exits, and its `error` field names which loss
-            occurred. Two causes: fsnotify's channels closed under a live
-            container, or fsnotify was unavailable AND
-            FALLBACK_SCAN_HOURS is 0/false, leaving no mechanism to notice
-            a renewal at all. Exiting is deliberate — the alternative was a
+            occurred. Three causes: fsnotify's channels closed under a live
+            container, the fsnotify root watch was removed while
+            FALLBACK_SCAN_HOURS is 0/false so nothing can re-attach it, or
+            fsnotify was unavailable AND FALLBACK_SCAN_HOURS is 0/false,
+            leaving no mechanism to notice a renewal at all. Exiting is
+            deliberate — the alternative was a
             container that sat healthy forever while converting nothing, because
             the startup scan had already written the health marker and disabling
             the fallback also disables the marker's freshness deadline. Critical
@@ -315,7 +317,7 @@ the exceptions to the prerequisite: they key on WARN lines, so they work at
 
 The image bakes in a health probe. After each processing cycle with no conversion failures, the main process writes a marker file at `/tmp/.healthy`. The `health` subcommand (`/cert-watcher health`) exits 0 when the marker exists and, while the fallback rescan is enabled, is fresher than three `FALLBACK_SCAN_HOURS` intervals. A staler marker means the watch loop is wedged, so the probe fails and the container is reported `unhealthy`. Docker Engine does not act on health status by itself: an orchestrator that does (Swarm, Kubernetes) restarts the container, while under plain Docker Compose the `unhealthy` state is a signal to monitor — see the `CertConverterScanStalled` rule under [Alerting](#alerting) — and the restart is yours to perform.
 
-Setting `FALLBACK_SCAN_HOURS` to `0`/`false` disables both the fallback and this staleness deadline, which leaves the watcher unsupervised. Nothing re-scans, and a dropped `/input` watch is invisible: unmounting or remounting that directory makes the kernel discard the watch without any filesystem event reaching the process, so the watcher can sit holding no watches while the last clean scan's marker keeps the container healthy indefinitely. It logs nothing in that state, so no alert rule can catch it either. Startup logs a WARN naming that tradeoff. The supervised choice is to leave the fallback enabled; turn it off only if you accept having no signal at all when conversion stops.
+Setting `FALLBACK_SCAN_HOURS` to `0`/`false` disables both the periodic fallback and this staleness deadline, which leaves the watcher unsupervised. Events on a live fsnotify watch still trigger scans, but no periodic scan remains to recover a missed event or reattach a silently dropped `/input` watch. Unmounting or remounting that directory can make the kernel discard the watch without any filesystem event reaching the process, so the watcher can sit holding no watches while the last clean scan's marker keeps the container healthy indefinitely. It logs nothing in that state, so no alert rule can catch it either. Startup logs a WARN naming that tradeoff. The supervised choice is to leave the fallback enabled; turn it off only if you accept having no signal at all when conversion stops.
 
 Health answers one question: should an orchestrator restart this container? It therefore tracks only failures a restart could plausibly clear. The container becomes **unhealthy** when the `/input` root itself cannot be read or a certificate fails to convert (PEM or key parse error, cert/key mismatch, or PFX write failure). It **auto-recovers** on the next clean cycle (fsnotify event or fallback timer) without a restart.
 
@@ -362,6 +364,7 @@ Updated automatically via [Renovate](https://github.com/renovatebot/renovate) an
 | github.com/cplieger/slogx          | [GitHub](https://github.com/cplieger/slogx)                      |
 | github.com/cplieger/atomicfile/v2  | [GitHub](https://github.com/cplieger/atomicfile)                 |
 | github.com/cplieger/envx           | [GitHub](https://github.com/cplieger/envx)                       |
+| github.com/cplieger/runesafe       | [GitHub](https://github.com/cplieger/runesafe)                   |
 
 ## Credits
 

@@ -915,13 +915,14 @@ func TestLoad_blank_secret_file_obeys_the_same_optout(t *testing.T) {
 		}
 	})
 
-	// The blank-file-plus-opt-out configuration used to emit TWO WARNs, and the
-	// first one an operator read was the generic empty-password record whose
+	// The blank-file-plus-opt-out configuration used to emit TWO WARNs for one
+	// condition: the channel-specific blank-file record from logPasswordDelivery,
+	// then the generic empty-password record from warnPasswordStrength, whose
 	// remediation said "point PFX_PASSWORD_FILE at a mounted secret" — the step
-	// they had already taken. The generic record is now suppressed when the
-	// channel-specific one will report the same empty password, so the first
-	// (and only) instruction names the action that actually helps. The
-	// empty-password condition itself must still surface at WARN.
+	// the operator had already taken. The generic record is now suppressed when the
+	// channel-specific one will report the same empty password, so the only
+	// instruction names the action that actually helps. The empty-password
+	// condition itself must still surface at WARN.
 	t.Run("the only guidance is to write the secret into the mounted file", func(t *testing.T) {
 		t.Setenv("PFX_PASSWORD", "")
 		t.Setenv("PFX_PASSWORD_FILE", blankFile(t))

@@ -144,7 +144,7 @@ func TestPollLoopWithUpgrade_hands_the_upgraded_watcher_back_and_releases_poll_m
 // TestPollTick_stays_in_poll_mode_when_watch_set_rebuild_fails pins the poll
 // tick's independently reachable middle branch: fsnotify constructs fine but the
 // watch set cannot be rebuilt (a missing root), so the tick must stay in poll
-// mode (done=false) and still run the safety-net scan that keeps change
+// mode (stopped=false) and still run the safety-net scan that keeps change
 // detection alive.
 func TestPollTick_stays_in_poll_mode_when_watch_set_rebuild_fails(t *testing.T) {
 	t.Parallel()
@@ -308,7 +308,7 @@ func TestRun_treats_shutdown_during_fsnotify_construction_failure_as_a_clean_sto
 
 // TestPollTick_stays_in_poll_mode_when_fsnotify_remains_unavailable pins the
 // third of pollTick's arms, the one the newFSWatcher seam exists for: with the
-// constructor still failing, the tick must stay in poll mode (done=false) and
+// constructor still failing, the tick must stay in poll mode (stopped=false) and
 // still run the polling scan that is then the only live change detection.
 // Not parallel: it swaps the package-level newFSWatcher seam.
 func TestPollTick_stays_in_poll_mode_when_fsnotify_remains_unavailable(t *testing.T) {
@@ -332,7 +332,7 @@ func TestPollTick_stays_in_poll_mode_when_fsnotify_remains_unavailable(t *testin
 
 // TestPollTick_treats_shutdown_during_fsnotify_retry_as_a_stop pins the
 // cancellation precedence of the same arm: a shutdown arriving during the retry
-// must stop the poll loop (done=true) without a scan that would still drive the
+// must stop the poll loop (stopped=true) without a scan that would still drive the
 // health marker on the way out.
 // Not parallel: it swaps the package-level newFSWatcher seam.
 func TestPollTick_treats_shutdown_during_fsnotify_retry_as_a_stop(t *testing.T) {

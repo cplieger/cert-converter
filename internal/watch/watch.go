@@ -174,14 +174,16 @@ func New(root string, onChange func(ctx context.Context), opts ...Option) *Watch
 // differs per entry, and each entry logs its own.
 //
 // It normally blocks until ctx is cancelled and then returns nil, but it ALSO
-// returns ErrWatchLost early in the two
-// states where change detection is gone for good, and the caller must then exit
-// non-zero for a restart, as main.go does: the fsnotify watcher dies (its Events or
-// Errors channel closes), or no fsnotify watch could be established at all -- its
-// constructor failed, or the watch set could not be built on the root -- while the
-// periodic fallback is disabled, leaving no mechanism that could notice a
-// renewal. A channel closure observed after ctx is already cancelled is part of
-// shutdown, not lost change detection, and returns nil.
+// returns ErrWatchLost early in every state where change detection is gone for
+// good (the LostError values above are the complete set), and the caller must
+// then exit non-zero for a restart, as main.go does: the fsnotify watcher dies
+// (its Events or Errors channel closes); the watch on the root itself is removed
+// while the periodic rescan is disabled, so nothing can reattach it; or no
+// fsnotify watch could be established at all -- its constructor failed, or the
+// watch set could not be built on the root -- while the periodic fallback is
+// disabled, leaving no mechanism that could notice a renewal. A channel closure
+// observed after ctx is already cancelled is part of shutdown, not lost change
+// detection, and returns nil.
 func (w *Watcher) Run(ctx context.Context) error {
 	watcher, stopped := w.attachWatchSet(ctx)
 	if stopped {
