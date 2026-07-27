@@ -6,6 +6,7 @@ require (
 	github.com/cplieger/atomicfile/v2 v2.4.0
 	github.com/cplieger/envx v1.3.0
 	github.com/cplieger/health v1.4.0
+	github.com/cplieger/runesafe v1.2.1
 	github.com/cplieger/slogx v1.4.0
 	github.com/fsnotify/fsnotify v1.10.1
 	pgregory.net/rapid v1.3.0

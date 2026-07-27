@@ -51,30 +51,85 @@ func TestBoundLogText_sanitizes_short_input_too(t *testing.T) {
 	}
 }
 
-// TestBoundLogText_strips_the_one_rune_slog_does_not is the paired assertion for the
-// claim boundLogText's doc comment makes. DEL must be gone because slog keeps it; the
-// bidi override may stay in the returned string because slog escapes it on emit, and
-// stripping it here would rewrite legitimate text for no gain. Both halves are pinned
-// so a future "sanitize more" change has to argue with the evidence.
-func TestBoundLogText_strips_the_one_rune_slog_does_not(t *testing.T) {
+// TestBoundLogText_applies_the_runesafe_single_line_policy pins the policy
+// boundLogText now delegates to (runesafe.SanitizeSingleLine): each unsafe rune
+// becomes a SPACE, invalid UTF-8 becomes U+FFFD, and legitimate text — including
+// non-ASCII letters — is untouched. Exact expected values rather than
+// "must not contain", because the replacement rune is part of the contract: a
+// dropped rune would silently join a subject's neighbouring labels.
+//
+// This deliberately REVERSES the assertion the previous version of this test made.
+// It required U+202E to SURVIVE, on the evidence that the only reachable handler
+// (TextHandler) escapes it, so stripping it here would rewrite legitimate text for
+// no gain. Delegating widens the policy to the whole unsafe set, which is the
+// accepted cost of a sanitizer that is correct under either handler rather than
+// under the one currently wired up — see boundLogText's doc comment for the
+// per-handler measurements.
+func TestBoundLogText_applies_the_runesafe_single_line_policy(t *testing.T) {
 	t.Parallel()
 
-	if got := boundLogText("a\u007fb", maxSubjectLogLen); strings.Contains(got, "\u007f") {
-		t.Errorf("boundLogText kept U+007F: %q — slog's safeSet lets it reach the log raw", got)
+	tests := map[string]struct {
+		in   string
+		want string
+	}{
+		// Raw under BOTH handlers: the leak the old hand-rolled policy existed for.
+		"DEL": {"a\u007fb", "a b"},
+		// Raw under JSONHandler, escaped by TextHandler: the classes that made the
+		// old policy correct only for the handler that happens to be wired up.
+		"C1 escape introducer":        {"a\u009bb", "a b"},
+		"C1 next line":                {"a\u0085b", "a b"},
+		"bidi right-to-left override": {"a\u202eb", "a b"},
+		"bidi arabic letter mark":     {"a\u061cb", "a b"},
+		"bidi isolate":                {"a\u2066b", "a b"},
+		// Escaped by both handlers, but a single-line sink must not carry them.
+		"line separator":      {"a\u2028b", "a b"},
+		"paragraph separator": {"a\u2029b", "a b"},
+		"C0 NUL":              {"a\x00b", "a b"},
+		"newline":             {"a\nb", "a b"},
+		"carriage return":     {"a\rb", "a b"},
+		"tab":                 {"a\tb", "a b"},
+		// Invalid bytes become the replacement rune rather than vanishing, so the
+		// result is always valid UTF-8 (strings.Map, via the library).
+		"invalid UTF-8": {"CN=a\xffb.example.com", "CN=a\ufffdb.example.com"},
+		// Legitimate text, including non-ASCII, is returned byte-identical.
+		"plain subject":        {"CN=plain.example.com", "CN=plain.example.com"},
+		"non-ASCII letters":    {"CN=café.example.com", "CN=café.example.com"},
+		"full subject with DN": {"CN=a.example.com,O=Example Ltd,C=NL", "CN=a.example.com,O=Example Ltd,C=NL"},
 	}
-	if got := boundLogText("a\u202eb", maxSubjectLogLen); !strings.Contains(got, "\u202e") {
-		t.Errorf("boundLogText stripped U+202E (%q); slog escapes it on emit, so this function need not", got)
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := boundLogText(tt.in, maxSubjectLogLen)
+			if got != tt.want {
+				t.Errorf("boundLogText(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("boundLogText(%q) = %q, want valid UTF-8", tt.in, got)
+			}
+			if strings.Contains(got, truncationMarker) {
+				t.Errorf("boundLogText(%q) = %q, want no truncation marker on input under the limit", tt.in, got)
+			}
+		})
 	}
 }
 
-// TestBoundLogText_slog_escapes_what_this_function_leaves is the evidence behind the
-// doc comment, asserted rather than asserted-in-prose. If a future Go release stops
-// escaping one of these classes, this test fails and boundLogText has to grow to cover
-// it — which is the only way that regression would ever be noticed.
-func TestBoundLogText_slog_escapes_what_this_function_leaves(t *testing.T) {
+// TestBoundLogText_output_is_safe_under_either_slog_handler is the evidence behind
+// the reason for delegating, asserted rather than asserted-in-prose. Each rune here
+// reaches at least one of the two handlers RAW — DEL both of them, C1 and
+// Bidi_Control the JSON one — so before delegation the policy was correct only
+// because JSONHandler is unreachable. Both handlers are exercised, so the day
+// slogx.Setup is given Format: slogx.JSON this test still holds and no widening of
+// this package is a prerequisite.
+func TestBoundLogText_output_is_safe_under_either_slog_handler(t *testing.T) {
 	t.Parallel()
 
-	for name, r := range map[string]string{
+	handlers := map[string]func(*bytes.Buffer) slog.Handler{
+		"TextHandler": func(b *bytes.Buffer) slog.Handler { return slog.NewTextHandler(b, nil) },
+		"JSONHandler": func(b *bytes.Buffer) slog.Handler { return slog.NewJSONHandler(b, nil) },
+	}
+	runes := map[string]string{
+		"DEL":                     "\u007f",
 		"C1 escape introducer":    "\u009b",
 		"bidi right-to-left over": "\u202e",
 		"bidi isolate":            "\u2066",
@@ -82,19 +137,23 @@ func TestBoundLogText_slog_escapes_what_this_function_leaves(t *testing.T) {
 		"line separator":          "\u2028",
 		"paragraph separator":     "\u2029",
 		"newline":                 "\n",
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			var buf bytes.Buffer
-			slog.New(slog.NewTextHandler(&buf, nil)).
-				Info("x", "detail", boundLogText("a"+r+"b", maxSubjectLogLen))
-			// Trim the record terminator: every slog line ends with a real newline,
-			// which would otherwise satisfy the newline case against the value.
-			out := strings.TrimSuffix(buf.String(), "\n")
-			if strings.Contains(out, r) {
-				t.Errorf("slog emitted %q raw in %q; boundLogText must strip it instead", r, out)
-			}
-		})
+	}
+
+	for handlerName, newHandler := range handlers {
+		for name, r := range runes {
+			t.Run(handlerName+"/"+name, func(t *testing.T) {
+				t.Parallel()
+				var buf bytes.Buffer
+				slog.New(newHandler(&buf)).
+					Info("x", "detail", boundLogText("a"+r+"b", maxSubjectLogLen))
+				// Trim the record terminator: every slog line ends with a real newline,
+				// which would otherwise satisfy the newline case against the value.
+				out := strings.TrimSuffix(buf.String(), "\n")
+				if strings.Contains(out, r) {
+					t.Errorf("%s emitted %q raw in %q; boundLogText must sanitize it first", handlerName, r, out)
+				}
+			})
+		}
 	}
 }
 
@@ -103,8 +162,11 @@ func TestBoundLogText_slog_escapes_what_this_function_leaves(t *testing.T) {
 func TestBoundLogText_bounds_and_marks(t *testing.T) {
 	t.Parallel()
 
-	// A multi-byte run guarantees the byte cut lands inside a rune.
-	got := boundLogText(strings.Repeat("é", 4000), maxSubjectLogLen)
+	// A 3-byte run guarantees the byte cut lands INSIDE a rune: maxSubjectLogLen
+	// (256) is not a multiple of 3, so runesafe.CapBytes must back the cut off to
+	// the preceding rune start. A 2-byte rune divides 256 evenly and would never
+	// exercise that backoff.
+	got := boundLogText(strings.Repeat("\u2603", 4000), maxSubjectLogLen)
 	if !strings.HasSuffix(got, truncationMarker) {
 		t.Errorf("boundLogText(oversized) = %q..., want the truncation marked", got[:32])
 	}
@@ -131,7 +193,7 @@ func TestBoundedTextError_keeps_the_wrapped_error_reachable(t *testing.T) {
 		t.Error("errors.Is(boundedTextError{inner}, inner) = false, want true: the wrapped error must stay reachable")
 	}
 	if strings.ContainsRune(wrapped.Error(), 0x7f) {
-		t.Errorf("boundedTextError.Error() = %q, want the unloggable rune dropped", wrapped.Error())
+		t.Errorf("boundedTextError.Error() = %q, want the unsafe rune sanitized", wrapped.Error())
 	}
 }
 
