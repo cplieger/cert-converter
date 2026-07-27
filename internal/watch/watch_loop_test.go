@@ -3,10 +3,14 @@ package watch
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/cplieger/slogx/capture"
 )
 
 // TestWatchLoop_converts_a_real_cert_write_through_the_debounce is the first
@@ -78,6 +82,14 @@ func TestWatchLoop_returns_ErrWatchLost_when_the_watcher_dies(t *testing.T) {
 		if !errors.Is(err, ErrWatchLost) {
 			t.Errorf("watchLoop(dead watcher) = %v, want ErrWatchLost", err)
 		}
+		// The specific loss, not just "something died": main names it in the one
+		// announcement it makes. Closing the watcher closes BOTH channels and the
+		// select picks a ready case at random, so either closure arm is correct
+		// here — but a neighbouring cause (the root-watch loss) is not.
+		if err != error(errEventsChannelClosed) && err != error(errErrorsChannelClosed) {
+			t.Errorf("watchLoop(dead watcher) = %v, want one of the channel-closure losses (%v / %v)",
+				err, errEventsChannelClosed, errErrorsChannelClosed)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("watchLoop did not return after the watcher died; the process would keep running with no change detection")
 	}
@@ -99,9 +111,13 @@ func TestWatchLoop_returns_ErrWatchLost_when_the_watcher_dies(t *testing.T) {
 // right answer here specifically BECAUSE the failure is restart-clearable — unlike
 // a missing volume or a bad symlink, an exhausted inotify table usually clears — so
 // the restart has a real chance of succeeding rather than looping pointlessly.
+//
+// It also pins how the operator learns about it: this path is the only
+// operator-fixable loss, so the error it returns carries the FALLBACK_SCAN_HOURS
+// remediation out to main, which announces it. This package emits no ERROR of its
+// own — that would be a second announcement of one event.
+// Serial (no t.Parallel): it swaps the process-global slog default.
 func TestPollLoopWithUpgrade_reports_dead_change_detection(t *testing.T) {
-	t.Parallel()
-
 	// onChange is a required dependency, so it is wired even here: poll mode now runs
 	// one scan before deciding change detection is dead (deferred finding d-u5c6-1),
 	// and converting whatever is already on disk is the only useful work this process
@@ -113,6 +129,7 @@ func TestPollLoopWithUpgrade_reports_dead_change_detection(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	logs := capture.Default(t)
 
 	done := runPollLoop(ctx, w)
 
@@ -125,6 +142,14 @@ func TestPollLoopWithUpgrade_reports_dead_change_detection(t *testing.T) {
 		if !errors.Is(res.err, ErrWatchLost) {
 			t.Errorf("pollLoopWithUpgrade(no fallback, no fsnotify) = %v, want ErrWatchLost", res.err)
 		}
+		var lost *LostError
+		if !errors.As(res.err, &lost) {
+			t.Fatalf("pollLoopWithUpgrade(no fallback, no fsnotify) = %v, want a *LostError so main can reach the remediation", res.err)
+		}
+		if !strings.Contains(lost.Remediation, "FALLBACK_SCAN_HOURS") {
+			t.Errorf("remediation = %q, want it to name FALLBACK_SCAN_HOURS: this is the one lost-detection cause an operator can fix, and the hint must survive the trip to main",
+				lost.Remediation)
+		}
 	case <-time.After(2 * time.Second):
 		// The defect was precisely that this call never returns.
 		t.Fatal("pollLoopWithUpgrade did not return; it parked on ctx.Done() with change detection dead, which is what let the container report healthy forever")
@@ -134,6 +159,10 @@ func TestPollLoopWithUpgrade_reports_dead_change_detection(t *testing.T) {
 	case <-scanned:
 	default:
 		t.Error("pollLoopWithUpgrade exited without scanning; main no longer scans before Run, so this is the only conversion the process would perform")
+	}
+	if n := logs.CountLevel(slog.LevelError, ""); n != 0 {
+		t.Errorf("pollLoopWithUpgrade logged %d ERROR records %v, want 0: main states the conclusion once, and a record here makes it twice",
+			n, logs.Messages())
 	}
 }
 
@@ -195,7 +224,10 @@ func TestWatchLoop_runs_the_periodic_fallback_scan_without_any_event(t *testing.
 // pins handleRootWatchLoss's terminal branch: with the periodic rescan disabled, losing the watch on
 // the root itself is unrecoverable in-process (no Create can announce a
 // replacement, and both fsnotify channels stay open), so the loop must exit with
-// ErrWatchLost for a restart rather than schedule a rescan.
+// ErrWatchLost for a restart rather than schedule a rescan — reporting the
+// root-watch loss specifically, and announcing nothing itself (main owns the
+// single ERROR).
+// Serial (no t.Parallel): it swaps the process-global slog default.
 func TestWatchLoop_reports_lost_change_detection_when_the_root_watch_disappears(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "input")
@@ -209,6 +241,7 @@ func TestWatchLoop_reports_lost_change_detection_when_the_root_watch_disappears(
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("addWatchDirs: %v", err)
 	}
+	logs := capture.Default(t)
 
 	done := make(chan error, 1)
 	go func() { done <- w.watchLoop(t.Context(), watcher) }()
@@ -221,7 +254,14 @@ func TestWatchLoop_reports_lost_change_detection_when_the_root_watch_disappears(
 		if !errors.Is(err, ErrWatchLost) {
 			t.Errorf("watchLoop(root removed, fallback disabled) = %v, want ErrWatchLost", err)
 		}
+		if err != error(errRootWatchRemoved) {
+			t.Errorf("watchLoop(root removed, fallback disabled) = %v, want the root-watch-removed loss (%v)", err, errRootWatchRemoved)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("watchLoop did not return after the root watch was removed")
+	}
+	if n := logs.CountLevel(slog.LevelError, ""); n != 0 {
+		t.Errorf("watchLoop(root removed) logged %d ERROR records %v, want 0: main states the conclusion once, and a record here makes it twice",
+			n, logs.Messages())
 	}
 }

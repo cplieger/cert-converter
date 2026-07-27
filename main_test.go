@@ -13,6 +13,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/health"
 	"github.com/cplieger/slogx/capture"
 )
@@ -406,6 +407,106 @@ func TestDispatchArgs_usage_error_names_the_offending_argument(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestReportWatchExit_announces_dead_change_detection_exactly_once pins the
+// boundary decision this app makes about the loudest thing it ever says: main is
+// the ONLY author of the dead-change-detection announcement, because main is
+// what acts on it (exit 1 for a restart). internal/watch returns the condition
+// and says nothing.
+//
+// The four contracts, all operator-visible:
+//   - Exactly ONE ERROR record per dead-detection event. A second one, here or
+//     in internal/watch, double-counts the CertConverterChangeDetectionDead
+//     alert and lets the two wordings drift apart again.
+//   - The message keeps the exact "change detection is dead" wording that alert
+//     matches, and the specific loss travels in the error attr.
+//   - The FALLBACK_SCAN_HOURS remediation still reaches the operator on the one
+//     path that carries it, and is absent on the paths that have none — a
+//     dead fsnotify fd is not something the operator misconfigured.
+//   - A shutdown (nil error) says only that it is shutting down, at Info. If it
+//     announced dead change detection, every SIGTERM would fire a critical alert.
+//
+// Serial (no t.Parallel): it swaps the process-global slog default.
+func TestReportWatchExit_announces_dead_change_detection_exactly_once(t *testing.T) {
+	const deadMsg = "watcher stopped without a shutdown signal; change detection is dead, exiting for a restart"
+
+	for _, tc := range []struct {
+		name            string
+		runErr          error
+		wantCode        int
+		wantRemediation string
+	}{
+		{
+			name:            "the disabled-fallback loss carries its remediation",
+			runErr:          &watch.LostError{Cause: "no fsnotify watch could be established and the periodic rescan is disabled", Remediation: "unset FALLBACK_SCAN_HOURS (or set it above 0)"},
+			wantCode:        1,
+			wantRemediation: "FALLBACK_SCAN_HOURS",
+		},
+		{
+			name:     "a dead fsnotify channel has no remediation to give",
+			runErr:   &watch.LostError{Cause: "the fsnotify events channel closed"},
+			wantCode: 1,
+		},
+		{
+			// Defensive: a future loss returned as the bare sentinel must still
+			// be announced, not swallowed for lack of a *LostError.
+			name:     "the bare sentinel is still announced",
+			runErr:   watch.ErrWatchLost,
+			wantCode: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := capture.Default(t)
+
+			if got := reportWatchExit(t.Context(), tc.runErr); got != tc.wantCode {
+				t.Errorf("reportWatchExit(%v) = %d, want %d", tc.runErr, got, tc.wantCode)
+			}
+
+			if n := logs.CountLevel(slog.LevelError, ""); n != 1 {
+				t.Fatalf("reportWatchExit(%v) logged %d ERROR records %v, want exactly 1: the alert counts lines, so a second announcement double-counts one event",
+					tc.runErr, n, logs.Messages())
+			}
+			if n := logs.CountExact(deadMsg); n != 1 {
+				t.Errorf("reportWatchExit(%v) logged %d records with the exact alerted message %q, want 1 (logs %v)",
+					tc.runErr, n, deadMsg, logs.Messages())
+			}
+			if !logs.AttrContains(deadMsg, "error", "change detection lost") {
+				t.Errorf("reportWatchExit(%v) ERROR does not name which loss occurred (logs %v)", tc.runErr, logs.Messages())
+			}
+			gotRemediation, hasRemediation := logs.AttrValue(deadMsg, "remediation")
+			if tc.wantRemediation == "" {
+				if hasRemediation {
+					t.Errorf("reportWatchExit(%v) attached remediation %q, want none: nothing the operator configured caused this loss",
+						tc.runErr, gotRemediation)
+				}
+				return
+			}
+			if !strings.Contains(gotRemediation, tc.wantRemediation) {
+				t.Errorf("reportWatchExit(%v) remediation = %q, want it to name %q so the operator can fix the state that produced it",
+					tc.runErr, gotRemediation, tc.wantRemediation)
+			}
+		})
+	}
+
+	t.Run("a shutdown says nothing about dead change detection", func(t *testing.T) {
+		logs := capture.Default(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		if got := reportWatchExit(ctx, nil); got != 0 {
+			t.Errorf("reportWatchExit(nil) = %d, want 0: a clean shutdown is not a failure", got)
+		}
+		if n := logs.CountLevel(slog.LevelError, ""); n != 0 {
+			t.Errorf("reportWatchExit(nil) logged %d ERROR records %v, want 0: a SIGTERM must not fire the critical dead-detection alert", n, logs.Messages())
+		}
+		if logs.Contains("change detection") {
+			t.Errorf("reportWatchExit(nil) mentioned change detection in %v; the alert matcher would fire on a graceful stop", logs.Messages())
+		}
+		if n := logs.CountLevel(slog.LevelInfo, "shutting down"); n != 1 {
+			t.Errorf("reportWatchExit(nil) logged %d INFO shutdown records %v, want 1 so the stop is still visible", n, logs.Messages())
+		}
+	})
 }
 
 func TestHealthyAfterScan(t *testing.T) {

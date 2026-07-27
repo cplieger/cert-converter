@@ -241,17 +241,39 @@ func run() int {
 	w := watch.New(certsRootDir, runAndSetHealth,
 		watch.WithDebounce(watchDebounce),
 		watch.WithFallback(cfg.FallbackInterval))
-	if runErr := w.Run(ctx); runErr != nil {
-		// Run reported that change detection ended for a reason other than
-		// shutdown: the fsnotify channels closed, so only a restart can recover
-		// it. Exit non-zero so restart: on-failure deployments restart too; the
-		// deferred marker.Cleanup drops the marker on the way out, so a probe
-		// cannot report healthy after this point.
-		slog.Error("watcher stopped without a shutdown signal; "+
-			"change detection is dead, exiting for a restart", "error", runErr)
-		return 1
-	}
+	return reportWatchExit(ctx, w.Run(ctx))
+}
 
-	slog.Info("shutting down", "reason", context.Cause(ctx))
-	return 0
+// reportWatchExit turns the watcher's single exit into the process's exit code,
+// and is the SINGLE place the app announces that change detection is dead.
+//
+// That announcement is main's to make because main is what ACTS on the
+// condition: it exits non-zero so the orchestrator restarts the container.
+// internal/watch returns the condition (a *watch.LostError naming which loss
+// occurred, plus the operator action where one exists) and logs nothing about
+// it, so the wording cannot drift across the package boundary — the
+// CertConverterChangeDetectionDead alert matches the message below and nothing
+// else. Exactly one ERROR record per dead-detection event.
+//
+// A nil error is a shutdown: it reports the cause at Info and exits 0, and must
+// never mention dead change detection, or a SIGTERM would fire that critical
+// alert.
+func reportWatchExit(ctx context.Context, runErr error) int {
+	if runErr == nil {
+		slog.Info("shutting down", "reason", context.Cause(ctx))
+		return 0
+	}
+	// Run reported that change detection ended for a reason other than
+	// shutdown: the fsnotify watch is gone and only a restart can recover it.
+	// Exit non-zero so restart: on-failure deployments restart too; the
+	// deferred marker.Cleanup drops the marker on the way out, so a probe
+	// cannot report healthy after this point.
+	attrs := []any{"error", runErr}
+	var lost *watch.LostError
+	if errors.As(runErr, &lost) && lost.Remediation != "" {
+		attrs = append(attrs, "remediation", lost.Remediation)
+	}
+	slog.Error("watcher stopped without a shutdown signal; "+
+		"change detection is dead, exiting for a restart", attrs...)
+	return 1
 }

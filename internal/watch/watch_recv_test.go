@@ -3,10 +3,10 @@ package watch
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -211,37 +211,89 @@ func TestHandleErrorRecv_does_not_resync_the_watch_set_for_a_benign_error(t *tes
 }
 
 // TestLostOrShutdown_gives_cancellation_precedence pins both halves of the
-// channel-closed translation. watchLoop's select has no ctx precedence of its
-// own (Go picks a ready case at random), so a SIGTERM arriving in the same
-// instant as an fsnotify fd death can take the channel arm: with a live ctx that
-// really is lost change detection and must surface ErrWatchLost — with the
-// operator-facing loss message logged — so main exits 1 for a restart, while
-// under an already-cancelled ctx it is a clean shutdown and must return nil
-// without any ERROR claiming the process is about to exit and restart.
+// channel-closed translation, for every loss this package can reach.
+// watchLoop's select has no ctx precedence of its own (Go picks a ready case at
+// random), so a SIGTERM arriving in the same instant as an fsnotify fd death can
+// take the channel arm: with a live ctx that really is lost change detection and
+// must surface the loss ITSELF — the same *LostError value, so the caller can
+// tell which loss occurred and reach its remediation — while under an
+// already-cancelled ctx it is a clean shutdown and must return nil.
+//
+// Both halves must be SILENT. The operator-facing announcement is main's, once
+// per event; a record emitted here would be a second announcement on the loss
+// path and a phantom restart notice on the shutdown path.
 // Not parallel: it swaps the process-global slog default.
 func TestLostOrShutdown_gives_cancellation_precedence(t *testing.T) {
-	const lossMessage = "fsnotify events channel closed, watcher stopping; process will exit and restart"
+	for _, lost := range []*LostError{
+		errRootWatchRemoved,
+		errEventsChannelClosed,
+		errErrorsChannelClosed,
+		errNoWatchNoFallback,
+	} {
+		t.Run(lost.Cause, func(t *testing.T) {
+			t.Run("a live ctx is lost change detection", func(t *testing.T) {
+				logs := capture.Default(t)
+				got := lostOrShutdown(t.Context(), lost)
+				if !errors.Is(got, ErrWatchLost) {
+					t.Errorf("lostOrShutdown(live ctx) = %v, want ErrWatchLost (a watcher that dies while the app must keep running is fatal)", got)
+				}
+				if got != error(lost) {
+					t.Errorf("lostOrShutdown(live ctx) = %v, want the %q loss itself so main can name which loss occurred", got, lost.Cause)
+				}
+				if !strings.Contains(got.Error(), lost.Cause) {
+					t.Errorf("lostOrShutdown(live ctx).Error() = %q, want it to name the cause %q", got.Error(), lost.Cause)
+				}
+				if logs.Len() != 0 {
+					t.Errorf("lostOrShutdown(live ctx) logged %v, want no output: main owns the single operator-facing announcement, so a record here is a second one",
+						logs.Messages())
+				}
+			})
+			t.Run("a cancelled ctx is a clean stop", func(t *testing.T) {
+				logs := capture.Default(t)
+				cancelled, cancel := context.WithCancel(context.Background())
+				cancel()
+				if got := lostOrShutdown(cancelled, lost); got != nil {
+					t.Errorf("lostOrShutdown(cancelled ctx) = %v, want nil (a channel closing during shutdown is a clean stop, not lost change detection)", got)
+				}
+				if logs.Len() != 0 {
+					t.Errorf("lostOrShutdown(cancelled ctx) logged %v, want no output: a clean shutdown must not claim the process will exit and restart", logs.Messages())
+				}
+			})
+		})
+	}
+}
 
-	t.Run("a live ctx is lost change detection", func(t *testing.T) {
-		logs := capture.Default(t)
-		if got := lostOrShutdown(t.Context(), lossMessage); !errors.Is(got, ErrWatchLost) {
-			t.Errorf("lostOrShutdown(live ctx) = %v, want ErrWatchLost (a watcher that dies while the app must keep running is fatal)", got)
-		}
-		if logs.CountLevel(slog.LevelError, lossMessage) != 1 {
-			t.Errorf("lostOrShutdown(live ctx) logged %v, want one ERROR %q so operators see why the process restarts", logs.Messages(), lossMessage)
-		}
-	})
-	t.Run("a cancelled ctx is a clean stop", func(t *testing.T) {
-		logs := capture.Default(t)
-		cancelled, cancel := context.WithCancel(context.Background())
-		cancel()
-		if got := lostOrShutdown(cancelled, lossMessage); got != nil {
-			t.Errorf("lostOrShutdown(cancelled ctx) = %v, want nil (a channel closing during shutdown is a clean stop, not lost change detection)", got)
-		}
-		if logs.Len() != 0 {
-			t.Errorf("lostOrShutdown(cancelled ctx) logged %v, want no output: a clean shutdown must not claim the process will exit and restart", logs.Messages())
-		}
-	})
+// TestLostError_carries_the_remediation_only_where_one_exists pins the split
+// that lets main say the right thing per loss: the disabled-fallback case is the
+// only operator-fixable one, so it is the only one that names
+// FALLBACK_SCAN_HOURS. Dropping that field would silently strip the one
+// actionable hint this package has ever given, and adding one to a dead
+// fsnotify fd would tell an operator to fix something they did not cause.
+func TestLostError_carries_the_remediation_only_where_one_exists(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		lost            *LostError
+		wantRemediation bool
+	}{
+		{errRootWatchRemoved, false},
+		{errEventsChannelClosed, false},
+		{errErrorsChannelClosed, false},
+		{errNoWatchNoFallback, true},
+	} {
+		t.Run(tc.lost.Cause, func(t *testing.T) {
+			t.Parallel()
+			if tc.lost.Cause == "" {
+				t.Error("a loss with no cause leaves main announcing that change detection is dead without saying which loss ended it")
+			}
+			if got := tc.lost.Remediation != ""; got != tc.wantRemediation {
+				t.Errorf("Remediation = %q, want a remediation: %v", tc.lost.Remediation, tc.wantRemediation)
+			}
+			if tc.wantRemediation && !strings.Contains(tc.lost.Remediation, "FALLBACK_SCAN_HOURS") {
+				t.Errorf("Remediation = %q, want it to name FALLBACK_SCAN_HOURS, the env var that produced this state", tc.lost.Remediation)
+			}
+		})
+	}
 }
 
 // TestHandleFallbackTick_runs_the_scan_when_resync_fails pins the safety-net

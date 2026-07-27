@@ -26,8 +26,60 @@ import (
 
 // ErrWatchLost reports that change detection ended for a reason other than
 // shutdown: the fsnotify watcher died and cannot be recovered in-process, so
-// the caller must exit non-zero for a restart.
+// the caller must exit non-zero for a restart. Every lost-change-detection
+// return is a *LostError wrapping this sentinel, so errors.Is(err,
+// ErrWatchLost) is the caller's test for the condition regardless of which
+// loss occurred.
 var ErrWatchLost = errors.New("change detection lost")
+
+// LostError is the concrete error behind every ErrWatchLost return: it names
+// WHICH loss ended change detection and, where one exists, the operator action
+// that prevents it.
+//
+// It carries that detail because this package does NOT announce the condition.
+// The announcement belongs to the caller that ACTS on it — main exits non-zero
+// for a restart, so main states the conclusion, exactly once per event (the
+// message the CertConverterChangeDetectionDead alert matches). Authoring it on
+// both sides of this boundary is how the wording drifted apart and how such an
+// alert quietly stops firing. So the cause and the remediation travel out with
+// the error instead of being logged here.
+type LostError struct {
+	// Cause is the specific loss, phrased to complete the caller's sentence:
+	// "change detection is dead: <cause>".
+	Cause string
+	// Remediation is the operator action that prevents this loss, or empty when
+	// there is none to give (a dead fsnotify fd is not a misconfiguration).
+	Remediation string
+}
+
+// Error renders the sentinel plus the specific loss, so a caller that only logs
+// the error still names which loss occurred.
+func (e *LostError) Error() string { return ErrWatchLost.Error() + ": " + e.Cause }
+
+// Unwrap reports ErrWatchLost so errors.Is keeps identifying the condition
+// without the caller having to know the concrete type.
+func (e *LostError) Unwrap() error { return ErrWatchLost }
+
+// The lost-change-detection conditions this package can reach. Each is returned
+// as-is (they are immutable), and the caller distinguishes them by Cause; only
+// the disabled-fallback one is operator-fixable, so only it carries a
+// remediation.
+var (
+	errRootWatchRemoved = &LostError{
+		Cause: "the fsnotify root watch was removed while the periodic rescan is disabled",
+	}
+	errEventsChannelClosed = &LostError{
+		Cause: "the fsnotify events channel closed",
+	}
+	errErrorsChannelClosed = &LostError{
+		Cause: "the fsnotify errors channel closed",
+	}
+	errNoWatchNoFallback = &LostError{
+		Cause: "no fsnotify watch could be established and the periodic rescan is disabled",
+		Remediation: "unset FALLBACK_SCAN_HOURS (or set it above 0) so the periodic rescan covers the missing " +
+			"fsnotify watch; the preceding WARN names why the fsnotify watch is missing",
+	}
+)
 
 // newFSWatcher is the fsnotify construction seam. It is a package var rather
 // than a direct call so a test can drive the "fsnotify unavailable" dispatch
@@ -491,10 +543,10 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) erro
 
 		case event, ok := <-watcher.Events:
 			if ok && !w.handleRootWatchLoss(ctx, watcher, event) {
-				return lostOrShutdown(ctx, "fsnotify root watch removed while the periodic rescan is disabled; change detection is inactive, process will exit and restart")
+				return lostOrShutdown(ctx, errRootWatchRemoved)
 			}
 			if !w.handleEventRecv(ctx, watcher, st, event, ok) {
-				return lostOrShutdown(ctx, "fsnotify events channel closed, watcher stopping; process will exit and restart")
+				return lostOrShutdown(ctx, errEventsChannelClosed)
 			}
 
 		case <-st.debounceTimer.C:
@@ -505,7 +557,7 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) erro
 
 		case err, ok := <-watcher.Errors:
 			if !w.handleErrorRecv(ctx, watcher, st, err, ok) {
-				return lostOrShutdown(ctx, "fsnotify errors channel closed, watcher stopping; process will exit and restart")
+				return lostOrShutdown(ctx, errErrorsChannelClosed)
 			}
 		}
 	}
@@ -548,26 +600,28 @@ func (w *Watcher) handleRootWatchLoss(ctx context.Context, watcher *fsnotify.Wat
 // lostOrShutdown maps a watcher-death exit to nil when the process is already
 // shutting down: an Events/Errors channel closing in the same instant as
 // cancellation is a clean stop, not lost change detection, and must not turn a
-// SIGTERM into exit 1 with an ERROR claiming there was no shutdown signal.
-// watchLoop's select has no ctx precedence of its own (Go picks a ready case at
-// random), so the precedence lives here, at the single translation point — and
-// so does the operator-facing ERROR for lossMessage, which describes the closed
-// channel: logging it in the receive helpers would announce a restart that is
-// not happening whenever cancellation wins this check.
-func lostOrShutdown(ctx context.Context, lossMessage string) error {
+// SIGTERM into exit 1 with an announcement claiming there was no shutdown
+// signal. watchLoop's select has no ctx precedence of its own (Go picks a ready
+// case at random), so the precedence lives here, at the single translation
+// point.
+//
+// It logs nothing, on either branch. The operator-facing ERROR belongs to main,
+// which is what acts on the condition (see LostError); emitting one here would
+// announce a restart that is not happening whenever cancellation wins this
+// check, and a second one when it does not.
+func lostOrShutdown(ctx context.Context, lost *LostError) error {
 	if ctx.Err() != nil {
 		return nil
 	}
-	slog.Error(lossMessage)
-	return ErrWatchLost
+	return lost
 }
 
 // handleEventRecv processes one receive from the watcher's event channel and
 // reports whether the loop should keep running. A closed channel means the
 // watcher is dead, so the loop must exit (the process then restarts); otherwise
 // an event classified as interesting arms the debounced rescan. The closure is
-// reported by the return value alone: lostOrShutdown owns the ERROR, so a
-// closure racing a shutdown stays quiet.
+// reported by the return value alone: lostOrShutdown maps it to the terminal
+// error (or to a clean stop when it raced a shutdown), and main announces it.
 func (w *Watcher) handleEventRecv(ctx context.Context, watcher *fsnotify.Watcher, st *watchState, event fsnotify.Event, ok bool) bool {
 	if !ok {
 		return false
@@ -580,8 +634,8 @@ func (w *Watcher) handleEventRecv(ctx context.Context, watcher *fsnotify.Watcher
 
 // handleErrorRecv processes one receive from the watcher's error channel and
 // reports whether the loop should keep running. A closed channel means the
-// watcher is dead, so the loop must exit (lostOrShutdown logs it, if it is a
-// genuine loss rather than a shutdown); an event-queue overflow additionally
+// watcher is dead, so the loop must exit (lostOrShutdown classifies it as a
+// genuine loss or a shutdown); an event-queue overflow additionally
 // re-syncs the watch set.
 func (w *Watcher) handleErrorRecv(ctx context.Context, watcher *fsnotify.Watcher, st *watchState, err error, ok bool) bool {
 	if !ok {
@@ -726,9 +780,10 @@ func (st *watchState) handleWatcherError(err error) bool {
 // upgrade succeeded and watch mode takes over from here, while a nil watcher
 // means change detection is over for this mode -- nil error on shutdown, or
 // ErrWatchLost with the fallback disabled (<= 0), where there is no interval to
-// poll on, so after the initial scan it logs an ERROR and returns rather than
+// poll on, so after the initial scan it returns rather than
 // parking: nothing would ever notice a renewal, and the caller must exit
-// non-zero for a restart.
+// non-zero for a restart. The returned error carries the FALLBACK_SCAN_HOURS
+// remediation for the caller to announce.
 //
 // Returning the upgraded watcher instead of running the watch loop is what keeps
 // poll mode's resources out of watch mode's lifetime: the ticker in
@@ -763,10 +818,10 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) (upgraded *fsnotify.W
 		// transient host pressure, so the retry has a real chance of succeeding.
 		//
 		// This also honours Run's own documented contract: dead change detection is
-		// an error return, not a survivable steady state.
-		slog.Error("no fsnotify watch and the periodic rescan is disabled; change detection is inactive, exiting for a restart",
-			"remediation", "unset FALLBACK_SCAN_HOURS (or set it above 0) so the periodic rescan covers the missing fsnotify watch; the preceding WARN names why the fsnotify watch is missing")
-		return nil, ErrWatchLost
+		// an error return, not a survivable steady state. The error carries the
+		// FALLBACK_SCAN_HOURS remediation out to main, which announces it: this is
+		// the one lost-detection cause an operator can fix.
+		return nil, errNoWatchNoFallback
 	}
 
 	return w.pollUntilUpgrade(ctx), nil

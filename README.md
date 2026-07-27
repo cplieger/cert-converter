@@ -171,7 +171,7 @@ groups:
         expr: |
           sum by (container) (count_over_time(
             {container="cert-converter"}
-            |~ `change detection is (dead|inactive)` [15m]
+            |= `change detection is dead` [15m]
           )) > 0
         for: 0m
         labels:
@@ -180,8 +180,10 @@ groups:
           summary: "cert-converter lost change detection and is exiting for a restart"
           description: >
             The watch loop ended for a reason other than shutdown, so the process
-            exited non-zero to be restarted. Two causes: fsnotify's channels
-            closed under a live container, or fsnotify was unavailable AND
+            exited non-zero to be restarted. The announcement is emitted once,
+            by the process that exits, and its `error` field names which loss
+            occurred. Two causes: fsnotify's channels closed under a live
+            container, or fsnotify was unavailable AND
             FALLBACK_SCAN_HOURS is 0/false, leaving no mechanism to notice
             a renewal at all. Exiting is deliberate — the alternative was a
             container that sat healthy forever while converting nothing, because
@@ -189,10 +191,11 @@ groups:
             the fallback also disables the marker's freshness deadline. Critical
             rather than warning: with no restart policy the container stays down
             and every renewal is silently missed. Ensure the deployment restarts
-            it (`restart: unless-stopped`), and if the log names the disabled
-            fallback, unset FALLBACK_SCAN_HOURS or set it above 0 so the periodic
-            rescan covers the missing watch. Exhausted inotify instances on the
-            host are the usual root cause and are often transient.
+            it (`restart: unless-stopped`), and if the record carries a
+            `remediation` field naming FALLBACK_SCAN_HOURS, unset it or set it
+            above 0 so the periodic rescan covers the missing watch. Exhausted
+            inotify instances on the host are the usual root cause and are often
+            transient.
       - alert: CertConverterInputPathUnreachable
         expr: |
           sum by (container) (count_over_time(
