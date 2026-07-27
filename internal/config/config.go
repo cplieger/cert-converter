@@ -165,6 +165,7 @@ func Load() (Config, error) {
 	}
 
 	fallbackInterval := FallbackInterval()
+	warnFallbackDisabled(fallbackInterval)
 	warnPasswordStrength(status)
 
 	return Config{
@@ -298,6 +299,42 @@ func parseFallbackInterval(v string) time.Duration {
 			"value", v, "default", defaultFallbackInterval.String())
 		return defaultFallbackInterval
 	}
+}
+
+// warnFallbackDisabled warns that FALLBACK_SCAN_HOURS=0/false runs the watcher
+// unsupervised, naming the three things that go away together, because nothing
+// else in the process ever will.
+//
+// There is no periodic re-scan, so a renewal whose fsnotify event never arrived
+// stays unconverted. The health marker's freshness deadline goes with it (main
+// hands the probe WithMaxAge(3*interval), and health treats a non-positive
+// max-age as no deadline at all), so the marker written by the last clean scan
+// reports HEALTHY for as long as the container runs. And an /input watch
+// dropped by an unmount or remount is undetectable: the kernel reports that as
+// IN_UNMOUNT/IN_IGNORED, which fsnotify swallows without emitting an event and
+// without closing either channel, so watch's root-watch-loss guard (keyed on a
+// Remove/Rename naming the root) never fires and the loop parks holding zero
+// watches while health stays green.
+//
+// Deliberately a warning rather than a detector. With the fallback off, an idle
+// deployment and a wedged one are indistinguishable without active probing, so
+// any liveness timer or probe would either restore the periodic work this
+// setting exists to avoid or report a quiet deployment unhealthy. Stating the
+// tradeoff once, at startup, is the honest alternative.
+//
+// Keyed on the parsed interval, which is zero only for the explicit "0"/"false"
+// opt-out: an empty, whitespace-only, or invalid value yields
+// defaultFallbackInterval and stays silent here, because it is not the opt-out
+// (parseFallbackInterval already warns about the values it repaired).
+func warnFallbackDisabled(interval time.Duration) {
+	if interval > 0 {
+		return
+	}
+	slog.Warn("FALLBACK_SCAN_HOURS is 0/false: no periodic re-scan, and no health-marker freshness deadline with it; "+
+		"an /input watch silently dropped by an unmount or remount emits no fsnotify event, so it goes undetected "+
+		"and the container keeps reporting healthy while converting nothing",
+		"remediation", "unset FALLBACK_SCAN_HOURS (or set it above 0) so the periodic rescan re-attaches the watch set "+
+			"and the health marker's freshness deadline can report a wedged loop")
 }
 
 // warnBothPasswordChannels warns when the operator supplied the PFX password through

@@ -155,6 +155,83 @@ func isolatePasswordFile(t *testing.T) {
 	t.Setenv("PFX_PASSWORD_FILE", "")
 }
 
+// TestLoad_warns_when_the_fallback_rescan_is_disabled pins the startup WARN for
+// the FALLBACK_SCAN_HOURS opt-out, the only configuration in which the app
+// cannot notice that it has stopped working: no periodic re-scan, no
+// health-marker freshness deadline, and a watch dropped by an unmount that
+// fsnotify never reports. The warning is the whole detector, so its firing rule
+// matters as much as its text.
+//
+// It must fire ONLY for the explicit opt-out. An empty, whitespace-only, or
+// invalid value falls back to the 6h default, which is supervised and must stay
+// silent: warning there would train an operator to ignore the line that matters.
+// The interval is asserted alongside the warning so the two cannot drift apart.
+// slog.Default is process-global, so this test must not run in parallel with
+// anything that logs.
+func TestLoad_warns_when_the_fallback_rescan_is_disabled(t *testing.T) {
+	// Matches only the opt-out WARN: the repair diagnostics read "invalid
+	// FALLBACK_SCAN_HOURS, ..." and "FALLBACK_SCAN_HOURS too large, ...".
+	const optOutWarn = "FALLBACK_SCAN_HOURS is 0/false"
+
+	for _, tc := range []struct {
+		name         string
+		raw          string
+		wantInterval time.Duration
+		wantWarn     bool
+	}{
+		{"zero opts out and warns", "0", 0, true},
+		{"false opts out and warns", "false", 0, true},
+		{"uppercase FALSE opts out and warns", "FALSE", 0, true},
+		{"padded zero opts out and warns", " 0 ", 0, true},
+		{"unset default is silent", "", 6 * time.Hour, false},
+		{"whitespace-only value is silent", "   ", 6 * time.Hour, false},
+		{"invalid value is silent", "abc", 6 * time.Hour, false},
+		{"non-canonical zero is silent", "00", 6 * time.Hour, false},
+		{"explicit interval is silent", "12", 12 * time.Hour, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", "pw")
+			t.Setenv("FALLBACK_SCAN_HOURS", tc.raw)
+
+			logs := capture.Default(t)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() = %v, want nil", err)
+			}
+			if cfg.FallbackInterval != tc.wantInterval {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q FallbackInterval = %v, want %v",
+					tc.raw, cfg.FallbackInterval, tc.wantInterval)
+			}
+
+			warnings := logs.CountLevel(slog.LevelWarn, optOutWarn)
+			if (warnings > 0) != tc.wantWarn {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q logged %d WARN records matching %q, want warn = %v (logs %v)",
+					tc.raw, warnings, optOutWarn, tc.wantWarn, logs.Messages())
+			}
+			if !tc.wantWarn {
+				return
+			}
+			if warnings != 1 {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q logged %d opt-out WARN records, want exactly 1 (logs %v)",
+					tc.raw, warnings, logs.Messages())
+			}
+			// The three losses an operator has to weigh, plus the way back.
+			for _, want := range []string{"no periodic re-scan", "freshness deadline", "reporting healthy"} {
+				if !logs.Contains(want) {
+					t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN does not name %q (logs %v)",
+						tc.raw, want, logs.Messages())
+				}
+			}
+			if !logs.AttrContains(optOutWarn, "remediation", "FALLBACK_SCAN_HOURS") {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN carries no remediation naming the variable (logs %v)",
+					tc.raw, logs.Messages())
+			}
+		})
+	}
+}
+
 func TestLoad_explicit_fallback_overrides_default(t *testing.T) {
 	isolatePasswordFile(t)
 	t.Setenv("PFX_PASSWORD", "s3cret")
