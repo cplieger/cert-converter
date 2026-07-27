@@ -78,8 +78,122 @@ func equalPublicKeys(a, b crypto.PublicKey) (matched, supported bool) {
 	return matcher.Equal(b), true
 }
 
-// Decoded is what a previously written PFX yields when read back.
-type Decoded struct {
+// --- Read-back: the currency check ---
+
+// CurrencyReason names WHY an existing bundle is, or is not, the bundle a set of
+// inputs would produce. It exists because the caller does not just act on the
+// verdict, it narrates it: each value is a distinct diagnosis with its own
+// operator meaning, and flattening them into a bare bool would make a deliberate
+// PFX_ENCODER switch indistinguishable from a corrupt file.
+//
+// The zero value is deliberately not CurrencyMatch, so a Currency nobody filled
+// in reads as "not current" rather than as a match.
+type CurrencyReason string
+
+// The five outcomes of a currency check. Every one that is not CurrencyMatch
+// means the same ACTION — rewrite the bundle — and a different diagnosis.
+const (
+	// CurrencyMatch: the bundle on disk was written by the wanted encoder profile
+	// and carries exactly the leaf, key and chain these inputs produce.
+	CurrencyMatch CurrencyReason = "match"
+	// CurrencyPreflightFailed: the preflight refused the bytes, so nothing was
+	// decoded. Either the file is not one this app wrote, or it names a
+	// key-derivation iteration count outside the bound. Currency.Err carries the
+	// diagnosis; it wraps ErrProfileUnknown when the refusal came from one of this
+	// app's own profile rules rather than from the DER parser.
+	CurrencyPreflightFailed CurrencyReason = "preflight-failed"
+	// CurrencyProfileMismatch: the file is a well-formed bundle from one of this
+	// app's profiles, but not the wanted one — a deliberate PFX_ENCODER change.
+	// Currency.Profile carries the profile the file was written with.
+	CurrencyProfileMismatch CurrencyReason = "profile-mismatch"
+	// CurrencyDecodeFailed: the preflight passed but the bundle did not decode — a
+	// rotated password, a truncated file, a foreign file at that path. These are
+	// not distinguishable from each other (see decode) and need no distinguishing.
+	// Currency.Err carries the bounded decode error.
+	CurrencyDecodeFailed CurrencyReason = "decode-failed"
+	// CurrencyContentMismatch: the bundle decoded and its profile matches, but its
+	// leaf, key or chain is not what these inputs produce — the ordinary "the
+	// certificate was renewed" outcome, which needs no diagnostic of its own.
+	CurrencyContentMismatch CurrencyReason = "content-mismatch"
+)
+
+// Currency is the outcome of CheckCurrency: the verdict plus the material the
+// caller needs to explain it.
+//
+// Err and Profile are each populated for exactly one Reason (see the constants);
+// on the others they are zero. The verdict is derived from Reason by Current()
+// rather than stored, so there is only one thing to get right.
+type Currency struct {
+	// Reason is what the check concluded.
+	Reason CurrencyReason
+	// Err is the underlying failure for CurrencyPreflightFailed and
+	// CurrencyDecodeFailed, for a caller's diagnostic. Both are expected outcomes
+	// rather than faults: the caller's response to either is to rewrite the file.
+	Err error
+	// Profile is the encoder profile the existing file was written with, set for
+	// CurrencyProfileMismatch so the caller can name found-vs-configured.
+	Profile EncoderType
+}
+
+// Current reports whether the existing bundle needs no rewrite.
+func (c Currency) Current() bool { return c.Reason == CurrencyMatch }
+
+// CheckCurrency reports whether pfx is already the bundle want would produce
+// under wantEncoder, and when it is not, why.
+//
+// This is the entire read-back side of the codec behind one call, deliberately.
+// Reading an existing bundle safely has a mandatory ORDER:
+//
+//  1. the preflight (inspect), FIRST, because it bounds every key-derivation
+//     iteration count the file itself dictates before any of them can reach
+//     PBKDF2, and because it names the encoder profile that decoding cannot
+//     reveal (see profile.go maxKDFIterations for exactly what it can and cannot
+//     see);
+//  2. the profile comparison, before any derivation, so a deliberate
+//     PFX_ENCODER change is answered without decrypting anything;
+//  3. the decode, whose derivation counts step 1 has now bounded;
+//  4. the comparison against want.
+//
+// That order is a safety invariant of the codec, not a convention for callers to
+// remember. It used to live in the one production consumer while this package
+// exported the three steps separately, so a second consumer reaching for the
+// decode alone would have run an unbounded derivation on counts taken from a file
+// under /output. The steps are unexported now, so the order is unbypassable: this
+// is the only door, and it always walks them in this sequence. It is the same rule
+// the package already applies to parseCertChain, applied to the read-back side.
+//
+// Nothing here is fatal. Every non-match outcome means "rewrite the file", so a
+// parse or decode failure is reported as a reason rather than as an error return;
+// the caller owns what a reason is worth and, since this package takes no context,
+// owns the shutdown classification too. pfx is never mutated.
+//
+// The Analysis is taken by pointer only because the struct is large enough that
+// copying it per call is wasteful (gocritic hugeParam); CheckCurrency does not
+// mutate it.
+func CheckCurrency(pfx []byte, password string, want *Analysis, wantEncoder EncoderType) Currency {
+	insp, err := inspect(pfx)
+	if err != nil {
+		return Currency{Reason: CurrencyPreflightFailed, Err: err}
+	}
+	if insp.Profile != wantEncoder {
+		return Currency{Reason: CurrencyProfileMismatch, Profile: insp.Profile}
+	}
+	prior, err := decode(pfx, password)
+	if err != nil {
+		return Currency{Reason: CurrencyDecodeFailed, Err: err}
+	}
+	if !prior.matchesAnalysis(want) {
+		return Currency{Reason: CurrencyContentMismatch}
+	}
+	return Currency{Reason: CurrencyMatch}
+}
+
+// decoded is what a previously written PFX yields when read back.
+//
+// Unexported like the steps that produce and consume it: CheckCurrency is the
+// only way in, so no caller outside this package can hold decoded material
+// without having gone through the preflight first.
+type decoded struct {
 	// Leaf is the end-entity certificate stored in the first bag.
 	Leaf *x509.Certificate
 	// Key is the private key stored alongside it.
@@ -91,12 +205,17 @@ type Decoded struct {
 	CACerts []*x509.Certificate
 }
 
-// Decode reads a PKCS#12 bundle back into its parts.
+// decode reads a PKCS#12 bundle back into its parts.
 //
 // It exists so the output tree's owner can answer "is the file on disk still the
 // right bundle for these inputs?" by reading the file rather than by remembering
 // what it wrote. Decoding is codec work, so it belongs here; deciding what the
 // answer means belongs to the caller.
+//
+// It is a step of CheckCurrency rather than an entry point of its own, because it
+// must never run before the preflight: the iteration counts it feeds to PBKDF2
+// come from the FILE, and inspect is what bounds them (see profile.go
+// maxKDFIterations).
 //
 // A decode failure is a legitimate, expected outcome — a rotated password, a
 // truncated file, a foreign file at that path — and is NOT diagnosed further. The
@@ -108,15 +227,15 @@ type Decoded struct {
 // two of its decode diagnostics interpolate an OBJECT IDENTIFIER decoded from the
 // bundle (go-pkcs12 v0.7.3: an unhandled safe-bag type, an unknown attribute),
 // and a bundle-controlled OID is bounded only by the file size.
-func Decode(pfx []byte, password string) (Decoded, error) {
+func decode(pfx []byte, password string) (decoded, error) {
 	key, leaf, caCerts, err := pkcs12.DecodeChain(pfx, password)
 	if err != nil {
-		return Decoded{}, fmt.Errorf("decode pfx: %w", boundedTextError{err})
+		return decoded{}, fmt.Errorf("decode pfx: %w", boundedTextError{err})
 	}
-	return Decoded{Leaf: leaf, Key: key, CACerts: caCerts}, nil
+	return decoded{Leaf: leaf, Key: key, CACerts: caCerts}, nil
 }
 
-// MatchesAnalysis reports whether d is the bundle a would produce: the same
+// matchesAnalysis reports whether d is the bundle a would produce: the same
 // end-entity certificate, the same private key, and the same chain in the same
 // order.
 //
@@ -125,12 +244,12 @@ func Decode(pfx []byte, password string) (Decoded, error) {
 // whose chain is correct but differently ordered is not the bundle this app emits
 // today, and rewriting it makes the output match its own contract.
 //
-// Encoder profile is deliberately outside this method because Decoded contains
-// only decoded material, not the algorithm identifiers. A currency caller must
-// compare Inspect(pfx).Profile with the configured EncoderType before Decode and
-// MatchesAnalysis; internal/process.store.isCurrent performs that sequence so a
-// PFX_ENCODER change triggers a rewrite.
-func (d Decoded) MatchesAnalysis(a *Analysis) bool {
+// Encoder profile is deliberately outside this method because decoded contains
+// only decoded material, not the algorithm identifiers. That comparison is
+// CheckCurrency's third step, which is why the profile check cannot be forgotten
+// by a caller any more: a PFX_ENCODER change reaches the verdict without anyone
+// having to sequence it.
+func (d decoded) matchesAnalysis(a *Analysis) bool {
 	if d.Leaf == nil || a.Leaf == nil || !bytes.Equal(d.Leaf.Raw, a.Leaf.Raw) {
 		return false
 	}

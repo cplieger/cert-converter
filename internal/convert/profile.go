@@ -264,13 +264,15 @@ type pbkdf2Params struct {
 	Iterations int
 }
 
-// Inspection is what the preflight learned about an existing bundle.
-type Inspection struct {
+// inspection is what the preflight learned about an existing bundle. Unexported
+// with the step that produces it: CheckCurrency consumes it and no caller outside
+// this package sees it.
+type inspection struct {
 	// Profile is the encoder profile the bundle was written with.
 	Profile EncoderType
 }
 
-// Inspect identifies the encoder profile of an existing PKCS#12 bundle and
+// inspect identifies the encoder profile of an existing PKCS#12 bundle and
 // verifies the key-derivation iteration counts it can read are within range,
 // WITHOUT running any derivation.
 //
@@ -282,48 +284,50 @@ type Inspection struct {
 // decode, not after. One nested count is unreachable and stays unbounded (see
 // maxKDFIterations).
 //
-// Every failure means the same thing to a caller — this is not a bundle we would
-// have written, so replace it. That makes a parse failure safe by construction.
-func Inspect(pfx []byte) (Inspection, error) {
+// It is the FIRST step of CheckCurrency and is not reachable on its own, because
+// running it after a decode would bound nothing. Every failure means the same thing
+// to a caller — this is not a bundle we would have written, so replace it. That
+// makes a parse failure safe by construction.
+func inspect(pfx []byte) (inspection, error) {
 	var preamble pfxPreamble
 	rest, unmarshalErr := asn1.Unmarshal(pfx, &preamble)
 	if unmarshalErr != nil {
-		return Inspection{}, fmt.Errorf("parse pkcs12 preamble: %w", unmarshalErr)
+		return inspection{}, fmt.Errorf("parse pkcs12 preamble: %w", unmarshalErr)
 	}
 	if len(rest) != 0 {
 		// asn1.Unmarshal returns trailing bytes rather than rejecting them. A bundle
 		// with anything appended is not one this app wrote, and accepting it would
 		// mean inspecting a prefix while the decoder sees the whole file.
-		return Inspection{}, fmt.Errorf("%w: %d trailing byte(s) after the bundle", ErrProfileUnknown, len(rest))
+		return inspection{}, fmt.Errorf("%w: %d trailing byte(s) after the bundle", ErrProfileUnknown, len(rest))
 	}
 	macAlg := preamble.MacData.Mac.Algorithm
 	if len(macAlg.Algorithm.FullBytes) == 0 {
 		// A bundle with no MacData is not one of ours: all four profiles set a MAC.
-		return Inspection{}, fmt.Errorf("%w: no MAC present", ErrProfileUnknown)
+		return inspection{}, fmt.Errorf("%w: no MAC present", ErrProfileUnknown)
 	}
 	macOID, err := macAlg.algorithmOID()
 	if err != nil {
-		return Inspection{}, err
+		return inspection{}, err
 	}
 	if iterErr := checkMACIterations(macOID, macAlg.Parameters, preamble.MacData.Iterations); iterErr != nil {
-		return Inspection{}, iterErr
+		return inspection{}, iterErr
 	}
 
 	algs, err := bundleAlgorithms(&preamble.AuthSafe)
 	if err != nil {
-		return Inspection{}, err
+		return inspection{}, err
 	}
 
 	profileName, err := profileFor(macOID, algs.certEnc, algs.keyEnc)
 	if err != nil {
-		return Inspection{}, err
+		return inspection{}, err
 	}
 	// The encryption iteration counts are bounded during the authenticated-safe
 	// walk (bundleAlgorithms -> boundedSafeAlgorithms), which covers EVERY
 	// encrypted safe's outer algorithm plus the plaintext safe's shrouded key bag,
 	// not just the ones that identify the profile. Re-checking them here would be
 	// dead.
-	return Inspection{Profile: profileName}, nil
+	return inspection{Profile: profileName}, nil
 }
 
 // safeAlgorithms is the part of a bundle's profile identity that lives in the

@@ -19,7 +19,10 @@ import (
 // analysis that produced none, must report "not current" rather than dereference.
 //
 // Lives here rather than in main's test file (deferred finding l-f13) — this is
-// convert.Decoded's contract.
+// the decoded bundle's own contract. It is reached through export_test.go, like
+// parseCertChain: the comparison is a step of convert.CheckCurrency and is not
+// exported, so no production caller can compare a bundle without the preflight
+// having run first.
 func TestDecodedMatchesAnalysis_leaf_guard(t *testing.T) {
 	t.Parallel()
 
@@ -52,7 +55,7 @@ func TestDecodedMatchesAnalysis_leaf_guard(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			if got := tt.decoded.MatchesAnalysis(&analysis); got != tt.want {
+			if got := convert.MatchesAnalysis(tt.decoded, &analysis); got != tt.want {
 				t.Errorf("MatchesAnalysis = %v, want %v", got, tt.want)
 			}
 		})
@@ -72,17 +75,21 @@ func TestDecodedMatchesAnalysis_nil_analysis_leaf(t *testing.T) {
 	}
 	decoded := convert.Decoded{Leaf: analysis.Leaf, Key: analysis.Key, CACerts: analysis.Chain}
 
-	if decoded.MatchesAnalysis(&convert.Analysis{}) {
+	if convert.MatchesAnalysis(decoded, &convert.Analysis{}) {
 		t.Error("MatchesAnalysis(empty analysis) = true, want false")
 	}
 }
 
 // TestDecode_round_trips_an_encoded_bundle_into_a_currency_match pins the pair of
 // operations the scan's "is the file on disk still right?" decision rests on:
-// Encode's bytes must decode back into a Decoded that MatchesAnalysis accepts. If
-// Decode dropped the CA bags, or returned them in the wrong order, every scan
-// would rewrite a correct bundle forever; the two functions are only meaningful
+// Encode's bytes must decode back into a decoded bundle the comparison accepts. If
+// the decode dropped the CA bags, or returned them in the wrong order, every scan
+// would rewrite a correct bundle forever; the two steps are only meaningful
 // together, so they are asserted together.
+//
+// Both are reached through export_test.go now that convert.CheckCurrency is the
+// only exported door; their combined behaviour through that door is asserted in
+// currency_test.go, while this test keeps the step-level coverage.
 //
 // The failure paths are asserted too, because they are the caller's cue to treat
 // the output as stale: a rotated password and a truncated file must both be
@@ -107,7 +114,7 @@ func TestDecode_round_trips_an_encoded_bundle_into_a_currency_match(t *testing.T
 		t.Fatalf("Decode returned %d CA cert(s), want %d: the chain must survive the round trip",
 			len(decoded.CACerts), len(analysis.Chain))
 	}
-	if !decoded.MatchesAnalysis(&analysis) {
+	if !convert.MatchesAnalysis(decoded, &analysis) {
 		t.Error("MatchesAnalysis(the bundle just written from this analysis) = false, want true: a correct bundle would be rewritten on every scan")
 	}
 
@@ -163,7 +170,7 @@ func TestDecodedMatchesAnalysis_rejects_a_bundle_whose_chain_or_key_differs(t *t
 	for name, decoded := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			if decoded.MatchesAnalysis(&analysis) {
+			if convert.MatchesAnalysis(decoded, &analysis) {
 				t.Errorf("MatchesAnalysis(%s) = true, want false: the bundle on disk is not the one these inputs produce", name)
 			}
 		})

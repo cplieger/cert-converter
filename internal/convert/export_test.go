@@ -15,6 +15,26 @@ var (
 	EncoderFor     = encoderFor
 )
 
+// Test-only handles on the read-back steps CheckCurrency sequences. Same rule as
+// the parsers above, for the same reason: publishing inspect, decode or
+// matchesAnalysis would offer a second contract that skips the ordering
+// CheckCurrency exists to enforce (preflight before derivation), and no
+// production consumer needs one. Their individual coverage is worth keeping, so
+// the external tests reach them here.
+var (
+	Inspect = inspect
+	Decode  = decode
+)
+
+// Decoded is the decoded-bundle type the external tests build comparison cases
+// from. An alias rather than a wrapper, so a test can name the exported fields
+// directly.
+type Decoded = decoded
+
+// MatchesAnalysis is the unexported method as a function, because a type alias
+// cannot re-export a method.
+func MatchesAnalysis(d Decoded, a *Analysis) bool { return d.matchesAnalysis(a) }
+
 // ParsePrivateKey is the single-key convenience the parser's own tests read
 // through. Production uses parsePrivateKeys: identity selection needs every key
 // in the file, because with more than one present the certificate decides which

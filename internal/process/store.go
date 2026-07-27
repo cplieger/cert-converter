@@ -245,8 +245,8 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 			// the read error: atomicfile checks the context only on ENTRY, so a read
 			// that raced the cancellation returns a plain ENOENT/ErrNotRegular here,
 			// and wrapping that alone made IsShutdown false and logged a routine
-			// shutdown at ERROR. The Decode gate below already wraps ctx.Err() for
-			// the same reason; joining keeps the read error for diagnosis.
+			// shutdown at ERROR. The decode-failure gate below already wraps ctx.Err()
+			// for the same reason; joining keeps the read error for diagnosis.
 			return false, fmt.Errorf("read prior pfx: %w", errors.Join(ctxErr, err))
 		}
 		// Same reasoning as the stat failure above: unreadable means "cannot tell",
@@ -257,32 +257,35 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 		return false, nil
 	}
 
-	// Preflight BEFORE any derivation: it bounds every iteration count the file
-	// exposes without decrypting a safe, and it names the encoder profile the file
-	// was written with, which decoding cannot reveal.
-	insp, err := convert.Inspect(prior)
-	if err != nil {
-		slog.Debug("prior pfx failed preflight; regenerating", "path", rel, "error", err)
+	// One call, because the codec owns the ORDER: the preflight runs before any
+	// derivation (it bounds every iteration count the file exposes without
+	// decrypting a safe), the profile comparison runs before the decode, and the
+	// content comparison runs last. That sequence used to live here, which meant
+	// the codec published three steps any caller could take out of order; it is
+	// now unbypassable inside convert.CheckCurrency. What stays here is what it
+	// always was: deciding what each outcome MEANS for the output tree.
+	//
+	// The decode is synchronous: the preflight bounded every derivation count it
+	// can read, which covers every bundle this app wrote and any bundle whose
+	// counts are visible, so for those there is nothing to time out and no
+	// goroutine to abandon. One shape escapes it, a shrouded key bag nested inside
+	// an encryptedData safe, and a deadline is not the answer there either: it
+	// would bound how long this caller waits, not the work done. See
+	// internal/convert profile.go maxKDFIterations.
+	res := convert.CheckCurrency(prior, password, want, wantEncoder)
+	switch res.Reason {
+	case convert.CurrencyPreflightFailed:
+		slog.Debug("prior pfx failed preflight; regenerating", "path", rel, "error", res.Err)
 		return false, nil
-	}
-	if insp.Profile != wantEncoder {
+	case convert.CurrencyProfileMismatch:
 		// A deliberate PFX_ENCODER change. Without this the switch would rewrite
 		// nothing: the leaf, key and chain all still match, so the bundle would keep
 		// its old algorithms indefinitely while the startup log announced the new
 		// profile.
 		slog.Info("prior pfx uses a different encoder profile; regenerating",
-			"path", rel, "found", string(insp.Profile), "configured", string(wantEncoder))
+			"path", rel, "found", string(res.Profile), "configured", string(wantEncoder))
 		return false, nil
-	}
-
-	// Synchronous: the preflight bounded every derivation count it can read, which
-	// covers every bundle this app wrote and any bundle whose counts are visible, so
-	// for those there is nothing to time out and no goroutine to abandon. One shape
-	// escapes it, a shrouded key bag nested inside an encryptedData safe, and a
-	// deadline is not the answer there either: it would bound how long this caller
-	// waits, not the work done. See internal/convert profile.go maxKDFIterations.
-	decoded, err := convert.Decode(prior, password)
-	if err != nil {
+	case convert.CurrencyDecodeFailed:
 		if ctx.Err() != nil {
 			// Shutdown is a third category, neither current nor stale. Treating it as
 			// stale would make every in-flight pair rewrite on the way out.
@@ -290,10 +293,12 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 		}
 		// Expected and non-fatal: a rotated password, a truncated file, a foreign
 		// file at that path. All mean the same thing — rewrite it.
-		slog.Debug("prior pfx did not decode; regenerating", "path", rel, "error", err)
+		slog.Debug("prior pfx did not decode; regenerating", "path", rel, "error", res.Err)
 		return false, nil
 	}
-	return decoded.MatchesAnalysis(want), nil
+	// A match, or a plain content mismatch: the ordinary renewed-certificate
+	// outcome, which needs no diagnostic of its own.
+	return res.Current(), nil
 }
 
 // modeNotTightenedMsg is the one message both tightening failures share — a refused

@@ -17,6 +17,10 @@ import (
 // Both fields are needed and this proves it: modern2023 and modern2026 differ only
 // in their MAC, while legacydes and legacyrc2 share a SHA-1 MAC and differ only in
 // their encryption. Either field alone leaves two profiles indistinguishable.
+//
+// The preflight is reached through export_test.go: it is the first step of
+// convert.CheckCurrency and is not exported, because running it after a decode
+// would bound nothing.
 func TestInspect_identifies_every_profile_we_emit(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)

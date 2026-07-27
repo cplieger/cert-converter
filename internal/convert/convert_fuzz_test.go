@@ -314,15 +314,19 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 
 // FuzzInspect_boundedProfile fuzzes the preflight that runs over a PKCS#12 file
 // found in the output tree -- bytes this app did not necessarily write -- before
-// any key derivation happens. Inspect is the gate that keeps a crafted file from
-// spending arbitrary CPU on the scan's only goroutine, so it must survive
+// any key derivation happens. The preflight is the gate that keeps a crafted file
+// from spending arbitrary CPU on the scan's only goroutine, so it must survive
 // arbitrary input and report a bounded verdict.
+//
+// It is reached through export_test.go: convert.CheckCurrency is the only exported
+// door and always runs this step first, so fuzzing the step directly is the way to
+// fuzz the gate itself.
 //
 // The invariants are stronger than "does not panic": a rejected bundle must carry
 // no profile (a caller that read Profile past an error would act on a fabricated
 // one), an accepted bundle's profile must be one of the four this app emits, the
-// verdict must be deterministic for the same bytes, and Inspect must not mutate
-// the slice its caller then hands to Decode.
+// verdict must be deterministic for the same bytes, and the preflight must not
+// mutate the slice CheckCurrency then hands to the decode.
 func FuzzInspect_boundedProfile(f *testing.F) {
 	m := testcerts.GenerateChainMaterial(f)
 	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
@@ -362,7 +366,7 @@ func FuzzInspect_boundedProfile(f *testing.F) {
 		before := bytes.Clone(data)
 		got, inspectErr := convert.Inspect(data)
 		if !bytes.Equal(before, data) {
-			t.Fatal("Inspect mutated its input; the caller passes the same bytes on to Decode")
+			t.Fatal("Inspect mutated its input; CheckCurrency passes the same bytes on to the decode")
 		}
 		if inspectErr != nil {
 			if got.Profile != "" {

@@ -1,0 +1,211 @@
+package convert_test
+
+import (
+	"bytes"
+	"errors"
+	"testing"
+
+	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/testcerts"
+)
+
+// hugeMACIterations rewrites the MAC iteration count of a modern2023 bundle to a
+// two-byte maximum, which is the shape of the attack the preflight exists to stop:
+// the file names the derivation work and the decoder honours it.
+//
+// modern2023 writes a count of 2048, which DER-encodes as 02 02 08 00. The
+// replacement keeps the encoding length identical, so the surrounding structure
+// stays valid and only the count changes. Patching the count also invalidates the
+// MAC, which is what makes the bundle a usable ORDER detector: the preflight
+// refuses it before any derivation, while a decoder handed it first would derive
+// 32767 rounds and then fail the MAC — a different, observable outcome.
+func hugeMACIterations(t *testing.T, pfx []byte) []byte {
+	t.Helper()
+	encoded2048 := []byte{0x02, 0x02, 0x08, 0x00}
+	if n := bytes.Count(pfx, encoded2048); n == 0 {
+		t.Fatalf("no DER-encoded 2048-iteration count found in a modern2023 bundle: the pinned encoder's framing changed, so this test no longer verifies the KDF iteration bound at all")
+	}
+	return bytes.Replace(bytes.Clone(pfx), encoded2048, []byte{0x02, 0x02, 0x7f, 0xff}, 1)
+}
+
+// TestCheckCurrency_runs_the_preflight_and_profile_check_before_the_decode is the
+// load-bearing test for why the three read-back steps were collapsed into one
+// entry point. The ORDER is the safety property: the preflight bounds every
+// key-derivation iteration count the FILE dictates before any of them reaches
+// PBKDF2, and the profile comparison answers a PFX_ENCODER change without
+// decrypting anything.
+//
+// A test that only checked the verdict would not catch a reordering, because every
+// case here is "not current" either way. Each case is therefore built so that the
+// step that MUST run first and the step that must not run yet disagree about the
+// diagnosis, and the reason is asserted:
+//
+//   - an out-of-range iteration count is a preflight refusal; run the decoder
+//     first and it becomes a decode failure, after paying for 32767 rounds;
+//   - a bundle from another profile is a profile mismatch; run the decoder first
+//     (here with a password that cannot open it) and it becomes a decode failure.
+func TestCheckCurrency_runs_the_preflight_and_profile_check_before_the_decode(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	good, err := convert.Encode(&analysis, convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+	if res := convert.CheckCurrency(good, "pw", &analysis, convert.EncNameModern2023); !res.Current() {
+		t.Fatalf("setup: CheckCurrency(the bundle just encoded) = %q, want a match", res.Reason)
+	}
+
+	tests := map[string]struct {
+		pfx         []byte
+		password    string
+		wantEncoder convert.EncoderType
+		wantReason  convert.CurrencyReason
+	}{
+		"an out-of-range iteration count is refused by the preflight, not by the decoder": {
+			pfx: hugeMACIterations(t, good), password: "pw",
+			wantEncoder: convert.EncNameModern2023,
+			wantReason:  convert.CurrencyPreflightFailed,
+		},
+		"a bundle written by another profile is answered before any derivation runs": {
+			pfx: good, password: "a password that cannot open this bundle",
+			wantEncoder: convert.EncNameLegacyDES,
+			wantReason:  convert.CurrencyProfileMismatch,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			res := convert.CheckCurrency(tt.pfx, tt.password, &analysis, tt.wantEncoder)
+			if res.Reason != tt.wantReason {
+				t.Errorf("CheckCurrency reason = %q, want %q: the read-back steps ran out of order",
+					res.Reason, tt.wantReason)
+			}
+			if res.Current() {
+				t.Error("CheckCurrency reported the bundle as current, want a rewrite")
+			}
+		})
+	}
+}
+
+// TestCheckCurrency_preflight_refusal_is_the_bounded_one pins the other half of
+// the ordering claim: the preflight refusal must be the KDF bound speaking, not
+// some later arm that happens to reject the same bytes. Without this, a
+// preflight-shaped reason produced by a decode failure would satisfy the ordering
+// test above.
+func TestCheckCurrency_preflight_refusal_is_the_bounded_one(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	good, err := convert.Encode(&analysis, convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+
+	res := convert.CheckCurrency(hugeMACIterations(t, good), "pw", &analysis, convert.EncNameModern2023)
+	if res.Reason != convert.CurrencyPreflightFailed {
+		t.Fatalf("CheckCurrency reason = %q, want %q", res.Reason, convert.CurrencyPreflightFailed)
+	}
+	if !errors.Is(res.Err, convert.ErrProfileUnknown) {
+		t.Errorf("CheckCurrency error = %v, want it to wrap ErrProfileUnknown: the refusal must come from the preflight's own bound", res.Err)
+	}
+}
+
+// TestCheckCurrency_classifies_every_outcome pins the return shape the caller
+// consumes. internal/process.store.isCurrent logs a different diagnostic per
+// reason — a prior that does not decode at Debug, a profile change at Info, a
+// content mismatch silently — so a bare bool would flatten distinctions the
+// operator reads. Each case asserts the reason, the derived verdict, and whether
+// the reason's own field (Err or Profile) is populated.
+func TestCheckCurrency_classifies_every_outcome(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	good, err := convert.Encode(&analysis, convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+	strangerPEM, strangerKeyPEM := testcerts.GenerateSelfSignedCert(t, "stranger.example.com", "ecdsa")
+	stranger, err := convert.Analyse(strangerPEM, strangerKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse(stranger): %v", err)
+	}
+	strangerPFX, err := convert.Encode(&stranger, convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode(stranger): %v", err)
+	}
+
+	tests := map[string]struct {
+		pfx         []byte
+		password    string
+		wantEncoder convert.EncoderType
+		wantReason  convert.CurrencyReason
+		wantErr     bool
+		wantProfile convert.EncoderType
+	}{
+		"the bundle these inputs produce is current": {
+			pfx: good, password: "pw", wantEncoder: convert.EncNameModern2023,
+			wantReason: convert.CurrencyMatch,
+		},
+		"a file that is not a bundle at all fails the preflight": {
+			pfx: []byte("this is not a pkcs12 bundle"), password: "pw",
+			wantEncoder: convert.EncNameModern2023,
+			wantReason:  convert.CurrencyPreflightFailed, wantErr: true,
+		},
+		"a bundle from another profile reports the profile it was written with": {
+			pfx: good, password: "pw", wantEncoder: convert.EncNameModern2026,
+			wantReason: convert.CurrencyProfileMismatch, wantProfile: convert.EncNameModern2023,
+		},
+		"a rotated password is a decode failure": {
+			pfx: good, password: "rotated", wantEncoder: convert.EncNameModern2023,
+			wantReason: convert.CurrencyDecodeFailed, wantErr: true,
+		},
+		"a bundle for different inputs is a content mismatch": {
+			pfx: strangerPFX, password: "pw", wantEncoder: convert.EncNameModern2023,
+			wantReason: convert.CurrencyContentMismatch,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			before := bytes.Clone(tt.pfx)
+			res := convert.CheckCurrency(tt.pfx, tt.password, &analysis, tt.wantEncoder)
+			if res.Reason != tt.wantReason {
+				t.Errorf("CheckCurrency reason = %q, want %q", res.Reason, tt.wantReason)
+			}
+			if want := tt.wantReason == convert.CurrencyMatch; res.Current() != want {
+				t.Errorf("Current() = %v, want %v for reason %q", res.Current(), want, res.Reason)
+			}
+			if (res.Err != nil) != tt.wantErr {
+				t.Errorf("CheckCurrency error = %v, want an error: %v", res.Err, tt.wantErr)
+			}
+			if res.Profile != tt.wantProfile {
+				t.Errorf("CheckCurrency profile = %q, want %q", res.Profile, tt.wantProfile)
+			}
+			if !bytes.Equal(before, tt.pfx) {
+				t.Error("CheckCurrency mutated its input")
+			}
+		})
+	}
+}
+
+// TestCurrency_zero_value_is_not_current pins the choice of a string reason whose
+// zero value is not a match: a Currency nobody filled in must read as "rewrite
+// it", never as "the file on disk is fine".
+func TestCurrency_zero_value_is_not_current(t *testing.T) {
+	t.Parallel()
+	if (convert.Currency{}).Current() {
+		t.Error("Currency{}.Current() = true, want false: an unfilled verdict must never report a bundle as current")
+	}
+}
