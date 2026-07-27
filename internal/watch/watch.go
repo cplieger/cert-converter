@@ -4,7 +4,8 @@
 // internal/process, which goes through an *os.Root. The invariant that keeps
 // that safe: this package reads no file CONTENT, so a future read of a watched
 // file MUST go through internal/process's confined root
-// (convert.ReadBoundedFromRoot) and never through a path built here. See
+// (source.readBounded, i.e. atomicfile.ReadBoundedInRoot) and never through a
+// path built here. See
 // addWatchDirs for why no confined equivalent exists and what the residual
 // exposure is.
 package watch
@@ -12,6 +13,7 @@ package watch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -60,15 +62,26 @@ func WithFallback(d time.Duration) Option {
 	return func(w *Watcher) { w.fallback = d }
 }
 
+// FallbackLabel renders a periodic-rescan interval for an operator-facing log
+// record. A non-positive interval is reported as "disabled" rather than as a
+// bare "0s": that value is the operator's confirmation that
+// FALLBACK_SCAN_HOURS=0/false took effect, and that the health probe's staleness
+// deadline is off with it. It is exported so the composition root's startup line
+// and this package's degraded-path WARNs render the shared fallback_scan
+// attribute identically.
+func FallbackLabel(d time.Duration) string {
+	if d <= 0 {
+		return "disabled"
+	}
+	return d.String()
+}
+
 // fallbackStatus renders the periodic safety-net rescan's cadence for a
 // degraded-path WARN. "disabled" is the operationally important case: nothing
 // re-scans the path the WARN just reported for the life of the process, so the
 // hedge "(if enabled)" must not be left for the operator to resolve.
 func (w *Watcher) fallbackStatus() string {
-	if w.fallback <= 0 {
-		return "disabled"
-	}
-	return w.fallback.String()
+	return FallbackLabel(w.fallback)
 }
 
 // New creates a Watcher for the given root directory. Timing policy is chosen by
@@ -182,8 +195,8 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 // ancestor can extend registrations into the replacement target and consume
 // watch descriptors, but it still cannot make the app read or convert content
 // outside the root. Any future read of a watched file must go through
-// internal/process's confined root
-// (convert.ReadBoundedFromRoot); never build an ambient path here and read it.
+// internal/process's confined root (source.readBounded, i.e.
+// atomicfile.ReadBoundedInRoot); never build an ambient path here and read it.
 //
 // The traversal is cancellable: it checks ctx before each entry and returns
 // ctx.Err() as soon as the process is shutting down, so a shutdown arriving
@@ -211,10 +224,22 @@ func (w *Watcher) visitWatchPath(
 		if path == root {
 			return walkErr
 		}
-		slog.Warn("skipping unwatchable path", "path", path, "error", walkErr)
+		slog.Warn("skipping unwatchable path; renewals under it require a full rescan",
+			"path", path, "fallback_scan", w.fallbackStatus(), "error", walkErr)
 		return nil
 	}
 	if !d.IsDir() {
+		if path == root {
+			// A non-directory ROOT is fatal, not a skip: filepath.WalkDir Lstats
+			// its root and does not follow it, so a bind-mounted file or a
+			// symlinked /input walks exactly one non-directory entry, registers no
+			// watches, and would otherwise return nil - leaving Run to log
+			// "fsnotify active" with an empty watch set and park in a loop no event
+			// can reach, while the scan (os.OpenRoot DOES follow a symlinked root)
+			// keeps the health marker green. Reporting it lets Run degrade to
+			// polling, or return ErrWatchLost when the fallback is disabled too.
+			return fmt.Errorf("watch root %q is not a directory", path)
+		}
 		return nil
 	}
 	if addErr := watcher.Add(path); addErr != nil {
@@ -231,7 +256,7 @@ func (w *Watcher) handleWatchAddError(root, path string, addErr error) error {
 	if path == root {
 		return addErr
 	}
-	slog.Warn("skipping unwatchable directory; renewals under it require a full rescan (periodic fallback if enabled)",
+	slog.Warn("skipping unwatchable directory; renewals under it require a full rescan",
 		"path", path, "fallback_scan", w.fallbackStatus(), "error", addErr)
 	return nil
 }
@@ -306,7 +331,8 @@ func (w *Watcher) handleCreate(ctx context.Context, watcher *fsnotify.Watcher, e
 	}
 	if info.IsDir() {
 		if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
-			slog.Warn("failed to watch new directory subtree", "path", event.Name, "error", addErr)
+			slog.Warn("failed to watch new directory subtree; renewals under it are covered only by the periodic rescan",
+				"path", event.Name, "fallback_scan", w.fallbackStatus(), "error", addErr)
 		}
 		return true
 	}
@@ -351,7 +377,8 @@ func (w *Watcher) handleChmod(ctx context.Context, watcher *fsnotify.Watcher, ev
 	}
 	if info.IsDir() {
 		if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
-			slog.Warn("failed to watch a directory whose permissions changed", "path", event.Name, "error", addErr)
+			slog.Warn("failed to watch a directory whose permissions changed; renewals under it are covered only by the periodic rescan",
+				"path", event.Name, "fallback_scan", w.fallbackStatus(), "error", addErr)
 		}
 		return true
 	}
@@ -385,16 +412,7 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) erro
 			return nil
 
 		case event, ok := <-watcher.Events:
-			// Losing the watch on the ROOT itself is not an ordinary path
-			// removal: the root's parent is not watched, so no Create event
-			// can ever announce a replacement, and fsnotify leaves both
-			// channels open (so the closure checks below never fire). With the
-			// periodic rescan disabled nothing can reattach it, so change
-			// detection is dead and only a restart recovers it. With the
-			// fallback enabled the next tick rebuilds the watch set, so the
-			// ordinary rescan path stays correct.
-			if ok && w.fallback <= 0 && filepath.Clean(event.Name) == filepath.Clean(w.root) &&
-				(event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename)) {
+			if ok && !w.handleRootWatchLoss(ctx, watcher, event) {
 				return lostOrShutdown(ctx, "fsnotify root watch removed while the periodic rescan is disabled; change detection is inactive, process will exit and restart")
 			}
 			if !w.handleEventRecv(ctx, watcher, st, event, ok) {
@@ -413,6 +431,40 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) erro
 			}
 		}
 	}
+}
+
+// handleRootWatchLoss reacts to an event that took the watch on the ROOT itself
+// away, and reports whether change detection is still live.
+//
+// Losing the root watch is not an ordinary path removal: the root's parent is not
+// watched, so no Create event can ever announce a replacement, and fsnotify leaves
+// both channels open (so watchLoop's closure checks never fire). With the periodic
+// rescan disabled nothing can reattach it, so change detection is dead and only a
+// restart recovers it — that is the false return. With the fallback enabled it is
+// recoverable, but the whole watch set went with the root, so re-attach here instead
+// of leaving real-time detection off until the next tick — and say so, because
+// nothing else does above Debug. Any other event reports true untouched.
+func (w *Watcher) handleRootWatchLoss(ctx context.Context, watcher *fsnotify.Watcher, event fsnotify.Event) bool {
+	if filepath.Clean(event.Name) != filepath.Clean(w.root) {
+		return true
+	}
+	if !event.Has(fsnotify.Remove) && !event.Has(fsnotify.Rename) {
+		return true
+	}
+	if w.fallback <= 0 {
+		return false
+	}
+	// watcher.Add is idempotent, exactly as on the event-queue-overflow re-sync
+	// path, so this only restores what the root's removal took away; a root that is
+	// genuinely gone surfaces as the WARN below plus the scan error the debounced
+	// rescan reports.
+	slog.Warn("fsnotify root watch lost; re-attaching the watch set, renewals until it succeeds are covered only by the periodic rescan",
+		"root", w.root, "op", event.Op.String(), "fallback_scan", w.fallbackStatus())
+	if addErr := w.addWatchDirs(ctx, watcher, w.root); addErr != nil && ctx.Err() == nil {
+		slog.Warn("failed to re-attach the watch set after the root watch was lost; renewals are covered only by the periodic rescan",
+			"root", w.root, "fallback_scan", w.fallbackStatus(), "error", addErr)
+	}
+	return true
 }
 
 // lostOrShutdown maps a watcher-death exit to nil when the process is already
@@ -464,7 +516,8 @@ func (w *Watcher) handleErrorRecv(ctx context.Context, watcher *fsnotify.Watcher
 		// already in the watch set, so re-walking the tree only
 		// re-attaches what the overflow lost.
 		if addErr := w.addWatchDirs(ctx, watcher, w.root); addErr != nil && ctx.Err() == nil {
-			slog.Warn("failed to re-sync the watch set after an event-queue overflow", "error", addErr)
+			slog.Warn("failed to re-sync the watch set after an event-queue overflow; a directory whose Create was dropped stays unwatched until the next re-sync",
+				"root", w.root, "fallback_scan", w.fallbackStatus(), "error", addErr)
 		}
 	}
 	return true
@@ -483,7 +536,8 @@ func (w *Watcher) handleErrorRecv(ctx context.Context, watcher *fsnotify.Watcher
 // about to return anyway.
 func (w *Watcher) handleFallbackTick(ctx context.Context, watcher *fsnotify.Watcher, st *watchState) {
 	if addErr := w.addWatchDirs(ctx, watcher, w.root); addErr != nil && ctx.Err() == nil {
-		slog.Warn("failed to re-sync the watch set during the periodic fallback scan", "error", addErr)
+		slog.Warn("failed to re-sync the watch set during the periodic fallback scan; the scan below still runs, so a renewal is not missed",
+			"root", w.root, "fallback_scan", w.fallbackStatus(), "error", addErr)
 	}
 	// Same stop-request rule as runDebouncedScan, on the success path too: the
 	// select has no ctx precedence, so a fallback deadline reached in the same
@@ -583,7 +637,7 @@ func (st *watchState) handleWatcherError(err error) bool {
 		st.scheduleScan()
 		return true
 	}
-	slog.Warn("watcher error; the watch loop continues and a change missed because of it is recovered by the periodic fallback rescan (if enabled)",
+	slog.Warn("watcher error; the watch loop continues and a change missed because of it is recovered by the periodic fallback rescan",
 		"root", st.w.root, "fallback_scan", st.w.fallbackStatus(), "error", err)
 	return false
 }

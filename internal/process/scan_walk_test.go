@@ -1,14 +1,12 @@
 package process
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -212,24 +210,22 @@ func TestNoteUnwalkableSymlink_reports_resolution_outcomes(t *testing.T) {
 	t.Cleanup(func() { _ = root.Close() })
 	sw := &scanWalk{src: &source{root: root}}
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-
-	for _, tt := range []struct{ name, wantMessage, wantLevel string }{
-		{"escape", "skipping symlink that could not be resolved through the input root", "level=WARN"},
-		{"inside", "skipping symlinked directory; its target is walked directly", "level=DEBUG"},
+	for _, tt := range []struct {
+		name, wantMessage string
+		wantLevel         slog.Level
+	}{
+		{"escape", "skipping symlink that could not be resolved through the input root", slog.LevelWarn},
+		{"inside", "skipping symlinked directory; its target is walked directly", slog.LevelDebug},
 	} {
-		buf.Reset()
+		// A fresh recorder per case, replacing the buffer reset the text handler needed.
+		logs := captureLogs(t)
 		fi, err := os.Lstat(filepath.Join(input, tt.name))
 		if err != nil {
 			t.Fatal(err)
 		}
 		sw.noteUnwalkableSymlink(tt.name, fs.FileInfoToDirEntry(fi))
-		out := buf.String()
-		if !strings.Contains(out, tt.wantMessage) || !strings.Contains(out, tt.wantLevel) {
-			t.Errorf("noteUnwalkableSymlink(%q) logged %q, want message %q at %s", tt.name, out, tt.wantMessage, tt.wantLevel)
+		if got := logs.CountLevel(tt.wantLevel, tt.wantMessage); got != 1 {
+			t.Errorf("noteUnwalkableSymlink(%q) logged %q, want message %q at %s", tt.name, logs.Messages(), tt.wantMessage, tt.wantLevel)
 		}
 	}
 }
@@ -275,11 +271,6 @@ func TestNoteUnwalkableSymlink_stays_silent_where_nothing_is_hidden(t *testing.T
 	t.Cleanup(func() { _ = inHandle.Close() })
 	sw := &scanWalk{src: &source{root: inHandle}}
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-
 	entry := func(name string) fs.DirEntry {
 		fi, lerr := os.Lstat(filepath.Join(input, name))
 		if lerr != nil {
@@ -289,16 +280,17 @@ func TestNoteUnwalkableSymlink_stays_silent_where_nothing_is_hidden(t *testing.T
 	}
 
 	for _, name := range []string{"dangling", "tls.crt", "tls.key"} {
-		buf.Reset()
+		// A fresh recorder per case, replacing the buffer reset the text handler needed.
+		logs := captureLogs(t)
 		sw.noteUnwalkableSymlink(name, entry(name))
-		if out := buf.String(); out != "" {
-			t.Errorf("noteUnwalkableSymlink(%q) logged %q, want no output", name, out)
+		if logs.Len() != 0 {
+			t.Errorf("noteUnwalkableSymlink(%q) logged %q, want no output", name, logs.Messages())
 		}
 	}
 
-	buf.Reset()
+	logs := captureLogs(t)
 	sw.noteUnwalkableSymlink("linked-dir", entry("linked-dir"))
-	if out := buf.String(); !strings.Contains(out, "skipping symlink that could not be resolved through the input root") {
-		t.Errorf("noteUnwalkableSymlink(%q) logged %q, want the unresolved-symlink warning", "linked-dir", out)
+	if !logs.Contains("skipping symlink that could not be resolved through the input root") {
+		t.Errorf("noteUnwalkableSymlink(%q) logged %q, want the unresolved-symlink warning", "linked-dir", logs.Messages())
 	}
 }

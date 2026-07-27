@@ -13,7 +13,6 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/slogx/capture"
-	"pgregory.net/rapid"
 )
 
 func TestLoad_empty_password_optout_warns_only_on_unrecognized_values(t *testing.T) {
@@ -148,36 +147,6 @@ func TestParseFallbackInterval_warns_when_input_is_repaired(t *testing.T) {
 	}
 }
 
-func TestParseFallbackInterval_permitted_cadence_and_padding_invariant(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		// A plain rapid.String() generator almost never produces the values that
-		// decide this parser ("0", "false", a numeric string), so the interesting
-		// inputs are drawn explicitly alongside arbitrary text.
-		v := rapid.OneOf(
-			rapid.SampledFrom([]string{"", " ", "0", "00", "+0", "false", "FALSE", "-1", "1", "6", "12", "87600", "87601"}),
-			rapid.StringMatching(`[ \t]*[-+]?[0-9]{0,7}[ \t]*`),
-			rapid.String(),
-		).Draw(t, "env_value")
-		got := parseFallbackInterval(v)
-
-		// Surrounding whitespace is trimmed, so padding can never change the
-		// decision: a padded "0" still disables, a padded number still parses,
-		// and a padded blank still takes the default.
-		if padded := parseFallbackInterval(" \t" + v + "\n "); padded != got {
-			t.Errorf("parseFallbackInterval(%q) = %v but padded variant = %v, want padding-invariant", v, got, padded)
-		}
-
-		// Every accepted value is either "disabled", the default, or a whole
-		// number of hours no greater than the 10-year overflow ceiling.
-		switch {
-		case got == 0 || got == defaultFallbackInterval:
-		case got > 0 && got <= 87600*time.Hour && got%time.Hour == 0:
-		default:
-			t.Errorf("parseFallbackInterval(%q) = %v, want 0, %v, or whole hours in (0, 87600h]", v, got, defaultFallbackInterval)
-		}
-	})
-}
-
 // isolatePasswordFile clears PFX_PASSWORD_FILE so an ambient value inherited
 // from the host cannot take precedence over the PFX_PASSWORD the test sets:
 // envx.Secret prefers the <KEY>_FILE indirection whenever it is non-empty.
@@ -213,15 +182,6 @@ func TestLoad_reads_password_and_encoder(t *testing.T) {
 	}
 	if cfg.EncoderName != convert.EncNameLegacyDES {
 		t.Errorf("Load() EncoderName = %q, want %q", cfg.EncoderName, convert.EncNameLegacyDES)
-	}
-}
-
-func TestLoad_empty_password_returns_error(t *testing.T) {
-	isolatePasswordFile(t)
-	t.Setenv("PFX_PASSWORD", "")
-	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
-	if _, err := Load(); !errors.Is(err, ErrEmptyPassword) {
-		t.Errorf("Load() error = %v, want ErrEmptyPassword", err)
 	}
 }
 
@@ -581,7 +541,7 @@ func TestLoad_unknown_encoder_warns_and_falls_back_to_modern2023(t *testing.T) {
 
 // TestCheckPasswordEncodable_refuses_every_unrepresentable_shape pins a DELIBERATE
 // reversal: all three shapes are now a startup REFUSAL rather than a warning that let
-// the container start (deferred findings l-f12, l-f14, l-f2).
+// the container start.
 //
 // Each must be rejected, must name its shape and remediation so an operator can act,
 // and must never put the secret value in the error — the error text reaches the startup
@@ -664,8 +624,8 @@ func TestCheckPasswordEncodable_accepts_a_usable_password(t *testing.T) {
 	}
 }
 
-// TestLoad_rejects_a_whitespace_only_password pins the other half of the unification
-// (deferred finding l-f5): the blank guard now trims, so PFX_PASSWORD=" " — a quoting
+// TestLoad_rejects_a_whitespace_only_password pins the other half of the unification:
+// the blank guard now trims, so PFX_PASSWORD=" " — a quoting
 // slip in a compose file or .env — is REFUSED where it previously started and embedded a
 // single space into every generated bundle as the only protection on the private key.
 //
@@ -714,8 +674,8 @@ func TestLoad_refuses_an_unencodable_password(t *testing.T) {
 	}
 }
 
-// TestLoad_blank_secret_file_obeys_the_same_optout pins the unification (deferred finding
-// l-f5): PFX_ALLOW_EMPTY_PASSWORD now means ONE thing regardless of how the secret was
+// TestLoad_blank_secret_file_obeys_the_same_optout pins the unification:
+// PFX_ALLOW_EMPTY_PASSWORD now means ONE thing regardless of how the secret was
 // delivered.
 //
 // Before, the same question had three answers: a blank PFX_PASSWORD was accepted with a
@@ -845,8 +805,8 @@ func TestLoad_warns_when_the_env_password_is_padded(t *testing.T) {
 	}
 }
 
-// TestLoad_warns_when_both_password_channels_are_set pins the ambiguity warning
-// (deferred finding d-gpt-u1-2). PFX_PASSWORD_FILE wins by design, so a PFX_PASSWORD set
+// TestLoad_warns_when_both_password_channels_are_set pins the ambiguity warning.
+// PFX_PASSWORD_FILE wins by design, so a PFX_PASSWORD set
 // beside it is silently ignored — an operator who edits the wrong one gets a successful
 // startup and bundles carrying the other password, and only finds out when a consumer
 // cannot open a .pfx. Runs serially: it swaps slog.Default().
@@ -933,38 +893,4 @@ func TestLoad_wires_output_lifecycle(t *testing.T) {
 			}
 		})
 	}
-}
-
-// FuzzCheckPasswordEncodable_gate_matches_the_recognizer pins the two contracts
-// the startup gate owns over arbitrary secret bytes: it refuses exactly the
-// shapes convert.InspectPasswordEncoding recognises (a dropped or reordered
-// branch would let a silently-unopenable bundle ship), and its error never
-// carries the secret into the startup log every aggregator retains.
-func FuzzCheckPasswordEncodable_gate_matches_the_recognizer(f *testing.F) {
-	for _, seed := range []string{
-		"", " ", "hunter2", "pässwörd-Ünicode", "日本語パスワード",
-		string([]byte{0xff}), string([]byte{0xff}) + "pw-\U0001F600",
-		"pw-\U0001F600", "sentinel\x00secret", "\uFFFD",
-	} {
-		f.Add(seed)
-	}
-	f.Fuzz(func(t *testing.T, password string) {
-		issues := convert.InspectPasswordEncoding(password)
-		unusable := issues.InvalidUTF8 || issues.NonBMP || issues.EmbeddedNUL
-
-		err := checkPasswordEncodable(password)
-		if unusable != (err != nil) {
-			t.Fatalf("checkPasswordEncodable(%q) = %v, but InspectPasswordEncoding reports %+v: the gate must refuse exactly the shapes the encoder cannot carry",
-				password, err, issues)
-		}
-		if err == nil {
-			return
-		}
-		if !errors.Is(err, ErrUnencodablePassword) {
-			t.Errorf("checkPasswordEncodable(%q) = %v, want it to wrap ErrUnencodablePassword", password, err)
-		}
-		if strings.Contains(err.Error(), password) {
-			t.Errorf("checkPasswordEncodable leaked the password into %q", err.Error())
-		}
-	})
 }

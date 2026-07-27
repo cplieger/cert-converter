@@ -1,12 +1,10 @@
 package process
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"os"
-	"strings"
 	"testing"
 
 	"github.com/cplieger/atomicfile/v2"
@@ -34,38 +32,39 @@ func TestStoreLogSweepOutcome_operator_signals(t *testing.T) {
 	t.Cleanup(func() { _ = root.Close() })
 
 	tests := []struct {
-		walkErr   error
-		name      string
-		wantMsg   string
-		wantAttr  string
-		res       atomicfile.SweepResult
-		wantLevel slog.Level
+		walkErr       error
+		name          string
+		wantMsg       string
+		wantAttrKey   string
+		wantAttrValue string
+		res           atomicfile.SweepResult
+		wantLevel     slog.Level
 	}{
 		{
-			nil, "a reclaimed orphan is reported at info", "reaped stale temp files", "count=2",
+			nil, "a reclaimed orphan is reported at info", "reaped stale temp files", "count", "2",
 			atomicfile.SweepResult{Removed: 2},
 			slog.LevelInfo,
 		},
 		{
 			nil, "uninspectable candidates warn with a remediation hint",
-			"some stale output temps could not be inspected or removed", "remediation=",
+			"some stale output temps could not be inspected or removed", "remediation", "",
 			atomicfile.SweepResult{Failed: 3},
 			slog.LevelWarn,
 		},
 		{
 			nil, "unreadable output sub-paths warn with a remediation hint",
-			"some output paths could not be inspected during stale temp cleanup", "remediation=",
+			"some output paths could not be inspected during stale temp cleanup", "remediation", "",
 			atomicfile.SweepResult{Unreadable: 4},
 			slog.LevelWarn,
 		},
 		{
-			errors.New("permission denied"), "a failed sweep warns", "stale temp cleanup failed", "error=",
+			errors.New("permission denied"), "a failed sweep warns", "stale temp cleanup failed", "error", "",
 			atomicfile.SweepResult{},
 			slog.LevelWarn,
 		},
 		{
 			context.Canceled, "a shutdown abort stays at debug",
-			"stale temp cleanup cancelled during shutdown", "error=",
+			"stale temp cleanup cancelled during shutdown", "error", "",
 			atomicfile.SweepResult{},
 			slog.LevelDebug,
 		},
@@ -73,23 +72,26 @@ func TestStoreLogSweepOutcome_operator_signals(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			prev := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-			t.Cleanup(func() { slog.SetDefault(prev) })
+			logs := captureLogs(t)
 
 			s := &store{root: root}
 			s.logSweepOutcome(tt.res, tt.walkErr)
 
-			out := buf.String()
-			if !strings.Contains(out, tt.wantMsg) {
-				t.Errorf("logSweepOutcome(%v) logged %q, want message %q", tt.walkErr, out, tt.wantMsg)
+			if !logs.Contains(tt.wantMsg) {
+				t.Errorf("logSweepOutcome(%v) logged %q, want message %q", tt.walkErr, logs.Messages(), tt.wantMsg)
 			}
-			if !strings.Contains(out, "level="+tt.wantLevel.String()) {
-				t.Errorf("logSweepOutcome(%v) logged %q, want level %s", tt.walkErr, out, tt.wantLevel)
+			if got := logs.CountLevel(tt.wantLevel, tt.wantMsg); got != 1 {
+				t.Errorf("logSweepOutcome(%v) logged %q at %s %d times, want 1", tt.walkErr, tt.wantMsg, tt.wantLevel, got)
 			}
-			if !strings.Contains(out, tt.wantAttr) {
-				t.Errorf("logSweepOutcome(%v) logged %q, want attribute %q", tt.walkErr, out, tt.wantAttr)
+			// The attribute is asserted by KEY on the record carrying the message, so a
+			// value that happens to appear elsewhere in the line cannot satisfy it. An
+			// empty wantAttrValue asserts presence only.
+			got, ok := logs.AttrValue(tt.wantMsg, tt.wantAttrKey)
+			if !ok {
+				t.Errorf("logSweepOutcome(%v) logged %q, want attribute %q", tt.walkErr, logs.Messages(), tt.wantAttrKey)
+			}
+			if tt.wantAttrValue != "" && got != tt.wantAttrValue {
+				t.Errorf("logSweepOutcome(%v) logged %s=%q, want %q", tt.walkErr, tt.wantAttrKey, got, tt.wantAttrValue)
 			}
 		})
 	}
@@ -110,15 +112,12 @@ func TestStoreLogSweepOutcome_is_silent_for_a_clean_sweep(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = root.Close() })
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	logs := captureLogs(t)
 
 	s := &store{root: root}
 	s.logSweepOutcome(atomicfile.SweepResult{}, nil)
 
-	if out := buf.String(); out != "" {
-		t.Errorf("logSweepOutcome(clean sweep) logged %q, want no output at all", out)
+	if logs.Len() != 0 {
+		t.Errorf("logSweepOutcome(clean sweep) logged %q, want no output at all", logs.Messages())
 	}
 }

@@ -88,7 +88,12 @@ func TestCertImpliesRelevant(t *testing.T) {
 	t.Parallel()
 
 	rapid.Check(t, func(t *rapid.T) {
-		name := rapid.String().Draw(t, "name")
+		// The generator must be able to REACH a certificate name: a plain
+		// rapid.String() ends in ".crt" with vanishing probability, which leaves the
+		// implication vacuously true and lets an IsRelevant that no longer consults
+		// IsCert pass every run.
+		name := rapid.String().Draw(t, "stem") +
+			rapid.SampledFrom([]string{layout.CertExt, layout.KeyExt, layout.PFXExt, "", ".bak"}).Draw(t, "suffix")
 		if layout.IsCert(name) && !layout.IsRelevant(name) {
 			t.Fatalf("IsCert(%q) is true but IsRelevant is false", name)
 		}

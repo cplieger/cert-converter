@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -144,6 +145,45 @@ func TestStoreReconcile(t *testing.T) {
 	}
 }
 
+// TestSampleOrphanPaths_bounds_the_logged_sample pins the bound on the orphan report's
+// paths attribute. reconcile emits that line on every scan for as long as an orphan
+// exists, so an unbounded sample is a permanent multi-kilobyte log record per scan,
+// while a sample that elides without saying how many it dropped hides the scale.
+func TestSampleOrphanPaths_bounds_the_logged_sample(t *testing.T) {
+	t.Parallel()
+	all := make([]string, 0, maxLoggedOrphans+5)
+	for range maxLoggedOrphans + 5 {
+		all = append(all, "x.pfx")
+	}
+	for _, tc := range []struct {
+		name      string
+		n         int
+		wantNamed int
+		wantMore  string
+	}{
+		{"under the cap names every path", maxLoggedOrphans - 1, maxLoggedOrphans - 1, ""},
+		{"exactly the cap names every path", maxLoggedOrphans, maxLoggedOrphans, ""},
+		{"over the cap elides the rest and says how many", maxLoggedOrphans + 5, maxLoggedOrphans, " (+5 more)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := sampleOrphanPaths(all[:tc.n])
+			if named := strings.Count(got, ".pfx"); named != tc.wantNamed {
+				t.Errorf("sampleOrphanPaths(%d paths) named %d paths, want %d: %q", tc.n, named, tc.wantNamed, got)
+			}
+			if tc.wantMore == "" {
+				if strings.Contains(got, "more)") {
+					t.Errorf("sampleOrphanPaths(%d paths) = %q, want no elision notice", tc.n, got)
+				}
+				return
+			}
+			if !strings.HasSuffix(got, tc.wantMore) {
+				t.Errorf("sampleOrphanPaths(%d paths) = %q, want it to end with %q", tc.n, got, tc.wantMore)
+			}
+		})
+	}
+}
+
 // TestStoreRemoveOrphans_cancelled_context_stops_before_deletion pins
 // removeOrphans' own shutdown guard: a scan cancelled by SIGTERM must delete no
 // key material and must report the cancellation, so the caller can classify the
@@ -173,6 +213,45 @@ func TestStoreRemoveOrphans_cancelled_context_stops_before_deletion(t *testing.T
 	}
 	if _, err := os.Stat(orphan); err != nil {
 		t.Errorf("orphan was removed after shutdown cancellation: %v", err)
+	}
+}
+
+// TestStoreReconcile_propagates_a_shutdown_from_the_orphan_walk pins the one
+// reconcile outcome that must reach the caller as an ERROR rather than as "nothing to
+// reap": a cancellation that arrives after the input walk finished cleanly, which is
+// the case Run cannot notice for itself. Degrading it to (0, nil) would make Run log
+// "scan complete" at Info and leave the health marker set for a scan that stopped
+// partway through the output tree -- under OUTPUT_LIFECYCLE=sync, after deleting some
+// bundles and not others.
+func TestStoreReconcile_propagates_a_shutdown_from_the_orphan_walk(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, "orphan.pfx")
+	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	s := &store{root: root}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	// sync over a tree with one orphan: the mode that would delete, so nothing about
+	// the arrangement excuses the refusal except the cancellation itself.
+	deleted, err := s.reconcile(ctx, LifecycleSync, map[string]struct{}{},
+		reapContext{scanTotal: 1, walkCompleted: true})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("reconcile(cancelled ctx) error = %v, want context.Canceled so Run does not report a complete scan", err)
+	}
+	if deleted != 0 {
+		t.Errorf("reconcile(cancelled ctx) deleted = %d, want 0", deleted)
+	}
+	if _, statErr := os.Stat(orphan); statErr != nil {
+		t.Errorf("orphan.pfx was deleted during a cancelled scan: %v", statErr)
 	}
 }
 
@@ -277,6 +356,50 @@ func TestStoreReconcile_sync_spares_a_nested_live_bundle(t *testing.T) {
 	}
 }
 
+// TestStoreRemoveOrphans_skips_an_undeletable_orphan_and_continues pins the
+// "skipping (never aborting on) an individual removal failure" half of removeOrphans'
+// contract. Aborting instead would let one stuck path permanently stop the reap of
+// every later bundle under OUTPUT_LIFECYCLE=sync, and the two behaviours are
+// indistinguishable from the logs: both WARN about the offending path, the scan still
+// completes and health stays green.
+func TestStoreRemoveOrphans_skips_an_undeletable_orphan_and_continues(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	// A NON-EMPTY directory wearing an output name: Remove refuses it with ENOTEMPTY
+	// whatever uid the test runs as, so the case does not silently pass as root.
+	stuck := filepath.Join(dir, "stuck.pfx")
+	if err := os.Mkdir(stuck, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stuck, "occupant"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reapable := filepath.Join(dir, "reapable.pfx")
+	if err := os.WriteFile(reapable, []byte("pfx"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	s := &store{root: root}
+
+	deleted, err := s.removeOrphans(t.Context(), []string{"stuck.pfx", "reapable.pfx"})
+	if err != nil {
+		t.Fatalf("removeOrphans = %v, want nil: one refused removal is not a scan error", err)
+	}
+	if deleted != 1 {
+		t.Errorf("removeOrphans deleted = %d, want 1: the orphan after the refused one must still go", deleted)
+	}
+	if _, statErr := os.Stat(reapable); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("os.Stat(reapable.pfx) = %v, want fs.ErrNotExist: a later orphan must not be blocked by an earlier failure", statErr)
+	}
+	if _, statErr := os.Stat(stuck); statErr != nil {
+		t.Errorf("the undeletable path vanished (%v); only what Remove accepted may disappear", statErr)
+	}
+}
+
 // TestStoreIsCurrent_rewrites_after_a_password_rotation pins the second reason
 // output-derived currency replaced the fingerprint cache: the cache answered "have
 // these input bytes been converted?", so rotating PFX_PASSWORD changed nothing
@@ -327,8 +450,8 @@ func TestStoreIsCurrent_rewrites_after_a_password_rotation(t *testing.T) {
 // output name is not this bundle, so it must be REWRITTEN rather than reported as
 // a failed pair. Returning an error instead would pin the container unhealthy over
 // a condition the app repairs itself on the same scan.
+// Runs serially: it swaps slog.Default().
 func TestStoreIsCurrent_treats_an_undecodable_prior_as_stale(t *testing.T) {
-	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
 	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
@@ -356,15 +479,29 @@ func TestStoreIsCurrent_treats_an_undecodable_prior_as_stale(t *testing.T) {
 		{"a truncated bundle", "truncated.pfx", full[:len(full)/2]},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := os.WriteFile(filepath.Join(dir, tc.rel), tc.content, 0o600); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, tc.rel), tc.content, pfxFileMode); err != nil {
 				t.Fatalf("setup: WriteFile: %v", err)
 			}
+			// Chmod explicitly: a filesystem can widen the O_CREATE mode (an inherited
+			// ACL does), and isCurrent regenerates on an unexpected mode BEFORE it reads
+			// the file, so without this every case would be answered by the mode arm and
+			// never reach the preflight this test is named for.
+			if err := os.Chmod(filepath.Join(dir, tc.rel), pfxFileMode); err != nil {
+				t.Fatalf("setup: Chmod: %v", err)
+			}
+			logs := captureLogs(t)
 			current, err := s.isCurrent(t.Context(), tc.rel, &analysis, convert.EncNameModern2023, "pw")
 			if err != nil {
 				t.Errorf("isCurrent(%s) = error %v, want nil: an undecodable prior output is stale, not a failed pair", tc.name, err)
 			}
 			if current {
 				t.Errorf("isCurrent(%s) = true, want false: a file that is not this bundle must be rewritten", tc.name)
+			}
+			// Which arm answered matters as much as the answer: the mode arm and the
+			// size arm both reach this same verdict without reading the bundle, so
+			// asserting the outcome alone lets the preflight go unexercised.
+			if !logs.Contains("prior pfx failed preflight; regenerating") {
+				t.Errorf("isCurrent(%s) logged %q, want the preflight notice: the stale verdict must come from the preflight, not from an earlier arm", tc.name, logs.Messages())
 			}
 		})
 	}
@@ -403,7 +540,7 @@ func TestStoreIsCurrent_regenerates_an_oversized_prior(t *testing.T) {
 	defer root.Close()
 	s := &store{root: root}
 
-	buf := captureLogs(t)
+	logs := captureLogs(t)
 	current, err := s.isCurrent(t.Context(), "big.pfx", &convert.Analysis{}, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("isCurrent(oversized prior) = error %v, want nil: it must resolve to stale, not fail the pair", err)
@@ -411,12 +548,12 @@ func TestStoreIsCurrent_regenerates_an_oversized_prior(t *testing.T) {
 	if current {
 		t.Error("isCurrent(oversized prior) = true, want false")
 	}
-	out := buf.String()
-	if !strings.Contains(out, "prior pfx exceeds the readable bound") {
-		t.Errorf("isCurrent(oversized prior) logged %q, want the size-bound notice rather than a permissions hint", out)
+	const sizeMsg = "prior pfx exceeds the readable bound"
+	if !logs.Contains(sizeMsg) {
+		t.Errorf("isCurrent(oversized prior) logged %q, want the size-bound notice rather than a permissions hint", logs.Messages())
 	}
-	if !strings.Contains(out, "level=WARN") {
-		t.Errorf("isCurrent(oversized prior) logged %q, want level WARN", out)
+	if got := logs.CountLevel(slog.LevelWarn, sizeMsg); got != 1 {
+		t.Errorf("isCurrent(oversized prior) logged %q at WARN %d times, want exactly 1", sizeMsg, got)
 	}
 }
 
@@ -457,7 +594,7 @@ func TestStoreIsCurrent_regenerates_a_prior_with_a_lax_mode(t *testing.T) {
 	if err := os.Chmod(filepath.Join(dir, "out.pfx"), 0o644); err != nil {
 		t.Fatalf("setup: Chmod: %v", err)
 	}
-	buf := captureLogs(t)
+	logs := captureLogs(t)
 	current, err = s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("isCurrent(lax mode) = error %v, want nil: it must resolve to stale, not fail the pair", err)
@@ -466,11 +603,55 @@ func TestStoreIsCurrent_regenerates_a_prior_with_a_lax_mode(t *testing.T) {
 		t.Error("isCurrent(lax mode) = true, want false: a bundle holding a private key must not keep a" +
 			" laxer mode just because its contents match")
 	}
-	out := buf.String()
-	for _, want := range []string{"prior pfx has an unexpected file mode", "level=WARN", "-rw-r--r--", "-rw-------"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("isCurrent(lax mode) logged %q, want it to carry %q", out, want)
+	const modeMsg = "prior pfx has an unexpected file mode"
+	if got := logs.CountLevel(slog.LevelWarn, modeMsg); got != 1 {
+		t.Errorf("isCurrent(lax mode) logged %q at WARN %d times, want exactly 1: %q", modeMsg, got, logs.Messages())
+	}
+	// Keyed attributes, not a line substring: the found mode and the policy mode must
+	// each appear under their own key, or a line naming one twice would pass.
+	for key, want := range map[string]string{"mode": "-rw-r--r--", "want": "-rw-------"} {
+		if !logs.HasAttr(modeMsg, key, want) {
+			got, _ := logs.AttrValue(modeMsg, key)
+			t.Errorf("isCurrent(lax mode) logged %s=%q, want %q", key, got, want)
 		}
+	}
+}
+
+// TestStoreIsCurrent_propagates_a_shutdown_instead_of_reporting_stale pins the one
+// isCurrent outcome that is neither current nor stale. Every other "I cannot tell what
+// is on disk" case resolves to "rewrite it", so if a cancelled read joined them, a
+// SIGTERM landing mid-scan would regenerate every remaining pair on the way out --
+// fresh KDF salts and mtimes on bundles that were already correct, re-replicated
+// downstream -- and convertEntry, whose error arm assumes "only shutdown gets here",
+// would report those as conversions rather than as a cancelled scan.
+func TestStoreIsCurrent_propagates_a_shutdown_instead_of_reporting_stale(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	root, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	defer root.Close()
+	s := &store{root: root}
+	// Written through store.write, so the file carries pfxFileMode and the mode arm
+	// cannot answer in place of the read.
+	if err := s.write(t.Context(), "out.pfx", mustEncode(t, &analysis)); err != nil {
+		t.Fatalf("setup: write: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	current, err := s.isCurrent(ctx, "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("isCurrent(cancelled ctx) error = %v, want context.Canceled: a shutdown is neither current nor stale", err)
+	}
+	if current {
+		t.Error("isCurrent(cancelled ctx) = true, want false")
 	}
 }
 

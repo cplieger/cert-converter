@@ -1,13 +1,14 @@
 package process
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/slogx/capture"
 )
 
 // TestScannerRun_reports_a_new_input_observation_once_on_an_unchanged_output pins
@@ -63,7 +64,7 @@ func TestScannerRun_reports_a_new_input_observation_once_on_an_unchanged_output(
 		t.Fatal(err)
 	}
 
-	buf := captureLogs(t)
+	logs := captureLogs(t)
 	res2, err := scanner.Run(t.Context())
 	if err != nil {
 		t.Fatalf("post-reorder Run = %v, want nil", err)
@@ -71,7 +72,7 @@ func TestScannerRun_reports_a_new_input_observation_once_on_an_unchanged_output(
 	if res2.Unchanged != 1 || res2.Converted != 0 {
 		t.Errorf("post-reorder Run = %+v, want Unchanged 1 Converted 0: the pfx on disk is still the right bundle", res2)
 	}
-	if got := countObservation(buf.String(), convert.ObsLeafNotFirst); got != 1 {
+	if got := countObservation(logs, convert.ObsLeafNotFirst); got != 1 {
 		t.Errorf("post-reorder Run logged %d leaf-not-first observations, want exactly 1: a new input condition must be named once", got)
 	}
 	after, err := os.ReadFile(pfxPath)
@@ -84,7 +85,8 @@ func TestScannerRun_reports_a_new_input_observation_once_on_an_unchanged_output(
 
 	// A third scan over the SAME bytes must stay silent: the condition was already
 	// reported, and repeating it on every scan is the log noise this gate prevents.
-	buf.Reset()
+	// A fresh recorder replaces the buffer reset the text handler needed.
+	logs = captureLogs(t)
 	res3, err := scanner.Run(t.Context())
 	if err != nil {
 		t.Fatalf("steady-state Run = %v, want nil", err)
@@ -92,13 +94,28 @@ func TestScannerRun_reports_a_new_input_observation_once_on_an_unchanged_output(
 	if res3.Unchanged != 1 {
 		t.Errorf("steady-state Run = %+v, want Unchanged 1", res3)
 	}
-	if got := countObservation(buf.String(), convert.ObsLeafNotFirst); got != 0 {
+	if got := countObservation(logs, convert.ObsLeafNotFirst); got != 0 {
 		t.Errorf("steady-state Run logged %d leaf-not-first observations, want 0: an already-reported input condition must not re-emit", got)
 	}
 }
 
-// countObservation counts the cert-input-observation log lines of the given kind in
-// captured slog output.
-func countObservation(logged string, kind convert.ObservationKind) int {
-	return strings.Count(logged, `kind=`+string(kind))
+// countObservation counts the cert-input-observation records of the given kind in the
+// captured slog records, keyed on the `kind` ATTRIBUTE rather than on a rendered
+// substring, so an observation kind that appears in some other attribute (a detail
+// string, a path) cannot be miscounted.
+func countObservation(logs *capture.Recorder, kind convert.ObservationKind) int {
+	n := 0
+	for _, r := range logs.Records() {
+		if r.Message != "cert input observation" {
+			continue
+		}
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "kind" && a.Value.String() == string(kind) {
+				n++
+				return false
+			}
+			return true
+		})
+	}
+	return n
 }

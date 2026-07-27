@@ -294,6 +294,32 @@ func subjectCNs(certs []*x509.Certificate) []string {
 	return out
 }
 
+// TestAnalyse_treats_a_key_repeated_twice_as_one_key pins the key-dedupe half of
+// identity resolution. A key file that carries the same key twice is an ordinary
+// copy-paste artefact (an aborted rotation that appended the key it already
+// held), and it must convert exactly as the single-block file does: one key, no
+// multiple-keys observation. Without the dedupe the two blocks become two
+// signers, both match the same certificate, and the ambiguity rule reports "the
+// input contains 2 distinct certificate/key identities" -- a hard conversion
+// failure that keeps the container unhealthy until an operator edits the file.
+func TestAnalyse_treats_a_key_repeated_twice_as_one_key(t *testing.T) {
+	t.Parallel()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "repeated-key.example.com", "ecdsa")
+
+	got, err := convert.Analyse(certPEM, concatPEM(keyPEM, keyPEM))
+	if err != nil {
+		t.Fatalf("Analyse(one certificate, the same key twice) = error %v, want nil: two blocks holding one key are one key", err)
+	}
+	if got.Leaf.Subject.CommonName != "repeated-key.example.com" {
+		t.Errorf("selected identity = %q, want %q", got.Leaf.Subject.CommonName, "repeated-key.example.com")
+	}
+	if hasObservation(got.Observations, convert.ObsMultipleKeys) {
+		t.Errorf("observations = %v, want NO %q: the file holds one key written twice",
+			got.Observations, convert.ObsMultipleKeys)
+	}
+	assertKeyMatchesLeaf(t, got)
+}
+
 // TestAnalyse_reports_an_out_of_window_identity_without_refusing_it pins the
 // documented non-gate: validity is never a reason to refuse a conversion (an
 // operator migrating an expired certificate is a supported case), so the
@@ -373,5 +399,42 @@ func TestAnalyse_reports_no_validity_observation_for_a_current_identity(t *testi
 		if hasObservation(got.Observations, kind) {
 			t.Errorf("Analyse(a currently valid identity) observations = %v, want no %q", got.Observations, kind)
 		}
+	}
+}
+
+// TestAnalyse_caps_the_subjects_it_names_in_the_exclusion_observation pins the
+// count cap on the excluded-certificate observation. Subjects are
+// certificate-controlled text bounded only by the 10 MB input read bound, and
+// boundSubject caps each one at 256 bytes but not how MANY are listed; the cap of
+// three plus an "and N more" summary is the only thing keeping a bundle full of
+// extras from producing an observation line that grows with the input, logged on
+// every scan that revisits the pair.
+func TestAnalyse_caps_the_subjects_it_names_in_the_exclusion_observation(t *testing.T) {
+	t.Parallel()
+	identityCertPEM, identityKeyPEM := testcerts.GenerateSelfSignedCert(t, "identity.example.com", "ecdsa")
+	bundle := append([]byte{}, identityCertPEM...)
+	for _, cn := range []string{"extra-1", "extra-2", "extra-3", "extra-4", "extra-5"} {
+		extraPEM, _ := testcerts.GenerateSelfSignedCert(t, cn+".example.com", "ecdsa")
+		bundle = append(bundle, extraPEM...)
+	}
+
+	got, err := convert.Analyse(bundle, identityKeyPEM)
+	if err != nil {
+		t.Fatalf("Analyse(identity + 5 unrelated certificates) = error %v, want nil", err)
+	}
+	var detail string
+	for _, o := range got.Observations {
+		if o.Kind == convert.ObsExtraCertsExcluded {
+			detail = o.Detail
+		}
+	}
+	if detail == "" {
+		t.Fatalf("observations = %v, want one of kind %q", got.Observations, convert.ObsExtraCertsExcluded)
+	}
+	if !strings.Contains(detail, "and 2 more") {
+		t.Errorf("observation detail = %q, want the certificates past the cap summarised as a count", detail)
+	}
+	if strings.Contains(detail, "extra-4.example.com") || strings.Contains(detail, "extra-5.example.com") {
+		t.Errorf("observation detail = %q, want at most 3 subjects named", detail)
 	}
 }

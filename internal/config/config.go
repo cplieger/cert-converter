@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/process"
@@ -51,7 +52,7 @@ var ErrEmptyPassword = errors.New(
 // Encode, so the container would be permanently unhealthy, while invalid UTF-8 and an
 // embedded NUL SUCCEED and report healthy, silently writing bundles protected by a
 // password no consumer can reproduce.
-var ErrUnencodablePassword = errors.New("PFX_PASSWORD cannot be encoded by PKCS#12")
+var ErrUnencodablePassword = errors.New("the configured PFX password cannot be encoded by PKCS#12")
 
 // PasswordStatus is a non-secret classification of how well PFX_PASSWORD
 // protects the private key inside every generated PFX file.
@@ -147,7 +148,7 @@ func Load() (Config, error) {
 	// main's "starting cert watcher" record).
 	status := classifyPassword(password)
 	if err := checkPasswordEncodable(password); err != nil {
-		return Config{}, err
+		return Config{}, fmt.Errorf("%w (supplied via %s)", err, passwordChannel(source))
 	}
 	logPasswordDelivery(source, password, blankSecretFile)
 
@@ -312,12 +313,22 @@ func parseFallbackInterval(v string) time.Duration {
 // cannot claim a conflict that did not happen. Neither value is logged, and the path is
 // omitted for the same reason the success line omits it.
 func warnBothPasswordChannels(source envx.SecretSource) {
-	if source != envx.SourceFile || strings.TrimSpace(os.Getenv("PFX_PASSWORD")) == "" {
+	if source != envx.SourceFile || isBlank(os.Getenv("PFX_PASSWORD")) {
 		return
 	}
 	slog.Warn("both PFX_PASSWORD and PFX_PASSWORD_FILE are set; the file wins and PFX_PASSWORD is ignored",
 		"source", "PFX_PASSWORD_FILE",
 		"remediation", "remove PFX_PASSWORD from the environment so there is one place to change the secret")
+}
+
+// passwordChannel names the environment variable an operator must edit to change the
+// configured PFX password. A startup refusal that always named PFX_PASSWORD sent an
+// operator using a mounted secret to a variable the file-wins rule ignores.
+func passwordChannel(source envx.SecretSource) string {
+	if source == envx.SourceFile {
+		return "PFX_PASSWORD_FILE"
+	}
+	return "PFX_PASSWORD"
 }
 
 // warnPasswordStrength emits the operator-facing warning for a password that
@@ -364,9 +375,18 @@ func logPasswordDelivery(source envx.SecretSource, password string, blankSecretF
 		}
 	}
 	warnBothPasswordChannels(source)
-	if source == envx.SourceEnv && password != strings.TrimSpace(password) &&
-		strings.TrimSpace(password) != "" {
+	if source == envx.SourceEnv && !isBlank(password) &&
+		password != strings.TrimSpace(password) {
 		slog.Warn("PFX_PASSWORD has leading or trailing whitespace, which is part of the password embedded in every PFX file",
 			"remediation", "remove the surrounding whitespace, or note that PFX_PASSWORD_FILE trims it, so the same value delivered as a mounted secret yields a different password")
+	}
+	// An INTERIOR control character survives both guards: envx trims only
+	// surrounding whitespace, and PKCS#12 encodes a newline or tab verbatim, so
+	// checkPasswordEncodable accepts it. The bundle is written, health stays
+	// green, and the password cannot be typed into the consumers that need it.
+	if strings.ContainsFunc(password, unicode.IsControl) {
+		slog.Warn("the PFX password contains a control character (newline, carriage return, or tab), which is embedded verbatim in every PFX file and cannot be typed into most PKCS#12 consumers",
+			"source", string(source),
+			"remediation", "supply the secret on a single line (openssl rand -base64 wraps at 64 columns; add -A) so whatever opens the .pfx can reproduce the password")
 	}
 }

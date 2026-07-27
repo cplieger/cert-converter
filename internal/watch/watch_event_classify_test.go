@@ -5,7 +5,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cplieger/slogx/capture"
 	"github.com/fsnotify/fsnotify"
@@ -103,5 +105,85 @@ func TestHandleFsEvent_classifies_a_chmod_it_cannot_stat(t *testing.T) {
 				t.Errorf("handleFsEvent(Chmod %s) warned = %v, want %v; log = %v", tc.path, warned, tc.wantWarn, logs.Messages())
 			}
 		})
+	}
+}
+
+// TestFallbackStatus_tells_the_operator_whether_anything_will_rescan pins the
+// fallback_scan attribute every degraded-path WARN carries. The existing
+// classify tests assert only that the WARN fires, so the attribute's value --
+// the operator's single statement of when (or whether) the reported path is
+// re-scanned -- is unverified, and the boundary that produces "disabled" can
+// invert without any test noticing. The disabled case is the load-bearing one:
+// nothing re-scans that path for the life of the process, so rendering it as a
+// duration would read as a promise the process cannot keep.
+// Not parallel: it swaps the process-global slog default.
+func TestFallbackStatus_tells_the_operator_whether_anything_will_rescan(t *testing.T) {
+	const msg = "cannot classify a path whose permissions changed"
+
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	notADir := filepath.Join(root, "notes.txt")
+	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		fallback time.Duration
+		want     string
+	}{
+		{"a disabled fallback is named outright", 0, "disabled"},
+		{"a negative interval is disabled too", -time.Second, "disabled"},
+		{"an enabled fallback states its cadence", 6 * time.Hour, "6h0m0s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := capture.Default(t)
+			w := New(root, func(context.Context) {}, WithFallback(tc.fallback))
+
+			w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: filepath.Join(notADir, "tls.crt"), Op: fsnotify.Chmod})
+
+			got, ok := logs.AttrValue(msg, "fallback_scan")
+			if !ok {
+				t.Fatalf("no fallback_scan attribute on the degraded-path WARN; log = %v", logs.Messages())
+			}
+			if got != tc.want {
+				t.Errorf("fallback_scan = %q with WithFallback(%v), want %q", got, tc.fallback, tc.want)
+			}
+		})
+	}
+}
+
+// TestHandleFsEvent_does_not_watch_through_a_symlinked_directory pins the
+// containment invariant both the Create and the Chmod arm rely on: they Lstat
+// (never Stat), so a symlink to a directory takes the FILE arm and
+// addWatchDirs/watcher.Add never runs on it. Neither addWatchDirs nor the
+// scanner's root-confined walk descends a symlinked directory, so watching
+// through one would register inotify watches on a tree outside /input whose
+// certs can never be converted, silently burning the watch quota. The
+// invariant is documented in three comments in watch.go and, before this test,
+// asserted nowhere: swapping either Lstat to Stat kept the whole suite green.
+func TestHandleFsEvent_does_not_watch_through_a_symlinked_directory(t *testing.T) {
+	t.Parallel()
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(outside, "escaped"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "example.com")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unavailable on this filesystem: %v", err)
+	}
+	w := New(root, func(context.Context) {})
+
+	for _, op := range []fsnotify.Op{fsnotify.Create, fsnotify.Chmod} {
+		if got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: link, Op: op}); got {
+			t.Errorf("handleFsEvent(%v on a symlinked dir) = true, want false (the link name is not a cert or key)", op)
+		}
+	}
+	for _, watched := range watcher.WatchList() {
+		if watched == link || strings.HasPrefix(watched, outside) {
+			t.Errorf("watch registered through a symlink: %q; watch list = %v", watched, watcher.WatchList())
+		}
 	}
 }

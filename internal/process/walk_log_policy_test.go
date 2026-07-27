@@ -1,25 +1,24 @@
 package process
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
+
+	"github.com/cplieger/slogx/capture"
 )
 
-// captureLogs swaps slog.Default() for a Debug-level text handler and returns the
-// buffer. Tests using it must run serially: slog.Default is process-global.
-func captureLogs(t *testing.T) *bytes.Buffer {
+// captureLogs installs slogx/capture's Recorder as slog.Default() for the test and
+// restores the previous default on cleanup. Assertions then read structured
+// slog.Records rather than one rendered line, so a check cannot pass because the
+// sought text happened to appear in an unrelated attribute. Tests using it must run
+// serially: slog.Default is process-global.
+func captureLogs(t *testing.T) *capture.Recorder {
 	t.Helper()
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-	return &buf
+	return capture.Default(t)
 }
 
 // TestWalkLogPolicy_per_path_lines_are_debug_only pins the app's two-level walk
@@ -39,15 +38,14 @@ func captureLogs(t *testing.T) *bytes.Buffer {
 // apart before.
 func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 	t.Run("input walk unreadable sub-path", func(t *testing.T) {
-		buf := captureLogs(t)
+		logs := captureLogs(t)
 		sw := &scanWalk{seen: map[string]struct{}{}}
 
 		if err := sw.visit(t.Context(), "locked", nil, errors.New("permission denied")); err != nil {
 			t.Fatalf("visit(unreadable sub-path) = %v, want nil so the rest of the tree is still walked", err)
 		}
 
-		out := buf.String()
-		assertDebugOnly(t, out, "skipping unreadable path", "locked")
+		assertDebugOnly(t, logs, "skipping unreadable path", "locked")
 		if sw.unreadable != 1 {
 			t.Errorf("unreadable = %d, want 1 so the aggregate in scanAndSetHealth fires", sw.unreadable)
 		}
@@ -73,7 +71,7 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = root.Close() })
 
-		buf := captureLogs(t)
+		logs := captureLogs(t)
 		s := &store{root: root}
 		_, safe, err := s.orphans(context.Background(), map[string]struct{}{})
 		if err != nil {
@@ -83,9 +81,8 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 			t.Error("safe = true, want false: an incomplete output enumeration must not authorise deletions")
 		}
 
-		out := buf.String()
-		assertDebugOnly(t, out, "skipping unreadable output path", "blocked")
-		assertOneAggregateWarn(t, out, "could not be read while looking for orphans", "count=1")
+		assertDebugOnly(t, logs, "skipping unreadable output path", "blocked")
+		assertOneAggregateWarn(t, logs, "could not be read while looking for orphans", "1")
 	})
 
 	t.Run("orphan walk symlink", func(t *testing.T) {
@@ -99,7 +96,7 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = root.Close() })
 
-		buf := captureLogs(t)
+		logs := captureLogs(t)
 		s := &store{root: root}
 		_, safe, err := s.orphans(context.Background(), map[string]struct{}{})
 		if err != nil {
@@ -109,62 +106,50 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 			t.Error("safe = true, want false: writes and this walk resolve a symlink differently")
 		}
 
-		out := buf.String()
-		assertDebugOnly(t, out, "output tree contains a symlink", "loop")
-		assertOneAggregateWarn(t, out, "orphan removal is disabled for this scan", "count=1")
+		assertDebugOnly(t, logs, "output tree contains a symlink", "loop")
+		assertOneAggregateWarn(t, logs, "orphan removal is disabled for this scan", "1")
 	})
 }
 
 // assertDebugOnly requires that the record carrying msg is at Debug and that the path
-// is named there — the path must remain discoverable under LOG_LEVEL=debug, which is
-// the whole justification for demoting it.
-func assertDebugOnly(t *testing.T, out, msg, wantPath string) {
+// is named in its `path` attribute — the path must remain discoverable under
+// LOG_LEVEL=debug, which is the whole justification for demoting it. Asserting on the
+// attribute rather than on the rendered line means a path that only appears in some
+// other attribute (an error string, a remediation hint) cannot satisfy it.
+func assertDebugOnly(t *testing.T, logs *capture.Recorder, msg, wantPath string) {
 	t.Helper()
-	line := recordWith(out, msg)
-	if line == "" {
-		t.Fatalf("logged %q, want a record containing %q", out, msg)
+	if !logs.Contains(msg) {
+		t.Fatalf("logged %q, want a record containing %q", logs.Messages(), msg)
 	}
-	if !strings.Contains(line, "level=DEBUG") {
-		t.Errorf("record %q is not at DEBUG; per-path lines must not reach the default level", line)
+	if got := logs.CountLevel(slog.LevelDebug, msg); got != 1 {
+		t.Errorf("%q logged at DEBUG %d times, want exactly 1; per-path lines must not reach the default level", msg, got)
 	}
-	if !strings.Contains(line, wantPath) {
-		t.Errorf("record %q does not name the path %q; demoting it must not make it undiscoverable", line, wantPath)
+	if got := logs.CountLevel(slog.LevelWarn, msg); got != 0 {
+		t.Errorf("%q logged at WARN %d times, want 0; per-path lines must not reach the default level", msg, got)
+	}
+	if !logs.HasAttr(msg, "path", wantPath) {
+		t.Errorf("record %q does not name path=%q; demoting it must not make it undiscoverable", msg, wantPath)
 	}
 }
 
-// assertOneAggregateWarn requires exactly one WARN record, carrying msg and a count.
-// Exactly one is the point of the policy: the default level reports the condition once
-// per scan regardless of how many paths are affected.
-func assertOneAggregateWarn(t *testing.T, out, msg, wantAttr string) {
+// assertOneAggregateWarn requires exactly one WARN record, carrying msg and the given
+// count. Exactly one is the point of the policy: the default level reports the
+// condition once per scan regardless of how many paths are affected.
+func assertOneAggregateWarn(t *testing.T, logs *capture.Recorder, msg, wantCount string) {
 	t.Helper()
-	var warns []string
-	for line := range strings.SplitSeq(strings.TrimSuffix(out, "\n"), "\n") {
-		if strings.Contains(line, "level=WARN") {
-			warns = append(warns, line)
-		}
+	if got := logs.CountLevel(slog.LevelWarn, ""); got != 1 {
+		t.Fatalf("got %d WARN records, want exactly 1 aggregate: %q", got, logs.Messages())
 	}
-	if len(warns) != 1 {
-		t.Fatalf("got %d WARN records, want exactly 1 aggregate: %q", len(warns), out)
+	if got := logs.CountLevel(slog.LevelWarn, msg); got != 1 {
+		t.Errorf("aggregate WARN = %q, want it to contain %q", logs.Messages(), msg)
 	}
-	if !strings.Contains(warns[0], msg) {
-		t.Errorf("aggregate WARN = %q, want it to contain %q", warns[0], msg)
+	if !logs.HasAttr(msg, "count", wantCount) {
+		got, _ := logs.AttrValue(msg, "count")
+		t.Errorf("aggregate WARN count = %q, want %q", got, wantCount)
 	}
-	if !strings.Contains(warns[0], wantAttr) {
-		t.Errorf("aggregate WARN = %q, want the count attribute %q", warns[0], wantAttr)
+	if _, ok := logs.AttrValue(msg, "remediation"); !ok {
+		t.Errorf("aggregate WARN %q has no remediation hint: it is the only line the operator sees", msg)
 	}
-	if !strings.Contains(warns[0], "remediation=") {
-		t.Errorf("aggregate WARN = %q, want a remediation hint: it is the only line the operator sees", warns[0])
-	}
-}
-
-// recordWith returns the first log line containing msg, or "".
-func recordWith(out, msg string) string {
-	for line := range strings.SplitSeq(out, "\n") {
-		if strings.Contains(line, msg) {
-			return line
-		}
-	}
-	return ""
 }
 
 // TestWalkLogPolicy_quiet_when_nothing_is_wrong pins the steady state: a readable
@@ -178,12 +163,12 @@ func TestWalkLogPolicy_quiet_when_nothing_is_wrong(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = root.Close() })
 
-	buf := captureLogs(t)
+	logs := captureLogs(t)
 	s := &store{root: root}
 	if _, safe, orphanErr := s.orphans(context.Background(), map[string]struct{}{}); orphanErr != nil || !safe {
 		t.Fatalf("orphans(clean tree) = safe %v, err %v; want true, nil", safe, orphanErr)
 	}
-	if out := buf.String(); out != "" {
-		t.Errorf("orphans(clean tree) logged %q, want no output at all", out)
+	if logs.Len() != 0 {
+		t.Errorf("orphans(clean tree) logged %q, want no output at all", logs.Messages())
 	}
 }

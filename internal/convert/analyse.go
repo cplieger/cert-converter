@@ -3,6 +3,7 @@ package convert
 import (
 	"bytes"
 	"crypto"
+	"crypto/rsa"
 	"crypto/x509"
 	"fmt"
 	"time"
@@ -48,6 +49,11 @@ const (
 	// ObsIdentityExpired reports a selected identity past its NotAfter.
 	// Conversion still proceeds: migrating an expired certificate is legitimate.
 	ObsIdentityExpired ObservationKind = "identity-expired"
+	// ObsChainCertOutOfWindow reports a certificate in the EMITTED chain that is
+	// outside its own validity window. Conversion still proceeds (validity is never
+	// a gate here), but the bundle will fail path validation at the consumer and no
+	// other signal names which link is at fault.
+	ObsChainCertOutOfWindow ObservationKind = "chain-cert-out-of-window"
 )
 
 // Observation is one non-fatal finding about the input. Detail is already bounded
@@ -172,6 +178,7 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 
 	chain, extra, chainObs := g.assembleChain(identity.cert, leaf)
 	obs = append(obs, chainObs...)
+	obs = append(obs, chainValidityObservations(chain, now)...)
 
 	return Analysis{
 		Leaf:         leaf,
@@ -233,6 +240,27 @@ type certGraph struct {
 	// chain whose selected intermediate did not verify under the root beside it,
 	// while the fully verified alternative sat in the same input.
 	verifiedDistToRoot []int
+}
+
+// maxVerifiableKeyBits bounds the public-key size this app will run a signature
+// verification against. crypto/x509 accepts an RSA modulus of any size (go1.26
+// enforces only a 1024-bit floor) and crypto/rsa then pays a full modexp with it
+// whenever the signature length matches, so the cost of one candidate edge is
+// dictated by the FILE, not by the certificate count maxChainCerts bounds: a
+// 131072-bit modulus costs 184ms per verification and a 1-Mbit one 11.9s, against
+// 69us for RSA-2048. 16384 is far above anything issued (Let's Encrypt tops out at
+// RSA-4096) and keeps one verification in the low milliseconds.
+const maxVerifiableKeyBits = 16384
+
+// verifiableKey reports whether pub is small enough to verify against. Only RSA is
+// unbounded: x509 parses ECDSA keys on named curves only, Ed25519 is fixed-size,
+// and x509 refuses DSA verification outright (DSAWithSHA1/256 are Unsupported).
+func verifiableKey(pub crypto.PublicKey) bool {
+	k, ok := pub.(*rsa.PublicKey)
+	if !ok {
+		return true
+	}
+	return k.N != nil && k.N.BitLen() <= maxVerifiableKeyBits
 }
 
 // newCertGraph derives both issuance edge sets.
@@ -299,12 +327,18 @@ func (g *certGraph) plausibleIssuer(child, parent int) bool {
 // verifies reports whether certs[parent]'s signature over certs[child] checks out,
 // memoised. This is the STRONG signal: a candidate edge only says the two names or
 // key identifiers line up, which an impostor sharing a subject can also satisfy.
+//
+// A parent whose public key exceeds maxVerifiableKeyBits is not verified at all.
+// That is a COST guard, not a trust decision: the edge simply stays unproven and
+// falls back to the inclusive candidate path, exactly as the SHA-1 and
+// name-encoding cases already do.
 func (g *certGraph) verifies(child, parent int) bool {
 	key := [2]int{child, parent}
 	if got, ok := g.verified[key]; ok {
 		return got
 	}
-	got := g.certs[child].CheckSignatureFrom(g.certs[parent]) == nil
+	got := verifiableKey(g.certs[parent].PublicKey) &&
+		g.certs[child].CheckSignatureFrom(g.certs[parent]) == nil
 	g.verified[key] = got
 	return got
 }
@@ -338,9 +372,17 @@ func (g *certGraph) isIssuer(i int) bool {
 //
 // CA-ness is irrelevant to the question asked here: a self-signed end-entity
 // certificate is still self-signed.
+//
+// A certificate whose own public key exceeds maxVerifiableKeyBits is reported as
+// not self-signed. That is a COST guard rather than a trust decision: the
+// certificate is simply not treated as a root for the distance walk, and every
+// input this app converts today still converts.
 func (g *certGraph) isSelfSigned(i int) bool {
 	c := g.certs[i]
 	if !bytes.Equal(c.RawSubject, c.RawIssuer) {
+		return false
+	}
+	if !verifiableKey(c.PublicKey) {
 		return false
 	}
 	return c.CheckSignature(c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) == nil
@@ -452,6 +494,16 @@ func (g *certGraph) collectMatches(signers []crypto.Signer) (matches []identityM
 func (g *certGraph) noMatchError(keyCount, firstUnverifiable int) error {
 	if firstUnverifiable >= 0 {
 		c := g.certs[firstUnverifiable]
+		if c.PublicKey == nil {
+			// crypto/x509 parses a certificate whose SubjectPublicKeyInfo algorithm OID it
+			// does not recognise and leaves PublicKey nil (parser.go's
+			// UnknownPublicKeyAlgorithm branch), so %T would render "<nil>" here - the one
+			// case where naming the algorithm matters most is the one where there is no
+			// type to name. Say what happened instead.
+			return fmt.Errorf(
+				"certificate %q uses a public key algorithm crypto/x509 does not recognise, so it cannot be verified against the private key; re-issue it with an RSA, ECDSA or Ed25519 key",
+				boundSubject(c.Subject.String()))
+		}
 		return fmt.Errorf(
 			"certificate %q has a public key of type %T that cannot be verified against the private key",
 			boundSubject(c.Subject.String()), c.PublicKey)
@@ -640,11 +692,8 @@ func (g *certGraph) outsidePath(path []int) []*x509.Certificate {
 // Used to tell KEY REUSE apart from issuance: a certificate holding the same
 // public key as another cannot have issued it.
 func samePublicKey(a, b crypto.PublicKey) bool {
-	matcher, ok := a.(interface{ Equal(crypto.PublicKey) bool })
-	if !ok {
-		return false
-	}
-	return matcher.Equal(b)
+	matched, _ := equalPublicKeys(a, b)
+	return matched
 }
 
 // assembleChain builds the emitted chain for the selected identity, the
@@ -710,6 +759,32 @@ func validityObservations(leaf *x509.Certificate, now time.Time) []Observation {
 		}}
 	}
 	return nil
+}
+
+// chainValidityObservations reports certificates in the EMITTED chain that are
+// outside their validity window at now. Never an error, for the same reason an
+// out-of-window identity is not: this package converts, it does not validate.
+//
+// It is reported because betterParent already ranks a currently valid issuer
+// ahead of an expired one, so an out-of-window certificate reaching the emitted
+// chain means no valid alternative existed in the bundle. That is precisely the
+// case where the operator has to act, and it is the one the leaf-only
+// validityObservations cannot see.
+func chainValidityObservations(chain []*x509.Certificate, now time.Time) []Observation {
+	var obs []Observation
+	for i, c := range chain {
+		if validAt(c, now) {
+			continue
+		}
+		obs = append(obs, Observation{
+			Kind: ObsChainCertOutOfWindow,
+			Detail: fmt.Sprintf(
+				"chain certificate %d of %d, %q, is outside its validity window (NotBefore %s, NotAfter %s)",
+				i+1, len(chain), boundSubject(c.Subject.String()),
+				c.NotBefore.UTC().Format(time.RFC3339), c.NotAfter.UTC().Format(time.RFC3339)),
+		})
+	}
+	return obs
 }
 
 // dedupeCerts removes byte-identical certificates, keeping input order, and

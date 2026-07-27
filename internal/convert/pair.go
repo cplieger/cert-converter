@@ -62,11 +62,20 @@ func boundSubject(subject string) string {
 // implements, in which case matched carries no meaning and the caller must treat
 // the key type as unverifiable rather than as a mismatch.
 func publicKeyMatches(pub crypto.PublicKey, signer crypto.Signer) (matched, supported bool) {
-	matcher, ok := pub.(interface{ Equal(crypto.PublicKey) bool })
+	return equalPublicKeys(pub, signer.Public())
+}
+
+// equalPublicKeys is the single home of the comparison rule publicKeyMatches
+// and samePublicKey share: every public key type crypto/x509 parses exposes
+// Equal(crypto.PublicKey) bool, and a type that does not is unverifiable rather
+// than unequal. supported reports which of the two it was, so a caller that
+// must distinguish them can, and one that need not can ignore it.
+func equalPublicKeys(a, b crypto.PublicKey) (matched, supported bool) {
+	matcher, ok := a.(interface{ Equal(crypto.PublicKey) bool })
 	if !ok {
 		return false, false
 	}
-	return matcher.Equal(signer.Public()), true
+	return matcher.Equal(b), true
 }
 
 // Decoded is what a previously written PFX yields when read back.
@@ -94,10 +103,15 @@ type Decoded struct {
 // library's ErrIncorrectPassword also fires on a MAC failure from corruption, so
 // "wrong password" and "damaged file" are not distinguishable, and the caller
 // needs the same response either way: treat the output as stale and rewrite it.
+//
+// The library's own message is bounded before it reaches a caller's log, because
+// two of its decode diagnostics interpolate an OBJECT IDENTIFIER decoded from the
+// bundle (go-pkcs12 v0.7.3: an unhandled safe-bag type, an unknown attribute),
+// and a bundle-controlled OID is bounded only by the file size.
 func Decode(pfx []byte, password string) (Decoded, error) {
 	key, leaf, caCerts, err := pkcs12.DecodeChain(pfx, password)
 	if err != nil {
-		return Decoded{}, fmt.Errorf("decode pfx: %w", err)
+		return Decoded{}, fmt.Errorf("decode pfx: %w", boundedTextError{err})
 	}
 	return Decoded{Leaf: leaf, Key: key, CACerts: caCerts}, nil
 }

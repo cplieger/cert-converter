@@ -56,8 +56,8 @@ type Options struct {
 // path. main.go does this (initial scan, then the watcher's synchronous onChange
 // callback).
 type Scanner struct {
-	observedInputs map[string][sha256.Size]byte
-	opts           Options
+	observations *observationLog
+	opts         Options
 }
 
 // New constructs a Scanner with the given process-lifetime scan configuration.
@@ -66,8 +66,8 @@ type Scanner struct {
 // identity, it copies the value into the Scanner.
 func New(opts *Options) *Scanner {
 	return &Scanner{
-		opts:           *opts,
-		observedInputs: make(map[string][sha256.Size]byte),
+		opts:         *opts,
+		observations: newObservationLog(),
 	}
 }
 
@@ -98,12 +98,12 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	out.sweepStaleTemps(ctx)
 
 	sw := &scanWalk{
-		src:            &source{root: inHandle},
-		out:            out,
-		observedInputs: s.observedInputs,
-		password:       s.opts.Password,
-		enc:            s.opts.Encoder,
-		seen:           make(map[string]struct{}),
+		src:          &source{root: inHandle},
+		out:          out,
+		observations: s.observations,
+		password:     s.opts.Password,
+		enc:          s.opts.Encoder,
+		seen:         make(map[string]struct{}),
 	}
 	// Enumerate the input tree THROUGH the root handle, exactly as the
 	// /output stale-temp sweep does: every step is an openat-relative
@@ -114,18 +114,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	})
 
 	result := countResults(sw.results, sw.unreadable)
-	// Prune observation state for pairs that are gone, but ONLY when the walk
-	// proved the enumeration complete: an aborted walk, an unreadable sub-path or
-	// an unresolved symlink means `seen` is not the whole input tree, so a pair
-	// hidden behind it would be forgotten and re-warn on the next clean scan.
-	if walkErr == nil && result.Unreadable == 0 && sw.unresolved == 0 {
-		for rel := range s.observedInputs {
-			if _, ok := sw.seen[rel]; !ok {
-				delete(s.observedInputs, rel)
-			}
-		}
-	}
-	removed, reconcileErr := out.reconcile(ctx, s.opts.Lifecycle, sw.seen, reapContext{
+	rc := reapContext{
 		scanTotal: result.Total,
 		failed:    result.Failed,
 		// result.Unreadable, not sw.unreadable: it also carries the per-entry
@@ -136,7 +125,17 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		unresolved:    sw.unresolved,
 		walkCompleted: walkErr == nil,
 		shutdown:      walkErr != nil && IsShutdown(walkErr),
-	})
+	}
+	// Prune observation state for pairs that are gone, but ONLY when the walk
+	// proved the enumeration complete: an aborted walk, an unreadable sub-path or
+	// an unresolved symlink means `seen` is not the whole input tree, so a pair
+	// hidden behind it would be forgotten and re-warn on the next clean scan.
+	// scanTotal is deliberately NOT part of this gate (unlike enumeratedInput): a
+	// clean walk that found nothing proves every remembered pair is gone.
+	if rc.enumerationClean() {
+		s.observations.forget(sw.seen)
+	}
+	removed, reconcileErr := out.reconcile(ctx, s.opts.Lifecycle, sw.seen, rc)
 	result.Removed = removed
 	// A shutdown that arrives after the input walk completed cancels reconciliation
 	// instead, and that scan is NOT complete: without folding the error in, the
@@ -146,24 +145,26 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		walkErr = reconcileErr
 	}
 
-	logScanOutcome(ctx, result, walkErr)
+	logScanOutcome(ctx, result, sw.unresolved, walkErr)
 	return result, walkErr
 }
 
 // scanWalk carries the read-only conversion parameters and the mutable
 // accounting for one Scanner.Run tree walk: the per-pair results, the count of
 // unreadable sub-paths, and the set of cert paths seen (the input enumeration
-// store.reconcile checks the output tree against).
+// store.reconcile checks the output tree against). The one exception is
+// observations, which is process-lifetime state owned by the Scanner and shared
+// with the walk, not per-run accounting: it survives across scans by design.
 // Hoisting the WalkDir callback onto this struct keeps Scanner.Run flat.
 type scanWalk struct {
-	src            *source
-	out            *store
-	seen           map[string]struct{}
-	observedInputs map[string][sha256.Size]byte
-	enc            convert.EncoderType
-	password       string
-	results        []conversionStatus
-	unreadable     int
+	src          *source
+	out          *store
+	seen         map[string]struct{}
+	observations *observationLog
+	enc          convert.EncoderType
+	password     string
+	results      []conversionStatus
+	unreadable   int
 	// unresolved counts input symlinks the confined root could not resolve. Each
 	// one may hide certificates, so `seen` is NOT a complete enumeration of the
 	// input tree afterwards. It is deliberately separate from `unreadable`, which
@@ -279,7 +280,7 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 // any other abort logs at Warn so an operator sees the partial scan and its
 // error. The count attributes are identical in all three cases (the README's Loki
 // alert matches on them), so they are built once.
-func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
+func logScanOutcome(ctx context.Context, result ScanResult, unresolved int, walkErr error) {
 	level, msg := slog.LevelInfo, "scan complete"
 	if walkErr != nil {
 		level, msg = slog.LevelWarn, "scan aborted before completion"
@@ -300,18 +301,19 @@ func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
 		"removed", result.Removed,
 		"failed", result.Failed)
 	slog.Log(ctx, level, msg, attrs...)
-	logInputCoverageWarnings(result, walkErr)
+	logInputCoverageWarnings(result, unresolved, walkErr)
 }
 
 // logInputCoverageWarnings names the two health-neutral outcomes that produce no
 // PFX at all and that the summary counts alone cannot distinguish from a healthy
-// steady state. Both require a completed walk with no unreadable sub-path:
+// steady state. Both require a completed walk with no unreadable sub-path and no
+// unresolved symlink:
 // Unreadable == 0 is what makes "every certificate" provable, because Run
 // deliberately continues past an unreadable sub-path, so a partial enumeration
 // cannot know what lies beneath it, and the unreadable-path WARN already carries
 // the actionable diagnosis for that shape.
-func logInputCoverageWarnings(result ScanResult, walkErr error) {
-	if walkErr != nil || result.Unreadable > 0 {
+func logInputCoverageWarnings(result ScanResult, unresolved int, walkErr error) {
+	if walkErr != nil || result.Unreadable > 0 || unresolved > 0 {
 		return
 	}
 	switch {
@@ -395,6 +397,56 @@ func pairFingerprint(certPEM, keyPEM []byte) [sha256.Size]byte {
 	return sha256.Sum256(pair[:])
 }
 
+// observationLog de-duplicates the per-pair input-observation WARNs across
+// scans: an odd-but-convertible input is named on the scan that introduced it
+// and stays silent on every later fsnotify event and fallback tick. It is keyed
+// on the raw input fingerprint and NEVER consulted for currency, which
+// store.isCurrent derives from the bundle on disk. It is process-lifetime state
+// held by the Scanner, so a restart re-reports each pair exactly once.
+//
+// The map is plain, so it inherits Scanner's single-goroutine Run contract.
+type observationLog struct {
+	seenInputs map[string][sha256.Size]byte
+}
+
+func newObservationLog() *observationLog {
+	return &observationLog{seenInputs: make(map[string][sha256.Size]byte)}
+}
+
+// note records the pair's input fingerprint and emits its observations when the
+// input bytes differ from the last ones observed for that path. The observations
+// describe the INPUT, so a semantically equivalent input edit (a reordered
+// chain, an appended duplicate cert, a second key) still has to be named once
+// even though the bundle on disk stays correct; keying the emission on the raw
+// input fingerprint reports it on the scan that introduced it, which is what
+// unconditional logging would turn into noise.
+func (o *observationLog) note(rel string, fp [sha256.Size]byte, obs []convert.Observation) {
+	previous, ok := o.seenInputs[rel]
+	o.seenInputs[rel] = fp
+	if !ok || previous != fp {
+		logConversionObservations(rel, obs)
+	}
+}
+
+// record commits the fingerprint without re-emitting: the conversion path has
+// already logged the observations unconditionally.
+func (o *observationLog) record(rel string, fp [sha256.Size]byte) {
+	o.seenInputs[rel] = fp
+}
+
+// forget drops entries for paths a COMPLETE walk did not see, so a pair that
+// comes back is reported once again. Callers must gate this on a complete
+// enumeration: with a partial one, a pair hidden behind an unreadable sub-path
+// or an unresolved symlink would be forgotten and re-warn on the next clean
+// scan.
+func (o *observationLog) forget(seen map[string]struct{}) {
+	for rel := range o.seenInputs {
+		if _, ok := seen[rel]; !ok {
+			delete(o.seenInputs, rel)
+		}
+	}
+}
+
 // readPair resolves and reads the input side of one .crt entry: it classifies
 // the sibling .key (a missing key is a health-neutral statusOrphan; a non-ENOENT
 // stat failure is statusUnreadable instead, because the key is there and cannot
@@ -420,7 +472,8 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 		// diagnostic, so it is statusUnreadable, the same outcome the two bounded
 		// reads below produce for the same class of condition. Health-neutral either
 		// way; the message is unchanged because an alert rule keys on it.
-		slog.Warn("skipping cert: cannot stat sibling key", "path", rel, "error", statErr)
+		slog.Warn("skipping cert: cannot stat sibling key", "path", rel, "error", statErr,
+			"remediation", "check /input permissions and that the path is a regular file inside the mount, not a symlink out of it")
 		return pairInputs{}, statusUnreadable, false
 	}
 
@@ -522,15 +575,9 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	}
 	if current {
 		// The observations describe the INPUT, so a semantically equivalent input
-		// edit (a reordered chain, an appended duplicate cert, a second key) still
-		// has to be named once even though the bundle on disk stays correct. Keying
-		// the emission on the raw input fingerprint reports it on the scan that
-		// introduced it and stays silent on every later fsnotify event and fallback
-		// tick, which is what unconditional logging here would turn into noise.
-		if previous, ok := sw.observedInputs[rel]; !ok || previous != fingerprint {
-			logConversionObservations(rel, analysis.Observations)
-		}
-		sw.observedInputs[rel] = fingerprint
+		// edit still has to be named once even though the bundle on disk stays
+		// correct; observationLog.note owns that once-per-change rule.
+		sw.observations.note(rel, fingerprint, analysis.Observations)
 		slog.Debug("skipping unchanged cert pair", "path", rel)
 		return statusUnchanged
 	}
@@ -548,7 +595,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 			"remediation", "check /output ownership and permissions for the UID in user:, "+
 				"and that no symlink is planted at the output path")
 	}
-	sw.observedInputs[rel] = fingerprint
+	sw.observations.record(rel, fingerprint)
 
 	slog.Info("wrote pfx", "path", pfxRel)
 	return statusConverted

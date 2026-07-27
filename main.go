@@ -68,26 +68,16 @@ func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *hea
 
 // --- Entrypoint ---
 
-// fallbackLogValue renders the fallback rescan cadence for the startup log.
-// A non-positive interval means the rescan is switched off, which is reported
-// as "disabled" rather than as a bare "0s" duration: the value is the
-// operator's confirmation that FALLBACK_SCAN_HOURS=0/false took effect, and
-// that the health probe's staleness deadline is off with it.
-func fallbackLogValue(d time.Duration) string {
-	if d <= 0 {
-		return "disabled"
-	}
-	return d.String()
-}
-
 // volumeDir is a required mount point and the role it plays in the startup log.
 type volumeDir struct {
 	role, path string
 }
 
 // volumesReady reports whether every required volume is already mounted as a
-// directory, logging the first offender at ERROR with its role, path and
-// remediation.
+// directory, logging EVERY offender at ERROR with its role, path and
+// remediation: an operator who omitted the volumes block entirely has both
+// mounts missing, and naming only the first costs a restart per mount to
+// discover the next one.
 //
 // Both volumes must already exist. Nothing in this app creates them, and a
 // missing one used to surface as a scan-level error on every tick: the
@@ -102,6 +92,7 @@ type volumeDir struct {
 // is not a directory (a file bind-mounted over /input, a stray touch) is the
 // same fact and is refused the same way.
 func volumesReady(dirs []volumeDir) bool {
+	ready := true
 	for _, dir := range dirs {
 		fi, statErr := os.Stat(dir.path)
 		if statErr == nil && fi.IsDir() {
@@ -117,9 +108,9 @@ func volumesReady(dirs []volumeDir) bool {
 		slog.Error("required volume is missing or not a directory; refusing to start",
 			"role", dir.role, "path", dir.path, "error", statErr,
 			"remediation", "mount "+dir.path+" into the container before starting it")
-		return false
+		ready = false
 	}
-	return true
+	return ready
 }
 
 // runProbe is a seam: health.RunProbe exits the process, so tests replace it.
@@ -215,7 +206,7 @@ func run() int {
 	slog.Info("starting cert watcher",
 		"input", certsRootDir, "output", outputDir,
 		"password", passwordStatus,
-		"fallback_scan", fallbackLogValue(cfg.FallbackInterval), "encoder", cfg.EncoderName,
+		"fallback_scan", watch.FallbackLabel(cfg.FallbackInterval), "encoder", cfg.EncoderName,
 		"output_lifecycle", string(cfg.Lifecycle))
 
 	if !volumesReady([]volumeDir{{"input", certsRootDir}, {"output", outputDir}}) {

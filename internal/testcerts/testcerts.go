@@ -126,8 +126,8 @@ func GenerateCertChain(tb testing.TB) (leafPEM, keyPEM, caPEM, chainPEM []byte) 
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign,
 	}
-	caDER, caPEMBytes := signCert(tb, caTemplate, caTemplate, &caKey.PublicKey, caKey)
-	caPEM = caPEMBytes
+	var caDER []byte
+	caDER, caPEM = signCert(tb, caTemplate, caTemplate, &caKey.PublicKey, caKey)
 	caCert, err := x509.ParseCertificate(caDER)
 	if err != nil {
 		tb.Fatal(err)

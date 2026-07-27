@@ -1,14 +1,12 @@
 package process
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/convert"
@@ -35,22 +33,21 @@ func TestLogScanOutcome_levels(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			prev := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-			t.Cleanup(func() { slog.SetDefault(prev) })
+			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), result, tt.walkErr)
+			logScanOutcome(t.Context(), result, 0, tt.walkErr)
 
-			out := buf.String()
-			if !strings.Contains(out, tt.wantMsg) {
-				t.Errorf("logScanOutcome(walkErr=%v) logged %q, want message %q", tt.walkErr, out, tt.wantMsg)
+			// CountExact, not a substring: these messages are pinned by the README's
+			// Loki rules, so a superstring must not satisfy them.
+			if got := logs.CountExact(tt.wantMsg); got != 1 {
+				t.Errorf("logScanOutcome(walkErr=%v) logged %q, want message %q", tt.walkErr, logs.Messages(), tt.wantMsg)
 			}
-			if !strings.Contains(out, "level="+tt.wantLevel.String()) {
-				t.Errorf("logScanOutcome(walkErr=%v) logged %q, want level %s", tt.walkErr, out, tt.wantLevel)
+			if got := logs.CountLevel(tt.wantLevel, tt.wantMsg); got != 1 {
+				t.Errorf("logScanOutcome(walkErr=%v) logged %q at %s %d times, want 1", tt.walkErr, tt.wantMsg, tt.wantLevel, got)
 			}
-			if !strings.Contains(out, "converted=1") {
-				t.Errorf("logScanOutcome(walkErr=%v) logged %q, want the converted count in the summary", tt.walkErr, out)
+			if !logs.HasAttr(tt.wantMsg, "converted", "1") {
+				got, _ := logs.AttrValue(tt.wantMsg, "converted")
+				t.Errorf("logScanOutcome(walkErr=%v) logged converted=%q, want the converted count in the summary", tt.walkErr, got)
 			}
 		})
 	}
@@ -67,30 +64,28 @@ func TestLogEntryFailure_levels(t *testing.T) {
 		wantMsg   string
 		wantLevel slog.Level
 	}{
-		{errors.New("permission denied"), "real failure logs at error", `msg="conversion failed"`, slog.LevelError},
-		{context.Canceled, "cancellation logs at debug", `msg="conversion failed (shutdown)"`, slog.LevelDebug},
-		{context.DeadlineExceeded, "deadline exceeded logs at debug", `msg="conversion failed (shutdown)"`, slog.LevelDebug},
-		{errors.Join(errors.New("read certificate"), context.Canceled), "wrapped cancellation logs at debug", `msg="conversion failed (shutdown)"`, slog.LevelDebug},
+		{errors.New("permission denied"), "real failure logs at error", "conversion failed", slog.LevelError},
+		{context.Canceled, "cancellation logs at debug", "conversion failed (shutdown)", slog.LevelDebug},
+		{context.DeadlineExceeded, "deadline exceeded logs at debug", "conversion failed (shutdown)", slog.LevelDebug},
+		{errors.Join(errors.New("read certificate"), context.Canceled), "wrapped cancellation logs at debug", "conversion failed (shutdown)", slog.LevelDebug},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			prev := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-			t.Cleanup(func() { slog.SetDefault(prev) })
+			logs := captureLogs(t)
 
 			logEntryFailure("example.com/tls.crt", "conversion failed", tt.err)
 
-			out := buf.String()
-			if !strings.Contains(out, tt.wantMsg) {
-				t.Errorf("logEntryFailure(%v) logged %q, want %s", tt.err, out, tt.wantMsg)
+			// CountExact: the shutdown variant is a SUPERSTRING of the plain message, so
+			// a substring check would let the wrong one pass for the real-failure case.
+			if got := logs.CountExact(tt.wantMsg); got != 1 {
+				t.Errorf("logEntryFailure(%v) logged %q, want %s", tt.err, logs.Messages(), tt.wantMsg)
 			}
-			if !strings.Contains(out, "level="+tt.wantLevel.String()) {
-				t.Errorf("logEntryFailure(%v) logged %q, want level %s", tt.err, out, tt.wantLevel)
+			if got := logs.CountLevel(tt.wantLevel, tt.wantMsg); got != 1 {
+				t.Errorf("logEntryFailure(%v) logged %q at %s %d times, want 1", tt.err, tt.wantMsg, tt.wantLevel, got)
 			}
-			if !strings.Contains(out, "path=example.com/tls.crt") {
-				t.Errorf("logEntryFailure(%v) logged %q, want the cert's relative path", tt.err, out)
+			if !logs.HasAttr(tt.wantMsg, "path", "example.com/tls.crt") {
+				t.Errorf("logEntryFailure(%v) logged %q, want the cert's relative path", tt.err, logs.Messages())
 			}
 		})
 	}
@@ -137,19 +132,16 @@ func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing
 	t.Cleanup(func() { _ = inHandle.Close() })
 	sw := &scanWalk{src: &source{root: inHandle}}
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-
 	for _, tt := range []struct {
-		certRel, keyRel, wantMsg, wantLevel string
-		wantOutcome                         conversionStatus
+		certRel, keyRel, wantMsg string
+		wantLevel                slog.Level
+		wantOutcome              conversionStatus
 	}{
-		{"lonely.crt", "lonely.key", "skipping cert without matching key", "level=DEBUG", statusOrphan},
-		{"escape.crt", "escape.key", "skipping cert: cannot stat sibling key", "level=WARN", statusUnreadable},
+		{"lonely.crt", "lonely.key", "skipping cert without matching key", slog.LevelDebug, statusOrphan},
+		{"escape.crt", "escape.key", "skipping cert: cannot stat sibling key", slog.LevelWarn, statusUnreadable},
 	} {
-		buf.Reset()
+		// A fresh recorder per case, replacing the buffer reset the text handler needed.
+		logs := captureLogs(t)
 
 		_, outcome, ok := sw.readPair(t.Context(), tt.certRel, tt.keyRel)
 
@@ -162,9 +154,8 @@ func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing
 		if outcome == statusFailed {
 			t.Errorf("readPair(%q) outcome flips health; neither condition is clearable by a restart", tt.certRel)
 		}
-		out := buf.String()
-		if !strings.Contains(out, tt.wantMsg) || !strings.Contains(out, tt.wantLevel) {
-			t.Errorf("readPair(%q) logged %q, want message %q at %s", tt.certRel, out, tt.wantMsg, tt.wantLevel)
+		if got := logs.CountLevel(tt.wantLevel, tt.wantMsg); got != 1 {
+			t.Errorf("readPair(%q) logged %q, want message %q at %s", tt.certRel, logs.Messages(), tt.wantMsg, tt.wantLevel)
 		}
 	}
 }
@@ -196,20 +187,16 @@ func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			prev := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-			t.Cleanup(func() { slog.SetDefault(prev) })
+			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), tt.result, tt.walkErr)
+			logScanOutcome(t.Context(), tt.result, 0, tt.walkErr)
 
-			out := buf.String()
-			if got := strings.Contains(out, wantMsg); got != tt.wantWarn {
+			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; empty-input notice present = %v, want %v",
-					tt.result, tt.walkErr, out, got, tt.wantWarn)
+					tt.result, tt.walkErr, logs.Messages(), got, tt.wantWarn)
 			}
-			if tt.wantWarn && !strings.Contains(out, "level=WARN") {
-				t.Errorf("logScanOutcome(%+v, nil) logged %q, want the empty-input notice at level WARN", tt.result, out)
+			if tt.wantWarn && logs.CountLevel(slog.LevelWarn, wantMsg) != 1 {
+				t.Errorf("logScanOutcome(%+v, nil) logged %q, want the empty-input notice at level WARN", tt.result, logs.Messages())
 			}
 		})
 	}
@@ -243,20 +230,16 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_all_lack_a_key(t *testin
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			prev := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-			t.Cleanup(func() { slog.SetDefault(prev) })
+			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), tt.result, tt.walkErr)
+			logScanOutcome(t.Context(), tt.result, 0, tt.walkErr)
 
-			out := buf.String()
-			if got := strings.Contains(out, wantMsg); got != tt.wantWarn {
+			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; all-orphan notice present = %v, want %v",
-					tt.result, tt.walkErr, out, got, tt.wantWarn)
+					tt.result, tt.walkErr, logs.Messages(), got, tt.wantWarn)
 			}
-			if tt.wantWarn && !strings.Contains(out, "level=WARN") {
-				t.Errorf("logScanOutcome(%+v, nil) logged %q, want the all-orphan notice at level WARN", tt.result, out)
+			if tt.wantWarn && logs.CountLevel(slog.LevelWarn, wantMsg) != 1 {
+				t.Errorf("logScanOutcome(%+v, nil) logged %q, want the all-orphan notice at level WARN", tt.result, logs.Messages())
 			}
 		})
 	}
@@ -272,30 +255,36 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_all_lack_a_key(t *testin
 func TestLogConversionObservations_levels(t *testing.T) {
 	for _, tc := range []struct {
 		kind      convert.ObservationKind
-		wantLevel string
+		wantLevel slog.Level
 	}{
-		{convert.ObsDuplicateCerts, "level=DEBUG"},
-		{convert.ObsLeafNotFirst, "level=WARN"},
-		{convert.ObsMultipleKeys, "level=WARN"},
-		{convert.ObsIdentityExpired, "level=WARN"},
-		{convert.ObsChainUnverified, "level=WARN"},
+		{convert.ObsDuplicateCerts, slog.LevelDebug},
+		{convert.ObsLeafNotFirst, slog.LevelWarn},
+		{convert.ObsMultipleKeys, slog.LevelWarn},
+		{convert.ObsIdentityExpired, slog.LevelWarn},
+		{convert.ObsChainUnverified, slog.LevelWarn},
 	} {
 		t.Run(string(tc.kind), func(t *testing.T) {
-			buf := captureLogs(t)
+			logs := captureLogs(t)
 			logConversionObservations("example.com/tls.crt", []convert.Observation{
 				{Kind: tc.kind, Detail: "detail text"},
 			})
-			line := recordWith(buf.String(), "cert input observation")
-			if line == "" {
-				t.Fatalf("logConversionObservations(%s) logged %q, want a record", tc.kind, buf.String())
+			const msg = "cert input observation"
+			if !logs.Contains(msg) {
+				t.Fatalf("logConversionObservations(%s) logged %q, want a record", tc.kind, logs.Messages())
 			}
-			if !strings.Contains(line, tc.wantLevel) {
-				t.Errorf("logConversionObservations(%s) = %q, want %s", tc.kind, line, tc.wantLevel)
+			if got := logs.CountLevel(tc.wantLevel, msg); got != 1 {
+				t.Errorf("logConversionObservations(%s) logged at %s %d times, want 1: %q", tc.kind, tc.wantLevel, got, logs.Messages())
 			}
-			for _, want := range []string{"kind=" + string(tc.kind), "path=example.com/tls.crt", "detail"} {
-				if !strings.Contains(line, want) {
-					t.Errorf("logConversionObservations(%s) = %q, want it to carry %q", tc.kind, line, want)
+			// Keyed attributes: the kind must be the `kind` attribute, not text that
+			// happens to appear in the detail or the path.
+			for key, want := range map[string]string{"kind": string(tc.kind), "path": "example.com/tls.crt"} {
+				if !logs.HasAttr(msg, key, want) {
+					got, _ := logs.AttrValue(msg, key)
+					t.Errorf("logConversionObservations(%s) logged %s=%q, want %q", tc.kind, key, got, want)
 				}
+			}
+			if !logs.AttrContains(msg, "detail", "detail") {
+				t.Errorf("logConversionObservations(%s) carries no detail attribute", tc.kind)
 			}
 		})
 	}
@@ -306,10 +295,10 @@ func TestLogConversionObservations_levels(t *testing.T) {
 // every conversion, so a guard that logged an empty summary would add a line per
 // cert per renewal. Runs serially: it swaps slog.Default().
 func TestLogConversionObservations_is_silent_without_observations(t *testing.T) {
-	buf := captureLogs(t)
+	logs := captureLogs(t)
 	logConversionObservations("example.com/tls.crt", nil)
-	if out := buf.String(); out != "" {
-		t.Errorf("logConversionObservations(no observations) logged %q, want no output at all", out)
+	if logs.Len() != 0 {
+		t.Errorf("logConversionObservations(no observations) logged %q, want no output at all", logs.Messages())
 	}
 }
 
@@ -326,27 +315,26 @@ func TestNoteUnreadableInput_levels(t *testing.T) {
 		name      string
 		what      string
 		wantMsg   string
-		wantLevel string
+		wantLevel slog.Level
 	}{
-		{fs.ErrNotExist, "a vanished certificate is a benign race", "certificate", "certificate vanished during the scan", "level=DEBUG"},
-		{fs.ErrNotExist, "a vanished key is a benign race", "private key", "private key vanished during the scan", "level=DEBUG"},
-		{errors.New("permission denied"), "an unreadable certificate warns", "certificate", "cannot read certificate", "level=WARN"},
+		{fs.ErrNotExist, "a vanished certificate is a benign race", "certificate", "certificate vanished during the scan", slog.LevelDebug},
+		{fs.ErrNotExist, "a vanished key is a benign race", "private key", "private key vanished during the scan", slog.LevelDebug},
+		{errors.New("permission denied"), "an unreadable certificate warns", "certificate", "cannot read certificate", slog.LevelWarn},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := captureLogs(t)
+			logs := captureLogs(t)
 			noteUnreadableInput("example.com/tls.crt", tc.what, tc.err)
-			out := buf.String()
-			if !strings.Contains(out, tc.wantMsg) || !strings.Contains(out, tc.wantLevel) {
-				t.Fatalf("noteUnreadableInput(%v) logged %q, want %q at %s", tc.err, out, tc.wantMsg, tc.wantLevel)
+			if got := logs.CountLevel(tc.wantLevel, tc.wantMsg); got != 1 {
+				t.Fatalf("noteUnreadableInput(%v) logged %q, want %q at %s", tc.err, logs.Messages(), tc.wantMsg, tc.wantLevel)
 			}
-			if !strings.Contains(out, "path=example.com/tls.crt") {
-				t.Errorf("noteUnreadableInput(%v) logged %q, want the cert's relative path", tc.err, out)
+			if !logs.HasAttr(tc.wantMsg, "path", "example.com/tls.crt") {
+				t.Errorf("noteUnreadableInput(%v) logged %q, want the cert's relative path", tc.err, logs.Messages())
 			}
 			// The remediation hint belongs to the actionable arm only: on the benign
 			// race there is nothing for the operator to do.
-			hasHint := strings.Contains(out, "remediation=")
-			if wantHint := tc.wantLevel == "level=WARN"; hasHint != wantHint {
-				t.Errorf("noteUnreadableInput(%v) remediation hint present = %v, want %v: %q", tc.err, hasHint, wantHint, out)
+			_, hasHint := logs.AttrValue(tc.wantMsg, "remediation")
+			if wantHint := tc.wantLevel == slog.LevelWarn; hasHint != wantHint {
+				t.Errorf("noteUnreadableInput(%v) remediation hint present = %v, want %v: %q", tc.err, hasHint, wantHint, logs.Messages())
 			}
 		})
 	}

@@ -50,11 +50,10 @@ const maxKeyBlocks = 16
 // rather than silently truncated, because a PFX built from a truncated chain
 // fails validation obscurely at the consumer instead of here.
 //
-// It is unexported because Analyse is the package's only production
-// conversion edge: it owns the cert/key match, the leaf/chain split and the PFX
-// write, so publishing the lower-level parser would offer a second contract
-// that bypasses those invariants with no production consumer. The package's own
-// tests reach it through export_test.go.
+// It is unexported because Analyse owns the invariants a caller could otherwise
+// bypass: the cert/key match and the leaf/chain split. Publishing the
+// lower-level parser would offer a second contract around them with no
+// production consumer. The package's own tests reach it through export_test.go.
 func parseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
 	declaredCertBlocks := countDeclaredBlocks(pemBytes, certBeginMarker)
 	if declaredCertBlocks > maxChainCerts {
@@ -193,7 +192,15 @@ const maxBlockTypeLogLen = 64
 // containing a rune that fails unicode.IsPrint gets strconv.Quote'd, which covers C0
 // controls, the C1 block (U+0080-U+009F escape introducers), Unicode Bidi_Control
 // (the Trojan-Source reordering class) and U+2028/U+2029; invalid UTF-8 is caught the
-// same way through RuneError. JSONHandler, the other slogx option, escapes them too.
+// same way through RuneError.
+//
+// JSONHandler, the other slogx option, does NOT: it escapes ASCII controls, the
+// quote/backslash pair, U+2028/U+2029 and invalid UTF-8 (log/slog
+// json_handler.go safeSet + the explicit \u202x case), and passes C1 and
+// Bidi_Control through as ordinary multi-byte UTF-8. Only TextHandler is
+// reachable today - main.go calls slogx.Setup with no format - so switching this
+// app to JSON output means widening dropUnloggable first, not just flipping the
+// handler.
 //
 // The one exception is U+007F DEL: it is below utf8.RuneSelf and sits in slog's
 // safeSet, so it reaches the log raw. That is the only rune this function has to
@@ -231,11 +238,12 @@ func dropUnloggable(r rune) rune {
 	return r
 }
 
-// boundedTextError caps the rendered text of a certificate-derived error. The
+// boundedTextError caps the rendered text of an input-derived error. The
 // crypto/x509 parser interpolates certificate-controlled fields into several of
-// its messages with %q (a SAN URI, a name constraint, an extension OID), and a
-// certificate is capped only by the caller's input read bound (10 MB), so the
-// unbounded text would
+// its messages with %q (a SAN URI, a name constraint, an extension OID), and
+// x509's PKCS#8 unknown-algorithm message interpolates an OBJECT IDENTIFIER
+// decoded from the key file. Either file is capped only by the caller's input
+// read bound (10 MB), so the unbounded text would
 // put a multi-megabyte line into the log of every scan that retries the pair.
 // It shares the same bound (maxSubjectLogLen) and the same partial-rune handling
 // as every other certificate-controlled interpolation in this package. Unwrap is
@@ -431,7 +439,7 @@ func parsePrivateKeyBlock(block *pem.Block) (crypto.Signer, error) {
 		parseErr = sec1Err
 	}
 	return nil, fmt.Errorf("failed to parse private key from %s block (tried PKCS8, PKCS1, SEC1): %w",
-		block.Type, parseErr)
+		block.Type, boundedTextError{parseErr})
 }
 
 // PasswordEncodingIssues reports the ways a PFX password cannot survive the

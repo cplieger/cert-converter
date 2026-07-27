@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
-	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -117,18 +116,6 @@ func TestHandleFsEvent(t *testing.T) {
 	}
 }
 
-func TestNew_applies_debounce_and_fallback_options(t *testing.T) {
-	t.Parallel()
-	w := New("/input", func(context.Context) {}, WithDebounce(750*time.Millisecond), WithFallback(3*time.Hour))
-
-	if w.debounce != 750*time.Millisecond {
-		t.Errorf("New(WithDebounce(750ms)) debounce = %v, want %v", w.debounce, 750*time.Millisecond)
-	}
-	if w.fallback != 3*time.Hour {
-		t.Errorf("New(WithFallback(3h)) fallback = %v, want %v", w.fallback, 3*time.Hour)
-	}
-}
-
 // TestHandleFsEvent_rescans_even_when_the_new_subtree_cannot_be_watched pins the
 // return value of the Create-directory path when addWatchDirs fails: the event
 // must still report true so the debounced rescan converts a cert pair that
@@ -148,5 +135,29 @@ func TestHandleFsEvent_rescans_even_when_the_new_subtree_cannot_be_watched(t *te
 
 	if !got {
 		t.Error("handleFsEvent(Create dir, unwatchable) = false, want true: a cert pair already inside the new directory would otherwise wait for the fallback rescan")
+	}
+}
+
+// TestHandleFsEvent_rescans_when_a_repaired_directory_cannot_be_rewatched pins
+// the Chmod twin of the Create-side contract: when the permission-repair arm
+// cannot re-attach the subtree's watches, the event must still report true so
+// the debounced rescan converts the pair that just became readable. Returning
+// false there would leave the repaired directory converting nothing until the
+// next fallback tick, and never with the fallback disabled -- the exact
+// stuck-unhealthy state the Chmod arm exists to end.
+func TestHandleFsEvent_rescans_when_a_repaired_directory_cannot_be_rewatched(t *testing.T) {
+	t.Parallel()
+	watcher := newClosedTestWatcher(t)
+	root := t.TempDir()
+	repaired := filepath.Join(root, "example.com")
+	if err := os.MkdirAll(repaired, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	w := New(root, func(context.Context) {})
+
+	got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: repaired, Op: fsnotify.Chmod})
+
+	if !got {
+		t.Error("handleFsEvent(Chmod dir, unwatchable) = false, want true: the permission repair would otherwise convert nothing until the next fallback tick, and never with the fallback disabled")
 	}
 }

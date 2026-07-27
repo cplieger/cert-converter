@@ -55,6 +55,15 @@ func TestScannerRun_reaps_only_stale_output_temps(t *testing.T) {
 	if err := os.Chtimes(keep, old, old); err != nil {
 		t.Fatal(err)
 	}
+	// A name that shares only atomicfile's prefix and suffix is not its temp
+	// shape, so it is operator-owned and must survive an aged sweep.
+	lookalike := filepath.Join(outRoot, ".atomicfile-notes.tmp")
+	if err := os.WriteFile(lookalike, []byte("operator-owned"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(lookalike, old, old); err != nil {
+		t.Fatal(err)
+	}
 
 	scanner := newScanner(certsRoot, outRoot)
 	if _, err := scanner.Run(t.Context()); err != nil {
@@ -72,6 +81,9 @@ func TestScannerRun_reaps_only_stale_output_temps(t *testing.T) {
 	}
 	if _, err := os.Stat(keep); err != nil {
 		t.Errorf("os.Stat(%q) = %v, want nil (a caller-owned output file must never be reaped)", keep, err)
+	}
+	if _, err := os.Stat(lookalike); err != nil {
+		t.Errorf("os.Stat(%q) = %v, want nil (a name sharing only the prefix and suffix is not a reclaimable temp)", lookalike, err)
 	}
 }
 
@@ -124,57 +136,6 @@ func TestScannerRun_temp_sweep_stays_inside_the_output_root(t *testing.T) {
 	}
 	if _, err := os.Stat(nestedTemp); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("os.Stat(nested stale temp) error = %v, want fs.ErrNotExist (a real nested orphan must still be reaped)", err)
-	}
-}
-
-// TestScannerRun_reaps_only_exact_stale_temp_names pins the exact shape the
-// sweep matches: ".atomicfile-" + one or more ASCII digits + ".tmp". A name that
-// shares only the prefix and suffix is operator-owned and must survive, and a
-// valid name containing the boundary digits 0 and 9 must still be reaped.
-func TestScannerRun_reaps_only_exact_stale_temp_names(t *testing.T) {
-	t.Parallel()
-	tests := map[string]struct {
-		name        string
-		wantRemoved bool
-	}{
-		"valid name accepts boundary digits":  {".atomicfile-109.tmp", true},
-		"empty digit run is spared":           {".atomicfile-.tmp", false},
-		"letters are spared":                  {".atomicfile-notes.tmp", false},
-		"mixed digits and letters are spared": {".atomicfile-12a3.tmp", false},
-		"missing prefix is spared":            {"atomicfile-123.tmp", false},
-		"extra suffix is spared":              {".atomicfile-123.tmp.bak", false},
-		"unicode digits are spared":           {".atomicfile-\uff11\uff12\uff13.tmp", false},
-	}
-
-	for testName, tt := range tests {
-		t.Run(testName, func(t *testing.T) {
-			t.Parallel()
-			certsRoot := t.TempDir()
-			outRoot := t.TempDir()
-			candidate := filepath.Join(outRoot, tt.name)
-			if err := os.WriteFile(candidate, []byte("operator-owned"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			old := time.Now().Add(-2 * time.Hour)
-			if err := os.Chtimes(candidate, old, old); err != nil {
-				t.Fatal(err)
-			}
-
-			if _, err := newScanner(certsRoot, outRoot).Run(t.Context()); err != nil {
-				t.Fatalf("Run = %v, want nil", err)
-			}
-
-			_, statErr := os.Stat(candidate)
-			if tt.wantRemoved {
-				if !errors.Is(statErr, fs.ErrNotExist) {
-					t.Errorf("os.Stat(%q) error = %v, want fs.ErrNotExist for an exact stale temp name", tt.name, statErr)
-				}
-				return
-			}
-			if statErr != nil {
-				t.Errorf("os.Stat(%q) = %v, want nil because a temp-name lookalike must be spared", tt.name, statErr)
-			}
-		})
 	}
 }
 

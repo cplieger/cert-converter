@@ -368,3 +368,116 @@ func testASN1Marshal(t *testing.T, value any) []byte {
 	}
 	return der
 }
+
+func TestInspect_rejects_more_than_one_shrouded_key_bag(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(append(append([]byte{}, m.LeafPEM...), m.CAPEM...), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+	if _, err := Inspect(pfx); err != nil {
+		t.Fatalf("setup: Inspect(unmodified bundle) = %v, want nil", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*testing.T, []contentInfo) []contentInfo
+		wantErr bool
+	}{
+		{"the control: re-encoded unchanged", func(_ *testing.T, safes []contentInfo) []contentInfo { return safes }, false},
+		{"a second bag inside one plaintext safe", duplicateTestKeyBag, true},
+		{"a second plaintext safe carrying its own bag", duplicateTestPlaintextSafe, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var preamble pfxPreamble
+			testASN1Unmarshal(t, pfx, &preamble)
+			setTestAuthenticatedSafes(t, &preamble, tc.mutate(t, testAuthenticatedSafes(t, &preamble)))
+			got, err := Inspect(testASN1Marshal(t, preamble))
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("Inspect(%s) = %v, want nil", tc.name, err)
+				}
+				if got.Profile != EncNameModern2023 {
+					t.Errorf("Inspect(%s) reported %q, want %q", tc.name, got.Profile, EncNameModern2023)
+				}
+				return
+			}
+			if !errors.Is(err, ErrProfileUnknown) {
+				t.Errorf("Inspect(bundle with %s) = %v, want ErrProfileUnknown", tc.name, err)
+			}
+		})
+	}
+}
+
+// testAuthenticatedSafes decodes the authenticated safe list out of a preamble.
+func testAuthenticatedSafes(t *testing.T, p *pfxPreamble) []contentInfo {
+	t.Helper()
+	var inner []byte
+	testASN1Unmarshal(t, p.AuthSafe.Content.Bytes, &inner)
+	var safes []contentInfo
+	testASN1Unmarshal(t, inner, &safes)
+	return safes
+}
+
+// setTestAuthenticatedSafes re-encodes a safe list back into the preamble.
+func setTestAuthenticatedSafes(t *testing.T, p *pfxPreamble, safes []contentInfo) {
+	t.Helper()
+	inner := testASN1Marshal(t, safes)
+	p.AuthSafe.Content.Bytes = testASN1Marshal(t, inner)
+	p.AuthSafe.Content.FullBytes = nil
+}
+
+// plaintextTestSafeIndex returns the index of the first data-type safe, which is
+// where every profile puts the shrouded private-key bag.
+func plaintextTestSafeIndex(t *testing.T, safes []contentInfo) int {
+	t.Helper()
+	for i := range safes {
+		got, err := decodeOID(safes[i].ContentType)
+		if err != nil {
+			t.Fatalf("setup: decode safe content type: %v", err)
+		}
+		if got.Equal(oidDataContentType) {
+			return i
+		}
+	}
+	t.Fatal("setup: no plaintext safe in the bundle")
+	return -1
+}
+
+// duplicateTestKeyBag adds a second shrouded key bag INSIDE the plaintext safe.
+func duplicateTestKeyBag(t *testing.T, safes []contentInfo) []contentInfo {
+	t.Helper()
+	safe := &safes[plaintextTestSafeIndex(t, safes)]
+	var inner []byte
+	testASN1Unmarshal(t, safe.Content.Bytes, &inner)
+	var bags []safeBag
+	testASN1Unmarshal(t, inner, &bags)
+	for i := range bags {
+		id, err := decodeOID(bags[i].ID)
+		if err != nil {
+			t.Fatalf("setup: decode bag id: %v", err)
+		}
+		if !id.Equal(oidPKCS8ShroudedKeyBag) {
+			continue
+		}
+		safeDER := testASN1Marshal(t, append(bags, bags[i]))
+		safe.Content.Bytes = testASN1Marshal(t, safeDER)
+		safe.Content.FullBytes = nil
+		return safes
+	}
+	t.Fatal("setup: no shrouded key bag in the plaintext safe")
+	return nil
+}
+
+// duplicateTestPlaintextSafe adds a SECOND plaintext safe carrying its own copy of
+// the shrouded key bag, which is the cross-safe case merge refuses.
+func duplicateTestPlaintextSafe(t *testing.T, safes []contentInfo) []contentInfo {
+	t.Helper()
+	return append(safes, safes[plaintextTestSafeIndex(t, safes)])
+}

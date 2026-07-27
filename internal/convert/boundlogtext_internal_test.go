@@ -2,6 +2,9 @@ package convert
 
 import (
 	"bytes"
+	"encoding/asn1"
+	"encoding/pem"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -110,5 +113,55 @@ func TestBoundLogText_bounds_and_marks(t *testing.T) {
 	}
 	if len(got) > maxSubjectLogLen+len(truncationMarker) {
 		t.Errorf("boundLogText(oversized) is %d bytes, want at most limit+marker", len(got))
+	}
+}
+
+// TestBoundedTextError_keeps_the_wrapped_error_reachable pins the Unwrap contract
+// boundedTextError's doc comment promises. The type replaces a crypto/x509 error's
+// rendered text with a bounded copy, so without Unwrap the wrapping is opaque and
+// any errors.Is / errors.As classification a caller applies to a parse failure
+// silently stops matching -- a failure mode no test would otherwise notice,
+// because the bounded message still reads correctly.
+func TestBoundedTextError_keeps_the_wrapped_error_reachable(t *testing.T) {
+	t.Parallel()
+	inner := errors.New("x509: malformed certificate\u007f")
+	wrapped := boundedTextError{inner}
+
+	if !errors.Is(wrapped, inner) {
+		t.Error("errors.Is(boundedTextError{inner}, inner) = false, want true: the wrapped error must stay reachable")
+	}
+	if strings.ContainsRune(wrapped.Error(), 0x7f) {
+		t.Errorf("boundedTextError.Error() = %q, want the unloggable rune dropped", wrapped.Error())
+	}
+}
+
+// TestParsePrivateKey_bounds_an_oversized_pkcs8_algorithm_oid pins the key-side
+// half of the bounded-text rule. x509's PKCS#8 fallback ends in "unknown
+// algorithm: <OID>", interpolating an OBJECT IDENTIFIER decoded straight out of
+// the key file, and asn1 allocates one component per content byte -- so a key
+// inside the 10 MB input read bound renders a multi-megabyte ERROR line, re-emitted
+// on every scan because a failed pair is never cached.
+func TestParsePrivateKey_bounds_an_oversized_pkcs8_algorithm_oid(t *testing.T) {
+	t.Parallel()
+	oid := testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagOID, Bytes: bytes.Repeat([]byte{0x01}, 64<<10)})
+	algorithm := asn1.RawValue{Tag: asn1.TagSequence, IsCompound: true, Bytes: oid}
+	der := testASN1Marshal(t, struct {
+		Version    int
+		Algo       asn1.RawValue
+		PrivateKey []byte
+	}{Version: 0, Algo: algorithm, PrivateKey: []byte{}})
+
+	_, err := ParsePrivateKey(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
+	if err == nil {
+		t.Fatal("ParsePrivateKey(PKCS#8 with a 64 KB algorithm OID) = nil error, want a parse failure")
+	}
+	// The static prefix names the block type and the parsers tried; everything
+	// input-derived past it is what the bound has to cover.
+	const staticPrefix = len("failed to parse private key from PRIVATE KEY block (tried PKCS8, PKCS1, SEC1): ")
+	if want := staticPrefix + maxSubjectLogLen + len(truncationMarker); len(err.Error()) > want {
+		t.Errorf("error is %d bytes, want at most %d: the OID reaches the log unbounded", len(err.Error()), want)
+	}
+	if !strings.HasSuffix(err.Error(), truncationMarker) {
+		t.Errorf("error = %q, want the truncation marked", err.Error())
 	}
 }

@@ -124,7 +124,8 @@ func FuzzParsePrivateKey(f *testing.F) {
 			return
 		}
 		// Must implement crypto.Signer.
-		if _, ok := key.(crypto.Signer); !ok {
+		signer, ok := key.(crypto.Signer)
+		if !ok {
 			t.Fatal("key does not implement crypto.Signer")
 		}
 		// Must be one of the expected types.
@@ -132,6 +133,30 @@ func FuzzParsePrivateKey(f *testing.F) {
 		case *rsa.PrivateKey, *ecdsa.PrivateKey, ed25519.PrivateKey:
 		default:
 			t.Fatalf("unexpected key type: %T", key)
+		}
+		// A key with no public half cannot be matched against a certificate, which
+		// is the only thing identity selection has to work with.
+		if signer.Public() == nil {
+			t.Fatalf("parsed %T reports a nil public half", key)
+		}
+		// Round trip: a key this parser accepted must survive its own canonical
+		// PKCS#8 re-encoding unchanged. A marshal refusal is a stdlib limit on a
+		// degenerate key, not a parser defect, so it ends the case instead of failing
+		// it.
+		der, marshalErr := x509.MarshalPKCS8PrivateKey(key)
+		if marshalErr != nil {
+			return
+		}
+		again, reErr := convert.ParsePrivateKey(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
+		if reErr != nil {
+			t.Fatalf("a key this parser accepted no longer parses after its own PKCS#8 re-encoding: %v", reErr)
+		}
+		reDER, reMarshalErr := x509.MarshalPKCS8PrivateKey(again)
+		if reMarshalErr != nil {
+			t.Fatalf("re-parsed %T cannot be marshalled: %v", again, reMarshalErr)
+		}
+		if !bytes.Equal(der, reDER) {
+			t.Fatal("the private key changed across its own PKCS#8 round trip")
 		}
 	})
 }

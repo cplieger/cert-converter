@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -205,32 +206,6 @@ func TestScanAndSetHealth_cancelled_context_leaves_marker_untouched(t *testing.T
 	}
 }
 
-// TestFallbackLogValue pins the startup log's rendering of the fallback
-// cadence, the one operator-visible decision left in run(): a disabled
-// rescan must read "disabled", never a bare "0s".
-func TestFallbackLogValue(t *testing.T) {
-	t.Parallel()
-
-	for _, tc := range []struct {
-		name string
-		in   time.Duration
-		want string
-	}{
-		{"explicit zero is disabled", 0, "disabled"},
-		{"negative is disabled", -1 * time.Hour, "disabled"},
-		{"default cadence", 6 * time.Hour, "6h0m0s"},
-		{"one hour", 1 * time.Hour, "1h0m0s"},
-		{"clamp ceiling", 87600 * time.Hour, "87600h0m0s"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			if got := fallbackLogValue(tc.in); got != tc.want {
-				t.Errorf("fallbackLogValue(%v) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
-	}
-}
-
 // TestDispatchArgs pins the argv policy behind the runProbe seam: the health
 // subcommand probes the marker at health.DefaultPath, an unrecognized argument
 // is a usage error that never probes and never starts a watcher, and a bare
@@ -250,7 +225,7 @@ func TestDispatchArgs(t *testing.T) {
 		// watcher's health marker and started a second watcher over the same
 		// output tree. It is now a usage error that never reaches the marker.
 		{"typo is a usage error and never starts a watcher", []string{"cert-watcher", "helth"}, false, exitUsage},
-		// h-f1: `health` plus a trailing operand used to enter the health case
+		// `health` plus a trailing operand used to enter the health case
 		// and probe while silently ignoring the extra argument. The subcommand
 		// must consume the whole of argv or the invocation is a usage error.
 		{"health with a trailing argument is a usage error", []string{"cert-watcher", "health", "typo"}, false, exitUsage},
@@ -331,6 +306,74 @@ func TestDispatchArgs_arms_the_marker_lease(t *testing.T) {
 			if got := health.ProbeCheck(marker, gotOpts...); got != tc.wantCode {
 				t.Errorf("ProbeCheck(marker aged %v, opts from FALLBACK_SCAN_HOURS=%q) = %d, want %d",
 					tc.markerAge, tc.fallbackHours, got, tc.wantCode)
+			}
+		})
+	}
+}
+
+// captureStderr redirects os.Stderr to a temp file for the duration of fn and
+// returns everything written to it. A temp file rather than an os.Pipe: a pipe
+// blocks its writer once the buffer fills, which would deadlock the test.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := os.Stderr
+	os.Stderr = f
+	fn()
+	os.Stderr = prev
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+// TestDispatchArgs_usage_error_names_the_offending_argument pins the usage
+// diagnostic, which is the only operator-visible output of the reject path: the
+// rejected token is quoted back on stderr and the two usage lines follow it, so
+// a mistyped HEALTHCHECK override is diagnosable from the container log instead
+// of being a bare exit 2. It also pins that the reject path never probes.
+// Serial (no t.Parallel): it swaps the process-global os.Stderr and runProbe.
+func TestDispatchArgs_usage_error_names_the_offending_argument(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		args      []string
+		wantParts []string
+	}{
+		{
+			name:      "unrecognized argument is quoted back",
+			args:      []string{"cert-watcher", "helth"},
+			wantParts: []string{`unrecognized argument "helth"`, "usage: cert-watcher", "cert-watcher health"},
+		},
+		{
+			name:      "trailing operands are quoted back",
+			args:      []string{"cert-watcher", "health", "typo"},
+			wantParts: []string{`unexpected trailing arguments ["typo"]`, "usage: cert-watcher", "cert-watcher health"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := runProbe
+			runProbe = func(string, ...health.ProbeOption) {
+				t.Error("a usage error must never probe the health marker")
+			}
+			t.Cleanup(func() { runProbe = prev })
+
+			var code int
+			out := captureStderr(t, func() { code = dispatchArgs(tc.args) })
+
+			if code != exitUsage {
+				t.Errorf("dispatchArgs(%q) = %d, want %d", tc.args, code, exitUsage)
+			}
+			for _, want := range tc.wantParts {
+				if !strings.Contains(out, want) {
+					t.Errorf("dispatchArgs(%q) stderr = %q, want it to contain %q", tc.args, out, want)
+				}
 			}
 		})
 	}

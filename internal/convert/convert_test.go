@@ -12,7 +12,6 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -86,9 +85,18 @@ func TestParseCertChain(t *testing.T) {
 		}
 		// Past the bound the file is refused before any DER work: one 10 MB input
 		// can otherwise declare ~19,000 certificates and spend hours of CPU in the
-		// all-pairs candidate graph on the scan's only goroutine.
-		if _, err := convert.ParseCertChain(bulk(100)); err == nil {
-			t.Error("convert.ParseCertChain(100 blocks) = nil error, want a refusal past the block bound")
+		// all-pairs candidate graph on the scan's only goroutine. One block past the
+		// bound is the case that pins the limit to 64 rather than to a range, and the
+		// message must name the number, because that is where an operator learns it.
+		boundErr := func() error {
+			_, err := convert.ParseCertChain(bulk(65))
+			return err
+		}()
+		if boundErr == nil {
+			t.Fatal("convert.ParseCertChain(65 blocks) = nil error, want a refusal one block past the bound")
+		}
+		if !strings.Contains(boundErr.Error(), "more than the 64 this app converts") {
+			t.Errorf("convert.ParseCertChain(65 blocks) error = %q, want it to name the 64-block limit", boundErr.Error())
 		}
 	})
 }
@@ -324,6 +332,27 @@ func TestParsePrivateKey_unparseable_key_data(t *testing.T) {
 	}
 }
 
+// TestParsePrivateKey_diagnoses_a_malformed_block_with_its_own_parser pins the
+// label-specific error selection parsePrivateKeyBlock documents: a malformed
+// block labelled "EC PRIVATE KEY" must report the SEC1 parser's failure, never
+// the PKCS#8 one, because the PKCS#8 message points an operator at the wrong
+// encoding while their file is a damaged SEC1 key.
+func TestParsePrivateKey_diagnoses_a_malformed_block_with_its_own_parser(t *testing.T) {
+	t.Parallel()
+	badEC := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: []byte("this is not valid DER")})
+
+	_, err := convert.ParsePrivateKey(badEC)
+	if err == nil {
+		t.Fatal("convert.ParsePrivateKey(malformed EC PRIVATE KEY block) = nil error, want a parse failure")
+	}
+	if !strings.Contains(err.Error(), "failed to parse EC private key") {
+		t.Errorf("error = %q, want the SEC1 parser's own failure for an EC-labelled block", err.Error())
+	}
+	if strings.Contains(err.Error(), "pkcs8") {
+		t.Errorf("error = %q, want no PKCS#8 diagnosis for an EC-labelled block: it names the wrong encoding", err.Error())
+	}
+}
+
 func TestParsePrivateKey_empty_input(t *testing.T) {
 	t.Parallel()
 	_, err := convert.ParsePrivateKey([]byte{})
@@ -474,71 +503,6 @@ func TestConvertPair_round_trips_chain_for_every_encoder_profile(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestConvertPair_confines_the_write_to_the_output_root pins the guarantee of
-// item h-f8 on the path production actually takes: the confined write must
-// produce a decodable 0600 PFX, and a symlinked subdirectory under the output
-// root must not redirect the private-key-bearing PFX outside it.
-func TestConvertPair_confines_the_write_to_the_output_root(t *testing.T) {
-	t.Parallel()
-	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "confined", "ecdsa")
-
-	t.Run("writes a decodable pfx at mode 0600", func(t *testing.T) {
-		t.Parallel()
-		dir := t.TempDir()
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer root.Close()
-		if _, err := convertPairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", "pw", convert.EncNameModern2023); err != nil {
-			t.Fatalf("convertPairInRoot = error %v, want nil", err)
-		}
-		info, statErr := os.Stat(filepath.Join(dir, "out.pfx"))
-		if statErr != nil {
-			t.Fatalf("convertPairInRoot did not write a file: %v", statErr)
-		}
-		if perm := info.Mode().Perm(); perm != 0o600 {
-			t.Errorf("convertPairInRoot wrote mode %o, want 600", perm)
-		}
-		pfxData, readErr := os.ReadFile(filepath.Join(dir, "out.pfx"))
-		if readErr != nil {
-			t.Fatalf("read pfx written by convertPairInRoot: %v", readErr)
-		}
-		_, leaf, _, decErr := pkcs12.DecodeChain(pfxData, "pw")
-		if decErr != nil {
-			t.Fatalf("decode pfx written by convertPairInRoot: %v", decErr)
-		}
-		if leaf.Subject.CommonName != "confined" {
-			t.Errorf("convertPairInRoot leaf CN = %q, want %q", leaf.Subject.CommonName, "confined")
-		}
-	})
-
-	t.Run("refuses a subdirectory symlinked outside the root", func(t *testing.T) {
-		if runtime.GOOS == "windows" {
-			t.Skip("symlink semantics differ on Windows")
-		}
-		t.Parallel()
-		outside := t.TempDir()
-		dir := t.TempDir()
-		if err := os.Symlink(outside, filepath.Join(dir, "escape")); err != nil {
-			t.Fatal(err)
-		}
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer root.Close()
-
-		_, writeErr := convertPairInRoot(t.Context(), certPEM, keyPEM, root, "escape/out.pfx", "pw", convert.EncNameModern2023)
-		if _, statErr := os.Stat(filepath.Join(outside, "out.pfx")); statErr == nil {
-			t.Error("convertPairInRoot wrote the PFX outside the output root through a symlinked subdirectory")
-		}
-		if writeErr == nil {
-			t.Error("convertPairInRoot(symlinked subdirectory) = nil error, want a confinement error")
-		}
-	})
 }
 
 // TestConvertPair_names_the_matching_certificate_for_a_leaf_last_chain pins the

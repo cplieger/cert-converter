@@ -24,6 +24,12 @@ const (
 	pfxDirMode  = 0o750
 )
 
+// outputPermRemediation is the one remediation hint every /output-side WARN in this
+// package carries. It is a single const rather than a literal per call site because
+// all five name the SAME operator action, and an operator who sees two of them in
+// one scan must not read two different pieces of advice for one cause.
+const outputPermRemediation = "check /output ownership and permissions for the UID in user:"
+
 // store owns every touch of the output tree.
 //
 // Before this type, output responsibility was spread across three places: the
@@ -51,6 +57,13 @@ func (s *store) write(ctx context.Context, rel string, pfx []byte) error {
 	if _, err := atomicfile.WriteFileInRoot(ctx, s.root, rel, pfx,
 		atomicfile.WithMode(pfxFileMode),
 		atomicfile.WithMkdirMode(pfxDirMode),
+		// Mirror the read bound: isCurrent reads this same file back under
+		// maxPFXSize, so a bundle this app writes above that cap is one its own
+		// currency check would refuse, which is the permanent rewrite loop
+		// maxPFXSize's comment exists to prevent. The cap is checked before the
+		// temp is staged, so a violation leaves the previous bundle intact and
+		// fails the entry loudly instead of churning it silently forever.
+		atomicfile.WithMaxBytes(maxPFXSize),
 	); err != nil {
 		return fmt.Errorf("write pfx: %w", err)
 	}
@@ -112,7 +125,6 @@ func (s *store) sweepStaleTemps(ctx context.Context) {
 // misconfigurations that let stale atomic-write artifacts accumulate unnoticed,
 // so they carry a remediation hint at the default log level.
 func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
-	const remediation = "check /output ownership and permissions for the UID in user:"
 	if walkErr != nil {
 		if IsShutdown(walkErr) {
 			// Shutdown, not an operator-actionable cleanup failure; the input
@@ -130,11 +142,11 @@ func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
 	}
 	if res.Failed > 0 {
 		slog.Warn("some stale output temps could not be inspected or removed", "dir", s.root.Name(),
-			"count", res.Failed, "remediation", remediation)
+			"count", res.Failed, "remediation", outputPermRemediation)
 	}
 	if res.Unreadable > 0 {
 		slog.Warn("some output paths could not be inspected during stale temp cleanup",
-			"dir", s.root.Name(), "count", res.Unreadable, "remediation", remediation)
+			"dir", s.root.Name(), "count", res.Unreadable, "remediation", outputPermRemediation)
 	}
 }
 
@@ -195,7 +207,7 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 		// below, which already regenerates.
 		slog.Warn("cannot stat prior pfx; regenerating",
 			"path", rel, "error", err,
-			"remediation", "check /output ownership and permissions for the UID in user:")
+			"remediation", outputPermRemediation)
 		return false, nil
 	case !fi.Mode().IsRegular():
 		// A directory, symlink or device node at the output name is not a usable
@@ -218,16 +230,21 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 
 	prior, err := s.readBoundedPFX(ctx, rel)
 	if err != nil {
-		if ctx.Err() != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
 			// Shutdown, not an unreadable output: propagate so the scan reports the
-			// cancellation rather than rewriting on the way out.
-			return false, fmt.Errorf("read prior pfx: %w", err)
+			// cancellation rather than rewriting on the way out. Join ctx.Err() with
+			// the read error: atomicfile checks the context only on ENTRY, so a read
+			// that raced the cancellation returns a plain ENOENT/ErrNotRegular here,
+			// and wrapping that alone made IsShutdown false and logged a routine
+			// shutdown at ERROR. The Decode gate below already wraps ctx.Err() for
+			// the same reason; joining keeps the read error for diagnosis.
+			return false, fmt.Errorf("read prior pfx: %w", errors.Join(ctxErr, err))
 		}
 		// Same reasoning as the stat failure above: unreadable means "cannot tell",
 		// which resolves to stale.
 		slog.Warn("cannot read prior pfx; regenerating",
 			"path", rel, "error", err,
-			"remediation", "check /output ownership and permissions for the UID in user:")
+			"remediation", outputPermRemediation)
 		return false, nil
 	}
 
@@ -381,7 +398,7 @@ func (s *store) logOrphanWalkOutcome(unreadable, symlinked int) {
 	if unreadable > 0 {
 		slog.Warn("some output paths could not be read while looking for orphans; orphan removal is disabled for this scan",
 			"dir", s.root.Name(), "count", unreadable,
-			"remediation", "check /output ownership and permissions for the UID in user:")
+			"remediation", outputPermRemediation)
 	}
 	if symlinked > 0 {
 		slog.Warn("output tree contains symlinks; orphan removal is disabled for this scan because writes and the orphan walk resolve paths differently",
@@ -405,12 +422,22 @@ type reapContext struct {
 	shutdown bool
 }
 
+// enumerationClean reports whether nothing PREVENTED the walk from enumerating the
+// whole input tree. It is the shared half of two decisions that differ by one term:
+// enumeratedInput adds scanTotal > 0 (an empty tree is clean but gives the output
+// nothing to be compared against), while Scanner.Run's observation-state prune does
+// not. Spelling the veto set once means a new veto field cannot be added to one
+// caller and missed in the other.
+func (r reapContext) enumerationClean() bool {
+	return r.walkCompleted && r.unreadable == 0 && r.unresolved == 0
+}
+
 // enumeratedInput reports whether `seen` can be trusted as a COMPLETE enumeration
 // of the input tree. It is the precondition for calling an output an orphan AT ALL,
 // not just for deleting one: without it every bundle whose cert the scan never
 // reached reads as an orphan.
 func (r reapContext) enumeratedInput() bool {
-	return r.walkCompleted && r.unreadable == 0 && r.unresolved == 0 && r.scanTotal > 0
+	return r.enumerationClean() && r.scanTotal > 0
 }
 
 // safeToReap reports whether the input enumeration is complete enough to justify
@@ -436,7 +463,7 @@ func (s *store) reconcile(ctx context.Context, mode Lifecycle, seen map[string]s
 			slog.Debug("skipping orphan reconciliation; scan cancelled during shutdown")
 			return 0, nil
 		}
-		if rc.walkCompleted && rc.unreadable == 0 && rc.unresolved == 0 {
+		if rc.enumerationClean() {
 			// A complete walk that found no pair at all: the enumeration did not fail, there
 			// is simply nothing to compare the output tree against. logInputCoverageWarnings
 			// already names this at WARN with the /input-mount remediation, and the operator
@@ -463,7 +490,7 @@ func (s *store) reconcile(ctx context.Context, mode Lifecycle, seen map[string]s
 		}
 		slog.Warn("could not enumerate output orphans; orphan removal is disabled for this scan",
 			"error", err, "dir", s.root.Name(),
-			"remediation", "check /output ownership and permissions for the UID in user:")
+			"remediation", outputPermRemediation)
 		return 0, nil
 	}
 	if len(orphaned) == 0 {

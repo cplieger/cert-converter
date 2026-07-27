@@ -12,6 +12,17 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// stubFSWatcherUnavailable makes the newFSWatcher seam fail for the duration of
+// the test, which is how these tests reach the fsnotify-unavailable dispatch on a
+// host where inotify works. A caller must not call t.Parallel: the seam is
+// package-level state.
+func stubFSWatcherUnavailable(t *testing.T) {
+	t.Helper()
+	prev := newFSWatcher
+	newFSWatcher = func() (*fsnotify.Watcher, error) { return nil, errors.New("inotify exhausted") }
+	t.Cleanup(func() { newFSWatcher = prev })
+}
+
 // TestPollLoopWithUpgrade_upgrades_to_fsnotify_and_scans_first pins the poll
 // mode recovery path: on a tick where fsnotify becomes available again the
 // watch set is rebuilt, a scan runs with it already live (attach-then-scan, so a
@@ -158,9 +169,7 @@ func TestPollTick_treats_shutdown_during_the_watch_set_rebuild_as_a_stop(t *test
 // rather than abort, which is unreachable on a host where inotify works.
 // Not parallel: it swaps the package-level newFSWatcher seam.
 func TestRun_falls_back_to_polling_when_fsnotify_is_unavailable(t *testing.T) {
-	prev := newFSWatcher
-	newFSWatcher = func() (*fsnotify.Watcher, error) { return nil, errors.New("inotify exhausted") }
-	t.Cleanup(func() { newFSWatcher = prev })
+	stubFSWatcherUnavailable(t)
 
 	scans := 0
 	// No WithFallback: poll mode then has no interval, so Run scans once and
@@ -184,9 +193,7 @@ func TestRun_falls_back_to_polling_when_fsnotify_is_unavailable(t *testing.T) {
 // into exit 1 with the critical dead-change-detection alert.
 // Not parallel: it swaps the package-level newFSWatcher seam.
 func TestRun_treats_shutdown_during_fsnotify_construction_failure_as_a_clean_stop(t *testing.T) {
-	prev := newFSWatcher
-	newFSWatcher = func() (*fsnotify.Watcher, error) { return nil, errors.New("inotify exhausted") }
-	t.Cleanup(func() { newFSWatcher = prev })
+	stubFSWatcherUnavailable(t)
 
 	scans := 0
 	w := New(t.TempDir(), func(context.Context) { scans++ })
@@ -207,9 +214,7 @@ func TestRun_treats_shutdown_during_fsnotify_construction_failure_as_a_clean_sto
 // still run the polling scan that is then the only live change detection.
 // Not parallel: it swaps the package-level newFSWatcher seam.
 func TestPollTick_stays_in_poll_mode_when_fsnotify_remains_unavailable(t *testing.T) {
-	prev := newFSWatcher
-	newFSWatcher = func() (*fsnotify.Watcher, error) { return nil, errors.New("inotify exhausted") }
-	t.Cleanup(func() { newFSWatcher = prev })
+	stubFSWatcherUnavailable(t)
 
 	scans := 0
 	w := New(t.TempDir(), func(context.Context) { scans++ }, WithFallback(time.Hour))
@@ -232,9 +237,7 @@ func TestPollTick_stays_in_poll_mode_when_fsnotify_remains_unavailable(t *testin
 // health marker on the way out.
 // Not parallel: it swaps the package-level newFSWatcher seam.
 func TestPollTick_treats_shutdown_during_fsnotify_retry_as_a_stop(t *testing.T) {
-	prev := newFSWatcher
-	newFSWatcher = func() (*fsnotify.Watcher, error) { return nil, errors.New("inotify exhausted") }
-	t.Cleanup(func() { newFSWatcher = prev })
+	stubFSWatcherUnavailable(t)
 
 	scans := 0
 	w := New(t.TempDir(), func(context.Context) { scans++ }, WithFallback(time.Hour))
@@ -275,5 +278,47 @@ func TestPollLoopWithUpgrade_treats_shutdown_during_the_initial_scan_as_a_clean_
 	}
 	if scans != 1 {
 		t.Errorf("pollLoopWithUpgrade(ctx cancelled during initial scan) ran %d scans, want 1", scans)
+	}
+}
+
+// TestPollLoopWithUpgrade_returns_on_shutdown_while_polling pins that poll mode
+// is interruptible at all. Every other shutdown test on this path returns before
+// the ticker loop is entered (the pre-scan guard, the during-scan guard, the
+// disabled-fallback exit) or leaves through the upgraded watch loop, so nothing
+// pinned the loop's own ctx.Done() arm: with it broken a SIGTERM in the degraded
+// mode would block until the next poll tick -- six hours on the documented
+// cadence -- and the container would be SIGKILLed on every stop.
+//
+// A one-hour poll interval means no tick can fire, so the ctx.Done() arm is the
+// only way out; the fsnotify seam keeps the loop in poll mode instead of
+// upgrading away from it.
+// Not parallel: it swaps the package-level newFSWatcher seam.
+func TestPollLoopWithUpgrade_returns_on_shutdown_while_polling(t *testing.T) {
+	stubFSWatcherUnavailable(t)
+
+	scans := make(chan struct{}, 4)
+	w := New(t.TempDir(), func(context.Context) { scans <- struct{}{} }, WithFallback(time.Hour))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.pollLoopWithUpgrade(ctx) }()
+
+	select {
+	case <-scans:
+	case <-time.After(10 * time.Second):
+		cancel()
+		t.Fatal("poll mode never ran its initial scan")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("pollLoopWithUpgrade(cancelled while polling) = %v, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("pollLoopWithUpgrade did not return after cancellation; a SIGTERM in poll mode would block until the next poll tick and the container would be SIGKILLed on every stop")
+	}
+	if len(scans) != 0 {
+		t.Errorf("pollLoopWithUpgrade ran %d extra scans after cancellation, want none", len(scans))
 	}
 }
