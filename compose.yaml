@@ -4,7 +4,7 @@ services:
     image: ghcr.io/cplieger/cert-converter:latest
     container_name: cert-converter
     restart: unless-stopped
-    # Defaults to 1000:1000; override with PUID/PGID in .env without editing this file.
+    # Override with PUID/PGID in .env; defaults to 1000:1000.
     user: "${PUID:-1000}:${PGID:-1000}"  # must own the /output host dir
 
     environment:
