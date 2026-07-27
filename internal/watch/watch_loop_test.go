@@ -114,13 +114,16 @@ func TestPollLoopWithUpgrade_reports_dead_change_detection(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	done := make(chan error, 1)
-	go func() { done <- w.pollLoopWithUpgrade(ctx) }()
+	done := runPollLoop(ctx, w)
 
 	select {
-	case err := <-done:
-		if !errors.Is(err, ErrWatchLost) {
-			t.Errorf("pollLoopWithUpgrade(no fallback, no fsnotify) = %v, want ErrWatchLost", err)
+	case res := <-done:
+		if res.upgraded != nil {
+			res.upgraded.Close()
+			t.Error("pollLoopWithUpgrade(no fallback, no fsnotify) handed back a watcher, want none")
+		}
+		if !errors.Is(res.err, ErrWatchLost) {
+			t.Errorf("pollLoopWithUpgrade(no fallback, no fsnotify) = %v, want ErrWatchLost", res.err)
 		}
 	case <-time.After(2 * time.Second):
 		// The defect was precisely that this call never returns.

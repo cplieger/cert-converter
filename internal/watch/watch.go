@@ -31,8 +31,8 @@ var ErrWatchLost = errors.New("change detection lost")
 
 // newFSWatcher is the fsnotify construction seam. It is a package var rather
 // than a direct call so a test can drive the "fsnotify unavailable" dispatch
-// (Run's fallback to polling, pollTick's stay-in-poll) on a host where inotify
-// works, in the same style as atomicfile's osChown/fsyncDir seams.
+// (attachWatchSet's selection of poll mode, pollTick's stay-in-poll) on a host
+// where inotify works, in the same style as atomicfile's osChown/fsyncDir seams.
 var newFSWatcher = fsnotify.NewWatcher
 
 // Watcher monitors a directory tree for cert/key changes and invokes a callback.
@@ -105,9 +105,24 @@ func New(root string, onChange func(ctx context.Context), opts ...Option) *Watch
 	return w
 }
 
-// Run starts watching. It tries fsnotify first; if unavailable it falls back to
-// polling with periodic upgrade attempts. It normally blocks until ctx is
-// cancelled and then returns nil, but it ALSO returns ErrWatchLost early in the two
+// Run starts watching. It supervises two SIBLING change-detection modes and
+// blocks until change detection ends.
+//
+// The mode contract. Watch mode (watchMode) runs whenever an fsnotify watch set
+// is live; poll mode (pollLoopWithUpgrade) runs when one could not be
+// established. Each mode has exactly ONE exit and neither runs inside the
+// other: watch mode returns only the terminal answer (shutdown, or the watcher
+// died), while poll mode returns either that same terminal answer or an
+// upgraded watcher — and by then it has already released its own ticker, so no
+// poll-mode resource outlives the mode. The supervisor below therefore picks a
+// mode per round: a watcher in hand means watch mode, no watcher means poll
+// until it hands one back. Everything that happens once a watch set exists
+// (dump the set, scan with it live, run the watch loop, close the watcher) is
+// stated once, in watchMode, for both mode entries; only the arrival RECORD
+// differs per entry, and each entry logs its own.
+//
+// It normally blocks until ctx is cancelled and then returns nil, but it ALSO
+// returns ErrWatchLost early in the two
 // states where change detection is gone for good, and the caller must then exit
 // non-zero for a restart, as main.go does: the fsnotify watcher dies (its Events or
 // Errors channel closes), or no fsnotify watch could be established at all -- its
@@ -116,26 +131,69 @@ func New(root string, onChange func(ctx context.Context), opts ...Option) *Watch
 // renewal. A channel closure observed after ctx is already cancelled is part of
 // shutdown, not lost change detection, and returns nil.
 func (w *Watcher) Run(ctx context.Context) error {
-	watcher, err := newFSWatcher()
+	watcher, stopped := w.attachWatchSet(ctx)
+	if stopped {
+		return nil
+	}
+	for {
+		if watcher != nil {
+			return w.watchMode(ctx, watcher)
+		}
+		upgraded, pollErr := w.pollLoopWithUpgrade(ctx)
+		if upgraded == nil {
+			return pollErr // poll mode reached its own terminal answer
+		}
+		watcher = upgraded
+	}
+}
+
+// attachWatchSet is Run's initial mode selection: it constructs the fsnotify
+// watcher and registers the watch set, announcing an active watch set on
+// success. It reports (watcher, false) for watch mode, (nil, false) when
+// fsnotify is unusable and Run must select poll mode (the reason is WARNed
+// here, because only this attempt is a degradation from the intended mode), and
+// (nil, true) when a shutdown arrived mid-attempt, which is a clean stop rather
+// than a watch failure and must not be reported as one. Poll mode's equivalent
+// retry is pollTick, which logs at Info because staying in poll mode is not a
+// new degradation.
+//
+// A watcher that cannot be given a watch set is closed HERE rather than handed
+// back: its fd and readEvents goroutine must not survive into a long-lived poll
+// mode. Every watcher this returns is closed by watchMode instead.
+func (w *Watcher) attachWatchSet(ctx context.Context) (watcher *fsnotify.Watcher, stopped bool) {
+	fw, err := newFSWatcher()
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil // shutdown arrived during construction; not a watch failure
+			return nil, true // shutdown arrived during construction; not a watch failure
 		}
 		slog.Warn("fsnotify unavailable, using polling with periodic upgrade attempts", "error", err)
-		return w.pollLoopWithUpgrade(ctx)
+		return nil, false
 	}
 
-	if err := w.addWatchDirs(ctx, watcher, w.root); err != nil {
-		watcher.Close() // release fd + readEvents goroutine before long-lived fallback
+	if addErr := w.addWatchDirs(ctx, fw, w.root); addErr != nil {
+		fw.Close() // release fd + readEvents goroutine before long-lived fallback
 		if ctx.Err() != nil {
-			return nil // shutdown interrupted the walk; not a watch failure
+			return nil, true // shutdown interrupted the walk; not a watch failure
 		}
-		slog.Warn("failed to watch directories, using polling with periodic upgrade attempts", "error", err)
-		return w.pollLoopWithUpgrade(ctx)
+		slog.Warn("failed to watch directories, using polling with periodic upgrade attempts", "error", addErr)
+		return nil, false
 	}
-	defer watcher.Close()
 
-	slog.Info("fsnotify active", "directory_count", len(watcher.WatchList()))
+	slog.Info("fsnotify active", "directory_count", len(fw.WatchList()))
+	return fw, false
+}
+
+// watchMode runs one whole watch-mode lifetime over an already-attached watch
+// set, and is the ONLY statement of that sequence: dump the watch set, scan with
+// it live, run the watch loop, and release the watcher on every exit path. Both
+// mode entries reach it through Run's supervisor -- the initial attach and the
+// poll-to-watch upgrade -- so the ordering cannot drift between them, and a
+// third entry (or a change to the order) is one edit here.
+//
+// It returns watch mode's single exit: nil on shutdown, ErrWatchLost when the
+// watcher died under a live ctx.
+func (w *Watcher) watchMode(ctx context.Context, watcher *fsnotify.Watcher) error {
+	defer watcher.Close()
 	logWatchSet(watcher)
 	return w.scanThenWatch(ctx, watcher)
 }
@@ -151,9 +209,9 @@ func logWatchSet(watcher *fsnotify.Watcher) {
 }
 
 // scanThenWatch scans once with the watch set already live and then runs the
-// watch loop. Both entry points share it - Run's fsnotify path and
-// pollLoopWithUpgrade's poll-to-watch handoff - so the attach-then-scan
-// ordering and its shutdown guard cannot drift apart between them.
+// watch loop. It is watchMode's body, called from there alone; the mode-entry
+// ordering that used to be its reason for existing is now the supervisor's, so
+// what this holds is the attach-then-scan rule itself and its shutdown guard.
 //
 // Attach-then-scan: the scan that preceded this watch set (main's startup scan,
 // or the poll tick being upgraded) ran before these watches existed, so a
@@ -643,19 +701,27 @@ func (st *watchState) handleWatcherError(err error) bool {
 }
 
 // pollLoopWithUpgrade polls on the fallback interval and attempts to
-// upgrade to fsnotify on every tick. With the fallback disabled (<= 0) there is no
-// interval to poll on, so after the initial scan it logs an ERROR and returns
-// ErrWatchLost rather than parking: nothing would ever notice a renewal, and the
-// caller must exit non-zero for a restart. It otherwise returns nil on shutdown and
-// propagates ErrWatchLost from the watch loop it upgrades into.
-func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) error {
+// upgrade to fsnotify on every tick. It is one of Run's two modes and has a
+// single exit, reported to the supervisor as a pair: a non-nil watcher means the
+// upgrade succeeded and watch mode takes over from here, while a nil watcher
+// means change detection is over for this mode -- nil error on shutdown, or
+// ErrWatchLost with the fallback disabled (<= 0), where there is no interval to
+// poll on, so after the initial scan it logs an ERROR and returns rather than
+// parking: nothing would ever notice a renewal, and the caller must exit
+// non-zero for a restart.
+//
+// Returning the upgraded watcher instead of running the watch loop is what keeps
+// poll mode's resources out of watch mode's lifetime: the ticker in
+// pollUntilUpgrade is stopped by its own defer as this mode returns, i.e. before
+// watch mode begins, rather than living on unread until the process exits.
+func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) (upgraded *fsnotify.Watcher, err error) {
 	// The initial scan: Run owns the first scan in BOTH modes, so main does not scan
 	// before calling it. It runs before the fallback check on purpose: when polling is
 	// disabled AND fsnotify is unavailable this function exits for a restart, and
 	// converting whatever is already on disk once before doing so is the only useful
 	// work the process can perform.
 	if ctx.Err() != nil {
-		return nil
+		return nil, nil
 	}
 	w.onChange(ctx)
 
@@ -666,7 +732,7 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) error {
 		// CertConverterChangeDetectionDead critical alert for a graceful stop. Same
 		// cancellation precedence lostOrShutdown applies at the other loss point.
 		if ctx.Err() != nil {
-			return nil
+			return nil, nil
 		}
 		// Return, do not park. Parking here left the container reporting HEALTHY
 		// forever while converting nothing: the initial scan had already written the
@@ -680,9 +746,21 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) error {
 		// an error return, not a survivable steady state.
 		slog.Error("no fsnotify watch and the periodic rescan is disabled; change detection is inactive, exiting for a restart",
 			"remediation", "unset FALLBACK_SCAN_HOURS (or set it above 0) so the periodic rescan covers the missing fsnotify watch; the preceding WARN names why the fsnotify watch is missing")
-		return ErrWatchLost
+		return nil, ErrWatchLost
 	}
 
+	return w.pollUntilUpgrade(ctx), nil
+}
+
+// pollUntilUpgrade is poll mode's ticker loop: it polls on the fallback interval
+// and re-attempts the fsnotify upgrade on every tick, returning the upgraded
+// watcher for watch mode to run over, or nil when a shutdown ended the mode.
+//
+// It OWNS the ticker, and that ownership is the point of the mode split: the
+// ticker's Stop runs as this returns, so it is released before watch mode begins
+// rather than firing for watch mode's whole lifetime into a receiver nobody
+// selects on, with its Stop deferred until process exit.
+func (w *Watcher) pollUntilUpgrade(ctx context.Context) *fsnotify.Watcher {
 	ticker := time.NewTicker(w.fallback)
 	defer ticker.Stop()
 
@@ -695,8 +773,12 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) error {
 				return nil
 			}
 			slog.Debug("poll scan triggered", "interval", w.fallback)
-			if done, tickErr := w.pollTick(ctx); done {
-				return tickErr
+			fw, stopped := w.pollTick(ctx)
+			if stopped {
+				return nil
+			}
+			if fw != nil {
+				return fw
 			}
 		}
 	}
@@ -704,34 +786,37 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) error {
 
 // pollTick handles one poll-loop tick: it re-attempts the fsnotify upgrade and,
 // when that fails, runs the polling scan that keeps change detection alive. It
-// reports done=true when the poll loop must return -- the upgrade succeeded and
-// the watch loop it handed off to has finished, or shutdown interrupted the
-// attempt -- and carries that return value in the error.
-func (w *Watcher) pollTick(ctx context.Context) (done bool, err error) {
+// hands the attached watcher back for the supervisor to run watch mode over --
+// it does NOT run the watch loop itself -- and reports stopped=true when a
+// shutdown interrupted the attempt, so the poll loop returns instead of treating
+// it as a degraded upgrade failure. A nil watcher with stopped=false means stay
+// in poll mode.
+//
+// The Info level is deliberate: unlike Run's initial attempt (attachWatchSet,
+// which WARNs), a failed retry is a continuation of an already-reported
+// degradation, not a new one.
+func (w *Watcher) pollTick(ctx context.Context) (upgraded *fsnotify.Watcher, stopped bool) {
 	fw, newErr := newFSWatcher()
 	if newErr != nil {
 		if ctx.Err() != nil {
-			return true, nil // shutdown interrupted the upgrade attempt; not a poll-mode continuation
+			return nil, true // shutdown interrupted the upgrade attempt; not a poll-mode continuation
 		}
 		slog.Info("fsnotify still unavailable, staying in poll mode",
 			"mode", "poll", "retry_interval", w.fallback, "error", newErr)
 		w.onChange(ctx)
-		return false, nil
+		return nil, false
 	}
 	if addErr := w.addWatchDirs(ctx, fw, w.root); addErr != nil {
 		fw.Close()
 		if ctx.Err() != nil {
-			return true, nil // shutdown interrupted the walk; not an upgrade failure
+			return nil, true // shutdown interrupted the walk; not an upgrade failure
 		}
 		slog.Info("fsnotify available but the watch set could not be rebuilt, staying in poll mode",
 			"mode", "poll", "retry_interval", w.fallback, "error", addErr)
 		w.onChange(ctx)
-		return false, nil
+		return nil, false
 	}
 	slog.Info("fsnotify recovered, upgrading from poll to watch",
 		"directory_count", len(fw.WatchList()))
-	logWatchSet(fw)
-	loopErr := w.scanThenWatch(ctx, fw)
-	fw.Close()
-	return true, loopErr
+	return fw, false
 }
