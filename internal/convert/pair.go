@@ -24,15 +24,17 @@ import (
 // The Analysis is taken by pointer only because the struct is large enough that
 // copying it per call is wasteful (gocritic hugeParam); Encode does not mutate it.
 func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
-	// Defensive: config.Load rejects a password PKCS#12 cannot represent at
-	// startup and the password is read once there (a rotated PFX_PASSWORD_FILE
-	// takes effect only on restart), so this is unreachable in production. It
-	// stays because an exported entry point should not depend on a caller having
-	// validated for it.
-	if InspectPasswordEncoding(password).NonBMP {
-		return nil, errors.New("pfx password contains a character outside the Basic Multilingual Plane, " +
-			"which the PKCS#12 UCS-2 password encoding cannot represent; " +
-			"choose a password made of BMP characters (ASCII is safest)")
+	// Defensive, and deliberately NOT redundant with internal/config's
+	// checkPasswordEncodable: both guards are wanted, and neither is the only line
+	// of defence. config.Load refuses all three unencodable shapes at startup,
+	// which is what makes this unreachable in production (the password is read once
+	// there, so a rotated PFX_PASSWORD_FILE takes effect only on restart). This
+	// guard refuses the same three shapes because an exported entry point should
+	// not depend on a caller having validated for it. Do not delete either as
+	// duplication: the startup gate fails the container fast for the one production
+	// caller, this one holds the codec's own contract for every caller.
+	if err := unencodablePasswordError(password); err != nil {
+		return nil, err
 	}
 
 	pfxData, err := encoderFor(encName).Encode(a.Key, a.Leaf, a.Chain, password)
@@ -40,6 +42,46 @@ func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 		return nil, fmt.Errorf("encode pfx: %w", err)
 	}
 	return pfxData, nil
+}
+
+// unencodablePasswordError reports why the PKCS#12 UCS-2 password encoding
+// (RFC 7292 appendix B.1) cannot carry password intact, or nil when it can.
+//
+// It refuses every shape PasswordEncodingIssues reports, not just the one
+// go-pkcs12 refuses on its own. The two the library accepts are the worse
+// outcomes: it replaces invalid UTF-8 rune-by-rune and encodes an interior NUL
+// verbatim, so in both cases Encode would SUCCEED and write a bundle protected by
+// a different password than the one supplied, with the failure surfacing at
+// whatever later tries to open it.
+//
+// Recognition is InspectPasswordEncoding's, so the encoder cannot drift from the
+// startup gate that consumes the same query, and the shapes are reported in the
+// same order internal/config's checkPasswordEncodable reports them so a password
+// carrying several is named identically by both.
+//
+// Only the SHAPE is named, never the value: these messages reach the container
+// log and the password is a secret. No sentinel wraps them because no caller
+// branches on the kind — the one production path treats any Encode error as a
+// conversion failure, and config.ErrUnencodablePassword (which cannot be reused
+// here anyway: internal/config imports this package) exists for callers of Load.
+func unencodablePasswordError(password string) error {
+	switch issues := InspectPasswordEncoding(password); {
+	case issues.InvalidUTF8:
+		return errors.New("pfx password is not valid UTF-8, so the PKCS#12 UCS-2 password encoding " +
+			"would replace every invalid byte with U+FFFD and protect the bundle with a different, " +
+			"lower-entropy password than the one supplied; " +
+			"supply a text secret (for example base64) instead of raw binary bytes")
+	case issues.NonBMP:
+		return errors.New("pfx password contains a character outside the Basic Multilingual Plane, " +
+			"which the PKCS#12 UCS-2 password encoding cannot represent; " +
+			"choose a password made of BMP characters (ASCII is safest)")
+	case issues.EmbeddedNUL:
+		return errors.New("pfx password contains a NUL byte, and PKCS#12 passwords are NUL-terminated, " +
+			"so no consumer that builds the terminated BMPString itself could open the bundle with the " +
+			"password supplied; strip NUL bytes from the secret " +
+			"(a UTF-16 or NUL-padded secret file is the usual cause)")
+	}
+	return nil
 }
 
 // maxSubjectLogLen bounds the certificate-controlled subject interpolated into a

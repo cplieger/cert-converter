@@ -219,26 +219,36 @@ func allowEmptyPassword(raw string) bool {
 // checkPasswordEncodable rejects password shapes that PKCS#12 cannot carry intact.
 // Empty passwords are handled separately by PFX_ALLOW_EMPTY_PASSWORD.
 //
-// Each shape is unconditionally broken and no scan recovers from it:
+// Each shape is unconditionally broken and no scan recovers from it. What the
+// PKCS#12 encoder does with each, absent any guard:
 //
-//   - NonBMP: UCS-2 cannot represent the rune, so every Encode call fails and the
-//     container reports unhealthy on every event and every fallback tick.
+//   - NonBMP: UCS-2 cannot represent the rune, so go-pkcs12 refuses it and every
+//     conversion fails, leaving the container unhealthy on every event and every
+//     fallback tick.
 //   - InvalidUTF8: go-pkcs12's bmpString ranges over the string, so each invalid byte
-//     becomes U+FFFD and Encode SUCCEEDS. Bundles are written, the scan counts them
+//     becomes U+FFFD and the encode SUCCEEDS. Bundles are written, the scan counts them
 //     converted, health stays green — and no consumer can open them with the configured
 //     secret, because distinct invalid bytes all collapse to the same replacement rune.
 //   - EmbeddedNUL: PKCS#12 passwords are NUL-terminated, so an interior NUL encodes
 //     verbatim and no consumer can reproduce the password the bundle was built with.
 //     Also succeeds silently.
 //
-// The last two are the dangerous ones: nothing in the conversion path, the scan
-// summary, or health reflects them, and the README's Loki rules key on failure counts
-// that stay at zero. Hence a startup refusal, per go.md's config rule: validate at
-// startup, fail fast, do not discover invalid config at request time.
+// The last two are the dangerous ones: were they to reach the encoder, nothing in the
+// conversion path, the scan summary, or health would reflect them, and the README's
+// Loki rules key on failure counts that stay at zero. Hence a startup refusal, per
+// go.md's config rule: validate at startup, fail fast, do not discover invalid config
+// at request time.
+//
+// convert.Encode refuses the same three shapes itself. That is NOT duplication to
+// clean up: this gate is what makes the app fail fast and visibly for its one
+// production caller, before a single file is scanned, with a diagnostic naming the
+// env var; Encode's guard holds the codec's own contract for any caller, including
+// one that never went through Load. Both are wanted — do not delete either.
 //
 // Only the SHAPE is reported, never the value. Recognition is
 // convert.InspectPasswordEncoding's, the same package that encodes, so this gate cannot
-// drift from the encoder.
+// drift from the encoder; the shapes are reported in the order Encode reports them,
+// so a password carrying several is named the same way by both.
 func checkPasswordEncodable(password string) error {
 	if password == "" {
 		return nil

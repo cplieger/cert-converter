@@ -18,13 +18,21 @@ import (
 
 // TestConvertPair_password_guard_agrees_with_the_pkcs12_encoder is the oracle
 // property for the PFX password guard: for an arbitrary password,
-// InspectPasswordEncoding must predict the encoder's verdict exactly. A
-// password it reports as non-BMP must be rejected with the actionable
-// BMP message and leave no file behind, and any other password must produce a
-// PFX that decodes with that same password. The guard exists because
-// go-pkcs12's own refusal names neither the password nor the constraint, so a
-// drift between the guard and the encoder turns a clear startup-level
-// diagnostic back into an opaque conversion failure.
+// InspectPasswordEncoding must predict the guard's verdict exactly, and the
+// guard must refuse EVERY shape the inspection reports — not just the one
+// go-pkcs12 refuses on its own.
+//
+// The two the library accepts are why the guard is this wide: with invalid UTF-8
+// it substitutes U+FFFD rune-by-rune and with an interior NUL it encodes the NUL
+// verbatim, so in both cases it happily writes a bundle protected by a DIFFERENT
+// password than the one supplied, and the failure surfaces at whatever later
+// tries to open the bundle. So a password carrying any of the three shapes must
+// be rejected with a message naming that shape, leaving no file behind, and any
+// other password must produce a PFX that decodes with that same password.
+//
+// The draw injects each shape deliberately rather than hoping rapid.String()
+// stumbles onto one: a generator of valid UTF-8 BMP text would exercise only the
+// accept path, and the property would pin nothing.
 func TestConvertPair_password_guard_agrees_with_the_pkcs12_encoder(t *testing.T) {
 	t.Parallel()
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "password-oracle.example.com", "ecdsa")
@@ -42,6 +50,17 @@ func TestConvertPair_password_guard_agrees_with_the_pkcs12_encoder(t *testing.T)
 
 	rapid.Check(t, func(rt *rapid.T) {
 		password := rapid.String().Draw(rt, "password")
+		// Each fabricated fragment is the minimal carrier of one unencodable
+		// shape; any combination of them (including none) is a valid draw.
+		if rapid.Bool().Draw(rt, "inject_invalid_utf8") {
+			password += string([]byte{0xff})
+		}
+		if rapid.Bool().Draw(rt, "inject_non_bmp") {
+			password += "\U0001F600"
+		}
+		if rapid.Bool().Draw(rt, "inject_embedded_nul") {
+			password += "\x00"
+		}
 		if err := os.Remove(dest); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			rt.Fatalf("setup: remove %q: %v", dest, err)
 		}
@@ -49,12 +68,26 @@ func TestConvertPair_password_guard_agrees_with_the_pkcs12_encoder(t *testing.T)
 
 		_, err := convertPairInRoot(rt.Context(), certPEM, keyPEM, root, "out.pfx", password, convert.EncNameModern2023)
 
-		if issues.NonBMP {
+		// The shape the message must name when a password carries several: the
+		// guard's own precedence, which internal/config's startup gate shares.
+		var wantShape string
+		switch {
+		case issues.InvalidUTF8:
+			wantShape = "not valid UTF-8"
+		case issues.NonBMP:
+			wantShape = "outside the Basic Multilingual Plane"
+		case issues.EmbeddedNUL:
+			wantShape = "contains a NUL byte"
+		}
+
+		if wantShape != "" {
 			if err == nil {
-				rt.Fatalf("convertPairInRoot with a non-BMP password (%d bytes) = nil, want the BMP rejection", len(password))
+				rt.Fatalf("convertPairInRoot with an unencodable password (%+v, %d bytes) = nil, want a rejection naming %q",
+					issues, len(password), wantShape)
 			}
-			if !strings.Contains(err.Error(), "Basic Multilingual Plane") {
-				rt.Errorf("convertPairInRoot error = %q, want it to name the Basic Multilingual Plane limit rather than the vendor message", err.Error())
+			if !strings.Contains(err.Error(), wantShape) {
+				rt.Errorf("convertPairInRoot error = %q, want it to name %q for a password with issues %+v",
+					err.Error(), wantShape, issues)
 			}
 			if _, statErr := os.Stat(dest); !errors.Is(statErr, fs.ErrNotExist) {
 				rt.Errorf("convertPairInRoot wrote %q for a rejected password (stat error %v); want no file", dest, statErr)

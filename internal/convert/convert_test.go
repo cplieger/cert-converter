@@ -920,33 +920,65 @@ func TestParsePrivateKey_reports_truncated_declared_armour(t *testing.T) {
 	}
 }
 
-// TestConvertPair_rejects_password_outside_BMP_without_writing pins the app-owned
-// non-BMP password guard: the rejection must carry the actionable BMP
-// constraint, must not echo the secret character, and must happen before any
-// PFX is written.
-func TestConvertPair_rejects_password_outside_BMP_without_writing(t *testing.T) {
+// TestConvertPair_rejects_unencodable_passwords_without_writing pins the
+// app-owned password guard for every shape PKCS#12 cannot carry: the rejection
+// must name the shape found so an operator can act, must not echo the secret
+// material, and must happen before any PFX is written.
+//
+// All three matter, not just the non-BMP one go-pkcs12 refuses itself: for
+// invalid UTF-8 and an interior NUL the library encodes happily and writes a
+// bundle protected by a different password than the one supplied, which is the
+// worse outcome — it surfaces at whatever tries to open the bundle instead of
+// here.
+func TestConvertPair_rejects_unencodable_passwords_without_writing(t *testing.T) {
 	t.Parallel()
-	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "non-bmp-password", "ecdsa")
-	dir := t.TempDir()
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "unencodable-password", "ecdsa")
 
-	const password = "safe-\U0001F642-suffix"
-	_, err = convertPairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", password, convert.EncNameModern2023)
-	if err == nil {
-		t.Fatal("convertPairInRoot(non-BMP password) = nil error, want rejection")
-	}
-	if !strings.Contains(err.Error(), "outside the Basic Multilingual Plane") {
-		t.Errorf("convertPairInRoot(non-BMP password) error = %q, want an actionable BMP constraint", err.Error())
-	}
-	if strings.Contains(err.Error(), "\U0001F642") {
-		t.Errorf("convertPairInRoot(non-BMP password) error = %q, want the secret character omitted", err.Error())
-	}
-	if _, statErr := os.Stat(filepath.Join(dir, "out.pfx")); statErr == nil {
-		t.Error("convertPairInRoot(non-BMP password) wrote a PFX; want no file")
+	for name, tc := range map[string]struct {
+		password  string
+		wantShape string
+		wantNotIn string
+	}{
+		"non-BMP rune": {
+			password:  "safe-\U0001F642-suffix",
+			wantShape: "outside the Basic Multilingual Plane",
+			wantNotIn: "\U0001F642",
+		},
+		"invalid UTF-8": {
+			password:  "safe-" + string([]byte{0xff, 0xfe}) + "-suffix",
+			wantShape: "not valid UTF-8",
+			wantNotIn: "safe-",
+		},
+		"embedded NUL": {
+			password:  "safe-\x00-suffix",
+			wantShape: "contains a NUL byte",
+			wantNotIn: "safe-",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatalf("setup: os.OpenRoot: %v", err)
+			}
+			defer root.Close()
+
+			_, err = convertPairInRoot(t.Context(), certPEM, keyPEM, root, "out.pfx", tc.password, convert.EncNameModern2023)
+			if err == nil {
+				t.Fatalf("convertPairInRoot(%s password) = nil error, want rejection", name)
+			}
+			if !strings.Contains(err.Error(), tc.wantShape) {
+				t.Errorf("convertPairInRoot(%s password) error = %q, want it to name %q", name, err.Error(), tc.wantShape)
+			}
+			if strings.Contains(err.Error(), tc.wantNotIn) {
+				t.Errorf("convertPairInRoot(%s password) error = %q, want the secret material %q omitted",
+					name, err.Error(), tc.wantNotIn)
+			}
+			if _, statErr := os.Stat(filepath.Join(dir, "out.pfx")); statErr == nil {
+				t.Errorf("convertPairInRoot(%s password) wrote a PFX; want no file", name)
+			}
+		})
 	}
 }
 
