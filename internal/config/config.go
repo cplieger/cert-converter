@@ -25,6 +25,39 @@ const envFalseValue = "false"
 // "false" disables the fallback rescan.
 const defaultFallbackInterval = 6 * time.Hour
 
+// maxFallbackHours keeps time.Duration(n)*time.Hour from overflowing int64;
+// 10y is far beyond any real re-scan cadence. Package-level rather than local
+// to parseFallbackInterval because warnFallbackRepaired names it in the
+// clamp WARN, and the two must report the same ceiling.
+const maxFallbackHours = 87600
+
+// fallbackRepair classifies what parseFallbackInterval had to do with a
+// configured FALLBACK_SCAN_HOURS value. The parse itself is silent — it derives
+// the cadence and reports the condition — because FallbackInterval() is also
+// called by the `health` subcommand, where a startup diagnostic would repeat on
+// every probe (roughly every 30s under Docker's healthcheck, forever). Load is
+// the single home for this setting's diagnostics, the same reason
+// warnFallbackDisabled lives there.
+//
+// Three conditions, because they need three different operator messages: the
+// value was used as configured, an unusable value was replaced by the default,
+// or an above-ceiling value was clamped.
+type fallbackRepair int
+
+const (
+	// fallbackAccepted means the derived cadence is the configured one: an
+	// explicit interval, the explicit "0"/"false" opt-out (reported by
+	// warnFallbackDisabled), or an unset/blank value taking the documented
+	// default. Nothing was repaired, so nothing is warned about here.
+	fallbackAccepted fallbackRepair = iota
+	// fallbackInvalid means the value was unparseable or non-positive and
+	// defaultFallbackInterval was substituted.
+	fallbackInvalid
+	// fallbackClamped means the value was above maxFallbackHours and was
+	// clamped down to it.
+	fallbackClamped
+)
+
 // Config holds the runtime configuration for cert-converter. The PFX encoder is
 // carried as the app-owned convert.EncoderType name, not as a go-pkcs12 value:
 // the vendor type stays confined to internal/convert, which resolves the name
@@ -168,7 +201,8 @@ func Load() (Config, error) {
 		slog.Warn("unknown PFX_ENCODER, using modern2023", "value", rawEncoder)
 	}
 
-	fallbackInterval := FallbackInterval()
+	fallbackInterval, rawFallback, repair := fallbackIntervalFromEnv()
+	warnFallbackRepaired(rawFallback, repair)
 	warnFallbackDisabled(fallbackInterval)
 	warnPasswordStrength(status, blankSecretFile != nil)
 
@@ -187,8 +221,24 @@ func Load() (Config, error) {
 // its probe max-age from the same source of truth without a full config
 // load, which would fail on a missing PFX_PASSWORD the probe does not
 // need.
+//
+// Deliberately SILENT: it emits no log records, because the health subcommand
+// calls it on every probe. Every diagnostic for this setting is emitted once per
+// process start, by Load.
 func FallbackInterval() time.Duration {
-	return parseFallbackInterval(os.Getenv("FALLBACK_SCAN_HOURS"))
+	interval, _, _ := fallbackIntervalFromEnv()
+	return interval
+}
+
+// fallbackIntervalFromEnv reads FALLBACK_SCAN_HOURS and returns the effective
+// interval, the raw configured value (what a diagnostic must quote), and how the
+// parse had to repair it. The single home for the variable's name, shared by the
+// silent FallbackInterval reader and by Load, which is the only caller that
+// warns.
+func fallbackIntervalFromEnv() (interval time.Duration, raw string, repair fallbackRepair) {
+	raw = os.Getenv("FALLBACK_SCAN_HOURS")
+	interval, repair = parseFallbackInterval(raw)
+	return interval, raw, repair
 }
 
 // LogLevel returns the effective LOG_LEVEL as a slog level, the raw value as
@@ -270,7 +320,8 @@ func checkPasswordEncodable(password string) error {
 }
 
 // parseFallbackInterval parses a FALLBACK_SCAN_HOURS value into a re-scan
-// cadence. Surrounding whitespace is trimmed first, so " 12 " parses as 12
+// cadence and reports how the value had to be repaired to get there.
+// Surrounding whitespace is trimmed first, so " 12 " parses as 12
 // hours. Only an explicit "0" or "false" disables the fallback (returns 0),
 // matched case-insensitively, so "FALSE" and " 0 " disable it too.
 // An empty or whitespace-only value — or any unparseable value — yields
@@ -279,17 +330,19 @@ func checkPasswordEncodable(password string) error {
 // above maxFallbackHours is clamped to it, including a valid decimal too large
 // for int64: a positive out-of-range number counts as above-ceiling, not as
 // malformed input.
-func parseFallbackInterval(v string) time.Duration {
-	// maxFallbackHours keeps time.Duration(n)*time.Hour from overflowing int64;
-	// 10y is far beyond any real re-scan cadence.
-	const maxFallbackHours = 87600
-
+//
+// A pure parse: it emits no log records. The repaired-input diagnostics are
+// warnFallbackRepaired's, emitted once per process start from Load, following
+// the LogLevel precedent in this package. Warning from here repeated the
+// startup WARN on every `health` probe, because the probe calls
+// FallbackInterval() too.
+func parseFallbackInterval(v string) (time.Duration, fallbackRepair) {
 	trimmed := strings.TrimSpace(v)
 	switch strings.ToLower(trimmed) {
 	case "0", envFalseValue:
-		return 0
+		return 0, fallbackAccepted
 	case "":
-		return defaultFallbackInterval
+		return defaultFallbackInterval, fallbackAccepted
 	default:
 		n, err := strconv.ParseInt(trimmed, 10, 64)
 		// A valid decimal too large for int64 is still a positive
@@ -302,16 +355,36 @@ func parseFallbackInterval(v string) time.Duration {
 		positiveOverflow := errors.Is(err, strconv.ErrRange) &&
 			digits != "" && strings.Trim(digits, "0123456789") == ""
 		if positiveOverflow || (err == nil && n > maxFallbackHours) {
-			slog.Warn("FALLBACK_SCAN_HOURS too large, clamping",
-				"value", v, "max_hours", maxFallbackHours)
-			return time.Duration(maxFallbackHours) * time.Hour
+			return time.Duration(maxFallbackHours) * time.Hour, fallbackClamped
 		}
 		if err == nil && n > 0 {
-			return time.Duration(n) * time.Hour
+			return time.Duration(n) * time.Hour, fallbackAccepted
 		}
+		return defaultFallbackInterval, fallbackInvalid
+	}
+}
+
+// warnFallbackRepaired emits the operator-facing diagnostic for a
+// FALLBACK_SCAN_HOURS value the parser could not use as configured. Both cases
+// are silently repaired, so the WARN naming the rejected value is the operator's
+// only way to tell an intended cadence from a default or a clamp.
+//
+// Called only from Load, so each line is emitted exactly once per process start
+// and never from the `health` subcommand, whose FallbackInterval() call would
+// otherwise reprint a startup diagnostic on every probe. raw is the value as
+// configured, untrimmed, so the log shows what the operator actually set.
+func warnFallbackRepaired(raw string, repair fallbackRepair) {
+	switch repair {
+	case fallbackClamped:
+		slog.Warn("FALLBACK_SCAN_HOURS too large, clamping",
+			"value", raw, "max_hours", maxFallbackHours)
+	case fallbackInvalid:
 		slog.Warn("invalid FALLBACK_SCAN_HOURS, using default",
-			"value", v, "default", defaultFallbackInterval.String())
-		return defaultFallbackInterval
+			"value", raw, "default", defaultFallbackInterval.String())
+	case fallbackAccepted:
+		// The configured cadence was used as-is. The explicit "0"/"false"
+		// opt-out lands here too and is reported by warnFallbackDisabled, which
+		// keys on the interval rather than on the repair.
 	}
 }
 
@@ -339,7 +412,7 @@ func parseFallbackInterval(v string) time.Duration {
 // Keyed on the parsed interval, which is zero only for the explicit "0"/"false"
 // opt-out: an empty, whitespace-only, or invalid value yields
 // defaultFallbackInterval and stays silent here, because it is not the opt-out
-// (parseFallbackInterval already warns about the values it repaired).
+// (Load's warnFallbackRepaired reports the values it had to repair).
 func warnFallbackDisabled(interval time.Duration) {
 	if interval > 0 {
 		return

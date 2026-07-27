@@ -311,6 +311,35 @@ func TestDispatchArgs_arms_the_marker_lease(t *testing.T) {
 	}
 }
 
+// TestDispatchArgs_health_probe_emits_no_startup_diagnostics pins the reason the
+// FALLBACK_SCAN_HOURS diagnostics live in config.Load rather than in the parser:
+// the health subcommand derives its marker lease from config.FallbackInterval on
+// EVERY probe, which under Docker's healthcheck is roughly every 30 seconds for
+// the life of the container. A misconfigured or above-ceiling value must not turn
+// that into a repeating startup-shaped WARN. No t.Parallel: it swaps runProbe,
+// slog.Default() and the environment.
+func TestDispatchArgs_health_probe_emits_no_startup_diagnostics(t *testing.T) {
+	for _, raw := range []string{"abc", "-1", "87601", "999999999999999999999999999999", "0", "12", ""} {
+		t.Run("FALLBACK_SCAN_HOURS="+raw, func(t *testing.T) {
+			t.Setenv("FALLBACK_SCAN_HOURS", raw)
+
+			prev := runProbe
+			runProbe = func(string, ...health.ProbeOption) {}
+			t.Cleanup(func() { runProbe = prev })
+
+			logs := capture.Default(t)
+
+			_ = dispatchArgs([]string{"cert-watcher", "health"})
+
+			if logs.Len() != 0 {
+				t.Errorf("the health subcommand with FALLBACK_SCAN_HOURS=%q logged %v, want no records: "+
+					"config diagnostics belong to startup, and this runs on every healthcheck",
+					raw, logs.Messages())
+			}
+		})
+	}
+}
+
 // captureStderr redirects os.Stderr to a temp file for the duration of fn and
 // returns everything written to it. A temp file rather than an os.Pipe: a pipe
 // blocks its writer once the buffer fills, which would deadlock the test.

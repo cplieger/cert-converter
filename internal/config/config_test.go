@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -52,99 +53,256 @@ func TestLoad_empty_password_optout_warns_only_on_unrecognized_values(t *testing
 	}
 }
 
+// TestParseFallbackInterval pins the derived cadence for every shape of
+// FALLBACK_SCAN_HOURS, and — alongside each value — the repair classification
+// Load turns into a diagnostic. The two travel together so a value can never
+// change class without this table saying so.
 func TestParseFallbackInterval(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		val  string
-		want time.Duration
+		name       string
+		val        string
+		want       time.Duration
+		wantRepair fallbackRepair
 	}{
-		{"empty uses default", "", 6 * time.Hour},
-		{"zero", "0", 0},
-		{"false", "false", 0},
-		{"FALSE", "FALSE", 0},
-		{"valid", "12", 12 * time.Hour},
-		{"one", "1", 1 * time.Hour},
-		{"negative", "-1", 6 * time.Hour},
+		{"empty uses default", "", 6 * time.Hour, fallbackAccepted},
+		{"zero", "0", 0, fallbackAccepted},
+		{"false", "false", 0, fallbackAccepted},
+		{"FALSE", "FALSE", 0, fallbackAccepted},
+		{"valid", "12", 12 * time.Hour, fallbackAccepted},
+		{"one", "1", 1 * time.Hour, fallbackAccepted},
+		{"negative", "-1", 6 * time.Hour, fallbackInvalid},
 		// Non-canonical zeros reach the numeric branch (the "0" switch case
 		// only matches the literal string "0"), so they exercise the n > 0
 		// boundary: Atoi yields 0, which must NOT be treated as a positive
 		// interval. Pins the n > 0 guard: a parsed zero falls through to the
 		// default, never accepted as a (disabling) zero interval.
-		{"non-canonical zero", "00", 6 * time.Hour},
-		{"signed zero", "+0", 6 * time.Hour},
-		{"non-numeric", "abc", 6 * time.Hour},
+		{"non-canonical zero", "00", 6 * time.Hour, fallbackInvalid},
+		{"signed zero", "+0", 6 * time.Hour, fallbackInvalid},
+		{"non-numeric", "abc", 6 * time.Hour, fallbackInvalid},
 		// strconv reports ErrRange (not ErrSyntax) once the digit prefix
 		// overflows, even when junk follows, so a malformed value must stay
 		// malformed instead of being mistaken for an above-ceiling number.
-		{"overflowing prefix with junk", "999999999999999999999999999999x", 6 * time.Hour},
-		{"leading spaces", "  12", 12 * time.Hour},
-		{"trailing spaces", "12  ", 12 * time.Hour},
-		{"padded zero", " 0 ", 0},
-		{"padded false", " false ", 0},
-		{"padded empty uses default", "   ", 6 * time.Hour},
+		{"overflowing prefix with junk", "999999999999999999999999999999x", 6 * time.Hour, fallbackInvalid},
+		{"leading spaces", "  12", 12 * time.Hour, fallbackAccepted},
+		{"trailing spaces", "12  ", 12 * time.Hour, fallbackAccepted},
+		{"padded zero", " 0 ", 0, fallbackAccepted},
+		{"padded false", " false ", 0, fallbackAccepted},
+		{"padded empty uses default", "   ", 6 * time.Hour, fallbackAccepted},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := parseFallbackInterval(tc.val); got != tc.want {
+			got, repair := parseFallbackInterval(tc.val)
+			if got != tc.want {
 				t.Errorf("parseFallbackInterval(%q) = %v, want %v", tc.val, got, tc.want)
+			}
+			if repair != tc.wantRepair {
+				t.Errorf("parseFallbackInterval(%q) repair = %s, want %s",
+					tc.val, repairName(repair), repairName(tc.wantRepair))
 			}
 		})
 	}
+}
+
+// repairName renders a fallbackRepair for a test failure message. Test-local on
+// purpose: the production type needs no String method for its own diagnostics,
+// which are message-per-case rather than formatted from the enum.
+func repairName(r fallbackRepair) string {
+	switch r {
+	case fallbackAccepted:
+		return "fallbackAccepted"
+	case fallbackInvalid:
+		return "fallbackInvalid"
+	case fallbackClamped:
+		return "fallbackClamped"
+	}
+	return "fallbackRepair(" + strconv.Itoa(int(r)) + ")"
 }
 
 func TestParseFallbackInterval_clamps_excessive_values(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		val  string
-		want time.Duration
+		name       string
+		val        string
+		want       time.Duration
+		wantRepair fallbackRepair
 	}{
 		// 87600h (10 years) is the clamp ceiling: at the ceiling the value
 		// passes through unchanged; above it the value is clamped down to it.
-		{"at ceiling unclamped", "87600", 87600 * time.Hour},
-		{"one above ceiling clamped", "87601", 87600 * time.Hour},
-		{"far above ceiling clamped", "1000000", 87600 * time.Hour},
+		{"at ceiling unclamped", "87600", 87600 * time.Hour, fallbackAccepted},
+		{"one above ceiling clamped", "87601", 87600 * time.Hour, fallbackClamped},
+		{"far above ceiling clamped", "1000000", 87600 * time.Hour, fallbackClamped},
 		// Beyond int64: a valid decimal that overflows is still a positive
 		// above-ceiling value, so it clamps rather than falling through to the
 		// 6h default. An optional leading "+" is still a valid decimal.
-		{"beyond int64 clamped", "999999999999999999999999999999", 87600 * time.Hour},
-		{"signed beyond int64 clamped", "+999999999999999999999999999999", 87600 * time.Hour},
+		{"beyond int64 clamped", "999999999999999999999999999999", 87600 * time.Hour, fallbackClamped},
+		{"signed beyond int64 clamped", "+999999999999999999999999999999", 87600 * time.Hour, fallbackClamped},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := parseFallbackInterval(tc.val); got != tc.want {
+			got, repair := parseFallbackInterval(tc.val)
+			if got != tc.want {
 				t.Errorf("parseFallbackInterval(%q) = %v, want %v", tc.val, got, tc.want)
+			}
+			if repair != tc.wantRepair {
+				t.Errorf("parseFallbackInterval(%q) repair = %s, want %s",
+					tc.val, repairName(repair), repairName(tc.wantRepair))
 			}
 		})
 	}
 }
 
-// TestParseFallbackInterval_warns_when_input_is_repaired pins the two repair
-// diagnostics: an invalid value and an above-ceiling value are both silently
-// repaired, so the WARN naming the rejected value is the operator's only way to
-// tell an intended cadence from a default or a clamp.
-func TestParseFallbackInterval_warns_when_input_is_repaired(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		raw     string
-		want    time.Duration
-		message string
-	}{
-		{"invalid value uses default", "abc", 6 * time.Hour, "invalid FALLBACK_SCAN_HOURS, using default"},
-		{"excessive value is clamped", "87601", 87600 * time.Hour, "FALLBACK_SCAN_HOURS too large, clamping"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+// TestParseFallbackInterval_is_silent pins the parse as pure: it classifies a
+// repaired value but emits nothing. The diagnostics are Load's, because
+// FallbackInterval() is called by the `health` subcommand too, where a startup
+// WARN would reprint on every probe (every ~30s under Docker's healthcheck).
+// slog.Default is process-global, so this test must not run in parallel with
+// anything that logs.
+func TestParseFallbackInterval_is_silent(t *testing.T) {
+	for _, raw := range []string{"", "   ", "abc", "-1", "00", "12", "0", "false", "87601", "999999999999999999999999999999"} {
+		t.Run(raw, func(t *testing.T) {
 			logs := capture.Default(t)
 
-			if got := parseFallbackInterval(tc.raw); got != tc.want {
-				t.Errorf("parseFallbackInterval(%q) = %v, want %v", tc.raw, got, tc.want)
-			}
-			if n := logs.CountLevel(slog.LevelWarn, tc.message); n != 1 {
-				t.Errorf("parseFallbackInterval(%q) logged %d WARN records matching %q, want 1 (logs %v)",
-					tc.raw, n, tc.message, logs.Messages())
-			}
-			if !logs.AttrContains(tc.message, "value", tc.raw) {
-				t.Errorf("parseFallbackInterval(%q) WARN does not name the rejected value (logs %v)", tc.raw, logs.Messages())
+			parseFallbackInterval(raw)
+
+			if logs.Len() != 0 {
+				t.Errorf("parseFallbackInterval(%q) logged %v, want no records: the diagnostics belong to Load",
+					raw, logs.Messages())
 			}
 		})
 	}
+}
+
+// TestFallbackInterval_is_silent pins the same contract on the exported reader
+// the `health` subcommand calls. This is the regression the whole split exists
+// to prevent: with the WARNs back in the parser, a misconfigured or
+// above-ceiling FALLBACK_SCAN_HOURS printed a startup-shaped WARN on every
+// healthcheck, forever.
+func TestFallbackInterval_is_silent(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want time.Duration
+	}{
+		{"", 6 * time.Hour},
+		{"abc", 6 * time.Hour},
+		{"-1", 6 * time.Hour},
+		{"87601", 87600 * time.Hour},
+		{"12", 12 * time.Hour},
+		{"0", 0},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			t.Setenv("FALLBACK_SCAN_HOURS", tc.raw)
+
+			logs := capture.Default(t)
+
+			if got := FallbackInterval(); got != tc.want {
+				t.Errorf("FallbackInterval() with FALLBACK_SCAN_HOURS=%q = %v, want %v", tc.raw, got, tc.want)
+			}
+			if logs.Len() != 0 {
+				t.Errorf("FallbackInterval() with FALLBACK_SCAN_HOURS=%q logged %v, want no records: "+
+					"the health subcommand calls it on every probe", tc.raw, logs.Messages())
+			}
+		})
+	}
+}
+
+// TestLoad_warns_when_the_fallback_value_is_repaired pins the two repair
+// diagnostics at their new home. Both values are silently repaired, so the WARN
+// naming the rejected value is the operator's only way to tell an intended
+// cadence from a default or a clamp. Message text, level and attribute keys are
+// asserted verbatim: a documented Loki matcher or an operator's grep keys on
+// them. Exactly one record per process start, and the derived value is asserted
+// beside the warning so the two cannot drift.
+// slog.Default is process-global, so this test must not run in parallel with
+// anything that logs.
+func TestLoad_warns_when_the_fallback_value_is_repaired(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		raw      string
+		want     time.Duration
+		message  string
+		attrKey  string
+		attrWant string
+	}{
+		{
+			name: "invalid value uses default", raw: "abc", want: 6 * time.Hour,
+			message: "invalid FALLBACK_SCAN_HOURS, using default", attrKey: "default", attrWant: "6h0m0s",
+		},
+		{
+			name: "excessive value is clamped", raw: "87601", want: 87600 * time.Hour,
+			message: "FALLBACK_SCAN_HOURS too large, clamping", attrKey: "max_hours", attrWant: "87600",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", "pw")
+			t.Setenv("FALLBACK_SCAN_HOURS", tc.raw)
+
+			logs := capture.Default(t)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() = %v, want nil", err)
+			}
+			if cfg.FallbackInterval != tc.want {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q FallbackInterval = %v, want %v",
+					tc.raw, cfg.FallbackInterval, tc.want)
+			}
+			if n := logs.CountLevel(slog.LevelWarn, tc.message); n != 1 {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q logged %d WARN records matching %q, want exactly 1 (logs %v)",
+					tc.raw, n, tc.message, logs.Messages())
+			}
+			if n := logs.CountExact(tc.message); n != 1 {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q logged %d records with the exact message %q, want 1 (logs %v)",
+					tc.raw, n, tc.message, logs.Messages())
+			}
+			if !logs.AttrContains(tc.message, "value", tc.raw) {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN does not name the rejected value (logs %v)",
+					tc.raw, logs.Messages())
+			}
+			if !logs.HasAttr(tc.message, tc.attrKey, tc.attrWant) {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN %q = %q, want %q=%q (logs %v)",
+					tc.raw, tc.attrKey, mustAttr(t, logs, tc.message, tc.attrKey), tc.attrKey, tc.attrWant, logs.Messages())
+			}
+		})
+	}
+}
+
+// TestLoad_stays_silent_for_a_usable_fallback_value keeps the repair WARNs off
+// every correctly configured startup: an accepted cadence, the documented
+// default, and the ceiling itself are all used as configured, so warning on
+// them would train an operator to ignore the lines that matter.
+func TestLoad_stays_silent_for_a_usable_fallback_value(t *testing.T) {
+	for _, raw := range []string{"", "   ", "12", "1", "87600", "  12", "0", "false"} {
+		t.Run(raw, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", "pw")
+			t.Setenv("FALLBACK_SCAN_HOURS", raw)
+
+			logs := capture.Default(t)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() = %v, want nil", err)
+			}
+
+			for _, unwanted := range []string{
+				"invalid FALLBACK_SCAN_HOURS, using default",
+				"FALLBACK_SCAN_HOURS too large, clamping",
+			} {
+				if n := logs.Count(unwanted); n != 0 {
+					t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q logged %d records matching %q, want none (logs %v)",
+						raw, n, unwanted, logs.Messages())
+				}
+			}
+		})
+	}
+}
+
+// mustAttr renders an attribute for a failure message, or a marker when the
+// record carried no such key.
+func mustAttr(t *testing.T, logs *capture.Recorder, msgSub, key string) string {
+	t.Helper()
+	got, ok := logs.AttrValue(msgSub, key)
+	if !ok {
+		return "<absent>"
+	}
+	return got
 }
 
 // isolatePasswordFile clears PFX_PASSWORD_FILE so an ambient value inherited

@@ -133,6 +133,9 @@ func dispatchArgs(args []string) int {
 		// FALLBACK_SCAN_HOURS=0/false disables the fallback and with it
 		// the deadline (WithMaxAge(0) is a no-op): watch-only mode has no
 		// guaranteed refresh cadence to hold the marker to.
+		// config.FallbackInterval is deliberately silent — a misconfigured or
+		// above-ceiling value is diagnosed once at startup by config.Load, not
+		// here, where Docker's healthcheck would reprint it every 30s forever.
 		// RunProbe exits the process, so this never falls through to the
 		// watcher below.
 		runProbe(health.DefaultPath,
