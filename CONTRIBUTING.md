@@ -36,6 +36,11 @@ scan, then hand off to the watcher. The real work lives under
   package-internal), the encoder-profile mapping (`EncoderName` /
   `PickEncoder` in `encoder.go`; `EncoderName` normalizes the value and
   reports whether it was recognized).
+- `internal/outputpolicy`: the `OUTPUT_LIFECYCLE` value domain — the
+  `Lifecycle` type, its `warn`/`sync`/`keep` modes and `ParseLifecycle`.
+  A standard-library-only leaf both `config` (which parses the operator's
+  raw value) and `process` (which acts on the parsed mode) import, so the
+  configuration layer does not sit above the orchestrator.
 - `internal/process`: orchestration, plus `types.go` holding the
   package-private `conversionStatus` outcome enum (`ScanResult` is the
   package's only exported outcome surface), and the package-private

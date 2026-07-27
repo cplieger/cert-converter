@@ -12,34 +12,9 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 )
-
-// TestParseLifecycle pins the knob's normalisation, including that an
-// unrecognised value falls back to the SAFE mode rather than the destructive one.
-func TestParseLifecycle(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		raw       string
-		want      Lifecycle
-		wantKnown bool
-	}{
-		{"", LifecycleWarn, true},
-		{"warn", LifecycleWarn, true},
-		{"  SYNC  ", LifecycleSync, true},
-		{"Keep", LifecycleKeep, true},
-		{"delete", LifecycleWarn, false},
-		{"true", LifecycleWarn, false},
-	} {
-		t.Run(tc.raw, func(t *testing.T) {
-			t.Parallel()
-			got, known := ParseLifecycle(tc.raw)
-			if got != tc.want || known != tc.wantKnown {
-				t.Errorf("ParseLifecycle(%q) = (%q, %v), want (%q, %v)", tc.raw, got, known, tc.want, tc.wantKnown)
-			}
-		})
-	}
-}
 
 // TestStoreReconcile pins every rail on orphan deletion. Each case is a way the
 // gate must refuse, because getting a deletion wrong destroys private key material
@@ -48,14 +23,14 @@ func TestStoreReconcile(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name        string
-		mode        Lifecycle
+		mode        outputpolicy.Lifecycle
 		rc          reapContext
 		wantDeleted int
 		wantPresent bool
 	}{
 		{
 			name: "sync removes an orphan after a clean complete scan",
-			mode: LifecycleSync, rc: reapContext{scanTotal: 1, walkCompleted: true},
+			mode: outputpolicy.LifecycleSync, rc: reapContext{scanTotal: 1, walkCompleted: true},
 			wantDeleted: 1, wantPresent: false,
 		},
 		{
@@ -63,17 +38,17 @@ func TestStoreReconcile(t *testing.T) {
 			// produces a clean, complete walk, so without this the first scan after
 			// a slow or wrong mount would delete every bundle.
 			name: "sync refuses when the scan found no pairs at all",
-			mode: LifecycleSync, rc: reapContext{scanTotal: 0, walkCompleted: true},
+			mode: outputpolicy.LifecycleSync, rc: reapContext{scanTotal: 0, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
 			name: "sync refuses when the walk did not complete",
-			mode: LifecycleSync, rc: reapContext{scanTotal: 1, walkCompleted: false},
+			mode: outputpolicy.LifecycleSync, rc: reapContext{scanTotal: 1, walkCompleted: false},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
 			name: "sync refuses when a sub-path was unreadable",
-			mode: LifecycleSync, rc: reapContext{scanTotal: 1, unreadable: 1, walkCompleted: true},
+			mode: outputpolicy.LifecycleSync, rc: reapContext{scanTotal: 1, unreadable: 1, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
@@ -81,24 +56,24 @@ func TestStoreReconcile(t *testing.T) {
 			// so `seen` is incomplete even though the walk reported no error and
 			// nothing was unreadable. Reproduced as a live-bundle deletion.
 			name: "sync refuses when an input symlink could not be resolved",
-			mode: LifecycleSync, rc: reapContext{scanTotal: 1, unresolved: 1, walkCompleted: true},
+			mode: outputpolicy.LifecycleSync, rc: reapContext{scanTotal: 1, unresolved: 1, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
 			// The design promised this rail and the first implementation dropped it: a
 			// scan already failing conversions must not also delete.
 			name: "sync refuses when a conversion failed",
-			mode: LifecycleSync, rc: reapContext{scanTotal: 1, failed: 1, walkCompleted: true},
+			mode: outputpolicy.LifecycleSync, rc: reapContext{scanTotal: 1, failed: 1, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
 			name: "warn, the default, reports but never deletes",
-			mode: LifecycleWarn, rc: reapContext{scanTotal: 1, walkCompleted: true},
+			mode: outputpolicy.LifecycleWarn, rc: reapContext{scanTotal: 1, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
 			name: "keep is silent and never deletes",
-			mode: LifecycleKeep, rc: reapContext{scanTotal: 1, walkCompleted: true},
+			mode: outputpolicy.LifecycleKeep, rc: reapContext{scanTotal: 1, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 	} {
@@ -242,7 +217,7 @@ func TestStoreReconcile_propagates_a_shutdown_from_the_orphan_walk(t *testing.T)
 
 	// sync over a tree with one orphan: the mode that would delete, so nothing about
 	// the arrangement excuses the refusal except the cancellation itself.
-	deleted, err := s.reconcile(ctx, LifecycleSync, map[string]struct{}{},
+	deleted, err := s.reconcile(ctx, outputpolicy.LifecycleSync, map[string]struct{}{},
 		reapContext{scanTotal: 1, walkCompleted: true})
 
 	if !errors.Is(err, context.Canceled) {
@@ -342,7 +317,7 @@ func TestStoreReconcile_sync_spares_a_nested_live_bundle(t *testing.T) {
 	s := &store{root: root}
 	seen := map[string]struct{}{filepath.Join("acme-v02", "example.com", "live.crt"): {}}
 
-	got, reconcileErr := s.reconcile(context.Background(), LifecycleSync, seen, reapContext{scanTotal: 1, walkCompleted: true})
+	got, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync, seen, reapContext{scanTotal: 1, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Errorf("reconcile(nested output tree) = error %v, want nil", reconcileErr)
 	}

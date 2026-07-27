@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 )
@@ -32,7 +33,7 @@ func newSyncScanner(certsRoot, outRoot string) *process.Scanner {
 		OutRoot:   outRoot,
 		Password:  "pw",
 		Encoder:   convert.EncNameModern2023,
-		Lifecycle: process.LifecycleSync,
+		Lifecycle: outputpolicy.LifecycleSync,
 	})
 }
 

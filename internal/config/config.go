@@ -12,7 +12,7 @@ import (
 	"unicode"
 
 	"github.com/cplieger/cert-converter/internal/convert"
-	"github.com/cplieger/cert-converter/internal/process"
+	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/envx"
 	"github.com/cplieger/slogx"
 )
@@ -32,7 +32,7 @@ const defaultFallbackInterval = 6 * time.Hour
 type Config struct {
 	Password         string
 	EncoderName      convert.EncoderType
-	Lifecycle        process.Lifecycle
+	Lifecycle        outputpolicy.Lifecycle
 	PasswordStatus   PasswordStatus
 	FallbackInterval time.Duration
 }
@@ -153,7 +153,7 @@ func Load() (Config, error) {
 	logPasswordDelivery(source, password, blankSecretFile)
 
 	rawLifecycle := os.Getenv("OUTPUT_LIFECYCLE")
-	lifecycle, lifecycleKnown := process.ParseLifecycle(rawLifecycle)
+	lifecycle, lifecycleKnown := outputpolicy.ParseLifecycle(rawLifecycle)
 	if !lifecycleKnown {
 		slog.Warn("unknown OUTPUT_LIFECYCLE, using warn", "value", rawLifecycle)
 	}

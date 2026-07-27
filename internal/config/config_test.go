@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
-	"github.com/cplieger/cert-converter/internal/process"
+	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -941,15 +941,15 @@ func TestLoad_wires_output_lifecycle(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		raw      string
-		want     process.Lifecycle
+		want     outputpolicy.Lifecycle
 		wantWarn bool
 	}{
-		{"unset defaults to warn", "", process.LifecycleWarn, false},
-		{"explicit warn", "warn", process.LifecycleWarn, false},
-		{"sync is wired through", "sync", process.LifecycleSync, false},
-		{"keep is wired through", "keep", process.LifecycleKeep, false},
-		{"padded mixed case is normalised", "  SyNc  ", process.LifecycleSync, false},
-		{"unknown value warns and falls back to warn", "delete", process.LifecycleWarn, true},
+		{"unset defaults to warn", "", outputpolicy.LifecycleWarn, false},
+		{"explicit warn", "warn", outputpolicy.LifecycleWarn, false},
+		{"sync is wired through", "sync", outputpolicy.LifecycleSync, false},
+		{"keep is wired through", "keep", outputpolicy.LifecycleKeep, false},
+		{"padded mixed case is normalised", "  SyNc  ", outputpolicy.LifecycleSync, false},
+		{"unknown value warns and falls back to warn", "delete", outputpolicy.LifecycleWarn, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			isolatePasswordFile(t)

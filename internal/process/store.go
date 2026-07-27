@@ -13,6 +13,7 @@ import (
 	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
+	"github.com/cplieger/cert-converter/internal/outputpolicy"
 )
 
 // Output file and directory modes. A PFX carries a private key, so it is
@@ -419,37 +420,13 @@ func (s *store) readBoundedPFX(ctx context.Context, rel string) ([]byte, error) 
 }
 
 // --- Output lifecycle ---
-
-// Lifecycle decides what happens to an output whose input pair has disappeared.
-type Lifecycle string
-
-// The three lifecycle modes.
-const (
-	// LifecycleWarn reports orphaned outputs and deletes nothing. The DEFAULT:
-	// deletion is opt-in, so an upgrade cannot remove files on its own.
-	LifecycleWarn Lifecycle = "warn"
-	// LifecycleSync makes the output tree mirror the input tree, deleting a bundle
-	// whose source is gone. The homelab deployment opts into this explicitly.
-	LifecycleSync Lifecycle = "sync"
-	// LifecycleKeep leaves orphans in place silently.
-	LifecycleKeep Lifecycle = "keep"
-)
-
-// ParseLifecycle normalises a raw OUTPUT_LIFECYCLE value. An unrecognised value
-// falls back to the default with known false, so the caller that read the
-// environment is the one that names it in a warning.
-func ParseLifecycle(raw string) (mode Lifecycle, known bool) {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case string(LifecycleSync):
-		return LifecycleSync, true
-	case string(LifecycleKeep):
-		return LifecycleKeep, true
-	case "", string(LifecycleWarn):
-		return LifecycleWarn, true
-	default:
-		return LifecycleWarn, false
-	}
-}
+//
+// The OUTPUT_LIFECYCLE value domain itself (the Lifecycle type, its three modes
+// and their parse) lives in internal/outputpolicy, which this package consumes:
+// the operator's raw value is read and normalised by internal/config, and keeping
+// the enum here put that configuration layer above the orchestrator. What follows
+// is this package's own half — acting on an already-parsed mode over the output
+// tree.
 
 // orphans lists outputs under the store whose input pair is absent, as
 // root-relative paths in walk order.
@@ -573,8 +550,8 @@ func (r reapContext) safeToReap() bool {
 // removed plus a cancellation error when the process is shutting down: the walk
 // caller folds that error into the scan's outcome, so a scan interrupted after the
 // input walk finished is not reported as a clean, complete scan.
-func (s *store) reconcile(ctx context.Context, mode Lifecycle, seen map[string]struct{}, rc reapContext) (int, error) {
-	if mode == LifecycleKeep {
+func (s *store) reconcile(ctx context.Context, mode outputpolicy.Lifecycle, seen map[string]struct{}, rc reapContext) (int, error) {
+	if mode == outputpolicy.LifecycleKeep {
 		return 0, nil
 	}
 	if !rc.enumeratedInput() {
@@ -620,7 +597,7 @@ func (s *store) reconcile(ctx context.Context, mode Lifecycle, seen map[string]s
 	}
 
 	reapable := rc.safeToReap() && walkSafe
-	if mode != LifecycleSync || !reapable {
+	if mode != outputpolicy.LifecycleSync || !reapable {
 		slog.Warn("output bundles have no matching input",
 			"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),
 			"action", lifecycleInaction(mode),
@@ -672,8 +649,8 @@ func sampleOrphanPaths(paths []string) string {
 // orphaned — reconcile now returns before this point when the INPUT enumeration is
 // incomplete, so the sync arm is reached via a failed conversion or an unsafe
 // OUTPUT walk.
-func lifecycleInaction(mode Lifecycle) string {
-	if mode != LifecycleSync {
+func lifecycleInaction(mode outputpolicy.Lifecycle) string {
+	if mode != outputpolicy.LifecycleSync {
 		return "reported only (OUTPUT_LIFECYCLE=" + string(mode) + ")"
 	}
 	return "kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle"

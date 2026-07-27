@@ -12,6 +12,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
+	"github.com/cplieger/cert-converter/internal/outputpolicy"
 )
 
 // ScanResult carries per-pair outcome summary counts from a scan run.
@@ -37,7 +38,7 @@ type ScanResult struct {
 // than re-supplied per scan.
 type Options struct {
 	Encoder   convert.EncoderType
-	Lifecycle Lifecycle
+	Lifecycle outputpolicy.Lifecycle
 	CertsRoot string
 	OutRoot   string
 	Password  string
