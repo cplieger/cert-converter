@@ -221,3 +221,89 @@ func TestHandleRootWatchLoss_reattaches_the_watch_set_when_the_fallback_is_enabl
 		}
 	}
 }
+
+// TestHandleRootWatchLoss_only_the_root_being_taken_away_ends_change_detection
+// pins the two guards that decide whether an event is a root-watch LOSS at all.
+// Both are load-bearing and neither is otherwise exercised: the whole table runs
+// with the periodic rescan disabled, the one configuration in which a loss is
+// terminal, so every "still live" answer here comes from a guard rather than
+// from the fallback.
+//
+// A chmod on the root is the documented permission-repair recovery event, and a
+// Remove or Rename BELOW the root is an ordinary certificate deletion. If either
+// guard stopped classifying, that benign event would report lost change
+// detection, main would exit non-zero, and the critical
+// CertConverterChangeDetectionDead alert would fire on a cert deletion or a
+// chmod of /input. The terminal rows are what keep the live rows honest: without
+// them a function that always reported "live" would satisfy the table.
+func TestHandleRootWatchLoss_only_the_root_being_taken_away_ends_change_detection(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		op       fsnotify.Op
+		atRoot   bool
+		wantLive bool
+	}{
+		{"a chmod on the root is a permission repair, not a loss", fsnotify.Chmod, true, true},
+		{"a write on the root is not a loss", fsnotify.Write, true, true},
+		{"a create in the root is not a loss", fsnotify.Create, true, true},
+		{"removing a cert below the root is not a loss", fsnotify.Remove, false, true},
+		{"renaming a directory below the root is not a loss", fsnotify.Rename, false, true},
+		{"the root itself being removed is terminal", fsnotify.Remove, true, false},
+		{"the root itself being renamed is terminal", fsnotify.Rename, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			watcher := newTestWatcher(t)
+			root := t.TempDir()
+			path := filepath.Join(root, "example.com")
+			if tc.atRoot {
+				path = root
+			}
+			// No WithFallback: the periodic rescan is disabled, so a loss is terminal.
+			w := New(root, func(context.Context) {})
+
+			got := w.handleRootWatchLoss(t.Context(), watcher, fsnotify.Event{Name: path, Op: tc.op})
+
+			if got != tc.wantLive {
+				t.Errorf("handleRootWatchLoss(%s on %s) = %v, want %v", tc.op, path, got, tc.wantLive)
+			}
+		})
+	}
+}
+
+// TestHandleRootWatchLoss_stays_live_when_the_reattach_fails pins the liveness
+// half of the recoverable branch, the same contract its sibling arms carry
+// (handleErrorRecv on an overflow, handleFallbackTick on a failed re-sync): with
+// the periodic rescan enabled, a re-attach that fails must be WARNed about and
+// still report change detection live. Reporting a loss there would restart the
+// container over a condition the rescan already covers.
+//
+// The WARN is the only signal an operator gets that real-time detection is off
+// until a later re-sync, so it must name the root and the rescan cadence.
+// Not parallel: it swaps the process-global slog default.
+func TestHandleRootWatchLoss_stays_live_when_the_reattach_fails(t *testing.T) {
+	const msg = "failed to re-attach the watch set after the root watch was lost"
+
+	logs := capture.Default(t)
+	root := t.TempDir()
+	w := New(root, func(context.Context) {}, WithFallback(6*time.Hour))
+
+	if !w.handleRootWatchLoss(t.Context(), newClosedTestWatcher(t), fsnotify.Event{Name: root, Op: fsnotify.Remove}) {
+		t.Fatal("handleRootWatchLoss(re-attach failing, fallback enabled) = false, want true: the periodic rescan still covers renewals, so a failed repair must not restart the container")
+	}
+	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
+		t.Fatalf("WARN %q logged %d times, want exactly 1; log = %v", msg, n, logs.Messages())
+	}
+	for key, want := range map[string]string{"root": root, "fallback_scan": "6h0m0s"} {
+		got, ok := logs.AttrValue(msg, key)
+		if !ok {
+			t.Errorf("WARN %q carries no %q attribute; an operator cannot tell which tree lost real-time detection or when it is re-scanned", msg, key)
+			continue
+		}
+		if got != want {
+			t.Errorf("WARN %q %s = %q, want %q", msg, key, got, want)
+		}
+	}
+}

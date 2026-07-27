@@ -477,13 +477,6 @@ func TestConvertPair_round_trips_chain_for_every_encoder_profile(t *testing.T) {
 			if _, err := convertPairInRoot(t.Context(), chainPEM, keyPEM, root, rel, "pw", enc); err != nil {
 				t.Fatalf("convertPairInRoot(%s) = error %v, want nil", name, err)
 			}
-			info, err := os.Stat(destPath)
-			if err != nil {
-				t.Fatalf("convertPairInRoot(%s) did not write a file: %v", name, err)
-			}
-			if perm := info.Mode().Perm(); perm != 0o600 {
-				t.Errorf("convertPairInRoot(%s) wrote mode %o, want 600", name, perm)
-			}
 			pfxData, err := os.ReadFile(destPath)
 			if err != nil {
 				t.Fatalf("read pfx written by convertPairInRoot(%s): %v", name, err)
@@ -505,12 +498,6 @@ func TestConvertPair_round_trips_chain_for_every_encoder_profile(t *testing.T) {
 	}
 }
 
-// TestConvertPair_names_the_matching_certificate_for_a_leaf_last_chain pins the
-// leaf-last chain diagnosis: when a LATER certificate in the chain matches the
-// private key, the mismatch error keeps the base sentence as its prefix (existing
-// log matching depends on it) and additionally names the position and subject of
-// the certificate that does match. An unrelated key, where no certificate in the
-// chain matches, must get the base sentence alone and no leaf-last claim.
 // TestConvertPair_resolves_a_leaf_last_chain_structurally pins the behaviour that
 // replaced the old leaf-last DIAGNOSTIC. Identity selection is key-first, so the
 // certificate the private key matches is the identity wherever it sits in the

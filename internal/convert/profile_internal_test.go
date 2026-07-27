@@ -3,6 +3,7 @@ package convert
 import (
 	"encoding/asn1"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -142,7 +143,7 @@ func TestInspect_rejects_an_oversized_identifier(t *testing.T) {
 func TestInspect_rejects_an_oversized_safe_bag_identifier(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(append(append([]byte{}, m.LeafPEM...), m.CAPEM...), m.LeafKeyPEM)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
@@ -153,16 +154,11 @@ func TestInspect_rejects_an_oversized_safe_bag_identifier(t *testing.T) {
 	var preamble pfxPreamble
 	testASN1Unmarshal(t, pfx, &preamble)
 	mutateTestAuthenticatedSafe(t, &preamble, oidDataContentType, func(safe *contentInfo) {
-		var inner []byte
-		testASN1Unmarshal(t, safe.Content.Bytes, &inner)
-		var bags []safeBag
-		testASN1Unmarshal(t, inner, &bags)
-		oversized := bags[0]
-		oversized.ID = oversizedOID()
-		bags = append(bags, oversized)
-		safeDER := testASN1Marshal(t, bags)
-		safe.Content.Bytes = testASN1Marshal(t, safeDER)
-		safe.Content.FullBytes = nil
+		mutateTestSafeBags(t, safe, func(bags []safeBag) []safeBag {
+			oversized := bags[0]
+			oversized.ID = oversizedOID()
+			return append(bags, oversized)
+		})
 	})
 	if _, err := Inspect(testASN1Marshal(t, preamble)); !errors.Is(err, ErrProfileUnknown) {
 		t.Errorf("Inspect(bundle with oversized safe-bag identifier) = %v, want ErrProfileUnknown", err)
@@ -184,7 +180,7 @@ func TestInspect_rejects_an_oversized_safe_bag_identifier(t *testing.T) {
 func TestInspect_rejects_excessive_iterations_in_every_derivation_location(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(append(append([]byte{}, m.LeafPEM...), m.CAPEM...), m.LeafKeyPEM)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
@@ -285,29 +281,15 @@ func mutateTestEncryptedSafe(t *testing.T, p *pfxPreamble, mutate func(*algorith
 func mutateTestShroudedKeyBag(t *testing.T, p *pfxPreamble, mutate func(*algorithmIdentifier)) {
 	t.Helper()
 	mutateTestAuthenticatedSafe(t, p, oidDataContentType, func(safe *contentInfo) {
-		var inner []byte
-		testASN1Unmarshal(t, safe.Content.Bytes, &inner)
-		var bags []safeBag
-		testASN1Unmarshal(t, inner, &bags)
-		for i := range bags {
-			id, err := decodeOID(bags[i].ID)
-			if err != nil {
-				t.Fatalf("setup: decode bag id: %v", err)
-			}
-			if !id.Equal(oidPKCS8ShroudedKeyBag) {
-				continue
-			}
+		mutateTestSafeBags(t, safe, func(bags []safeBag) []safeBag {
+			bag := &bags[testShroudedKeyBagIndex(t, bags)]
 			var info encryptedPrivateKeyInfo
-			testASN1Unmarshal(t, bags[i].Value.Bytes, &info)
+			testASN1Unmarshal(t, bag.Value.Bytes, &info)
 			mutate(&info.Algorithm)
-			bags[i].Value.Bytes = testASN1Marshal(t, info)
-			bags[i].Value.FullBytes = nil
-			safeDER := testASN1Marshal(t, bags)
-			safe.Content.Bytes = testASN1Marshal(t, safeDER)
-			safe.Content.FullBytes = nil
-			return
-		}
-		t.Fatal("setup: no shrouded key bag found")
+			bag.Value.Bytes = testASN1Marshal(t, info)
+			bag.Value.FullBytes = nil
+			return bags
+		})
 	})
 }
 
@@ -315,37 +297,16 @@ func mutateTestShroudedKeyBag(t *testing.T, p *pfxPreamble, mutate func(*algorit
 // content type is want, and re-encodes the enclosing authSafe around it.
 func mutateTestAuthenticatedSafe(t *testing.T, p *pfxPreamble, want asn1.ObjectIdentifier, mutate func(*contentInfo)) {
 	t.Helper()
-	var inner []byte
-	testASN1Unmarshal(t, p.AuthSafe.Content.Bytes, &inner)
-	var safes []contentInfo
-	testASN1Unmarshal(t, inner, &safes)
-	for i := range safes {
-		got, err := decodeOID(safes[i].ContentType)
-		if err != nil {
-			t.Fatalf("setup: decode safe content type: %v", err)
-		}
-		if got.Equal(want) {
-			mutate(&safes[i])
-			inner = testASN1Marshal(t, safes)
-			p.AuthSafe.Content.Bytes = testASN1Marshal(t, inner)
-			p.AuthSafe.Content.FullBytes = nil
-			return
-		}
-	}
-	t.Fatalf("setup: no authenticated safe with content type %v", want)
+	safes := testAuthenticatedSafes(t, p)
+	mutate(&safes[testSafeIndex(t, safes, want)])
+	setTestAuthenticatedSafes(t, p, safes)
 }
 
 // setTestPBKDF2Iterations rewrites the nested PBKDF2 iteration count of a PBES2 or
 // PBMAC1 parameter block.
 func setTestPBKDF2Iterations(t *testing.T, alg *algorithmIdentifier, iterations int) {
 	t.Helper()
-	var params pbes2Params
-	testASN1Unmarshal(t, alg.Parameters.FullBytes, &params)
-	var kdf pbkdf2Params
-	testASN1Unmarshal(t, params.KeyDerivationFunc.Parameters.FullBytes, &kdf)
-	kdf.Iterations = iterations
-	params.KeyDerivationFunc.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, kdf)}
-	alg.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, params)}
+	setTestPBKDF2Params(t, alg, func(kdf *pbkdf2Params) { kdf.Iterations = iterations })
 }
 
 // setTestLegacyIterations rewrites the iteration count of a pkcs-12PbeParams block.
@@ -377,10 +338,58 @@ func testASN1Marshal(t *testing.T, value any) []byte {
 	return der
 }
 
+// testSafeIndex returns the index of the first authenticated safe whose content type is
+// want. One home for the walk, so every caller decodes a content type the same way.
+func testSafeIndex(t *testing.T, safes []contentInfo, want asn1.ObjectIdentifier) int {
+	t.Helper()
+	for i := range safes {
+		got, err := decodeOID(safes[i].ContentType)
+		if err != nil {
+			t.Fatalf("setup: decode safe content type: %v", err)
+		}
+		if got.Equal(want) {
+			return i
+		}
+	}
+	t.Fatalf("setup: no authenticated safe with content type %v", want)
+	return -1
+}
+
+// mutateTestSafeBags decodes a safe's bag list, hands it to mutate, and re-encodes both
+// DER layers the payload is wrapped in (the OCTET STRING and the SEQUENCE OF SafeBag)
+// around whatever mutate returns.
+func mutateTestSafeBags(t *testing.T, safe *contentInfo, mutate func([]safeBag) []safeBag) {
+	t.Helper()
+	var inner []byte
+	testASN1Unmarshal(t, safe.Content.Bytes, &inner)
+	var bags []safeBag
+	testASN1Unmarshal(t, inner, &bags)
+	safeDER := testASN1Marshal(t, mutate(bags))
+	safe.Content.Bytes = testASN1Marshal(t, safeDER)
+	safe.Content.FullBytes = nil
+}
+
+// testShroudedKeyBagIndex returns the index of the shrouded private-key bag, which every
+// profile puts alone in the plaintext safe.
+func testShroudedKeyBagIndex(t *testing.T, bags []safeBag) int {
+	t.Helper()
+	for i := range bags {
+		id, err := decodeOID(bags[i].ID)
+		if err != nil {
+			t.Fatalf("setup: decode bag id: %v", err)
+		}
+		if id.Equal(oidPKCS8ShroudedKeyBag) {
+			return i
+		}
+	}
+	t.Fatal("setup: no shrouded key bag in the plaintext safe")
+	return -1
+}
+
 func TestInspect_rejects_more_than_one_shrouded_key_bag(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(append(append([]byte{}, m.LeafPEM...), m.CAPEM...), m.LeafKeyPEM)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
@@ -404,6 +413,7 @@ func TestInspect_rejects_more_than_one_shrouded_key_bag(t *testing.T) {
 	}{
 		{"the control: re-encoded unchanged", "", func(_ *testing.T, safes []contentInfo) []contentInfo { return safes }},
 		{"a second bag inside one plaintext safe", "more than one shrouded private-key bag in one safe", duplicateTestKeyBag},
+		{"trailing bytes after the plaintext safe's content", "trailing byte(s) after a plaintext safe's content", appendTestTrailingByteToPlaintextSafe},
 		{"a second plaintext safe carrying its own bag", "more than one shrouded private-key bag", duplicateTestPlaintextSafe},
 		{"a second encrypted certificate safe", "more than one encrypted certificate bag", duplicateTestEncryptedSafe},
 		{"more authenticated safes than the preflight admits", "more than 2 element(s)", appendTestPlaintextSafe},
@@ -456,42 +466,29 @@ func setTestAuthenticatedSafes(t *testing.T, p *pfxPreamble, safes []contentInfo
 // where every profile puts the shrouded private-key bag.
 func plaintextTestSafeIndex(t *testing.T, safes []contentInfo) int {
 	t.Helper()
-	for i := range safes {
-		got, err := decodeOID(safes[i].ContentType)
-		if err != nil {
-			t.Fatalf("setup: decode safe content type: %v", err)
-		}
-		if got.Equal(oidDataContentType) {
-			return i
-		}
-	}
-	t.Fatal("setup: no plaintext safe in the bundle")
-	return -1
+	return testSafeIndex(t, safes, oidDataContentType)
 }
 
 // duplicateTestKeyBag adds a second shrouded key bag INSIDE the plaintext safe.
 func duplicateTestKeyBag(t *testing.T, safes []contentInfo) []contentInfo {
 	t.Helper()
+	mutateTestSafeBags(t, &safes[plaintextTestSafeIndex(t, safes)], func(bags []safeBag) []safeBag {
+		return append(bags, bags[testShroudedKeyBagIndex(t, bags)])
+	})
+	return safes
+}
+
+// appendTestTrailingByteToPlaintextSafe appends one byte after the plaintext safe's
+// content, so the preflight is asked to identify a profile from a PREFIX of a
+// structure whose remaining bytes it never reads. Accepting that means inspecting one
+// structure while the decoder acts on another, which is the parse differential the
+// preflight exists to prevent.
+func appendTestTrailingByteToPlaintextSafe(t *testing.T, safes []contentInfo) []contentInfo {
+	t.Helper()
 	safe := &safes[plaintextTestSafeIndex(t, safes)]
-	var inner []byte
-	testASN1Unmarshal(t, safe.Content.Bytes, &inner)
-	var bags []safeBag
-	testASN1Unmarshal(t, inner, &bags)
-	for i := range bags {
-		id, err := decodeOID(bags[i].ID)
-		if err != nil {
-			t.Fatalf("setup: decode bag id: %v", err)
-		}
-		if !id.Equal(oidPKCS8ShroudedKeyBag) {
-			continue
-		}
-		safeDER := testASN1Marshal(t, append(bags, bags[i]))
-		safe.Content.Bytes = testASN1Marshal(t, safeDER)
-		safe.Content.FullBytes = nil
-		return safes
-	}
-	t.Fatal("setup: no shrouded key bag in the plaintext safe")
-	return nil
+	safe.Content.Bytes = append(slices.Clone(safe.Content.Bytes), 0x00)
+	safe.Content.FullBytes = nil
+	return safes
 }
 
 // duplicateTestPlaintextSafe REPLACES the safe list with two copies of the
@@ -511,17 +508,8 @@ func duplicateTestPlaintextSafe(t *testing.T, safes []contentInfo) []contentInfo
 // what rejects it.
 func duplicateTestEncryptedSafe(t *testing.T, safes []contentInfo) []contentInfo {
 	t.Helper()
-	for i := range safes {
-		got, err := decodeOID(safes[i].ContentType)
-		if err != nil {
-			t.Fatalf("setup: decode safe content type: %v", err)
-		}
-		if got.Equal(oidEncryptedDataContentType) {
-			return []contentInfo{safes[i], safes[i]}
-		}
-	}
-	t.Fatal("setup: no encrypted safe in the bundle")
-	return nil
+	encrypted := safes[testSafeIndex(t, safes, oidEncryptedDataContentType)]
+	return []contentInfo{encrypted, encrypted}
 }
 
 // appendTestPlaintextSafe pushes the bundle one element PAST
@@ -542,7 +530,7 @@ func appendTestPlaintextSafe(t *testing.T, safes []contentInfo) []contentInfo {
 func TestInspect_rejects_a_weaker_pbes2_cipher(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(append(append([]byte{}, m.LeafPEM...), m.CAPEM...), m.LeafKeyPEM)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
@@ -588,7 +576,7 @@ func setTestPBES2Cipher(t *testing.T, alg *algorithmIdentifier, scheme asn1.Obje
 func TestInspect_rejects_a_weaker_nested_modern_algorithm(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(append(append([]byte{}, m.LeafPEM...), m.CAPEM...), m.LeafKeyPEM)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
@@ -760,4 +748,128 @@ func setTestPBMAC1Mac(t *testing.T, alg *algorithmIdentifier, mac asn1.ObjectIde
 	testASN1Unmarshal(t, alg.Parameters.FullBytes, &params)
 	params.MessageAuthScheme.Algorithm = rawOID(t, mac)
 	alg.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, params)}
+}
+
+// TestInspect_rejects_more_safe_bags_than_it_admits pins the element-count bound
+// on a plaintext safe's bag list. maxSafeBags is an allocation guard: Go's ASN.1
+// decoder sizes a []safeBag from the input's element count and every element costs
+// 216 bytes of RawValue headers however small its encoding is, and Inspect runs
+// over a file found in the output tree before any authentication, on the scan's
+// only goroutine.
+//
+// Nothing else pins it. Every profile writes exactly ONE bag, so the bound never
+// fires on this app's own output, and the fuzz target cannot reach it either:
+// arbitrary bytes are rejected long before they form a valid bag list with 65
+// members. Raise or delete the bound and every other test in this package stays
+// green.
+//
+// The filler bags carry the data content type as their id, so shroudedKeyBag skips
+// them and the single real key bag still resolves: without the bound the 65-bag
+// bundle is ACCEPTED as modern2023, which is what the accepted 64-bag case beside
+// it shows the construction is otherwise valid for. The error text is asserted
+// because ErrProfileUnknown alone cannot say which arm refused.
+func TestInspect_rejects_more_safe_bags_than_it_admits(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		// fillers is how many non-key bags ride beside the real shrouded key bag.
+		fillers int
+		// wantErrText is empty when the bundle must still be accepted.
+		wantErrText string
+	}{
+		{"the most bags the preflight admits", maxSafeBags - 1, ""},
+		{"one bag more than the preflight admits", maxSafeBags, "more than 64 element(s) in plaintext safe bags"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var preamble pfxPreamble
+			testASN1Unmarshal(t, pfx, &preamble)
+			mutateTestAuthenticatedSafe(t, &preamble, oidDataContentType, func(safe *contentInfo) {
+				var inner []byte
+				testASN1Unmarshal(t, safe.Content.Bytes, &inner)
+				var bags []safeBag
+				testASN1Unmarshal(t, inner, &bags)
+				filler := bags[0]
+				filler.ID = rawOID(t, oidDataContentType)
+				for range tc.fillers {
+					bags = append(bags, filler)
+				}
+				safeDER := testASN1Marshal(t, bags)
+				safe.Content.Bytes = testASN1Marshal(t, safeDER)
+				safe.Content.FullBytes = nil
+			})
+			got, err := Inspect(testASN1Marshal(t, preamble))
+			if tc.wantErrText == "" {
+				if err != nil {
+					t.Fatalf("Inspect(%s) = %v, want nil", tc.name, err)
+				}
+				if got.Profile != EncNameModern2023 {
+					t.Errorf("Inspect(%s) reported %q, want %q", tc.name, got.Profile, EncNameModern2023)
+				}
+				return
+			}
+			if !errors.Is(err, ErrProfileUnknown) {
+				t.Fatalf("Inspect(%s) = %v, want ErrProfileUnknown", tc.name, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrText) {
+				t.Errorf("Inspect(%s) = %v, want the refusal to come from the guard naming %q", tc.name, err, tc.wantErrText)
+			}
+		})
+	}
+}
+
+// TestInspect_rejects_a_non_positive_iteration_count pins the LOWER half of
+// checkIterations' range, which its own comment calls deliberate: a count of zero
+// or below is not a value any profile emits, so a file that spells one out is a
+// file whose framing this app does not understand and must be regenerated rather
+// than trusted.
+//
+// Only the upper half is otherwise pinned (the excessive-iteration table), so
+// narrowing the guard to n < 0, or dropping the non-positive half entirely, leaves
+// every test in this package green while Inspect starts reporting such a bundle as
+// one of this app's own profiles.
+func TestInspect_rejects_a_non_positive_iteration_count(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name        string
+		iterations  int
+		wantErrText string
+	}{
+		{"zero MAC iterations", 0, "mac iteration count 0 outside"},
+		{"negative MAC iterations", -1, "mac iteration count -1 outside"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var preamble pfxPreamble
+			testASN1Unmarshal(t, pfx, &preamble)
+			preamble.MacData.Iterations = tc.iterations
+			_, err := Inspect(testASN1Marshal(t, preamble))
+			if !errors.Is(err, ErrProfileUnknown) {
+				t.Fatalf("Inspect(%s) = %v, want ErrProfileUnknown", tc.name, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrText) {
+				t.Errorf("Inspect(%s) = %v, want the refusal to name %q", tc.name, err, tc.wantErrText)
+			}
+		})
+	}
 }

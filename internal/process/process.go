@@ -287,7 +287,9 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 // a walk aborted by shutdown (context cancellation or deadline) logs at Debug;
 // any other abort logs at Warn so an operator sees the partial scan and its
 // error. The count attributes are identical in all three cases (the README's Loki
-// alert matches on them), so they are built once.
+// alert matches on them), so they are built once. unresolved is carried as a
+// parameter rather than read off ScanResult, because it is deliberately not one of
+// the documented ScanResult fields.
 func logScanOutcome(ctx context.Context, result ScanResult, unresolved int, walkErr error) {
 	level, msg := slog.LevelInfo, "scan complete"
 	if walkErr != nil {
@@ -296,7 +298,7 @@ func logScanOutcome(ctx context.Context, result ScanResult, unresolved int, walk
 			level, msg = slog.LevelDebug, "scan cancelled during shutdown"
 		}
 	}
-	attrs := make([]any, 0, 16)
+	attrs := make([]any, 0, 18)
 	if walkErr != nil {
 		attrs = append(attrs, "error", walkErr)
 	}
@@ -306,17 +308,25 @@ func logScanOutcome(ctx context.Context, result ScanResult, unresolved int, walk
 		"unchanged", result.Unchanged,
 		"orphan", result.Orphan,
 		"unreadable", result.Unreadable,
+		// unresolved is deliberately NOT a ScanResult field (folding it into the
+		// documented Unreadable field would change an operator-visible alert
+		// attribute), so without naming it here the summary reports a clean, empty
+		// scan while an unresolvable input symlink hid an entire certificate subtree.
+		"unresolved", unresolved,
 		"removed", result.Removed,
 		"failed", result.Failed)
 	slog.Log(ctx, level, msg, attrs...)
 	logInputCoverageWarnings(result, unresolved, walkErr)
 }
 
-// logInputCoverageWarnings names the two health-neutral outcomes that produce no
-// PFX at all and that the summary counts alone cannot distinguish from a healthy
-// steady state. Both require a completed walk with no unreadable sub-path and no
-// unresolved symlink:
-// Unreadable == 0 is what makes "every certificate" provable, because Run
+// logInputCoverageWarnings names the health-neutral outcomes that produce no PFX --
+// for the whole input tree, or for one certificate in it -- and that the summary
+// counts alone cannot distinguish from a healthy steady state: an input tree holding
+// no certificate pair at all, one whose every certificate lacks its sibling .key, and
+// one where only some of them do.
+//
+// All require a completed walk with no unreadable sub-path and no unresolved
+// symlink. Unreadable == 0 is what makes "every certificate" provable, because Run
 // deliberately continues past an unreadable sub-path, so a partial enumeration
 // cannot know what lies beneath it, and the unreadable-path WARN already carries
 // the actionable diagnosis for that shape.
@@ -343,6 +353,17 @@ func logInputCoverageWarnings(result ScanResult, unresolved int, walkErr error) 
 		slog.Warn("every certificate under the input root is missing its sibling .key; no PFX output is being produced",
 			"orphan", result.Orphan,
 			"remediation", "name each private key <name>.key beside its <name>.crt (Caddy's layout)")
+	case result.Orphan > 0:
+		// Some, not all. The pairs that DO have their key still convert, so the scan
+		// completes with failed=0 and the summary's orphan count is the only trace at
+		// the default level. An orphaned .crt is also recorded as seen, so its
+		// existing bundle is never reaped either: it keeps being served, indefinitely
+		// stale, with nothing naming it. Same reasoning as the arm above, one blast
+		// radius smaller. The per-cert path stays Debug; this is the once-per-scan
+		// aggregate.
+		slog.Warn("some certificates under the input root are missing their sibling .key; those produce no PFX and any existing bundle for them goes stale",
+			"orphan", result.Orphan, "total", result.Total,
+			"remediation", "name each private key <name>.key beside its <name>.crt (Caddy's layout), or remove the certificate from /input")
 	}
 }
 
@@ -407,9 +428,9 @@ func pairFingerprint(certPEM, keyPEM []byte) [sha256.Size]byte {
 
 // observationLog de-duplicates the per-pair input-observation WARNs across
 // scans: an odd-but-convertible input is named on the scan that introduced it
-// and stays silent on every later fsnotify event and fallback tick. It is keyed
-// on the raw input fingerprint and NEVER consulted for currency, which
-// store.isCurrent derives from the bundle on disk. It is process-lifetime state
+// and stays silent on every later fsnotify event and fallback tick. It maps each
+// cert path to the last input fingerprint observed for it, and is NEVER consulted
+// for currency, which store.isCurrent derives from the bundle on disk. It is process-lifetime state
 // held by the Scanner, so a restart re-reports each pair exactly once.
 //
 // The map is plain, so it inherits Scanner's single-goroutine Run contract.

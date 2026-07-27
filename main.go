@@ -182,12 +182,19 @@ func main() {
 func run() int {
 	lvl, rawLevel, ok := config.LogLevel()
 	slogx.Setup(slogx.Options{Level: lvl})
-	if !ok {
-		slog.Warn("invalid LOG_LEVEL, using default", "value", rawLevel, "default", strings.ToLower(lvl.String()))
-	}
 
 	if code := dispatchArgs(os.Args); code != continueToWatcher {
 		return code
+	}
+
+	// Diagnosed only on the watcher path, below the argv dispatch: the health
+	// subcommand re-reads LOG_LEVEL on every probe (roughly every 30s under the
+	// image's HEALTHCHECK), so warning before dispatchArgs turned a
+	// once-per-process-start startup line into one on every healthcheck. Same
+	// reason config.FallbackInterval is deliberately silent and config.Load owns
+	// that setting's WARNs.
+	if !ok {
+		slog.Warn("invalid LOG_LEVEL, using default", "value", rawLevel, "default", strings.ToLower(lvl.String()))
 	}
 
 	// Clear any marker left by a previous run BEFORE the first failure exit:
@@ -205,10 +212,9 @@ func run() int {
 		return 1
 	}
 
-	passwordStatus := string(cfg.PasswordStatus)
 	slog.Info("starting cert watcher",
 		"input", certsRootDir, "output", outputDir,
-		"password", passwordStatus,
+		"password", string(cfg.PasswordStatus),
 		"fallback_scan", watch.FallbackLabel(cfg.FallbackInterval), "encoder", cfg.EncoderName,
 		"output_lifecycle", string(cfg.Lifecycle))
 

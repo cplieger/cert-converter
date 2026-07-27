@@ -75,7 +75,7 @@ func TestSourceReadBounded(t *testing.T) {
 			t.Skip("symlink semantics differ on Windows")
 		}
 		t.Parallel()
-		// The security guarantee of item l-f14: a symlink planted in the
+		// The security guarantee under test: a symlink planted in the
 		// watched directory that points outside it must not leak the target.
 		outside := t.TempDir()
 		if err := os.WriteFile(filepath.Join(outside, "secret"), []byte("top secret"), 0o644); err != nil {
@@ -130,7 +130,7 @@ func TestSourceReadBounded(t *testing.T) {
 			t.Skip("mkfifo is not available on Windows")
 		}
 		t.Parallel()
-		// The guarantee of item h-f5: open(2) on a FIFO with no writer blocks
+		// The guarantee under test: open(2) on a FIFO with no writer blocks
 		// forever, and the scan runs on the watch loop's only goroutine, so a
 		// FIFO planted in the watched tree must be rejected, not waited on.
 		dir := t.TempDir()
@@ -163,5 +163,3 @@ func TestSourceReadBounded(t *testing.T) {
 		}
 	})
 }
-
-// --- Tests: convertPairInRoot ---

@@ -123,10 +123,8 @@ func TestPollLoopWithUpgrade_reports_dead_change_detection(t *testing.T) {
 	// already on disk is the only useful work this process can do before exiting for
 	// a restart.
 	scanned := make(chan struct{}, 1)
-	w := &Watcher{ // FALLBACK_SCAN_HOURS=0/false
-		fallback: 0,
-		onChange: func(context.Context) { scanned <- struct{}{} },
-	}
+	// No WithFallback, i.e. FALLBACK_SCAN_HOURS=0/false.
+	w := New(t.TempDir(), func(context.Context) { scanned <- struct{}{} })
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	logs := capture.Default(t)

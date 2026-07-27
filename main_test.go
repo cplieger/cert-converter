@@ -46,7 +46,7 @@ func writeCertAndKey(t *testing.T, dir, base string, certPEM, keyPEM []byte) (cr
 	return crtPath, keyPath
 }
 
-// --- Tests: runAndSetHealth ---
+// --- Tests: scanAndSetHealth ---
 
 // newTestMarker constructs a marker rooted in a fresh TempDir so tests
 // don't race on /tmp/.healthy.
@@ -140,8 +140,23 @@ func TestScanAndSetHealth_unreadable_pair_stays_healthy(t *testing.T) {
 
 	scanAndSetHealth(t.Context(), scanner, marker)
 
-	if logs.CountLevel(slog.LevelWarn, "unreadable") == 0 {
-		t.Errorf("scanAndSetHealth should WARN about unreadable /input paths; got logs %q", logs.Messages())
+	// CountExact, not Count: the README's unreadable-path alerting keys on this
+	// exact message, so a superstring reword must fail here rather than in an
+	// operator's Loki rule that silently stops matching.
+	const unreadableMsg = "some /input paths were unreadable and were skipped; health is unaffected"
+	if n := logs.CountLevel(slog.LevelWarn, unreadableMsg); n != 1 {
+		t.Errorf("scanAndSetHealth logged %d WARN records with the alerted message %q, want exactly 1; got logs %q",
+			n, unreadableMsg, logs.Messages())
+	}
+	if n := logs.CountExact(unreadableMsg); n != 1 {
+		t.Errorf("scanAndSetHealth logged %d records exactly matching the alerted message %q, want 1; got logs %q",
+			n, unreadableMsg, logs.Messages())
+	}
+	if !logs.HasAttr(unreadableMsg, "unreadable", "1") {
+		t.Errorf("scanAndSetHealth WARN does not report unreadable=1 for one escaping pair; got logs %q", logs.Messages())
+	}
+	if !logs.AttrContains(unreadableMsg, "remediation", "fix /input permissions") {
+		t.Errorf("scanAndSetHealth WARN carries no actionable remediation attr; got logs %q", logs.Messages())
 	}
 	if _, err := os.Stat(markerPath); err != nil {
 		t.Fatalf("marker must stay healthy when only Unreadable>0 and no conversion failed: %v", err)
@@ -547,17 +562,18 @@ func TestVolumesReady(t *testing.T) {
 	absent := filepath.Join(t.TempDir(), "absent")
 
 	for _, tc := range []struct {
-		name     string
-		dirs     []volumeDir
-		want     bool
-		wantRole string
+		name       string
+		dirs       []volumeDir
+		want       bool
+		wantRole   string
+		wantErrSub string
 	}{
-		{"both mounted", []volumeDir{{"input", existingDir}, {"output", existingDir}}, true, ""},
-		{"missing input", []volumeDir{{"input", absent}, {"output", existingDir}}, false, "input"},
-		{"missing output", []volumeDir{{"input", existingDir}, {"output", absent}}, false, "output"},
-		{"input is a regular file", []volumeDir{{"input", regularFile}, {"output", existingDir}}, false, "input"},
-		{"output is a regular file", []volumeDir{{"input", existingDir}, {"output", regularFile}}, false, "output"},
-		{"no volumes required", nil, true, ""},
+		{"both mounted", []volumeDir{{"input", existingDir}, {"output", existingDir}}, true, "", ""},
+		{"missing input", []volumeDir{{"input", absent}, {"output", existingDir}}, false, "input", "no such file"},
+		{"missing output", []volumeDir{{"input", existingDir}, {"output", absent}}, false, "output", "no such file"},
+		{"input is a regular file", []volumeDir{{"input", regularFile}, {"output", existingDir}}, false, "input", "path exists but is not a directory"},
+		{"output is a regular file", []volumeDir{{"input", existingDir}, {"output", regularFile}}, false, "output", "path exists but is not a directory"},
+		{"no volumes required", nil, true, "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
@@ -581,6 +597,13 @@ func TestVolumesReady(t *testing.T) {
 			}
 			if !logs.AttrContains(msg, "remediation", "mount ") {
 				t.Errorf("volumesReady(%+v) ERROR is missing an actionable remediation attr (logs %v)", tc.dirs, logs.Messages())
+			}
+			// The two causes need different remedies — a missing mount versus a
+			// bind-mounted FILE — so the error attr must distinguish them. It
+			// carried error=<nil> for the non-directory case before the
+			// substitution in volumesReady, which is unactionable.
+			if !logs.AttrContains(msg, "error", tc.wantErrSub) {
+				t.Errorf("volumesReady(%+v) ERROR attr does not name the cause %q (logs %v)", tc.dirs, tc.wantErrSub, logs.Messages())
 			}
 		})
 	}

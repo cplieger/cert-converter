@@ -55,6 +55,12 @@ const (
 	// a gate here), but the bundle will fail path validation at the consumer and no
 	// other signal names which link is at fault.
 	ObsChainCertOutOfWindow ObservationKind = "chain-cert-out-of-window"
+	// ObsUnrelatedBlocksSkipped reports PEM blocks in the CERTIFICATE file that are
+	// neither a certificate nor a private key — an OpenSSL "TRUSTED CERTIFICATE",
+	// the legacy "X509 CERTIFICATE" alias, a stray CERTIFICATE REQUEST — and were
+	// therefore not part of the bundle. A private-key block is deliberately not
+	// reported: a combined cert+key file is a supported input.
+	ObsUnrelatedBlocksSkipped ObservationKind = "unrelated-blocks-skipped"
 )
 
 // Observation is one non-fatal finding about the input. Detail is already bounded
@@ -87,8 +93,11 @@ type Analysis struct {
 	// certificates in INPUT order instead. There is no ancestry to order them by,
 	// and carrying a CA a deployment may rely on beats emitting an empty chain.
 	chain []*x509.Certificate
-	// key is the private half of leaf.
-	key crypto.PrivateKey
+	// key is the private half of leaf. Typed crypto.Signer rather than
+	// crypto.PrivateKey because that is what parsePrivateKeys already proved it is:
+	// every admitted key type exposes a public half, which is the invariant identity
+	// matching and the currency read-back both rest on.
+	key crypto.Signer
 	// extra holds certificates that parsed but are not ancestors of leaf. They
 	// are deliberately excluded from the bundle: embedding an unrelated CA
 	// pollutes the trust chain the consumer sees.
@@ -143,16 +152,24 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 // to analyse a bundle at anything other than now, and widening the exported
 // surface to hand one in would invite exactly that.
 func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
-	certs, err := parseCertChain(certPEM)
+	certs, unrelatedBlocks, err := parseCertChain(certPEM)
 	if err != nil {
 		return Analysis{}, fmt.Errorf("parse cert chain: %w", err)
 	}
-	keys, err := parsePrivateKeys(keyPEM)
+	keys, keyIssues, err := parsePrivateKeys(keyPEM)
 	if err != nil {
 		return Analysis{}, fmt.Errorf("parse private key: %w", err)
 	}
 
 	var obs []Observation
+
+	if unrelatedBlocks.count > 0 {
+		obs = append(obs, Observation{
+			Kind: ObsUnrelatedBlocksSkipped,
+			Detail: fmt.Sprintf("%d PEM block(s) in the certificate file are neither a certificate nor a private key and were left out of the bundle (first %q)",
+				unrelatedBlocks.count, unrelatedBlocks.firstTypeForLog()),
+		})
+	}
 
 	certs, certAt, dupCerts := dedupeCerts(certs)
 	if dupCerts > 0 {
@@ -175,7 +192,7 @@ func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 		return Analysis{}, err
 	}
 
-	identity, tieObs, err := g.selectIdentity(signers)
+	identity, tieObs, err := g.selectIdentity(signers, keyIssues)
 	if err != nil {
 		return Analysis{}, err
 	}
@@ -242,6 +259,11 @@ type certGraph struct {
 	// the role check on the selected identity's candidate children — and the memo
 	// means an edge is verified at most once for all of them.
 	verified map[[2]int]bool
+	// selfSigned memoises the self-signature check per certificate, for the same
+	// reason verified memoises edges: it is a real signature verification whose cost
+	// the input file dictates, and three places ask — the root set, every hop of
+	// pathFrom, and assembleChain's self-signed carve-out.
+	selfSigned map[int]bool
 	// candidateParents[i]: indices that are plausibly issuers of certs[i], by key
 	// identifier or by issuer/subject name, whether or not a signature could be
 	// verified. The inclusive signal, used to assemble the emitted chain, where
@@ -252,8 +274,7 @@ type certGraph struct {
 	// to verify a SHA-1 signature at all (no x509sha1 GODEBUG remains in
 	// go1.26), and RFC 5280 permits issuer and subject names to be encoded
 	// differently in ways a byte comparison rejects. Treating "could not prove
-	// related" as "proved unrelated" is what dropped genuine CA certificates the
-	// previous positional code shipped.
+	// related" as "proved unrelated" drops genuine CA certificates.
 	candidateParents [][]int
 	children         [][]int
 	// distToRoot[i]: fewest parent hops from certs[i] to a self-signed certificate
@@ -281,22 +302,52 @@ type certGraph struct {
 // dictated by the FILE, not by the certificate count maxChainCerts bounds: a
 // 131072-bit modulus costs 184ms per verification and a 1-Mbit one 11.9s, against
 // 69us for RSA-2048. 16384 is far above anything issued (Let's Encrypt tops out at
-// RSA-4096) and keeps one verification in the low milliseconds.
+// RSA-4096) and keeps one verification in the low milliseconds for a conventional
+// public exponent; maxVerifiablePublicExponent bounds the other half of that cost.
 //
 // A certificate this bundle names as the issuer of another one is REFUSED when it
 // exceeds the ceiling, rather than carried as an unverified candidate edge; see
 // oversizedIssuerError for why degrading silently was the worse outcome.
 const maxVerifiableKeyBits = 16384
 
+// maxVerifiablePublicExponent bounds the RSA public exponent this app will run a
+// signature verification against. maxVerifiableKeyBits bounds only the modulus,
+// which fixes the cost of ONE modular multiplication; crypto/rsa raises the
+// signature to the power of the exponent the FILE supplies, so the NUMBER of
+// squarings is dictated by the exponent's bit length. crypto/x509 accepts any
+// positive exponent asn1 fits in an int, and crypto/rsa stops only at even values
+// and at 2^31-1. Measured on go1.26.5: one verification at the modulus ceiling
+// costs 4.7ms with the conventional 65537 and 14.3ms with 2^31-1, and one Analyse
+// pays up to maxChainCerts^2/2 of them. Real keys use 3, 17 or 65537 (RFC 8017
+// recommends 65537), so 2^24 is far above anything issued.
+const maxVerifiablePublicExponent = 1 << 24
+
 // verifiableKey reports whether pub is small enough to verify against. Only RSA is
 // unbounded: x509 parses ECDSA keys on named curves only, Ed25519 is fixed-size,
 // and x509 refuses DSA verification outright (DSAWithSHA1/256 are Unsupported).
 func verifiableKey(pub crypto.PublicKey) bool {
+	return unverifiableKeyReason(pub) == ""
+}
+
+// unverifiableKeyReason describes why a signature is too expensive to check
+// against pub, or "" when it is not. Both ceilings live here so the guard and the
+// refusal that reports it cannot drift.
+func unverifiableKeyReason(pub crypto.PublicKey) string {
 	k, ok := pub.(*rsa.PublicKey)
 	if !ok {
-		return true
+		return ""
 	}
-	return k.N != nil && k.N.BitLen() <= maxVerifiableKeyBits
+	switch {
+	case k.N == nil:
+		return "holds an RSA key with no modulus, which no signature can be checked against"
+	case rsaModulusBits(pub) > maxVerifiableKeyBits:
+		return fmt.Sprintf("holds a %d-bit RSA key, above the %d-bit modulus ceiling this app will verify a signature against",
+			rsaModulusBits(pub), maxVerifiableKeyBits)
+	case k.E > maxVerifiablePublicExponent:
+		return fmt.Sprintf("holds an RSA key with public exponent %d, above the %d exponent ceiling this app will verify a signature against",
+			k.E, maxVerifiablePublicExponent)
+	}
+	return ""
 }
 
 // rsaModulusBits reports the size of pub's RSA modulus, and 0 for any other key
@@ -338,6 +389,7 @@ func newCertGraph(certs []*x509.Certificate, now time.Time) (*certGraph, error) 
 		candidateParents: make([][]int, len(certs)),
 		children:         make([][]int, len(certs)),
 		verified:         make(map[[2]int]bool),
+		selfSigned:       make(map[int]bool, len(certs)),
 	}
 	for child := range certs {
 		for parent := range certs {
@@ -357,10 +409,11 @@ func newCertGraph(certs []*x509.Certificate, now time.Time) (*certGraph, error) 
 
 // oversizedIssuerError refuses a bundle in which a certificate named as the
 // issuer of another one here holds a key no signature can be checked against —
-// which is an RSA modulus above maxVerifiableKeyBits — naming the size observed.
-// It reports nil for every other bundle, and reads verifiableKey rather than
-// re-deriving the ceiling, so the refusal is exactly the guard's negation and the
-// two cannot drift.
+// which is an RSA modulus above maxVerifiableKeyBits, or a public exponent above
+// maxVerifiablePublicExponent — naming which limit was crossed.
+// It reports nil for every other bundle, and reads unverifiableKeyReason (the
+// predicate verifiableKey answers) rather than re-deriving either ceiling, so the
+// refusal is exactly the guard's negation and the two cannot drift.
 //
 // The alternative is to carry such an edge as merely UNVERIFIED, which is what
 // the SHA-1 and name-encoding cases do — and that is safe only because nothing
@@ -370,8 +423,7 @@ func newCertGraph(certs []*x509.Certificate, now time.Time) (*certGraph, error) 
 // NotAfter — keys an impostor wins (the ceiling denies the oversized certificate
 // the root status the impostor's self-signature gets, and a longer NotAfter or the
 // DER tie-break settles the rest). The bundle would convert to a PFX whose chain
-// no consumer can verify, from input that resolved correctly before the ceiling
-// existed.
+// no consumer can verify.
 //
 // Refusing costs nothing real: no CA issues RSA above 16384 bits, so an
 // over-ceiling issuer standing beside a same-subject decoy is an attack shape
@@ -383,12 +435,13 @@ func (g *certGraph) oversizedIssuerError() error {
 		// A certificate this bundle names as nobody's issuer is never a parent in a
 		// signature check, so its size decides nothing: it can only be excluded, or
 		// kept by the additive fallback, and both say so out loud.
-		if len(g.children[i]) == 0 || verifiableKey(c.PublicKey) {
+		reason := unverifiableKeyReason(c.PublicKey)
+		if len(g.children[i]) == 0 || reason == "" {
 			continue
 		}
 		return fmt.Errorf(
-			"certificate %q is named as the issuer of another certificate in this bundle and holds a %d-bit RSA key, above the %d-bit ceiling this app will verify a signature against; no signature can be checked against it, so its place in the chain could only be guessed; remove it from the bundle",
-			boundSubject(c.Subject.String()), rsaModulusBits(c.PublicKey), maxVerifiableKeyBits)
+			"certificate %q is named as the issuer of another certificate in this bundle and %s; no signature can be checked against it, so its place in the chain could only be guessed; remove it from the bundle",
+			boundSubject(c.Subject.String()), reason)
 	}
 	return nil
 }
@@ -481,6 +534,16 @@ func (g *certGraph) isIssuer(i int) bool {
 // it is the IDENTITY itself its empty chain counts as a failure to prove rather
 // than proof, so the additive fallback keeps the rest of the bundle and says so.
 func (g *certGraph) isSelfSigned(i int) bool {
+	if got, ok := g.selfSigned[i]; ok {
+		return got
+	}
+	got := g.checkSelfSigned(i)
+	g.selfSigned[i] = got
+	return got
+}
+
+// checkSelfSigned is isSelfSigned without the memo: the actual signature check.
+func (g *certGraph) checkSelfSigned(i int) bool {
 	c := g.certs[i]
 	if !bytes.Equal(c.RawSubject, c.RawIssuer) {
 		return false
@@ -496,9 +559,9 @@ func (g *certGraph) isSelfSigned(i int) bool {
 //
 // Both are multi-source breadth-first walks DOWNWARD from every root over the
 // children edges. The obvious alternative — a memoised depth-first walk upward
-// with an on-path cycle guard — is subtly wrong, and both adversarial reviews
-// reproduced the failure: the guard's -1 gets memoised for a node that was merely
-// FORBIDDEN on the current path, not genuinely unreachable, so a bundle
+// with an on-path cycle guard — is subtly wrong: the guard's -1 gets memoised
+// for a node that was merely FORBIDDEN on the current path, not genuinely
+// unreachable, so a bundle
 // containing a cross-certification loop yields distances that depend on the order
 // certificates appeared in the file. Cycles are real: RFC 4158 describes mesh
 // PKIs with bidirectional cross-certification, and RFC 5280 permits several
@@ -510,7 +573,7 @@ func (g *certGraph) isSelfSigned(i int) bool {
 // far below all pairs for an ordinary bundle, but it is not a smaller bound in
 // principle: plausibleIssuer accepts on an issuer/subject name match alone, so a
 // bundle whose certificates all share one issuer name still yields O(n^2) edges,
-// and unlike the pre-rewrite lazy scheme this walk pays for them eagerly.
+// and this walk pays for them eagerly.
 func (g *certGraph) computeDistances() {
 	// One self-signature check per certificate, shared by both walks: the root set
 	// is the same for either edge predicate, and isSelfSigned is a real signature
@@ -555,11 +618,11 @@ func (g *certGraph) distancesFromRoots(roots []int, edgeOK func(child, parent in
 
 // selectIdentity resolves which certificate and key form the identity, matching
 // every key against every certificate rather than against a positional guess.
-func (g *certGraph) selectIdentity(signers []crypto.Signer) (identityMatch, []Observation, error) {
+func (g *certGraph) selectIdentity(signers []crypto.Signer, keyIssues keyDefects) (identityMatch, []Observation, error) {
 	matches, firstUnverifiable := g.collectMatches(signers)
 	switch len(matches) {
 	case 0:
-		return identityMatch{}, nil, g.noMatchError(len(signers), firstUnverifiable)
+		return identityMatch{}, nil, g.noMatchError(len(signers), firstUnverifiable, keyIssues)
 	case 1:
 		return matches[0], nil, nil
 	default:
@@ -593,8 +656,12 @@ func (g *certGraph) collectMatches(signers []crypto.Signer) (matches []identityM
 
 // noMatchError explains that no certificate here belongs to any supplied key,
 // naming an unverifiable key algorithm ahead of a plain mismatch because it is
-// the more specific diagnosis.
-func (g *certGraph) noMatchError(keyCount, firstUnverifiable int) error {
+// the more specific diagnosis. On a plain mismatch the key blocks that yielded
+// no key at all are named after the base sentence (keyDefects.suffix), because
+// the count in that sentence is of USABLE keys: a mid-rotation key file whose
+// appended block is damaged otherwise reads as "the key does not match the
+// certificate" with no hint that half the file was unreadable.
+func (g *certGraph) noMatchError(keyCount, firstUnverifiable int, keyIssues keyDefects) error {
 	if firstUnverifiable >= 0 {
 		c := g.certs[firstUnverifiable]
 		if c.PublicKey == nil {
@@ -612,8 +679,8 @@ func (g *certGraph) noMatchError(keyCount, firstUnverifiable int) error {
 			boundSubject(c.Subject.String()), c.PublicKey)
 	}
 	return fmt.Errorf(
-		"none of the %d private key block(s) matches any of the %d certificate(s) in the chain",
-		keyCount, len(g.certs))
+		"none of the %d private key block(s) matches any of the %d certificate(s) in the chain%s",
+		keyCount, len(g.certs), keyIssues.suffix())
 }
 
 // resolveAmbiguousMatches rules on more than one (key, certificate) match.
@@ -656,10 +723,9 @@ func (g *certGraph) resolveAmbiguousMatches(matches []identityMatch) (identityMa
 // predecessor's subject by definition, so a subject comparison is always 0 for
 // exactly the inputs this comparator exists to rank; and NotBefore is
 // second-granular, so two certificates minted in the same second tie there too.
-// With both keys inert the fold degenerated to "first block in the file wins" —
+// With both keys inert the fold degenerates to "first block in the file wins" —
 // order-dependence in the one function whose headline claim is order invariance.
-// Both adversarial reviews reproduced it. DER is a total order over distinct
-// certificates, so ties are now impossible.
+// DER is a total order over distinct certificates, so ties are impossible.
 func (g *certGraph) betterIdentity(a, b int) bool {
 	va, vb := validAt(g.certs[a], g.now), validAt(g.certs[b], g.now)
 	if va != vb {
@@ -744,7 +810,7 @@ func (g *certGraph) betterParent(a, b int) bool {
 	// Validity first. An expired issuer breaks the chain at the consumer no matter
 	// how short its route to a root is, so ranking reachability or path length
 	// ahead of validity could emit an unusable chain while a usable one sat in the
-	// same input. That ordering was an oversight, not a decision.
+	// same input.
 	va, vb := validAt(g.certs[a], g.now), validAt(g.certs[b], g.now)
 	if va != vb {
 		return va
@@ -791,6 +857,28 @@ func (g *certGraph) outsidePath(path []int) []*x509.Certificate {
 	return extra
 }
 
+// publicKeyMatches reports whether pub is the public half of signer's private
+// key. supported is false when pub's type does not provide the
+// Equal(crypto.PublicKey) bool method every crypto/x509 public key type
+// implements, in which case matched carries no meaning and the caller must treat
+// the key type as unverifiable rather than as a mismatch.
+func publicKeyMatches(pub crypto.PublicKey, signer crypto.Signer) (matched, supported bool) {
+	return equalPublicKeys(pub, signer.Public())
+}
+
+// equalPublicKeys is the single home of the comparison rule publicKeyMatches
+// and samePublicKey share: every public key type crypto/x509 parses exposes
+// Equal(crypto.PublicKey) bool, and a type that does not is unverifiable rather
+// than unequal. supported reports which of the two it was, so a caller that
+// must distinguish them can, and one that need not can ignore it.
+func equalPublicKeys(a, b crypto.PublicKey) (matched, supported bool) {
+	matcher, ok := a.(interface{ Equal(crypto.PublicKey) bool })
+	if !ok {
+		return false, false
+	}
+	return matcher.Equal(b), true
+}
+
 // samePublicKey reports whether two certificate public keys are the same key.
 // Used to tell KEY REUSE apart from issuance: a certificate holding the same
 // public key as another cannot have issued it.
@@ -805,10 +893,9 @@ func samePublicKey(a, b crypto.PublicKey) bool {
 //
 // The additive-only fallback lives here: if NO issuer for the identity could be
 // established even on the inclusive edge signal, the remaining certificates are
-// KEPT rather than dropped. The previous positional code shipped everything after
-// the first block, and silently removing a CA a working deployment relied on is
-// far worse than carrying one it did not need, so exclusion is reserved for
-// certificates positively shown to sit off the chain.
+// KEPT rather than dropped: silently removing a CA a working deployment relied
+// on is far worse than carrying one it did not need, so exclusion is reserved
+// for certificates positively shown to sit off the chain.
 //
 // A SELF-SIGNED identity is excluded from the fallback: it has no issuer by
 // construction, so an empty chain there is proof rather than a failure to prove,

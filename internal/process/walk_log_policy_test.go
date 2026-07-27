@@ -24,8 +24,7 @@ func captureLogs(t *testing.T) *capture.Recorder {
 
 // TestWalkLogPolicy_per_path_lines_are_debug_only pins the app's two-level walk
 // logging contract, decided deliberately after the input walk and the /output sweep
-// were found surfacing the SAME condition at different levels (deferred finding
-// l-f28).
+// were found surfacing the SAME condition at different levels.
 //
 // The rule: an individual path is named at DEBUG, and the default level carries ONE
 // aggregate line with a count. Both walks tolerate an unreadable sub-path — it is a

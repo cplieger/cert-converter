@@ -101,7 +101,7 @@ func TestLogEntryFailure_levels(t *testing.T) {
 // root (a symlink escaping /input, or a permission error) is statusUnreadable and Warn:
 // the key IS there, so calling it an orphan misdescribes it in the scan summary and in
 // the all-orphan diagnostic, and Warn is what makes the broken layout diagnosable
-// instead of hidden behind LOG_LEVEL=debug (deferred finding h-f9). Runs serially: it
+// instead of hidden behind LOG_LEVEL=debug. Runs serially: it
 // swaps slog.Default().
 func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing.T) {
 	base := t.TempDir()

@@ -212,6 +212,16 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 		// A directory, symlink or device node at the output name is not a usable
 		// prior bundle, and a symlink must never be followed here or unrelated
 		// content could satisfy the check.
+		//
+		// Named at WARN like the other "cannot tell what is on disk" arms, because
+		// nothing else records it. A symlink is REPLACED by the rewrite this verdict
+		// triggers, whose only trace is the routine "wrote pfx" line, so an attempt to
+		// redirect the private-key-bearing bundle out of the mounted volume would
+		// otherwise be defeated silently; a directory or device node makes that
+		// rewrite fail instead, and this line says why before the write error arrives.
+		slog.Warn("prior output path is not a regular file; regenerating",
+			"path", rel, "mode", fi.Mode().String(),
+			"remediation", "remove whatever occupies the output path; this app writes only regular files there")
 		return false, nil
 	}
 

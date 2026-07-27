@@ -484,3 +484,99 @@ func TestAnalyse_caps_the_subjects_it_names_in_the_exclusion_observation(t *test
 		t.Errorf("observation detail = %q, want at most 3 subjects named", detail)
 	}
 }
+
+// relabelPEM re-encodes the first PEM block of blob under a different label, the
+// way `openssl x509 -trustout` emits a "TRUSTED CERTIFICATE" instead of a plain
+// CERTIFICATE.
+func relabelPEM(tb testing.TB, blob []byte, label string) []byte {
+	tb.Helper()
+	block, _ := pem.Decode(blob)
+	if block == nil {
+		tb.Fatal("setup: PEM did not decode")
+		return nil
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: label, Bytes: block.Bytes})
+}
+
+// TestAnalyse_reports_a_chain_link_left_out_because_its_label_is_not_CERTIFICATE
+// pins the signal for the silent-drop case: a chain file whose CA link arrives
+// as "TRUSTED CERTIFICATE" (or the legacy "X509 CERTIFICATE" alias) still
+// converts, but the block that was left out of the bundle is named, so the
+// consumer-side path-validation failure has something to grep for.
+func TestAnalyse_reports_a_chain_link_left_out_because_its_label_is_not_CERTIFICATE(t *testing.T) {
+	leafPEM, keyPEM, caPEM, _ := testcerts.GenerateCertChain(t)
+
+	for _, label := range []string{"TRUSTED CERTIFICATE", "X509 CERTIFICATE", "CERTIFICATE REQUEST"} {
+		t.Run(label, func(t *testing.T) {
+			bundle := concatPEM(leafPEM, relabelPEM(t, caPEM, label))
+
+			got, err := convert.Analyse(bundle, keyPEM)
+			if err != nil {
+				t.Fatalf("Analyse(leaf + %q block) = error %v, want nil", label, err)
+			}
+			var detail string
+			for _, o := range got.Observations() {
+				if o.Kind == convert.ObsUnrelatedBlocksSkipped {
+					detail = o.Detail
+				}
+			}
+			if detail == "" {
+				t.Fatalf("observations = %v, want one of kind %q", got.Observations(), convert.ObsUnrelatedBlocksSkipped)
+			}
+			if !strings.Contains(detail, label) {
+				t.Errorf("observation detail = %q, want the skipped block's label named", detail)
+			}
+		})
+	}
+}
+
+// TestAnalyse_reports_no_skipped_block_for_a_combined_cert_and_key_file is the
+// other half of the rule: a private key in the certificate file is a documented
+// supported input, so it must stay silent. Without this the observation would
+// fire on every combined .crt.
+func TestAnalyse_reports_no_skipped_block_for_a_combined_cert_and_key_file(t *testing.T) {
+	leafPEM, keyPEM, caPEM, _ := testcerts.GenerateCertChain(t)
+	combined := concatPEM(leafPEM, keyPEM, caPEM)
+
+	got, err := convert.Analyse(combined, keyPEM)
+	if err != nil {
+		t.Fatalf("Analyse(combined cert+key file) = error %v, want nil", err)
+	}
+	if hasObservation(got.Observations(), convert.ObsUnrelatedBlocksSkipped) {
+		t.Errorf("observations = %v, want no %q for a private key in the certificate file",
+			got.Observations(), convert.ObsUnrelatedBlocksSkipped)
+	}
+}
+
+// TestAnalyse_names_the_unusable_key_blocks_when_nothing_matches pins the
+// mid-rotation diagnosis: a key file whose appended block is truncated still
+// parses its other key, so the count in the no-match sentence is of USABLE keys
+// and understates the file. The blocks that yielded no key must be named after
+// the base sentence, or the operator reads "the key does not match the
+// certificate" and goes looking at the certificate.
+func TestAnalyse_names_the_unusable_key_blocks_when_nothing_matches(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	_, unrelatedKeyPEM := testcerts.GenerateSelfSignedCert(t, "unrelated.example.com", "ecdsa")
+
+	// A second key declaration whose armour is cut off mid-body, as a partial
+	// write into /input leaves it: encoding/pem drops it entirely, so only the
+	// declaration count knows it was ever there.
+	truncated := []byte("-----BEGIN PRIVATE KEY-----\nMIIBOgIBAAJBAKj34G\n")
+
+	_, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), concatPEM(unrelatedKeyPEM, truncated))
+	if err == nil {
+		t.Fatal("Analyse(unrelated key + truncated key block) = nil error, want a no-match error")
+	}
+	got := err.Error()
+	// The base sentence stays an exact prefix of the diagnosis (analyse_test.go's
+	// documented-input-shape row and convert_test.go both match on it).
+	for _, want := range []string{
+		"none of the 1 private key block(s) matches any of the 2 certificate(s) in the chain",
+		"1 declared block(s) could not be decoded",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Analyse error = %q, want it to contain %q", got, want)
+		}
+	}
+}

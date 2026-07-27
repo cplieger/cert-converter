@@ -896,3 +896,175 @@ func TestAnalyse_ranks_verified_issuers_by_validity_then_expiry(t *testing.T) {
 		})
 	}
 }
+
+// unverifiableCA builds the certificate template every candidate issuer in the
+// inclusive-route tests uses: a CA with the given subject and validity window.
+func unverifiableCA(serial int64, cn string, notBefore, notAfter time.Time) *x509.Certificate {
+	return &x509.Certificate{
+		SerialNumber:          big.NewInt(serial),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+}
+
+// TestAnalyse_prefers_an_unverified_issuer_with_a_route_to_a_root pins the FIRST
+// of the two inclusive-distance ranking keys in betterParent, the pair that only
+// decides anything once NEITHER candidate has a verified route to a root -- the
+// documented SHA-1 and name-encoding fallback, where no signature can be checked
+// at all. Every other ranking test gives at least one candidate a verified route,
+// so a mutation that drops or inverts this key emits a chain whose top link has
+// no route to any root in the bundle, with no error and no observation.
+//
+// Both candidate issuers here carry the leaf's issuer name without having signed
+// it (the leaf's real signer is absent), so the leaf's own hop cannot separate
+// them. Only one of them chains by name to a root present in the bundle. The
+// stranded candidate expires LATER, so every ranking key BELOW this one prefers
+// it: if the route-presence key stops deciding, the emitted chain changes.
+func TestAnalyse_prefers_an_unverified_issuer_with_a_route_to_a_root(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	const (
+		sharedRootCN = "Shared Root"
+		contestedCN  = "Contested CA"
+	)
+
+	// A root present in the bundle, and a same-named root that is NOT, holding a
+	// different key. The absent one signs the routed candidate, so that candidate's
+	// route to the included root is a NAME match no signature can confirm.
+	fakeRootKey := newKey(t)
+	fakeRootPEM, _ := mint(t, unverifiableCA(300, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
+		&fakeRootKey.PublicKey, nil, fakeRootKey)
+	absentRootKey := newKey(t)
+	_, absentRootCert := mint(t, unverifiableCA(301, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
+		&absentRootKey.PublicKey, nil, absentRootKey)
+
+	// The routed candidate: names the included root as its issuer, so it has an
+	// inclusive route to a root.
+	routedKey := newKey(t)
+	routedPEM, _ := mint(t, unverifiableCA(302, contestedCN, notBefore, notBefore.Add(24*time.Hour)),
+		&routedKey.PublicKey, absentRootCert, absentRootKey)
+
+	// The stranded candidate: names an issuer nothing in the bundle carries, so it
+	// has no route to a root at all -- and it expires later, which is what every
+	// lower-ranked key would reward.
+	absentOtherKey := newKey(t)
+	_, absentOtherCert := mint(t, unverifiableCA(303, "Nobody CA", notBefore, notBefore.Add(240*time.Hour)),
+		&absentOtherKey.PublicKey, nil, absentOtherKey)
+	strandedKey := newKey(t)
+	strandedPEM, _ := mint(t, unverifiableCA(304, contestedCN, notBefore, notBefore.Add(72*time.Hour)),
+		&strandedKey.PublicKey, absentOtherCert, absentOtherKey)
+
+	// The leaf's real signer shares the contested subject and is absent, so neither
+	// candidate verifies the leaf's signature.
+	absentSignerKey := newKey(t)
+	_, absentSignerCert := mint(t, unverifiableCA(305, contestedCN, notBefore, notBefore.Add(240*time.Hour)),
+		&absentSignerKey.PublicKey, nil, absentSignerKey)
+	leafKey := newKey(t)
+	leafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(306),
+		Subject:      pkix.Name{CommonName: "inclusive-route-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, absentSignerCert, absentSignerKey)
+
+	for _, order := range []struct {
+		name  string
+		certs [][]byte
+	}{
+		{"stranded first", [][]byte{leafPEM, strandedPEM, routedPEM, fakeRootPEM}},
+		{"routed first", [][]byte{leafPEM, routedPEM, strandedPEM, fakeRootPEM}},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := convert.Analyse(concatPEM(order.certs...), keyPEMOf(t, leafKey))
+			if err != nil {
+				t.Fatalf("Analyse = error %v, want nil", err)
+			}
+			if len(got.Chain()) == 0 {
+				t.Fatal("chain is empty; want the candidate issuer that chains to a root")
+			}
+			if got.Chain()[0].SerialNumber.Cmp(big.NewInt(302)) != 0 {
+				t.Errorf("chain[0] serial = %s, want 302 (the unverified candidate with a route to a root in the bundle, not the later-expiring candidate with none)",
+					got.Chain()[0].SerialNumber)
+			}
+		})
+	}
+}
+
+// TestAnalyse_prefers_the_shorter_inclusive_route pins the SECOND inclusive
+// ranking key: with neither candidate verifiable and BOTH chaining by name to a
+// root, the shorter route wins. Same reachability as the test above -- nothing
+// else in the suite gets two unverified candidates that both reach a root, so a
+// mutation that inverts this comparison silently emits the longer, later-expiring
+// route instead.
+func TestAnalyse_prefers_the_shorter_inclusive_route(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	const (
+		sharedRootCN = "Shared Root"
+		midCN        = "Mid CA"
+		contestedCN  = "Contested CA"
+	)
+
+	fakeRootKey := newKey(t)
+	fakeRootPEM, _ := mint(t, unverifiableCA(310, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
+		&fakeRootKey.PublicKey, nil, fakeRootKey)
+	absentRootKey := newKey(t)
+	_, absentRootCert := mint(t, unverifiableCA(311, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
+		&absentRootKey.PublicKey, nil, absentRootKey)
+
+	// One name-hop from the included root.
+	nearKey := newKey(t)
+	nearPEM, _ := mint(t, unverifiableCA(312, contestedCN, notBefore, notBefore.Add(24*time.Hour)),
+		&nearKey.PublicKey, absentRootCert, absentRootKey)
+
+	// An intermediate one name-hop from the root, and the far candidate below it:
+	// two hops, and a LATER expiry so the NotAfter key would reward it.
+	midKey := newKey(t)
+	midPEM, _ := mint(t, unverifiableCA(313, midCN, notBefore, notBefore.Add(240*time.Hour)),
+		&midKey.PublicKey, absentRootCert, absentRootKey)
+	absentMidKey := newKey(t)
+	_, absentMidCert := mint(t, unverifiableCA(314, midCN, notBefore, notBefore.Add(240*time.Hour)),
+		&absentMidKey.PublicKey, nil, absentMidKey)
+	farKey := newKey(t)
+	farPEM, _ := mint(t, unverifiableCA(315, contestedCN, notBefore, notBefore.Add(72*time.Hour)),
+		&farKey.PublicKey, absentMidCert, absentMidKey)
+
+	absentSignerKey := newKey(t)
+	_, absentSignerCert := mint(t, unverifiableCA(316, contestedCN, notBefore, notBefore.Add(240*time.Hour)),
+		&absentSignerKey.PublicKey, nil, absentSignerKey)
+	leafKey := newKey(t)
+	leafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(317),
+		Subject:      pkix.Name{CommonName: "shorter-route-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, absentSignerCert, absentSignerKey)
+
+	for _, order := range []struct {
+		name  string
+		certs [][]byte
+	}{
+		{"far first", [][]byte{leafPEM, farPEM, midPEM, nearPEM, fakeRootPEM}},
+		{"near first", [][]byte{leafPEM, nearPEM, fakeRootPEM, farPEM, midPEM}},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := convert.Analyse(concatPEM(order.certs...), keyPEMOf(t, leafKey))
+			if err != nil {
+				t.Fatalf("Analyse = error %v, want nil", err)
+			}
+			if len(got.Chain()) == 0 {
+				t.Fatal("chain is empty; want the nearer candidate issuer")
+			}
+			if got.Chain()[0].SerialNumber.Cmp(big.NewInt(312)) != 0 {
+				t.Errorf("chain[0] serial = %s, want 312 (the candidate one name-hop from a root in the bundle, not the later-expiring candidate two hops away)",
+					got.Chain()[0].SerialNumber)
+			}
+		})
+	}
+}

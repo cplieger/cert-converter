@@ -1,7 +1,6 @@
 package config
 
 import (
-	"bytes"
 	"errors"
 	"log/slog"
 	"os"
@@ -603,10 +602,7 @@ func TestLoad_password_file_log_records_source_without_secret_or_path(t *testing
 	t.Setenv("PFX_PASSWORD", "")
 	t.Setenv("PFX_PASSWORD_FILE", path)
 
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	logs := capture.Default(t)
 
 	cfg, err := Load()
 	if err != nil {
@@ -616,15 +612,23 @@ func TestLoad_password_file_log_records_source_without_secret_or_path(t *testing
 		t.Fatalf("Load() Password = %q, want the file's contents", cfg.Password)
 	}
 
-	out := buf.String()
-	if !strings.Contains(out, "source=PFX_PASSWORD_FILE") {
-		t.Errorf("Load() logged %q, want a record naming PFX_PASSWORD_FILE as the secret source", out)
+	if !logs.HasAttr("PFX password configured", "source", "PFX_PASSWORD_FILE") {
+		t.Errorf("Load() logged %v, want a record naming PFX_PASSWORD_FILE as the secret source", logs.Messages())
 	}
-	if strings.Contains(out, secret) {
-		t.Errorf("Load() leaked the PFX password into the log: %q", out)
-	}
-	if strings.Contains(out, path) {
-		t.Errorf("Load() leaked the secret-mount path into the log: %q", out)
+	// Walk every captured record end to end, the form the sibling
+	// TestLoad_env_password_logs_no_secret_source documents: it catches the secret
+	// or the mount path leaking as an attr under ANY message, not only the one that
+	// carries it today.
+	for _, r := range logs.Records() {
+		if strings.Contains(r.Message, secret) || strings.Contains(r.Message, path) {
+			t.Errorf("Load() leaked the PFX password or the secret-mount path in message %q", r.Message)
+		}
+		r.Attrs(func(a slog.Attr) bool {
+			if strings.Contains(a.Value.String(), secret) || strings.Contains(a.Value.String(), path) {
+				t.Errorf("Load() leaked the PFX password or the secret-mount path in attr %s=%v on %q", a.Key, a.Value, r.Message)
+			}
+			return true
+		})
 	}
 }
 
@@ -1034,6 +1038,37 @@ func TestLoad_warns_when_the_env_password_is_padded(t *testing.T) {
 	}
 }
 
+// TestLoad_uses_the_env_password_verbatim pins the contract the padding WARN only
+// describes: PFX_PASSWORD is embedded in every bundle exactly as configured,
+// surrounding whitespace included, while envx trims the FILE channel
+// (TestLoad_password_file_takes_precedence_over_env pins that half). Normalising the
+// value on the way into Config keeps the padding WARN -- and every other test in this
+// package -- green while silently protecting every generated .pfx with a password the
+// operator never configured; encoding succeeds either way, so health never notices.
+// Serial: it swaps slog.Default().
+func TestLoad_uses_the_env_password_verbatim(t *testing.T) {
+	const padded = "  s3cret\t"
+	isolatePasswordFile(t)
+	t.Setenv("PFX_PASSWORD", padded)
+	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
+
+	logs := capture.Default(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() = %v, want nil", err)
+	}
+	if cfg.Password != padded {
+		t.Errorf("Load() Password = %q, want %q verbatim: the whitespace is part of the password embedded in every PFX file",
+			cfg.Password, padded)
+	}
+	for _, r := range logs.Records() {
+		if strings.Contains(r.Message, padded) {
+			t.Errorf("Load() leaked the configured password in message %q", r.Message)
+		}
+	}
+}
+
 // TestLoad_warns_when_both_password_channels_are_set pins the ambiguity warning.
 // PFX_PASSWORD_FILE wins by design, so a PFX_PASSWORD set
 // beside it is silently ignored — an operator who edits the wrong one gets a successful
@@ -1055,10 +1090,7 @@ func TestLoad_warns_when_both_password_channels_are_set(t *testing.T) {
 		{"whitespace-only env is not a real conflict", "   ", path, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			prev := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-			t.Cleanup(func() { slog.SetDefault(prev) })
+			logs := capture.Default(t)
 
 			t.Setenv("PFX_PASSWORD", tc.env)
 			t.Setenv("PFX_PASSWORD_FILE", tc.file)
@@ -1068,15 +1100,57 @@ func TestLoad_warns_when_both_password_channels_are_set(t *testing.T) {
 				t.Fatalf("Load = %v, want nil", err)
 			}
 
-			out := buf.String()
-			got := strings.Contains(out, "both PFX_PASSWORD and PFX_PASSWORD_FILE are set")
+			got := logs.Contains("both PFX_PASSWORD and PFX_PASSWORD_FILE are set")
 			if got != tc.wantWarn {
-				t.Errorf("Load(env=%q file=%q) warned = %v, want %v; log = %q", tc.env, tc.file, got, tc.wantWarn, out)
+				t.Errorf("Load(env=%q file=%q) warned = %v, want %v; log = %v", tc.env, tc.file, got, tc.wantWarn, logs.Messages())
 			}
-			if strings.Contains(out, "from-env") || strings.Contains(out, "from-file") {
-				t.Errorf("the log leaked a password value: %q", out)
+			for _, r := range logs.Records() {
+				if strings.Contains(r.Message, "from-env") || strings.Contains(r.Message, "from-file") {
+					t.Errorf("the log leaked a password value in message %q", r.Message)
+				}
+				r.Attrs(func(a slog.Attr) bool {
+					if strings.Contains(a.Value.String(), "from-env") || strings.Contains(a.Value.String(), "from-file") {
+						t.Errorf("the log leaked a password value in attr %s=%v on %q", a.Key, a.Value, r.Message)
+					}
+					return true
+				})
 			}
 		})
+	}
+}
+
+// TestLoad_warns_when_a_blank_file_overrides_a_configured_env_password pins the
+// conflict WARN in the configuration that needs it most: the mounted file is blank
+// and the opt-out lets startup proceed, so the file channel still wins and the
+// PFX_PASSWORD the operator did configure is discarded. Every generated bundle then
+// protects the private key with NO password while health stays green, and the
+// conflict WARN is the only line that says the env value was ignored. The existing
+// both-channels test only covers a file that supplied a secret, so moving the
+// conflict check beside the success INFO would drop this case silently. Serial: it
+// swaps slog.Default().
+func TestLoad_warns_when_a_blank_file_overrides_a_configured_env_password(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blank")
+	if err := os.WriteFile(path, []byte("  \n\t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PFX_PASSWORD", "from-env")
+	t.Setenv("PFX_PASSWORD_FILE", path)
+	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "true")
+
+	logs := capture.Default(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(blank file, opt-out) = %v, want nil", err)
+	}
+	if cfg.Password != "" {
+		t.Fatalf("Load() Password = %q, want empty: a blank file must never fall back to PFX_PASSWORD", cfg.Password)
+	}
+	const conflict = "both PFX_PASSWORD and PFX_PASSWORD_FILE are set"
+	if n := logs.CountLevel(slog.LevelWarn, conflict); n != 1 {
+		t.Errorf("Load(blank file, opt-out, PFX_PASSWORD set) logged %d WARN records matching %q, want exactly 1: "+
+			"nothing else tells the operator the configured password was discarded (logs %v)",
+			n, conflict, logs.Messages())
 	}
 }
 
@@ -1159,6 +1233,45 @@ func TestLoad_warns_when_the_password_contains_a_control_character(t *testing.T)
 				t.Errorf("control-character WARN does not name the delivery channel (logs %v)", logs.Messages())
 			}
 		})
+	}
+}
+
+// TestLoad_warns_when_a_mounted_secret_contains_a_control_character pins the
+// control-character WARN on the delivery channel that actually produces one: envx
+// trims only surrounding whitespace, so a secret file written from wrapped
+// `openssl rand -base64` output -- the exact cause the remediation names -- keeps its
+// interior newline, PKCS#12 embeds it verbatim, and no consumer can type the
+// password back. The guard is channel-agnostic today while its sibling padding WARN
+// is env-only, so folding the two together would silence the file channel with
+// every other test still green. Serial: it swaps slog.Default().
+func TestLoad_warns_when_a_mounted_secret_contains_a_control_character(t *testing.T) {
+	const secret = "line1\nline2"
+	path := filepath.Join(t.TempDir(), "pfx-password")
+	if err := os.WriteFile(path, []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PFX_PASSWORD", "")
+	t.Setenv("PFX_PASSWORD_FILE", path)
+	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
+
+	logs := capture.Default(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() = %v, want nil: a control character is a WARN, not a startup refusal", err)
+	}
+	if cfg.Password != secret {
+		t.Fatalf("Load() Password = %q, want the file contents with only surrounding whitespace trimmed", cfg.Password)
+	}
+	const msg = "contains a control character"
+	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
+		t.Errorf("Load() with a wrapped mounted secret logged %d WARN records matching %q, want exactly 1 (logs %v)",
+			n, msg, logs.Messages())
+	}
+	for _, r := range logs.Records() {
+		if strings.Contains(r.Message, secret) {
+			t.Errorf("Load() leaked the mounted secret in message %q", r.Message)
+		}
 	}
 }
 

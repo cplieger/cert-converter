@@ -119,3 +119,101 @@ func countObservation(logs *capture.Recorder, kind convert.ObservationKind) int 
 	}
 	return n
 }
+
+// TestScannerRun_keeps_observation_state_across_an_incomplete_enumeration pins the
+// gate on Run's observation-state prune, which forget's own doc comment names but
+// no test exercises: the prune may only run when the walk proved the enumeration
+// COMPLETE.
+//
+// Without the gate, a scan that could not see the whole input tree -- here an
+// input symlink the confined root refuses to resolve, the shape the certbot
+// live/ -> archive/ layout produces -- forgets every pair it did not reach. The
+// next clean scan then re-emits their input observations, so the odd-but-convertible
+// bundle the operator was told about once is WARNed about again, which is exactly
+// the per-scan noise observationLog exists to prevent.
+//
+// Runs serially: it swaps slog.Default().
+func TestScannerRun_keeps_observation_state_across_an_incomplete_enumeration(t *testing.T) {
+	base := t.TempDir()
+	certsRoot := filepath.Join(base, "input")
+	outside := filepath.Join(base, "outside")
+	for _, dir := range []string{certsRoot, outside} {
+		if err := os.Mkdir(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outRoot := t.TempDir()
+
+	// Root-first, so the pair is convertible AND carries one observation: it is
+	// that observation's re-emission that makes a lost memory visible.
+	leafPEM, keyPEM, caPEM, _ := testcerts.GenerateCertChain(t)
+	rootFirst := append(append([]byte{}, caPEM...), leafPEM...)
+	crt := filepath.Join(certsRoot, "chain.crt")
+	key := filepath.Join(certsRoot, "chain.key")
+	if err := os.WriteFile(crt, rootFirst, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(key, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanner := New(&Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+	})
+
+	logs := captureLogs(t)
+	res1, err := scanner.Run(t.Context())
+	if err != nil || res1.Converted != 1 {
+		t.Fatalf("initial Run = %+v, %v, want Converted 1 and nil", res1, err)
+	}
+	if got := countObservation(logs, convert.ObsLeafNotFirst); got != 1 {
+		t.Fatalf("initial Run logged %d leaf-not-first observations, want exactly 1", got)
+	}
+
+	// The pair leaves the walk's reach while an unresolvable symlink proves the
+	// enumeration incomplete: os.Root refuses to resolve a link out of the mount
+	// whatever uid the process runs as, so this needs no permission staging.
+	if err := os.Remove(crt); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(key); err != nil {
+		t.Fatal(err)
+	}
+	escape := filepath.Join(certsRoot, "escape")
+	if err := os.Symlink(outside, escape); err != nil {
+		t.Fatal(err)
+	}
+	res2, err := scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run over an incomplete tree = %v, want nil", err)
+	}
+	if res2.Total != 0 {
+		t.Fatalf("Run over an incomplete tree = %+v, want Total 0: the pair must be out of the walk's reach", res2)
+	}
+
+	// Put the tree back exactly as it was. The bundle on disk is still current, so
+	// this scan converts nothing -- and must say nothing either.
+	if err := os.WriteFile(crt, rootFirst, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(key, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(escape); err != nil {
+		t.Fatal(err)
+	}
+	logs = captureLogs(t)
+	res3, err := scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run after the tree was restored = %v, want nil", err)
+	}
+	if res3.Unchanged != 1 {
+		t.Errorf("Run after the tree was restored = %+v, want Unchanged 1", res3)
+	}
+	if got := countObservation(logs, convert.ObsLeafNotFirst); got != 0 {
+		t.Errorf("Run after the tree was restored logged %d leaf-not-first observations, want 0: state kept across an incomplete enumeration must not be pruned",
+			got)
+	}
+}

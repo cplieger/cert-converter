@@ -37,6 +37,16 @@ func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 		return nil, err
 	}
 
+	// An Analysis is only ever produced by Analyse, which returns an error rather
+	// than an incomplete value — but the zero value is constructible, and handing it
+	// to the encoder dereferences a nil *x509.Certificate inside go-pkcs12
+	// (sha1.Sum(certificate.Raw)), killing the process instead of failing one
+	// conversion. The type's own doc promises a caller cannot null the leaf and hand
+	// the value back here; this is what makes that true.
+	if a.leaf == nil {
+		return nil, errors.New("analysed pair carries no leaf certificate, so it did not come from Analyse")
+	}
+
 	pfxData, err := encoderFor(encName).Encode(a.key, a.leaf, a.chain, password)
 	if err != nil {
 		return nil, fmt.Errorf("encode pfx: %w", err)
@@ -55,9 +65,10 @@ func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 // whatever later tries to open it.
 //
 // Recognition is InspectPasswordEncoding's, so the encoder cannot drift from the
-// startup gate that consumes the same query, and the shapes are reported in the
-// same order internal/config's checkPasswordEncodable reports them so a password
-// carrying several is named identically by both.
+// startup gate that consumes the same query, and which shape is named when a
+// password carries several is PasswordEncodingIssues.Primary's, the single home of
+// that precedence, so this guard and internal/config's checkPasswordEncodable name
+// the same shape for the same password by construction.
 //
 // Only the SHAPE is named, never the value: these messages reach the container
 // log and the password is a secret. No sentinel wraps them because no caller
@@ -65,59 +76,23 @@ func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 // conversion failure, and config.ErrUnencodablePassword (which cannot be reused
 // here anyway: internal/config imports this package) exists for callers of Load.
 func unencodablePasswordError(password string) error {
-	switch issues := InspectPasswordEncoding(password); {
-	case issues.InvalidUTF8:
+	switch InspectPasswordEncoding(password).Primary() {
+	case PasswordInvalidUTF8:
 		return errors.New("pfx password is not valid UTF-8, so the PKCS#12 UCS-2 password encoding " +
 			"would replace every invalid byte with U+FFFD and protect the bundle with a different, " +
 			"lower-entropy password than the one supplied; " +
 			"supply a text secret (for example base64) instead of raw binary bytes")
-	case issues.NonBMP:
+	case PasswordNonBMP:
 		return errors.New("pfx password contains a character outside the Basic Multilingual Plane, " +
 			"which the PKCS#12 UCS-2 password encoding cannot represent; " +
 			"choose a password made of BMP characters (ASCII is safest)")
-	case issues.EmbeddedNUL:
+	case PasswordEmbeddedNUL:
 		return errors.New("pfx password contains a NUL byte, and PKCS#12 passwords are NUL-terminated, " +
 			"so no consumer that builds the terminated BMPString itself could open the bundle with the " +
 			"password supplied; strip NUL bytes from the secret " +
 			"(a UTF-16 or NUL-padded secret file is the usual cause)")
 	}
 	return nil
-}
-
-// maxSubjectLogLen bounds the certificate-controlled subject interpolated into a
-// diagnostic. The subject is parsed out of a PEM file the app does not control
-// and is capped only by the reader's size limit, so an unbounded interpolation
-// puts a multi-megabyte line into the logs of every scan that retries the pair.
-const maxSubjectLogLen = 256
-
-// boundSubject truncates a certificate subject to maxSubjectLogLen bytes for a
-// log-bound diagnostic, dropping the partial rune the cut may leave behind so
-// the %q form stays readable. It is a named alias for the package's shared
-// boundLogText rule.
-func boundSubject(subject string) string {
-	return boundLogText(subject, maxSubjectLogLen)
-}
-
-// publicKeyMatches reports whether pub is the public half of signer's private
-// key. supported is false when pub's type does not provide the
-// Equal(crypto.PublicKey) bool method every crypto/x509 public key type
-// implements, in which case matched carries no meaning and the caller must treat
-// the key type as unverifiable rather than as a mismatch.
-func publicKeyMatches(pub crypto.PublicKey, signer crypto.Signer) (matched, supported bool) {
-	return equalPublicKeys(pub, signer.Public())
-}
-
-// equalPublicKeys is the single home of the comparison rule publicKeyMatches
-// and samePublicKey share: every public key type crypto/x509 parses exposes
-// Equal(crypto.PublicKey) bool, and a type that does not is unverifiable rather
-// than unequal. supported reports which of the two it was, so a caller that
-// must distinguish them can, and one that need not can ignore it.
-func equalPublicKeys(a, b crypto.PublicKey) (matched, supported bool) {
-	matcher, ok := a.(interface{ Equal(crypto.PublicKey) bool })
-	if !ok {
-		return false, false
-	}
-	return matcher.Equal(b), true
 }
 
 // --- Read-back: the currency check ---
@@ -218,7 +193,7 @@ func CheckCurrency(pfx []byte, password string, want *Analysis, wantEncoder Enco
 	if err != nil {
 		return Currency{Reason: CurrencyPreflightFailed, Err: err}
 	}
-	if insp.Profile != wantEncoder {
+	if insp.Profile != resolvedName(wantEncoder) {
 		return Currency{Reason: CurrencyProfileMismatch, Profile: insp.Profile}
 	}
 	prior, err := decode(pfx, password)

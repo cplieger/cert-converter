@@ -46,7 +46,10 @@ const maxKeyBlocks = 16
 // them in order. Blocks of any other type (the private key of a combined
 // cert+key file, for instance) are skipped, and the "no certificate" diagnostic
 // names the first skipped block's label (bounded) so a swapped cert/key pair is
-// diagnosable from the message alone. It returns an error if no
+// diagnosable from the message alone. Blocks that are neither a certificate nor
+// a private key are additionally returned as the second result, so Analyse can
+// report that they were left out of the bundle instead of dropping them
+// silently. It returns an error if no
 // CERTIFICATE block is present, and also if any CERTIFICATE block holds DER
 // that x509 cannot parse: a partially decodable chain is rejected outright
 // rather than silently truncated, because a PFX built from a truncated chain
@@ -56,14 +59,14 @@ const maxKeyBlocks = 16
 // bypass: the cert/key match and the leaf/chain split. Publishing the
 // lower-level parser would offer a second contract around them with no
 // production consumer. The package's own tests reach it through export_test.go.
-func parseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
+func parseCertChain(pemBytes []byte) ([]*x509.Certificate, skippedBlocks, error) {
 	declaredCertBlocks := countDeclaredBlocks(pemBytes, certBeginMarker)
 	if declaredCertBlocks > maxChainCerts {
-		return nil, fmt.Errorf("certificate PEM chain declares %d CERTIFICATE block(s), more than the %d this app converts",
+		return nil, skippedBlocks{}, fmt.Errorf("certificate PEM chain declares %d CERTIFICATE block(s), more than the %d this app converts",
 			declaredCertBlocks, maxChainCerts)
 	}
 	var certs []*x509.Certificate
-	var skipped skippedBlocks
+	var skipped, unrelated skippedBlocks
 
 	for {
 		var block *pem.Block
@@ -73,27 +76,46 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
 		}
 		if block.Type != pemTypeCertificate {
 			skipped.add(block.Type)
+			// A private-key block is an expected passenger: a combined cert+key file
+			// is a supported input, so it is skipped silently. Anything else was
+			// neither a certificate this app can put in the bundle nor a key, and the
+			// operator hears about it.
+			if !isPrivateKeyBlockType(block.Type) {
+				unrelated.add(block.Type)
+			}
 			continue
 		}
 		c, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			return nil, fmt.Errorf("certificate PEM block %d: %w", len(certs)+1, boundedTextError{err})
+			return nil, skippedBlocks{}, fmt.Errorf("certificate PEM block %d: %w", len(certs)+1, boundedTextError{err})
 		}
 		certs = append(certs, c)
 	}
 
 	if len(certs) != declaredCertBlocks {
-		return nil, fmt.Errorf("certificate PEM chain is malformed: decoded %d of %d declared CERTIFICATE block(s)", len(certs), declaredCertBlocks)
+		return nil, skippedBlocks{}, fmt.Errorf("certificate PEM chain is malformed: decoded %d of %d declared CERTIFICATE block(s)", len(certs), declaredCertBlocks)
 	}
 
 	if len(certs) == 0 {
 		if skipped.count > 0 {
-			return nil, fmt.Errorf("no certificate PEM block found (skipped %d non-certificate PEM block(s), first %q)",
+			return nil, skippedBlocks{}, fmt.Errorf("no certificate PEM block found (skipped %d non-certificate PEM block(s), first %q)",
 				skipped.count, skipped.firstTypeForLog())
 		}
-		return nil, errors.New("no certificate PEM block found")
+		return nil, skippedBlocks{}, errors.New("no certificate PEM block found")
 	}
-	return certs, nil
+	return certs, unrelated, nil
+}
+
+// isPrivateKeyBlockType reports whether a PEM label names a private-key block
+// this package knows, including the encrypted forms it only diagnoses. It reads
+// the same pemType* constants keyBeginMarkers is built from, so the "a key in the
+// certificate file is expected" rule cannot drift from the parser's own set.
+func isPrivateKeyBlockType(blockType string) bool {
+	switch blockType {
+	case pemTypePrivateKey, pemTypeRSAPrivateKey, pemTypeECPrivateKey, pemTypeEncryptedPrivateKey:
+		return true
+	}
+	return false
 }
 
 // --- PEM declaration counting (shared by both parsers) ---
@@ -214,6 +236,20 @@ func boundLogText(s string, limit int) string {
 // boundLogText composes the library's primitives instead of taking its preset.
 const truncationMarker = "...(truncated)"
 
+// maxSubjectLogLen bounds the certificate-controlled subject interpolated into a
+// diagnostic. The subject is parsed out of a PEM file the app does not control
+// and is capped only by the reader's size limit, so an unbounded interpolation
+// puts a multi-megabyte line into the logs of every scan that retries the pair.
+const maxSubjectLogLen = 256
+
+// boundSubject truncates a certificate subject to maxSubjectLogLen bytes for a
+// log-bound diagnostic, dropping the partial rune the cut may leave behind so
+// the %q form stays readable. It is a named alias for the package's shared
+// boundLogText rule.
+func boundSubject(subject string) string {
+	return boundLogText(subject, maxSubjectLogLen)
+}
+
 // boundedTextError caps the rendered text of an input-derived error. The
 // crypto/x509 parser interpolates certificate-controlled fields into several of
 // its messages with %q (a SAN URI, a name constraint, an extension OID), and
@@ -243,11 +279,11 @@ type keyScan struct {
 	firstParseErr error
 	skipped       skippedBlocks
 	decodedBlocks int
+	parseFailures int
 	sawEncrypted  bool
 }
 
-// visit classifies one PEM block, applying the same per-block rules the parser
-// has always used.
+// visit classifies one PEM block, applying the parser's per-block rules.
 func (s *keyScan) visit(block *pem.Block) {
 	switch block.Type {
 	case pemTypePrivateKey, pemTypeRSAPrivateKey, pemTypeECPrivateKey:
@@ -258,6 +294,7 @@ func (s *keyScan) visit(block *pem.Block) {
 		}
 		key, err := parsePrivateKeyBlock(block)
 		if err != nil {
+			s.parseFailures++
 			if s.firstParseErr == nil {
 				s.firstParseErr = err
 			}
@@ -292,18 +329,19 @@ func (s *keyScan) visit(block *pem.Block) {
 //
 // Returning all of them is what lets identity selection be key-first: with more
 // than one key present, the certificate decides which key is correct, so
-// discarding the later blocks would throw away the evidence. The diagnostics are
-// unchanged and are consulted only when NO block yields a key, so an input that
-// used to produce a key still produces the same first key.
+// discarding the later blocks would throw away the evidence. The failure
+// diagnostics are consulted only when NO block yields a key; when one does, the
+// returned keyDefects carries the blocks that did not, so a later identity
+// mismatch can still name the half of the file that is damaged.
 //
 // The result element type is crypto.Signer, not crypto.PrivateKey, because that
 // is what the allowlist below actually admits: every accepted key type exposes a
 // public half, which is what identity matching compares. Naming the narrower type
 // here means no caller has to handle a key that cannot be matched.
-func parsePrivateKeys(pemBytes []byte) ([]crypto.Signer, error) {
+func parsePrivateKeys(pemBytes []byte) ([]crypto.Signer, keyDefects, error) {
 	declaredKeyBlocks := countDeclaredBlocks(pemBytes, keyBeginMarkers...)
 	if declaredKeyBlocks > maxKeyBlocks {
-		return nil, fmt.Errorf("private key PEM file declares %d key block(s), more than the %d this app reads",
+		return nil, keyDefects{}, fmt.Errorf("private key PEM file declares %d key block(s), more than the %d this app reads",
 			declaredKeyBlocks, maxKeyBlocks)
 	}
 	var scan keyScan
@@ -316,10 +354,14 @@ func parsePrivateKeys(pemBytes []byte) ([]crypto.Signer, error) {
 		scan.visit(block)
 	}
 	if len(scan.keys) == 0 {
-		return nil, noPrivateKeyError(scan.firstParseErr, scan.sawEncrypted, scan.skipped,
+		return nil, keyDefects{}, noPrivateKeyError(scan.firstParseErr, scan.sawEncrypted, scan.skipped,
 			declaredKeyBlocks-scan.decodedBlocks)
 	}
-	return scan.keys, nil
+	return scan.keys, keyDefects{
+		unparseable: scan.parseFailures,
+		undecoded:   declaredKeyBlocks - scan.decodedBlocks,
+		encrypted:   scan.sawEncrypted,
+	}, nil
 }
 
 // noPrivateKeyError explains why parsePrivateKeys decoded no usable key, in
@@ -349,6 +391,43 @@ func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped skippedBl
 		msg = fmt.Sprintf("%s; the file declares %d private-key PEM block(s) that could not be decoded (truncated armour or a corrupt body)", msg, undecodedKeyBlocks)
 	}
 	return errors.New(msg)
+}
+
+// keyDefects counts the key blocks that yielded no usable key even though
+// another block did. parsePrivateKeys itself succeeds in that case, so without
+// carrying this out the evidence is discarded exactly when it is needed: a
+// mid-rotation file whose appended key is truncated or of an unsupported type
+// still parses its OLD key, and if the certificate has been renewed the failure
+// the operator then sees is "the key does not match the certificate".
+type keyDefects struct {
+	// unparseable is the number of key-labelled blocks whose DER no parser accepted.
+	unparseable int
+	// undecoded is the number of private-key declarations encoding/pem could not
+	// decode at all (truncated armour, a corrupt body).
+	undecoded int
+	// encrypted reports that at least one block held ciphertext.
+	encrypted bool
+}
+
+// suffix names those blocks for a "nothing matches" diagnostic, or returns ""
+// when every declared block became a key. It is appended to the existing
+// sentence rather than folded into it, so log matching on the base message is
+// unaffected.
+func (d keyDefects) suffix() string {
+	var parts []string
+	if d.unparseable > 0 {
+		parts = append(parts, fmt.Sprintf("%d could not be parsed", d.unparseable))
+	}
+	if d.encrypted {
+		parts = append(parts, "at least one is encrypted")
+	}
+	if d.undecoded > 0 {
+		parts = append(parts, fmt.Sprintf("%d declared block(s) could not be decoded (truncated armour or a corrupt body)", d.undecoded))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "; the key file also holds block(s) that yielded no key: " + strings.Join(parts, ", ")
 }
 
 // isEncryptedPEMBlock reports whether a traditional OpenSSL private-key block
@@ -415,7 +494,7 @@ func parsePrivateKeyBlock(block *pem.Block) (crypto.Signer, error) {
 		parseErr = sec1Err
 	}
 	return nil, fmt.Errorf("failed to parse private key from %s block (tried PKCS8, PKCS1, SEC1): %w",
-		block.Type, boundedTextError{parseErr})
+		boundLogText(block.Type, maxBlockTypeLogLen), boundedTextError{parseErr})
 }
 
 // PasswordEncodingIssues reports the ways a PFX password cannot survive the
@@ -438,6 +517,33 @@ type PasswordEncodingIssues struct {
 	// consumer that builds the BMPString from a NUL-terminated string
 	// (OpenSSL, Windows CryptoAPI) can reproduce the key-derivation input.
 	EmbeddedNUL bool
+}
+
+// PasswordEncodingIssue names one shape, or none.
+type PasswordEncodingIssue string
+
+// The password shapes PasswordEncodingIssues.Primary selects between.
+const (
+	PasswordEncodesFine PasswordEncodingIssue = ""
+	PasswordInvalidUTF8 PasswordEncodingIssue = "invalid-utf8" //nolint:gosec // G101 false positive: a shape NAME for a diagnostic, not a credential value.
+	PasswordNonBMP      PasswordEncodingIssue = "non-bmp"
+	PasswordEmbeddedNUL PasswordEncodingIssue = "embedded-nul"
+)
+
+// Primary reports the shape to name when several hold. The ORDER is the
+// contract: internal/config's startup gate and Encode's codec guard must
+// name the same shape for the same password, so it lives here once rather
+// than as two switches kept aligned by comment.
+func (i PasswordEncodingIssues) Primary() PasswordEncodingIssue {
+	switch {
+	case i.InvalidUTF8:
+		return PasswordInvalidUTF8
+	case i.NonBMP:
+		return PasswordNonBMP
+	case i.EmbeddedNUL:
+		return PasswordEmbeddedNUL
+	}
+	return PasswordEncodesFine
 }
 
 // InspectPasswordEncoding reports how a PFX password fares under the PKCS#12

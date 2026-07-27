@@ -15,7 +15,7 @@ import (
 // still-completed scan, so this branch is what makes a missing or unmounted /input
 // flip the container unhealthy instead of reporting a clean scan of nothing.
 //
-// It lives here rather than in main's test file (deferred finding l-f13): the
+// It lives here rather than in main's test file: the
 // behaviour is Scanner.Run's, so a change to it must fail a test in this package.
 func TestScannerRun_reports_an_unopenable_input_root(t *testing.T) {
 	t.Parallel()

@@ -125,8 +125,11 @@ func isBlank(password string) bool {
 // password follows the Docker-secrets convention: when PFX_PASSWORD_FILE is
 // set the secret is read from that file (bounded, whitespace-trimmed) so it
 // never appears in the process environment; otherwise PFX_PASSWORD is used. It
-// returns ErrEmptyPassword when neither supplies a value unless
-// PFX_ALLOW_EMPTY_PASSWORD is set to true, and it fails loudly when a
+// returns ErrEmptyPassword when neither supplies a value, or when the value is
+// blank (empty or whitespace-only), unless PFX_ALLOW_EMPTY_PASSWORD is set to
+// true; it returns ErrUnencodablePassword when the configured password is a
+// shape PKCS#12 cannot carry (invalid UTF-8, a non-BMP rune, or an embedded
+// NUL); and it fails loudly when a
 // configured PFX_PASSWORD_FILE cannot be used — including a path envx
 // rejects (it must already be cleaned and contain no ".." anywhere, so even
 // a "pfx..v2" filename is refused), an oversized file, and a file whose
@@ -134,6 +137,13 @@ func isBlank(password string) bool {
 func Load() (Config, error) {
 	var blankSecretFile error
 	password, source, secretErr := envx.SecretWithSource("PFX_PASSWORD")
+	// Emitted here rather than from logPasswordDelivery because every startup
+	// REFUSAL below is about the file channel while PFX_PASSWORD is the variable the
+	// operator can see is set: ErrEmptyPassword's "set it" and envx's "read secret
+	// file for PFX_PASSWORD" both point at the ignored variable unless this line
+	// says the file wins. envx reports SourceFile on its error paths for exactly
+	// this purpose.
+	warnBothPasswordChannels(source)
 	if secretErr != nil {
 		var missing *envx.MissingError
 		switch {
@@ -164,17 +174,9 @@ func Load() (Config, error) {
 		}
 		return Config{}, ErrEmptyPassword
 	}
-	// The classification and its WARN tree live together in this package (see
-	// warnPasswordStrength), alongside every other configuration warning. The
-	// status is classified next to the guard that consumes it, but its WARN is
-	// emitted last, immediately before Load returns: that keeps the baseline
-	// startup log order (delivery and channel diagnostics, then lifecycle,
-	// encoder and fallback diagnostics, then the weak-password warning, then
-	// main's "starting cert watcher" record). One configuration drops a record
-	// from that order: a blank PFX_PASSWORD_FILE the opt-out let through is
-	// reported once, by the channel-specific delivery WARN, and the generic
-	// weak-password WARN is suppressed rather than repeating it with guidance
-	// aimed at the other channel.
+	// Classified next to the guard that consumes it, but warned last (see
+	// warnPasswordStrength), so the weak-password WARN lands after the delivery,
+	// lifecycle, encoder and fallback diagnostics rather than ahead of them.
 	status := classifyPassword(password)
 	if err := checkPasswordEncodable(password); err != nil {
 		return Config{}, fmt.Errorf("%w (supplied via %s)", err, passwordChannel(source))
@@ -273,20 +275,21 @@ func allowEmptyPassword(raw string) bool {
 //
 // Only the SHAPE is reported, never the value. Recognition is
 // convert.InspectPasswordEncoding's, the same package that encodes, so this gate
-// cannot drift from the encoder; keep issue precedence aligned with convert.Encode.
+// cannot drift from the encoder; which shape is named when a password carries
+// several is convert.PasswordEncodingIssues.Primary's, the single home of that
+// precedence, so this gate and convert.Encode's own guard cannot disagree.
 // This startup gate fails before scanning, while Encode's codec-level guard protects
 // callers that bypass config loading — both are wanted.
 func checkPasswordEncodable(password string) error {
 	if password == "" {
 		return nil
 	}
-	issues := convert.InspectPasswordEncoding(password)
-	switch {
-	case issues.InvalidUTF8:
+	switch convert.InspectPasswordEncoding(password).Primary() {
+	case convert.PasswordInvalidUTF8:
 		return fmt.Errorf("%w: not valid UTF-8, so every invalid byte would be encoded as U+FFFD and generated PFX files would be protected by a different, lower-entropy password than the configured secret; supply a text secret (for example base64) instead of raw binary bytes", ErrUnencodablePassword)
-	case issues.NonBMP:
+	case convert.PasswordNonBMP:
 		return fmt.Errorf("%w: contains a character outside the Basic Multilingual Plane, which PKCS#12 cannot encode, so every conversion would fail; use a password made only of BMP characters (ASCII is safest)", ErrUnencodablePassword)
-	case issues.EmbeddedNUL:
+	case convert.PasswordEmbeddedNUL:
 		return fmt.Errorf("%w: contains a NUL byte, and PKCS#12 passwords are NUL-terminated, so generated PFX files could not be opened with any password a consumer can supply; strip NUL bytes from the secret file (a UTF-16 or NUL-padded file is the usual cause)", ErrUnencodablePassword)
 	}
 	return nil
@@ -450,8 +453,10 @@ func warnPasswordStrength(status PasswordStatus, blankFileReported bool) {
 
 // logPasswordDelivery reports the resolved source and actionable delivery problems
 // without logging the password or the steady-state secret path: a blank mounted
-// secret the opt-out let through, a conflicting pair of channels, and whitespace or
-// control characters that silently become part of the password.
+// secret the opt-out let through, and whitespace or control characters that
+// silently become part of the password. The both-channels conflict is reported by
+// Load itself, before the guards that can refuse to start, so a refusal never sends
+// the operator to the variable the file-wins rule ignores.
 //
 // The source is the one envx reported rather than one re-derived here, so the log
 // cannot disagree with what was read, and an operator can confirm a mounted secret
@@ -469,7 +474,6 @@ func logPasswordDelivery(source envx.SecretSource, password string, blankSecretF
 			slog.Info("PFX password configured", "source", "PFX_PASSWORD_FILE")
 		}
 	}
-	warnBothPasswordChannels(source)
 	if source == envx.SourceEnv && !isBlank(password) &&
 		password != strings.TrimSpace(password) {
 		slog.Warn("PFX_PASSWORD has leading or trailing whitespace, which is part of the password embedded in every PFX file",
@@ -479,7 +483,9 @@ func logPasswordDelivery(source envx.SecretSource, password string, blankSecretF
 	// surrounding whitespace, and PKCS#12 encodes a newline or tab verbatim, so
 	// checkPasswordEncodable accepts it. The bundle is written, health stays
 	// green, and the password cannot be typed into the consumers that need it.
-	if strings.ContainsFunc(password, unicode.IsControl) {
+	// A blank value is skipped: warnPasswordStrength already reports it, with the
+	// remediation that helps (set a real password) rather than this one's.
+	if !isBlank(password) && strings.ContainsFunc(password, unicode.IsControl) {
 		slog.Warn("the PFX password contains a control character (newline, carriage return, or tab), which is embedded verbatim in every PFX file and cannot be typed into most PKCS#12 consumers",
 			"source", string(source),
 			"remediation", "supply the secret on a single line (openssl rand -base64 wraps at 64 columns; add -A) so whatever opens the .pfx can reproduce the password")

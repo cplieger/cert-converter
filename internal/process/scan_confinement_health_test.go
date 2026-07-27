@@ -10,7 +10,7 @@ import (
 )
 
 // TestScannerRun_symlink_escape_is_health_neutral pins the case that motivated the
-// classification change (deferred finding h-f9): a certificate whose /input entry is a
+// classification change: a certificate whose /input entry is a
 // symlink pointing OUT of the mounted subtree.
 //
 // This is not a hypothetical. The certbot layout — live/<domain>/cert.pem as a symlink

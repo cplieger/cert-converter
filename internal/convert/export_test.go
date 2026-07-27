@@ -14,9 +14,16 @@ import (
 // the external convert_test package without widening the app's API — test
 // placement no longer dictates the package surface.
 var (
-	ParseCertChain = parseCertChain
-	EncoderFor     = encoderFor
+	EncoderFor = encoderFor
 )
+
+// ParseCertChain drops the skipped-unrelated-block evidence the parser returns
+// for Analyse's observation, so the parser's own tests keep asserting on the
+// certificates and the error alone.
+func ParseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
+	certs, _, err := parseCertChain(pemBytes)
+	return certs, err
+}
 
 // Test-only handles on the read-back steps CheckCurrency sequences. Same rule as
 // the parsers above, for the same reason: publishing inspect, decode or
@@ -44,7 +51,7 @@ func MatchesAnalysis(d Decoded, a *Analysis) bool { return d.matchesAnalysis(a) 
 // is correct. The wrapper lives here rather than in production so no production
 // function exists solely for tests.
 func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
-	keys, err := parsePrivateKeys(pemBytes)
+	keys, _, err := parsePrivateKeys(pemBytes)
 	if err != nil {
 		return nil, err
 	}

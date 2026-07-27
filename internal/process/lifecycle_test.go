@@ -127,9 +127,13 @@ func TestStoreReconcile(t *testing.T) {
 // while a sample that elides without saying how many it dropped hides the scale.
 func TestSampleOrphanPaths_bounds_the_logged_sample(t *testing.T) {
 	t.Parallel()
+	// DISTINCT names: with one name repeated, a sample taken from the wrong window
+	// (one that drops the first orphan, or starts one past it) renders the same count
+	// of ".pfx" occurrences, so the count assertion below cannot tell the two apart --
+	// and this attribute is the operator's only view of WHICH bundles are reported.
 	all := make([]string, 0, maxLoggedOrphans+5)
-	for range maxLoggedOrphans + 5 {
-		all = append(all, "x.pfx")
+	for i := range maxLoggedOrphans + 5 {
+		all = append(all, string(rune('A'+i))+".pfx")
 	}
 	for _, tc := range []struct {
 		name      string
@@ -146,6 +150,13 @@ func TestSampleOrphanPaths_bounds_the_logged_sample(t *testing.T) {
 			got := sampleOrphanPaths(all[:tc.n])
 			if named := strings.Count(got, ".pfx"); named != tc.wantNamed {
 				t.Errorf("sampleOrphanPaths(%d paths) named %d paths, want %d: %q", tc.n, named, tc.wantNamed, got)
+			}
+			if !strings.HasPrefix(got, all[0]+",") {
+				t.Errorf("sampleOrphanPaths(%d paths) = %q, want it to start at the first path %q: the sample must not drop the head of the list",
+					tc.n, got, all[0])
+			}
+			if strings.Contains(got, all[maxLoggedOrphans]) {
+				t.Errorf("sampleOrphanPaths(%d paths) = %q, want %q elided: the sample must stop at the cap", tc.n, got, all[maxLoggedOrphans])
 			}
 			if tc.wantMore == "" {
 				if strings.Contains(got, "more)") {
@@ -782,4 +793,91 @@ func concatPEM(blobs ...[]byte) []byte {
 		out = append(out, b...)
 	}
 	return out
+}
+
+// TestCurrentFromCurrency_maps_every_outcome pins the translation from a
+// convert.Currency verdict into isCurrent's answer, one arm per outcome. The arm
+// that has no other test is the last one: a decode INTERRUPTED by shutdown is
+// neither current nor stale, so it must propagate the cancellation. If it joined
+// the ordinary decode-failure arm, a SIGTERM landing during a bundle's KDF decode
+// would report that pair stale and rewrite it on the way out -- a fresh salt and a
+// fresh mtime on a bundle that was already correct, which the documented
+// downstream rsync then re-replicates -- and convertEntry, whose error arm assumes
+// "only shutdown gets here", would count it as a conversion instead of a cancelled
+// scan. The other arms pin the level each outcome is reported at (Info for a
+// deliberate encoder change, Debug for the two expected failures, silence for a
+// match or an ordinary renewal). Runs serially: it swaps slog.Default().
+func TestCurrentFromCurrency_maps_every_outcome(t *testing.T) {
+	for _, tc := range []struct {
+		res         convert.Currency
+		name        string
+		wantMsg     string
+		wantLevel   slog.Level
+		cancelled   bool
+		wantCurrent bool
+		wantErr     bool
+	}{
+		{
+			res:  convert.Currency{Reason: convert.CurrencyMatch},
+			name: "a match is current and silent", wantCurrent: true,
+		},
+		{
+			res:  convert.Currency{Reason: convert.CurrencyContentMismatch},
+			name: "a renewed certificate is stale and silent",
+		},
+		{
+			res:  convert.Currency{Reason: convert.CurrencyPreflightFailed, Err: errors.New("bounded out")},
+			name: "a failed preflight is stale at debug", wantMsg: "prior pfx failed preflight; regenerating",
+			wantLevel: slog.LevelDebug,
+		},
+		{
+			res:  convert.Currency{Reason: convert.CurrencyProfileMismatch, Profile: convert.EncNameLegacyDES},
+			name: "an encoder change is stale at info", wantMsg: "prior pfx uses a different encoder profile; regenerating",
+			wantLevel: slog.LevelInfo,
+		},
+		{
+			res:  convert.Currency{Reason: convert.CurrencyDecodeFailed, Err: errors.New("mac mismatch")},
+			name: "a failed decode is stale at debug", wantMsg: "prior pfx did not decode; regenerating",
+			wantLevel: slog.LevelDebug,
+		},
+		{
+			res:  convert.Currency{Reason: convert.CurrencyDecodeFailed, Err: errors.New("mac mismatch")},
+			name: "a decode interrupted by shutdown is an error, not stale", cancelled: true, wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			if tc.cancelled {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+			logs := captureLogs(t)
+
+			current, err := currentFromCurrency(ctx, "example.com/tls.pfx", tc.res, convert.EncNameModern2023)
+
+			if gotErr := err != nil; gotErr != tc.wantErr {
+				t.Fatalf("currentFromCurrency(%s) error = %v, want an error: %v", tc.res.Reason, err, tc.wantErr)
+			}
+			if tc.wantErr && !errors.Is(err, context.Canceled) {
+				t.Errorf("currentFromCurrency(cancelled, %s) error = %v, want context.Canceled so the scan reports the shutdown instead of rewriting every remaining pair",
+					tc.res.Reason, err)
+			}
+			if current != tc.wantCurrent {
+				t.Errorf("currentFromCurrency(%s) = %v, want %v", tc.res.Reason, current, tc.wantCurrent)
+			}
+			if tc.wantMsg == "" {
+				if logs.Len() != 0 {
+					t.Errorf("currentFromCurrency(%s) logged %q, want no output at all", tc.res.Reason, logs.Messages())
+				}
+				return
+			}
+			if got := logs.CountLevel(tc.wantLevel, tc.wantMsg); got != 1 {
+				t.Errorf("currentFromCurrency(%s) logged %q at %s %d times, want exactly 1", tc.res.Reason, tc.wantMsg, tc.wantLevel, got)
+			}
+			if !logs.HasAttr(tc.wantMsg, "path", "example.com/tls.pfx") {
+				t.Errorf("currentFromCurrency(%s) logged %q, want the output path named", tc.res.Reason, logs.Messages())
+			}
+		})
+	}
 }

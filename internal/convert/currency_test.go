@@ -215,3 +215,28 @@ func TestCurrency_zero_value_is_not_current(t *testing.T) {
 		t.Error("Currency{}.Current() = true, want false: an unfilled verdict must never report a bundle as current")
 	}
 }
+
+// TestCheckCurrency_resolves_an_unknown_encoder_name_the_way_Encode_does pins the
+// agreement between the write side and the read-back side. encoderFor is total: an
+// EncoderType no profile row names still selects modern2023, so Encode WRITES a
+// modern2023 bundle. If CheckCurrency compared the file against the raw name it
+// was handed, it would report profile-mismatch on the very bundle Encode had just
+// produced, and the caller would rewrite the file on every scan forever.
+func TestCheckCurrency_resolves_an_unknown_encoder_name_the_way_Encode_does(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+
+	const unknown = convert.EncoderType("modern2024")
+	pfx, err := convert.Encode(&analysis, unknown, "pw")
+	if err != nil {
+		t.Fatalf("Encode(unknown encoder name) = error %v, want the modern2023 fallback to succeed", err)
+	}
+	if res := convert.CheckCurrency(pfx, "pw", &analysis, unknown); !res.Current() {
+		t.Errorf("CheckCurrency(the bundle Encode just wrote for %q) = %q, want a match",
+			unknown, res.Reason)
+	}
+}

@@ -189,8 +189,7 @@ func TestScannerRun_regenerates_pfx_when_output_is_not_a_regular_file(t *testing
 // in a key's place -- like a symlink escaping /input, or a permission denial -- is a
 // steady-state layout condition no restart can clear. The old classification made the
 // container restart-loop forever on a misconfiguration, and it disagreed with the
-// sibling-key STAT failure one line above, which was already health-neutral (deferred
-// finding h-f9).
+// sibling-key STAT failure one line above, which was already health-neutral.
 //
 // The pair is still not converted, still WARNed with its path, still retried on the
 // next scan, and still blocks orphan reaping. Only the health flip is gone.

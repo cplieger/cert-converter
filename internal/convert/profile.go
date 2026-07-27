@@ -406,8 +406,13 @@ func bundleAlgorithms(authSafe *contentInfo) (safeAlgorithms, error) {
 		return safeAlgorithms{}, fmt.Errorf("%w: authSafe is not a data ContentInfo", ErrProfileUnknown)
 	}
 	var inner []byte
-	if _, unmarshalErr := asn1.Unmarshal(authSafe.Content.Bytes, &inner); unmarshalErr != nil {
+	authRest, unmarshalErr := asn1.Unmarshal(authSafe.Content.Bytes, &inner)
+	if unmarshalErr != nil {
 		return safeAlgorithms{}, fmt.Errorf("parse authSafe content: %w", unmarshalErr)
+	}
+	if len(authRest) != 0 {
+		return safeAlgorithms{}, fmt.Errorf("%w: %d trailing byte(s) after the authSafe content",
+			ErrProfileUnknown, len(authRest))
 	}
 	elements, err := sequenceElements(inner, "authenticated safe", maxAuthenticatedSafes)
 	if err != nil {
@@ -470,8 +475,13 @@ func boundedSafeAlgorithms(safe *contentInfo) (safeAlgorithms, error) {
 	switch {
 	case contentType.Equal(oidEncryptedDataContentType):
 		var enc encryptedData
-		if _, err := asn1.Unmarshal(safe.Content.Bytes, &enc); err != nil {
-			return safeAlgorithms{}, fmt.Errorf("parse encrypted safe contents: %w", err)
+		encRest, encErr := asn1.Unmarshal(safe.Content.Bytes, &enc)
+		if encErr != nil {
+			return safeAlgorithms{}, fmt.Errorf("parse encrypted safe contents: %w", encErr)
+		}
+		if len(encRest) != 0 {
+			return safeAlgorithms{}, fmt.Errorf("%w: %d trailing byte(s) after an encrypted safe's contents",
+				ErrProfileUnknown, len(encRest))
 		}
 		certEnc := enc.EncryptedContentInfo.ContentEncryptionAlgorithm
 		certOID, err := certEnc.algorithmOID()
@@ -505,8 +515,13 @@ func boundedSafeAlgorithms(safe *contentInfo) (safeAlgorithms, error) {
 // writes, and the decoder would pay for both derivations before refusing it.
 func keyBagAlgorithm(content []byte) (asn1.ObjectIdentifier, error) {
 	var inner []byte
-	if _, err := asn1.Unmarshal(content, &inner); err != nil {
+	innerRest, err := asn1.Unmarshal(content, &inner)
+	if err != nil {
 		return nil, fmt.Errorf("parse plaintext safe content: %w", err)
+	}
+	if len(innerRest) != 0 {
+		return nil, fmt.Errorf("%w: %d trailing byte(s) after a plaintext safe's content",
+			ErrProfileUnknown, len(innerRest))
 	}
 	elements, err := sequenceElements(inner, "plaintext safe bags", maxSafeBags)
 	if err != nil {
@@ -554,8 +569,13 @@ func shroudedKeyBag(element []byte) (*safeBag, error) {
 // private-key bag and reports the algorithm the key inside it is encrypted with.
 func boundedKeyBagEncryption(bag *safeBag) (asn1.ObjectIdentifier, error) {
 	var info encryptedPrivateKeyInfo
-	if _, unmarshalErr := asn1.Unmarshal(bag.Value.Bytes, &info); unmarshalErr != nil {
+	bagRest, unmarshalErr := asn1.Unmarshal(bag.Value.Bytes, &info)
+	if unmarshalErr != nil {
 		return nil, fmt.Errorf("parse shrouded key bag: %w", unmarshalErr)
+	}
+	if len(bagRest) != 0 {
+		return nil, fmt.Errorf("%w: %d trailing byte(s) after a shrouded key bag's EncryptedPrivateKeyInfo",
+			ErrProfileUnknown, len(bagRest))
 	}
 	keyOID, err := info.Algorithm.algorithmOID()
 	if err != nil {

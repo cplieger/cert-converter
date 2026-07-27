@@ -69,6 +69,22 @@ func EncoderName(raw string) (name EncoderType, known bool) {
 	return EncNameModern2023, false
 }
 
+// resolvedName reports the profile name an EncoderType actually selects: the name
+// itself when this package knows it, and the modern2023 default otherwise — the
+// same total fallback encoderFor applies. It exists so the write side and the
+// read-back side cannot disagree about an unrecognized name: Encode would write a
+// modern2023 bundle while CheckCurrency compared the file against the name it was
+// handed, reporting profile-mismatch on every scan and rewriting the bundle
+// forever.
+func resolvedName(name EncoderType) EncoderType {
+	for _, p := range profiles {
+		if p.name == name {
+			return name
+		}
+	}
+	return EncNameModern2023
+}
+
 // encoderFor resolves an already-normalized encoder name to its PKCS#12
 // encoder. It never validates (EncoderName owns name normalization) and
 // never returns nil: an unknown name yields the modern2023 default, so the

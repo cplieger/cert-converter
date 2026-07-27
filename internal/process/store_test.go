@@ -146,3 +146,49 @@ func TestStoreWrite_wraps_an_atomic_write_failure(t *testing.T) {
 		t.Errorf("error = %q, want it to name the pfx write step", err.Error())
 	}
 }
+
+// TestStoreWrite_refuses_a_bundle_larger_than_the_read_bound pins the write-side
+// half of maxPFXSize, which nothing else exercises: a bundle above the cap must be
+// refused rather than written.
+//
+// The cap mirrors the read bound isCurrent uses. Without it, a bundle this app
+// wrote could be one its own currency check calls unreadable, so every scan would
+// declare it stale and rewrite it -- a permanent write loop with a fresh mtime each
+// time, which the documented downstream rsync re-replicates every cycle. The
+// refusal happens before the temp is staged, so the previous bundle must survive
+// intact and no temp may be left behind.
+func TestStoreWrite_refuses_a_bundle_larger_than_the_read_bound(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	defer root.Close()
+	s := &store{root: root}
+	if err := s.write(t.Context(), "out.pfx", []byte("prior bundle")); err != nil {
+		t.Fatalf("setup: write: %v", err)
+	}
+
+	err = s.write(t.Context(), "out.pfx", make([]byte, maxPFXSize+1))
+	if err == nil {
+		t.Fatal("store.write(over maxPFXSize) = nil error, want a refusal: a bundle this app writes above the cap is one its own currency check would call unreadable")
+	}
+	if !strings.Contains(err.Error(), "write pfx") || !strings.Contains(err.Error(), "too large") {
+		t.Errorf("store.write(over maxPFXSize) error = %q, want it to name the write step and the size refusal", err.Error())
+	}
+	got, readErr := os.ReadFile(filepath.Join(dir, "out.pfx"))
+	if readErr != nil {
+		t.Fatalf("read the prior bundle after the refused write: %v", readErr)
+	}
+	if string(got) != "prior bundle" {
+		t.Errorf("prior bundle = %q, want %q: the cap is checked before the temp is staged, so a refusal must leave the previous bundle intact", got, "prior bundle")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("the output directory holds %d entries, want 1: a refused write must stage no temp file", len(entries))
+	}
+}

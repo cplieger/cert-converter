@@ -220,7 +220,8 @@ func (w *Watcher) attachWatchSet(ctx context.Context) (watcher *fsnotify.Watcher
 		if ctx.Err() != nil {
 			return nil, true // shutdown arrived during construction; not a watch failure
 		}
-		slog.Warn("fsnotify unavailable, using polling with periodic upgrade attempts", "error", err)
+		slog.Warn("fsnotify unavailable, using polling with periodic upgrade attempts",
+			"fallback_scan", w.fallbackStatus(), "error", err)
 		return nil, false
 	}
 
@@ -229,7 +230,8 @@ func (w *Watcher) attachWatchSet(ctx context.Context) (watcher *fsnotify.Watcher
 		if ctx.Err() != nil {
 			return nil, true // shutdown interrupted the walk; not a watch failure
 		}
-		slog.Warn("failed to watch directories, using polling with periodic upgrade attempts", "error", addErr)
+		slog.Warn("failed to watch directories, using polling with periodic upgrade attempts",
+			"fallback_scan", w.fallbackStatus(), "error", addErr)
 		return nil, false
 	}
 
@@ -578,10 +580,8 @@ func (w *Watcher) handleRootWatchLoss(ctx context.Context, watcher *fsnotify.Wat
 	// rescan reports.
 	slog.Warn("fsnotify root watch lost; re-attaching the watch set, renewals until it succeeds are covered only by the periodic rescan",
 		"root", w.root, "op", event.Op.String(), "fallback_scan", w.fallbackStatus())
-	if addErr := w.addWatchDirs(ctx, watcher, w.root); addErr != nil && ctx.Err() == nil {
-		slog.Warn("failed to re-attach the watch set after the root watch was lost; renewals are covered only by the periodic rescan",
-			"root", w.root, "fallback_scan", w.fallbackStatus(), "error", addErr)
-	}
+	w.resyncWatchSet(ctx, watcher,
+		"failed to re-attach the watch set after the root watch was lost; renewals are covered only by the periodic rescan")
 	return true
 }
 
@@ -642,10 +642,8 @@ func (w *Watcher) handleErrorRecv(ctx context.Context, watcher *fsnotify.Watcher
 		// the process's life. watcher.Add is idempotent for a directory
 		// already in the watch set, so re-walking the tree only
 		// re-attaches what the overflow lost.
-		if addErr := w.addWatchDirs(ctx, watcher, w.root); addErr != nil && ctx.Err() == nil {
-			slog.Warn("failed to re-sync the watch set after an event-queue overflow; a directory whose Create was dropped stays unwatched until the next re-sync",
-				"root", w.root, "fallback_scan", w.fallbackStatus(), "error", addErr)
-		}
+		w.resyncWatchSet(ctx, watcher,
+			"failed to re-sync the watch set after an event-queue overflow; a directory whose Create was dropped stays unwatched until the next re-sync")
 	}
 	return true
 }
@@ -662,10 +660,8 @@ func (w *Watcher) handleErrorRecv(ctx context.Context, watcher *fsnotify.Watcher
 // it cut the re-sync short or arrived while the re-sync succeeded: the loop is
 // about to return anyway.
 func (w *Watcher) handleFallbackTick(ctx context.Context, watcher *fsnotify.Watcher, st *watchState) {
-	if addErr := w.addWatchDirs(ctx, watcher, w.root); addErr != nil && ctx.Err() == nil {
-		slog.Warn("failed to re-sync the watch set during the periodic fallback scan; the scan below still runs, so a renewal is not missed",
-			"root", w.root, "fallback_scan", w.fallbackStatus(), "error", addErr)
-	}
+	w.resyncWatchSet(ctx, watcher,
+		"failed to re-sync the watch set during the periodic fallback scan; the scan below still runs, so a renewal is not missed")
 	// Same stop-request rule as runDebouncedScan, on the success path too: the
 	// select has no ctx precedence, so a fallback deadline reached in the same
 	// instant as cancellation can win over ctx.Done. The loop is about to
@@ -674,6 +670,19 @@ func (w *Watcher) handleFallbackTick(ctx context.Context, watcher *fsnotify.Watc
 		return
 	}
 	st.runFallbackScan(ctx)
+}
+
+// resyncWatchSet re-asserts the watch set over the root and, when that fails under a
+// live ctx, reports it with the three diagnostics every re-sync site owes the
+// operator: WHICH root, whether anything will revisit what is now unwatched
+// (fallback_scan), and the error. It is the single home of that triple and of the
+// shutdown rule -- a walk cut short by cancellation is a clean stop, not a watch
+// degradation -- so neither can be changed for one re-sync site and silently left
+// wrong at the others. warning names what stays uncovered until the next re-sync.
+func (w *Watcher) resyncWatchSet(ctx context.Context, watcher *fsnotify.Watcher, warning string) {
+	if addErr := w.addWatchDirs(ctx, watcher, w.root); addErr != nil && ctx.Err() == nil {
+		slog.Warn(warning, "root", w.root, "fallback_scan", w.fallbackStatus(), "error", addErr)
+	}
 }
 
 // watchState carries the mutable accounting for one watchLoop run: the pending
@@ -764,7 +773,7 @@ func (st *watchState) handleWatcherError(err error) bool {
 		st.scheduleScan()
 		return true
 	}
-	slog.Warn("watcher error; the watch loop continues and a change missed because of it is recovered by the periodic fallback rescan",
+	slog.Warn("watcher error; the watch loop continues and a change missed because of it is covered only by the periodic fallback rescan",
 		"root", st.w.root, "fallback_scan", st.w.fallbackStatus(), "error", err)
 	return false
 }
