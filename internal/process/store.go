@@ -257,9 +257,9 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 		return false, nil
 	}
 
-	// Preflight BEFORE any derivation: it bounds the iteration counts the file
-	// itself dictates, and it names the encoder profile the file was written with,
-	// which decoding cannot reveal.
+	// Preflight BEFORE any derivation: it bounds every iteration count the file
+	// exposes without decrypting a safe, and it names the encoder profile the file
+	// was written with, which decoding cannot reveal.
 	insp, err := convert.Inspect(prior)
 	if err != nil {
 		slog.Debug("prior pfx failed preflight; regenerating", "path", rel, "error", err)
@@ -275,8 +275,12 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 		return false, nil
 	}
 
-	// Synchronous: the preflight has already bounded the work, so there is nothing
-	// to time out and no goroutine to abandon.
+	// Synchronous: the preflight bounded every derivation count it can read, which
+	// covers every bundle this app wrote and any bundle whose counts are visible, so
+	// for those there is nothing to time out and no goroutine to abandon. One shape
+	// escapes it, a shrouded key bag nested inside an encryptedData safe, and a
+	// deadline is not the answer there either: it would bound how long this caller
+	// waits, not the work done. See internal/convert profile.go maxKDFIterations.
 	decoded, err := convert.Decode(prior, password)
 	if err != nil {
 		if ctx.Err() != nil {

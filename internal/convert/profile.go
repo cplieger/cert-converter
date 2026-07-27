@@ -17,10 +17,29 @@ import (
 // and a decode deadline do not help — they bound how long the caller waits, not
 // how much work is done.
 //
-// One count is out of reach: a pkcs8ShroudedKeyBag nested inside an encryptedData
-// safe is still ciphertext while the preflight runs, so DecodeChain honours its
-// stored count unbounded. Closing that needs go-pkcs12's unexported pbDecrypt, so
-// it is a known limit of this gate rather than something it enforces.
+// One count is out of reach, so this cap is not a total bound. The preflight reads
+// only what is plaintext: the MAC's own count, each encryptedData safe's OUTER
+// content-encryption algorithm, and a shrouded key bag sitting in the plaintext
+// data safe. DecodeChain accepts one or two authenticated safes, decrypts every
+// encryptedData safe, flattens all the resulting bags, and derives with the stored
+// count of the first shrouded key bag in that flattened order (go-pkcs12 v0.7.3
+// pkcs12.go:591-626 and 481-489). A bundle that hides a shrouded key bag INSIDE
+// its encryptedData safe, which is the safe Encode writes first, therefore passes
+// every check here and then pays that bag's own count, which nothing bounds below
+// the largest value an int holds. The decoder's "expected exactly one key bag"
+// refusal does not help: it fires on the SECOND bag, which is the plaintext one
+// this preflight already bounded.
+//
+// It cannot be bounded here. pbDecrypt, pbeCipherFor and decodePkcs8ShroudedKeyBag
+// are unexported in v0.7.3 and DecodeChain takes only a bundle and a password, so
+// no in-repo call can express the limit. Reaching the gap needs write access to
+// /output AND a bundle whose MAC verifies, because DecodeChain verifies the MAC
+// before it decrypts any safe (pkcs12.go:569-584), which means knowing the
+// configured PFX_PASSWORD; PFX_ALLOW_EMPTY_PASSWORD=true removes that second
+// requirement, because the MAC over an empty password is computable by anyone.
+// Whoever holds both can already replace the bundle outright, so the residual is
+// accepted rather than worked around. A fix needs a decode-time
+// maximum-iterations option upstream.
 const maxKDFIterations = 10000
 
 // Object identifiers of the algorithms the four encoder profiles emit. Values
@@ -252,14 +271,16 @@ type Inspection struct {
 }
 
 // Inspect identifies the encoder profile of an existing PKCS#12 bundle and
-// verifies its key-derivation iteration counts are within range, WITHOUT running
-// any derivation.
+// verifies the key-derivation iteration counts it can read are within range,
+// WITHOUT running any derivation.
 //
 // It exists for two reasons that share one parser. Currency: comparing a bundle's
 // leaf, key and chain cannot notice that PFX_ENCODER changed, so switching profiles
 // would rewrite nothing and leave every file on the old algorithms while the startup
 // log announced the new one. Safety: the iteration counts live in the file and the
-// decoder honours them, so they must be bounded before the decode, not after.
+// decoder honours them, so every count this parser can reach is bounded before the
+// decode, not after. One nested count is unreachable and stays unbounded (see
+// maxKDFIterations).
 //
 // Every failure means the same thing to a caller — this is not a bundle we would
 // have written, so replace it. That makes a parse failure safe by construction.
@@ -299,8 +320,9 @@ func Inspect(pfx []byte) (Inspection, error) {
 	}
 	// The encryption iteration counts are bounded during the authenticated-safe
 	// walk (bundleAlgorithms -> boundedSafeAlgorithms), which covers EVERY
-	// encrypted safe plus the plaintext safe's shrouded key bag, not just the
-	// ones that identify the profile. Re-checking them here would be dead.
+	// encrypted safe's outer algorithm plus the plaintext safe's shrouded key bag,
+	// not just the ones that identify the profile. Re-checking them here would be
+	// dead.
 	return Inspection{Profile: profileName}, nil
 }
 
@@ -314,8 +336,8 @@ type safeAlgorithms struct {
 }
 
 // bundleAlgorithms reaches the certificate bag's and the private-key bag's
-// content-encryption algorithms, and bounds every derivation count the decoder
-// would honour on the way.
+// content-encryption algorithms, and bounds every derivation count that is
+// readable without decrypting a safe on the way.
 //
 // authSafe wraps an OCTET STRING holding the DER of AuthenticatedSafe, a SEQUENCE
 // OF ContentInfo whose members are the encrypted bag (holding the certificates)
@@ -329,7 +351,7 @@ type safeAlgorithms struct {
 // from one safe while the certificates could live in the other, and a bundle whose
 // certificates are RC2-40 encrypted would be reported as modern. The bound, in any
 // case, cannot stop at the first safe:
-// the decoder decrypts every encrypted safe (go-pkcs12 v0.7.3 pkcs12.go:604-616)
+// the decoder decrypts every encrypted safe (go-pkcs12 v0.7.3 pkcs12.go:606-616)
 // and derives separately for the shrouded key bag, which for every profile sits in
 // the PLAINTEXT safe. Every count VISIBLE without decrypting a safe is checked
 // here; a shrouded key bag nested INSIDE an encryptedData safe stays ciphertext
@@ -398,8 +420,8 @@ func (a *safeAlgorithms) merge(found safeAlgorithms) error {
 	return nil
 }
 
-// boundedSafeAlgorithms bounds every derivation count a single authenticated safe
-// would make the decoder honour, and reports the profile-identifying algorithms it
+// boundedSafeAlgorithms bounds the derivation count a single authenticated safe
+// exposes without being decrypted, and reports the profile-identifying algorithms it
 // carries: an encrypted safe's content encryption, or a plaintext safe's shrouded
 // key-bag encryption. A safe of neither kind contributes nothing.
 func boundedSafeAlgorithms(safe *contentInfo) (safeAlgorithms, error) {
