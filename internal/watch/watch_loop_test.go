@@ -95,17 +95,17 @@ func TestWatchLoop_returns_ErrWatchLost_when_the_watcher_dies(t *testing.T) {
 	}
 }
 
-// TestPollLoopWithUpgrade_reports_dead_change_detection pins the fix for the one
-// state in which this app could lie about being healthy.
+// TestPollLoopWithUpgrade_reports_dead_change_detection pins the one state in
+// which this app could lie about being healthy.
 //
 // With FALLBACK_SCAN_HOURS disabling the periodic rescan AND fsnotify unavailable
 // (inotify instance exhaustion is ordinary host pressure), there is no mechanism
-// left that can ever notice a renewal. The loop used to log once and park on
-// ctx.Done(), returning nil at shutdown. Because the initial scan had already
-// written the health marker, and because disabling the fallback also disarms the
-// probe's freshness deadline, nothing contradicted it: the container reported
-// HEALTHY indefinitely while converting nothing, and the operator's first signal
-// was a downstream service serving an expired certificate.
+// left that can ever notice a renewal. Parking on ctx.Done() and returning nil at
+// shutdown would leave the health marker written by the initial scan uncontradicted
+// — disabling the fallback also disarms the probe's freshness deadline — so the
+// container would report HEALTHY indefinitely while converting nothing, and the
+// operator's first signal would be a downstream service serving an expired
+// certificate.
 //
 // Returning ErrWatchLost reaches main's existing non-zero exit path. That is the
 // right answer here specifically BECAUSE the failure is restart-clearable — unlike
@@ -118,10 +118,10 @@ func TestWatchLoop_returns_ErrWatchLost_when_the_watcher_dies(t *testing.T) {
 // own — that would be a second announcement of one event.
 // Serial (no t.Parallel): it swaps the process-global slog default.
 func TestPollLoopWithUpgrade_reports_dead_change_detection(t *testing.T) {
-	// onChange is a required dependency, so it is wired even here: poll mode now runs
-	// one scan before deciding change detection is dead (deferred finding d-u5c6-1),
-	// and converting whatever is already on disk is the only useful work this process
-	// can do before exiting for a restart.
+	// onChange is a required dependency, so it is wired even here: poll mode runs
+	// one scan before deciding change detection is dead, and converting whatever is
+	// already on disk is the only useful work this process can do before exiting for
+	// a restart.
 	scanned := make(chan struct{}, 1)
 	w := &Watcher{ // FALLBACK_SCAN_HOURS=0/false
 		fallback: 0,

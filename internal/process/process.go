@@ -511,8 +511,7 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 // where the branch is taken.
 //
 // Every OPERATOR-ACTIONABLE reason a read fails here is a steady-state condition a
-// restart cannot clear
-// (deferred finding h-f9). A confinement refusal in particular cannot be identified by
+// restart cannot clear. A confinement refusal in particular cannot be identified by
 // sentinel — os.Root reports "path escapes from parent", which matches none of
 // fs.ErrPermission, fs.ErrNotExist, fs.ErrInvalid, syscall.ELOOP or syscall.EXDEV — so
 // classifying per-error would mean matching on Go's error text. Treating every
@@ -591,12 +590,12 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		// The observations describe the INPUT, so a semantically equivalent input
 		// edit still has to be named once even though the bundle on disk stays
 		// correct; observationLog.note owns that once-per-change rule.
-		sw.observations.note(rel, fingerprint, analysis.Observations)
+		sw.observations.note(rel, fingerprint, analysis.Observations())
 		slog.Debug("skipping unchanged cert pair", "path", rel)
 		return statusUnchanged
 	}
 
-	logConversionObservations(rel, analysis.Observations)
+	logConversionObservations(rel, analysis.Observations())
 	slog.Debug("converting cert pair", "path", rel)
 	pfxData, err := convert.Encode(&analysis, sw.enc, sw.password)
 	if err != nil {

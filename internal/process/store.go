@@ -37,12 +37,6 @@ const outputPermRemediation = "check /output ownership and permissions for the U
 
 // store owns every touch of the output tree.
 //
-// Before this type, output responsibility was spread across three places: the
-// atomic write lived in internal/convert (on a root that package did not own),
-// while the root itself, the path derivation, the directory mode, the prior-output
-// check and the stale-temp sweep lived in the scan. Deferred finding l-f27 named
-// the missing owner directly.
-//
 // A store does not close its root; the Scanner that opened it does.
 type store struct {
 	root *os.Root
@@ -53,11 +47,8 @@ type store struct {
 // planted under the output directory cannot redirect the private-key-bearing PFX
 // outside the mounted volume.
 // The parent directory is created by atomicfile's own WithMkdirMode rather than
-// by a hand-rolled MkdirAll here. That is the library's job — it creates the
-// directory inside the same confined root, before staging the temp file — and
-// duplicating it locally is what deferred findings l-f41 and l-f18 flagged: the
-// write went through the library while the directory step did not, so the two
-// halves of one operation could drift in mode or in confinement behaviour.
+// by a hand-rolled MkdirAll here. WithMkdirMode creates the parent inside the
+// same confined root as the write, so mode and confinement cannot drift.
 func (s *store) write(ctx context.Context, rel string, pfx []byte) error {
 	if _, err := atomicfile.WriteFileInRoot(ctx, s.root, rel, pfx,
 		atomicfile.WithMode(pfxFileMode),
@@ -89,9 +80,7 @@ func (s *store) lstat(rel string) (os.FileInfo, error) {
 //
 // The sweep belongs to the store because it is output-tree maintenance: it walks
 // the same confined root the writes go through, and it exists only because those
-// writes are atomic temp+rename. It used to sit beside the scan as free functions
-// over a raw *os.Root, which is what left the output tree with no single owner
-// (deferred finding l-f27).
+// writes are atomic temp+rename.
 
 // staleTempAge is the age past which an atomicfile temp is considered orphaned by
 // an interrupted write rather than staged by one still in flight.
@@ -107,10 +96,10 @@ const maxLoggedOrphans = 20
 //
 // atomicfile owns the mechanics — the confined walk (recursive via WithRecursive), the temp-name match,
 // the re-stat before each unlink, and the cancellation. All three properties this
-// sweep needs are the library's guarantees rather than this app's code (deferred
-// finding l-f16): the walk is root-relative so a co-mounting writer that swaps an
-// output subdirectory for a symlink mid-sweep cannot redirect a deletion outside the
-// mounted volume; it recurses because atomicfile stages its temp in the TARGET
+// sweep needs are the library's guarantees rather than this app's code: the walk is
+// root-relative so a co-mounting writer that swaps an output subdirectory for a
+// symlink mid-sweep cannot redirect a deletion outside the mounted volume; it
+// recurses because atomicfile stages its temp in the TARGET
 // directory, so a nested cert (input/example.com/cert.crt) leaves its orphan in the
 // matching nested output directory; and it stops between entries on cancellation,
 // because this runs before the input walk and must not traverse a large tree while
@@ -274,6 +263,15 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 	// would bound how long this caller waits, not the work done. See
 	// internal/convert profile.go maxKDFIterations.
 	res := convert.CheckCurrency(prior, password, want, wantEncoder)
+	return currentFromCurrency(ctx, rel, res, wantEncoder)
+}
+
+// currentFromCurrency turns a convert.Currency outcome into isCurrent's verdict:
+// what each outcome MEANS for the output tree, with its own diagnostic. Only
+// shutdown is a hard error; every other non-match resolves to "rewrite it".
+func currentFromCurrency(ctx context.Context, rel string, res convert.Currency,
+	wantEncoder convert.EncoderType,
+) (bool, error) {
 	switch res.Reason {
 	case convert.CurrencyPreflightFailed:
 		slog.Debug("prior pfx failed preflight; regenerating", "path", rel, "error", res.Err)
@@ -296,10 +294,11 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 		// file at that path. All mean the same thing — rewrite it.
 		slog.Debug("prior pfx did not decode; regenerating", "path", rel, "error", res.Err)
 		return false, nil
+	default:
+		// A match, or a plain content mismatch: the ordinary renewed-certificate
+		// outcome, which needs no diagnostic of its own.
+		return res.Current(), nil
 	}
-	// A match, or a plain content mismatch: the ordinary renewed-certificate
-	// outcome, which needs no diagnostic of its own.
-	return res.Current(), nil
 }
 
 // modeNotTightenedMsg is the one message both tightening failures share — a refused
@@ -545,6 +544,30 @@ func (r reapContext) safeToReap() bool {
 	return r.enumeratedInput() && r.failed == 0
 }
 
+// logIncompleteInputEnumeration reports why orphan reconciliation is skipped when
+// the input enumeration is incomplete. Without a complete enumeration, "this output
+// has no matching input" is not a claim the scan can make: a bundle whose cert the
+// walk never reached is indistinguishable from one whose cert was deleted.
+func logIncompleteInputEnumeration(rc reapContext) {
+	switch {
+	case rc.shutdown:
+		slog.Debug("skipping orphan reconciliation; scan cancelled during shutdown")
+	case rc.enumerationClean():
+		// A complete walk that found no pair at all: the enumeration did not fail, there
+		// is simply nothing to compare the output tree against. logInputCoverageWarnings
+		// already names this at WARN with the /input-mount remediation, and the operator
+		// alert on "orphan removal is disabled for this scan" points at /output, so
+		// repeating it here would fire that alert with the wrong diagnosis on every scan
+		// of a deployment whose first certificate has not been issued yet.
+		slog.Debug("skipping orphan reconciliation; the scan found no certificate pairs to compare the output tree against")
+	default:
+		slog.Warn("orphan removal is disabled for this scan: the scan did not fully enumerate the input tree, so no output can be proven orphaned",
+			"walk_completed", rc.walkCompleted, "unreadable", rc.unreadable,
+			"unresolved", rc.unresolved, "total", rc.scanTotal,
+			"remediation", "check the /input mount and the unreadable-path warnings above")
+	}
+}
+
 // reconcile compares the output tree against the input enumeration and, in sync
 // mode, deletes the bundles that no longer have an input. It returns how many were
 // removed plus a cancellation error when the process is shutting down: the walk
@@ -555,27 +578,7 @@ func (s *store) reconcile(ctx context.Context, mode outputpolicy.Lifecycle, seen
 		return 0, nil
 	}
 	if !rc.enumeratedInput() {
-		// Without a complete input enumeration, "this output has no matching input"
-		// is not a claim the scan can make: a bundle whose cert the walk never
-		// reached is indistinguishable from one whose cert was deleted.
-		if rc.shutdown {
-			slog.Debug("skipping orphan reconciliation; scan cancelled during shutdown")
-			return 0, nil
-		}
-		if rc.enumerationClean() {
-			// A complete walk that found no pair at all: the enumeration did not fail, there
-			// is simply nothing to compare the output tree against. logInputCoverageWarnings
-			// already names this at WARN with the /input-mount remediation, and the operator
-			// alert on "orphan removal is disabled for this scan" points at /output, so
-			// repeating it here would fire that alert with the wrong diagnosis on every scan
-			// of a deployment whose first certificate has not been issued yet.
-			slog.Debug("skipping orphan reconciliation; the scan found no certificate pairs to compare the output tree against")
-			return 0, nil
-		}
-		slog.Warn("orphan removal is disabled for this scan: the scan did not fully enumerate the input tree, so no output can be proven orphaned",
-			"walk_completed", rc.walkCompleted, "unreadable", rc.unreadable,
-			"unresolved", rc.unresolved, "total", rc.scanTotal,
-			"remediation", "check the /input mount and the unreadable-path warnings above")
+		logIncompleteInputEnumeration(rc)
 		return 0, nil
 	}
 	orphaned, walkSafe, err := s.orphans(ctx, seen)

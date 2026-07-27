@@ -18,10 +18,9 @@ import (
 //
 // Two separate guarantees, both load-bearing. The scan must happen after the watch
 // set is live, or a renewal landing in the attach window is missed until the fallback
-// tick. And there must be only one: Run now owns the startup scan outright, because
-// main used to scan before calling Run and the fsnotify path therefore scanned /input
-// twice on every container start, writing the health marker twice and emitting a
-// duplicated startup "scan complete" pair (deferred finding d-u5c6-1).
+// tick. And there must be only one: Run owns exactly one post-attach startup scan, so
+// /input is not scanned twice on container start, writing the health marker twice and
+// emitting a duplicated startup "scan complete" pair.
 func TestRun_scans_once_with_the_watch_set_live(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -135,30 +134,50 @@ func TestRun_upgrades_from_poll_to_watch_and_keeps_detecting_events(t *testing.T
 	if err := os.MkdirAll(filepath.Join(root, "example.com"), 0o750); err != nil {
 		t.Fatal(err)
 	}
-	scans := make(chan struct{}, 32)
-	w := New(root, func(context.Context) { scans <- struct{}{} },
-		WithDebounce(10*time.Millisecond), WithFallback(20*time.Millisecond))
+	scanStarted := make(chan struct{}, 4)
+	scanMayFinish := make(chan struct{})
+	w := New(root, func(ctx context.Context) {
+		scanStarted <- struct{}{}
+		select {
+		case <-scanMayFinish:
+		case <-ctx.Done():
+		}
+	}, WithDebounce(10*time.Millisecond), WithFallback(20*time.Millisecond))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- w.Run(ctx) }()
 
-	deadline := time.Now().Add(10 * time.Second)
-	for !logs.Contains("fsnotify recovered, upgrading from poll to watch") {
-		if time.Now().After(deadline) {
-			cancel()
-			t.Fatalf("Run never upgraded from poll to watch; log = %v", logs.Messages())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	// Watch mode's own attach-then-scan, which happens after poll mode has
-	// returned: a scan must still arrive once the supervisor switched modes.
 	select {
-	case <-scans:
+	case <-scanStarted:
+		scanMayFinish <- struct{}{}
 	case <-time.After(10 * time.Second):
 		cancel()
-		t.Fatal("no scan after the upgrade; the supervisor did not run watch mode over the watcher poll mode handed back")
+		t.Fatal("Run never ran the initial poll-mode scan")
+	}
+
+	select {
+	case <-scanStarted:
+		// The poll ticker has already returned its watcher, while scanThenWatch
+		// is blocked in this callback. Lengthen only watch mode's fallback so
+		// the next scan can only be caused by the cert event below.
+		w.fallback = time.Hour
+		scanMayFinish <- struct{}{}
+	case <-time.After(10 * time.Second):
+		cancel()
+		t.Fatal("Run never entered watch mode after fsnotify recovered")
+	}
+
+	if err := os.WriteFile(filepath.Join(root, "example.com", "tls.crt"), []byte("x"), 0o600); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	select {
+	case <-scanStarted:
+		scanMayFinish <- struct{}{}
+	case <-time.After(10 * time.Second):
+		cancel()
+		t.Fatal("Run did not process a cert event after upgrading from poll to watch mode")
 	}
 
 	cancel()
@@ -191,9 +210,9 @@ func TestRun_upgrades_from_poll_to_watch_and_keeps_detecting_events(t *testing.T
 // live (attach-then-scan, no duplicate from the acquiring side), the watch loop
 // is live afterwards, and the watcher is closed on the way out.
 //
-// Before the restructure that sequence was stated twice (Run and pollTick), so a
-// case could pass while its sibling drifted; a second statement that scans twice,
-// forgets the watch-set dump, or leaks the watcher now fails here.
+// watchMode is the single statement of the post-acquisition sequence, so a second
+// statement that scans twice, forgets the watch-set dump, or leaks the watcher fails
+// here.
 // Not parallel: it swaps the process-global slog default.
 func TestWatchMode_states_the_post_watch_set_sequence_once(t *testing.T) {
 	for _, tc := range []struct {

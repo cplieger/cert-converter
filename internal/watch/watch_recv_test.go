@@ -16,9 +16,10 @@ import (
 
 // TestHandleEventRecv_closed_channel_stops_the_loop pins the liveness contract
 // of the event receive: a closed events channel means the fsnotify watcher is
-// dead, so the loop must report "stop" (Run then returns and the container
-// restarts with a fresh watcher). Returning true there would spin the loop on a
-// dead channel forever with no change detection and a still-healthy marker.
+// dead, so the receive must name that loss (errEventsChannelClosed) and watchLoop
+// then returns, restarting the container with a fresh watcher. Returning nil there
+// would spin the loop on a dead channel forever with no change detection and a
+// still-healthy marker.
 func TestHandleEventRecv_closed_channel_stops_the_loop(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)
@@ -27,8 +28,9 @@ func TestHandleEventRecv_closed_channel_stops_the_loop(t *testing.T) {
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
-	if got := w.handleEventRecv(t.Context(), watcher, st, fsnotify.Event{}, false); got {
-		t.Error("handleEventRecv(ok=false) = true, want false so watchLoop exits and the process restarts")
+	if got := w.handleEventRecv(t.Context(), watcher, st, fsnotify.Event{}, false); got != errEventsChannelClosed {
+		t.Errorf("handleEventRecv(ok=false) = %v, want the events-channel-closed loss (%v) so watchLoop exits and the process restarts",
+			got, errEventsChannelClosed)
 	}
 	if st.pending {
 		t.Error("handleEventRecv(ok=false) scheduled a scan; a dead watcher must not arm the debounce timer")
@@ -59,8 +61,8 @@ func TestHandleEventRecv_arms_the_debounce_only_for_interesting_events(t *testin
 			t.Cleanup(st.stop)
 
 			event := fsnotify.Event{Name: filepath.Join(root, tc.file), Op: fsnotify.Write}
-			if got := w.handleEventRecv(t.Context(), watcher, st, event, true); !got {
-				t.Errorf("handleEventRecv(%s) = false, want true (a live event must never stop the loop)", tc.file)
+			if got := w.handleEventRecv(t.Context(), watcher, st, event, true); got != nil {
+				t.Errorf("handleEventRecv(%s) = %v, want nil (a live event must never stop the loop)", tc.file, got)
 			}
 			if st.pending != tc.wantPending {
 				t.Errorf("handleEventRecv(write %s) pending = %v, want %v", tc.file, st.pending, tc.wantPending)

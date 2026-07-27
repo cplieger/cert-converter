@@ -2,9 +2,9 @@
 // tests: cert+key PAIRS and signing CHAINS, which is what a PKCS#12 conversion needs.
 //
 // This is deliberately NOT a general-purpose test-certificate library, and it is not a
-// candidate for consolidation with httpx's certtest subpackage (deferred finding
-// l-f52, dismissed). The two look similar because both call crypto/x509, but they
-// serve different responsibilities and neither wants the other's features:
+// candidate for consolidation with httpx's certtest subpackage. Although httpx's
+// certtest also uses crypto/x509, the two helpers serve different responsibilities and
+// neither wants the other's features:
 //
 //   - certtest.SelfSignedCA is fixed at P-256, IsCA with KeyUsageCertSign, and
 //     DISCARDS the private key. That is the point of it — its consumers pin a CA and

@@ -532,7 +532,8 @@ func appendTestPlaintextSafe(t *testing.T, safes []contentInfo) []contentInfo {
 	return append(safes, safes[plaintextTestSafeIndex(t, safes)])
 }
 
-// TestInspect_rejects_a_weaker_pbes2_cipher pins checkPBES2Cipher. The profile
+// TestInspect_rejects_a_weaker_pbes2_cipher pins checkPBES2Parameters' cipher arm.
+// The profile
 // identity is the (MAC, certificate, key) OID triple, and PBES2 names its cipher in
 // its PARAMETERS, so without this arm a bundle whose PBES2 wraps AES-128-CBC reads
 // as modern2023 and store.isCurrent keeps it as current indefinitely. The positive
@@ -566,5 +567,162 @@ func setTestPBES2Cipher(t *testing.T, alg *algorithmIdentifier, scheme asn1.Obje
 	var params pbes2Params
 	testASN1Unmarshal(t, alg.Parameters.FullBytes, &params)
 	params.EncryptionScheme.Algorithm = asn1.RawValue{FullBytes: testASN1Marshal(t, scheme)}
+	alg.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, params)}
+}
+
+// TestInspect_rejects_a_weaker_nested_modern_algorithm pins every fixed algorithm
+// choice a modern profile makes INSIDE a parameter block, where the (MAC,
+// certificate, key) OID triple cannot see it.
+//
+// This is the currency hole, not just a hardening nicety. go-pkcs12's decoder
+// accepts PBKDF2-HMAC-SHA1 and PBMAC1-HMAC-SHA1, and treats an absent PRF as
+// HMAC-SHA1 by ASN.1 default, so a bundle carrying the same leaf, key, chain and
+// password but SHA-1 in these nested fields decodes, matches the Analysis, and is
+// reported current. An operator who selected modern2023 or modern2026 would keep
+// SHA-1 derivation on disk indefinitely while the startup log announced the modern
+// profile — the file is never regenerated, because nothing ever notices.
+//
+// Each case asserts the guard-specific message as well as ErrProfileUnknown: the
+// sentinel alone cannot tell which arm refused, and several of these mutations are
+// one field apart from each other.
+func TestInspect_rejects_a_weaker_nested_modern_algorithm(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(append(append([]byte{}, m.LeafPEM...), m.CAPEM...), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	// hmacWithSHA1: the PRF and MAC go-pkcs12 decodes happily and no profile emits.
+	sha1HMAC := asn1.ObjectIdentifier{1, 2, 840, 113549, 2, 7}
+
+	for _, tc := range []struct {
+		name        string
+		enc         EncoderType
+		wantErrText string
+		mutate      func(*testing.T, *pfxPreamble)
+	}{
+		{
+			name:        "certificate safe derived with HMAC-SHA1",
+			enc:         EncNameModern2023,
+			wantErrText: "pbes2 PBKDF2 PRF is 1.2.840.113549.2.7",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
+					setTestPBKDF2PRF(t, alg, sha1HMAC)
+				})
+			},
+		},
+		{
+			name:        "shrouded key bag derived with HMAC-SHA1",
+			enc:         EncNameModern2023,
+			wantErrText: "pbes2 PBKDF2 PRF is 1.2.840.113549.2.7",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestShroudedKeyBag(t, p, func(alg *algorithmIdentifier) {
+					setTestPBKDF2PRF(t, alg, sha1HMAC)
+				})
+			},
+		},
+		{
+			name:        "certificate safe naming no PRF at all",
+			enc:         EncNameModern2023,
+			wantErrText: "pbes2 PBKDF2 names no PRF",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
+					setTestPBKDF2PRF(t, alg, nil)
+				})
+			},
+		},
+		{
+			name:        "PBMAC1 derived with HMAC-SHA1",
+			enc:         EncNameModern2026,
+			wantErrText: "pbmac1 PBKDF2 PRF is 1.2.840.113549.2.7",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				setTestPBKDF2PRF(t, &p.MacData.Mac.Algorithm, sha1HMAC)
+			},
+		},
+		{
+			name:        "PBMAC1 authenticated with HMAC-SHA1",
+			enc:         EncNameModern2026,
+			wantErrText: "pbmac1 message authentication is 1.2.840.113549.2.7",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				setTestPBMAC1Mac(t, &p.MacData.Mac.Algorithm, sha1HMAC)
+			},
+		},
+		{
+			// 20 octets is the shortest key the decoder accepts (mac.go:128),
+			// so this is a weaker MAC that still round-trips.
+			name:        "PBMAC1 deriving a 20-octet key",
+			enc:         EncNameModern2026,
+			wantErrText: "pbmac1 derives a 20-octet key, want 32",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				setTestPBKDF2KeyLength(t, &p.MacData.Mac.Algorithm, 20)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pfx, err := Encode(&analysis, tc.enc, "pw")
+			if err != nil {
+				t.Fatalf("setup: Encode(%s): %v", tc.enc, err)
+			}
+			if _, err := Inspect(pfx); err != nil {
+				t.Fatalf("setup: Inspect(unmodified %s bundle): %v", tc.enc, err)
+			}
+			var preamble pfxPreamble
+			testASN1Unmarshal(t, pfx, &preamble)
+			tc.mutate(t, &preamble)
+
+			got, err := Inspect(testASN1Marshal(t, preamble))
+			if !errors.Is(err, ErrProfileUnknown) {
+				t.Fatalf("Inspect(%s) = (%+v, %v), want ErrProfileUnknown", tc.name, got, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrText) {
+				t.Errorf("Inspect(%s) = %v, want the refusal to come from the guard naming %q",
+					tc.name, err, tc.wantErrText)
+			}
+		})
+	}
+}
+
+// setTestPBKDF2PRF rewrites the nested PBKDF2 pseudorandom function of a PBES2 or
+// PBMAC1 parameter block; a nil prf REMOVES the field, which is how a file spells
+// the ASN.1 default of HMAC-SHA1. pbes2Params reads either block here because both
+// are a KDF identifier followed by one more algorithm identifier, and only the KDF
+// half is touched.
+func setTestPBKDF2PRF(t *testing.T, alg *algorithmIdentifier, prf asn1.ObjectIdentifier) {
+	t.Helper()
+	setTestPBKDF2Params(t, alg, func(kdf *pbkdf2Params) {
+		if prf == nil {
+			kdf.PRF = algorithmIdentifier{}
+			return
+		}
+		kdf.PRF = algorithmIdentifier{Algorithm: rawOID(t, prf)}
+	})
+}
+
+// setTestPBKDF2KeyLength rewrites the derived-key length a PBKDF2 block states.
+func setTestPBKDF2KeyLength(t *testing.T, alg *algorithmIdentifier, octets int) {
+	t.Helper()
+	setTestPBKDF2Params(t, alg, func(kdf *pbkdf2Params) { kdf.KeyLength = octets })
+}
+
+// setTestPBKDF2Params applies mutate to the PBKDF2 parameters nested in a PBES2 or
+// PBMAC1 block and re-encodes both levels around it.
+func setTestPBKDF2Params(t *testing.T, alg *algorithmIdentifier, mutate func(*pbkdf2Params)) {
+	t.Helper()
+	var params pbes2Params
+	testASN1Unmarshal(t, alg.Parameters.FullBytes, &params)
+	var kdf pbkdf2Params
+	testASN1Unmarshal(t, params.KeyDerivationFunc.Parameters.FullBytes, &kdf)
+	mutate(&kdf)
+	params.KeyDerivationFunc.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, kdf)}
+	alg.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, params)}
+}
+
+// setTestPBMAC1Mac rewrites the message-authentication scheme of a PBMAC1 block.
+func setTestPBMAC1Mac(t *testing.T, alg *algorithmIdentifier, mac asn1.ObjectIdentifier) {
+	t.Helper()
+	var params pbmac1Params
+	testASN1Unmarshal(t, alg.Parameters.FullBytes, &params)
+	params.MessageAuthScheme.Algorithm = rawOID(t, mac)
 	alg.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, params)}
 }

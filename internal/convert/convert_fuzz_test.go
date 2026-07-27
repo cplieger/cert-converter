@@ -264,16 +264,16 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		// Invariant 1: the bundle round-trips the identity Analyse selected, and
 		// DecodeChain reads the FIRST bag as the leaf, so this also proves the
 		// emitted bag order is leaf-first.
-		if !bytes.Equal(decodedLeaf.Raw, analysis.Leaf.Raw) {
+		if !bytes.Equal(decodedLeaf.Raw, analysis.Leaf().Raw) {
 			t.Fatal("round-tripped leaf is not the certificate Analyse selected")
 		}
 
 		// Invariant 2: the emitted chain is exactly Analyse's chain, in order.
-		if len(decodedCAs) != len(analysis.Chain) {
-			t.Fatalf("CA count mismatch: got %d, want %d", len(decodedCAs), len(analysis.Chain))
+		if len(decodedCAs) != len(analysis.Chain()) {
+			t.Fatalf("CA count mismatch: got %d, want %d", len(decodedCAs), len(analysis.Chain()))
 		}
-		for i := range analysis.Chain {
-			if !bytes.Equal(decodedCAs[i].Raw, analysis.Chain[i].Raw) {
+		for i := range analysis.Chain() {
+			if !bytes.Equal(decodedCAs[i].Raw, analysis.Chain()[i].Raw) {
 				t.Fatalf("CA certificate %d changed across the PFX round trip", i)
 			}
 		}
@@ -298,7 +298,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 
 		// Invariant 4: the embedded key is the private half of the embedded leaf,
 		// which is the property that makes the bundle usable at all.
-		wantKey, err := x509.MarshalPKCS8PrivateKey(analysis.Key)
+		wantKey, err := x509.MarshalPKCS8PrivateKey(analysis.Key())
 		if err != nil {
 			t.Fatalf("marshal selected private key: %v", err)
 		}

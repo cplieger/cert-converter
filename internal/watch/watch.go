@@ -261,9 +261,8 @@ func logWatchSet(watcher *fsnotify.Watcher) {
 }
 
 // scanThenWatch scans once with the watch set already live and then runs the
-// watch loop. It is watchMode's body, called from there alone; the mode-entry
-// ordering that used to be its reason for existing is now the supervisor's, so
-// what this holds is the attach-then-scan rule itself and its shutdown guard.
+// watch loop. It is watchMode's body, called from there alone. It preserves the
+// attach-then-scan ordering and skips the scan after shutdown.
 //
 // Attach-then-scan: the scan that preceded this watch set (main's startup scan,
 // or the poll tick being upgraded) ran before these watches existed, so a
@@ -425,106 +424,96 @@ func (w *Watcher) handleFsEvent(ctx context.Context, watcher *fsnotify.Watcher, 
 	return false
 }
 
-// handleCreate is handleFsEvent's Create arm: it extends the watch set when the
-// created path is a directory, and reports whether the event warrants a rescan.
-func (w *Watcher) handleCreate(ctx context.Context, watcher *fsnotify.Watcher, event fsnotify.Event) bool {
-	// Only a directory needs watches added. Lstat, for two reasons: a transient
-	// file (an atomic-write temp created and renamed away before this event is
-	// handled) cannot produce a spurious "failed to watch" WARN from WalkDir
-	// failing to lstat a path that is already gone; and a SYMLINK to a directory
-	// is not followed. Neither addWatchDirs nor the scanner's root-confined walk
-	// (fs.WalkDir over the /input os.Root) descends a symlinked directory, so
-	// watching through one would register inotify watches on a tree outside
-	// /input whose certs can never be converted — and a symlink to a large tree
-	// would burn the watch quota.
+// handlePathEvent is the decision tree the Create and Chmod arms share, and the
+// single executable home of the unclassifiable-path rule documented on
+// handleFsEvent: extend the watch set when the event's path is a directory, classify
+// a path that is merely GONE by name, and conservatively rescan every other stat
+// failure. It reports whether the event warrants a rescan. The two arms differ only
+// in the operator messages they pass in, so a containment or recovery fix here
+// cannot repair one event class and leave the other silently missing renewals.
+//
+// Lstat, not Stat, for two reasons: a transient file (an atomic-write temp created
+// and renamed away before this event is handled) cannot produce a spurious "failed
+// to watch" WARN from WalkDir failing to lstat a path that is already gone; and a
+// SYMLINK to a directory is not followed. Neither addWatchDirs nor the scanner's
+// root-confined walk (fs.WalkDir over the /input os.Root) descends a symlinked
+// directory, so watching through one would register inotify watches on a tree
+// outside /input whose certs can never be converted — and a symlink to a large tree
+// would burn the watch quota.
+//
+// The directory test comes BEFORE the name classifier because layout.IsRelevant is
+// suffix-only: a legitimately nested directory named "archive.crt" would otherwise
+// take the file arm, schedule one rescan, and never regain its watches, so every
+// later renewal underneath it would be missed.
+func (w *Watcher) handlePathEvent(
+	ctx context.Context, watcher *fsnotify.Watcher, event fsnotify.Event, classifyWarning, addWarning string,
+) bool {
 	info, err := os.Lstat(event.Name)
 	if err != nil {
 		// A vanished path is known to be gone rather than unclassifiable (an
 		// atomic-write temp created and renamed away before this event was
-		// handled), so it stays silent and is classified by name.
+		// handled), so it stays silent and is classified by name: there is nothing
+		// left to watch or re-attach.
 		if errors.Is(err, fs.ErrNotExist) {
 			return layout.IsRelevant(event.Name)
 		}
 		// Any other error is the unclassifiable-path case described on
 		// handleFsEvent, and gets that rule's answer: rescan rather than guess
-		// from the suffix, because a created domain-named directory
-		// ("example.com") reads as an unrelated file to layout.IsRelevant, and a
-		// pair already inside it would then wait for the periodic fallback
-		// re-sync (never, with the fallback disabled). The WARN reports the half
-		// the rescan does not fix -- the subtree is outside the watch set, so its
-		// later renewals are covered only by that same fallback, which is a state
-		// an operator must be able to see.
-		slog.Warn("cannot classify a created path; rescanning because it may be a directory, but if it is one it stays unwatched until the next fallback re-sync",
+		// from the suffix, because a domain-named directory ("example.com") reads
+		// as an unrelated file to layout.IsRelevant, and a pair already inside it
+		// would then wait for the periodic fallback re-sync (never, with the
+		// fallback disabled). The WARN reports the half the rescan does not fix --
+		// the subtree is outside the watch set, so its later renewals are covered
+		// only by that same fallback, which is a state an operator must be able to
+		// see.
+		slog.Warn(classifyWarning,
 			"path", event.Name, "fallback_scan", w.fallbackStatus(), "error", err)
 		return true
 	}
-	if info.IsDir() {
-		if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
-			slog.Warn("failed to watch new directory subtree; renewals under it are covered only by the periodic rescan",
-				"path", event.Name, "fallback_scan", w.fallbackStatus(), "error", addErr)
-		}
-		return true
+	if !info.IsDir() {
+		return layout.IsRelevant(event.Name)
 	}
-	return layout.IsRelevant(event.Name)
+	if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
+		slog.Warn(addWarning,
+			"path", event.Name, "fallback_scan", w.fallbackStatus(), "error", addErr)
+	}
+	return true
+}
+
+// handleCreate is handleFsEvent's Create arm: a newly created directory joins the
+// watch set (and triggers a rescan, because it may already hold a pair created
+// before the watch attached), and a newly created file is classified by name.
+func (w *Watcher) handleCreate(ctx context.Context, watcher *fsnotify.Watcher, event fsnotify.Event) bool {
+	return w.handlePathEvent(ctx, watcher, event,
+		"cannot classify a created path; rescanning because it may be a directory, but if it is one it stays unwatched until the next fallback re-sync",
+		"failed to watch new directory subtree; renewals under it are covered only by the periodic rescan")
 }
 
 // handleChmod is handleFsEvent's Chmod arm: the recovery path for a permission
 // repair on a cert, on a key, or on a directory the watch set had to skip.
+//
+// A chmod on a DIRECTORY is that same recovery one step up: an /input
+// sub-directory the watch set had to skip because this UID could not read it
+// (README: "Fix the directory permissions") has just become readable, so its
+// subtree is re-attached and a rescan runs now instead of at the next fallback
+// tick (never, with the fallback disabled). Unlike the file case this outcome is
+// health-neutral (ScanResult.Unreadable), so nothing else signals the operator
+// that the repair has not taken effect yet.
+//
+// A chmod on a cert or key IS conversion-relevant, and this arm is the recovery
+// path for the app's most likely operator error: a pair the scan could not read
+// fails conversion and clears the health marker; the operator fixes it with
+// chmod; without this arm that chmod schedules nothing, so the container stays
+// unhealthy and the .pfx stays stale until the next fallback tick -- six hours on
+// the documented cadence, and NEVER when the fallback is disabled.
+//
+// Scoped to the naming contract, so a chmod on an unrelated file still schedules
+// nothing. A chmod storm is absorbed by the debounce, exactly as a write storm
+// is, and /input is a certificate directory rather than a busy tree.
 func (w *Watcher) handleChmod(ctx context.Context, watcher *fsnotify.Watcher, event fsnotify.Event) bool {
-	// A chmod on a DIRECTORY is the same recovery path one step up: an
-	// /input sub-directory the watch set had to skip because this UID
-	// could not read it (README: "Fix the directory permissions") has
-	// just become readable, so re-attach its subtree and rescan now
-	// instead of at the next fallback tick (never, with the fallback
-	// disabled). Unlike the file case this outcome is health-neutral
-	// (ScanResult.Unreadable), so nothing else signals the operator that
-	// the repair has not taken effect yet.
-	//
-	// The directory test comes FIRST because layout.IsRelevant is a suffix-only
-	// classifier: a legitimately nested directory named "archive.crt" would
-	// otherwise take the file arm, schedule one rescan, and never regain its
-	// watches, so every later renewal underneath it would be missed. Lstat, so a
-	// symlink to a directory still takes the file arm and the containment guard
-	// holds.
-	info, err := os.Lstat(event.Name)
-	if err != nil {
-		// A vanished path is known to be gone rather than unclassifiable, so it
-		// stays quiet and is classified by name: the chmod target no longer
-		// exists, so there is nothing left to re-attach.
-		if errors.Is(err, fs.ErrNotExist) {
-			return layout.IsRelevant(event.Name)
-		}
-		// Any other error is the unclassifiable-path case described on
-		// handleFsEvent, and gets that rule's answer: rescan, because the
-		// directory case cannot be ruled out and the suffix-only classifier
-		// would silently drop a repaired domain-named directory into the file
-		// arm. The WARN reports the half the rescan does not fix -- the subtree
-		// stays unwatched until the next fallback tick (never, with the fallback
-		// disabled).
-		slog.Warn("cannot classify a path whose permissions changed; rescanning because it may be an unwatched directory",
-			"path", event.Name, "fallback_scan", w.fallbackStatus(), "error", err)
-		return true
-	}
-	if info.IsDir() {
-		if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
-			slog.Warn("failed to watch a directory whose permissions changed; renewals under it are covered only by the periodic rescan",
-				"path", event.Name, "fallback_scan", w.fallbackStatus(), "error", addErr)
-		}
-		return true
-	}
-	// A chmod on a cert or key IS conversion-relevant, and this arm is the
-	// recovery path for the app's most likely operator error: a pair the scan
-	// could not read fails conversion and clears the
-	// health marker; the operator fixes it with chmod; without this arm that
-	// chmod schedules nothing, so the container stays unhealthy and the .pfx
-	// stays stale until the next fallback tick -- six hours on the documented
-	// cadence, and NEVER when the fallback is disabled.
-	//
-	// Scoped to the naming contract, so a chmod on an unrelated file still
-	// schedules nothing. A chmod storm is absorbed by the debounce, exactly as a
-	// write storm is, and /input is a certificate directory rather than a busy
-	// tree.
-	return layout.IsRelevant(event.Name)
+	return w.handlePathEvent(ctx, watcher, event,
+		"cannot classify a path whose permissions changed; rescanning because it may be an unwatched directory",
+		"failed to watch a directory whose permissions changed; renewals under it are covered only by the periodic rescan")
 }
 
 // watchLoop uses fsnotify for immediate reaction to cert changes,
@@ -542,11 +531,8 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) erro
 			return nil
 
 		case event, ok := <-watcher.Events:
-			if ok && !w.handleRootWatchLoss(ctx, watcher, event) {
-				return lostOrShutdown(ctx, errRootWatchRemoved)
-			}
-			if !w.handleEventRecv(ctx, watcher, st, event, ok) {
-				return lostOrShutdown(ctx, errEventsChannelClosed)
+			if lost := w.handleEventRecv(ctx, watcher, st, event, ok); lost != nil {
+				return lostOrShutdown(ctx, lost)
 			}
 
 		case <-st.debounceTimer.C:
@@ -616,20 +602,27 @@ func lostOrShutdown(ctx context.Context, lost *LostError) error {
 	return lost
 }
 
-// handleEventRecv processes one receive from the watcher's event channel and
-// reports whether the loop should keep running. A closed channel means the
-// watcher is dead, so the loop must exit (the process then restarts); otherwise
-// an event classified as interesting arms the debounced rescan. The closure is
-// reported by the return value alone: lostOrShutdown maps it to the terminal
-// error (or to a clean stop when it raced a shutdown), and main announces it.
-func (w *Watcher) handleEventRecv(ctx context.Context, watcher *fsnotify.Watcher, st *watchState, event fsnotify.Event, ok bool) bool {
+// handleEventRecv owns watchLoop's whole event-channel arm: it reports which
+// terminal loss that arm observed, or nil while change detection is live. A closed
+// channel means the fsnotify watcher is dead (errEventsChannelClosed); an event that
+// took the watch on the root away with no way to reattach it ends change detection
+// too (errRootWatchRemoved). Otherwise an event classified as interesting arms the
+// debounced rescan. Naming the loss here keeps watchLoop a flat dispatch table and
+// lets it hand the value straight to lostOrShutdown, which maps it to the terminal
+// error (or to a clean stop when it raced a shutdown); main announces it.
+func (w *Watcher) handleEventRecv(
+	ctx context.Context, watcher *fsnotify.Watcher, st *watchState, event fsnotify.Event, ok bool,
+) *LostError {
 	if !ok {
-		return false
+		return errEventsChannelClosed
+	}
+	if !w.handleRootWatchLoss(ctx, watcher, event) {
+		return errRootWatchRemoved
 	}
 	if w.handleFsEvent(ctx, watcher, event) {
 		st.scheduleScan()
 	}
-	return true
+	return nil
 }
 
 // handleErrorRecv processes one receive from the watcher's error channel and

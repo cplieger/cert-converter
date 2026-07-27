@@ -532,9 +532,10 @@ func TestStoreIsCurrent_regenerates_an_oversized_prior(t *testing.T) {
 // regression to rewriting it: a rewrite re-encodes with a fresh KDF salt and leaves a
 // fresh mtime, which the documented downstream rsync replication then copies again.
 //
-// The resulting mode is deliberately NOT asserted: a filesystem is allowed to refuse
-// the chmod (the next test covers that), so pinning it here would turn this into a
-// filesystem probe. Runs serially: it swaps slog.Default().
+// Successful real-filesystem cases assert the exact surviving bits: tightening may
+// clear only permissions outside policy, never an allowed owner bit. The next test
+// separately covers filesystems that refuse or ignore chmod. Runs serially: it swaps
+// slog.Default().
 func TestStoreIsCurrent_tightens_a_lax_mode_without_regenerating(t *testing.T) {
 	m := testcerts.GenerateChainMaterial(t)
 	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
@@ -601,6 +602,9 @@ func TestStoreIsCurrent_tightens_a_lax_mode_without_regenerating(t *testing.T) {
 				if logs.Len() != 1 {
 					t.Errorf("isCurrent(mode %o) logged %q, want only the tighten notice: a repaired mode is"+
 						" not also a warning", tc.mode, logs.Messages())
+				}
+				if got, want := after.Mode().Perm(), tc.mode&pfxFileMode; got != want {
+					t.Errorf("isCurrent(mode %o) tightened mode to %o, want %o: allowed owner bits must survive", tc.mode, got, want)
 				}
 				return
 			}

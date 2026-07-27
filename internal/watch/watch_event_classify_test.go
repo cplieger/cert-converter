@@ -166,9 +166,8 @@ func TestFallbackStatus_tells_the_operator_whether_anything_will_rescan(t *testi
 // addWatchDirs/watcher.Add never runs on it. Neither addWatchDirs nor the
 // scanner's root-confined walk descends a symlinked directory, so watching
 // through one would register inotify watches on a tree outside /input whose
-// certs can never be converted, silently burning the watch quota. The
-// invariant is documented in three comments in watch.go and, before this test,
-// asserted nowhere: swapping either Lstat to Stat kept the whole suite green.
+// certs can never be converted, silently burning the watch quota. Both Create and
+// Chmod must use Lstat so a symlinked directory never enters addWatchDirs.
 func TestHandleFsEvent_does_not_watch_through_a_symlinked_directory(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)

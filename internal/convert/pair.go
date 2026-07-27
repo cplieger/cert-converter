@@ -18,7 +18,7 @@ import (
 // and never learns where its input came from or where its output goes.
 //
 // The bag order the encoder produces is the order Analysis defines: the leaf's
-// bag first, then Chain nearest-parent-first. That is a contract rather than an
+// bag first, then its chain nearest-parent-first. That is a contract rather than an
 // implementation detail — PKCS#12 stores an ordered SEQUENCE of bags (RFC 7292
 // §4.2) and decoders read it positionally, go-pkcs12's own DecodeChain included.
 // The Analysis is taken by pointer only because the struct is large enough that
@@ -37,7 +37,7 @@ func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 		return nil, err
 	}
 
-	pfxData, err := encoderFor(encName).Encode(a.Key, a.Leaf, a.Chain, password)
+	pfxData, err := encoderFor(encName).Encode(a.key, a.leaf, a.chain, password)
 	if err != nil {
 		return nil, fmt.Errorf("encode pfx: %w", err)
 	}
@@ -162,9 +162,10 @@ const (
 // Currency is the outcome of CheckCurrency: the verdict plus the material the
 // caller needs to explain it.
 //
-// Err and Profile are each populated for exactly one Reason (see the constants);
-// on the others they are zero. The verdict is derived from Reason by Current()
-// rather than stored, so there is only one thing to get right.
+// Err is populated for CurrencyPreflightFailed and CurrencyDecodeFailed;
+// Profile is populated only for CurrencyProfileMismatch. On the other reasons
+// those fields are zero. The verdict is derived from Reason by Current() rather
+// than stored, so there is only one thing to get right.
 type Currency struct {
 	// Reason is what the check concluded.
 	Reason CurrencyReason
@@ -288,22 +289,22 @@ func decode(pfx []byte, password string) (decoded, error) {
 //
 // Encoder profile is deliberately outside this method because decoded contains
 // only decoded material, not the algorithm identifiers. That comparison is
-// CheckCurrency's third step, which is why the profile check cannot be forgotten
+// CheckCurrency's second step, which is why the profile check cannot be forgotten
 // by a caller any more: a PFX_ENCODER change reaches the verdict without anyone
 // having to sequence it.
 func (d decoded) matchesAnalysis(a *Analysis) bool {
-	if d.Leaf == nil || a.Leaf == nil || !bytes.Equal(d.Leaf.Raw, a.Leaf.Raw) {
+	if d.Leaf == nil || a.leaf == nil || !bytes.Equal(d.Leaf.Raw, a.leaf.Raw) {
 		return false
 	}
-	if len(d.CACerts) != len(a.Chain) {
+	if len(d.CACerts) != len(a.chain) {
 		return false
 	}
-	for i := range a.Chain {
-		if !bytes.Equal(d.CACerts[i].Raw, a.Chain[i].Raw) {
+	for i := range a.chain {
+		if !bytes.Equal(d.CACerts[i].Raw, a.chain[i].Raw) {
 			return false
 		}
 	}
-	return sameKey(d.Key, a.Key)
+	return sameKey(d.Key, a.key)
 }
 
 // sameKey reports whether two private keys are the same key, compared through

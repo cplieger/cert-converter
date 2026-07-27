@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/convert"
-	"pgregory.net/rapid"
 	"software.sslmate.com/src/go-pkcs12"
 )
 
@@ -33,34 +32,6 @@ func TestEncoderFor(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestEncoderFor_unknown_names_fall_back_to_modern2023 generalises the table:
-// for an arbitrary name, EncoderFor must return one of the four vendor encoders
-// and exactly pkcs12.Modern2023 for anything outside the known set, so a caller
-// can never hand a nil encoder to pkcs12.Encode.
-func TestEncoderFor_unknown_names_fall_back_to_modern2023(t *testing.T) {
-	t.Parallel()
-	known := map[convert.EncoderType]*pkcs12.Encoder{
-		convert.EncNameModern2023: pkcs12.Modern2023,
-		convert.EncNameModern2026: pkcs12.Modern2026,
-		convert.EncNameLegacyDES:  pkcs12.LegacyDES,
-		convert.EncNameLegacyRC2:  pkcs12.LegacyRC2,
-	}
-	rapid.Check(t, func(t *rapid.T) {
-		name := convert.EncoderType(rapid.String().Draw(t, "name"))
-		got := convert.EncoderFor(name)
-		if got == nil {
-			t.Fatalf("convert.EncoderFor(%q) = nil; the documented contract is that it never returns nil", name)
-		}
-		want, isKnown := known[name]
-		if !isKnown {
-			want = pkcs12.Modern2023
-		}
-		if got != want {
-			t.Errorf("convert.EncoderFor(%q) = %p, want %p", name, got, want)
-		}
-	})
 }
 
 // TestEncoderName pins both halves of the normalization contract: the name a

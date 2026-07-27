@@ -42,13 +42,13 @@ func TestDecodedMatchesAnalysis_leaf_guard(t *testing.T) {
 		want    bool
 	}{
 		"the same leaf and key match": {
-			convert.Decoded{Leaf: analysis.Leaf, Key: analysis.Key, CACerts: analysis.Chain}, true,
+			convert.Decoded{Leaf: analysis.Leaf(), Key: analysis.Key(), CACerts: analysis.Chain()}, true,
 		},
 		"a different leaf does not match": {
-			convert.Decoded{Leaf: other.Leaf, Key: other.Key, CACerts: other.Chain}, false,
+			convert.Decoded{Leaf: other.Leaf(), Key: other.Key(), CACerts: other.Chain()}, false,
 		},
 		"a decoded bundle with no leaf does not match": {
-			convert.Decoded{Leaf: nil, Key: analysis.Key}, false,
+			convert.Decoded{Leaf: nil, Key: analysis.Key()}, false,
 		},
 	}
 
@@ -73,7 +73,7 @@ func TestDecodedMatchesAnalysis_nil_analysis_leaf(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	decoded := convert.Decoded{Leaf: analysis.Leaf, Key: analysis.Key, CACerts: analysis.Chain}
+	decoded := convert.Decoded{Leaf: analysis.Leaf(), Key: analysis.Key(), CACerts: analysis.Chain()}
 
 	if convert.MatchesAnalysis(decoded, &convert.Analysis{}) {
 		t.Error("MatchesAnalysis(empty analysis) = true, want false")
@@ -110,9 +110,9 @@ func TestDecode_round_trips_an_encoded_bundle_into_a_currency_match(t *testing.T
 	if err != nil {
 		t.Fatalf("Decode(a bundle Encode just produced) = error %v, want nil", err)
 	}
-	if len(decoded.CACerts) != len(analysis.Chain) {
+	if len(decoded.CACerts) != len(analysis.Chain()) {
 		t.Fatalf("Decode returned %d CA cert(s), want %d: the chain must survive the round trip",
-			len(decoded.CACerts), len(analysis.Chain))
+			len(decoded.CACerts), len(analysis.Chain()))
 	}
 	if !convert.MatchesAnalysis(decoded, &analysis) {
 		t.Error("MatchesAnalysis(the bundle just written from this analysis) = false, want true: a correct bundle would be rewritten on every scan")
@@ -138,8 +138,8 @@ func TestDecodedMatchesAnalysis_rejects_a_bundle_whose_chain_or_key_differs(t *t
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	if len(analysis.Chain) != 1 {
-		t.Fatalf("setup: analysis chain length = %d, want 1", len(analysis.Chain))
+	if len(analysis.Chain()) != 1 {
+		t.Fatalf("setup: analysis chain length = %d, want 1", len(analysis.Chain()))
 	}
 	strangerPEM, strangerKeyPEM := testcerts.GenerateSelfSignedCert(t, "stranger.example.com", "ecdsa")
 	stranger, err := convert.Analyse(strangerPEM, strangerKeyPEM)
@@ -149,21 +149,21 @@ func TestDecodedMatchesAnalysis_rejects_a_bundle_whose_chain_or_key_differs(t *t
 
 	tests := map[string]convert.Decoded{
 		"a missing CA certificate": {
-			Leaf: analysis.Leaf, Key: analysis.Key, CACerts: nil,
+			Leaf: analysis.Leaf(), Key: analysis.Key(), CACerts: nil,
 		},
 		"an extra CA certificate": {
-			Leaf: analysis.Leaf, Key: analysis.Key,
-			CACerts: []*x509.Certificate{analysis.Chain[0], stranger.Leaf},
+			Leaf: analysis.Leaf(), Key: analysis.Key(),
+			CACerts: []*x509.Certificate{analysis.Chain()[0], stranger.Leaf()},
 		},
 		"a different CA certificate": {
-			Leaf: analysis.Leaf, Key: analysis.Key,
-			CACerts: []*x509.Certificate{stranger.Leaf},
+			Leaf: analysis.Leaf(), Key: analysis.Key(),
+			CACerts: []*x509.Certificate{stranger.Leaf()},
 		},
 		"a different private key": {
-			Leaf: analysis.Leaf, Key: stranger.Key, CACerts: analysis.Chain,
+			Leaf: analysis.Leaf(), Key: stranger.Key(), CACerts: analysis.Chain(),
 		},
 		"no private key at all": {
-			Leaf: analysis.Leaf, Key: nil, CACerts: analysis.Chain,
+			Leaf: analysis.Leaf(), Key: nil, CACerts: analysis.Chain(),
 		},
 	}
 

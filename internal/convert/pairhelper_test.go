@@ -28,10 +28,10 @@ func convertPairInRoot(ctx context.Context, certPEM, keyPEM []byte, root *os.Roo
 	}
 	pfx, err := convert.Encode(&analysis, enc, password)
 	if err != nil {
-		return analysis.Observations, err
+		return analysis.Observations(), err
 	}
 	if _, err := atomicfile.WriteFileInRoot(ctx, root, rel, pfx, atomicfile.WithMode(0o600)); err != nil {
-		return analysis.Observations, err
+		return analysis.Observations(), err
 	}
-	return analysis.Observations, nil
+	return analysis.Observations(), nil
 }

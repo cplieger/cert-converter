@@ -1,6 +1,9 @@
 package convert
 
-import "crypto"
+import (
+	"crypto"
+	"crypto/x509"
+)
 
 // Test-only handles on the package-internal PEM parsers. Analyse is the
 // package's only production conversion edge (it owns the cert/key match and the
@@ -52,3 +55,16 @@ func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 // external tests can build a key just above it instead of hardcoding a number that
 // silently stops testing the refusal if the ceiling ever moves up.
 const MaxVerifiableKeyBits = maxVerifiableKeyBits
+
+// Analysis's representation, as test-only accessors. Production exports only
+// Observations, because reporting what was noticed is all internal/process does
+// with an Analysis; the leaf, chain, key and excluded certificates are codec
+// material, and keeping them unexported is what stops a consumer invalidating
+// Analyse's cert-matches-key invariant before handing the value back to Encode.
+// The external tests still have to assert on that representation — it IS the
+// result Analyse computes — so they read it here, the same way they reach inspect
+// and decode above. Test placement does not dictate the package surface.
+func (a *Analysis) Leaf() *x509.Certificate    { return a.leaf }
+func (a *Analysis) Chain() []*x509.Certificate { return a.chain }
+func (a *Analysis) Key() crypto.PrivateKey     { return a.key }
+func (a *Analysis) Extra() []*x509.Certificate { return a.extra }

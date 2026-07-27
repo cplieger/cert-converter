@@ -28,7 +28,7 @@ func TestEncode_encode_failure_is_wrapped(t *testing.T) {
 	}
 
 	// A nil private key cannot be marshalled to PKCS#8, so the encoder fails.
-	_, err = Encode(&Analysis{Leaf: certs[0], Key: nil}, EncNameModern2023, "pw")
+	_, err = Encode(&Analysis{leaf: certs[0], key: nil}, EncNameModern2023, "pw")
 	if err == nil {
 		t.Fatal("Encode(nil private key) = nil error, want a wrapped encode error")
 	}

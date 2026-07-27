@@ -66,6 +66,18 @@ var (
 	// oidAES256CBC is the only PBES2 encryption scheme either modern profile
 	// emits: go-pkcs12 v0.7.3 sets it unconditionally (crypto.go:324).
 	oidAES256CBC = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 42}
+
+	// oidPBKDF2 is the only key-derivation function either modern profile names
+	// inside a PBES2 or PBMAC1 parameter block: go-pkcs12 v0.7.3 sets it
+	// unconditionally (crypto.go:320, mac.go:55).
+	oidPBKDF2 = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 12}
+
+	// oidHMACWithSHA256 is the only PBKDF2 pseudorandom function, and the only
+	// PBMAC1 message-authentication scheme, either modern profile emits
+	// (go-pkcs12 v0.7.3 crypto.go:317, mac.go:51 and mac.go:58). It is a
+	// different arc from oidSHA256 above: that one names a bare digest, this one
+	// the keyed HMAC construction built from it.
+	oidHMACWithSHA256 = asn1.ObjectIdentifier{1, 2, 840, 113549, 2, 9}
 )
 
 // ErrProfileUnknown reports a bundle whose algorithm triple is not one this app
@@ -253,15 +265,37 @@ type legacyPBEParams struct {
 	Iterations int
 }
 
-// pbes2Params and pbkdf2Params reach PBES2's derivation iteration count.
+// pbes2Params and pbmac1Params are the two outer parameter blocks the modern
+// profiles use (RFC 8018 §A.4 and RFC 9579 §4). Both are a PBKDF2 identifier
+// followed by one more algorithm identifier, but they are modelled separately
+// because that second field means a cipher in one and a MAC in the other, and
+// mistaking them for each other is exactly the confusion these checks exist to
+// prevent.
 type pbes2Params struct {
 	KeyDerivationFunc algorithmIdentifier
 	EncryptionScheme  algorithmIdentifier
 }
 
+type pbmac1Params struct {
+	KeyDerivationFunc algorithmIdentifier
+	MessageAuthScheme algorithmIdentifier
+}
+
+// pbkdf2Params is RFC 8018 §A.2's PBKDF2-params, modelled far enough to reach
+// every fixed choice a profile makes: the iteration count, the derived key length
+// PBMAC1 must state, and the pseudorandom function.
+//
+// keyLength and prf are ASN.1 OPTIONAL, and an ABSENT prf is not "unspecified":
+// the definition's DEFAULT is algid-hmacWithSHA1, and the decoder implements that
+// default (go-pkcs12 v0.7.3 crypto.go:234-236, mac.go:103-105). An absent field
+// therefore has to be refused like an explicit SHA-1, not silently accepted.
+//
+//nolint:govet // DER SEQUENCE order (RFC 8018 §A.2); see pfxPreamble.
 type pbkdf2Params struct {
 	Salt       asn1.RawValue
 	Iterations int
+	KeyLength  int                 `asn1:"optional"`
+	PRF        algorithmIdentifier `asn1:"optional"`
 }
 
 // inspection is what the preflight learned about an existing bundle. Unexported
@@ -552,7 +586,8 @@ func profileFor(macAlg, certAlg, keyAlg asn1.ObjectIdentifier) (EncoderType, err
 		ErrProfileUnknown, macAlg, certAlg, keyAlg)
 }
 
-// checkMACIterations bounds the MAC's derivation count.
+// checkMACIterations bounds the MAC's derivation count and, for PBMAC1, checks the
+// nested algorithm choices its parameter block carries.
 //
 // Where that count LIVES depends on the MAC algorithm, which is why this cannot
 // simply read macData.iterations. The SHA-1 and SHA-256 profiles put it there:
@@ -566,36 +601,87 @@ func profileFor(macAlg, certAlg, keyAlg asn1.ObjectIdentifier) (EncoderType, err
 // out-of-range count.
 func checkMACIterations(macOID asn1.ObjectIdentifier, params asn1.RawValue, macDataIterations int) error {
 	if macOID.Equal(oidPBMAC1) {
-		return checkPBKDF2Iterations("pbmac1", params)
+		return checkPBMAC1Parameters(params)
 	}
 	return checkIterations("mac", macDataIterations)
 }
 
-// checkPBKDF2Iterations reads the iteration count out of a PBES2 or PBMAC1
-// parameter block, both of which wrap a PBKDF2 AlgorithmIdentifier.
-func checkPBKDF2Iterations(label string, params asn1.RawValue) error {
-	var outer pbes2Params
-	if _, err := asn1.Unmarshal(params.FullBytes, &outer); err != nil {
-		return fmt.Errorf("parse %s parameters: %w", label, err)
+// parseProfilePBKDF2 checks one PBKDF2 AlgorithmIdentifier, nested inside either a
+// PBES2 or a PBMAC1 block, against the single derivation the modern profiles emit,
+// and returns the parsed parameters so a caller can check the fields that are
+// specific to its own block.
+//
+// The PRF is part of profile identity, not a detail. modern2023 and modern2026 are
+// selected for their SHA-256 algorithms, and go-pkcs12 always writes
+// HMAC-SHA256 here, but its decoder ACCEPTS HMAC-SHA1 and applies the ASN.1
+// DEFAULT of HMAC-SHA1 when the field is absent. Without this check a bundle
+// deriving from SHA-1 decodes, matches the analysis and is reported current, so an
+// operator who selected a modern profile keeps SHA-1 derivation on disk forever
+// and the log says otherwise — the same missing-dimension the (MAC, certificate,
+// key) triple and the AES-256 check already close at the outer levels.
+func parseProfilePBKDF2(label string, alg *algorithmIdentifier) (pbkdf2Params, error) {
+	algOID, err := alg.algorithmOID()
+	if err != nil {
+		return pbkdf2Params{}, err
+	}
+	if !algOID.Equal(oidPBKDF2) {
+		return pbkdf2Params{}, fmt.Errorf("%w: %s key derivation is %v, want PBKDF2", ErrProfileUnknown, label, algOID)
 	}
 	var kdf pbkdf2Params
-	if _, err := asn1.Unmarshal(outer.KeyDerivationFunc.Parameters.FullBytes, &kdf); err != nil {
-		return fmt.Errorf("parse %s PBKDF2 parameters: %w", label, err)
+	rest, err := asn1.Unmarshal(alg.Parameters.FullBytes, &kdf)
+	if err != nil {
+		return pbkdf2Params{}, fmt.Errorf("parse %s PBKDF2 parameters: %w", label, err)
 	}
-	return checkIterations(label, kdf.Iterations)
+	if len(rest) != 0 {
+		return pbkdf2Params{}, fmt.Errorf("%w: %d trailing byte(s) after the %s PBKDF2 parameters",
+			ErrProfileUnknown, len(rest), label)
+	}
+	// The salt is a CHOICE, and only the specified-OCTET-STRING arm is a shape
+	// either modern profile writes or the decoder can consume (go-pkcs12 v0.7.3
+	// crypto.go:222-224, mac.go:89-91).
+	if kdf.Salt.Class != asn1.ClassUniversal || kdf.Salt.Tag != asn1.TagOctetString || kdf.Salt.IsCompound {
+		return pbkdf2Params{}, fmt.Errorf("%w: %s PBKDF2 salt is not a primitive OCTET STRING", ErrProfileUnknown, label)
+	}
+	if iterErr := checkIterations(label, kdf.Iterations); iterErr != nil {
+		return pbkdf2Params{}, iterErr
+	}
+	// An absent PRF means HMAC-SHA1 by definition, so it is refused here rather
+	// than reaching decodeOID as an empty field with a misleading message.
+	if len(kdf.PRF.Algorithm.FullBytes) == 0 {
+		return pbkdf2Params{}, fmt.Errorf("%w: %s PBKDF2 names no PRF, which defaults to HMAC-SHA1",
+			ErrProfileUnknown, label)
+	}
+	prfOID, err := kdf.PRF.algorithmOID()
+	if err != nil {
+		return pbkdf2Params{}, err
+	}
+	if !prfOID.Equal(oidHMACWithSHA256) {
+		return pbkdf2Params{}, fmt.Errorf("%w: %s PBKDF2 PRF is %v, want HMAC-SHA256", ErrProfileUnknown, label, prfOID)
+	}
+	return kdf, nil
 }
 
-// checkPBES2Cipher rejects a PBES2 block whose encryption scheme is not the one
-// both modern profiles emit. PBES2 names its cipher in its PARAMETERS, not in the
-// algorithm identifier, so the (MAC, certificate, key) OID triple cannot tell
-// AES-256-CBC from AES-192-CBC or AES-128-CBC, and the decoder accepts all three
-// (go-pkcs12 v0.7.3 crypto.go:241-250). Without this, a bundle that wraps the
-// private key with a weaker cipher would be reported as modern2023 and kept as
-// current indefinitely.
-func checkPBES2Cipher(params asn1.RawValue) error {
+// checkPBES2Parameters checks a PBES2 block against what both modern profiles emit:
+// PBKDF2 with an HMAC-SHA256 PRF and an in-range iteration count, over
+// AES-256-CBC.
+//
+// PBES2 names its cipher and its derivation in its PARAMETERS, not in the algorithm
+// identifier, so the (MAC, certificate, key) OID triple cannot tell AES-256-CBC from
+// AES-192-CBC or AES-128-CBC, and the decoder accepts all three (go-pkcs12 v0.7.3
+// crypto.go:241-250). Without this, a bundle that wraps the certificates or the
+// private key with a weaker cipher, or derives its key with SHA-1, would be reported
+// as modern2023 and kept as current indefinitely.
+func checkPBES2Parameters(params asn1.RawValue) error {
 	var outer pbes2Params
-	if _, err := asn1.Unmarshal(params.FullBytes, &outer); err != nil {
+	rest, err := asn1.Unmarshal(params.FullBytes, &outer)
+	if err != nil {
 		return fmt.Errorf("parse pbes2 parameters: %w", err)
+	}
+	if len(rest) != 0 {
+		return fmt.Errorf("%w: %d trailing byte(s) after the pbes2 parameters", ErrProfileUnknown, len(rest))
+	}
+	if _, kdfErr := parseProfilePBKDF2("pbes2", &outer.KeyDerivationFunc); kdfErr != nil {
+		return kdfErr
 	}
 	schemeOID, err := outer.EncryptionScheme.algorithmOID()
 	if err != nil {
@@ -607,16 +693,52 @@ func checkPBES2Cipher(params asn1.RawValue) error {
 	return nil
 }
 
-// checkEncryptionIterations bounds the certificate bag's derivation count. The two
-// parameter shapes differ by profile: the SHA-1 profiles carry pkcs-12PbeParams
-// directly, while PBES2 nests the count inside its PBKDF2 parameters.
+// checkPBMAC1Parameters checks a PBMAC1 block against what modern2026 emits: PBKDF2
+// with an HMAC-SHA256 PRF and a 32-octet derived key, authenticated with
+// HMAC-SHA256.
+//
+// Both nested algorithms matter for the same reason the PBES2 cipher does. The MAC
+// algorithm identifier is the bare oidPBMAC1 whatever is nested inside it, and the
+// decoder accepts HMAC-SHA1 as both the PRF and the MAC (go-pkcs12 v0.7.3
+// mac.go:96-121). The key length is checked too because RFC 9579 makes it mandatory
+// and go-pkcs12 writes exactly 32 (mac.go:50): a shorter key the decoder still
+// accepts (down to 20 octets) is a weaker MAC than the profile promises.
+func checkPBMAC1Parameters(params asn1.RawValue) error {
+	var outer pbmac1Params
+	rest, err := asn1.Unmarshal(params.FullBytes, &outer)
+	if err != nil {
+		return fmt.Errorf("parse pbmac1 parameters: %w", err)
+	}
+	if len(rest) != 0 {
+		return fmt.Errorf("%w: %d trailing byte(s) after the pbmac1 parameters", ErrProfileUnknown, len(rest))
+	}
+	kdf, err := parseProfilePBKDF2("pbmac1", &outer.KeyDerivationFunc)
+	if err != nil {
+		return err
+	}
+	const pbmac1KeyOctets = 32
+	if kdf.KeyLength != pbmac1KeyOctets {
+		return fmt.Errorf("%w: pbmac1 derives a %d-octet key, want %d",
+			ErrProfileUnknown, kdf.KeyLength, pbmac1KeyOctets)
+	}
+	macOID, err := outer.MessageAuthScheme.algorithmOID()
+	if err != nil {
+		return err
+	}
+	if !macOID.Equal(oidHMACWithSHA256) {
+		return fmt.Errorf("%w: pbmac1 message authentication is %v, want HMAC-SHA256", ErrProfileUnknown, macOID)
+	}
+	return nil
+}
+
+// checkEncryptionIterations bounds the certificate bag's derivation count and, for
+// PBES2, checks the nested algorithm choices too. The two parameter shapes differ by
+// profile: the SHA-1 profiles carry pkcs-12PbeParams directly, while PBES2 nests its
+// count and its algorithms inside a PBKDF2 parameter block.
 func checkEncryptionIterations(algOID asn1.ObjectIdentifier, params asn1.RawValue) error {
 	switch {
 	case algOID.Equal(oidPBES2):
-		if err := checkPBES2Cipher(params); err != nil {
-			return err
-		}
-		return checkPBKDF2Iterations("pbkdf2", params)
+		return checkPBES2Parameters(params)
 	default:
 		var legacy legacyPBEParams
 		if _, err := asn1.Unmarshal(params.FullBytes, &legacy); err != nil {

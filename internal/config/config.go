@@ -31,24 +31,16 @@ const defaultFallbackInterval = 6 * time.Hour
 // clamp WARN, and the two must report the same ceiling.
 const maxFallbackHours = 87600
 
-// fallbackRepair classifies what parseFallbackInterval had to do with a
-// configured FALLBACK_SCAN_HOURS value. The parse itself is silent — it derives
-// the cadence and reports the condition — because FallbackInterval() is also
-// called by the `health` subcommand, where a startup diagnostic would repeat on
-// every probe (roughly every 30s under Docker's healthcheck, forever). Load is
-// the single home for this setting's diagnostics, the same reason
-// warnFallbackDisabled lives there.
-//
-// Three conditions, because they need three different operator messages: the
-// value was used as configured, an unusable value was replaced by the default,
-// or an above-ceiling value was clamped.
+// fallbackRepair reports whether parsing accepted, defaulted, or clamped the
+// configured value. Parsing stays silent because FallbackInterval is called by
+// health probes; Load owns the one-time diagnostics.
 type fallbackRepair int
 
 const (
 	// fallbackAccepted means the derived cadence is the configured one: an
 	// explicit interval, the explicit "0"/"false" opt-out (reported by
 	// warnFallbackDisabled), or an unset/blank value taking the documented
-	// default. Nothing was repaired, so nothing is warned about here.
+	// default.
 	fallbackAccepted fallbackRepair = iota
 	// fallbackInvalid means the value was unparseable or non-positive and
 	// defaultFallbackInterval was substituted.
@@ -270,39 +262,20 @@ func allowEmptyPassword(raw string) bool {
 	return false
 }
 
-// checkPasswordEncodable rejects password shapes that PKCS#12 cannot carry intact.
-// Empty passwords are handled separately by PFX_ALLOW_EMPTY_PASSWORD.
+// checkPasswordEncodable rejects password shapes PKCS#12 cannot preserve.
+// Empty-password policy is handled separately by PFX_ALLOW_EMPTY_PASSWORD.
 //
-// Each shape is unconditionally broken and no scan recovers from it. What the
-// PKCS#12 encoder does with each, absent any guard:
-//
-//   - NonBMP: UCS-2 cannot represent the rune, so go-pkcs12 refuses it and every
-//     conversion fails, leaving the container unhealthy on every event and every
-//     fallback tick.
-//   - InvalidUTF8: go-pkcs12's bmpString ranges over the string, so each invalid byte
-//     becomes U+FFFD and the encode SUCCEEDS. Bundles are written, the scan counts them
-//     converted, health stays green — and no consumer can open them with the configured
-//     secret, because distinct invalid bytes all collapse to the same replacement rune.
-//   - EmbeddedNUL: PKCS#12 passwords are NUL-terminated, so an interior NUL encodes
-//     verbatim and no consumer can reproduce the password the bundle was built with.
-//     Also succeeds silently.
-//
-// The last two are the dangerous ones: were they to reach the encoder, nothing in the
-// conversion path, the scan summary, or health would reflect them, and the README's
-// Loki rules key on failure counts that stay at zero. Hence a startup refusal, per
-// go.md's config rule: validate at startup, fail fast, do not discover invalid config
-// at request time.
-//
-// convert.Encode refuses the same three shapes itself. That is NOT duplication to
-// clean up: this gate is what makes the app fail fast and visibly for its one
-// production caller, before a single file is scanned, with a diagnostic naming the
-// env var; Encode's guard holds the codec's own contract for any caller, including
-// one that never went through Load. Both are wanted — do not delete either.
+// A startup refusal rather than a warning: a non-BMP rune fails every Encode, so the
+// container would be unhealthy on every tick, while invalid UTF-8 (each bad byte
+// becomes U+FFFD) and an embedded NUL (PKCS#12 passwords are NUL-terminated) both
+// SUCCEED and report healthy, writing bundles no consumer can open with the
+// configured secret.
 //
 // Only the SHAPE is reported, never the value. Recognition is
-// convert.InspectPasswordEncoding's, the same package that encodes, so this gate cannot
-// drift from the encoder; the shapes are reported in the order Encode reports them,
-// so a password carrying several is named the same way by both.
+// convert.InspectPasswordEncoding's, the same package that encodes, so this gate
+// cannot drift from the encoder; keep issue precedence aligned with convert.Encode.
+// This startup gate fails before scanning, while Encode's codec-level guard protects
+// callers that bypass config loading — both are wanted.
 func checkPasswordEncodable(password string) error {
 	if password == "" {
 		return nil
@@ -331,11 +304,9 @@ func checkPasswordEncodable(password string) error {
 // for int64: a positive out-of-range number counts as above-ceiling, not as
 // malformed input.
 //
-// A pure parse: it emits no log records. The repaired-input diagnostics are
-// warnFallbackRepaired's, emitted once per process start from Load, following
-// the LogLevel precedent in this package. Warning from here repeated the
-// startup WARN on every `health` probe, because the probe calls
-// FallbackInterval() too.
+// A pure parse: it emits no log records, because FallbackInterval() is also called
+// by the `health` subcommand. The repaired-input diagnostics are
+// warnFallbackRepaired's, emitted once per process start from Load.
 func parseFallbackInterval(v string) (time.Duration, fallbackRepair) {
 	trimmed := strings.TrimSpace(v)
 	switch strings.ToLower(trimmed) {
@@ -365,14 +336,13 @@ func parseFallbackInterval(v string) (time.Duration, fallbackRepair) {
 }
 
 // warnFallbackRepaired emits the operator-facing diagnostic for a
-// FALLBACK_SCAN_HOURS value the parser could not use as configured. Both cases
-// are silently repaired, so the WARN naming the rejected value is the operator's
-// only way to tell an intended cadence from a default or a clamp.
+// FALLBACK_SCAN_HOURS value the parser could not use as configured. Both cases are
+// silently repaired, so the WARN naming the rejected value is the operator's only
+// way to tell an intended cadence from a default or a clamp.
 //
-// Called only from Load, so each line is emitted exactly once per process start
-// and never from the `health` subcommand, whose FallbackInterval() call would
-// otherwise reprint a startup diagnostic on every probe. raw is the value as
-// configured, untrimmed, so the log shows what the operator actually set.
+// Called only from Load, so each line is emitted exactly once per process start and
+// never from the `health` subcommand. raw is the value as configured, untrimmed, so
+// the log shows what the operator actually set.
 func warnFallbackRepaired(raw string, repair fallbackRepair) {
 	switch repair {
 	case fallbackClamped:
@@ -388,31 +358,26 @@ func warnFallbackRepaired(raw string, repair fallbackRepair) {
 	}
 }
 
-// warnFallbackDisabled warns that FALLBACK_SCAN_HOURS=0/false runs the watcher
-// unsupervised, naming the three things that go away together, because nothing
-// else in the process ever will.
+// warnFallbackDisabled warns when the explicit 0/false opt-out removes both
+// periodic recovery and the health-marker freshness deadline, because nothing else
+// in the process ever will.
 //
-// There is no periodic re-scan, so a renewal whose fsnotify event never arrived
-// stays unconverted. The health marker's freshness deadline goes with it (main
-// hands the probe WithMaxAge(3*interval), and health treats a non-positive
-// max-age as no deadline at all), so the marker written by the last clean scan
-// reports HEALTHY for as long as the container runs. And an /input watch
-// dropped by an unmount or remount is undetectable: the kernel reports that as
-// IN_UNMOUNT/IN_IGNORED, which fsnotify swallows without emitting an event and
-// without closing either channel, so watch's root-watch-loss guard (keyed on a
-// Remove/Rename naming the root) never fires and the loop parks holding zero
-// watches while health stays green.
+// Three things go away together: the periodic re-scan that would convert a renewal
+// whose fsnotify event never arrived; the marker's freshness deadline (main hands the
+// probe WithMaxAge(3*interval), and health treats a non-positive max-age as no
+// deadline), so the last clean scan reports HEALTHY for as long as the container
+// runs; and any chance of noticing an /input watch dropped by an unmount or remount,
+// which the kernel reports as IN_UNMOUNT/IN_IGNORED — fsnotify emits no event and
+// closes no channel, so watch's root-watch-loss guard never fires.
 //
-// Deliberately a warning rather than a detector. With the fallback off, an idle
-// deployment and a wedged one are indistinguishable without active probing, so
-// any liveness timer or probe would either restore the periodic work this
-// setting exists to avoid or report a quiet deployment unhealthy. Stating the
-// tradeoff once, at startup, is the honest alternative.
+// Deliberately a warning rather than a detector: with the fallback off, an idle
+// deployment and a wedged one are indistinguishable without active probing, so any
+// liveness timer would either restore the periodic work this setting exists to avoid
+// or report a quiet deployment unhealthy.
 //
-// Keyed on the parsed interval, which is zero only for the explicit "0"/"false"
-// opt-out: an empty, whitespace-only, or invalid value yields
-// defaultFallbackInterval and stays silent here, because it is not the opt-out
-// (Load's warnFallbackRepaired reports the values it had to repair).
+// It keys on the parsed interval, which is zero only for the explicit "0"/"false"
+// opt-out, so repaired blank or invalid values remain enabled and silent here
+// (Load's warnFallbackRepaired reports those).
 func warnFallbackDisabled(interval time.Duration) {
 	if interval > 0 {
 		return
@@ -455,22 +420,17 @@ func passwordChannel(source envx.SecretSource) string {
 	return "PFX_PASSWORD"
 }
 
-// warnPasswordStrength emits the operator-facing warning for a password that
-// offers no real protection. Every other configuration warning is emitted from
-// Load's package, so this one is too: keeping the classification and its WARN
-// tree in one place means a new PasswordStatus cannot gain a case without its
-// warning being considered in the same edit.
+// warnPasswordStrength warns when the password offers no real protection. Every
+// other configuration warning is emitted from Load's package, so this one is too:
+// a new PasswordStatus cannot gain a case without its warning being considered in
+// the same edit.
 //
-// blankFileReported says logPasswordDelivery already reported this empty password
-// as a blank PFX_PASSWORD_FILE. In that configuration the generic empty-password
-// WARN is SUPPRESSED, because its remediation ("point PFX_PASSWORD_FILE at a
-// mounted secret") names the step the operator has already taken, and it is the
-// first line they read. The channel-specific WARN that replaces it reports the
-// same empty-password condition at WARN and names the action that actually helps
-// (write the secret into the mounted file), so nothing is quieter — the pair is
-// one accurate record instead of a wrong one followed by a right one. Only
-// PasswordEmpty can be reached this way: envx trims a file secret, so a
-// whitespace-only file arrives as ErrBlankSecretFile with an empty password.
+// blankFileReported suppresses the duplicate generic guidance because
+// logPasswordDelivery already emitted channel-specific remediation for a blank
+// PFX_PASSWORD_FILE — the generic line's "point PFX_PASSWORD_FILE at a mounted
+// secret" names a step the operator has already taken. Only PasswordEmpty can be
+// reached that way: envx trims a file secret, so a whitespace-only file arrives as
+// ErrBlankSecretFile with an empty password.
 func warnPasswordStrength(status PasswordStatus, blankFileReported bool) {
 	switch status {
 	case PasswordEmpty:
@@ -488,20 +448,17 @@ func warnPasswordStrength(status PasswordStatus, blankFileReported bool) {
 	}
 }
 
-// logPasswordDelivery reports how the PFX password reached the process, never
-// what it is: the resolved source, a blank mounted secret the opt-out let
-// through, a conflicting pair of channels, and surrounding whitespace that
-// silently becomes part of the password.
+// logPasswordDelivery reports the resolved source and actionable delivery problems
+// without logging the password or the steady-state secret path: a blank mounted
+// secret the opt-out let through, a conflicting pair of channels, and whitespace or
+// control characters that silently become part of the password.
 //
-// The secret's SOURCE is recorded so an operator can confirm a mounted secret was
-// actually consumed instead of silently falling back to PFX_PASSWORD. It is the
-// source envx reported rather than one re-derived from the environment here, so the
-// log cannot disagree with what was actually read. The configured path is
-// deliberately omitted from these steady-state lines, which every log aggregator
-// retains: it would publish the secret-mount topology on every healthy startup for
-// no diagnostic gain. A startup FAILURE is the deliberate exception — the envx error
-// Load returns names the path, and main logs it, because an unusable secret file
-// cannot be diagnosed without it.
+// The source is the one envx reported rather than one re-derived here, so the log
+// cannot disagree with what was read, and an operator can confirm a mounted secret
+// was consumed instead of falling back to PFX_PASSWORD. The configured path is
+// omitted from these steady-state lines so a healthy startup does not publish the
+// secret-mount topology to every aggregator; a startup FAILURE is the deliberate
+// exception, because an unusable secret file cannot be diagnosed without it.
 func logPasswordDelivery(source envx.SecretSource, password string, blankSecretFile error) {
 	if source == envx.SourceFile {
 		if blankSecretFile != nil {

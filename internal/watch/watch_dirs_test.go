@@ -138,10 +138,9 @@ func assertNoSkipWarn(t *testing.T, logs *capture.Recorder, msg string) {
 
 // TestVisitWatchPath_applies_the_walk_error_policy pins the per-entry half of
 // addWatchDirs' walk-error contract, at the level where the walk error is an
-// ARGUMENT rather than something a test has to provoke from the filesystem
-// (making a CHILD directory unwalkable while the root stays walkable is not
-// reproducible as uid 0, which is why this branch went uncovered -- deferred
-// finding l-f54).
+// ARGUMENT rather than something a test has to provoke from the filesystem: the
+// helper accepts the failure as an argument so the policy is deterministic even
+// when tests run as uid 0.
 //
 // The rule: only the root failing is fatal, because that is the signal Run uses
 // to fall back to polling; a child that cannot be walked is warned about and
@@ -220,9 +219,8 @@ func TestVisitWatchPath_reports_shutdown_ahead_of_a_walk_error(t *testing.T) {
 
 // TestHandleWatchAddError_classifies_root_and_child_registration_failures pins
 // the watch-registration half of the same policy, again at the level where the
-// failure is an argument: an exhausted fs.inotify.max_user_watches or a
-// directory unreadable to this UID cannot be provoked for a CHILD alone without
-// a production seam (deferred finding l-f54).
+// failure is an argument: the helper accepts the failure as an argument so the
+// policy is deterministic even when tests run as uid 0.
 //
 // A refused root watch is fatal -- Run needs it to fall back to polling, and a
 // swallowed failure would leave Run reporting "fsnotify active" over an empty

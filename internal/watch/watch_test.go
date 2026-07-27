@@ -36,11 +36,8 @@ func newClosedTestWatcher(t *testing.T) *fsnotify.Watcher {
 	return watcher
 }
 
-// TestHandleFsEvent is the first unit coverage of the watcher's event
-// classifier. It pins the rescan decision per event class, including the
-// d-u2-1 regression: a removed/renamed domain-named directory (e.g.
-// "example.com") must trigger a rescan even though its ".com" suffix is not a
-// cert extension.
+// TestHandleFsEvent pins the rescan decision for every event class, including
+// removed or renamed domain-named directories whose suffix is not certificate-relevant.
 func TestHandleFsEvent(t *testing.T) {
 	t.Parallel()
 
@@ -92,7 +89,7 @@ func TestHandleFsEvent(t *testing.T) {
 		{"chmod on a cert triggers rescan", fsnotify.Event{Name: crtFile, Op: fsnotify.Chmod}, true},
 		{"chmod on a key triggers rescan", fsnotify.Event{Name: filepath.Join(domainDir, "tls.key"), Op: fsnotify.Chmod}, true},
 		{"chmod on a non-cert file is ignored", fsnotify.Event{Name: plainFile, Op: fsnotify.Chmod}, false},
-		// h-f9: a chmod on a DIRECTORY is the permission-repair recovery path --
+		// A chmod on a DIRECTORY is the permission-repair recovery path --
 		// it re-attaches the subtree's watches and rescans, instead of waiting
 		// for the fallback tick (never, with the fallback disabled).
 		{"chmod on a domain directory rescans", fsnotify.Event{Name: domainDir, Op: fsnotify.Chmod}, true},

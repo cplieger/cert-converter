@@ -183,57 +183,28 @@ const maxBlockTypeLogLen = 64
 // that interpolates text taken from a file the app does not control (a certificate
 // subject, a PEM block label) goes through it.
 //
-// Two jobs, and the first is DELEGATED. Sanitizing is runesafe.SanitizeSingleLine,
-// the fleet's shared policy for untrusted text bound for a single-line sink: every
-// C0 control, CR/LF, DEL, C1 control (U+0080-U+009F), Unicode Bidi_Control rune
-// and U+2028/U+2029 becomes a space, and every invalid UTF-8 byte becomes U+FFFD.
-// That is wider than any single slog handler needs, which is the point — the text
-// is safe under EITHER handler by construction, so this function no longer has to
-// be read (or widened) before the log format can change. Measured against log/slog
-// on this host:
+// Sanitizing is delegated to runesafe.SanitizeSingleLine, the fleet's shared policy
+// for untrusted text bound for a single-line sink, so the text is safe under any
+// slog handler by construction rather than by matching one handler's escaping.
 //
-//	TextHandler: C1 escaped | DEL (U+007F) RAW | U+2028/U+2029 escaped | Bidi U+202E escaped
-//	JSONHandler: C1 RAW     | DEL (U+007F) RAW | U+2028/U+2029 escaped | Bidi U+202E RAW
-//
-// TextHandler quotes a value (strconv.Quote) whose ASCII bytes fall outside JSON's
-// safeSet, or whose non-ASCII runes fail unicode.IsPrint — which is what escapes
-// the C0 controls on the first rule and the C1 block (escape introducers),
-// Bidi_Control (the Trojan-Source reordering class) and U+2028/U+2029 on the
-// second; invalid UTF-8 is caught the same way through RuneError. JSONHandler
-// escapes far less: ASCII controls, the quote/backslash pair, U+2028/U+2029 and
-// invalid UTF-8 (log/slog json_handler.go safeSet plus the explicit \u202x case),
-// passing C1 and Bidi_Control through as ordinary multi-byte UTF-8. U+007F is the
-// gap in the FIRST rule: it is below utf8.RuneSelf, so unicode.IsPrint never sees
-// it, and safeSet marks it safe — which makes it the one rune BOTH handlers emit
-// raw, and, under the reachable handler, the only leak this function used to have
-// to plug on its own. Only TextHandler is reachable today (main.go calls
-// slogx.Setup with no Format and slogx's Text is the zero value), but that is now a
-// log-format preference rather than a precondition of this function's correctness.
-//
-// The second job stays here: bounding. The source file is capped only by the
-// caller's input read bound (10 MB, internal/process source.go maxFileSize), so an
-// unbounded interpolation would put a multi-megabyte line into the log of every
-// scan that retries the pair. The cap runs AFTER sanitizing, on a rune boundary
+// Bounding stays here: the source file is capped only by the caller's input read
+// bound (10 MB, internal/process source.go maxFileSize), so an unbounded
+// interpolation would put a multi-megabyte line into the log of every scan that
+// retries the pair. The cap runs AFTER sanitizing, on a rune boundary
 // (runesafe.CapBytes), because sanitizing can GROW the text — an invalid byte
 // becomes the three-byte U+FFFD — and a cut inside a rune would mint exactly the
 // raw 0x80-0x9F tail bytes the sanitizer just removed.
 //
 // This is runesafe.SanitizeSingleLineBounded composed from the library's own
 // primitives, which is how runesafe documents keeping a caller's marker: the preset
-// marks a cut with "..." and this package marks it with truncationMarker.
+// marks a cut with "..." and this package marks it with truncationMarker. The marker
+// is appended after the cut, so a truncated result exceeds limit by the marker's own
+// length; the bound exists to stop multi-megabyte lines, not to hit limit exactly.
 func boundLogText(s string, limit int) string {
-	// Sanitize BOTH paths, not only the truncating one. An earlier shape sanitized
-	// only the text it had just cut, so a string SHORTER than the limit carrying
-	// invalid UTF-8 or a DEL was returned untouched — the asymmetry meant the
-	// function's own contract held only for oversized input.
 	s = runesafe.SanitizeSingleLine(s)
 	if len(s) <= limit {
 		return s
 	}
-	// The marker is appended after the cut, so the result exceeds limit by its own
-	// length. That is deliberate: the bound exists to stop multi-megabyte lines,
-	// and a caller reading a truncated diagnostic needs to know it was truncated
-	// more than it needs the total to be exactly limit bytes.
 	return runesafe.CapBytes(s, limit) + truncationMarker
 }
 

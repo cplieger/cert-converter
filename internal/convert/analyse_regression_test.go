@@ -116,18 +116,18 @@ func assertOrderInvariant(t *testing.T, label string, certBlobs [][]byte, keyPEM
 		if err != nil {
 			t.Fatalf("%s: Analyse(rotation %d) = error %v, want nil", label, r, err)
 		}
-		chain := make([][]byte, 0, len(got.Chain))
-		for _, c := range got.Chain {
+		chain := make([][]byte, 0, len(got.Chain()))
+		for _, c := range got.Chain() {
 			chain = append(chain, c.Raw)
 		}
 
 		if r == 0 {
-			wantLeaf, wantChain = got.Leaf.Raw, chain
+			wantLeaf, wantChain = got.Leaf().Raw, chain
 			continue
 		}
-		if !bytes.Equal(got.Leaf.Raw, wantLeaf) {
+		if !bytes.Equal(got.Leaf().Raw, wantLeaf) {
 			t.Errorf("%s: rotation %d selected a DIFFERENT identity than rotation 0 (%q vs the first); selection depends on input order",
-				label, r, got.Leaf.Subject.CommonName)
+				label, r, got.Leaf().Subject.CommonName)
 		}
 		if len(chain) != len(wantChain) {
 			t.Errorf("%s: rotation %d emitted a chain of %d, rotation 0 emitted %d", label, r, len(chain), len(wantChain))
@@ -294,16 +294,16 @@ func TestAnalyse_accepts_a_regenerated_self_signed_certificate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Analyse(regenerated self-signed cert beside its predecessor) = error %v, want nil", err)
 	}
-	if got.Leaf.Subject.CommonName != "selfsigned.example.com" {
-		t.Errorf("selected identity = %q, want the self-signed certificate", got.Leaf.Subject.CommonName)
+	if got.Leaf().Subject.CommonName != "selfsigned.example.com" {
+		t.Errorf("selected identity = %q, want the self-signed certificate", got.Leaf().Subject.CommonName)
 	}
-	if !hasObservation(got.Observations, convert.ObsRenewedCertTie) {
-		t.Errorf("observations = %v, want the renewed-certificate tie to be reported", got.Observations)
+	if !hasObservation(got.Observations(), convert.ObsRenewedCertTie) {
+		t.Errorf("observations = %v, want the renewed-certificate tie to be reported", got.Observations())
 	}
 	// The pair is a legal identity, so the CA assertion is worth surfacing but
 	// must not be fatal.
-	if !hasObservation(got.Observations, convert.ObsCAAsIdentity) {
-		t.Errorf("observations = %v, want the IsCA assertion reported", got.Observations)
+	if !hasObservation(got.Observations(), convert.ObsCAAsIdentity) {
+		t.Errorf("observations = %v, want the IsCA assertion reported", got.Observations())
 	}
 	assertKeyMatchesLeaf(t, got)
 
@@ -404,21 +404,21 @@ func TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established(t *tes
 	if err != nil {
 		t.Fatalf("Analyse(leaf whose issuer is absent) = error %v, want nil", err)
 	}
-	if got.Leaf.Subject.CommonName != "orphaned-leaf.example.com" {
-		t.Errorf("selected identity = %q, want the leaf", got.Leaf.Subject.CommonName)
+	if got.Leaf().Subject.CommonName != "orphaned-leaf.example.com" {
+		t.Errorf("selected identity = %q, want the leaf", got.Leaf().Subject.CommonName)
 	}
-	if len(got.Chain) != 1 {
-		t.Fatalf("chain length = %d, want 1: an unprovable certificate must be kept, not dropped", len(got.Chain))
+	if len(got.Chain()) != 1 {
+		t.Fatalf("chain length = %d, want 1: an unprovable certificate must be kept, not dropped", len(got.Chain()))
 	}
-	if got.Chain[0].Subject.CommonName != "Possibly Related CA" {
-		t.Errorf("chain[0] = %q, want the kept certificate", got.Chain[0].Subject.CommonName)
+	if got.Chain()[0].Subject.CommonName != "Possibly Related CA" {
+		t.Errorf("chain[0] = %q, want the kept certificate", got.Chain()[0].Subject.CommonName)
 	}
-	if len(got.Extra) != 0 {
-		t.Errorf("Extra holds %d certificate(s), want 0: nothing was shown to be off the chain", len(got.Extra))
+	if len(got.Extra()) != 0 {
+		t.Errorf("Extra holds %d certificate(s), want 0: nothing was shown to be off the chain", len(got.Extra()))
 	}
-	if !hasObservation(got.Observations, convert.ObsChainUnverified) {
+	if !hasObservation(got.Observations(), convert.ObsChainUnverified) {
 		t.Errorf("observations = %v, want one of kind %q so the operator knows the chain was not verified",
-			got.Observations, convert.ObsChainUnverified)
+			got.Observations(), convert.ObsChainUnverified)
 	}
 }
 
@@ -451,17 +451,17 @@ func TestAnalyse_still_excludes_an_unrelated_cert_from_a_self_signed_identity(t 
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}
-	if len(got.Chain) != 0 {
-		t.Errorf("chain length = %d, want 0: a self-signed identity has no chain", len(got.Chain))
+	if len(got.Chain()) != 0 {
+		t.Errorf("chain length = %d, want 0: a self-signed identity has no chain", len(got.Chain()))
 	}
-	if len(got.Extra) != 1 {
-		t.Fatalf("Extra holds %d certificate(s), want 1", len(got.Extra))
+	if len(got.Extra()) != 1 {
+		t.Fatalf("Extra holds %d certificate(s), want 1", len(got.Extra()))
 	}
-	if !hasObservation(got.Observations, convert.ObsExtraCertsExcluded) {
-		t.Errorf("observations = %v, want the exclusion reported", got.Observations)
+	if !hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
+		t.Errorf("observations = %v, want the exclusion reported", got.Observations())
 	}
-	if hasObservation(got.Observations, convert.ObsChainUnverified) {
-		t.Errorf("observations = %v, want NO chain-unverified fallback for a self-signed identity", got.Observations)
+	if hasObservation(got.Observations(), convert.ObsChainUnverified) {
+		t.Errorf("observations = %v, want NO chain-unverified fallback for a self-signed identity", got.Observations())
 	}
 }
 
@@ -525,12 +525,12 @@ func TestAnalyse_prefers_the_certificate_that_actually_signed_the_leaf(t *testin
 			if err != nil {
 				t.Fatalf("Analyse = error %v, want nil", err)
 			}
-			if len(got.Chain) == 0 {
+			if len(got.Chain()) == 0 {
 				t.Fatal("chain is empty; want the issuing CA")
 			}
-			if got.Chain[0].SerialNumber.Cmp(big.NewInt(100)) != 0 {
+			if got.Chain()[0].SerialNumber.Cmp(big.NewInt(100)) != 0 {
 				t.Errorf("chain[0] serial = %s, want 100 (the certificate that actually signed the leaf, not the same-subject impostor with the later NotAfter)",
-					got.Chain[0].SerialNumber)
+					got.Chain()[0].SerialNumber)
 			}
 		})
 	}
@@ -575,8 +575,8 @@ func TestAnalyse_role_check_ignores_an_unverified_claim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil: a certificate merely CLAIMING this one as issuer must not make it an issuer", err)
 	}
-	if got.Leaf.SerialNumber.Cmp(big.NewInt(110)) != 0 {
-		t.Errorf("selected identity serial = %s, want 110", got.Leaf.SerialNumber)
+	if got.Leaf().SerialNumber.Cmp(big.NewInt(110)) != 0 {
+		t.Errorf("selected identity serial = %s, want 110", got.Leaf().SerialNumber)
 	}
 }
 
@@ -658,21 +658,21 @@ func TestAnalyse_prefers_the_issuer_whose_route_to_a_root_verifies(t *testing.T)
 			if err != nil {
 				t.Fatalf("Analyse = error %v, want nil", err)
 			}
-			if len(got.Chain) != 2 {
-				t.Fatalf("chain length = %d, want 2 (the verified intermediate and the root that signed it)", len(got.Chain))
+			if len(got.Chain()) != 2 {
+				t.Fatalf("chain length = %d, want 2 (the verified intermediate and the root that signed it)", len(got.Chain()))
 			}
-			if got.Chain[0].SerialNumber.Cmp(big.NewInt(203)) != 0 {
+			if got.Chain()[0].SerialNumber.Cmp(big.NewInt(203)) != 0 {
 				t.Errorf("chain[0] serial = %s, want 203 (the intermediate whose route to an included root verifies, not the later-expiring decoy)",
-					got.Chain[0].SerialNumber)
+					got.Chain()[0].SerialNumber)
 			}
 			// The contract the ranking exists to protect: every emitted hop verifies,
 			// so a consumer can build a path out of the bundle it was handed.
-			if err := got.Leaf.CheckSignatureFrom(got.Chain[0]); err != nil {
-				t.Errorf("leaf does not verify under chain[0] (serial %s): %v", got.Chain[0].SerialNumber, err)
+			if err := got.Leaf().CheckSignatureFrom(got.Chain()[0]); err != nil {
+				t.Errorf("leaf does not verify under chain[0] (serial %s): %v", got.Chain()[0].SerialNumber, err)
 			}
-			if err := got.Chain[0].CheckSignatureFrom(got.Chain[1]); err != nil {
+			if err := got.Chain()[0].CheckSignatureFrom(got.Chain()[1]); err != nil {
 				t.Errorf("chain[0] (serial %s) does not verify under chain[1] (serial %s): %v; the emitted chain cannot be validated by a consumer",
-					got.Chain[0].SerialNumber, got.Chain[1].SerialNumber, err)
+					got.Chain()[0].SerialNumber, got.Chain()[1].SerialNumber, err)
 			}
 		})
 	}
@@ -762,7 +762,7 @@ func TestAnalyse_refuses_an_over_ceiling_rsa_issuer(t *testing.T) {
 			got, err := convert.Analyse(concatPEM(order.certs...), keyPEMOf(t, leafKey))
 			if err == nil {
 				t.Fatalf("Analyse(leaf + a %d-bit RSA issuer + a same-subject ordinary-key certificate) = nil error and a chain of serial(s) %v, want a refusal: with the oversized edge left unverified the decoy (serial 211) outranks it, so the emitted chain does not verify",
-					oversizedBits, chainSerials(got.Chain))
+					oversizedBits, chainSerials(got.Chain()))
 			}
 			// The size and the subject are what make the refusal actionable: which
 			// certificate to remove, and the fact that its key is why.
@@ -811,13 +811,85 @@ func TestAnalyse_converts_beside_an_over_ceiling_certificate_that_issues_nothing
 	if err != nil {
 		t.Fatalf("Analyse(self-signed identity + an unrelated oversized certificate) = error %v, want nil: an oversized certificate that issues nothing here cannot influence the chain", err)
 	}
-	if len(got.Chain) != 0 {
-		t.Errorf("chain length = %d, want 0: a self-signed identity has no chain", len(got.Chain))
+	if len(got.Chain()) != 0 {
+		t.Errorf("chain length = %d, want 0: a self-signed identity has no chain", len(got.Chain()))
 	}
-	if len(got.Extra) != 1 {
-		t.Fatalf("Extra holds %d certificate(s), want the unrelated oversized certificate excluded", len(got.Extra))
+	if len(got.Extra()) != 1 {
+		t.Fatalf("Extra holds %d certificate(s), want the unrelated oversized certificate excluded", len(got.Extra()))
 	}
-	if !hasObservation(got.Observations, convert.ObsExtraCertsExcluded) {
-		t.Errorf("observations = %v, want the exclusion reported", got.Observations)
+	if !hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
+		t.Errorf("observations = %v, want the exclusion reported", got.Observations())
+	}
+}
+
+// TestAnalyse_ranks_verified_issuers_by_validity_then_expiry pins the two
+// chain-selection keys betterParent documents but nothing else exercises:
+// currently-valid beats not-yet-valid, and among equally valid candidates the
+// later NotAfter wins. Both rows use two same-subject, same-key self-signed
+// issuers so signature strength and root distance tie and only the ranking under
+// test can decide the emitted chain.
+func TestAnalyse_ranks_verified_issuers_by_validity_then_expiry(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+
+	tests := map[string]struct {
+		firstNotBefore  time.Time
+		firstNotAfter   time.Time
+		secondNotBefore time.Time
+		secondNotAfter  time.Time
+	}{
+		"a current issuer outranks a future-dated issuer with a later expiry": {
+			firstNotBefore:  now.Add(48 * time.Hour),
+			firstNotAfter:   now.Add(72 * time.Hour),
+			secondNotBefore: now.Add(-time.Hour),
+			secondNotAfter:  now.Add(24 * time.Hour),
+		},
+		"the later expiry breaks a tie between two current issuers": {
+			firstNotBefore:  now.Add(-time.Hour),
+			firstNotAfter:   now.Add(24 * time.Hour),
+			secondNotBefore: now.Add(-time.Hour),
+			secondNotAfter:  now.Add(48 * time.Hour),
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			issuerKey := newKey(t)
+			issuer := func(serial int64, notBefore, notAfter time.Time) *x509.Certificate {
+				return &x509.Certificate{
+					SerialNumber:          big.NewInt(serial),
+					Subject:               pkix.Name{CommonName: "Ranked Issuer CA"},
+					NotBefore:             notBefore,
+					NotAfter:              notAfter,
+					IsCA:                  true,
+					BasicConstraintsValid: true,
+					KeyUsage:              x509.KeyUsageCertSign,
+				}
+			}
+			firstPEM, _ := mint(t, issuer(220, tt.firstNotBefore, tt.firstNotAfter),
+				&issuerKey.PublicKey, nil, issuerKey)
+			secondPEM, secondCert := mint(t, issuer(221, tt.secondNotBefore, tt.secondNotAfter),
+				&issuerKey.PublicKey, nil, issuerKey)
+
+			leafKey := newKey(t)
+			leafPEM, _ := mint(t, &x509.Certificate{
+				SerialNumber: big.NewInt(222),
+				Subject:      pkix.Name{CommonName: "ranked-issuer-leaf.example.com"},
+				NotBefore:    now.Add(-time.Hour),
+				NotAfter:     now.Add(24 * time.Hour),
+			}, &leafKey.PublicKey, secondCert, issuerKey)
+
+			got, err := convert.Analyse(concatPEM(leafPEM, firstPEM, secondPEM), keyPEMOf(t, leafKey))
+			if err != nil {
+				t.Fatalf("Analyse = error %v, want nil", err)
+			}
+			if len(got.Chain()) != 1 {
+				t.Fatalf("chain length = %d, want 1", len(got.Chain()))
+			}
+			if got.Chain()[0].SerialNumber.Cmp(big.NewInt(221)) != 0 {
+				t.Errorf("chain[0] serial = %s, want 221", got.Chain()[0].SerialNumber)
+			}
+		})
 	}
 }

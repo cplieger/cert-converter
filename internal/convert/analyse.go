@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -67,27 +68,44 @@ type Observation struct {
 // Analysis is the resolved result of reading a certificate bundle and a key
 // file: which certificate is the identity, which private key belongs to it,
 // which certificates form its chain and in what order, and which were left out.
+// Its representation is deliberately opaque: the only thing a consumer outside
+// this package needs from it is Observations, and everything else (the
+// certificates, the private key, the chain order) is codec material whose shape
+// is this package's business. Keeping the fields unexported is also what makes
+// Analyse's invariant hold — no caller can swap the leaf, reorder the chain or
+// null the key and hand the result back to Encode or CheckCurrency.
 type Analysis struct {
-	// Leaf is the end-entity certificate the PFX is built around.
-	Leaf *x509.Certificate
-	// Chain holds Leaf's ancestors, ordered nearest-parent-first. PKCS#12 stores
+	// leaf is the end-entity certificate the PFX is built around.
+	leaf *x509.Certificate
+	// chain holds leaf's ancestors, ordered nearest-parent-first. PKCS#12 stores
 	// an ordered SEQUENCE of bags and decoders read it positionally (go-pkcs12's
 	// own decoder assumes the first certificate is the leaf), so this order is a
 	// contract rather than an implementation detail.
 	//
 	// One exception, always accompanied by ObsChainUnverified: when no issuer of
-	// Leaf could be established from the bundle, Chain carries the remaining
+	// leaf could be established from the bundle, chain carries the remaining
 	// certificates in INPUT order instead. There is no ancestry to order them by,
 	// and carrying a CA a deployment may rely on beats emitting an empty chain.
-	Chain []*x509.Certificate
-	// Key is the private half of Leaf.
-	Key crypto.PrivateKey
-	// Extra holds certificates that parsed but are not ancestors of Leaf. They
+	chain []*x509.Certificate
+	// key is the private half of leaf.
+	key crypto.PrivateKey
+	// extra holds certificates that parsed but are not ancestors of leaf. They
 	// are deliberately excluded from the bundle: embedding an unrelated CA
 	// pollutes the trust chain the consumer sees.
-	Extra []*x509.Certificate
-	// Observations are non-fatal findings, in the order discovered.
-	Observations []Observation
+	extra []*x509.Certificate
+	// observations are non-fatal findings, in the order discovered.
+	observations []Observation
+}
+
+// Observations returns the non-fatal findings about the input, in the order
+// discovered. The slice is a copy, so a caller may keep, sort or filter it
+// without disturbing the analysis it came from.
+//
+// This is the whole of Analysis's exported surface, because it is the whole of
+// what a consumer outside this package does with an Analysis: report what was
+// noticed, then hand the value back to Encode or CheckCurrency unchanged.
+func (a *Analysis) Observations() []Observation {
+	return slices.Clone(a.observations)
 }
 
 // Analyse resolves a certificate bundle and a key file into the identity, chain
@@ -108,7 +126,23 @@ type Analysis struct {
 // Invariant: whichever certificate is selected, its public key provably matches
 // the returned private key, so the bundle is internally consistent by
 // construction.
+//
+// This is the package's only production clock read, and it happens once for the
+// whole analysis: ranking and the validity observations must agree with each
+// other, and a comparator that re-reads the time can stop being transitive
+// mid-reduction. Everything past this line is a pure function of the input plus
+// that one instant, which is what lets analyseAt reproduce a validity or
+// tie-break decision at an exact moment instead of near it.
 func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
+	return analyseAt(certPEM, keyPEM, time.Now())
+}
+
+// analyseAt is Analyse with the scan instant supplied rather than read, so the
+// validity boundaries and the renewed-certificate tie-break are decidable at an
+// exact time. Unexported on purpose: no caller outside this package has a reason
+// to analyse a bundle at anything other than now, and widening the exported
+// surface to hand one in would invite exactly that.
+func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 	certs, err := parseCertChain(certPEM)
 	if err != nil {
 		return Analysis{}, fmt.Errorf("parse cert chain: %w", err)
@@ -117,11 +151,6 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 	if err != nil {
 		return Analysis{}, fmt.Errorf("parse private key: %w", err)
 	}
-
-	// One clock read for the whole analysis. Ranking and the validity
-	// observations must agree with each other, and a comparator that re-reads
-	// the time can stop being transitive mid-reduction.
-	now := time.Now()
 
 	var obs []Observation
 
@@ -184,11 +213,11 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 	obs = append(obs, chainValidityObservations(chain, now)...)
 
 	return Analysis{
-		Leaf:         leaf,
-		Chain:        chain,
-		Key:          signers[identity.key],
-		Extra:        extra,
-		Observations: obs,
+		leaf:         leaf,
+		chain:        chain,
+		key:          signers[identity.key],
+		extra:        extra,
+		observations: obs,
 	}, nil
 }
 

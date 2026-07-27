@@ -18,10 +18,7 @@ const maxFileSize = 10 << 20
 // source owns every read of the input tree.
 //
 // It is the single owner of input filesystem policy: the confined root, the
-// regular-file requirement, the size bound, and the non-blocking open. That
-// policy used to sit in internal/convert, which meant the codec package held an
-// *os.Root it did not own and could not have opened, while the walk that DOES own
-// the input tree lived here. One owner per tree removes that split.
+// regular-file requirement, the size bound, and the non-blocking open.
 //
 // A source does not close its root; the Scanner that opened it does.
 type source struct {
@@ -50,8 +47,8 @@ func (s *source) readBounded(ctx context.Context, rel string) ([]byte, error) {
 // atomicfile owns the confined read: it opens through the root non-blocking (so a
 // FIFO planted in the watched tree is rejected rather than wedging the scan's only
 // goroutine), requires a regular file, and stats the open handle rather than the
-// path. Hand-rolling that sequence here is what deferred finding l-f27 named — the
-// same three details the library already guarantees on the write side.
+// path. Delegating the sequence keeps the read and write boundaries on the same
+// atomicfile guarantees.
 func (s *source) readBoundedLimit(ctx context.Context, rel string, limit int64) ([]byte, error) {
 	return atomicfile.ReadBoundedInRoot(ctx, s.root, rel, limit)
 }

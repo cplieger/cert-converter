@@ -98,17 +98,17 @@ func TestAnalyse_is_invariant_under_input_order(t *testing.T) {
 		if err != nil {
 			rt.Fatalf("Analyse(cert order %v, key order %v) = error %v, want nil", certOrder, keyOrder, err)
 		}
-		if !bytes.Equal(got.Leaf.Raw, wantLeafDER) {
-			rt.Errorf("Analyse(cert order %v) selected leaf %q, want the end-entity certificate", certOrder, got.Leaf.Subject.CommonName)
+		if !bytes.Equal(got.Leaf().Raw, wantLeafDER) {
+			rt.Errorf("Analyse(cert order %v) selected leaf %q, want the end-entity certificate", certOrder, got.Leaf().Subject.CommonName)
 		}
-		if len(got.Chain) != 1 {
-			rt.Fatalf("Analyse(cert order %v) chain length = %d, want 1", certOrder, len(got.Chain))
+		if len(got.Chain()) != 1 {
+			rt.Fatalf("Analyse(cert order %v) chain length = %d, want 1", certOrder, len(got.Chain()))
 		}
-		if !bytes.Equal(got.Chain[0].Raw, wantCADER) {
-			rt.Errorf("Analyse(cert order %v) chain[0] = %q, want the issuing CA", certOrder, got.Chain[0].Subject.CommonName)
+		if !bytes.Equal(got.Chain()[0].Raw, wantCADER) {
+			rt.Errorf("Analyse(cert order %v) chain[0] = %q, want the issuing CA", certOrder, got.Chain()[0].Subject.CommonName)
 		}
-		if len(got.Extra) != 0 {
-			rt.Errorf("Analyse(cert order %v) excluded %d certificate(s), want 0", certOrder, len(got.Extra))
+		if len(got.Extra()) != 0 {
+			rt.Errorf("Analyse(cert order %v) excluded %d certificate(s), want 0", certOrder, len(got.Extra()))
 		}
 		// The invariant that makes the bundle internally consistent: the returned
 		// key is the private half of the returned leaf.
@@ -122,13 +122,13 @@ func assertKeyMatchesLeaf(tb interface {
 	Fatalf(string, ...any)
 }, a convert.Analysis,
 ) {
-	signer, ok := a.Key.(crypto.Signer)
+	signer, ok := a.Key().(crypto.Signer)
 	if !ok {
-		tb.Fatalf("Analyse returned a key of type %T that is not a crypto.Signer", a.Key)
+		tb.Fatalf("Analyse returned a key of type %T that is not a crypto.Signer", a.Key())
 	}
-	matcher, ok := a.Leaf.PublicKey.(interface{ Equal(crypto.PublicKey) bool })
+	matcher, ok := a.Leaf().PublicKey.(interface{ Equal(crypto.PublicKey) bool })
 	if !ok {
-		tb.Fatalf("selected leaf carries a public key of type %T with no Equal method", a.Leaf.PublicKey)
+		tb.Fatalf("selected leaf carries a public key of type %T with no Equal method", a.Leaf().PublicKey)
 	}
 	if !matcher.Equal(signer.Public()) {
 		tb.Errorf("Analyse returned a key that is not the private half of the selected leaf")
@@ -241,14 +241,14 @@ func TestAnalyse_resolves_every_documented_input_shape(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Analyse = error %v, want nil", err)
 			}
-			if got.Leaf.Subject.CommonName != tc.wantLeaf {
-				t.Errorf("Analyse selected leaf %q, want %q", got.Leaf.Subject.CommonName, tc.wantLeaf)
+			if got.Leaf().Subject.CommonName != tc.wantLeaf {
+				t.Errorf("Analyse selected leaf %q, want %q", got.Leaf().Subject.CommonName, tc.wantLeaf)
 			}
-			if len(got.Chain) != tc.wantLen {
-				t.Errorf("Analyse chain length = %d, want %d", len(got.Chain), tc.wantLen)
+			if len(got.Chain()) != tc.wantLen {
+				t.Errorf("Analyse chain length = %d, want %d", len(got.Chain()), tc.wantLen)
 			}
-			if tc.wantObs != "" && !hasObservation(got.Observations, tc.wantObs) {
-				t.Errorf("Analyse observations = %v, want one of kind %q", got.Observations, tc.wantObs)
+			if tc.wantObs != "" && !hasObservation(got.Observations(), tc.wantObs) {
+				t.Errorf("Analyse observations = %v, want one of kind %q", got.Observations(), tc.wantObs)
 			}
 			assertKeyMatchesLeaf(t, got)
 		})
@@ -267,11 +267,11 @@ func TestAnalyse_orders_the_chain_nearest_parent_first(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}
-	if got.Leaf.Subject.CommonName != "material-leaf.example.com" {
-		t.Fatalf("selected leaf = %q, want the end-entity certificate", got.Leaf.Subject.CommonName)
+	if got.Leaf().Subject.CommonName != "material-leaf.example.com" {
+		t.Fatalf("selected leaf = %q, want the end-entity certificate", got.Leaf().Subject.CommonName)
 	}
 	wantChain := []string{"Material Test CA"}
-	gotChain := subjectCNs(got.Chain)
+	gotChain := subjectCNs(got.Chain())
 	if len(gotChain) != len(wantChain) {
 		t.Fatalf("chain = %v, want %v", gotChain, wantChain)
 	}
@@ -280,8 +280,8 @@ func TestAnalyse_orders_the_chain_nearest_parent_first(t *testing.T) {
 			t.Errorf("chain[%d] = %q, want %q", i, gotChain[i], wantChain[i])
 		}
 	}
-	if !hasObservation(got.Observations, convert.ObsLeafNotFirst) {
-		t.Errorf("observations = %v, want one of kind %q", got.Observations, convert.ObsLeafNotFirst)
+	if !hasObservation(got.Observations(), convert.ObsLeafNotFirst) {
+		t.Errorf("observations = %v, want one of kind %q", got.Observations(), convert.ObsLeafNotFirst)
 	}
 }
 
@@ -310,12 +310,12 @@ func TestAnalyse_treats_a_key_repeated_twice_as_one_key(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Analyse(one certificate, the same key twice) = error %v, want nil: two blocks holding one key are one key", err)
 	}
-	if got.Leaf.Subject.CommonName != "repeated-key.example.com" {
-		t.Errorf("selected identity = %q, want %q", got.Leaf.Subject.CommonName, "repeated-key.example.com")
+	if got.Leaf().Subject.CommonName != "repeated-key.example.com" {
+		t.Errorf("selected identity = %q, want %q", got.Leaf().Subject.CommonName, "repeated-key.example.com")
 	}
-	if hasObservation(got.Observations, convert.ObsMultipleKeys) {
+	if hasObservation(got.Observations(), convert.ObsMultipleKeys) {
 		t.Errorf("observations = %v, want NO %q: the file holds one key written twice",
-			got.Observations, convert.ObsMultipleKeys)
+			got.Observations(), convert.ObsMultipleKeys)
 	}
 	assertKeyMatchesLeaf(t, got)
 }
@@ -367,11 +367,11 @@ func TestAnalyse_reports_an_out_of_window_identity_without_refusing_it(t *testin
 			if err != nil {
 				t.Fatalf("Analyse(%s) = error %v, want nil: validity is never a gate", tc.name, err)
 			}
-			if !hasObservation(got.Observations, tc.want) {
-				t.Errorf("Analyse(%s) observations = %v, want one of kind %q", tc.name, got.Observations, tc.want)
+			if !hasObservation(got.Observations(), tc.want) {
+				t.Errorf("Analyse(%s) observations = %v, want one of kind %q", tc.name, got.Observations(), tc.want)
 			}
-			if hasObservation(got.Observations, tc.unwanted) {
-				t.Errorf("Analyse(%s) observations = %v, want NO observation of kind %q", tc.name, got.Observations, tc.unwanted)
+			if hasObservation(got.Observations(), tc.unwanted) {
+				t.Errorf("Analyse(%s) observations = %v, want NO observation of kind %q", tc.name, got.Observations(), tc.unwanted)
 			}
 		})
 	}
@@ -396,8 +396,8 @@ func TestAnalyse_reports_no_validity_observation_for_a_current_identity(t *testi
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}
 	for _, kind := range []convert.ObservationKind{convert.ObsIdentityExpired, convert.ObsIdentityNotYetValid} {
-		if hasObservation(got.Observations, kind) {
-			t.Errorf("Analyse(a currently valid identity) observations = %v, want no %q", got.Observations, kind)
+		if hasObservation(got.Observations(), kind) {
+			t.Errorf("Analyse(a currently valid identity) observations = %v, want no %q", got.Observations(), kind)
 		}
 	}
 }
@@ -435,16 +435,16 @@ func TestAnalyse_reports_an_out_of_window_chain_certificate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Analyse(valid leaf + expired issuer) = error %v, want nil: validity is never a gate", err)
 	}
-	if len(got.Chain) != 1 {
-		t.Fatalf("Analyse chain = %d certificate(s), want the expired issuer emitted", len(got.Chain))
+	if len(got.Chain()) != 1 {
+		t.Fatalf("Analyse chain = %d certificate(s), want the expired issuer emitted", len(got.Chain()))
 	}
-	if !hasObservation(got.Observations, convert.ObsChainCertOutOfWindow) {
+	if !hasObservation(got.Observations(), convert.ObsChainCertOutOfWindow) {
 		t.Errorf("observations = %v, want one of kind %q naming the expired issuer",
-			got.Observations, convert.ObsChainCertOutOfWindow)
+			got.Observations(), convert.ObsChainCertOutOfWindow)
 	}
-	if hasObservation(got.Observations, convert.ObsIdentityExpired) {
+	if hasObservation(got.Observations(), convert.ObsIdentityExpired) {
 		t.Errorf("observations = %v, want NO %q: the identity itself is inside its window",
-			got.Observations, convert.ObsIdentityExpired)
+			got.Observations(), convert.ObsIdentityExpired)
 	}
 }
 
@@ -469,13 +469,13 @@ func TestAnalyse_caps_the_subjects_it_names_in_the_exclusion_observation(t *test
 		t.Fatalf("Analyse(identity + 5 unrelated certificates) = error %v, want nil", err)
 	}
 	var detail string
-	for _, o := range got.Observations {
+	for _, o := range got.Observations() {
 		if o.Kind == convert.ObsExtraCertsExcluded {
 			detail = o.Detail
 		}
 	}
 	if detail == "" {
-		t.Fatalf("observations = %v, want one of kind %q", got.Observations, convert.ObsExtraCertsExcluded)
+		t.Fatalf("observations = %v, want one of kind %q", got.Observations(), convert.ObsExtraCertsExcluded)
 	}
 	if !strings.Contains(detail, "and 2 more") {
 		t.Errorf("observation detail = %q, want the certificates past the cap summarised as a count", detail)

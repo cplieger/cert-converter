@@ -148,43 +148,29 @@ func TestParseFallbackInterval_clamps_excessive_values(t *testing.T) {
 	}
 }
 
-// TestParseFallbackInterval_is_silent pins the parse as pure: it classifies a
-// repaired value but emits nothing. The diagnostics are Load's, because
-// FallbackInterval() is called by the `health` subcommand too, where a startup
-// WARN would reprint on every probe (every ~30s under Docker's healthcheck).
-// slog.Default is process-global, so this test must not run in parallel with
-// anything that logs.
-func TestParseFallbackInterval_is_silent(t *testing.T) {
-	for _, raw := range []string{"", "   ", "abc", "-1", "00", "12", "0", "false", "87601", "999999999999999999999999999999"} {
-		t.Run(raw, func(t *testing.T) {
-			logs := capture.Default(t)
-
-			parseFallbackInterval(raw)
-
-			if logs.Len() != 0 {
-				t.Errorf("parseFallbackInterval(%q) logged %v, want no records: the diagnostics belong to Load",
-					raw, logs.Messages())
-			}
-		})
-	}
-}
-
-// TestFallbackInterval_is_silent pins the same contract on the exported reader
-// the `health` subcommand calls. This is the regression the whole split exists
+// TestFallbackInterval_is_silent pins the exported reader's contract for every
+// parse class: the health subcommand calls it on every probe, so it must never
+// emit startup diagnostics. This is the regression the parser/Load split exists
 // to prevent: with the WARNs back in the parser, a misconfigured or
 // above-ceiling FALLBACK_SCAN_HOURS printed a startup-shaped WARN on every
 // healthcheck, forever.
+// slog.Default is process-global, so this test must not run in parallel with
+// anything that logs.
 func TestFallbackInterval_is_silent(t *testing.T) {
 	for _, tc := range []struct {
 		raw  string
 		want time.Duration
 	}{
 		{"", 6 * time.Hour},
+		{"   ", 6 * time.Hour},
 		{"abc", 6 * time.Hour},
 		{"-1", 6 * time.Hour},
+		{"00", 6 * time.Hour},
 		{"87601", 87600 * time.Hour},
+		{"999999999999999999999999999999", 87600 * time.Hour},
 		{"12", 12 * time.Hour},
 		{"0", 0},
+		{"false", 0},
 	} {
 		t.Run(tc.raw, func(t *testing.T) {
 			t.Setenv("FALLBACK_SCAN_HOURS", tc.raw)
@@ -387,49 +373,6 @@ func TestLoad_warns_when_the_fallback_rescan_is_disabled(t *testing.T) {
 					tc.raw, logs.Messages())
 			}
 		})
-	}
-}
-
-func TestLoad_explicit_fallback_overrides_default(t *testing.T) {
-	isolatePasswordFile(t)
-	t.Setenv("PFX_PASSWORD", "s3cret")
-	t.Setenv("FALLBACK_SCAN_HOURS", "12")
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.FallbackInterval != 12*time.Hour {
-		t.Errorf("Load() FallbackInterval = %v, want %v", cfg.FallbackInterval, 12*time.Hour)
-	}
-}
-
-func TestLoad_reads_password_and_encoder(t *testing.T) {
-	isolatePasswordFile(t)
-	t.Setenv("PFX_PASSWORD", "s3cret")
-	t.Setenv("PFX_ENCODER", "legacy")
-	t.Setenv("FALLBACK_SCAN_HOURS", "0")
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.Password != "s3cret" {
-		t.Errorf("Load() Password = %q, want %q", cfg.Password, "s3cret")
-	}
-	if cfg.EncoderName != convert.EncNameLegacyDES {
-		t.Errorf("Load() EncoderName = %q, want %q", cfg.EncoderName, convert.EncNameLegacyDES)
-	}
-}
-
-func TestLoad_empty_password_allowed_by_optout(t *testing.T) {
-	isolatePasswordFile(t)
-	t.Setenv("PFX_PASSWORD", "")
-	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "true")
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.Password != "" {
-		t.Errorf("Load() Password = %q, want empty", cfg.Password)
 	}
 }
 

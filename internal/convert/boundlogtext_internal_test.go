@@ -11,46 +11,6 @@ import (
 	"unicode/utf8"
 )
 
-// TestBoundLogText_sanitizes_short_input_too pins the asymmetry this function used to
-// carry: it sanitized only the text it had just truncated, so a string SHORTER than
-// the limit was returned untouched. Every certificate subject in a normal deployment
-// is short, which means the sanitizing half of the contract applied to almost nothing
-// it was written for.
-func TestBoundLogText_sanitizes_short_input_too(t *testing.T) {
-	t.Parallel()
-
-	tests := map[string]struct {
-		in       string
-		wantGone string
-	}{
-		"DEL in short input":           {"CN=a\u007fb.example.com", "\u007f"},
-		"invalid UTF-8 in short input": {"CN=a\xffb.example.com", "\xff"},
-	}
-
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			got := boundLogText(tt.in, maxSubjectLogLen)
-			if len(tt.in) > maxSubjectLogLen {
-				t.Fatalf("fixture is %d bytes, must be under the %d-byte limit to test the short path",
-					len(tt.in), maxSubjectLogLen)
-			}
-			if strings.Contains(got, tt.wantGone) {
-				t.Errorf("boundLogText(%q) = %q, still contains %q", tt.in, got, tt.wantGone)
-			}
-			if !strings.Contains(got, "b.example.com") {
-				t.Errorf("boundLogText(%q) = %q, want the legitimate text preserved", tt.in, got)
-			}
-			if strings.Contains(got, truncationMarker) {
-				t.Errorf("boundLogText(%q) = %q, want no truncation marker on input under the limit", tt.in, got)
-			}
-			if !utf8.ValidString(got) {
-				t.Errorf("boundLogText(%q) = %q, want valid UTF-8", tt.in, got)
-			}
-		})
-	}
-}
-
 // TestBoundLogText_applies_the_runesafe_single_line_policy pins the policy
 // boundLogText now delegates to (runesafe.SanitizeSingleLine): each unsafe rune
 // becomes a SPACE, invalid UTF-8 becomes U+FFFD, and legitimate text — including
@@ -65,6 +25,13 @@ func TestBoundLogText_sanitizes_short_input_too(t *testing.T) {
 // accepted cost of a sanitizer that is correct under either handler rather than
 // under the one currently wired up — see boundLogText's doc comment for the
 // per-handler measurements.
+//
+// Every fixture is well under maxSubjectLogLen, so this also pins the asymmetry
+// the function once carried: it sanitized only the text it had just truncated, and
+// input SHORTER than the limit came back untouched — which is nearly every
+// certificate subject in a real deployment. Exact equality against a want that is
+// valid UTF-8 and carries no truncation marker states both of those as part of the
+// expected value, so no separate assertion is needed for either.
 func TestBoundLogText_applies_the_runesafe_single_line_policy(t *testing.T) {
 	t.Parallel()
 
@@ -103,12 +70,6 @@ func TestBoundLogText_applies_the_runesafe_single_line_policy(t *testing.T) {
 			got := boundLogText(tt.in, maxSubjectLogLen)
 			if got != tt.want {
 				t.Errorf("boundLogText(%q) = %q, want %q", tt.in, got, tt.want)
-			}
-			if !utf8.ValidString(got) {
-				t.Errorf("boundLogText(%q) = %q, want valid UTF-8", tt.in, got)
-			}
-			if strings.Contains(got, truncationMarker) {
-				t.Errorf("boundLogText(%q) = %q, want no truncation marker on input under the limit", tt.in, got)
 			}
 		})
 	}

@@ -68,24 +68,21 @@ func stubFSWatcherFailingOnce(t *testing.T) {
 }
 
 // TestPollLoopWithUpgrade_hands_the_upgraded_watcher_back_and_releases_poll_mode
-// pins what the mode restructure is FOR, and replaces the old
-// "upgrades_to_fsnotify_and_scans_first" test whose premise (poll mode running
-// the watch loop inside its own tick) no longer exists. The recovery path itself
-// is still pinned end to end, one level up, by
+// pins ownership transfer and ticker release. The recovery path itself is pinned
+// end to end, one level up, by
 // TestRun_upgrades_from_poll_to_watch_and_keeps_detecting_events.
 //
 // Poll mode has ONE exit: on the tick where fsnotify becomes available again it
 // rebuilds the watch set and RETURNS the watcher for Run to run watch mode over,
 // while ctx is still live. Because that is a return and not a nested call, poll
 // mode's `defer ticker.Stop()` runs here, before watch mode begins — the ticker
-// no longer fires for the whole watch-mode lifetime into a receiver nobody
-// selects on, with its Stop deferred until process exit. The assertions below
-// pin that single exit (a build that ran the watch loop inside the tick would
-// block until shutdown and hand back no watcher), that the watcher handed back
-// is the attached one rather than a bare constructor result, that the upgrade
-// tick itself performs NO scan (the post-attach scan belongs to watch mode's
-// attach-then-scan), and that poll mode is quiescent afterwards: no further poll
-// scan for many tick periods.
+// does not fire for the whole watch-mode lifetime into a receiver nobody selects
+// on. The assertions below pin that single exit (a build that ran the watch loop
+// inside the tick would block until shutdown and hand back no watcher), that the
+// watcher handed back is the attached one rather than a bare constructor result,
+// that the upgrade tick itself performs NO scan (the post-attach scan belongs to
+// watch mode's attach-then-scan), and that poll mode is quiescent afterwards: no
+// further poll scan for many tick periods.
 //
 // Runs serially (no t.Parallel): it swaps the process-global slog default.
 func TestPollLoopWithUpgrade_hands_the_upgraded_watcher_back_and_releases_poll_mode(t *testing.T) {
@@ -102,7 +99,7 @@ func TestPollLoopWithUpgrade_hands_the_upgraded_watcher_back_and_releases_poll_m
 	done := runPollLoop(ctx, w)
 
 	// The immediate initial scan, which poll mode performs before entering the
-	// ticker loop (deferred finding d-u5c6-1).
+	// ticker loop.
 	select {
 	case <-scans:
 	case <-time.After(10 * time.Second):
@@ -265,8 +262,8 @@ func TestPollLoopWithUpgrade_returns_when_a_shutdown_interrupts_a_poll_tick(t *t
 	}
 }
 
-// TestRun_falls_back_to_polling_when_fsnotify_is_unavailable drives the seam
-// l-f46 exists for: with the constructor failing, Run must degrade to polling
+// TestRun_falls_back_to_polling_when_fsnotify_is_unavailable drives the
+// newFSWatcher seam: with the constructor failing, Run must degrade to polling
 // rather than abort, which is unreachable on a host where inotify works.
 // Not parallel: it swaps the package-level newFSWatcher seam.
 func TestRun_falls_back_to_polling_when_fsnotify_is_unavailable(t *testing.T) {
