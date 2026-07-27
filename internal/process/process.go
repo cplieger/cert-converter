@@ -211,8 +211,15 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		// so sync reconciliation never deletes the still-live <name>.pfx of an input
 		// path that still exists in an unusable shape. The walk continues into it so
 		// genuinely nested certificate entries are still discovered.
+		//
+		// Debug for the reason the unreadable-sub-path arm above states in full: this
+		// is the same shape of steady-state layout mistake, recurring on EVERY scan
+		// until an operator moves the directory, and the unreadable count incremented
+		// here is what raises the aggregate Warn in scanAndSetHealth on this same
+		// scan. Naming the path at the default level too would emit both halves of
+		// that two-level contract as Warn for one condition.
 		if layout.IsCert(rel) {
-			slog.Warn("skipping cert: certificate path is a directory",
+			slog.Debug("skipping cert: certificate path is a directory",
 				"path", rel,
 				"remediation", "replace the directory with a regular <name>.crt file")
 			sw.unreadable++

@@ -3,6 +3,7 @@ package process
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -34,7 +35,7 @@ func captureLogs(t *testing.T) *capture.Recorder {
 // aggregate into the log forever for a condition the operator had already been told
 // about once.
 //
-// Asserted per walk, because these are three separate call sites that have drifted
+// Asserted per walk, because these are four separate call sites that have drifted
 // apart before.
 func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 	t.Run("input walk unreadable sub-path", func(t *testing.T) {
@@ -48,6 +49,35 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 		assertDebugOnly(t, logs, "skipping unreadable path", "locked")
 		if sw.unreadable != 1 {
 			t.Errorf("unreadable = %d, want 1 so the aggregate in scanAndSetHealth fires", sw.unreadable)
+		}
+	})
+
+	// A DIRECTORY occupying a <name>.crt path is the same shape of steady-state layout
+	// mistake as the arm above — it recurs on every scan until an operator moves it —
+	// and it feeds the SAME unreadable counter, so the aggregate WARN in
+	// scanAndSetHealth already fires on this scan. Naming the path at the default level
+	// as well made one condition produce two WARN records per scan, which is the exact
+	// double-report this policy exists to prevent.
+	//
+	// The counter assertion here is what makes that argument true rather than assumed:
+	// demoting the line is only safe while the aggregate still fires. The reaping veto
+	// the same counter drives is pinned end-to-end by
+	// TestScannerRun_directory_in_cert_path_does_not_authorise_reaping.
+	t.Run("input walk directory in a cert path", func(t *testing.T) {
+		logs := captureLogs(t)
+		sw := &scanWalk{seen: map[string]struct{}{}}
+
+		if err := sw.visit(t.Context(), "blocked.crt", dirEntryOf(t, t.TempDir()), nil); err != nil {
+			t.Fatalf("visit(directory in a cert path) = %v, want nil so the rest of the tree is still walked", err)
+		}
+
+		assertDebugOnly(t, logs, "skipping cert: certificate path is a directory", "blocked.crt")
+		if sw.unreadable != 1 {
+			t.Errorf("unreadable = %d, want 1 so the aggregate in scanAndSetHealth fires and reaping stays vetoed", sw.unreadable)
+		}
+		if len(sw.seen) != 0 || len(sw.results) != 0 {
+			t.Errorf("seen/results = %d/%d, want 0/0: an unreadable cert path is not a pair outcome",
+				len(sw.seen), len(sw.results))
 		}
 	})
 
@@ -109,6 +139,17 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 		assertDebugOnly(t, logs, "output tree contains a symlink", "loop")
 		assertOneAggregateWarn(t, logs, "orphan removal is disabled for this scan", "1")
 	})
+}
+
+// dirEntryOf builds the fs.DirEntry the walk would hand visit for path, so a test can
+// exercise the directory arm directly instead of through a real WalkDir.
+func dirEntryOf(t *testing.T, path string) fs.DirEntry {
+	t.Helper()
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fs.FileInfoToDirEntry(fi)
 }
 
 // assertDebugOnly requires that the record carrying msg is at Debug and that the path

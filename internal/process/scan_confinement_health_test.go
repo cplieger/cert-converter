@@ -133,6 +133,11 @@ func TestScannerRun_unreadable_pair_does_not_authorise_reaping(t *testing.T) {
 // scan otherwise looks complete, so under OUTPUT_LIFECYCLE=sync reconciliation would see
 // blocked.pfx with no matching seen certificate and delete a still-live bundle whose
 // source path does exist — just in an unusable shape.
+//
+// The per-path log record for this arm is Debug, pinned by
+// TestWalkLogPolicy_per_path_lines_are_debug_only: the counter this test asserts is what
+// raises the aggregate WARN, so the operator-visible signal is that aggregate, not the
+// per-path line.
 func TestScannerRun_directory_in_cert_path_does_not_authorise_reaping(t *testing.T) {
 	t.Parallel()
 	certsRoot := t.TempDir()
