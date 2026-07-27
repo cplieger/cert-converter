@@ -19,6 +19,10 @@ import (
 // owner-read/write only; its parent directory is owner-traversable plus group
 // read, matching the documented deployment where a matching host UID owns the
 // volume.
+//
+// pfxFileMode is a CEILING on a bundle already on disk, not an exact target:
+// tightenMode chmods away any bit beyond it and leaves a mode the operator made
+// stricter alone. It is never part of the currency decision.
 const (
 	pfxFileMode = 0o600
 	pfxDirMode  = 0o750
@@ -189,6 +193,11 @@ const maxPFXSize = 2*maxFileSize + 64<<10
 // rewrite genuinely cannot happen THAT failure flips health, which is the honest
 // signal. Only shutdown is a hard error: it is neither current nor stale, and
 // treating it as stale would rewrite every in-flight pair on the way out.
+//
+// Permission bits are NOT one of those outcomes and never reach the verdict: a
+// bundle laxer than pfxFileMode is tightened in place with a chmod (tightenMode,
+// which owns the reasoning) and stays current, so no mode can ever trigger a
+// rewrite.
 func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysis,
 	wantEncoder convert.EncoderType, password string,
 ) (bool, error) {
@@ -214,15 +223,15 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 		// prior bundle, and a symlink must never be followed here or unrelated
 		// content could satisfy the check.
 		return false, nil
-	case fi.Mode().Perm() != pfxFileMode:
-		// The bundle carries a private key, so pfxFileMode is this app's policy for
-		// it, not just the mode of a fresh write. A file whose contents already match
-		// would otherwise keep a laxer mode forever, because currency is decided on
-		// content alone. Rewriting converges it: atomicfile chmods to the exact mode.
-		slog.Warn("prior pfx has an unexpected file mode; regenerating",
-			"path", rel, "mode", fi.Mode().Perm().String(), "want", os.FileMode(pfxFileMode).String())
-		return false, nil
-	case fi.Size() > maxPFXSize:
+	}
+
+	// Permission repair, not a verdict: it runs before every return below so a
+	// bundle this app keeps and one it is about to replace are treated alike, and
+	// so a rewrite that then fails does not leave a private key readable by the
+	// world with nothing logged.
+	s.tightenMode(rel, fi.Mode().Perm())
+
+	if fi.Size() > maxPFXSize {
 		slog.Warn("prior pfx exceeds the readable bound; regenerating",
 			"path", rel, "size", fi.Size(), "limit", maxPFXSize)
 		return false, nil
@@ -281,6 +290,110 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 		return false, nil
 	}
 	return decoded.MatchesAnalysis(want), nil
+}
+
+// modeNotTightenedMsg is the one message both tightening failures share — a refused
+// chmod and a chmod the filesystem accepted without storing — because the fact the
+// operator has to act on is identical: a bundle under /output is more permissive
+// than this app's policy and this app could not fix it.
+const modeNotTightenedMsg = "prior pfx is more permissive than policy and could not be tightened"
+
+// outputModeRemediation is that WARN's hint. Deliberately NOT outputPermRemediation:
+// there the app cannot read or write /output and ownership is the fix, while here it
+// can already do both and the permission bit itself is the problem — which an
+// ownership change alone need not fix, because a filesystem with mount-forced modes
+// stores no bit at all.
+const outputModeRemediation = "chmod the bundle to the wanted mode, and check that /output's filesystem honours permission bits"
+
+// chmodInRoot is tightenMode's confined chmod, indirected through a package var for
+// one reason: the filesystem this design exists to survive — one that ACCEPTS a
+// chmod and stores nothing (CIFS/vfat with mount-forced modes, some NFS squash
+// configs) — cannot be staged in a temp directory, so the property that matters
+// there (the bundle stays current, so nothing rewrites it in a loop) would otherwise
+// go unpinned. Same seam shape internal/watch uses for fsnotify.NewWatcher and main
+// for health.RunProbe.
+var chmodInRoot = (*os.Root).Chmod
+
+// laxerThanPolicy reports whether perm carries a permission bit pfxFileMode does
+// not.
+//
+// A bitmask test rather than an inequality, because a mode can differ from policy by
+// being STRICTER: 0400 and 0600 have nothing to tighten, while 0640, 0644 and 0700
+// each do.
+func laxerThanPolicy(perm os.FileMode) bool {
+	return perm&^pfxFileMode != 0
+}
+
+// tightenMode chmods a prior bundle whose mode is laxer than pfxFileMode back to
+// policy and reports when the tightening did not take effect. It moves permission
+// bits only: the bundle's bytes and its mtime are never touched, and its currency is
+// decided without reference to its mode.
+//
+// This replaces an earlier design that reported a mode mismatch as STALE so the
+// rewrite would converge the mode, which was wrong twice over. It replaced a
+// STRICTER bundle too — a deliberate 0400 was already perfectly usable, since the
+// atomic temp+rename never needs the old file to be owner-writable — handing back a
+// laxer 0600, discarding the protection the operator chose and moving the mtime for
+// no benefit. And on a filesystem that does not honour permission bits it could never
+// converge: the mode never sticks, so EVERY bundle failed the check on EVERY scan — a
+// permanent rewrite loop with fresh KDF salts and fresh mtimes, which the documented
+// downstream rsync replication then copies every cycle. That is the same trap
+// maxPFXSize's comment exists to avoid. chmod is the right tool for a permission
+// bit; rewriting the bundle is not, and a rewrite driven by a bit the filesystem
+// will not store cannot converge.
+//
+// Only the EXTRA bits are cleared, so the tightening can never add a bit the file
+// did not already carry and a deliberately stricter mode survives untouched.
+//
+// The chmod goes through the store's confined root like every other output touch, so
+// a symlink planted under the output tree cannot redirect it outside the mounted
+// volume. os.Root.Chmod does follow a symlink, and isCurrent's lstat cannot rule out
+// a swap in the window before this call, but the reach of that race is one permission
+// bit: it never touches content, and anyone able to stage the swap on a co-mounted
+// /output can already replace the bundle itself.
+func (s *store) tightenMode(rel string, perm os.FileMode) {
+	if !laxerThanPolicy(perm) {
+		return
+	}
+	want := perm & pfxFileMode
+	got, err := s.chmodAndObserve(rel, want)
+	switch {
+	case err != nil:
+		slog.Warn(modeNotTightenedMsg,
+			"path", rel, "mode", perm.String(), "want", want.String(),
+			"error", err, "remediation", outputModeRemediation)
+	case laxerThanPolicy(got):
+		// The filesystem took the chmod and kept nothing. Saying so is all this can
+		// do, and all it SHOULD do: the bytes are still the right bytes, so the bundle
+		// stays current and the WARN no longer drags a rewrite behind it.
+		slog.Warn(modeNotTightenedMsg,
+			"path", rel, "mode", got.String(), "want", want.String(),
+			"remediation", outputModeRemediation)
+	default:
+		// Named at the default level because this app just changed the permissions of
+		// a file on the operator's volume, as every other output-tree mutation is
+		// named (a write, a reaped temp, a removed orphan).
+		slog.Info("tightened the file mode of a prior pfx",
+			"path", rel, "from", perm.String(), "to", got.String())
+	}
+}
+
+// chmodAndObserve tightens rel to want inside the output tree and reports the mode
+// the filesystem actually stored.
+//
+// The re-stat is the point: a chmod's return value says the request was accepted,
+// not that the bits were kept, and the filesystems this app has to survive differ
+// exactly there — mount-forced modes store nothing, an inherited ACL can widen what
+// it is given.
+func (s *store) chmodAndObserve(rel string, want os.FileMode) (os.FileMode, error) {
+	if err := chmodInRoot(s.root, rel, want); err != nil {
+		return 0, fmt.Errorf("chmod: %w", err)
+	}
+	fi, err := s.lstat(rel)
+	if err != nil {
+		return 0, fmt.Errorf("re-stat after chmod: %w", err)
+	}
+	return fi.Mode().Perm(), nil
 }
 
 // readBoundedPFX reads rel from inside the output tree under maxPFXSize.

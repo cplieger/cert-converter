@@ -1,6 +1,7 @@
 package process
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io/fs"
@@ -482,13 +483,6 @@ func TestStoreIsCurrent_treats_an_undecodable_prior_as_stale(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(dir, tc.rel), tc.content, pfxFileMode); err != nil {
 				t.Fatalf("setup: WriteFile: %v", err)
 			}
-			// Chmod explicitly: a filesystem can widen the O_CREATE mode (an inherited
-			// ACL does), and isCurrent regenerates on an unexpected mode BEFORE it reads
-			// the file, so without this every case would be answered by the mode arm and
-			// never reach the preflight this test is named for.
-			if err := os.Chmod(filepath.Join(dir, tc.rel), pfxFileMode); err != nil {
-				t.Fatalf("setup: Chmod: %v", err)
-			}
 			logs := captureLogs(t)
 			current, err := s.isCurrent(t.Context(), tc.rel, &analysis, convert.EncNameModern2023, "pw")
 			if err != nil {
@@ -497,9 +491,9 @@ func TestStoreIsCurrent_treats_an_undecodable_prior_as_stale(t *testing.T) {
 			if current {
 				t.Errorf("isCurrent(%s) = true, want false: a file that is not this bundle must be rewritten", tc.name)
 			}
-			// Which arm answered matters as much as the answer: the mode arm and the
-			// size arm both reach this same verdict without reading the bundle, so
-			// asserting the outcome alone lets the preflight go unexercised.
+			// Which arm answered matters as much as the answer: the size arm reaches
+			// this same verdict without reading the bundle, so asserting the outcome
+			// alone lets the preflight go unexercised.
 			if !logs.Contains("prior pfx failed preflight; regenerating") {
 				t.Errorf("isCurrent(%s) logged %q, want the preflight notice: the stale verdict must come from the preflight, not from an earlier arm", tc.name, logs.Messages())
 			}
@@ -527,12 +521,6 @@ func TestStoreIsCurrent_regenerates_an_oversized_prior(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("setup: Close: %v", err)
 	}
-	// Chmod explicitly: some filesystems ignore the O_CREATE mode, and isCurrent now
-	// regenerates on an unexpected mode BEFORE it looks at the size, so the fixture
-	// has to carry the policy mode for this case to reach the size arm.
-	if err := os.Chmod(filepath.Join(dir, "big.pfx"), pfxFileMode); err != nil {
-		t.Fatalf("setup: Chmod: %v", err)
-	}
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		t.Fatalf("setup: os.OpenRoot: %v", err)
@@ -557,64 +545,206 @@ func TestStoreIsCurrent_regenerates_an_oversized_prior(t *testing.T) {
 	}
 }
 
-// TestStoreIsCurrent_regenerates_a_prior_with_a_lax_mode pins the file-mode arm of
-// the currency check. A bundle carries a private key, so pfxFileMode is this app's
-// policy for the file that is ON DISK, not just for the write that created it: a
-// content-identical bundle restored by cp/tar at 0644 would otherwise keep the lax
-// mode forever, because currency is decided on content alone. Regenerating converges
-// it (atomicfile chmods to the exact mode), and it must resolve to STALE rather than
-// to an error -- failing the pair would flip health over a file the app repairs
-// itself. Runs serially: it swaps slog.Default().
-func TestStoreIsCurrent_regenerates_a_prior_with_a_lax_mode(t *testing.T) {
+// TestStoreIsCurrent_tightens_a_lax_mode_without_regenerating pins the approved
+// replacement for the retired mode arm: pfxFileMode is enforced on a bundle already
+// on disk with a chmod, never with a rewrite, and only downward.
+//
+// Both halves are load-bearing. A bundle the operator made STRICTER than policy
+// (0400) is left exactly as it is — it was already usable, since the atomic
+// temp+rename never needs the old file to be owner-writable, and "converging" it to
+// 0600 would have discarded the protection they chose and moved its mtime. A LAXER
+// bundle is tightened in place, and the content-and-mtime assertions are what catch a
+// regression to rewriting it: a rewrite re-encodes with a fresh KDF salt and leaves a
+// fresh mtime, which the documented downstream rsync replication then copies again.
+//
+// The resulting mode is deliberately NOT asserted: a filesystem is allowed to refuse
+// the chmod (the next test covers that), so pinning it here would turn this into a
+// filesystem probe. Runs serially: it swaps slog.Default().
+func TestStoreIsCurrent_tightens_a_lax_mode_without_regenerating(t *testing.T) {
 	m := testcerts.GenerateChainMaterial(t)
 	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	dir := t.TempDir()
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
-	s := &store{root: root}
-	if err := s.write(t.Context(), "out.pfx", mustEncode(t, &analysis)); err != nil {
-		t.Fatalf("setup: write: %v", err)
-	}
+	for _, tc := range []struct {
+		name        string
+		mode        os.FileMode
+		wantTighten bool
+	}{
+		{"the policy mode is left alone", pfxFileMode, false},
+		{"a stricter read-only bundle is left alone", 0o400, false},
+		{"a group-readable bundle is tightened", 0o640, true},
+		{"a world-readable bundle is tightened", 0o644, true},
+		{"an execute bit is cleared too", 0o700, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatalf("setup: os.OpenRoot: %v", err)
+			}
+			defer root.Close()
+			s := &store{root: root}
+			if err := s.write(t.Context(), "out.pfx", mustEncode(t, &analysis)); err != nil {
+				t.Fatalf("setup: write: %v", err)
+			}
+			path := filepath.Join(dir, "out.pfx")
+			// Chmod explicitly: a filesystem can widen the mode O_CREATE asks for (an
+			// inherited ACL does), so the fixture cannot get tc.mode from the write.
+			if err := os.Chmod(path, tc.mode); err != nil {
+				t.Fatalf("setup: Chmod: %v", err)
+			}
+			wantContent, before := readBundle(t, path)
 
-	// The app's own write must converge the mode, or every scan would rewrite every
-	// bundle forever.
-	current, err := s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
-	if err != nil || !current {
-		t.Fatalf("isCurrent(freshly written bundle) = (%v, %v), want (true, nil): the mode arm must not"+
-			" fire on this app's own write", current, err)
-	}
+			logs := captureLogs(t)
+			// Spelled out rather than imported from the production const: an operator's
+			// log query keys on these words, so a silent rename must fail here.
+			const tightenedMsg = "tightened the file mode of a prior pfx"
+			current, err := s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+			if err != nil {
+				t.Fatalf("isCurrent(mode %o) = error %v, want nil", tc.mode, err)
+			}
+			if !current {
+				t.Errorf("isCurrent(mode %o) = false, want true: a permission bit is not part of currency,"+
+					" and rewriting for one cannot converge on a filesystem that will not store it", tc.mode)
+			}
 
-	// Same bytes, laxer mode: a cp/tar restore of the output volume.
-	if err := os.Chmod(filepath.Join(dir, "out.pfx"), 0o644); err != nil {
-		t.Fatalf("setup: Chmod: %v", err)
+			gotContent, after := readBundle(t, path)
+			if !bytes.Equal(gotContent, wantContent) {
+				t.Errorf("isCurrent(mode %o) changed the bundle's bytes; the mode must be fixed with a"+
+					" chmod, not by re-encoding it with a fresh salt", tc.mode)
+			}
+			if !after.ModTime().Equal(before.ModTime()) {
+				t.Errorf("isCurrent(mode %o) moved the mtime from %v to %v; a chmod does not, a rewrite does",
+					tc.mode, before.ModTime(), after.ModTime())
+			}
+			if tc.wantTighten {
+				if got := logs.CountLevel(slog.LevelInfo, tightenedMsg); got != 1 {
+					t.Errorf("isCurrent(mode %o) logged %q at INFO %d times, want exactly 1: %q",
+						tc.mode, tightenedMsg, got, logs.Messages())
+				}
+				if logs.Len() != 1 {
+					t.Errorf("isCurrent(mode %o) logged %q, want only the tighten notice: a repaired mode is"+
+						" not also a warning", tc.mode, logs.Messages())
+				}
+				return
+			}
+			if logs.Len() != 0 {
+				t.Errorf("isCurrent(mode %o) logged %q, want nothing at all: a mode at or stricter than"+
+					" policy is not this app's to touch", tc.mode, logs.Messages())
+			}
+			if got, want := after.Mode().Perm(), before.Mode().Perm(); got != want {
+				t.Errorf("isCurrent(mode %o) changed the mode to %v, want %v left untouched", tc.mode, got, want)
+			}
+		})
 	}
-	logs := captureLogs(t)
-	current, err = s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+}
+
+// TestStoreIsCurrent_keeps_a_bundle_whose_mode_cannot_be_tightened pins the
+// convergence property the retired mode arm got wrong.
+//
+// On a filesystem that will not store the bit — CIFS/vfat with mount-forced modes, an
+// NFS squash config, all plausible for the /output volume of a Synology deployment —
+// the old design called every bundle stale on every scan, so the "fix" was a
+// permanent rewrite loop: fresh KDF salts, fresh mtimes, and the documented
+// downstream rsync re-replicating the entire output tree every cycle. Here the bundle
+// stays CURRENT and the whole cost is one WARN per scan naming the mode found and the
+// mode wanted, which a second scan repeats rather than compounding.
+//
+// The chmod is stubbed because neither failure is reproducible in a temp directory:
+// the suite runs as root, so a refused chmod cannot be staged, and no local
+// filesystem ignores permission bits.
+// Runs serially: it swaps slog.Default() and the chmod seam.
+func TestStoreIsCurrent_keeps_a_bundle_whose_mode_cannot_be_tightened(t *testing.T) {
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
-		t.Fatalf("isCurrent(lax mode) = error %v, want nil: it must resolve to stale, not fail the pair", err)
+		t.Fatalf("setup: Analyse: %v", err)
 	}
-	if current {
-		t.Error("isCurrent(lax mode) = true, want false: a bundle holding a private key must not keep a" +
-			" laxer mode just because its contents match")
+	for _, tc := range []struct {
+		name  string
+		chmod func(*os.Root, string, os.FileMode) error
+	}{
+		{
+			"a filesystem that accepts the chmod and stores nothing",
+			func(*os.Root, string, os.FileMode) error { return nil },
+		},
+		{
+			"a chmod the filesystem refuses",
+			func(*os.Root, string, os.FileMode) error { return fs.ErrPermission },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatalf("setup: os.OpenRoot: %v", err)
+			}
+			defer root.Close()
+			s := &store{root: root}
+			if err := s.write(t.Context(), "out.pfx", mustEncode(t, &analysis)); err != nil {
+				t.Fatalf("setup: write: %v", err)
+			}
+			// Same bytes, laxer mode: a cp/tar restore of the output volume.
+			if err := os.Chmod(filepath.Join(dir, "out.pfx"), 0o644); err != nil {
+				t.Fatalf("setup: Chmod: %v", err)
+			}
+			prev := chmodInRoot
+			chmodInRoot = tc.chmod
+			t.Cleanup(func() { chmodInRoot = prev })
+
+			logs := captureLogs(t)
+			// Spelled out rather than imported from the production const: an operator's
+			// log query keys on these words, so a silent rename must fail here.
+			const notTightenedMsg = "prior pfx is more permissive than policy and could not be tightened"
+			current, err := s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+			if err != nil {
+				t.Fatalf("isCurrent(untightenable mode) = error %v, want nil", err)
+			}
+			if !current {
+				t.Error("isCurrent(untightenable mode) = false, want true: calling it stale is the rewrite" +
+					" loop this design exists to avoid")
+			}
+			if got := logs.CountLevel(slog.LevelWarn, notTightenedMsg); got != 1 {
+				t.Errorf("isCurrent(untightenable mode) logged %q at WARN %d times, want exactly 1: %q",
+					notTightenedMsg, got, logs.Messages())
+			}
+			// Keyed attributes, not a line substring: the mode found and the mode wanted
+			// must each appear under their own key, or a line naming one twice would pass.
+			for key, want := range map[string]string{"mode": "-rw-r--r--", "want": "-rw-------"} {
+				if !logs.HasAttr(notTightenedMsg, key, want) {
+					got, _ := logs.AttrValue(notTightenedMsg, key)
+					t.Errorf("isCurrent(untightenable mode) logged %s=%q, want %q", key, got, want)
+				}
+			}
+
+			// The next scan reaches the same verdict and says the same thing once more:
+			// steady state, not an escalation and not a rewrite.
+			current, err = s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+			if err != nil || !current {
+				t.Fatalf("isCurrent(untightenable mode, second scan) = (%v, %v), want (true, nil)", current, err)
+			}
+			if got := logs.CountLevel(slog.LevelWarn, notTightenedMsg); got != 2 {
+				t.Errorf("two scans logged %q at WARN %d times, want exactly 2 (one per scan): %q",
+					notTightenedMsg, got, logs.Messages())
+			}
+		})
 	}
-	const modeMsg = "prior pfx has an unexpected file mode"
-	if got := logs.CountLevel(slog.LevelWarn, modeMsg); got != 1 {
-		t.Errorf("isCurrent(lax mode) logged %q at WARN %d times, want exactly 1: %q", modeMsg, got, logs.Messages())
+}
+
+// readBundle returns a bundle's bytes and its FileInfo, so a caller can prove a
+// later call left both the contents and the mtime alone.
+func readBundle(t *testing.T, path string) ([]byte, os.FileInfo) {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read bundle %s: %v", path, err)
 	}
-	// Keyed attributes, not a line substring: the found mode and the policy mode must
-	// each appear under their own key, or a line naming one twice would pass.
-	for key, want := range map[string]string{"mode": "-rw-r--r--", "want": "-rw-------"} {
-		if !logs.HasAttr(modeMsg, key, want) {
-			got, _ := logs.AttrValue(modeMsg, key)
-			t.Errorf("isCurrent(lax mode) logged %s=%q, want %q", key, got, want)
-		}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat bundle %s: %v", path, err)
 	}
+	return content, fi
 }
 
 // TestStoreIsCurrent_propagates_a_shutdown_instead_of_reporting_stale pins the one
@@ -637,8 +767,8 @@ func TestStoreIsCurrent_propagates_a_shutdown_instead_of_reporting_stale(t *test
 	}
 	defer root.Close()
 	s := &store{root: root}
-	// Written through store.write, so the file carries pfxFileMode and the mode arm
-	// cannot answer in place of the read.
+	// Written through store.write, so the file on disk is a real bundle and only the
+	// read can answer the question.
 	if err := s.write(t.Context(), "out.pfx", mustEncode(t, &analysis)); err != nil {
 		t.Fatalf("setup: write: %v", err)
 	}
