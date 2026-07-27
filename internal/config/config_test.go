@@ -814,6 +814,52 @@ func TestLoad_blank_secret_file_obeys_the_same_optout(t *testing.T) {
 		}
 	})
 
+	// The blank-file-plus-opt-out configuration used to emit TWO WARNs, and the
+	// first one an operator read was the generic empty-password record whose
+	// remediation said "point PFX_PASSWORD_FILE at a mounted secret" — the step
+	// they had already taken. The generic record is now suppressed when the
+	// channel-specific one will report the same empty password, so the first
+	// (and only) instruction names the action that actually helps. The
+	// empty-password condition itself must still surface at WARN.
+	t.Run("the only guidance is to write the secret into the mounted file", func(t *testing.T) {
+		t.Setenv("PFX_PASSWORD", "")
+		t.Setenv("PFX_PASSWORD_FILE", blankFile(t))
+		t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "true")
+
+		logs := capture.Default(t)
+
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load(blank file, opt-out) = %v, want nil", err)
+		}
+
+		const blankFileWarn = "PFX_PASSWORD_FILE is blank"
+		if n := logs.CountLevel(slog.LevelWarn, "empty PFX password"); n != 1 {
+			t.Errorf("Load(blank file, opt-out) logged %d WARN records reporting the empty password, want exactly 1 (logs %v)",
+				n, logs.Messages())
+		}
+		if n := logs.Count("PFX_PASSWORD is empty"); n != 0 {
+			t.Errorf("Load(blank file, opt-out) logged %d generic empty-password records, want 0: the channel-specific WARN already reports it (logs %v)",
+				n, logs.Messages())
+		}
+		if !logs.AttrContains(blankFileWarn, "remediation", "write the secret into the mounted file") {
+			t.Errorf("Load(blank file, opt-out) %q WARN does not tell the operator to write the secret into the mounted file (logs %v)",
+				blankFileWarn, logs.Messages())
+		}
+		// No record may send an operator to point PFX_PASSWORD_FILE at a secret
+		// when it is already pointed at one. Checked across every attr of every
+		// record, not just the remediation of the record that carried it, so a
+		// future diagnostic repeating the wrong advice is caught too.
+		for _, r := range logs.Records() {
+			r.Attrs(func(a slog.Attr) bool {
+				if strings.Contains(a.Value.String(), "point PFX_PASSWORD_FILE") {
+					t.Errorf("Load(blank file, opt-out) record %q carries %s=%v, telling the operator to point PFX_PASSWORD_FILE at a secret it is already pointed at",
+						r.Message, a.Key, a.Value)
+				}
+				return true
+			})
+		}
+	})
+
 	t.Run("a blank file never falls back to PFX_PASSWORD", func(t *testing.T) {
 		t.Setenv("PFX_PASSWORD", "from-env")
 		t.Setenv("PFX_PASSWORD_FILE", blankFile(t))

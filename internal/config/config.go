@@ -145,7 +145,11 @@ func Load() (Config, error) {
 	// emitted last, immediately before Load returns: that keeps the baseline
 	// startup log order (delivery and channel diagnostics, then lifecycle,
 	// encoder and fallback diagnostics, then the weak-password warning, then
-	// main's "starting cert watcher" record).
+	// main's "starting cert watcher" record). One configuration drops a record
+	// from that order: a blank PFX_PASSWORD_FILE the opt-out let through is
+	// reported once, by the channel-specific delivery WARN, and the generic
+	// weak-password WARN is suppressed rather than repeating it with guidance
+	// aimed at the other channel.
 	status := classifyPassword(password)
 	if err := checkPasswordEncodable(password); err != nil {
 		return Config{}, fmt.Errorf("%w (supplied via %s)", err, passwordChannel(source))
@@ -166,7 +170,7 @@ func Load() (Config, error) {
 
 	fallbackInterval := FallbackInterval()
 	warnFallbackDisabled(fallbackInterval)
-	warnPasswordStrength(status)
+	warnPasswordStrength(status, blankSecretFile != nil)
 
 	return Config{
 		Password:         password,
@@ -383,9 +387,23 @@ func passwordChannel(source envx.SecretSource) string {
 // Load's package, so this one is too: keeping the classification and its WARN
 // tree in one place means a new PasswordStatus cannot gain a case without its
 // warning being considered in the same edit.
-func warnPasswordStrength(status PasswordStatus) {
+//
+// blankFileReported says logPasswordDelivery already reported this empty password
+// as a blank PFX_PASSWORD_FILE. In that configuration the generic empty-password
+// WARN is SUPPRESSED, because its remediation ("point PFX_PASSWORD_FILE at a
+// mounted secret") names the step the operator has already taken, and it is the
+// first line they read. The channel-specific WARN that replaces it reports the
+// same empty-password condition at WARN and names the action that actually helps
+// (write the secret into the mounted file), so nothing is quieter — the pair is
+// one accurate record instead of a wrong one followed by a right one. Only
+// PasswordEmpty can be reached this way: envx trims a file secret, so a
+// whitespace-only file arrives as ErrBlankSecretFile with an empty password.
+func warnPasswordStrength(status PasswordStatus, blankFileReported bool) {
 	switch status {
 	case PasswordEmpty:
+		if blankFileReported {
+			return
+		}
 		slog.Warn("PFX_PASSWORD is empty; generated PFX files protect the private key with an empty password",
 			"remediation", "set PFX_PASSWORD, or point PFX_PASSWORD_FILE at a mounted secret")
 	case PasswordWhitespaceOnly:
