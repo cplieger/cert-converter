@@ -321,18 +321,29 @@ func (w *Watcher) handleWatchAddError(root, path string, addErr error) error {
 
 // handleFsEvent processes a single fsnotify event, keeping the watch set in
 // sync with directory changes and reporting whether the event warrants a
-// rescan. The three event classes are handled distinctly:
+// rescan.
+//
+// THE UNCLASSIFIABLE-PATH RULE, shared by every arm that has to decide what a
+// path IS: a path this handler cannot stat cannot be told apart from a
+// directory, and layout.IsRelevant is a suffix-only classifier — a
+// domain-named directory such as "example.com" reads to it as an unrelated
+// file. Classifying by name there is how a renamed certificate directory was
+// once skipped outright, so an unclassifiable path ALWAYS schedules a rescan
+// instead of being classified by name. A rescan is cheap: the fingerprint
+// cache skips unchanged pairs and prunes vanished ones. A path that is merely
+// GONE (fs.ErrNotExist) is a different state, not an unclassifiable one -- it
+// is known to hold nothing, so the arms below classify it by name.
+//
+// The event classes are handled distinctly:
 //
 //   - Create: a new subtree is added to the watcher. A newly created directory
 //     triggers a rescan (it may already hold a cert/key pair created before the
 //     watch attached); a newly created file triggers one only if it is a cert
-//     or key.
-//   - Remove/Rename: always triggers a rescan. The path is already gone, so it
-//     cannot be stat-ed to tell a cert file from a directory — and a renamed or
-//     deleted domain-named directory (e.g. "example.com", whose ".com" suffix
-//     fooled the old extension heuristic into skipping it) must still be
-//     reflected in the output. A rescan is cheap: the fingerprint cache skips
-//     unchanged pairs and prunes vanished ones.
+//     or key; a path that cannot be classified takes the shared rule above.
+//   - Remove/Rename: always triggers a rescan. The path is already gone, so
+//     there is no stat to attempt and nothing to classify — the shared rule
+//     above, reached unconditionally — and a renamed or deleted domain-named
+//     directory must still be reflected in the output.
 //   - Write: triggers a rescan only for a cert or key file; a write to an
 //     unrelated file is ignored.
 //   - Chmod: triggers a rescan for a cert or key file, and for a directory it
@@ -340,7 +351,8 @@ func (w *Watcher) handleWatchAddError(root, path string, addErr error) error {
 //     pair (or a whole sub-directory) whose permissions were fixed after a
 //     failed or skipped conversion -- without it, recovery waits for the
 //     fallback tick (never, with the fallback disabled). A chmod on any other
-//     file schedules nothing.
+//     file schedules nothing, and one it cannot classify takes the shared rule
+//     above.
 func (w *Watcher) handleFsEvent(ctx context.Context, watcher *fsnotify.Watcher, event fsnotify.Event) bool {
 	slog.Debug("fs event", "op", event.Op.String(), "path", event.Name)
 	switch {
@@ -375,17 +387,24 @@ func (w *Watcher) handleCreate(ctx context.Context, watcher *fsnotify.Watcher, e
 	// would burn the watch quota.
 	info, err := os.Lstat(event.Name)
 	if err != nil {
-		// A vanished path is the expected case (an atomic-write temp created and
-		// renamed away before this event was handled), so it stays silent. Any
-		// other error means the created path could NOT be classified: if it was a
-		// directory it is now outside the watch set, and its renewals are covered
-		// only by the periodic fallback re-sync (never, with the fallback
-		// disabled). That is a degraded state an operator must be able to see.
-		if !errors.Is(err, fs.ErrNotExist) {
-			slog.Warn("cannot classify a created path; if it is a directory it stays unwatched until the next fallback re-sync",
-				"path", event.Name, "fallback_scan", w.fallbackStatus(), "error", err)
+		// A vanished path is known to be gone rather than unclassifiable (an
+		// atomic-write temp created and renamed away before this event was
+		// handled), so it stays silent and is classified by name.
+		if errors.Is(err, fs.ErrNotExist) {
+			return layout.IsRelevant(event.Name)
 		}
-		return layout.IsRelevant(event.Name)
+		// Any other error is the unclassifiable-path case described on
+		// handleFsEvent, and gets that rule's answer: rescan rather than guess
+		// from the suffix, because a created domain-named directory
+		// ("example.com") reads as an unrelated file to layout.IsRelevant, and a
+		// pair already inside it would then wait for the periodic fallback
+		// re-sync (never, with the fallback disabled). The WARN reports the half
+		// the rescan does not fix -- the subtree is outside the watch set, so its
+		// later renewals are covered only by that same fallback, which is a state
+		// an operator must be able to see.
+		slog.Warn("cannot classify a created path; rescanning because it may be a directory, but if it is one it stays unwatched until the next fallback re-sync",
+			"path", event.Name, "fallback_scan", w.fallbackStatus(), "error", err)
+		return true
 	}
 	if info.IsDir() {
 		if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
@@ -417,18 +436,19 @@ func (w *Watcher) handleChmod(ctx context.Context, watcher *fsnotify.Watcher, ev
 	// holds.
 	info, err := os.Lstat(event.Name)
 	if err != nil {
-		// A vanished path stays quiet and is classified by name: the chmod
-		// target is already gone, so there is nothing left to re-attach.
+		// A vanished path is known to be gone rather than unclassifiable, so it
+		// stays quiet and is classified by name: the chmod target no longer
+		// exists, so there is nothing left to re-attach.
 		if errors.Is(err, fs.ErrNotExist) {
 			return layout.IsRelevant(event.Name)
 		}
-		// Any other error means the path could NOT be classified, so the
-		// directory case cannot be ruled out. Falling through to the
-		// suffix-only classifier would silently drop a repaired
-		// domain-named directory back into the file arm, leaving it
-		// unwatched until the next fallback tick (never, with the fallback
-		// disabled). Rescan conservatively and make the degraded state
-		// visible.
+		// Any other error is the unclassifiable-path case described on
+		// handleFsEvent, and gets that rule's answer: rescan, because the
+		// directory case cannot be ruled out and the suffix-only classifier
+		// would silently drop a repaired domain-named directory into the file
+		// arm. The WARN reports the half the rescan does not fix -- the subtree
+		// stays unwatched until the next fallback tick (never, with the fallback
+		// disabled).
 		slog.Warn("cannot classify a path whose permissions changed; rescanning because it may be an unwatched directory",
 			"path", event.Name, "fallback_scan", w.fallbackStatus(), "error", err)
 		return true

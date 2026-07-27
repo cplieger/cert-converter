@@ -15,14 +15,19 @@ import (
 )
 
 // TestHandleFsEvent_classifies_a_create_it_cannot_stat pins both halves of the
-// Create-branch Lstat failure. A vanished path is the expected case (an
-// atomic-write temp renamed away before the event was handled) and must stay
-// silent while still falling back to the extension check; any other stat error
-// means the created path could not be classified at all, which leaves a
-// directory outside the watch set until the next fallback re-sync, so it must
-// WARN. An ENOTDIR path (a component of the path is a regular file) is the
-// portable way to produce that second case without depending on permissions,
-// which is untestable as uid 0.
+// Create-branch Lstat failure, which now answer the unclassifiable-path
+// question exactly as the Remove/Rename and Chmod arms do. A vanished path
+// (fs.ErrNotExist) is known to hold nothing rather than being unclassifiable,
+// so it stays silent and is still classified by extension. Any other stat
+// error means the created path could not be classified at all: it must
+// schedule a rescan rather than guess from the suffix -- a created domain-named
+// directory such as "example.com" reads as an unrelated file to the suffix-only
+// classifier, so guessing means a pair already inside it waits for the periodic
+// fallback re-sync, and never with the fallback disabled -- AND it must still
+// WARN, because the rescan does not re-attach the subtree's watches. An ENOTDIR
+// path (a component of the path is a regular file) is the portable way to
+// produce that second case without depending on permissions, which is
+// untestable as uid 0.
 // Not parallel: it swaps the process-global slog default.
 func TestHandleFsEvent_classifies_a_create_it_cannot_stat(t *testing.T) {
 	watcher := newTestWatcher(t)
@@ -43,7 +48,8 @@ func TestHandleFsEvent_classifies_a_create_it_cannot_stat(t *testing.T) {
 		{"a vanished cert still rescans, silently", filepath.Join(root, "gone.crt"), true, false},
 		{"a vanished unrelated file is ignored, silently", filepath.Join(root, "gone.txt"), false, false},
 		{"an unclassifiable cert path rescans and warns", filepath.Join(notADir, "tls.crt"), true, true},
-		{"an unclassifiable unrelated path is ignored but warns", filepath.Join(notADir, "notes.txt"), false, true},
+		{"an unclassifiable unrelated path rescans and warns", filepath.Join(notADir, "notes.txt"), true, true},
+		{"an unclassifiable domain-named path rescans and warns", filepath.Join(notADir, "example.com"), true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
