@@ -27,3 +27,8 @@ func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 	}
 	return keys[0], nil
 }
+
+// MaxVerifiableKeyBits is the signature-verification key ceiling, exported so the
+// external tests can build a key just above it instead of hardcoding a number that
+// silently stops testing the refusal if the ceiling ever moves up.
+const MaxVerifiableKeyBits = maxVerifiableKeyBits

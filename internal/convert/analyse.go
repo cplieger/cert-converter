@@ -141,7 +141,10 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 		})
 	}
 
-	g := newCertGraph(certs, now)
+	g, err := newCertGraph(certs, now)
+	if err != nil {
+		return Analysis{}, err
+	}
 
 	identity, tieObs, err := g.selectIdentity(signers)
 	if err != nil {
@@ -250,6 +253,10 @@ type certGraph struct {
 // 131072-bit modulus costs 184ms per verification and a 1-Mbit one 11.9s, against
 // 69us for RSA-2048. 16384 is far above anything issued (Let's Encrypt tops out at
 // RSA-4096) and keeps one verification in the low milliseconds.
+//
+// A certificate this bundle names as the issuer of another one is REFUSED when it
+// exceeds the ceiling, rather than carried as an unverified candidate edge; see
+// oversizedIssuerError for why degrading silently was the worse outcome.
 const maxVerifiableKeyBits = 16384
 
 // verifiableKey reports whether pub is small enough to verify against. Only RSA is
@@ -263,7 +270,24 @@ func verifiableKey(pub crypto.PublicKey) bool {
 	return k.N != nil && k.N.BitLen() <= maxVerifiableKeyBits
 }
 
-// newCertGraph derives both issuance edge sets.
+// rsaModulusBits reports the size of pub's RSA modulus, and 0 for any other key
+// type (or for the RSA key x509 left without a modulus, whose BitLen would panic
+// on the nil big.Int — ParseCertificate cannot produce one, since it rejects a
+// non-positive modulus outright).
+//
+// It answers nothing about verifiability: verifiableKey owns that decision, and
+// this exists only so the refusal can NAME the size an operator would otherwise
+// have to pull out of the file with openssl.
+func rsaModulusBits(pub crypto.PublicKey) int {
+	k, ok := pub.(*rsa.PublicKey)
+	if !ok || k.N == nil {
+		return 0
+	}
+	return k.N.BitLen()
+}
+
+// newCertGraph derives both issuance edge sets, or refuses the bundle outright
+// when a candidate issuer's key is one no signature can be checked against.
 //
 // Signature verification via x509.CheckSignatureFrom is CRYPTOGRAPHIC PARENT
 // EVIDENCE WITH LIMITED CA GATING, not path validation. Go documents it as
@@ -274,7 +298,11 @@ func verifiableKey(pub crypto.PublicKey) bool {
 // basic-constraints extension is not rejected by its IsCA check. Identity role is
 // therefore enforced separately, by Analyse's own issuer check, and that check
 // reads only the verified set.
-func newCertGraph(certs []*x509.Certificate, now time.Time) *certGraph {
+//
+// The refusal is decided on the candidate edges alone, before either distance walk
+// runs, so a bundle this app will not reason about costs it no signature
+// verifications at all.
+func newCertGraph(certs []*x509.Certificate, now time.Time) (*certGraph, error) {
 	g := &certGraph{
 		now:              now,
 		certs:            certs,
@@ -291,8 +319,49 @@ func newCertGraph(certs []*x509.Certificate, now time.Time) *certGraph {
 			g.children[parent] = append(g.children[parent], child)
 		}
 	}
+	if err := g.oversizedIssuerError(); err != nil {
+		return nil, err
+	}
 	g.computeDistances()
-	return g
+	return g, nil
+}
+
+// oversizedIssuerError refuses a bundle in which a certificate named as the
+// issuer of another one here holds a key no signature can be checked against —
+// which is an RSA modulus above maxVerifiableKeyBits — naming the size observed.
+// It reports nil for every other bundle, and reads verifiableKey rather than
+// re-deriving the ceiling, so the refusal is exactly the guard's negation and the
+// two cannot drift.
+//
+// The alternative is to carry such an edge as merely UNVERIFIED, which is what
+// the SHA-1 and name-encoding cases do — and that is safe only because nothing
+// competes with them. Here something does: a same-subject certificate holding an
+// ordinary key satisfies the identical name match, so BOTH candidate edges are
+// unverified, and betterParent then ranks them on validity, route to a root and
+// NotAfter — keys an impostor wins (the ceiling denies the oversized certificate
+// the root status the impostor's self-signature gets, and a longer NotAfter or the
+// DER tie-break settles the rest). The bundle would convert to a PFX whose chain
+// no consumer can verify, from input that resolved correctly before the ceiling
+// existed.
+//
+// Refusing costs nothing real: no CA issues RSA above 16384 bits, so an
+// over-ceiling issuer standing beside a same-subject decoy is an attack shape
+// rather than a configuration. No verification is attempted either way, which is
+// the point of the ceiling; only the outcome changes, from a silent wrong chain to
+// a named refusal.
+func (g *certGraph) oversizedIssuerError() error {
+	for i, c := range g.certs {
+		// A certificate this bundle names as nobody's issuer is never a parent in a
+		// signature check, so its size decides nothing: it can only be excluded, or
+		// kept by the additive fallback, and both say so out loud.
+		if len(g.children[i]) == 0 || verifiableKey(c.PublicKey) {
+			continue
+		}
+		return fmt.Errorf(
+			"certificate %q is named as the issuer of another certificate in this bundle and holds a %d-bit RSA key, above the %d-bit ceiling this app will verify a signature against; no signature can be checked against it, so its place in the chain could only be guessed; remove it from the bundle",
+			boundSubject(c.Subject.String()), rsaModulusBits(c.PublicKey), maxVerifiableKeyBits)
+	}
+	return nil
 }
 
 // plausibleIssuer reports whether certs[parent] could be the issuer of
@@ -328,10 +397,12 @@ func (g *certGraph) plausibleIssuer(child, parent int) bool {
 // memoised. This is the STRONG signal: a candidate edge only says the two names or
 // key identifiers line up, which an impostor sharing a subject can also satisfy.
 //
-// A parent whose public key exceeds maxVerifiableKeyBits is not verified at all.
-// That is a COST guard, not a trust decision: the edge simply stays unproven and
-// falls back to the inclusive candidate path, exactly as the SHA-1 and
-// name-encoding cases already do.
+// A parent whose public key exceeds maxVerifiableKeyBits is never verified: that
+// modexp is the cost the ceiling exists to refuse. No candidate parent reaches
+// here in that state, because newCertGraph refuses such a bundle before either
+// distance walk runs — an edge that can never be proven, standing beside a
+// same-subject certificate that can, is how an impostor wins a branch. The guard
+// stays as the backstop that keeps the expensive call unreachable whatever asks.
 func (g *certGraph) verifies(child, parent int) bool {
 	key := [2]int{child, parent}
 	if got, ok := g.verified[key]; ok {
@@ -374,9 +445,12 @@ func (g *certGraph) isIssuer(i int) bool {
 // certificate is still self-signed.
 //
 // A certificate whose own public key exceeds maxVerifiableKeyBits is reported as
-// not self-signed. That is a COST guard rather than a trust decision: the
-// certificate is simply not treated as a root for the distance walk, and every
-// input this app converts today still converts.
+// not self-signed — unverified rather than disproven — for the same cost reason
+// verifies applies the ceiling. After newCertGraph's refusal that answer is only
+// reachable for a certificate this bundle names as nobody's issuer, so it decides
+// only two harmless things: such a stray is no root for the distance walk, and if
+// it is the IDENTITY itself its empty chain counts as a failure to prove rather
+// than proof, so the additive fallback keeps the rest of the bundle and says so.
 func (g *certGraph) isSelfSigned(i int) bool {
 	c := g.certs[i]
 	if !bytes.Equal(c.RawSubject, c.RawIssuer) {

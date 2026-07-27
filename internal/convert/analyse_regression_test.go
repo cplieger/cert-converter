@@ -2,12 +2,15 @@ package convert_test
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"strings"
 	"testing"
@@ -16,12 +19,18 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 )
 
-// The shapes in this file all come from the dual-model adversarial review of the
-// structural Analyse rewrite. Each one was REPRODUCED against the first
-// implementation, so each test here fails without its fix.
+// The shapes in this file all come from adversarial review of the structural
+// Analyse rewrite, and of the guards later added to it. Each one was REPRODUCED
+// against the implementation it found wanting, so each test here fails without its
+// fix.
 
 // mint builds a certificate. parentCert/parentKey nil means self-signed.
-func mint(t *testing.T, tmpl *x509.Certificate, pub *ecdsa.PublicKey,
+//
+// pub is a crypto.PublicKey rather than an *ecdsa.PublicKey because the subject's
+// key and the SIGNING key are independent inputs to x509.CreateCertificate: an
+// adversarial bundle needs a certificate carrying an RSA key it could not possibly
+// have signed with. Every ordinary caller still passes &key.PublicKey.
+func mint(t *testing.T, tmpl *x509.Certificate, pub crypto.PublicKey,
 	parentCert *x509.Certificate, parentKey *ecdsa.PrivateKey,
 ) (certPEM []byte, parsed *x509.Certificate) {
 	t.Helper()
@@ -60,6 +69,30 @@ func newKey(t *testing.T) *ecdsa.PrivateKey {
 		t.Fatalf("setup: GenerateKey: %v", err)
 	}
 	return k
+}
+
+// oversizedRSAPublicKey fabricates an RSA public key whose modulus is exactly bits
+// bits long. The modulus is not a product of primes and nothing can sign with it,
+// which is all an over-ceiling issuer needs to be: the key size is read out of the
+// SubjectPublicKeyInfo, and the point of the ceiling is that no signature is ever
+// checked against such a key. Generating a real 16k-bit RSA key costs minutes, so
+// no test may do that.
+func oversizedRSAPublicKey(bits uint) *rsa.PublicKey {
+	// Lsh(1, bits-1) is the smallest integer of that bit length; +1 makes it odd,
+	// as a real modulus is, and keeps it the positive value x509 requires.
+	n := new(big.Int).Lsh(big.NewInt(1), bits-1)
+	return &rsa.PublicKey{N: n.Add(n, big.NewInt(1)), E: 65537}
+}
+
+// chainSerials renders an emitted chain's serial numbers. Serials are what tell
+// two same-subject candidates apart in a failure message, where the subject by
+// definition cannot.
+func chainSerials(chain []*x509.Certificate) []string {
+	out := make([]string, 0, len(chain))
+	for _, c := range chain {
+		out = append(out, c.SerialNumber.String())
+	}
+	return out
 }
 
 // assertOrderInvariant runs Analyse over every rotation of certBlobs and asserts
@@ -642,5 +675,149 @@ func TestAnalyse_prefers_the_issuer_whose_route_to_a_root_verifies(t *testing.T)
 					got.Chain[0].SerialNumber, got.Chain[1].SerialNumber, err)
 			}
 		})
+	}
+}
+
+// TestAnalyse_refuses_an_over_ceiling_rsa_issuer pins the refusal that the key
+// ceiling has to carry, and with it the invariant
+// TestAnalyse_prefers_the_certificate_that_actually_signed_the_leaf states.
+//
+// The ceiling stops a file from dictating CPU cost: no signature is verified
+// against an RSA key above maxVerifiableKeyBits, because one modexp with an
+// oversized modulus runs for seconds to minutes on the scan's only goroutine and
+// cannot be cancelled. Leaving such an edge merely UNVERIFIED, the way the SHA-1
+// and name-encoding cases are, is what created a second defect: a same-subject
+// certificate holding an ordinary key satisfies the identical name match, so both
+// candidate edges are unverified, and betterParent then ranks them on keys the
+// impostor wins — it is a self-signed root (which the ceiling denies the oversized
+// certificate), it expires later, or it takes the DER tie-break. The PFX written
+// from that carries a chain no consumer can verify, from input that resolved
+// correctly before the ceiling existed.
+//
+// So the bundle is refused, naming the size observed. Both input orders are
+// asserted: a refusal that depended on which candidate came first would be the
+// same order-dependence every other test in this file exists to prevent.
+func TestAnalyse_refuses_an_over_ceiling_rsa_issuer(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	const (
+		contestedCN   = "Oversized Issuer CA"
+		oversizedBits = convert.MaxVerifiableKeyBits + 17
+	)
+
+	ca := func(serial int64, notAfter time.Time) *x509.Certificate {
+		return &x509.Certificate{
+			SerialNumber:          big.NewInt(serial),
+			Subject:               pkix.Name{CommonName: contestedCN},
+			NotBefore:             notBefore,
+			NotAfter:              notAfter,
+			IsCA:                  true,
+			BasicConstraintsValid: true,
+			KeyUsage:              x509.KeyUsageCertSign,
+		}
+	}
+
+	// The over-ceiling candidate issuer: the leaf's issuer name over a modulus past
+	// the ceiling. Its own signature is from a throwaway key, because nothing here
+	// reads that signature — the refusal is decided on the modulus in the
+	// SubjectPublicKeyInfo — and minting it for real would mean generating a
+	// 16k-bit RSA key, which costs minutes.
+	throwawayKey := newKey(t)
+	oversizedPEM, oversizedCert := mint(t, ca(210, notBefore.Add(240*time.Hour)),
+		oversizedRSAPublicKey(oversizedBits), nil, throwawayKey)
+	if k, ok := oversizedCert.PublicKey.(*rsa.PublicKey); !ok || k.N.BitLen() != oversizedBits {
+		t.Fatalf("setup: minted certificate carries a %T, want a %d-bit RSA modulus; x509 no longer parses one that large",
+			oversizedCert.PublicKey, oversizedBits)
+	}
+
+	// The same-subject decoy with an ordinary key. Self-signed, so it reaches a root
+	// in zero hops and outranks the oversized certificate on every key left once
+	// neither edge can be verified.
+	decoyKey := newKey(t)
+	decoyPEM, _ := mint(t, ca(211, notBefore.Add(72*time.Hour)), &decoyKey.PublicKey, nil, decoyKey)
+
+	// The leaf's real signer shares that subject and is NOT in the bundle, so
+	// neither candidate edge verifies — the state the ceiling produces for a leaf
+	// whose genuine issuer is the oversized one.
+	absentKey := newKey(t)
+	_, absentCACert := mint(t, ca(212, notBefore.Add(240*time.Hour)), &absentKey.PublicKey, nil, absentKey)
+
+	leafKey := newKey(t)
+	leafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(213),
+		Subject:      pkix.Name{CommonName: "oversized-issuer-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, absentCACert, absentKey)
+
+	for _, order := range []struct {
+		name  string
+		certs [][]byte
+	}{
+		{"oversized first", [][]byte{leafPEM, oversizedPEM, decoyPEM}},
+		{"decoy first", [][]byte{leafPEM, decoyPEM, oversizedPEM}},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := convert.Analyse(concatPEM(order.certs...), keyPEMOf(t, leafKey))
+			if err == nil {
+				t.Fatalf("Analyse(leaf + a %d-bit RSA issuer + a same-subject ordinary-key certificate) = nil error and a chain of serial(s) %v, want a refusal: with the oversized edge left unverified the decoy (serial 211) outranks it, so the emitted chain does not verify",
+					oversizedBits, chainSerials(got.Chain))
+			}
+			// The size and the subject are what make the refusal actionable: which
+			// certificate to remove, and the fact that its key is why.
+			for _, want := range []string{fmt.Sprintf("%d-bit", oversizedBits), contestedCN} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Analyse error = %q, want it to name %q", err.Error(), want)
+				}
+			}
+		})
+	}
+}
+
+// TestAnalyse_converts_beside_an_over_ceiling_certificate_that_issues_nothing keeps
+// the refusal narrow, the way the self-signed carve-out keeps the additive fallback
+// narrow. A certificate this bundle names as nobody's issuer is never a parent in a
+// signature check, so its key size decides nothing: it can only be excluded (said
+// out loud) or kept by the additive fallback (also said out loud). Refusing the
+// whole pair over it would turn a convertible input into a conversion failure,
+// which withholds the health marker and restart-loops the container.
+func TestAnalyse_converts_beside_an_over_ceiling_certificate_that_issues_nothing(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	identityKey := newKey(t)
+	identityPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(214),
+		Subject:      pkix.Name{CommonName: "narrow-refusal.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &identityKey.PublicKey, nil, identityKey)
+
+	// Oversized, and unrelated to the identity by name and by key identifier, so it
+	// is a candidate issuer of nothing here.
+	throwawayKey := newKey(t)
+	strangerPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(215),
+		Subject:               pkix.Name{CommonName: "Unrelated Oversized CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(240 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, oversizedRSAPublicKey(convert.MaxVerifiableKeyBits+17), nil, throwawayKey)
+
+	got, err := convert.Analyse(concatPEM(identityPEM, strangerPEM), keyPEMOf(t, identityKey))
+	if err != nil {
+		t.Fatalf("Analyse(self-signed identity + an unrelated oversized certificate) = error %v, want nil: an oversized certificate that issues nothing here cannot influence the chain", err)
+	}
+	if len(got.Chain) != 0 {
+		t.Errorf("chain length = %d, want 0: a self-signed identity has no chain", len(got.Chain))
+	}
+	if len(got.Extra) != 1 {
+		t.Fatalf("Extra holds %d certificate(s), want the unrelated oversized certificate excluded", len(got.Extra))
+	}
+	if !hasObservation(got.Observations, convert.ObsExtraCertsExcluded) {
+		t.Errorf("observations = %v, want the exclusion reported", got.Observations)
 	}
 }
