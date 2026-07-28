@@ -173,7 +173,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	if rc.enumerationClean() {
 		s.observations.forget(sw.seen)
 	}
-	removed, reconcileErr := out.reconcile(ctx, s.opts.Lifecycle, sw.seen, &rc)
+	removed, reconcileErr := out.reconcile(ctx, s.opts.Lifecycle, sw.src, sw.seen, &rc)
 	result.Removed = removed
 	// A shutdown that arrives after the input walk completed cancels reconciliation
 	// instead, and that scan is NOT complete: without folding the error in, the

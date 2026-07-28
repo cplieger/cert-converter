@@ -4,17 +4,34 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 )
+
+// newInputSource opens a confined source over dir: the INPUT tree the reap's
+// confirming re-check consults before deleting anything. Most reconcile cases want it
+// EMPTY, which is the ordinary deletion path — a certificate absent at walk time and
+// still absent at the re-check.
+func newInputSource(t *testing.T, dir string) *source {
+	t.Helper()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot(%s): %v", dir, err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	return &source{root: root}
+}
 
 // TestStoreReconcile pins every rail on orphan deletion. Each case is a way the
 // gate must refuse, because getting a deletion wrong destroys private key material
@@ -29,7 +46,11 @@ func TestStoreReconcile(t *testing.T) {
 		wantPresent bool
 	}{
 		{
-			name: "sync removes an orphan after a clean complete scan",
+			// The delay is a confirmation step, not a veto: a certificate absent at walk
+			// time AND still absent at the re-check is the ordinary deletion path, and it
+			// completes within the SAME scan (the user's rejected alternative, two clean
+			// scans, would have left the bundle for up to FALLBACK_SCAN_HOURS).
+			name: "sync removes an orphan after a clean complete scan and a confirming re-check",
 			mode: outputpolicy.LifecycleSync, rc: &reapContext{result: ScanResult{Total: 1}, walkCompleted: true},
 			wantDeleted: 1, wantPresent: false,
 		},
@@ -98,7 +119,7 @@ func TestStoreReconcile(t *testing.T) {
 			s := &store{root: root}
 			seen := map[string]struct{}{"live.crt": {}}
 
-			got, err := s.reconcile(context.Background(), tc.mode, seen, tc.rc)
+			got, err := s.reconcile(context.Background(), tc.mode, newInputSource(t, t.TempDir()), seen, tc.rc)
 			if err != nil {
 				t.Errorf("reconcile = error %v, want nil: only a cancelled scan reports one", err)
 			}
@@ -143,7 +164,8 @@ func TestStoreReconcile_warn_mode_reports_report_only_despite_a_conversion_failu
 	s := &store{root: root}
 
 	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleWarn,
-		map[string]struct{}{}, &reapContext{result: ScanResult{Total: 1, Failed: 1}, walkCompleted: true})
+		newInputSource(t, t.TempDir()), map[string]struct{}{},
+		&reapContext{result: ScanResult{Total: 1, Failed: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Fatalf("reconcile(warn, one failed conversion) = error %v, want nil", reconcileErr)
 	}
@@ -183,7 +205,8 @@ func TestStoreReconcile_unsafe_output_walk_never_advises_deletion(t *testing.T) 
 	s := &store{root: root}
 
 	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync,
-		map[string]struct{}{}, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+		newInputSource(t, t.TempDir()), map[string]struct{}{},
+		&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Fatalf("reconcile(unsafe output walk) = error %v, want nil", reconcileErr)
 	}
@@ -224,7 +247,8 @@ func TestStoreReconcile_vanished_input_is_reported_at_debug_not_as_a_mount_warni
 	s := &store{root: root}
 
 	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync,
-		map[string]struct{}{}, &reapContext{result: ScanResult{Total: 1, Vanished: 1}, walkCompleted: true})
+		newInputSource(t, t.TempDir()), map[string]struct{}{},
+		&reapContext{result: ScanResult{Total: 1, Vanished: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Fatalf("reconcile(vanished input) = error %v, want nil", reconcileErr)
 	}
@@ -291,6 +315,150 @@ func TestSampleOrphanPaths_bounds_the_logged_sample(t *testing.T) {
 	}
 }
 
+// TestSampleOrphanPaths_bounds_the_sample_by_bytes pins the BYTE budget on the same
+// attribute, which the item cap above does not provide: one root-relative path is
+// bounded only by the filesystem, so maxLoggedOrphans deeply nested names can still put
+// tens of kilobytes into a WARN that repeats on every scan for as long as the orphan
+// exists. The three cases are the three ways this can go wrong: a normal report losing
+// paths to the new cap, an oversized one not being cut (or being cut THROUGH a rune),
+// and one cap replacing the other instead of composing with it.
+func TestSampleOrphanPaths_bounds_the_sample_by_bytes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a realistic sample well under the budget is unchanged", func(t *testing.T) {
+		t.Parallel()
+		paths := make([]string, 0, maxLoggedOrphans)
+		for i := range maxLoggedOrphans {
+			paths = append(paths, fmt.Sprintf("example.com/host%02d/fullchain.pfx", i))
+		}
+		want := strings.Join(paths, ",")
+		if len(want) > maxLoggedOrphanBytes {
+			t.Fatalf("setup: %d realistic paths render to %d bytes, which is not below the %d-byte budget this case is about",
+				len(paths), len(want), maxLoggedOrphanBytes)
+		}
+		got := sampleOrphanPaths(paths)
+		if got != want {
+			t.Errorf("sampleOrphanPaths(%d realistic paths) = %q, want it byte-for-byte %q: the byte cap must not touch an ordinary report",
+				len(paths), got, want)
+		}
+		if strings.Contains(got, truncationMarker) {
+			t.Errorf("sampleOrphanPaths(%d realistic paths) = %q, want no %q marker on a sample inside the budget",
+				len(paths), got, truncationMarker)
+		}
+	})
+
+	// Multi-byte names, deliberately: every rune here is three bytes and
+	// maxLoggedOrphanBytes is not a multiple of three, so the cut offset lands INSIDE a
+	// rune. A naive slice would leave a partial-rune tail whose raw 0x80-0x9F bytes a
+	// non-UTF-8 terminal reads as C1 escape introducers, which is the class
+	// runesafe.CapBytes exists to prevent.
+	t.Run("an oversized sample is cut on a rune boundary and marked", func(t *testing.T) {
+		t.Parallel()
+		paths := []string{strings.Repeat("→", maxLoggedOrphanBytes) + "/leaf.pfx"}
+		got := sampleOrphanPaths(paths)
+		if !strings.HasSuffix(got, truncationMarker) {
+			t.Errorf("sampleOrphanPaths(one %d-byte path) rendered %d bytes without the %q marker: a reader cannot tell the list was cut",
+				len(paths[0]), len(got), truncationMarker)
+		}
+		if max := maxLoggedOrphanBytes + len(truncationMarker); len(got) > max {
+			t.Errorf("sampleOrphanPaths(one %d-byte path) rendered %d bytes, want at most %d",
+				len(paths[0]), len(got), max)
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("sampleOrphanPaths(one %d-byte path) rendered invalid UTF-8: the cut split a rune", len(paths[0]))
+		}
+		kept := strings.TrimSuffix(got, truncationMarker)
+		if !strings.HasPrefix(paths[0], kept) {
+			t.Errorf("sampleOrphanPaths(one %d-byte path) kept %d bytes that are not a prefix of the path: the sample must not rewrite a name",
+				len(paths[0]), len(kept))
+		}
+		// The rune backoff may discard up to utf8.UTFMax-1 bytes below the budget and no
+		// more; a cap that threw away much more would be a silent second truncation.
+		if min := maxLoggedOrphanBytes - (utf8.UTFMax - 1); len(kept) < min {
+			t.Errorf("sampleOrphanPaths(one %d-byte path) kept only %d bytes, want at least %d: the rune backoff must not discard more than one rune",
+				len(paths[0]), len(kept), min)
+		}
+	})
+
+	// Both caps engage on the same sample. The byte cut must not swallow the item
+	// cap's elision notice, because the notice (with the record's own count attribute)
+	// is what tells the operator how many bundles are affected once names are cut.
+	t.Run("the item cap and the byte cap compose", func(t *testing.T) {
+		t.Parallel()
+		const elidedCount = 5
+		long := strings.Repeat("d", 300)
+		paths := make([]string, 0, maxLoggedOrphans+elidedCount)
+		for i := range maxLoggedOrphans + elidedCount {
+			paths = append(paths, fmt.Sprintf("%s/%02d.pfx", long, i))
+		}
+		got := sampleOrphanPaths(paths)
+		wantMore := fmt.Sprintf(" (+%d more)", elidedCount)
+		if !strings.HasSuffix(got, wantMore) {
+			t.Errorf("sampleOrphanPaths(%d oversized paths) rendered %d bytes not ending in %q: the byte cap dropped the item cap's scale",
+				len(paths), len(got), wantMore)
+		}
+		if !strings.Contains(got, truncationMarker) {
+			t.Errorf("sampleOrphanPaths(%d oversized paths) rendered %d bytes without the %q marker: the item cap is not a byte bound",
+				len(paths), len(got), truncationMarker)
+		}
+		if max := maxLoggedOrphanBytes + len(truncationMarker) + len(wantMore); len(got) > max {
+			t.Errorf("sampleOrphanPaths(%d oversized paths) rendered %d bytes, want at most %d", len(paths), len(got), max)
+		}
+	})
+}
+
+// TestStoreReconcile_oversized_orphan_sample_keeps_the_count drives the byte cap
+// through the real report. The paths attribute is a sample and may be cut; the count
+// attribute is the actionable number and must survive that cut, or an operator reading
+// a truncated list cannot tell whether 20 or 2000 bundles are stale. Asserted on the
+// emitted record rather than on sampleOrphanPaths, because the count is a SEPARATE
+// attribute at the call site and that separation is the whole guarantee. Serial:
+// captureLogs swaps the process-global slog.Default.
+func TestStoreReconcile_oversized_orphan_sample_keeps_the_count(t *testing.T) {
+	dir := t.TempDir()
+	// Long enough that maxLoggedOrphans of them exceed the byte budget, short enough to
+	// stay inside the 255-byte filename limit.
+	const nameLen = 250
+	for i := range maxLoggedOrphans {
+		name := strings.Repeat(string(rune('a'+i)), nameLen-len(".pfx")) + ".pfx"
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("pfx"), 0o600); err != nil {
+			t.Fatalf("setup: WriteFile: %v", err)
+		}
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	logs := captureLogs(t)
+	s := &store{root: root}
+
+	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleWarn,
+		newInputSource(t, t.TempDir()), map[string]struct{}{},
+		&reapContext{result: ScanResult{Total: maxLoggedOrphans}, walkCompleted: true})
+	if reconcileErr != nil {
+		t.Fatalf("reconcile(%d oversized orphan names) = error %v, want nil", maxLoggedOrphans, reconcileErr)
+	}
+	if deleted != 0 {
+		t.Errorf("reconcile(warn mode) deleted = %d, want 0", deleted)
+	}
+	const msg = "output bundles have no matching input"
+	if want := fmt.Sprint(maxLoggedOrphans); !logs.HasAttr(msg, "count", want) {
+		got, _ := logs.AttrValue(msg, "count")
+		t.Errorf("orphan report logged count %q, want %q: the count must survive the paths cut", got, want)
+	}
+	paths, ok := logs.AttrValue(msg, "paths")
+	if !ok {
+		t.Fatalf("orphan report logged no paths attribute; records: %v", logs.Messages())
+	}
+	if !strings.HasSuffix(paths, truncationMarker) {
+		t.Errorf("orphan report logged a %d-byte paths attribute without the %q marker", len(paths), truncationMarker)
+	}
+	if max := maxLoggedOrphanBytes + len(truncationMarker); len(paths) > max {
+		t.Errorf("orphan report logged a %d-byte paths attribute, want at most %d", len(paths), max)
+	}
+}
+
 // TestStoreRemoveOrphans_cancelled_context_stops_before_deletion pins
 // removeOrphans' own shutdown guard: a scan cancelled by SIGTERM must delete no
 // key material and must report the cancellation, so the caller can classify the
@@ -348,8 +516,8 @@ func TestStoreReconcile_propagates_a_shutdown_from_the_orphan_walk(t *testing.T)
 
 	// sync over a tree with one orphan: the mode that would delete, so nothing about
 	// the arrangement excuses the refusal except the cancellation itself.
-	deleted, err := s.reconcile(ctx, outputpolicy.LifecycleSync, map[string]struct{}{},
-		&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+	deleted, err := s.reconcile(ctx, outputpolicy.LifecycleSync, newInputSource(t, t.TempDir()),
+		map[string]struct{}{}, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("reconcile(cancelled ctx) error = %v, want context.Canceled so Run does not report a complete scan", err)
@@ -448,7 +616,8 @@ func TestStoreReconcile_sync_spares_a_nested_live_bundle(t *testing.T) {
 	s := &store{root: root}
 	seen := map[string]struct{}{filepath.Join("acme-v02", "example.com", "live.crt"): {}}
 
-	got, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync, seen, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+	got, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync, newInputSource(t, t.TempDir()),
+		seen, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Errorf("reconcile(nested output tree) = error %v, want nil", reconcileErr)
 	}
@@ -1028,6 +1197,223 @@ func TestCurrentFromCurrency_maps_every_outcome(t *testing.T) {
 			}
 			if !logs.HasAttr(tc.wantMsg, "path", "example.com/tls.pfx") {
 				t.Errorf("currentFromCurrency(%s) logged %q, want the output path named", tc.res.Reason, logs.Messages())
+			}
+		})
+	}
+}
+
+// stubReapWait swaps the reap deferral's wait for during, restoring whatever was
+// installed (TestMain's no-op, in the normal case) when the test ends. Every caller
+// runs serially: the var is package state.
+func stubReapWait(t *testing.T, during func(ctx context.Context) error) {
+	t.Helper()
+	prev := waitBeforeReap
+	waitBeforeReap = func(ctx context.Context, _ time.Duration) error { return during(ctx) }
+	t.Cleanup(func() { waitBeforeReap = prev })
+}
+
+// TestWaitForReapDeferral pins the production wait itself, which no other test
+// reaches: TestMain replaces waitBeforeReap for the whole package so the suite does
+// not spend reapDeferral per case, and this is what keeps the real function's two
+// outcomes covered. The cancellation arm is the load-bearing one — the wait blocks the
+// scan's only goroutine, so a wait that ignored the context would hold SIGTERM for
+// reapDeferral and then delete key material on the way out.
+func TestWaitForReapDeferral(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a cancelled context returns immediately without waiting out the delay", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		start := time.Now()
+		// An hour: if the select ignored the context this case would hang, and no
+		// wall-clock threshold would be needed to tell.
+		if err := waitForReapDeferral(ctx, time.Hour); !errors.Is(err, context.Canceled) {
+			t.Errorf("waitForReapDeferral(cancelled ctx) = %v, want context.Canceled", err)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("waitForReapDeferral(cancelled ctx) took %v, want an immediate return", elapsed)
+		}
+	})
+
+	t.Run("an elapsed delay returns nil", func(t *testing.T) {
+		t.Parallel()
+		if err := waitForReapDeferral(context.Background(), time.Millisecond); err != nil {
+			t.Errorf("waitForReapDeferral(elapsed delay) = %v, want nil", err)
+		}
+	})
+}
+
+// TestStoreReconcile_spares_an_orphan_whose_certificate_returns_during_the_recheck is
+// the reason the deferral exists. A producer that replaces a certificate by
+// unlink-then-write, or an rsync that deletes before it transfers, is observed between
+// the two steps by the very scan the removal event scheduled (internal/watch requests
+// a rescan on any Remove; the debounce is 2s). Every reap veto passes — the walk
+// completed, nothing was unreadable, another pair is present, no conversion failed —
+// so without the re-check the bundle is deleted and then regenerated with fresh KDF
+// salts and a fresh mtime, which is the downstream re-replication output-derived
+// currency exists to prevent.
+//
+// The re-check cancelling one deletion is an ordinary producer transaction, not an
+// error: the scan must still report success (health is derived from conversion
+// failures, so a scan error here is what would flip it) and every OTHER candidate must
+// still be reaped. Serial: it swaps waitBeforeReap and slog.Default.
+func TestStoreReconcile_spares_an_orphan_whose_certificate_returns_during_the_recheck(t *testing.T) {
+	out := t.TempDir()
+	for _, name := range []string{"returning.pfx", "gone.pfx"} {
+		if err := os.WriteFile(filepath.Join(out, name), []byte("pfx"), 0o600); err != nil {
+			t.Fatalf("setup: WriteFile(%s): %v", name, err)
+		}
+	}
+	outRoot, err := os.OpenRoot(out)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	t.Cleanup(func() { _ = outRoot.Close() })
+	in := t.TempDir()
+	s := &store{root: outRoot}
+	// The producer's write lands INSIDE the deferral window, after the candidates were
+	// identified and before they are confirmed.
+	stubReapWait(t, func(context.Context) error {
+		return os.WriteFile(filepath.Join(in, "returning.crt"), []byte("cert"), 0o600)
+	})
+	logs := captureLogs(t)
+
+	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync,
+		newInputSource(t, in), map[string]struct{}{},
+		&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+
+	if reconcileErr != nil {
+		t.Fatalf("reconcile(certificate returned during the re-check) = error %v, want nil:"+
+			" a producer transaction is not a scan failure and must not flip health", reconcileErr)
+	}
+	if deleted != 1 {
+		t.Errorf("reconcile(certificate returned during the re-check) deleted = %d, want 1:"+
+			" only the candidate whose certificate stayed gone may go", deleted)
+	}
+	if _, statErr := os.Stat(filepath.Join(out, "returning.pfx")); statErr != nil {
+		t.Errorf("the bundle whose certificate came back was deleted: %v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(out, "gone.pfx")); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("os.Stat(gone.pfx) = %v, want fs.ErrNotExist: one cancelled deletion must not"+
+			" spare the rest of the batch", statErr)
+	}
+	const kept = "keeping an output bundle whose certificate came back during the confirmation delay"
+	if logs.CountLevel(slog.LevelInfo, kept) != 1 {
+		t.Errorf("reconcile logged %q, want the cancelled deletion named once at INFO", logs.Messages())
+	}
+	if !logs.HasAttr(reapRecheckMsg, "recheck_in", reapDeferral.String()) {
+		got, _ := logs.AttrValue(reapRecheckMsg, "recheck_in")
+		t.Errorf("the deferral announcement logged recheck_in %q, want %q: an operator reading a"+
+			" pause in the log has to be told how long it lasts", got, reapDeferral.String())
+	}
+}
+
+// TestStoreReconcile_shutdown_during_the_recheck_abandons_the_reap pins the
+// cancellation contract of the window itself, which is the cost of waiting at all: the
+// wait blocks the Scanner's only goroutine, so a SIGTERM arriving inside it must
+// ABANDON the reap — delete nothing — and report the cancellation the way every other
+// interrupted path in this file does, or Run logs "scan complete" and leaves the health
+// marker set for a scan that stopped halfway through the output tree.
+//
+// The Debug trace is asserted too, because it is what distinguishes abandoning the
+// window from the next guard downstream: removeOrphans re-checks the context before
+// every unlink, so a wait whose error were dropped would still delete nothing — and
+// nothing would record that the deferral was cut short.
+// Serial: it swaps waitBeforeReap and slog.Default.
+func TestStoreReconcile_shutdown_during_the_recheck_abandons_the_reap(t *testing.T) {
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, "orphan.pfx")
+	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	s := &store{root: root}
+	// A context that is live when the candidates are identified and cancelled inside
+	// the window, which is the only arrangement the earlier shutdown guards cannot
+	// already catch.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	stubReapWait(t, func(ctx context.Context) error {
+		cancel()
+		return ctx.Err()
+	})
+	logs := captureLogs(t)
+
+	deleted, reconcileErr := s.reconcile(ctx, outputpolicy.LifecycleSync,
+		newInputSource(t, t.TempDir()), map[string]struct{}{},
+		&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+
+	if !errors.Is(reconcileErr, context.Canceled) {
+		t.Errorf("reconcile(shutdown inside the re-check window) error = %v, want context.Canceled"+
+			" so Run does not report a complete scan", reconcileErr)
+	}
+	if deleted != 0 {
+		t.Errorf("reconcile(shutdown inside the re-check window) deleted = %d, want 0", deleted)
+	}
+	if _, statErr := os.Stat(orphan); statErr != nil {
+		t.Errorf("an orphan was deleted after the process started shutting down: %v", statErr)
+	}
+	const abandoned = "orphan removal abandoned during shutdown before the confirming re-check"
+	if logs.CountLevel(slog.LevelDebug, abandoned) != 1 {
+		t.Errorf("reconcile(shutdown inside the re-check window) logged %q, want the abandoned"+
+			" deferral named once at Debug", logs.Messages())
+	}
+}
+
+// TestStoreReconcile_defers_once_per_batch pins the two things that decide what the
+// deferral COSTS. It waits once for the whole batch, not once per candidate: at
+// reapDeferral each, a tree with twenty stale bundles would hold the scan's only
+// goroutine for ten minutes. And it is not entered at all when there is nothing to
+// confirm — the empty-/input guard refuses before the delay, so a wrong or slow mount
+// neither pauses the scan nor reaches the re-check.
+// Serial: it swaps waitBeforeReap.
+func TestStoreReconcile_defers_once_per_batch(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		total       int
+		wantWaits   int
+		wantDeleted int
+	}{
+		{"three orphans share one wait", 1, 1, 3},
+		{"an empty input tree never reaches the wait", 0, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			names := []string{"a.pfx", "b.pfx", "c.pfx"}
+			for _, name := range names {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte("pfx"), 0o600); err != nil {
+					t.Fatalf("setup: WriteFile(%s): %v", name, err)
+				}
+			}
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatalf("setup: os.OpenRoot: %v", err)
+			}
+			t.Cleanup(func() { _ = root.Close() })
+			s := &store{root: root}
+			waits := 0
+			stubReapWait(t, func(context.Context) error {
+				waits++
+				return nil
+			})
+
+			deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync,
+				newInputSource(t, t.TempDir()), map[string]struct{}{},
+				&reapContext{result: ScanResult{Total: tc.total}, walkCompleted: true})
+
+			if reconcileErr != nil {
+				t.Fatalf("reconcile = error %v, want nil", reconcileErr)
+			}
+			if waits != tc.wantWaits {
+				t.Errorf("reconcile(%d candidates) waited %d times, want %d", len(names), waits, tc.wantWaits)
+			}
+			if deleted != tc.wantDeleted {
+				t.Errorf("reconcile(%d candidates) deleted = %d, want %d", len(names), deleted, tc.wantDeleted)
 			}
 		})
 	}

@@ -423,6 +423,13 @@ type certGraph struct {
 // A certificate this bundle names as the issuer of another one is REFUSED when it
 // exceeds the ceiling, rather than carried as an unverified candidate edge; see
 // oversizedIssuerError for why degrading silently was the worse outcome.
+//
+// The private-key parser reads the same ceiling (convert.go oversizedRSAKeyError)
+// for the mirror-image reason on the other half of the pair: x509's own parsers pay
+// RSA precomputation on file-supplied integers before they can reject a key, so a
+// key above the ceiling stalls the scan goroutine to produce a bundle whose
+// signatures this app would refuse to check anyway. One constant, so the two halves
+// of the pair cannot disagree about what this app will read.
 const maxVerifiableKeyBits = 16384
 
 // maxVerifiablePublicExponent bounds the RSA public exponent this app will run a

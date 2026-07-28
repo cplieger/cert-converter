@@ -59,6 +59,27 @@ func (s *source) pathVanished(rel string) bool {
 	return fi.Mode()&fs.ModeSymlink == 0
 }
 
+// pathAbsent reports whether rel does not exist inside the input tree.
+//
+// It is the reap's durability question: an orphan candidate is only deleted when its
+// certificate is still missing after the confirmation delay, so a "cannot tell"
+// answer must read as PRESENT — the caller deletes private key material on a true.
+// Any Lstat failure other than ENOENT therefore answers false.
+//
+// Lstat, like pathVanished, so a dangling symlink at an input name reads as present:
+// the entry is still in the tree the operator manages, and no output under it may be
+// reaped on the strength of its target being unresolvable.
+//
+// Deliberately NOT pathVanished, which asks a different question on the READ path:
+// there a surviving NON-symlink means the entry was replaced under the read, so
+// pathVanished answers true for a path that exists. The reap needs the opposite
+// reading of exactly that case — a certificate that is back is a certificate that is
+// present — which is why absence is asked for directly rather than through it.
+func (s *source) pathAbsent(rel string) bool {
+	_, err := s.root.Lstat(rel)
+	return errors.Is(err, fs.ErrNotExist)
+}
+
 // readBounded opens rel within the input tree and reads it under maxFileSize,
 // confining the read to that tree: a symlink or ".." component in rel can never
 // redirect the read outside it (Go 1.24+ *os.Root). Only regular files are read,

@@ -44,6 +44,52 @@ func TestSourcePathVanished_reports_an_unclassifiable_path_as_steady_state(t *te
 	}
 }
 
+// TestSourcePathAbsent pins the primitive the orphan reap deletes on. Every arm is a
+// deletion decision over private key material, and only the first one may answer
+// "absent": the re-check runs after a deferral window in which a producer may have
+// rewritten the certificate, and any answer the confined Lstat cannot make with
+// certainty has to keep the bundle.
+func TestSourcePathAbsent(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "back.crt"), []byte("cert"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A regular file standing in for a path component: the confined Lstat answers
+	// ENOTDIR, the reachable non-ENOENT failure.
+	if err := os.WriteFile(filepath.Join(dir, "plain"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("nowhere", filepath.Join(dir, "dangling.crt")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	s := &source{root: root}
+
+	for _, tc := range []struct {
+		rel  string
+		want bool
+		why  string
+	}{
+		{"missing.crt", true, "an ENOENT path is the durable absence the reap needs"},
+		{"back.crt", false, "a certificate that is present must keep its bundle, which is the case " +
+			"pathVanished would have answered true for"},
+		{"dangling.crt", false, "a symlink whose target is missing is still an entry in the operator's tree"},
+		{"plain/tls.crt", false, "a path the scan cannot classify is not proof of absence"},
+	} {
+		t.Run(tc.rel, func(t *testing.T) {
+			t.Parallel()
+			if got := s.pathAbsent(tc.rel); got != tc.want {
+				t.Errorf("source.pathAbsent(%q) = %v, want %v: %s", tc.rel, got, tc.want, tc.why)
+			}
+		})
+	}
+}
+
 func TestSourceReadBounded(t *testing.T) {
 	t.Parallel()
 	t.Run("reads file within limit through root", func(t *testing.T) {

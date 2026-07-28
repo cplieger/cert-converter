@@ -49,8 +49,8 @@ func TestStoreReconcile_reports_an_output_tree_it_cannot_enumerate(t *testing.T)
 
 	// sync over a tree holding one orphan: the mode that would delete, so nothing
 	// about the arrangement excuses the refusal except the unwalkable tree.
-	deleted, err := s.reconcile(t.Context(), outputpolicy.LifecycleSync, map[string]struct{}{"a.crt": {}},
-		&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+	deleted, err := s.reconcile(t.Context(), outputpolicy.LifecycleSync, newInputSource(t, t.TempDir()),
+		map[string]struct{}{"a.crt": {}}, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 	if err != nil {
 		t.Fatalf("reconcile(unwalkable output tree) = error %v, want nil: an unreadable /output is an"+
 			" operator condition a restart cannot fix, so it must not fail the scan", err)

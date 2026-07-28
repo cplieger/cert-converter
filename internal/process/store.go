@@ -14,6 +14,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
+	"github.com/cplieger/runesafe"
 )
 
 // Output file and directory modes. A PFX carries a private key, so it is
@@ -90,6 +91,20 @@ const staleTempAge = time.Hour
 // actionable number; the paths are a sample, and an unbounded list on a per-scan
 // WARN is a permanent multi-kilobyte log line.
 const maxLoggedOrphans = 20
+
+// maxLoggedOrphanBytes caps the rendered orphan sample by BYTES, which the item cap
+// above does not do: a root-relative path is itself long enough (nested directories,
+// long domain names) that maxLoggedOrphans of them can still be tens of kilobytes on
+// a WARN that repeats for as long as the orphan exists. The budget is generous enough
+// to name a realistic sample in full — 20 typical bundle paths are a few hundred bytes
+// — so it only ever engages on the pathological tree.
+const maxLoggedOrphanBytes = 4096
+
+// truncationMarker is appended to a sample maxLoggedOrphanBytes had to cut, so a
+// reader can tell a path list that ends mid-name from one that genuinely ends there.
+// Same wording as internal/convert's marker, deliberately louder than runesafe's own
+// "...", which is why the cap composes runesafe.CapBytes instead of taking a preset.
+const truncationMarker = "...(truncated)"
 
 // sweepStaleTemps removes PFX temp files orphaned by an interrupted atomic write
 // (a crash between temp-write and rename), then narrates the outcome.
@@ -624,7 +639,14 @@ func logIncompleteInputEnumeration(rc *reapContext) {
 // removed plus a cancellation error when the process is shutting down: the walk
 // caller folds that error into the scan's outcome, so a scan interrupted after the
 // input walk finished is not reported as a clean, complete scan.
-func (s *store) reconcile(ctx context.Context, mode outputpolicy.Lifecycle, seen map[string]struct{}, rc *reapContext) (int, error) {
+//
+// A deletion is never made on the strength of this scan's snapshot alone. Once the
+// vetoes are passed, confirmOrphans defers the batch by reapDeferral and re-checks
+// each candidate's certificate through src, so an input observed mid-replacement
+// keeps its bundle. src is the input side of the same scan `seen` came from.
+func (s *store) reconcile(ctx context.Context, mode outputpolicy.Lifecycle, src *source,
+	seen map[string]struct{}, rc *reapContext,
+) (int, error) {
 	if mode == outputpolicy.LifecycleKeep {
 		return 0, nil
 	}
@@ -659,7 +681,124 @@ func (s *store) reconcile(ctx context.Context, mode outputpolicy.Lifecycle, seen
 		return 0, nil
 	}
 
-	return s.removeOrphans(ctx, orphaned)
+	return s.reapConfirmed(ctx, src, orphaned)
+}
+
+// reapConfirmed is the deletion half of reconcile: confirm the batch after the
+// deferral, then remove what is still orphaned. Split out so reconcile's gate reads
+// as a sequence of refusals with one tail call, rather than carrying the delay's own
+// three outcomes inline.
+func (s *store) reapConfirmed(ctx context.Context, src *source, orphaned []string) (int, error) {
+	confirmed, err := s.confirmOrphans(ctx, src, orphaned)
+	if err != nil {
+		return 0, err
+	}
+	if len(confirmed) == 0 {
+		return 0, nil
+	}
+	return s.removeOrphans(ctx, confirmed)
+}
+
+// reapDeferral is how long reconcile waits, ONCE per scan, between identifying
+// orphan candidates and deleting them.
+//
+// It exists because none of the reap vetoes asks whether an input's absence is
+// DURABLE, and the scan most likely to observe /input mid-transition is the one a
+// deletion itself scheduled: internal/watch requests a rescan on any Remove and the
+// debounce is 2s, so a producer that replaces a certificate by unlink-then-write (or
+// an rsync --delete-before) can be observed between the two steps. The bundle would
+// then be deleted and regenerated with fresh KDF salts and a fresh mtime, which is
+// the downstream re-replication output-derived currency exists to prevent.
+//
+// The value balances two costs that are not symmetric. Waiting LONGER covers a slower
+// producer transaction: a local unlink-then-write closes in milliseconds, but a
+// network-mounted /input, an rsync that deletes before it transfers, or a `docker cp`
+// of a whole tree can take seconds. Waiting longer costs only latency on work nobody
+// is waiting for — the reap runs after this scan's conversions, so the delay defers
+// deletions, plus at most one window of the NEXT scan on a daemon whose certificates
+// renew every few weeks. Thirty seconds sits well past the realistic producer window
+// and far below anything an operator would read as a stall: deliberately not minutes,
+// because the wait blocks the scan's only goroutine, and deliberately not a couple of
+// seconds, because that is the same order as the watcher's own 2s debounce and would
+// cover little more than a local rewrite.
+//
+// Nothing here is a guarantee: a producer whose transaction outlasts the window is
+// still observed mid-replacement. The window narrows the race; the vetoes above, the
+// audit line on every deletion, and OUTPUT_LIFECYCLE=warn are what bound the
+// consequence.
+const reapDeferral = 30 * time.Second
+
+// waitBeforeReap is reapDeferral's wait, indirected through a package var for the
+// same reason chmodInRoot is: the behaviour that matters cannot be produced in a test
+// otherwise. Here it is the delay itself — a suite that really waited reapDeferral per
+// case would cost minutes — plus the two edges the wait owns (a shutdown arriving
+// inside the window, and the batch waiting once rather than once per orphan).
+//
+// It returns the context's error when cancellation wins, so the caller abandons the
+// reap instead of running it to completion on the way out.
+var waitBeforeReap = waitForReapDeferral
+
+// waitForReapDeferral waits d, or returns early with the context's error when the
+// process starts shutting down inside the window. It is a named function so the
+// contract stays testable even where waitBeforeReap has been swapped.
+func waitForReapDeferral(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// reapRecheckMsg is the line that announces the deferral. It is a const because it is
+// the one message an operator correlates with a pause in the log and with every
+// deletion that follows it, so the two call sites that matter — the emit and the test
+// that pins the wording — cannot drift.
+const reapRecheckMsg = "possible orphaned output bundles; re-checking their certificates before deleting anything"
+
+// confirmOrphans waits reapDeferral once for the whole batch, then re-checks each
+// candidate's INPUT path and returns only the candidates whose certificate is STILL
+// absent.
+//
+// One wait for the batch, not one per candidate: the window is about wall-clock time
+// passing, not about the individual path, so waiting per orphan would make a tree
+// with twenty of them cost two hundred seconds on the scan's only goroutine.
+//
+// The re-check goes through the same confined input root the scan itself reads
+// through, so a symlink planted under /input cannot make an unrelated path answer for
+// a candidate.
+//
+// A certificate that came back cancels that one deletion and nothing else: it is the
+// ordinary producer transaction this delay exists for, not an error, so it does not
+// fail the scan, does not affect health, and leaves every other candidate reapable. A
+// cancellation during the wait abandons the whole reap and is returned to the caller,
+// which is what keeps an interrupted scan from being reported as complete.
+func (s *store) confirmOrphans(ctx context.Context, src *source, orphaned []string) ([]string, error) {
+	slog.Info(reapRecheckMsg,
+		"count", len(orphaned), "recheck_in", reapDeferral.String())
+	if err := waitBeforeReap(ctx, reapDeferral); err != nil {
+		// Shutdown inside the window: delete nothing further. Debug like the other
+		// interrupted paths here, because the error itself is returned and the caller
+		// reports the cancellation.
+		slog.Debug("orphan removal abandoned during shutdown before the confirming re-check",
+			"candidates", len(orphaned), "error", err)
+		return nil, err
+	}
+	confirmed := make([]string, 0, len(orphaned))
+	for _, rel := range orphaned {
+		cert := layout.CertForOutput(rel)
+		if !src.pathAbsent(cert) {
+			// Named at the default level: this is the deletion this app decided NOT to
+			// make, and it is the only trace that the delay did its job.
+			slog.Info("keeping an output bundle whose certificate came back during the confirmation delay",
+				"path", rel, "input", cert)
+			continue
+		}
+		confirmed = append(confirmed, rel)
+	}
+	return confirmed, nil
 }
 
 // removeOrphans deletes each named output bundle, stopping early on shutdown and
@@ -687,14 +826,40 @@ func (s *store) removeOrphans(ctx context.Context, orphaned []string) (int, erro
 	return deleted, nil
 }
 
-// sampleOrphanPaths renders at most maxLoggedOrphans paths, naming how many were
-// elided so the log line stays bounded without hiding the scale.
+// sampleOrphanPaths renders at most maxLoggedOrphans paths within
+// maxLoggedOrphanBytes, naming how many were elided so the log line stays bounded
+// without hiding the scale.
+//
+// The two caps compose because they bound different things and neither implies the
+// other: the ITEM cap keeps the sample readable, and the BYTE cap keeps the record
+// small. An item cap alone is not a size bound, because one root-relative path is
+// itself only bounded by the filesystem's own limits, so 20 deeply nested names can
+// still be tens of kilobytes on a WARN that repeats every scan for as long as the
+// orphan exists.
+//
+// The byte cut runs on the JOINED sample (that is what the budget is about) through
+// runesafe.CapBytes, which backs the cut off to a rune start so a multi-byte name is
+// never cut into a partial rune. Paths are NOT sanitized: /input is a read-only mount
+// of the operator's own tree, and these attributes are the operator's query key for
+// which bundles were reported (the settled path-attribute-runesafe-adoption
+// decision).
+//
+// Both suffixes are appended AFTER the cut, so a truncated sample exceeds the budget
+// by their own length: the bound exists to stop a multi-kilobyte record, not to hit
+// the budget exactly. The elision notice keeps its place at the very end, and the
+// count of orphans is a separate attribute on the same record, so the scale survives
+// either cut.
 func sampleOrphanPaths(paths []string) string {
-	if len(paths) <= maxLoggedOrphans {
-		return strings.Join(paths, ",")
+	sample, elided := paths, ""
+	if len(paths) > maxLoggedOrphans {
+		sample = paths[:maxLoggedOrphans]
+		elided = fmt.Sprintf(" (+%d more)", len(paths)-maxLoggedOrphans)
 	}
-	return strings.Join(paths[:maxLoggedOrphans], ",") +
-		fmt.Sprintf(" (+%d more)", len(paths)-maxLoggedOrphans)
+	rendered := strings.Join(sample, ",")
+	if len(rendered) > maxLoggedOrphanBytes {
+		rendered = runesafe.CapBytes(rendered, maxLoggedOrphanBytes) + truncationMarker
+	}
+	return rendered + elided
 }
 
 // lifecycleInaction explains why an orphan was reported rather than removed. Three

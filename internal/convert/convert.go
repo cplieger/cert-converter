@@ -8,9 +8,11 @@ import (
 	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/bits"
 	"strings"
 	"unicode/utf8"
 
@@ -531,14 +533,137 @@ func isEncryptedPEMBlock(block *pem.Block) bool {
 	return false
 }
 
+// oversizedRSAKeyError refuses a private-key block whose RSA modulus is larger
+// than maxVerifiableKeyBits, or reports nil for every block it cannot measure.
+//
+// It exists because the cost is INSIDE the parser: x509.ParsePKCS8PrivateKey and
+// x509.ParsePKCS1PrivateKey run RSA CRT precomputation and consistency validation
+// on the integers the FILE supplies before either can reject the key, and that
+// work has no context or cancellation path. Measured on go1.26.5, a
+// self-consistent key costs 8.8ms to parse at 16384 bits and 369ms at 131072 bits
+// from a 73 KB block, and other shapes inside the reader's 10 MB cap are far
+// worse; all of it lands on the scan's only goroutine, before convertEntry can
+// emit its per-path diagnostic, where shutdown cannot interrupt it. So the guard
+// cannot inspect a PARSED key — by then the stall has already happened — and runs
+// on the DER instead.
+//
+// The ceiling is maxVerifiableKeyBits, deliberately the same constant analyse.go's
+// signature-verification guard uses rather than a second number: a certificate
+// above it is already refused a signature check, so accepting a private key above
+// it could only produce a bundle this app would not reason about.
+func oversizedRSAKeyError(block *pem.Block) error {
+	modulusBits, ok := rsaModulusBitsFromKeyDER(block.Bytes, 1)
+	if !ok || modulusBits <= maxVerifiableKeyBits {
+		return nil
+	}
+	return fmt.Errorf("private key in a %q block holds a %d-bit RSA modulus, above the %d-bit ceiling this app reads a private key at (parsing it would run RSA precomputation on file-supplied integers and stall the scan)",
+		boundLogText(block.Type, maxBlockTypeLogLen), modulusBits, maxVerifiableKeyBits)
+}
+
+// rsaModulusBitsFromKeyDER reports the size of the RSA modulus in private-key
+// DER, reading ONLY the modulus INTEGER's own length: it walks tag-length headers
+// with encoding/asn1's RawValue (which slices the content rather than decoding it)
+// and never converts a file-supplied integer to a big.Int, so it costs
+// sub-microseconds on a 32 KB block where the parser costs hundreds of
+// milliseconds.
+//
+// Two shapes carry an RSA modulus, and both are handled: a PKCS#1 RSAPrivateKey,
+// whose modulus is the INTEGER after the version INTEGER, and a PKCS#8
+// PrivateKeyInfo, whose privateKey OCTET STRING (after the version INTEGER and the
+// AlgorithmIdentifier SEQUENCE) wraps that same PKCS#1 structure — hence depth,
+// which admits exactly one level of unwrapping and stops a crafted file from
+// nesting containers indefinitely.
+//
+// It FAILS OPEN by design: false for anything it cannot measure, which covers a
+// non-RSA key (a SEC1 EC key's second element is an OCTET STRING, a PKCS#8 EC or
+// Ed25519 key's inner OCTET STRING is not a PKCS#1 SEQUENCE, and none of them is
+// expensive to parse), a truncated or malformed block, and a zero or negative
+// modulus. The guard's job is to refuse OVERSIZED keys, not to become a second
+// parser: everything else is left to the existing parsers and their existing
+// errors.
+func rsaModulusBitsFromKeyDER(der []byte, depth int) (int, bool) {
+	outer, _, ok := asn1Element(der)
+	if !ok || !isASN1(outer, asn1.TagSequence) {
+		return 0, false
+	}
+	version, afterVersion, ok := asn1Element(outer.Bytes)
+	if !ok || !isASN1(version, asn1.TagInteger) {
+		return 0, false
+	}
+	second, afterSecond, ok := asn1Element(afterVersion)
+	if !ok {
+		return 0, false
+	}
+	switch {
+	case isASN1(second, asn1.TagInteger):
+		// PKCS#1 RSAPrivateKey: the modulus follows the version.
+		return derIntegerBits(second.Bytes)
+	case isASN1(second, asn1.TagSequence) && depth > 0:
+		// PKCS#8 PrivateKeyInfo: the AlgorithmIdentifier follows the version, and
+		// the privateKey OCTET STRING after it holds the PKCS#1 key.
+		inner, _, ok := asn1Element(afterSecond)
+		if !ok || !isASN1(inner, asn1.TagOctetString) {
+			return 0, false
+		}
+		return rsaModulusBitsFromKeyDER(inner.Bytes, depth-1)
+	}
+	return 0, false
+}
+
+// asn1Element reads one tag-length-value header off b, returning the element and
+// the bytes after it. The RawValue's content is a slice of b, so nothing is
+// decoded and nothing is copied.
+func asn1Element(b []byte) (asn1.RawValue, []byte, bool) {
+	var v asn1.RawValue
+	rest, err := asn1.Unmarshal(b, &v)
+	if err != nil {
+		return asn1.RawValue{}, nil, false
+	}
+	return v, rest, true
+}
+
+// isASN1 reports whether v carries the given universal tag. The class check is
+// what keeps a context-specific element (PKCS#8's optional attributes, SEC1's
+// [0] parameters) from being mistaken for the universal tag of the same number.
+func isASN1(v asn1.RawValue, tag int) bool {
+	return v.Class == asn1.ClassUniversal && v.Tag == tag
+}
+
+// derIntegerBits reports the bit length of a DER INTEGER's content bytes, and
+// false when the value is not a positive integer whose size means anything: an
+// empty content, a negative value (the leading byte of a two's-complement DER
+// INTEGER has its high bit set), or zero. Neither is a modulus, and both are left
+// to the parser's own refusal. The sign is read from the FIRST byte, before the
+// 0x00 bytes DER prepends to keep a large positive value positive are stripped.
+func derIntegerBits(content []byte) (int, bool) {
+	if len(content) == 0 || content[0] >= 0x80 {
+		return 0, false
+	}
+	for len(content) > 0 && content[0] == 0x00 {
+		content = content[1:]
+	}
+	if len(content) == 0 {
+		return 0, false
+	}
+	return (len(content)-1)*8 + bits.Len8(content[0]), true
+}
+
 // parsePrivateKeyBlock decodes a single unencrypted private-key PEM block,
 // trying PKCS8 first, then falling back to PKCS1 (RSA) and SEC1 (EC). A PKCS8
 // container holding a key type cert-converter does not support is rejected with
 // a distinct error rather than reported as unparseable.
 //
+// An oversized RSA modulus is refused BEFORE any parser sees the block, because
+// the cost of an oversized key is paid inside the parser itself; see
+// oversizedRSAKeyError.
+//
 // The return type is crypto.Signer: every accepted type implements it, so the
 // caller never has to consider a key whose public half cannot be read.
 func parsePrivateKeyBlock(block *pem.Block) (crypto.Signer, error) {
+	if err := oversizedRSAKeyError(block); err != nil {
+		return nil, err
+	}
+
 	key, pkcs8Err := x509.ParsePKCS8PrivateKey(block.Bytes)
 	if pkcs8Err == nil {
 		switch k := key.(type) {
