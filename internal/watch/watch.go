@@ -808,10 +808,6 @@ func (w *Watcher) pollUntilUpgrade(ctx context.Context) *fsnotify.Watcher {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if ctx.Err() != nil {
-				return nil
-			}
-			slog.Debug("poll scan triggered", "interval", w.fallback)
 			fw, stopped := w.pollTick(ctx)
 			if stopped {
 				return nil
@@ -834,7 +830,17 @@ func (w *Watcher) pollUntilUpgrade(ctx context.Context) *fsnotify.Watcher {
 // The Info level is deliberate: unlike Run's initial attempt (attachWatchSet,
 // which WARNs), a failed retry is a continuation of an already-reported
 // degradation, not a new one.
+//
+// The cancellation guard is here rather than in the caller's select because this
+// function owns the stopped outcome: a tick that fires in the same instant as a
+// shutdown must do no work at all -- no upgrade attempt, no scan driving the health
+// marker -- and every caller already reads stopped=true as "end poll mode". The
+// Debug line follows the guard so a cancelled tick announces no scan it never ran.
 func (w *Watcher) pollTick(ctx context.Context) (upgraded *fsnotify.Watcher, stopped bool) {
+	if ctx.Err() != nil {
+		return nil, true
+	}
+	slog.Debug("poll scan triggered", "interval", w.fallback)
 	fw, newErr := newFSWatcher()
 	if newErr != nil {
 		if ctx.Err() != nil {

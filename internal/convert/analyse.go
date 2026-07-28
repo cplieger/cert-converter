@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"fmt"
+	"reflect"
 	"slices"
 	"time"
 )
@@ -618,8 +619,54 @@ func (g *certGraph) verifies(child, parent int) bool {
 // Only a verified signature counts. A name match alone would reject an identity
 // because some unrelated certificate happens to claim it as issuer, which an
 // attacker or a careless paste could arrange.
+//
+// The candidate graph is not sufficient evidence on its own here, which is why the
+// second loop exists. plausibleIssuer recognises an issuer name by raw DER equality
+// (or an AKI/SKI match), so a permitted encoding difference between a leaf's issuer
+// name and its CA's subject name — same name, UTF8String against the canonical
+// encoding, no key identifiers — records NO candidate edge. That is deliberate for
+// the additive chain fallback, which must not treat an unestablished edge as chain
+// material, but for ROLE it hid a cryptographically verified issuance: the CA read
+// as a non-issuer, competed with its own leaf for identity, and won on NotBefore,
+// producing a PFX whose identity was the CA. So role selection falls back to
+// SEMANTIC name equality (RDNSequence, which compares parsed name values rather
+// than their encoding) and still requires the same signature verification.
+//
+// The fallback keeps plausibleIssuer's key-reuse exclusion: a distinct self-signed
+// certificate sharing both a subject and a public key with certs[i] is a
+// regenerated certificate left beside its predecessor, not something certs[i]
+// issued, and admitting it would make both look like issuers and reject the
+// identity outright.
 func (g *certGraph) isIssuer(i int) bool {
 	for _, child := range g.children[i] {
+		if g.verifies(child, i) {
+			return true
+		}
+	}
+	return g.isIssuerByName(i)
+}
+
+// isIssuerByName is isIssuer's semantic-name fallback: it reports whether any
+// certificate whose issuer name is SEMANTICALLY certs[i]'s subject name verifies
+// against certs[i], regardless of how either name is encoded.
+//
+// Split out of isIssuer so each half stays readable on its own: the first half asks
+// the candidate graph, this one re-asks the question the graph's byte comparison
+// cannot. RDNSequence equality compares the parsed name values, so a leaf naming
+// its issuer as a UTF8String matches a CA whose subject uses the canonical
+// encoding. The signature check is still the only thing that admits an edge; the
+// name equality only decides which pairs are worth checking.
+func (g *certGraph) isIssuerByName(i int) bool {
+	parent := g.certs[i]
+	parentSubject := parent.Subject.ToRDNSequence()
+	for child, cert := range g.certs {
+		if child == i || !reflect.DeepEqual(cert.Issuer.ToRDNSequence(), parentSubject) {
+			continue
+		}
+		if reflect.DeepEqual(cert.Subject.ToRDNSequence(), parentSubject) &&
+			samePublicKey(cert.PublicKey, parent.PublicKey) {
+			continue
+		}
 		if g.verifies(child, i) {
 			return true
 		}

@@ -10,9 +10,9 @@ type conversionStatus int
 // it, so a value propagated by mistake can never read as a successful
 // conversion. It never reaches countResults.
 //
-// statusConverted, statusUnchanged, statusFailed, statusOrphan, and
-// statusUnreadable enumerate the possible outcomes of converting a single
-// cert/key pair.
+// statusConverted, statusUnchanged, statusFailed, statusOrphan,
+// statusUnreadable, and statusVanished enumerate the possible outcomes of
+// converting a single cert/key pair.
 //
 // statusUnreadable is health-neutral and exists to keep the health marker honest.
 // An /input path the app cannot read — a symlink the confined root refuses because
@@ -25,6 +25,16 @@ type conversionStatus int
 // It is a distinct status rather than statusOrphan because an unreadable cert is not
 // "a certificate with no key" — reporting it as an orphan would misdescribe the
 // condition in the scan summary and in the all-orphan diagnostic.
+//
+// statusVanished is the TRANSIENT sibling of statusUnreadable: the entry existed at
+// readdir and was gone by the bounded read, which is what an ordinary renewal
+// replacing a cert looks like from inside the scan. It is health-neutral and it
+// still blocks orphan reaping (an input tree the scan could not fully read cannot
+// prove an output orphaned), but it is deliberately NOT folded into
+// ScanResult.Unreadable: that count drives the documented `unreadable=` Loki alert
+// and its permissions remediation, and the next scan converts the replacement, so
+// naming the renewal race there would alert an operator on exactly the activity this
+// daemon exists to process.
 const (
 	statusUnset conversionStatus = iota
 	statusConverted
@@ -32,4 +42,5 @@ const (
 	statusFailed
 	statusOrphan
 	statusUnreadable
+	statusVanished
 )

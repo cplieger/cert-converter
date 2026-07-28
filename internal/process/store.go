@@ -262,13 +262,8 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 		return false, nil
 	}
 
-	// One call, because the codec owns the ORDER: the preflight runs before any
-	// derivation (it bounds every iteration count the file exposes without
-	// decrypting a safe), the profile comparison runs before the decode, and the
-	// content comparison runs last. That sequence used to live here, which meant
-	// the codec published three steps any caller could take out of order; it is
-	// now unbypassable inside convert.CheckCurrency. What stays here is what it
-	// always was: deciding what each outcome MEANS for the output tree.
+	// CheckCurrency owns the mandatory preflight -> profile -> decode -> content
+	// order; this layer only maps its typed outcome to output-tree policy.
 	//
 	// The decode is synchronous: the preflight bounded every derivation count it
 	// can read, which covers every bundle this app wrote and any bundle whose
@@ -287,6 +282,15 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 func currentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 	wantEncoder convert.EncoderType,
 ) (bool, error) {
+	// Shutdown is a third category, neither current nor stale, and it is
+	// state-independent: it wins before every verdict arm below. Checked here rather
+	// than inside one arm, because a stale verdict returned from any other arm makes
+	// convertEntry start a full PKCS#12 encode after cancellation was already
+	// requested. Treating it as stale would make every in-flight pair rewrite on the
+	// way out.
+	if err := ctx.Err(); err != nil {
+		return false, fmt.Errorf("inspect prior pfx: %w", err)
+	}
 	switch res.Reason {
 	case convert.CurrencyPreflightFailed:
 		slog.Debug("prior pfx failed preflight; regenerating", "path", rel, "error", res.Err)
@@ -300,11 +304,6 @@ func currentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 			"path", rel, "found", string(res.Profile), "configured", string(wantEncoder))
 		return false, nil
 	case convert.CurrencyDecodeFailed:
-		if ctx.Err() != nil {
-			// Shutdown is a third category, neither current nor stale. Treating it as
-			// stale would make every in-flight pair rewrite on the way out.
-			return false, fmt.Errorf("inspect prior pfx: %w", ctx.Err())
-		}
 		// Expected and non-fatal: a rotated password, a truncated file, a foreign
 		// file at that path. All mean the same thing — rewrite it.
 		slog.Debug("prior pfx did not decode; regenerating", "path", rel, "error", res.Err)
@@ -353,18 +352,9 @@ func laxerThanPolicy(perm os.FileMode) bool {
 // bits only: the bundle's bytes and its mtime are never touched, and its currency is
 // decided without reference to its mode.
 //
-// This replaces an earlier design that reported a mode mismatch as STALE so the
-// rewrite would converge the mode, which was wrong twice over. It replaced a
-// STRICTER bundle too — a deliberate 0400 was already perfectly usable, since the
-// atomic temp+rename never needs the old file to be owner-writable — handing back a
-// laxer 0600, discarding the protection the operator chose and moving the mtime for
-// no benefit. And on a filesystem that does not honour permission bits it could never
-// converge: the mode never sticks, so EVERY bundle failed the check on EVERY scan — a
-// permanent rewrite loop with fresh KDF salts and fresh mtimes, which the documented
-// downstream rsync replication then copies every cycle. That is the same trap
-// maxPFXSize's comment exists to avoid. chmod is the right tool for a permission
-// bit; rewriting the bundle is not, and a rewrite driven by a bit the filesystem
-// will not store cannot converge.
+// Tighten with chmod rather than rewriting: rewriting would loosen an operator's
+// deliberate 0400 mode and would churn the bundle forever on filesystems that
+// accept chmod without storing permission bits.
 //
 // Only the EXTRA bits are cleared, so the tightening can never add a bit the file
 // did not already carry and a deliberately stricter mode survives untouched.
@@ -525,10 +515,15 @@ func (s *store) logOrphanWalkOutcome(unreadable, symlinked int) {
 // five positional parameters because every field is a veto and a caller must not
 // be able to transpose two of them silently.
 type reapContext struct {
-	scanTotal     int
-	failed        int
-	unreadable    int
-	unresolved    int
+	scanTotal  int
+	failed     int
+	unreadable int
+	unresolved int
+	// vanished counts input files that were replaced between readdir and the read.
+	// A veto like the two above — the scan did not observe those certs, so `seen` is
+	// not the whole tree — but a transient one, which is why it is reported at Debug
+	// rather than as the operator-actionable WARN.
+	vanished      int
 	walkCompleted bool
 	// shutdown is true when the walk ended because the process is stopping, which
 	// is not an operator-actionable incomplete enumeration.
@@ -542,7 +537,16 @@ type reapContext struct {
 // not. Spelling the veto set once means a new veto field cannot be added to one
 // caller and missed in the other.
 func (r reapContext) enumerationClean() bool {
-	return r.walkCompleted && r.unreadable == 0 && r.unresolved == 0
+	return r.walkCompleted && r.unreadable == 0 && r.unresolved == 0 && r.vanished == 0
+}
+
+// vanishedOnly reports whether a mid-scan replacement is the ONLY thing that left the
+// enumeration incomplete. It exists to split the diagnostic, not the gate: reaping is
+// blocked either way, but this shape is an ordinary renewal that the next scan
+// resolves by itself, so it must not raise the WARN whose remediation tells the
+// operator to check the /input mount.
+func (r reapContext) vanishedOnly() bool {
+	return r.walkCompleted && r.unreadable == 0 && r.unresolved == 0 && r.vanished > 0
 }
 
 // enumeratedInput reports whether `seen` can be trusted as a COMPLETE enumeration
@@ -567,6 +571,13 @@ func logIncompleteInputEnumeration(rc reapContext) {
 	switch {
 	case rc.shutdown:
 		slog.Debug("skipping orphan reconciliation; scan cancelled during shutdown")
+	case rc.vanishedOnly():
+		// A renewal replaced a cert between readdir and the read. The enumeration is
+		// incomplete, so nothing may be reaped, but the condition is transient and
+		// needs no operator action: the WARN below points at the /input mount, which
+		// would be the wrong diagnosis for the activity this daemon exists to process.
+		slog.Debug("skipping orphan reconciliation; input files were replaced during the scan",
+			"vanished", rc.vanished)
 	case rc.enumerationClean():
 		// A complete walk that found no pair at all: the enumeration did not fail, there
 		// is simply nothing to compare the output tree against. logInputCoverageWarnings
@@ -578,7 +589,7 @@ func logIncompleteInputEnumeration(rc reapContext) {
 	default:
 		slog.Warn("orphan removal is disabled for this scan: the scan did not fully enumerate the input tree, so no output can be proven orphaned",
 			"walk_completed", rc.walkCompleted, "unreadable", rc.unreadable,
-			"unresolved", rc.unresolved, "total", rc.scanTotal,
+			"unresolved", rc.unresolved, "vanished", rc.vanished, "total", rc.scanTotal,
 			"remediation", "check the /input mount and the unreadable-path warnings above")
 	}
 }
@@ -663,18 +674,25 @@ func sampleOrphanPaths(paths []string) string {
 
 // lifecycleInaction explains why an orphan was reported rather than removed. Three
 // independent reasons can apply and the mode alone does not pick between them, so
-// each is named separately and the strongest wins: an OUTPUT walk that could not
-// enumerate the tree makes the LIST itself untrustworthy (orphanReportRemediation
-// withholds the delete advice for exactly this case, so the two attributes must
-// agree on it); a failed conversion leaves the list trustworthy — the input
-// enumeration was complete, or reconcile would have returned earlier — and only
-// withholds this app's own deletion until a clean scan; otherwise the mode is the
-// reason.
+// each is named separately and the strongest wins, in this order:
+//
+// An OUTPUT walk that could not enumerate the tree makes the LIST itself
+// untrustworthy (orphanReportRemediation withholds the delete advice for exactly
+// this case, so the two attributes must agree on it).
+//
+// A non-sync mode is report-only, so it outranks the conversion-failure veto: the
+// veto's wording promises removal on the next clean scan, which a mode that never
+// removes anything cannot deliver — and the operator would wait for a recovery that
+// cannot happen while a stale bundle stays served.
+//
+// Otherwise the list is trustworthy — the input enumeration was complete, or
+// reconcile would have returned earlier — and sync mode is only withholding this
+// app's own deletion until a scan with no conversion failures.
 func lifecycleInaction(mode outputpolicy.Lifecycle, reapable, walkSafe bool) string {
 	switch {
 	case !walkSafe:
 		return "kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle"
-	case !reapable:
+	case mode == outputpolicy.LifecycleSync && !reapable:
 		return "kept: a conversion failed on this scan, so nothing is removed until a scan with no failures"
 	}
 	return "reported only (OUTPUT_LIFECYCLE=" + string(mode) + ")"

@@ -1,32 +1,9 @@
-// Package testcerts provides certificate generation helpers for cert-converter's
-// tests: cert+key PAIRS and signing CHAINS, which is what a PKCS#12 conversion needs.
+// Package testcerts provides key-type-aware cert/key pairs and signing chains for
+// cert-converter tests.
 //
-// This is deliberately NOT a general-purpose test-certificate library, and it is not a
-// candidate for consolidation with httpx's certtest subpackage. Although httpx's
-// certtest also uses crypto/x509, the two helpers serve different responsibilities and
-// neither wants the other's features:
-//
-//   - certtest.SelfSignedCA is fixed at P-256, IsCA with KeyUsageCertSign, and
-//     DISCARDS the private key. That is the point of it — its consumers pin a CA and
-//     assert that certificates from separate calls are mutually untrusted. It has no
-//     use for key-type selection or chain building.
-//   - This package is parameterised by key type and CN, returns the key in the
-//     encoding that key type requires (PKCS#8 for ECDSA, PKCS#1 for RSA), builds
-//     non-CA leaves, and assembles a real signing hierarchy. It has no use for
-//     certtest's write-a-CA-to-a-file helper: cert-converter's tests lay pairs out in
-//     the /input naming contract themselves.
-//
-// The shared part is roughly eight lines of boilerplate (template, CreateCertificate,
-// pem.EncodeToMemory), so a library extracted to deduplicate it would cost far more
-// than it saves — and a wrong test fixture fails loudly and immediately, so unlike a
-// shared RUNTIME library there are no latent bugs for consolidation to prevent.
-//
-// Revisit only on a concrete trigger: a THIRD consumer needing cert+key pairs, or
-// httpx gaining a genuine need for a keypair. Neither exists today.
-//
-// Ed25519 is a supported production key type but is not generated here; the one test
-// that needs it builds the key directly (internal/convert). Adding a third switch arm
-// for a single caller is not worth it.
+// It remains app-local because callers need returned private keys, selectable key
+// types, non-CA leaves, and full chains; httpx/certtest intentionally exposes a
+// fixed P-256 CA without its private key. The sole Ed25519 case builds its key directly.
 package testcerts
 
 import (

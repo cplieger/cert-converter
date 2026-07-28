@@ -120,8 +120,16 @@ func TestInspect_rejects_an_oversized_identifier(t *testing.T) {
 			if err != nil {
 				t.Fatalf("setup: marshal preamble: %v", err)
 			}
-			if _, err := Inspect(der); !errors.Is(err, ErrProfileUnknown) {
-				t.Errorf("Inspect(%s) = %v, want ErrProfileUnknown", tc.name, err)
+			_, inspectErr := Inspect(der)
+			if !errors.Is(inspectErr, ErrProfileUnknown) {
+				t.Fatalf("Inspect(%s) = %v, want ErrProfileUnknown", tc.name, inspectErr)
+			}
+			// The sentinel alone does not pin the bound: bypassing decodeOID at the
+			// authSafe content-type site leaves the oversized identifier syntactically
+			// valid, and bundleAlgorithms then refuses it as a non-data ContentInfo with
+			// the SAME sentinel. Only the guard's own wording distinguishes the two.
+			if want := "object identifier exceeds"; !strings.Contains(inspectErr.Error(), want) {
+				t.Errorf("Inspect(%s) = %v, want the refusal to name %q", tc.name, inspectErr, want)
 			}
 		})
 	}

@@ -39,6 +39,16 @@ func TestCountResults(t *testing.T) {
 			want:       ScanResult{Total: 1, Converted: 1, Unreadable: 7},
 		},
 		{
+			name: "a vanished entry gets its own count, never Unreadable",
+			results: []conversionStatus{
+				statusConverted,
+				statusVanished,
+				statusVanished,
+				statusUnreadable,
+			},
+			want: ScanResult{Total: 4, Converted: 1, Unreadable: 1, Vanished: 2},
+		},
+		{
 			name: "all converted",
 			results: []conversionStatus{
 				statusConverted,

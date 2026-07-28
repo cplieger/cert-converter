@@ -77,10 +77,16 @@ func TestScannerRun_symlink_escape_is_health_neutral(t *testing.T) {
 }
 
 // TestScannerRun_unreadable_pair_does_not_authorise_reaping pins the consequence of
-// folding per-entry unreadable into ScanResult.Unreadable: a cert the scan could not
-// read is absent from the seen set, so a naive orphan walk would delete its existing
-// .pfx on the very scan that failed to read its input — turning an unreadable input
-// into a DELETED output.
+// folding per-entry unreadable into ScanResult.Unreadable: an /input tree the scan
+// could not fully read cannot prove ANY output orphaned, so reconciliation is
+// disabled for the whole scan.
+//
+// The fixture's prior output is deliberately unrelated to the unreadable cert.
+// escape.crt is recorded in `seen` before its read is attempted, so its own
+// escape.pfx would be protected by the direct name match even with the veto gone;
+// only an output no seen certificate can claim (unrelated.pfx) can distinguish the
+// per-entry statusUnreadable veto from that match. Remove the
+// result.Unreadable-to-reapContext link and this fixture becomes reapable.
 func TestScannerRun_unreadable_pair_does_not_authorise_reaping(t *testing.T) {
 	t.Parallel()
 	base := t.TempDir()
@@ -106,8 +112,10 @@ func TestScannerRun_unreadable_pair_does_not_authorise_reaping(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A prior output, as if an earlier deployment had converted this pair successfully.
-	prior := filepath.Join(outRoot, "escape.pfx")
+	// A prior output no certificate in this tree claims, as if an earlier deployment
+	// had converted a pair since removed from /input. Only the scan-wide unreadable
+	// veto keeps it: an incomplete enumeration cannot prove it orphaned.
+	prior := filepath.Join(outRoot, "unrelated.pfx")
 	if err := os.WriteFile(prior, []byte("prior bundle"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -117,10 +125,10 @@ func TestScannerRun_unreadable_pair_does_not_authorise_reaping(t *testing.T) {
 		t.Fatalf("Run = %v, want nil", err)
 	}
 	if res.Removed != 0 {
-		t.Errorf("Removed = %d, want 0: an input the scan could not read must never authorise deleting its output", res.Removed)
+		t.Errorf("Removed = %d, want 0: a scan that could not read part of /input must never authorise deleting any output", res.Removed)
 	}
 	if _, statErr := os.Stat(prior); statErr != nil {
-		t.Errorf("the prior .pfx was deleted (%v); an unreadable input must not become a deleted output", statErr)
+		t.Errorf("the prior .pfx was deleted (%v); an incomplete input enumeration must not become a deleted output", statErr)
 	}
 }
 
@@ -181,5 +189,57 @@ func TestScannerRun_directory_in_cert_path_does_not_authorise_reaping(t *testing
 	}
 	if res.Converted != 1 {
 		t.Errorf("Converted = %d, want 1: the unrelated valid pair must still convert", res.Converted)
+	}
+}
+
+// TestScannerRun_vanished_cert_is_not_an_unreadable_path pins the split between a
+// transient renewal race and a steady-state unreadable path. A cert that is gone by
+// the time the bounded read runs (here a dangling symlink, the same ENOENT the read
+// sees when a renewal replaces the file between readdir and read) must land in
+// ScanResult.Vanished and NOT in Unreadable: that count feeds the documented
+// unreadable-path alert and its /input-permissions remediation, which is the wrong
+// diagnosis — and a false page — for the ordinary renewal this daemon exists to
+// process. It stays health-neutral and still blocks reaping.
+func TestScannerRun_vanished_cert_is_not_an_unreadable_path(t *testing.T) {
+	t.Parallel()
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+
+	_, keyPEM := testcerts.GenerateSelfSignedCert(t, "gone.example.com", "ecdsa")
+	if err := os.WriteFile(filepath.Join(certsRoot, "gone.key"), keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The cert entry exists for the walk and is gone for the read. A RELATIVE target
+	// inside the root, so the confined read reaches ENOENT rather than a confinement
+	// refusal (which is the steady-state unreadable case, not this one).
+	if err := os.Symlink("already-renewed.pem", filepath.Join(certsRoot, "gone.crt")); err != nil {
+		t.Fatal(err)
+	}
+
+	// A prior output nothing in this tree claims: the vanished cert must not authorise
+	// reaping it either, because the scan did not enumerate the whole tree.
+	prior := filepath.Join(outRoot, "unrelated.pfx")
+	if err := os.WriteFile(prior, []byte("prior bundle"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := newSyncScanner(certsRoot, outRoot).Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run(vanished cert) = %v, want nil: a replaced input is not a scan error", err)
+	}
+	if res.Vanished != 1 {
+		t.Errorf("Vanished = %d, want 1: a cert gone by the time it is read is the renewal race", res.Vanished)
+	}
+	if res.Unreadable != 0 {
+		t.Errorf("Unreadable = %d, want 0: folding the renewal race into this count raises the operator alert for /input permissions on an ordinary renewal", res.Unreadable)
+	}
+	if res.Failed != 0 {
+		t.Errorf("Failed = %d, want 0: a transient race must not flip health", res.Failed)
+	}
+	if res.Removed != 0 {
+		t.Errorf("Removed = %d, want 0: a scan that missed part of /input cannot prove any output orphaned", res.Removed)
+	}
+	if _, statErr := os.Stat(prior); statErr != nil {
+		t.Errorf("the prior .pfx was deleted (%v); an incomplete input enumeration must not become a deleted output", statErr)
 	}
 }

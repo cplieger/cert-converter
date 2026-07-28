@@ -33,6 +33,14 @@ type ScanResult struct {
 	// conflating the two would change that operator-visible signal. Kept on
 	// ScanResult so both coverage dimensions have one accumulator.
 	Unresolved int
+	// Vanished counts /input files that existed at readdir and were gone by the
+	// bounded read — the ordinary renewal race. Deliberately a SEPARATE field, never
+	// folded into Unreadable, for the same reason as Unresolved: the README's Loki
+	// rules match on the `unreadable=` attribute and carry a permissions
+	// remediation, which is the wrong diagnosis for a transient replacement that the
+	// next scan converts. It is health-neutral, and like Unreadable it still blocks
+	// orphan reaping.
+	Vanished int
 }
 
 // Options carries the process-lifetime scan configuration the composition root
@@ -132,8 +140,12 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		// not READ part of /input has not enumerated the tree completely in the
 		// README's sense ("no unreadable path"), so no output under it can be proven
 		// orphaned.
-		unreadable:    result.Unreadable,
-		unresolved:    result.Unresolved,
+		unreadable: result.Unreadable,
+		unresolved: result.Unresolved,
+		// A cert that vanished mid-walk leaves the same hole in `seen` as one that
+		// could not be read, so it vetoes reaping too — but transiently: the next
+		// scan sees the replacement and reconciles then.
+		vanished:      result.Vanished,
 		walkCompleted: walkErr == nil,
 		shutdown:      walkErr != nil && IsShutdown(walkErr),
 	}
@@ -310,7 +322,7 @@ func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
 			level, msg = slog.LevelDebug, "scan cancelled during shutdown"
 		}
 	}
-	attrs := make([]any, 0, 18)
+	attrs := make([]any, 0, 20)
 	if walkErr != nil {
 		attrs = append(attrs, "error", walkErr)
 	}
@@ -326,6 +338,11 @@ func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
 		// empty scan while an unresolvable input symlink hid an entire certificate
 		// subtree.
 		"unresolved", result.Unresolved,
+		// vanished is the transient renewal race, kept out of Unreadable so the
+		// documented unreadable-path alert stays specific to a steady-state
+		// permissions or layout problem; naming it here is what keeps a scan whose
+		// certs were being replaced mid-walk distinguishable from a clean one.
+		"vanished", result.Vanished,
 		"removed", result.Removed,
 		"failed", result.Failed)
 	slog.Log(ctx, level, msg, attrs...)
@@ -338,13 +355,16 @@ func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
 // no certificate pair at all, one whose every certificate lacks its sibling .key, and
 // one where only some of them do.
 //
-// All require a completed walk with no unreadable sub-path and no unresolved
-// symlink. Unreadable == 0 is what makes "every certificate" provable, because Run
-// deliberately continues past an unreadable sub-path, so a partial enumeration
-// cannot know what lies beneath it, and the unreadable-path WARN already carries
-// the actionable diagnosis for that shape.
+// All require a completed walk with no unreadable sub-path, no unresolved
+// symlink and nothing that vanished mid-scan. Unreadable == 0 is what makes "every
+// certificate" provable, because Run deliberately continues past an unreadable
+// sub-path, so a partial enumeration cannot know what lies beneath it, and the
+// unreadable-path WARN already carries the actionable diagnosis for that shape.
+// Vanished == 0 is the same argument for the transient case: a cert replaced during
+// the walk was not observed, so "every certificate lacks its key" is not a claim
+// this scan can make, and the next one can.
 func logInputCoverageWarnings(result ScanResult, walkErr error) {
-	if walkErr != nil || result.Unreadable > 0 || result.Unresolved > 0 {
+	if walkErr != nil || result.Unreadable > 0 || result.Unresolved > 0 || result.Vanished > 0 {
 		return
 	}
 	switch {
@@ -549,22 +569,21 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 
 	certPEM, err := sw.src.readBounded(ctx, rel)
 	if err != nil {
-		noteUnreadableInput(rel, "certificate", err)
-		return pairInputs{}, statusUnreadable
+		return pairInputs{}, noteUnreadableInput(rel, "certificate", err)
 	}
 	keyPEM, err := sw.src.readBounded(ctx, keyRel)
 	if err != nil {
-		noteUnreadableInput(rel, "private key", err)
-		return pairInputs{}, statusUnreadable
+		return pairInputs{}, noteUnreadableInput(rel, "private key", err)
 	}
 	return pairInputs{certPEM: certPEM, keyPEM: keyPEM}, statusUnset
 }
 
-// noteUnreadableInput logs a failed read of an /input file: Debug when the read was
-// cancelled by shutdown, Debug when the file simply vanished, and Warn otherwise --
-// the last matching readPair's sibling-key stat. The caller returns the
-// health-neutral statusUnreadable, kept at the call site so the outcome is visible
-// where the branch is taken.
+// noteUnreadableInput logs a failed read of an /input file and RETURNS the outcome it
+// diagnosed, so the classification and its diagnostic cannot drift apart: Debug plus
+// statusUnreadable when the read was cancelled by shutdown, Debug plus the transient
+// statusVanished when the file simply vanished, and Warn plus statusUnreadable
+// otherwise -- the last matching readPair's sibling-key stat. Both outcomes are
+// health-neutral.
 //
 // Every OPERATOR-ACTIONABLE reason a read fails here is a steady-state condition a
 // restart cannot clear. A confinement refusal in particular cannot be identified by
@@ -576,26 +595,29 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 // health-neutral while the cert's read failure flipped the container unhealthy.
 //
 // ENOENT is a benign race — the entry existed at readdir and was gone by the read (a
-// renewal replacing a file, an atomic-write temp) — so it stays at Debug.
+// renewal replacing a file, an atomic-write temp) — so it stays at Debug AND out of
+// the Unreadable count: folding it in raised the documented unreadable-path alert,
+// with its permissions remediation, on the ordinary renewal this daemon exists to
+// process. It becomes statusVanished instead, which the next scan clears.
 //
-// The pair is still not converted, so the outcome feeds ScanResult.Unreadable, which
-// blocks orphan reaping: an input tree the scan could not fully read cannot prove an
-// output is orphaned.
-func noteUnreadableInput(rel, what string, err error) {
+// The pair is still not converted either way, so both outcomes block orphan reaping:
+// an input tree the scan could not fully read cannot prove an output is orphaned.
+func noteUnreadableInput(rel, what string, err error) conversionStatus {
 	if IsShutdown(err) {
 		// A cancelled read is the shutdown itself, not an unreadable path: the WARN
 		// below is the message the README recommends alerting on, so emitting it for
 		// a normal SIGTERM would page an operator for a mount that is fine.
 		slog.Debug("skipping cert: "+what+" read interrupted by shutdown", "path", rel, "error", err)
-		return
+		return statusUnreadable
 	}
 	if errors.Is(err, fs.ErrNotExist) {
 		slog.Debug("skipping cert: "+what+" vanished during the scan", "path", rel, "error", err)
-		return
+		return statusVanished
 	}
 	slog.Warn("skipping cert: cannot read "+what,
 		"path", rel, "error", err,
 		"remediation", inputPermRemediation)
+	return statusUnreadable
 }
 
 // convertEntry resolves the outcome for one .crt entry under certsRoot. It
@@ -703,8 +725,11 @@ func logConversionObservations(rel string, observations []convert.Observation) {
 // (a cert or key the scan could not read) are folded into one Unreadable count on
 // purpose: both mean "an /input path this app could not read", both carry the same
 // operator remediation, both are health-neutral, and both must block orphan reaping.
+//
+// statusVanished is NOT folded in with them: it is the transient renewal race, so it
+// gets its own count and stays out of the documented unreadable alert.
 func countResults(results []conversionStatus, walkUnreadable, walkUnresolved int) ScanResult {
-	var converted, unchanged, orphan, failed, unreadable int
+	var converted, unchanged, orphan, failed, unreadable, vanished int
 	for _, r := range results {
 		switch r {
 		case statusConverted:
@@ -717,6 +742,8 @@ func countResults(results []conversionStatus, walkUnreadable, walkUnresolved int
 			failed++
 		case statusUnreadable:
 			unreadable++
+		case statusVanished:
+			vanished++
 		}
 	}
 	return ScanResult{
@@ -727,5 +754,6 @@ func countResults(results []conversionStatus, walkUnreadable, walkUnresolved int
 		Failed:     failed,
 		Unreadable: walkUnreadable + unreadable,
 		Unresolved: walkUnresolved,
+		Vanished:   vanished,
 	}
 }

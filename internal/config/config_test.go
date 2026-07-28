@@ -348,8 +348,8 @@ func isolatePasswordFile(t *testing.T) {
 // TestLoad_warns_only_for_a_blank_PFX_PASSWORD_FILE_pointer pins both halves of
 // warnBlankPasswordFilePointer's guard. A pointer that expands to nothing inverts the
 // file-wins rule silently, so the WARN must fire; an UNSET pointer is the normal
-// deployment, so it must stay silent, and dropping the LookupEnv "set" check (an
-// os.Getenv "simplification") would warn every correctly configured operator that
+// deployment, so it must stay silent, and losing that set-vs-unset distinction (which
+// envx.IsBlankSecretFilePath owns) would warn every correctly configured operator that
 // their secret pointer is broken. Serial: it swaps slog.Default().
 func TestLoad_warns_only_for_a_blank_PFX_PASSWORD_FILE_pointer(t *testing.T) {
 	const blankPointer = "PFX_PASSWORD_FILE is set but blank"
@@ -396,6 +396,32 @@ func TestLoad_warns_only_for_a_blank_PFX_PASSWORD_FILE_pointer(t *testing.T) {
 					got, blankPointer, want, logs.Messages())
 			}
 		})
+	}
+}
+
+// TestLoad_blank_password_file_pointer_reports_whitespace_outcome pins the second
+// arm of that WARN's message, which the test above does not reach: a WHITESPACE-only
+// pointer is non-empty to envx, so it IS the selected channel and startup fails while
+// opening a filename made of spaces. Reporting the empty-pointer outcome here would
+// tell an operator the env password was used on a startup that never got that far.
+// Serial: it swaps slog.Default().
+func TestLoad_blank_password_file_pointer_reports_whitespace_outcome(t *testing.T) {
+	t.Setenv("PFX_PASSWORD_FILE", " \t ")
+	t.Setenv("PFX_PASSWORD", "a-real-password")
+
+	logs := capture.Default(t)
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() = nil error, want the whitespace-only file pointer to fail when envx opens it")
+	}
+
+	const msg = "PFX_PASSWORD_FILE is set but blank"
+	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
+		t.Errorf("Load() logged %d %q WARN records, want 1 (logs %v)", n, msg, logs.Messages())
+	}
+	const outcome = "startup will fail trying to open a file whose name is whitespace"
+	if !logs.Contains(outcome) {
+		t.Errorf("Load() WARN does not report %q (logs %v)", outcome, logs.Messages())
 	}
 }
 

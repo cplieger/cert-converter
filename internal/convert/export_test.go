@@ -5,11 +5,6 @@ import (
 	"crypto/x509"
 )
 
-// EncoderFor is the package-internal encoder lookup, exported to the external
-// tests so they can assert which pkcs12.Encoder a name selects without the
-// vendor type leaving this package in production.
-var EncoderFor = encoderFor
-
 // ParseCertChain drops the skipped-unrelated-block evidence the parser returns
 // for Analyse's observation, so the parser's own tests keep asserting on the
 // certificates and the error alone.

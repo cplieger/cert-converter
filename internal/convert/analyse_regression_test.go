@@ -397,6 +397,54 @@ func TestAnalyse_converts_a_key_shared_by_a_ca_and_its_leaf(t *testing.T) {
 	}
 }
 
+// TestAnalyse_converts_when_key_file_holds_leaf_and_issuer_keys pins the second
+// reachable input dropIssuerMatches documents: the key file carries the leaf key AND
+// the CA key, so each certificate in the bundle has its own matching key. Without the
+// issuer matches being discarded before distinct-identity resolution, this bundle
+// looks like two identities, the pair is refused, conversion fails and the health
+// marker stays unset — while the shared-key test above stays green, because it only
+// covers one key matching both certificates.
+func TestAnalyse_converts_when_key_file_holds_leaf_and_issuer_keys(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	caKey := newKey(t)
+	caPEM, caCert := mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(74),
+		Subject:               pkix.Name{CommonName: "Separate Key CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(48 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &caKey.PublicKey, nil, caKey)
+
+	leafKey := newKey(t)
+	leafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(75),
+		Subject:      pkix.Name{CommonName: "separate-key-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, caCert, caKey)
+
+	got, err := convert.Analyse(
+		concatPEM(leafPEM, caPEM),
+		concatPEM(keyPEMOf(t, leafKey), keyPEMOf(t, caKey)),
+	)
+	if err != nil {
+		t.Fatalf("Analyse(leaf and issuer certificates with both private keys) = %v, want the leaf selected", err)
+	}
+	if got.Leaf().Subject.CommonName != "separate-key-leaf.example.com" {
+		t.Errorf("selected identity = %q, want the end-entity certificate", got.Leaf().Subject.CommonName)
+	}
+	if len(got.Chain()) != 1 || got.Chain()[0].Subject.CommonName != "Separate Key CA" {
+		t.Errorf("chain subjects = %v, want [Separate Key CA]", subjectCNs(got.Chain()))
+	}
+	if !hasObservation(got.Observations(), convert.ObsIssuerMatchIgnored) {
+		t.Errorf("observations = %v, want the passed-over issuer match reported", got.Observations())
+	}
+}
+
 // TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established pins the
 // additive-only fallback.
 //
@@ -1338,5 +1386,47 @@ func TestAnalyse_keeps_the_upper_chain_when_a_middle_issuer_cannot_be_establishe
 	}
 	if hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
 		t.Errorf("observations = %v, want NO exclusion: nothing was proven unrelated", got.Observations())
+	}
+}
+
+// TestAnalyse_drops_a_shared_key_issuer_across_a_name_encoding_difference pins
+// identity role against a bundle where the ONLY evidence of issuance is the
+// signature itself: one ECDSA key belongs to both a CA and the leaf it signed, and
+// the leaf's issuer name is the CA's subject in a permitted but byte-distinct
+// encoding, so neither candidate-edge signal fires. Judging role off the candidate
+// graph alone read the CA as a non-issuer, let it compete for identity, and let it
+// win on its later NotBefore — emitting a zero-chain PFX for the CA instead of the
+// leaf the operator asked to convert.
+func TestAnalyse_drops_a_shared_key_issuer_across_a_name_encoding_difference(t *testing.T) {
+	t.Parallel()
+	sharedKey := newKey(t)
+	now := time.Now().Truncate(time.Second)
+	caPEM, caCert := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(600), Subject: pkix.Name{CommonName: "Shared Encoding CA"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(48 * time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
+	}, &sharedKey.PublicKey, nil, sharedKey)
+	leafPEM, leafCert := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(601), Subject: pkix.Name{CommonName: "encoding-leaf.example.com"},
+		NotBefore: now.Add(-2 * time.Hour), NotAfter: now.Add(24 * time.Hour),
+	}, &sharedKey.PublicKey, utf8SubjectView(caCert, "Shared Encoding CA"), sharedKey)
+	if bytes.Equal(leafCert.RawIssuer, caCert.RawSubject) {
+		t.Fatal("setup: issuer and subject encodings unexpectedly match")
+	}
+	if err := leafCert.CheckSignatureFrom(caCert); err != nil {
+		t.Fatalf("setup: CA did not actually sign leaf: %v", err)
+	}
+	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), keyPEMOf(t, sharedKey))
+	if err != nil {
+		t.Fatalf("Analyse = %v, want the end-entity identity", err)
+	}
+	if got.Leaf().SerialNumber.Cmp(big.NewInt(601)) != 0 {
+		t.Errorf("selected identity serial = %s, want 601", got.Leaf().SerialNumber)
+	}
+	if len(got.Chain()) != 1 || got.Chain()[0].SerialNumber.Cmp(big.NewInt(600)) != 0 {
+		t.Errorf("chain serials = %v, want [600]", chainSerials(got.Chain()))
+	}
+	if !hasObservation(got.Observations(), convert.ObsIssuerMatchIgnored) {
+		t.Errorf("observations = %v, want the passed-over issuer match reported", got.Observations())
 	}
 }

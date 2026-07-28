@@ -20,10 +20,9 @@ import (
 // count and a remediation hint (they are the only signal that atomic-write
 // artifacts are accumulating in /output).
 //
-// The sweep mechanics moved to atomicfile.CleanupStaleTempsInRoot, which reports
-// counts rather than logging; this narrative stayed here because the remediation
-// hint names THIS app's volume and user: mapping. Runs serially: it swaps
-// slog.Default().
+// CleanupStaleTempsInRoot owns the sweep mechanics and returns counts; this
+// package tests the app-specific logs because their remediation names /output
+// and the deployment's user mapping. Runs serially because it swaps slog.Default().
 func TestStoreLogSweepOutcome_operator_signals(t *testing.T) {
 	root, err := os.OpenRoot(t.TempDir())
 	if err != nil {

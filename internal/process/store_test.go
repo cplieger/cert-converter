@@ -10,10 +10,9 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 )
 
-// TestStoreWrite_creates_the_parent_directory pins the half of store.write that
-// used to sit in scanWalk.convertEntry as an inline MkdirAll: a nested output path
-// must have its directory created rather than failing the entry, so an input tree
-// with domain subdirectories mirrors into the output tree.
+// TestStoreWrite_creates_the_parent_directory pins that a nested output path has its
+// parent created rather than failing, so an input tree with domain subdirectories
+// mirrors into the output tree.
 func TestStoreWrite_creates_the_parent_directory(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -120,10 +119,8 @@ func TestStoreLstat_does_not_follow_a_symlink(t *testing.T) {
 
 // TestStoreWrite_wraps_an_atomic_write_failure pins the "write pfx" wrapping.
 //
-// This assertion used to live against convert's retired write helper. The write
-// moved here, so its error contract did too: a caller reading the log needs to
-// know the failure was the PFX write rather than the parse, the encode, or the
-// directory creation, each of which has its own wrapping.
+// The error must identify the PFX write rather than parsing, encoding, or parent
+// creation, each of which has its own wrapping.
 //
 // The failure is forced by naming an existing DIRECTORY as the output path, which
 // makes the atomic rename fail regardless of the uid the test runs as (a

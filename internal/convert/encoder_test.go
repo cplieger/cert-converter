@@ -4,41 +4,20 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/convert"
-	"software.sslmate.com/src/go-pkcs12"
 )
-
-func TestEncoderFor(t *testing.T) {
-	t.Parallel()
-	for name, tc := range map[string]struct {
-		in   convert.EncoderType
-		want *pkcs12.Encoder
-	}{
-		"modern2023":                             {convert.EncNameModern2023, pkcs12.Modern2023},
-		"modern2026":                             {convert.EncNameModern2026, pkcs12.Modern2026},
-		"legacydes":                              {convert.EncNameLegacyDES, pkcs12.LegacyDES},
-		"legacyrc2":                              {convert.EncNameLegacyRC2, pkcs12.LegacyRC2},
-		"unknown name falls back to modern2023":  {convert.EncoderType("modern2029"), pkcs12.Modern2023},
-		"empty name falls back to modern2023":    {convert.EncoderType(""), pkcs12.Modern2023},
-		"raw env alias is not a normalized name": {convert.EncoderType("legacy"), pkcs12.Modern2023},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			got := convert.EncoderFor(tc.in)
-			if got == nil {
-				t.Fatalf("convert.EncoderFor(%q) = nil, want a non-nil encoder", tc.in)
-			}
-			if got != tc.want {
-				t.Errorf("convert.EncoderFor(%q) = %p, want %p", tc.in, got, tc.want)
-			}
-		})
-	}
-}
 
 // TestEncoderName pins both halves of the normalization contract: the name a
 // raw PFX_ENCODER value resolves to AND the known flag that decides whether the
 // caller warns. internal/config owns the warning, so the flag itself is only
 // asserted here; without it a spelling that silently stopped being recognized
 // would still return the right default name and go unnoticed.
+//
+// Which pkcs12.Encoder each name selects is deliberately NOT asserted by pointer
+// identity here: that is an implementation detail an equivalent encoder value would
+// fail while emitting the same algorithms. The behaviour is pinned end-to-end by
+// TestInspect_identifies_every_profile_we_emit (Encode then Inspect, all four
+// profiles) and TestCheckCurrency_resolves_an_unknown_encoder_name_the_way_Encode_does
+// (the unknown-name fallback).
 func TestEncoderName(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

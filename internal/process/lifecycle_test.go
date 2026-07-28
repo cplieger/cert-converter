@@ -121,6 +121,91 @@ func TestStoreReconcile(t *testing.T) {
 	}
 }
 
+// TestStoreReconcile_warn_mode_reports_report_only_despite_a_conversion_failure pins
+// the precedence between the configured lifecycle mode and this scan's conversion
+// failure in the orphan report's action attribute. OUTPUT_LIFECYCLE=warn is the
+// default and never removes anything, so blaming the inaction on the failure would
+// promise the operator a removal on the next clean scan that the mode forbids, while
+// the stale bundle stays served and the remediation attribute on the SAME record says
+// to remove it by hand. Serial: captureLogs swaps the process-global slog.Default.
+func TestStoreReconcile_warn_mode_reports_report_only_despite_a_conversion_failure(t *testing.T) {
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, "orphan.pfx")
+	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	logs := captureLogs(t)
+	s := &store{root: root}
+
+	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleWarn,
+		map[string]struct{}{}, reapContext{scanTotal: 1, failed: 1, walkCompleted: true})
+	if reconcileErr != nil {
+		t.Fatalf("reconcile(warn, one failed conversion) = error %v, want nil", reconcileErr)
+	}
+	if deleted != 0 {
+		t.Errorf("reconcile(warn, one failed conversion) deleted = %d, want 0", deleted)
+	}
+	const msg = "output bundles have no matching input"
+	if !logs.HasAttr(msg, "action", "reported only (OUTPUT_LIFECYCLE=warn)") {
+		got, _ := logs.AttrValue(msg, "action")
+		t.Errorf("reconcile(warn, one failed conversion) logged action %q, want the report-only mode explanation", got)
+	}
+}
+
+// TestStoreReconcile_unsafe_output_walk_never_advises_deletion drives an unsafe OUTPUT
+// walk all the way through reconcile with a real candidate present. The other tests
+// stop at orphans reporting safe=false, so nothing pinned the two operator-facing
+// attributes that decide what happens to a live bundle: a symlinked output subtree
+// enumerates a live private-key bundle under a physical path whose derived input name
+// is absent from `seen`, so it reads as an orphan. If either advice guard regresses,
+// sync mode deletes it or the operator is told to. Serial: captureLogs swaps
+// the process-global slog.Default.
+func TestStoreReconcile_unsafe_output_walk_never_advises_deletion(t *testing.T) {
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, "orphan.pfx")
+	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	if err := os.Symlink(".", filepath.Join(dir, "linked")); err != nil {
+		t.Fatalf("setup: Symlink: %v", err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	logs := captureLogs(t)
+	s := &store{root: root}
+
+	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync,
+		map[string]struct{}{}, reapContext{scanTotal: 1, walkCompleted: true})
+	if reconcileErr != nil {
+		t.Fatalf("reconcile(unsafe output walk) = error %v, want nil", reconcileErr)
+	}
+	if deleted != 0 {
+		t.Errorf("reconcile(unsafe output walk) deleted = %d, want 0", deleted)
+	}
+	if _, err := os.Stat(orphan); err != nil {
+		t.Errorf("orphan candidate was removed after an unsafe output walk: %v", err)
+	}
+	const msg = "output bundles have no matching input"
+	if !logs.HasAttr(msg, "action",
+		"kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle") {
+		got, _ := logs.AttrValue(msg, "action")
+		t.Errorf("reconcile(unsafe output walk) logged action %q, want the live-bundle deletion warning", got)
+	}
+	if !logs.HasAttr(msg, "remediation",
+		"do not remove anything from this list yet: fix the /output warnings above, then re-check it on a scan that reports no disabled orphan removal") {
+		got, _ := logs.AttrValue(msg, "remediation")
+		t.Errorf("reconcile(unsafe output walk) logged remediation %q, want advice that forbids manual deletion", got)
+	}
+}
+
 // TestSampleOrphanPaths_bounds_the_logged_sample pins the bound on the orphan report's
 // paths attribute. reconcile emits that line on every scan for as long as an orphan
 // exists, so an unbounded sample is a permanent multi-kilobyte log record per scan,
@@ -806,7 +891,10 @@ func concatPEM(blobs ...[]byte) []byte {
 // "only shutdown gets here", would count it as a conversion instead of a cancelled
 // scan. The other arms pin the level each outcome is reported at (Info for a
 // deliberate encoder change, Debug for the two expected failures, silence for a
-// match or an ordinary renewal). Runs serially: it swaps slog.Default().
+// match or an ordinary renewal), and each one repeats under a cancelled context:
+// the shutdown gate sits ahead of the whole switch, so no verdict arm may report
+// current or stale once cancellation is requested. Runs serially: it swaps
+// slog.Default().
 func TestCurrentFromCurrency_maps_every_outcome(t *testing.T) {
 	for _, tc := range []struct {
 		res         convert.Currency
@@ -843,6 +931,22 @@ func TestCurrentFromCurrency_maps_every_outcome(t *testing.T) {
 		{
 			res:  convert.Currency{Reason: convert.CurrencyDecodeFailed, Err: errors.New("mac mismatch")},
 			name: "a decode interrupted by shutdown is an error, not stale", cancelled: true, wantErr: true,
+		},
+		{
+			res:  convert.Currency{Reason: convert.CurrencyMatch},
+			name: "a match under shutdown is an error, not current", cancelled: true, wantErr: true,
+		},
+		{
+			res:  convert.Currency{Reason: convert.CurrencyContentMismatch},
+			name: "a renewal under shutdown is an error, not stale", cancelled: true, wantErr: true,
+		},
+		{
+			res:  convert.Currency{Reason: convert.CurrencyPreflightFailed, Err: errors.New("bounded out")},
+			name: "a failed preflight under shutdown is an error, not stale", cancelled: true, wantErr: true,
+		},
+		{
+			res:  convert.Currency{Reason: convert.CurrencyProfileMismatch, Profile: convert.EncNameLegacyDES},
+			name: "an encoder change under shutdown is an error, not stale", cancelled: true, wantErr: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

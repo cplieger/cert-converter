@@ -66,8 +66,7 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, skippedBlocks, error)
 		return nil, skippedBlocks{}, fmt.Errorf("certificate PEM chain declares %d CERTIFICATE block(s), more than the %d this app converts",
 			declaredCertBlocks, maxChainCerts)
 	}
-	var certs []*x509.Certificate
-	var skipped, unrelated skippedBlocks
+	var scan certScan
 
 	for {
 		var block *pem.Block
@@ -75,45 +74,76 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, skippedBlocks, error)
 		if block == nil {
 			break
 		}
-		if block.Type != pemTypeCertificate {
-			skipped.add(block.Type)
-			// A private-key block is an expected passenger: a combined cert+key file
-			// is a supported input, so it is skipped silently. Anything else was
-			// neither a certificate this app can put in the bundle nor a key, and the
-			// operator hears about it.
-			if !isPrivateKeyBlockType(block.Type) {
-				unrelated.add(block.Type)
-			}
-			continue
+		if err := scan.visit(block); err != nil {
+			return nil, skippedBlocks{}, err
 		}
-		c, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			return nil, skippedBlocks{}, fmt.Errorf("certificate PEM block %d: %w", len(certs)+1, boundedTextError{err})
-		}
-		certs = append(certs, c)
 	}
 
-	if len(certs) != declaredCertBlocks {
-		return nil, skippedBlocks{}, fmt.Errorf("certificate PEM chain is malformed: decoded %d of %d declared CERTIFICATE block(s)", len(certs), declaredCertBlocks)
+	if len(scan.certs) != declaredCertBlocks {
+		return nil, skippedBlocks{}, fmt.Errorf("certificate PEM chain is malformed: decoded %d of %d declared CERTIFICATE block(s)", len(scan.certs), declaredCertBlocks)
 	}
 
-	if len(certs) == 0 {
-		if skipped.count > 0 {
+	if len(scan.certs) == 0 {
+		if scan.skipped.count > 0 {
 			return nil, skippedBlocks{}, fmt.Errorf("no certificate PEM block found (skipped %d non-certificate PEM block(s), first %q)",
-				skipped.count, skipped.firstTypeForLog())
+				scan.skipped.count, scan.skipped.firstTypeForLog())
 		}
 		return nil, skippedBlocks{}, errors.New("no certificate PEM block found")
 	}
-	return certs, unrelated, nil
+	return scan.certs, scan.unrelated, nil
 }
 
-// isPrivateKeyBlockType reports whether a PEM label names a private-key block
-// this package knows, including the encrypted forms it only diagnoses. It reads
-// the same pemType* constants keyBeginMarkers is built from, so the "a key in the
-// certificate file is expected" rule cannot drift from the parser's own set.
-func isPrivateKeyBlockType(blockType string) bool {
+// certScan accumulates what one pass over a certificate file's PEM blocks
+// learned: the parsed chain, plus the skipped-block evidence the "no certificate"
+// diagnostic and the unrelated-passenger report need. Hoisting the loop body onto
+// it keeps parseCertChain a bounds -> drain -> validate sequence, the same shape
+// keyScan gives parsePrivateKeys.
+//
+// Field order is chosen for pointer-region packing (govet fieldalignment): the
+// slice leads, then the two skippedBlocks whose string leads them.
+type certScan struct {
+	certs     []*x509.Certificate
+	skipped   skippedBlocks
+	unrelated skippedBlocks
+}
+
+// visit classifies one PEM block, applying the parser's per-block rules. The
+// error it returns is the chain-rejecting one: unparseable certificate DER ends
+// the scan rather than truncating the chain.
+func (s *certScan) visit(block *pem.Block) error {
+	if block.Type != pemTypeCertificate {
+		s.skipped.add(block.Type)
+		// A private-key block is an expected passenger: a combined cert+key file
+		// is a supported input, so it is skipped silently, as is the EC PARAMETERS
+		// block OpenSSL writes beside an EC key. Anything else was neither a
+		// certificate this app can put in the bundle nor a key companion, and the
+		// operator hears about it.
+		if !isExpectedCertFilePassenger(block.Type) {
+			s.unrelated.add(block.Type)
+		}
+		return nil
+	}
+	c, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("certificate PEM block %d: %w", len(s.certs)+1, boundedTextError{err})
+	}
+	s.certs = append(s.certs, c)
+	return nil
+}
+
+// isExpectedCertFilePassenger reports whether a non-certificate PEM label in the
+// CERTIFICATE file is an expected companion rather than something the operator meant
+// this app to read as a certificate. The private-key labels are the combined cert+key
+// file (a supported input), and EC PARAMETERS is what `openssl ecparam -genkey` writes
+// immediately before the EC PRIVATE KEY it describes — the mirror of
+// isExpectedKeyFilePassenger, so a combined file classifies the same whichever input
+// it is passed as. It reads the same pemType* constants keyBeginMarkers is built from,
+// so the "a key in the certificate file is expected" rule cannot drift from the
+// parser's own set.
+func isExpectedCertFilePassenger(blockType string) bool {
 	switch blockType {
-	case pemTypePrivateKey, pemTypeRSAPrivateKey, pemTypeECPrivateKey, pemTypeEncryptedPrivateKey:
+	case pemTypePrivateKey, pemTypeRSAPrivateKey, pemTypeECPrivateKey,
+		pemTypeEncryptedPrivateKey, pemTypeECParameters:
 		return true
 	}
 	return false

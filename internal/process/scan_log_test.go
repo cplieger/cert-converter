@@ -310,25 +310,31 @@ func TestLogConversionObservations_is_silent_without_observations(t *testing.T) 
 // TestNoteUnreadableInput_levels pins the benign-race half of the unreadable-input
 // notice, which the escaping-symlink tests only exercise from the Warn side. A
 // file that vanished between readdir and the read is a normal renewal race — the
-// next scan converts the replacement — so it stays at Debug and carries no
-// remediation hint. Promoting it would put an operator-facing warning, pointing at
-// /input permissions, into the log every time a certificate is atomically
-// replaced. Runs serially: it swaps slog.Default().
+// next scan converts the replacement — so it stays at Debug, carries no
+// remediation hint, and is classified statusVanished rather than statusUnreadable.
+// Promoting either would put an operator-facing warning, pointing at /input
+// permissions, into the log (or into the alerted unreadable count) every time a
+// certificate is atomically replaced. Runs serially: it swaps slog.Default().
 func TestNoteUnreadableInput_levels(t *testing.T) {
 	for _, tc := range []struct {
-		err       error
-		name      string
-		what      string
-		wantMsg   string
-		wantLevel slog.Level
+		err        error
+		name       string
+		what       string
+		wantMsg    string
+		wantLevel  slog.Level
+		wantStatus conversionStatus
 	}{
-		{fs.ErrNotExist, "a vanished certificate is a benign race", "certificate", "certificate vanished during the scan", slog.LevelDebug},
-		{fs.ErrNotExist, "a vanished key is a benign race", "private key", "private key vanished during the scan", slog.LevelDebug},
-		{errors.New("permission denied"), "an unreadable certificate warns", "certificate", "cannot read certificate", slog.LevelWarn},
+		{fs.ErrNotExist, "a vanished certificate is a benign race", "certificate", "certificate vanished during the scan", slog.LevelDebug, statusVanished},
+		{fs.ErrNotExist, "a vanished key is a benign race", "private key", "private key vanished during the scan", slog.LevelDebug, statusVanished},
+		{errors.New("permission denied"), "an unreadable certificate warns", "certificate", "cannot read certificate", slog.LevelWarn, statusUnreadable},
+		{context.Canceled, "a cancelled read is the shutdown, not an unreadable path", "certificate", "certificate read interrupted by shutdown", slog.LevelDebug, statusUnreadable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := captureLogs(t)
-			noteUnreadableInput("example.com/tls.crt", tc.what, tc.err)
+			if got := noteUnreadableInput("example.com/tls.crt", tc.what, tc.err); got != tc.wantStatus {
+				t.Errorf("noteUnreadableInput(%v) = %v, want %v: the diagnostic and the counted outcome must agree",
+					tc.err, got, tc.wantStatus)
+			}
 			if got := logs.CountLevel(tc.wantLevel, tc.wantMsg); got != 1 {
 				t.Fatalf("noteUnreadableInput(%v) logged %q, want %q at %s", tc.err, logs.Messages(), tc.wantMsg, tc.wantLevel)
 			}

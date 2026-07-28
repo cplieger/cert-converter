@@ -736,6 +736,33 @@ func TestAnalyse_reports_no_key_block_observation_for_an_ec_parameters_passenger
 	}
 }
 
+// TestAnalyse_reports_no_unrelated_block_observation_for_a_combined_ec_file pins
+// the CERTIFICATE-side half of the same rule. A single `openssl ecparam -genkey`
+// bundle (CERTIFICATE + EC PARAMETERS + EC PRIVATE KEY) is a supported combined
+// input, so passing it as both files must stay silent: when only the key-side
+// predicate knew about EC PARAMETERS, the certificate parser filed it as unrelated
+// and WARNed about a healthy file on every scan.
+func TestAnalyse_reports_no_unrelated_block_observation_for_a_combined_ec_file(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+
+	// Same named-curve DER as the key-side test above; only the label drives the rule.
+	ecParams := pem.EncodeToMemory(&pem.Block{
+		Type:  "EC PARAMETERS",
+		Bytes: []byte{0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07},
+	})
+	combined := concatPEM(m.LeafPEM, ecParams, m.LeafKeyPEM)
+
+	got, err := convert.Analyse(combined, combined)
+	if err != nil {
+		t.Fatalf("Analyse(combined ecparam -genkey file) = %v, want success", err)
+	}
+	if hasObservation(got.Observations(), convert.ObsUnrelatedBlocksSkipped) {
+		t.Errorf("observations = %v, want no %q for the EC PARAMETERS block riding in the certificate file",
+			got.Observations(), convert.ObsUnrelatedBlocksSkipped)
+	}
+}
+
 // TestAnalyse_reports_no_key_block_observation_for_a_clean_key_file guards the
 // other direction: the observation must stay absent for the ordinary input, or
 // every scan of every healthy pair emits a WARN nobody can act on.
