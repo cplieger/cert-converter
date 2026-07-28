@@ -678,10 +678,10 @@ func TestStoreIsCurrent_tightens_a_lax_mode_without_regenerating(t *testing.T) {
 		mode        os.FileMode
 		wantTighten bool
 		// wantMode is the mode expected after the tightening; zero means the generic
-		// ceiling every mode carrying an owner bit masks to (tc.mode & pfxFileMode). A
-		// lax mode with NO owner bit masks to 0000, which is not a tightening at all —
-		// the app could not read its own bundle back through it — so that case names
-		// the mode it must land on instead.
+		// ceiling every mode carrying an owner read or write bit masks to
+		// (tc.mode & pfxFileMode). A lax mode with NO owner read or write bit masks to
+		// 0000, which is not a tightening at all — the app could not read its own
+		// bundle back through it — so that case names the mode it must land on instead.
 		wantMode os.FileMode
 	}{
 		{"the policy mode is left alone", pfxFileMode, false, 0},
@@ -689,7 +689,8 @@ func TestStoreIsCurrent_tightens_a_lax_mode_without_regenerating(t *testing.T) {
 		{"a group-readable bundle is tightened", 0o640, true, 0},
 		{"a world-readable bundle is tightened", 0o644, true, 0},
 		{"an execute bit is cleared too", 0o700, true, 0},
-		{"a mode with no owner bit is tightened to policy, not to 0000", 0o044, true, pfxFileMode},
+		{"a mode with no owner read or write bit is tightened to policy, not to 0000", 0o044, true, pfxFileMode},
+		{"an owner-execute-only mode is tightened to policy, not to 0000", 0o100, true, pfxFileMode},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()

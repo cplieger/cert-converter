@@ -362,9 +362,9 @@ func laxerThanPolicy(perm os.FileMode) bool {
 //
 // Only the EXTRA bits are cleared, so a deliberately stricter mode survives
 // untouched (laxerThanPolicy is what protects it) and the tightening adds no bit the
-// file did not already carry — with one exception: a lax mode with no owner bit at
-// all masks to 0000, a mode this app could not read its own bundle back through, so
-// that case targets pfxFileMode instead. See the inline comment.
+// file did not already carry — with one exception: a lax mode with no owner READ or
+// WRITE bit masks to 0000, a mode this app could not read its own bundle back
+// through, so that case targets pfxFileMode instead. See the inline comment.
 //
 // The chmod goes through the store's confined root like every other output touch, so
 // a symlink planted under the output tree cannot redirect it outside the mounted
@@ -377,8 +377,10 @@ func (s *store) tightenMode(rel string, perm os.FileMode) {
 		return
 	}
 	want := perm & pfxFileMode
-	// A lax mode carrying NO owner bit (0044, 0060, 0004) masks to 0000, which is
-	// not a tightening: it takes away this app's own read of the bundle. Output-derived
+	// A lax mode carrying no owner READ or WRITE bit (0044, 0060, 0004, and the
+	// execute-only 0100 family) masks to 0000, which is not a tightening: it leaves
+	// this app unable to read the bundle. It is also the one arm here that adds owner
+	// bits the file did not carry, which is why it is spelled out. Output-derived
 	// currency then fails on the very next read — "cannot read prior pfx; regenerating"
 	// plus a rewrite with fresh KDF salts and a fresh mtime, the downstream
 	// re-replication maxPFXSize's comment exists to prevent — or, where the process can

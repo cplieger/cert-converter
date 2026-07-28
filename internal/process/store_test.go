@@ -74,6 +74,52 @@ func TestStoreReconcile_reports_an_output_tree_it_cannot_enumerate(t *testing.T)
 	}
 }
 
+// TestStoreOrphanReportRemediation_advice_matches_the_mode pins that the orphan
+// report never advises a setting that is already in effect. In sync mode the report
+// branch is only reachable with a conversion failure (reconcile returns early unless
+// the input enumeration is complete, so !reapable there means Failed > 0), which is
+// why the sync advice names that failure instead of the mode.
+func TestStoreOrphanReportRemediation_advice_matches_the_mode(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		mode      outputpolicy.Lifecycle
+		walkSafe  bool
+		wantHas   string
+		wantLacks string
+	}{
+		{
+			name: "sync names the conversion failure, not the mode it is already in",
+			mode: outputpolicy.LifecycleSync, walkSafe: true,
+			wantHas:   "fix the conversion failure reported above",
+			wantLacks: "OUTPUT_LIFECYCLE=sync",
+		},
+		{
+			name: "warn offers sync",
+			mode: outputpolicy.LifecycleWarn, walkSafe: true,
+			wantHas: "OUTPUT_LIFECYCLE=sync",
+		},
+		{
+			name: "an unwalkable output tree withholds removal advice in every mode",
+			mode: outputpolicy.LifecycleSync, walkSafe: false,
+			wantHas:   "do not remove anything from this list yet",
+			wantLacks: "OUTPUT_LIFECYCLE=sync",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := orphanReportRemediation(tc.mode, tc.walkSafe)
+			if !strings.Contains(got, tc.wantHas) {
+				t.Errorf("orphanReportRemediation(%v, %v) = %q, want it to contain %q",
+					tc.mode, tc.walkSafe, got, tc.wantHas)
+			}
+			if tc.wantLacks != "" && strings.Contains(got, tc.wantLacks) {
+				t.Errorf("orphanReportRemediation(%v, %v) = %q, want it NOT to advise %q",
+					tc.mode, tc.walkSafe, got, tc.wantLacks)
+			}
+		})
+	}
+}
+
 // TestStoreWrite_creates_the_parent_directory pins that a nested output path has its
 // parent created rather than failing, so an input tree with domain subdirectories
 // mirrors into the output tree.

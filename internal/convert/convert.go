@@ -50,12 +50,12 @@ const maxKeyBlocks = 16
 // diagnosable from the message alone. Blocks that are neither a certificate nor
 // a private key are additionally returned as the second result, so Analyse can
 // report that they were left out of the bundle instead of dropping them
-// silently. Two labels are exempt from that second result: a private-key block (the
-// combined cert+key file) and EC PARAMETERS (what `openssl ecparam -genkey` writes
-// beside an EC key), both of which are expected companions rather than something
-// left out by mistake; isExpectedCertFilePassenger owns that set. It returns an
-// error if no
-// CERTIFICATE block is present, and also if any CERTIFICATE block holds DER
+// silently. Two kinds of label are exempt from that second result: any private-key
+// label, including the encrypted one (a combined cert+key file is a supported input),
+// and EC PARAMETERS (what `openssl ecparam -genkey` writes beside an EC key). Both are
+// expected companions rather than something left out by mistake;
+// isExpectedCertFilePassenger owns that set. It returns an error if no CERTIFICATE
+// block is present, and also if any CERTIFICATE block holds DER
 // that x509 cannot parse: a partially decodable chain is rejected outright
 // rather than silently truncated, because a PFX built from a truncated chain
 // fails validation obscurely at the consumer instead of here.

@@ -832,3 +832,39 @@ func TestAnalysis_Observations_returns_a_copy(t *testing.T) {
 		t.Errorf("Observations()[0] = %q after the caller overwrote its own slice, want the analysis unchanged", second[0].Kind)
 	}
 }
+
+// TestAnalyse_names_the_skipped_certificate_file_blocks_when_nothing_matches pins
+// the failure-path half of the skipped-block signal. The success path has
+// TestAnalyse_reports_a_chain_link_left_out_because_its_label_is_not_CERTIFICATE;
+// on the no-match path the observation is discarded, so noMatchError's own clause
+// is the only signal that a relabelled chain link was left out -- and deleting it
+// otherwise keeps the whole suite green.
+func TestAnalyse_names_the_skipped_certificate_file_blocks_when_nothing_matches(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	_, unrelatedKeyPEM := testcerts.GenerateSelfSignedCert(t, "unrelated.example.com", "ecdsa")
+
+	_, err := convert.Analyse(concatPEM(m.LeafPEM, relabelPEM(t, m.CAPEM, "TRUSTED CERTIFICATE")), unrelatedKeyPEM)
+	if err == nil {
+		t.Fatal("Analyse(relabelled CA link + unrelated key) = nil error, want a no-match error")
+	}
+	got := err.Error()
+	const base = "none of the 1 private key block(s) matches any of the 1 certificate(s) in the chain"
+	if !strings.HasPrefix(got, base) {
+		t.Errorf("Analyse error = %q, want the base no-match sentence %q as an exact prefix", got, base)
+	}
+	for _, want := range []string{"the certificate file also holds 1 block(s)", `"TRUSTED CERTIFICATE"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Analyse error = %q, want it to contain %q: the skipped block is the likely cause of the mismatch", got, want)
+		}
+	}
+
+	// A clean certificate file adds no clause.
+	_, err = convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), unrelatedKeyPEM)
+	if err == nil {
+		t.Fatal("Analyse(clean bundle + unrelated key) = nil error, want a no-match error")
+	}
+	if strings.Contains(err.Error(), "the certificate file also holds") {
+		t.Errorf("Analyse error = %q, want no skipped-block clause for a certificate file that held nothing else", err.Error())
+	}
+}

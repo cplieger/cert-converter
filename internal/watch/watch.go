@@ -355,7 +355,7 @@ func (w *Watcher) visitWatchPath(
 			// keeps the health marker green. Reporting it lets Run degrade to
 			// polling, or return ErrWatchLost when the fallback is disabled too.
 			if d.Type()&fs.ModeSymlink != 0 {
-				return fmt.Errorf("watch root %q is a symlink; fsnotify registers watches by path and does not follow it, so bind-mount the target directory at %s instead", path, path)
+				return fmt.Errorf("watch root %q is a symlink; the watch-set walk Lstats the root and does not descend it, so no directory under the target would be watched - bind-mount the target directory at %s instead", path, path)
 			}
 			return fmt.Errorf("watch root %q is not a directory", path)
 		}

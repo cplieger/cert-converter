@@ -306,12 +306,15 @@ func TestPollTick_stays_in_poll_mode_when_fsnotify_remains_unavailable(t *testin
 	}
 }
 
-// TestPollTick_does_no_work_when_the_ctx_is_already_cancelled pins pollTick's entry
-// guard: a tick that fires in the same instant as a shutdown must attempt no
-// upgrade and run no scan (which would still drive the health marker), and must
-// report stopped=true so the poll loop returns. fsnotify is stubbed UNAVAILABLE so
-// the guard is what the assertions turn on: without it the retry arm would log its
-// degraded notice and scan, making both stopped and scans wrong.
+// TestPollTick_does_no_work_when_the_ctx_is_already_cancelled pins pollTick's
+// cancelled-tick contract: a tick that fires in the same instant as a shutdown must
+// attempt no upgrade and run no scan (which would still drive the health marker), and
+// must report stopped=true so the poll loop returns. fsnotify is stubbed UNAVAILABLE so
+// the tick runs its cheapest failure path. What this pins is that composite contract
+// (no scan, stopped=true), not the entry guard in isolation: the retry arm's own ctx
+// check keeps both assertions green even with the guard deleted; only the guard
+// additionally suppresses the "poll scan triggered" Debug line, which this test does
+// not capture.
 //
 // The mid-attempt arms are pinned separately — the rebuild branch by
 // TestPollTick_treats_shutdown_during_the_watch_set_rebuild_as_a_stop above, the

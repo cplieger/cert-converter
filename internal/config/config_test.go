@@ -1544,3 +1544,95 @@ func TestFallbackInterval_agrees_with_the_interval_Load_reports(t *testing.T) {
 		})
 	}
 }
+
+// TestLoad_warns_when_the_password_contains_an_invisible_formatting_character pins
+// the Cf-rune diagnostic that sits beside the control-character WARN: a UTF-8 BOM or
+// a zero-width space is valid UTF-8, inside the BMP, not a NUL, not a control
+// character and not whitespace, so every other guard accepts it and this WARN is the
+// operator's only signal that the bundle's password is not the secret's visible
+// contents. The clean case keeps it from firing on every healthy startup, and the
+// control-character-only case pins the Cc/Cf disjointness that keeps one rune from
+// producing two records. Serial: it swaps slog.Default().
+func TestLoad_warns_when_the_password_contains_an_invisible_formatting_character(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		password string
+		wantWarn bool
+	}{
+		{"a byte-order mark warns", "\ufeffhunter2", true},
+		{"an interior zero-width space warns", "pw\u200bsecret", true},
+		{"a soft hyphen warns", "soft\u00adhyphen", true},
+		{"a clean password is silent", "hunter2", false},
+		{"a control character alone is silent", "line1\nline2", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", tc.password)
+			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
+
+			logs := capture.Default(t)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() = %v, want nil: an invisible formatting character is a WARN, not a startup refusal", err)
+			}
+			const msg = "invisible Unicode formatting character"
+			warned := logs.CountLevel(slog.LevelWarn, msg) > 0
+			if warned != tc.wantWarn {
+				t.Errorf("Load(%s) invisible-formatting WARN = %v, want %v (logs %v)", tc.name, warned, tc.wantWarn, logs.Messages())
+			}
+			if tc.wantWarn && !logs.AttrContains(msg, "source", "env") {
+				t.Errorf("invisible-formatting WARN does not name the delivery channel (logs %v)", logs.Messages())
+			}
+		})
+	}
+}
+
+// TestLoad_warns_when_a_mounted_secret_contains_a_format_character is the
+// file-channel half: the invisible-formatting guard is channel-agnostic today, and
+// the mounted file is where the failure mode actually originates (an editor saving
+// the secret as "UTF-8 with BOM"). Without this, folding the guard into the env-only
+// shape of its sibling padding WARN would silence the file channel with every other
+// test still green. Serial: it swaps slog.Default().
+func TestLoad_warns_when_a_mounted_secret_contains_a_format_character(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		password string
+		wantWarn bool
+	}{
+		{"a byte-order mark warns", "\ufeffsecret", true},
+		{"an interior zero-width space warns", "pw\u200bsecret", true},
+		{"a plain password is silent", "hunter2", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "pfx-password")
+			if err := os.WriteFile(path, []byte(tc.password), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PFX_PASSWORD", "")
+			t.Setenv("PFX_PASSWORD_FILE", path)
+			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
+
+			logs := capture.Default(t)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() = %v, want nil: an invisible formatting character is a WARN, not a startup refusal", err)
+			}
+			if cfg.Password != tc.password {
+				t.Errorf("Load() Password = %q, want %q verbatim", cfg.Password, tc.password)
+			}
+
+			const msg = "invisible Unicode formatting character"
+			wantCount := 0
+			if tc.wantWarn {
+				wantCount = 1
+			}
+			if got := logs.CountLevel(slog.LevelWarn, msg); got != wantCount {
+				t.Errorf("Load(%s) logged %d invisible-formatting WARNs, want %d (logs %v)", tc.name, got, wantCount, logs.Messages())
+			}
+			if tc.wantWarn && !logs.AttrContains(msg, "source", "file") {
+				t.Errorf("invisible-formatting WARN does not name the file delivery channel (logs %v)", logs.Messages())
+			}
+		})
+	}
+}

@@ -127,7 +127,7 @@ func TestInspect_rejects_an_oversized_identifier(t *testing.T) {
 			// Both halves of the refusal are pinned: the sentinel (a bound bypass fails
 			// it, because an unbounded decode of this arc errors with asn1's own "base
 			// 128 integer too large" rather than ErrProfileUnknown), and the guard's own
-			// wording, so a bound relaxed instead of removed is caught too.
+			// wording, confirming that the bounded decoder itself made the refusal.
 			if want := "object identifier exceeds"; !strings.Contains(inspectErr.Error(), want) {
 				t.Errorf("Inspect(%s) = %v, want the refusal to name %q", tc.name, inspectErr, want)
 			}

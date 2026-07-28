@@ -489,3 +489,44 @@ func TestLogScanOutcome_names_the_vanished_count(t *testing.T) {
 		t.Errorf("logScanOutcome(vanished=1) logged vanished=%q, want the renewal-race count in the summary", got)
 	}
 }
+
+// TestScannerRun_an_unopenable_root_emits_the_scan_outcome_record pins the RECORD side
+// of the two pre-walk hard errors, which nothing else in the suite reaches: an /input
+// or /output root that cannot be opened at all must still emit the end-of-scan summary
+// the README's CertConverterScanAborted rule matches, not only return an error to
+// main. That is the whole reason both returns route through failScan rather than
+// returning directly, and it is the one failure class that stops every renewal, so
+// without this the wrapper can be dropped again with the suite green and the
+// documented alert silent. Runs serially: it swaps slog.Default().
+func TestScannerRun_an_unopenable_root_emits_the_scan_outcome_record(t *testing.T) {
+	const aborted = "scan aborted before completion"
+	for _, tc := range []struct {
+		name      string
+		breakCert bool
+	}{
+		{name: "input root", breakCert: true},
+		{name: "output root", breakCert: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			certsRoot, outRoot := t.TempDir(), t.TempDir()
+			if tc.breakCert {
+				certsRoot = filepath.Join(certsRoot, "never-created")
+			} else {
+				outRoot = filepath.Join(outRoot, "never-created")
+			}
+			logs := captureLogs(t)
+
+			scanner := New(&Options{
+				CertsRoot: certsRoot, OutRoot: outRoot,
+				Password: "pw", Encoder: convert.EncNameModern2023,
+			})
+			if _, err := scanner.Run(t.Context()); err == nil {
+				t.Fatalf("Run(unopenable %s) = nil error, want a hard error so health flips", tc.name)
+			}
+			if got := logs.CountLevel(slog.LevelWarn, aborted); got != 1 {
+				t.Errorf("Run(unopenable %s) logged %q, want exactly one WARN %q: the documented scan-aborted alert never fires otherwise",
+					tc.name, logs.Messages(), aborted)
+			}
+		})
+	}
+}

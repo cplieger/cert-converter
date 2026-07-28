@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/fsnotify/fsnotify"
@@ -183,10 +184,25 @@ func TestAddWatchDirs_refuses_a_non_directory_root(t *testing.T) {
 	}
 	watcher := newTestWatcher(t)
 
-	for _, root := range []string{fileRoot, linkRoot} {
-		w := New(root, func(context.Context) {})
-		if err := w.addWatchDirs(t.Context(), watcher, root); err == nil {
-			t.Errorf("addWatchDirs(%q) = nil, want an error: the watch set is %v, so no event could ever arrive", root, watcher.WatchList())
+	for _, tc := range []struct {
+		root string
+		want string
+	}{
+		{fileRoot, "is not a directory"},
+		{linkRoot, "is a symlink"},
+	} {
+		w := New(tc.root, func(context.Context) {})
+		err := w.addWatchDirs(t.Context(), watcher, tc.root)
+		if err == nil {
+			t.Errorf("addWatchDirs(%q) = nil, want an error: the watch set is %v, so no event could ever arrive", tc.root, watcher.WatchList())
+			continue
+		}
+		// The message is the operator's only signal for this shape: a symlinked
+		// /input keeps converting and stays healthy while real-time detection is
+		// gone, so the error must name the symlink rather than the generic
+		// not-a-directory refusal.
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("addWatchDirs(%q) = %q, want it to name %q so the WARN is self-diagnosing", tc.root, err, tc.want)
 		}
 	}
 }

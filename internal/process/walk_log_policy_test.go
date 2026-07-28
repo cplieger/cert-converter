@@ -325,4 +325,20 @@ func TestLogIncompleteInputEnumeration_quiet_arms(t *testing.T) {
 				" the only line the operator sees", logs.Messages())
 		}
 	})
+
+	// A renewal during a scan that ALSO hit an unreadable path must not demote the
+	// durable condition to the transient arm: vanishedOnly's Vanished term is only
+	// half of it, and without this case dropping its durable half leaves the suite
+	// green while the /input-mount WARN (and the alert on it) vanishes for as long
+	// as any cert is renewing.
+	t.Run("a vanished cert does not hide an unreadable path", func(t *testing.T) {
+		logs := captureLogs(t)
+		logIncompleteInputEnumeration(&reapContext{
+			result: ScanResult{Total: 2, Unreadable: 1, Vanished: 1}, walkCompleted: true,
+		})
+		if got := logs.CountLevel(slog.LevelWarn, mountWarn); got != 1 {
+			t.Fatalf("logIncompleteInputEnumeration(unreadable path + vanished cert) logged %q, want %q"+
+				" once at WARN: a transient replacement must not silence a durable veto", logs.Messages(), mountWarn)
+		}
+	})
 }
