@@ -217,3 +217,34 @@ func TestScannerRun_keeps_observation_state_across_an_incomplete_enumeration(t *
 			got)
 	}
 }
+
+// TestObservationLog_reports_a_new_time_derived_observation_without_input_change
+// pins the identity of the de-duplication state: it covers the input bytes AND the
+// observations derived from them, not the bytes alone.
+//
+// Analyse derives the validity-window observations from the current scan time, so a
+// leaf that crosses NotAfter while the daemon stays up yields a NEW observation over
+// UNCHANGED bytes on the next fallback scan. Keying suppression on the input
+// fingerprint alone silenced that transition until a restart cleared the map, which
+// left the operator distributing an expired identity with no warning. The
+// once-per-condition rule still holds: the second scan over the same observation set
+// stays silent.
+//
+// Serial, not parallel: captureLogs swaps the process-global slog.Default().
+func TestObservationLog_reports_a_new_time_derived_observation_without_input_change(t *testing.T) {
+	logs := captureLogs(t)
+	o := newObservationLog()
+	fp := pairFingerprint([]byte("cert"), []byte("key"))
+	o.record("tls.crt", fp, nil)
+
+	expired := []convert.Observation{{
+		Kind:   convert.ObsIdentityExpired,
+		Detail: "selected identity expired at 2026-01-01T00:00:00Z",
+	}}
+	o.note("tls.crt", fp, expired)
+	o.note("tls.crt", fp, expired)
+
+	if got := countObservation(logs, convert.ObsIdentityExpired); got != 1 {
+		t.Fatalf("same input with a newly derived expiry observation logged %d times, want exactly 1", got)
+	}
+}

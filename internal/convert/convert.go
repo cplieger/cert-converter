@@ -414,6 +414,22 @@ type keyDefects struct {
 // sentence rather than folded into it, so log matching on the base message is
 // unaffected.
 func (d keyDefects) suffix() string {
+	details := d.details()
+	if details == "" {
+		return ""
+	}
+	return "; the key file also holds block(s) that yielded no key: " + details
+}
+
+// details lists the defective blocks as one clause ("2 could not be parsed, at
+// least one is encrypted"), or returns "" when every declared block became a key.
+//
+// It is the single home of that wording because two diagnostics need it and must
+// not drift: noMatchError's suffix on the hard-failure path, and the
+// unusable-key-blocks observation analyseAt emits when identity selection
+// SUCCEEDED anyway. Every part is a count or a fixed phrase, so the text carries
+// nothing key-file-controlled and needs no bounding before it reaches a log.
+func (d keyDefects) details() string {
 	var parts []string
 	if d.unparseable > 0 {
 		parts = append(parts, fmt.Sprintf("%d could not be parsed", d.unparseable))
@@ -424,10 +440,7 @@ func (d keyDefects) suffix() string {
 	if d.undecoded > 0 {
 		parts = append(parts, fmt.Sprintf("%d declared block(s) could not be decoded (truncated armour or a corrupt body)", d.undecoded))
 	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return "; the key file also holds block(s) that yielded no key: " + strings.Join(parts, ", ")
+	return strings.Join(parts, ", ")
 }
 
 // isEncryptedPEMBlock reports whether a traditional OpenSSL private-key block

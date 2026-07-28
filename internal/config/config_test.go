@@ -249,11 +249,10 @@ func TestLoad_warns_when_the_fallback_value_is_repaired(t *testing.T) {
 	}
 }
 
-// TestLoad_stays_silent_for_a_usable_fallback_value keeps the repair WARNs off
-// every correctly configured startup: an accepted cadence, the documented
-// default, and the ceiling itself are all used as configured, so warning on
-// them would train an operator to ignore the lines that matter.
-func TestLoad_stays_silent_for_a_usable_fallback_value(t *testing.T) {
+// TestLoad_does_not_repair_a_usable_fallback_value keeps invalid-value and
+// clamp diagnostics off accepted values. The explicit 0/false opt-outs still
+// emit warnFallbackDisabled, which is pinned by its dedicated test below.
+func TestLoad_does_not_repair_a_usable_fallback_value(t *testing.T) {
 	for _, raw := range []string{"", "   ", "12", "1", "87600", "  12", "0", "false"} {
 		t.Run(raw, func(t *testing.T) {
 			isolatePasswordFile(t)
@@ -1014,6 +1013,9 @@ func TestLoad_blank_secret_file_error_names_configured_path(t *testing.T) {
 	if !strings.Contains(err.Error(), path) {
 		t.Errorf("Load(blank password file) error = %q, want configured path %q", err, path)
 	}
+	if !strings.Contains(err.Error(), "write a non-blank secret to the file named by PFX_PASSWORD_FILE") {
+		t.Errorf("Load(blank password file) error = %q, want remediation for the configured file channel", err)
+	}
 }
 
 // TestLoad_warns_when_the_env_password_is_padded pins the whitespace diagnostic:
@@ -1078,6 +1080,12 @@ func TestLoad_uses_the_env_password_verbatim(t *testing.T) {
 		if strings.Contains(r.Message, padded) {
 			t.Errorf("Load() leaked the configured password in message %q", r.Message)
 		}
+		r.Attrs(func(a slog.Attr) bool {
+			if strings.Contains(a.Key, padded) || strings.Contains(a.Value.String(), padded) {
+				t.Errorf("Load() leaked the configured password in attr %s=%v on %q", a.Key, a.Value, r.Message)
+			}
+			return true
+		})
 	}
 }
 
@@ -1281,9 +1289,16 @@ func TestLoad_warns_when_a_mounted_secret_contains_a_control_character(t *testin
 			n, msg, logs.Messages())
 	}
 	for _, r := range logs.Records() {
-		if strings.Contains(r.Message, secret) {
-			t.Errorf("Load() leaked the mounted secret in message %q", r.Message)
+		if strings.Contains(r.Message, secret) || strings.Contains(r.Message, path) {
+			t.Errorf("Load() leaked the mounted secret or secret-mount path in message %q", r.Message)
 		}
+		r.Attrs(func(a slog.Attr) bool {
+			if strings.Contains(a.Key, secret) || strings.Contains(a.Value.String(), secret) ||
+				strings.Contains(a.Key, path) || strings.Contains(a.Value.String(), path) {
+				t.Errorf("Load() leaked the mounted secret or secret-mount path in attr %s=%v on %q", a.Key, a.Value, r.Message)
+			}
+			return true
+		})
 	}
 }
 

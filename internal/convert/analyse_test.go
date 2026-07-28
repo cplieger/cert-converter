@@ -26,6 +26,16 @@ func concatPEM(blobs ...[]byte) []byte {
 	return out
 }
 
+// truncatedKeyBlock returns a key declaration whose armour is cut off mid-body,
+// as a partial write into /input leaves it: encoding/pem drops it entirely, so
+// only the declaration count knows it was ever there. The body stays a
+// low-entropy placeholder (as convert_test.go's truncated block does), and the
+// single definition keeps the file from holding two unterminated BEGIN headers —
+// a pair of them reads as one multi-line private key to the secret scanner.
+func truncatedKeyBlock() []byte {
+	return []byte("-----BEGIN PRIVATE KEY-----\nZm9v\n")
+}
+
 // derOf returns the DER bytes of a single-certificate PEM blob.
 func derOf(tb testing.TB, certPEM []byte) []byte {
 	tb.Helper()
@@ -560,9 +570,8 @@ func TestAnalyse_names_the_unusable_key_blocks_when_nothing_matches(t *testing.T
 	_, unrelatedKeyPEM := testcerts.GenerateSelfSignedCert(t, "unrelated.example.com", "ecdsa")
 
 	// A second key declaration whose armour is cut off mid-body, as a partial
-	// write into /input leaves it: encoding/pem drops it entirely, so only the
-	// declaration count knows it was ever there.
-	truncated := []byte("-----BEGIN PRIVATE KEY-----\nMIIBOgIBAAJBAKj34G\n")
+	// write into /input leaves it.
+	truncated := truncatedKeyBlock()
 
 	_, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), concatPEM(unrelatedKeyPEM, truncated))
 	if err == nil {
@@ -610,5 +619,54 @@ func TestAnalyse_names_an_unparseable_and_an_encrypted_key_block_when_nothing_ma
 		if !strings.Contains(got, want) {
 			t.Errorf("Analyse error = %q, want it to contain %q", got, want)
 		}
+	}
+}
+
+// TestAnalyse_reports_unusable_key_blocks_when_a_usable_key_still_matches is the
+// success-path half of the same mid-rotation diagnosis, and the one the two
+// no-match tests above cannot reach. A rotation that appends a damaged key beside
+// the matching one converts fine today, so no error names the damaged block;
+// without an observation it stays silent until the next renewal turns it into a
+// conversion failure whose message points at the certificate.
+func TestAnalyse_reports_unusable_key_blocks_when_a_usable_key_still_matches(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+
+	// Same truncated declaration as the no-match test: encoding/pem drops it, so
+	// only the declaration count knows it was ever there.
+	truncated := truncatedKeyBlock()
+
+	got, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), concatPEM(m.LeafKeyPEM, truncated))
+	if err != nil {
+		t.Fatalf("Analyse(matching key + truncated key block) = %v, want success: the usable key still matches", err)
+	}
+	var detail string
+	for _, o := range got.Observations() {
+		if o.Kind == convert.ObsUnusableKeyBlocksSkipped {
+			detail = o.Detail
+		}
+	}
+	if detail == "" {
+		t.Fatalf("observations = %v, want one of kind %q naming the block that yielded no key",
+			got.Observations(), convert.ObsUnusableKeyBlocksSkipped)
+	}
+	if !strings.Contains(detail, "1 declared block(s) could not be decoded") {
+		t.Errorf("observation detail = %q, want it to name the undecoded declaration", detail)
+	}
+}
+
+// TestAnalyse_reports_no_key_block_observation_for_a_clean_key_file guards the
+// other direction: the observation must stay absent for the ordinary input, or
+// every scan of every healthy pair emits a WARN nobody can act on.
+func TestAnalyse_reports_no_key_block_observation_for_a_clean_key_file(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	got, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("Analyse(clean input) = %v, want success", err)
+	}
+	if hasObservation(got.Observations(), convert.ObsUnusableKeyBlocksSkipped) {
+		t.Errorf("observations = %v, want no %q for a key file whose every block yielded a key",
+			got.Observations(), convert.ObsUnusableKeyBlocksSkipped)
 	}
 }

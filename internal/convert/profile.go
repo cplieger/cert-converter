@@ -398,23 +398,7 @@ type safeAlgorithms struct {
 // none, or a second one, is not a shape this app writes and the decoder would
 // reject it after paying for the derivation.
 func bundleAlgorithms(authSafe *contentInfo) (safeAlgorithms, error) {
-	contentType, err := authSafe.contentTypeOID()
-	if err != nil {
-		return safeAlgorithms{}, err
-	}
-	if !contentType.Equal(oidDataContentType) {
-		return safeAlgorithms{}, fmt.Errorf("%w: authSafe is not a data ContentInfo", ErrProfileUnknown)
-	}
-	var inner []byte
-	authRest, unmarshalErr := asn1.Unmarshal(authSafe.Content.Bytes, &inner)
-	if unmarshalErr != nil {
-		return safeAlgorithms{}, fmt.Errorf("parse authSafe content: %w", unmarshalErr)
-	}
-	if len(authRest) != 0 {
-		return safeAlgorithms{}, fmt.Errorf("%w: %d trailing byte(s) after the authSafe content",
-			ErrProfileUnknown, len(authRest))
-	}
-	elements, err := sequenceElements(inner, "authenticated safe", maxAuthenticatedSafes)
+	elements, err := authenticatedSafeElements(authSafe)
 	if err != nil {
 		return safeAlgorithms{}, err
 	}
@@ -439,6 +423,29 @@ func bundleAlgorithms(authSafe *contentInfo) (safeAlgorithms, error) {
 		return safeAlgorithms{}, fmt.Errorf("%w: no shrouded private-key bag", ErrProfileUnknown)
 	}
 	return algs, nil
+}
+
+// authenticatedSafeElements validates the outer authSafe framing — a data
+// ContentInfo wrapping an OCTET STRING that holds the AuthenticatedSafe DER — and
+// returns the bounded SEQUENCE OF ContentInfo elements inside it.
+func authenticatedSafeElements(authSafe *contentInfo) ([][]byte, error) {
+	contentType, err := authSafe.contentTypeOID()
+	if err != nil {
+		return nil, err
+	}
+	if !contentType.Equal(oidDataContentType) {
+		return nil, fmt.Errorf("%w: authSafe is not a data ContentInfo", ErrProfileUnknown)
+	}
+	var inner []byte
+	authRest, unmarshalErr := asn1.Unmarshal(authSafe.Content.Bytes, &inner)
+	if unmarshalErr != nil {
+		return nil, fmt.Errorf("parse authSafe content: %w", unmarshalErr)
+	}
+	if len(authRest) != 0 {
+		return nil, fmt.Errorf("%w: %d trailing byte(s) after the authSafe content",
+			ErrProfileUnknown, len(authRest))
+	}
+	return sequenceElements(inner, "authenticated safe", maxAuthenticatedSafes)
 }
 
 // merge folds one safe's contribution into the bundle-level identity. A second
@@ -640,6 +647,20 @@ func checkMACIterations(macOID asn1.ObjectIdentifier, params asn1.RawValue, macD
 // and the log says otherwise — the same missing-dimension the (MAC, certificate,
 // key) triple and the AES-256 check already close at the outer levels.
 func parseProfilePBKDF2(label string, alg *algorithmIdentifier) (pbkdf2Params, error) {
+	kdf, err := decodeProfilePBKDF2(label, alg)
+	if err != nil {
+		return pbkdf2Params{}, err
+	}
+	if prfErr := checkProfilePBKDF2PRF(label, &kdf.PRF); prfErr != nil {
+		return pbkdf2Params{}, prfErr
+	}
+	return kdf, nil
+}
+
+// decodeProfilePBKDF2 identifies the derivation as PBKDF2, decodes its parameter
+// block, and checks the fields that describe the derivation itself: the salt's
+// encoding and the iteration count.
+func decodeProfilePBKDF2(label string, alg *algorithmIdentifier) (pbkdf2Params, error) {
 	algOID, err := alg.algorithmOID()
 	if err != nil {
 		return pbkdf2Params{}, err
@@ -665,20 +686,26 @@ func parseProfilePBKDF2(label string, alg *algorithmIdentifier) (pbkdf2Params, e
 	if iterErr := checkIterations(label, kdf.Iterations); iterErr != nil {
 		return pbkdf2Params{}, iterErr
 	}
+	return kdf, nil
+}
+
+// checkProfilePBKDF2PRF checks the pseudorandom function a PBKDF2 block names
+// against the only one either modern profile emits.
+func checkProfilePBKDF2PRF(label string, prf *algorithmIdentifier) error {
 	// An absent PRF means HMAC-SHA1 by definition, so it is refused here rather
 	// than reaching decodeOID as an empty field with a misleading message.
-	if len(kdf.PRF.Algorithm.FullBytes) == 0 {
-		return pbkdf2Params{}, fmt.Errorf("%w: %s PBKDF2 names no PRF, which defaults to HMAC-SHA1",
+	if len(prf.Algorithm.FullBytes) == 0 {
+		return fmt.Errorf("%w: %s PBKDF2 names no PRF, which defaults to HMAC-SHA1",
 			ErrProfileUnknown, label)
 	}
-	prfOID, err := kdf.PRF.algorithmOID()
+	prfOID, err := prf.algorithmOID()
 	if err != nil {
-		return pbkdf2Params{}, err
+		return err
 	}
 	if !prfOID.Equal(oidHMACWithSHA256) {
-		return pbkdf2Params{}, fmt.Errorf("%w: %s PBKDF2 PRF is %v, want HMAC-SHA256", ErrProfileUnknown, label, prfOID)
+		return fmt.Errorf("%w: %s PBKDF2 PRF is %v, want HMAC-SHA256", ErrProfileUnknown, label, prfOID)
 	}
-	return kdf, nil
+	return nil
 }
 
 // checkPBES2Parameters checks a PBES2 block against what both modern profiles emit:

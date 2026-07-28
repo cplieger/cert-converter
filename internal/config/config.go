@@ -62,12 +62,12 @@ type Config struct {
 	FallbackInterval time.Duration
 }
 
-// ErrEmptyPassword indicates PFX_PASSWORD is empty and the empty-password
-// opt-out (PFX_ALLOW_EMPTY_PASSWORD=true) is not set. A PFX generated with an
-// empty password protects the embedded private key with no password at all.
+// ErrEmptyPassword indicates the resolved PFX password is empty or entirely
+// Unicode whitespace and the PFX_ALLOW_EMPTY_PASSWORD opt-out is not set. Such
+// a password provides no meaningful protection for the embedded private key.
 var ErrEmptyPassword = errors.New(
-	"PFX_PASSWORD is empty or blank; set it, point PFX_PASSWORD_FILE at a secret file, " +
-		"or set PFX_ALLOW_EMPTY_PASSWORD=true")
+	"the resolved PFX password is empty or blank; set PFX_PASSWORD, write a non-blank secret " +
+		"to the file named by PFX_PASSWORD_FILE, or set PFX_ALLOW_EMPTY_PASSWORD=true")
 
 // ErrUnencodablePassword indicates the configured password contains invalid UTF-8,
 // a non-BMP rune, or an embedded NUL and cannot be represented safely by PKCS#12.

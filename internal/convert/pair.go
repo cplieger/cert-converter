@@ -43,7 +43,7 @@ func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 	// (sha1.Sum(certificate.Raw)), killing the process instead of failing one
 	// conversion. The type's own doc promises a caller cannot null the leaf and hand
 	// the value back here; this is what makes that true.
-	if a.leaf == nil {
+	if a == nil || a.leaf == nil {
 		return nil, errors.New("analysed pair carries no leaf certificate, so it did not come from Analyse")
 	}
 
@@ -268,7 +268,7 @@ func decode(pfx []byte, password string) (decoded, error) {
 // by a caller any more: a PFX_ENCODER change reaches the verdict without anyone
 // having to sequence it.
 func (d decoded) matchesAnalysis(a *Analysis) bool {
-	if d.Leaf == nil || a.leaf == nil || !bytes.Equal(d.Leaf.Raw, a.leaf.Raw) {
+	if a == nil || d.Leaf == nil || a.leaf == nil || !bytes.Equal(d.Leaf.Raw, a.leaf.Raw) {
 		return false
 	}
 	if len(d.CACerts) != len(a.chain) {

@@ -929,3 +929,161 @@ func TestInspect_rejects_trailing_bytes_after_the_authSafe_content(t *testing.T)
 		t.Errorf("Inspect = %v, want the refusal to name %q", err, want)
 	}
 }
+
+// TestBundleAlgorithms_rejects_wrong_auth_safe_type pins the outer authSafe
+// content-type guard: the wrapper must be a data ContentInfo. Nothing else reaches
+// it — every own-profile bundle carries the right identifier here, and the generic
+// malformed-bytes cases fail earlier in the parse — so the guard can be deleted
+// with the whole package still green while a wrapper claiming encryptedData is
+// classified as a known profile.
+func TestBundleAlgorithms_rejects_wrong_auth_safe_type(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+
+	var preamble pfxPreamble
+	testASN1Unmarshal(t, pfx, &preamble)
+	preamble.AuthSafe.ContentType = rawOID(t, oidEncryptedDataContentType)
+
+	_, err = Inspect(testASN1Marshal(t, preamble))
+	if !errors.Is(err, ErrProfileUnknown) {
+		t.Fatalf("Inspect(wrong authSafe content type) = %v, want ErrProfileUnknown", err)
+	}
+	if want := "authSafe is not a data ContentInfo"; !strings.Contains(err.Error(), want) {
+		t.Errorf("Inspect(wrong authSafe content type) = %v, want the refusal to name %q", err, want)
+	}
+}
+
+// testProfilePBKDF2 builds the PBKDF2 AlgorithmIdentifier both modern profiles
+// emit, round-tripped through DER so every retained field carries the raw bytes
+// parseProfilePBKDF2 reads, and asserts it is accepted as it stands. Each caller
+// below mutates exactly one field, so the refusal it asserts can only come from
+// that mutation.
+func testProfilePBKDF2(t *testing.T) algorithmIdentifier {
+	t.Helper()
+	params := pbkdf2Params{
+		Salt:       asn1.RawValue{FullBytes: testASN1Marshal(t, []byte("salt"))},
+		Iterations: 2048,
+		PRF:        algorithmIdentifier{Algorithm: rawOID(t, oidHMACWithSHA256)},
+	}
+	encoded := algorithmIdentifier{
+		Algorithm:  rawOID(t, oidPBKDF2),
+		Parameters: asn1.RawValue{FullBytes: testASN1Marshal(t, params)},
+	}
+	var alg algorithmIdentifier
+	testASN1Unmarshal(t, testASN1Marshal(t, encoded), &alg)
+	if _, err := parseProfilePBKDF2("pbes2", &alg); err != nil {
+		t.Fatalf("setup: parseProfilePBKDF2(unmutated block) = %v, want nil", err)
+	}
+	return alg
+}
+
+// setTestProfilePBKDF2Params applies mutate to the parameters of a bare PBKDF2
+// AlgorithmIdentifier and re-encodes the block around them. Distinct from
+// setTestPBKDF2Params, which reaches the same parameters through an enclosing
+// PBES2 or PBMAC1 block.
+func setTestProfilePBKDF2Params(t *testing.T, alg *algorithmIdentifier, mutate func(*pbkdf2Params)) {
+	t.Helper()
+	var params pbkdf2Params
+	testASN1Unmarshal(t, alg.Parameters.FullBytes, &params)
+	mutate(&params)
+	alg.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, params)}
+}
+
+// TestParseProfilePBKDF2_rejects_trailing_parameters pins the trailing-byte
+// refusal of the PBKDF2 parameter block. The neighbouring authSafe, safe and bag
+// layers each have one, but this innermost layer has none: valid parameters with
+// appended DER would otherwise be accepted as a shape this app emits.
+func TestParseProfilePBKDF2_rejects_trailing_parameters(t *testing.T) {
+	t.Parallel()
+	alg := testProfilePBKDF2(t)
+	alg.Parameters.FullBytes = append(slices.Clone(alg.Parameters.FullBytes), 0)
+
+	_, err := parseProfilePBKDF2("pbes2", &alg)
+	if !errors.Is(err, ErrProfileUnknown) {
+		t.Fatalf("parseProfilePBKDF2(trailing parameters) = %v, want ErrProfileUnknown", err)
+	}
+	if want := "trailing byte(s) after the pbes2 PBKDF2 parameters"; !strings.Contains(err.Error(), want) {
+		t.Errorf("parseProfilePBKDF2(trailing parameters) = %v, want the refusal to name %q", err, want)
+	}
+}
+
+// TestParseProfilePBKDF2_rejects_every_invalid_salt_shape completes the salt guard.
+// The existing nested-algorithm table exercises its TAG clause only, so the
+// universal-class and primitive-form clauses can be dropped while every other test
+// stays green — and either regression would accept a context-specific or
+// constructed salt the decoder cannot consume, reporting an unsupported bundle as
+// current instead of regenerating it.
+func TestParseProfilePBKDF2_rejects_every_invalid_salt_shape(t *testing.T) {
+	t.Parallel()
+
+	for name, salt := range map[string]asn1.RawValue{
+		"context-specific tag 4": {
+			Class: asn1.ClassContextSpecific,
+			Tag:   asn1.TagOctetString,
+			Bytes: []byte("salt"),
+		},
+		"constructed universal OCTET STRING": {
+			Class:      asn1.ClassUniversal,
+			Tag:        asn1.TagOctetString,
+			IsCompound: true,
+			Bytes:      testASN1Marshal(t, []byte("salt")),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			alg := testProfilePBKDF2(t)
+			setTestProfilePBKDF2Params(t, &alg, func(params *pbkdf2Params) { params.Salt = salt })
+
+			_, err := parseProfilePBKDF2("pbes2", &alg)
+			if !errors.Is(err, ErrProfileUnknown) {
+				t.Fatalf("parseProfilePBKDF2(%s) = %v, want ErrProfileUnknown", name, err)
+			}
+			if want := "not a primitive OCTET STRING"; !strings.Contains(err.Error(), want) {
+				t.Errorf("parseProfilePBKDF2(%s) = %v, want the refusal to name %q", name, err, want)
+			}
+		})
+	}
+}
+
+// TestParseProfilePBKDF2_bounds_both_nested_identifiers pins the allocation bound
+// at the two identifier fields nested inside a PBKDF2 block. The bound is tested at
+// the outer MAC, authSafe, safe-bag, encryption and message-authentication sites,
+// but not here: either nested decode could lose it while every other test stays
+// green, letting an unauthenticated bundle drive oversized identifier decoding on
+// the scan's only goroutine.
+func TestParseProfilePBKDF2_bounds_both_nested_identifiers(t *testing.T) {
+	t.Parallel()
+
+	for name, mutate := range map[string]func(*testing.T, *algorithmIdentifier){
+		"KDF identifier": func(_ *testing.T, alg *algorithmIdentifier) {
+			alg.Algorithm = oversizedOID()
+		},
+		"PRF identifier": func(t *testing.T, alg *algorithmIdentifier) {
+			setTestProfilePBKDF2Params(t, alg, func(params *pbkdf2Params) {
+				params.PRF.Algorithm = oversizedOID()
+			})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			alg := testProfilePBKDF2(t)
+			mutate(t, &alg)
+
+			_, err := parseProfilePBKDF2("pbes2", &alg)
+			if !errors.Is(err, ErrProfileUnknown) {
+				t.Fatalf("parseProfilePBKDF2(oversized %s) = %v, want ErrProfileUnknown", name, err)
+			}
+			if want := "object identifier exceeds"; !strings.Contains(err.Error(), want) {
+				t.Errorf("parseProfilePBKDF2(oversized %s) = %v, want the refusal to name %q", name, err, want)
+			}
+		})
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -1066,5 +1067,219 @@ func TestAnalyse_prefers_the_shorter_inclusive_route(t *testing.T) {
 					got.Chain()[0].SerialNumber)
 			}
 		})
+	}
+}
+
+// TestAnalyse_excludes_a_certificate_that_cannot_issue_certificates keeps the
+// additive fallback from emitting chain material RFC 5280 positively disqualifies.
+//
+// The inclusive edge signal exists so an UNPROVABLE relationship does not drop a
+// real CA, and the fallback keeps whatever is left for the same reason. Neither may
+// keep a certificate whose own extensions say it cannot have issued anything: with
+// the leaf's real issuer absent and a same-named certificate asserting CA:false
+// beside it, the reproduced defect emitted that certificate as the sole CA bag, so
+// every consumer's path validation rejected the generated PFX while conversion
+// reported success. A certificate that is merely unverifiable must still be kept
+// (TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established pins that
+// half); only positive disqualification excludes.
+func TestAnalyse_excludes_a_certificate_that_cannot_issue_certificates(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	for _, tc := range []struct {
+		name string
+		// disqualify shapes the decoy's issuing-related fields.
+		disqualify func(*x509.Certificate)
+	}{
+		{
+			name: "basic constraints say CA:false",
+			disqualify: func(c *x509.Certificate) {
+				c.BasicConstraintsValid = true
+				c.IsCA = false
+				c.KeyUsage = x509.KeyUsageCertSign
+			},
+		},
+		{
+			name: "v3 certificate with no basic constraints",
+			disqualify: func(c *x509.Certificate) {
+				c.BasicConstraintsValid = false
+				c.IsCA = false
+				c.KeyUsage = x509.KeyUsageCertSign
+			},
+		},
+		{
+			name: "stated key usage omits certificate signing",
+			disqualify: func(c *x509.Certificate) {
+				c.BasicConstraintsValid = true
+				c.IsCA = true
+				c.KeyUsage = x509.KeyUsageDigitalSignature
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// The leaf's real issuer is NOT in the bundle, so nothing present can
+			// be proven to be its issuer.
+			absentCAKey := newKey(t)
+			_, absentCACert := mint(t, &x509.Certificate{
+				SerialNumber:          big.NewInt(400),
+				Subject:               pkix.Name{CommonName: "Absent Encoding CA"},
+				NotBefore:             notBefore,
+				NotAfter:              notBefore.Add(48 * time.Hour),
+				IsCA:                  true,
+				BasicConstraintsValid: true,
+				KeyUsage:              x509.KeyUsageCertSign,
+			}, &absentCAKey.PublicKey, nil, absentCAKey)
+
+			leafKey := newKey(t)
+			leafPEM, _ := mint(t, &x509.Certificate{
+				SerialNumber: big.NewInt(401),
+				Subject:      pkix.Name{CommonName: "disqualified-issuer-leaf.example.com"},
+				NotBefore:    notBefore,
+				NotAfter:     notBefore.Add(24 * time.Hour),
+			}, &leafKey.PublicKey, absentCACert, absentCAKey)
+
+			// A decoy carrying the absent issuer's NAME, so name chaining alone
+			// admits it, but disqualified from issuing certificates by its own
+			// extensions.
+			decoyKey := newKey(t)
+			decoy := &x509.Certificate{
+				SerialNumber: big.NewInt(402),
+				Subject:      pkix.Name{CommonName: "Absent Encoding CA"},
+				NotBefore:    notBefore,
+				NotAfter:     notBefore.Add(48 * time.Hour),
+			}
+			tc.disqualify(decoy)
+			decoyPEM, _ := mint(t, decoy, &decoyKey.PublicKey, nil, decoyKey)
+
+			got, err := convert.Analyse(concatPEM(leafPEM, decoyPEM), keyPEMOf(t, leafKey))
+			if err != nil {
+				t.Fatalf("Analyse(leaf beside a %s) = error %v, want nil", tc.name, err)
+			}
+			if len(got.Chain()) != 0 {
+				t.Errorf("chain = %v, want empty: a certificate that cannot issue certificates is no chain material",
+					chainSerials(got.Chain()))
+			}
+			if len(got.Extra()) != 1 {
+				t.Fatalf("Extra holds %d certificate(s), want 1 (the disqualified decoy)", len(got.Extra()))
+			}
+			if !hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
+				t.Errorf("observations = %v, want the exclusion reported", got.Observations())
+			}
+			if !hasObservation(got.Observations(), convert.ObsChainUnverified) {
+				t.Errorf("observations = %v, want the unverified chain reported too", got.Observations())
+			}
+		})
+	}
+}
+
+// utf8SubjectView returns a parent VIEW of c whose subject is the same name encoded
+// as a UTF8String rather than c's own canonical encoding, with the subject key
+// identifier removed.
+//
+// A certificate minted against this view therefore carries an issuer name that is
+// SEMANTICALLY equal to c's subject but byte-distinct, and no authority key
+// identifier — exactly the RFC 5280 permitted-encoding difference that defeats both
+// of the inclusive edge signals while the signature itself stays valid.
+func utf8SubjectView(c *x509.Certificate, cn string) *x509.Certificate {
+	view := *c
+	view.RawSubject = nil
+	view.SubjectKeyId = nil
+	view.Subject = pkix.Name{ExtraNames: []pkix.AttributeTypeAndValue{{
+		Type: asn1.ObjectIdentifier{2, 5, 4, 3}, // id-at-commonName
+		Value: asn1.RawValue{
+			Class: asn1.ClassUniversal,
+			Tag:   asn1.TagUTF8String,
+			Bytes: []byte(cn),
+		},
+	}}}
+	return &view
+}
+
+// TestAnalyse_keeps_the_upper_chain_when_a_middle_issuer_cannot_be_established
+// makes the additive fallback depend on whether the discovered path reached a
+// self-signed terminus, not on whether it found anything at all.
+//
+// Reproduced shape: leaf -> lower CA -> upper CA -> root, where the lower CA's
+// issuer name is a permitted but byte-distinct encoding of the upper CA's subject
+// and no key-identifier edge exists. The leaf-to-lower edge is discovered, so the
+// old `len(chain) == 0` gate never fired, and the upper CA and the root were
+// reported as unrelated and EXCLUDED — the silent chain shrink the fallback exists
+// to prevent, one link further up. A consumer of the PFX then cannot build the path
+// that was present in the PEM bundle.
+func TestAnalyse_keeps_the_upper_chain_when_a_middle_issuer_cannot_be_established(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	rootKey := newKey(t)
+	rootPEM, rootCert := mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(500),
+		Subject:               pkix.Name{CommonName: "Encoding Root CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(96 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &rootKey.PublicKey, nil, rootKey)
+
+	upperKey := newKey(t)
+	upperPEM, upperCert := mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(501),
+		Subject:               pkix.Name{CommonName: "Encoding Upper CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(72 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &upperKey.PublicKey, rootCert, rootKey)
+
+	// Signed by the upper CA, but naming it through the other permitted encoding.
+	lowerKey := newKey(t)
+	lowerPEM, lowerCert := mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(502),
+		Subject:               pkix.Name{CommonName: "Encoding Lower CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(48 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &lowerKey.PublicKey, utf8SubjectView(upperCert, "Encoding Upper CA"), upperKey)
+
+	if bytes.Equal(lowerCert.RawIssuer, upperCert.RawSubject) {
+		t.Fatal("setup: the lower CA's issuer name matches the upper CA's subject byte for byte, so this bundle does not reproduce the encoding difference")
+	}
+	if len(lowerCert.AuthorityKeyId) > 0 {
+		t.Fatal("setup: the lower CA carries an authority key identifier, so the key-identifier edge signal would find the upper CA anyway")
+	}
+
+	leafKey := newKey(t)
+	leafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(503),
+		Subject:      pkix.Name{CommonName: "middle-gap-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, lowerCert, lowerKey)
+
+	got, err := convert.Analyse(concatPEM(leafPEM, lowerPEM, upperPEM, rootPEM), keyPEMOf(t, leafKey))
+	if err != nil {
+		t.Fatalf("Analyse(chain with an unestablishable middle edge) = error %v, want nil", err)
+	}
+	if len(got.Chain()) != 3 {
+		t.Fatalf("chain = %v, want all 3 CA certificates kept: an unprovable middle edge must not truncate the chain",
+			chainSerials(got.Chain()))
+	}
+	if got.Chain()[0].SerialNumber.Cmp(big.NewInt(502)) != 0 {
+		t.Errorf("chain[0] serial = %s, want 502 (the discovered lower CA first)", got.Chain()[0].SerialNumber)
+	}
+	if len(got.Extra()) != 0 {
+		t.Errorf("Extra holds %d certificate(s), want 0: neither the upper CA nor the root was shown to be off the chain",
+			len(got.Extra()))
+	}
+	if !hasObservation(got.Observations(), convert.ObsChainUnverified) {
+		t.Errorf("observations = %v, want the unverified upper chain reported", got.Observations())
+	}
+	if hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
+		t.Errorf("observations = %v, want NO exclusion: nothing was proven unrelated", got.Observations())
 	}
 }

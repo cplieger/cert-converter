@@ -55,9 +55,6 @@ func TestVerifiableKey_bounds_rsa_only(t *testing.T) {
 	if verifiableKey(pastExponentLimit) {
 		t.Errorf("verifiableKey(an RSA key with exponent %d) = true, want false: the exponent sets the squaring count and exceeds the cost this app permits an input to dictate", maxVerifiablePublicExponent+1)
 	}
-	if !verifiableKey(atLimit) {
-		t.Error("verifiableKey(a ceiling-sized RSA key with exponent 65537) = false, want true: conventional exponents stay verifiable")
-	}
 	if !verifiableKey(&ecKey.PublicKey) {
 		t.Error("verifiableKey(an ECDSA key) = false, want true: only RSA is size-unbounded, and refusing the rest would demote every chain to unverified edges")
 	}

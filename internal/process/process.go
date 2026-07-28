@@ -426,41 +426,62 @@ func pairFingerprint(certPEM, keyPEM []byte) [sha256.Size]byte {
 	return sha256.Sum256(pair[:])
 }
 
-// observationLog de-duplicates the per-pair input-observation WARNs across
-// scans: an odd-but-convertible input is named on the scan that introduced it
-// and stays silent on every later fsnotify event and fallback tick. It maps each
-// cert path to the last input fingerprint observed for it, and is NEVER consulted
-// for currency, which store.isCurrent derives from the bundle on disk. It is process-lifetime state
-// held by the Scanner, so a restart re-reports each pair exactly once.
+// observationLog de-duplicates the per-pair observation WARNs across scans: an
+// odd-but-convertible input is named on the scan that introduced it and stays
+// silent on every later fsnotify event and fallback tick. It maps each cert path
+// to a signature of the last input bytes AND the observations derived from them,
+// and is NEVER consulted for currency, which store.isCurrent derives from the
+// bundle on disk. It is process-lifetime state held by the Scanner, so a restart
+// re-reports each pair exactly once.
 //
 // The map is plain, so it inherits Scanner's single-goroutine Run contract.
 type observationLog struct {
-	seenInputs map[string][sha256.Size]byte
+	seen map[string][sha256.Size]byte
 }
 
 func newObservationLog() *observationLog {
-	return &observationLog{seenInputs: make(map[string][sha256.Size]byte)}
+	return &observationLog{seen: make(map[string][sha256.Size]byte)}
 }
 
-// note records the pair's input fingerprint and emits its observations when the
-// input bytes differ from the last ones observed for that path. The observations
-// describe the INPUT, so a semantically equivalent input edit (a reordered
-// chain, an appended duplicate cert, a second key) still has to be named once
-// even though the bundle on disk stays correct; keying the emission on the raw
-// input fingerprint reports it on the scan that introduced it, which is what
+// observationSignature identifies both the input bytes and the observations
+// Analyse currently derives from them. Not every observation is a property of the
+// bytes alone: the validity-window ones (expired, not-yet-valid, chain cert out of
+// window) also depend on the scan time, so keying de-duplication on the input
+// fingerprint alone would suppress a cert crossing NotAfter forever while the
+// daemon stays up. Hashing each field separately keeps the variable-length
+// kind/detail boundary unambiguous.
+func observationSignature(input [sha256.Size]byte, observations []convert.Observation) [sha256.Size]byte {
+	data := append([]byte{}, input[:]...)
+	for _, observation := range observations {
+		kind := sha256.Sum256([]byte(observation.Kind))
+		detail := sha256.Sum256([]byte(observation.Detail))
+		data = append(data, kind[:]...)
+		data = append(data, detail[:]...)
+	}
+	return sha256.Sum256(data)
+}
+
+// note records the pair's signature and emits its observations when that
+// signature differs from the last one observed for that path. The observations
+// describe the INPUT as read on this scan, so a semantically equivalent input
+// edit (a reordered chain, an appended duplicate cert, a second key) still has to
+// be named once even though the bundle on disk stays correct — and so does a
+// newly derived expiry, whose bytes never changed. Keying the emission on the
+// signature reports each one on the scan that introduced it, which is what
 // unconditional logging would turn into noise.
 func (o *observationLog) note(rel string, fp [sha256.Size]byte, obs []convert.Observation) {
-	previous, ok := o.seenInputs[rel]
-	o.seenInputs[rel] = fp
-	if !ok || previous != fp {
+	current := observationSignature(fp, obs)
+	previous, ok := o.seen[rel]
+	o.seen[rel] = current
+	if !ok || previous != current {
 		logConversionObservations(rel, obs)
 	}
 }
 
-// record commits the fingerprint without re-emitting: the conversion path has
+// record commits the signature without re-emitting: the conversion path has
 // already logged the observations unconditionally.
-func (o *observationLog) record(rel string, fp [sha256.Size]byte) {
-	o.seenInputs[rel] = fp
+func (o *observationLog) record(rel string, fp [sha256.Size]byte, obs []convert.Observation) {
+	o.seen[rel] = observationSignature(fp, obs)
 }
 
 // forget drops entries for paths a COMPLETE walk did not see, so a pair that
@@ -469,9 +490,9 @@ func (o *observationLog) record(rel string, fp [sha256.Size]byte) {
 // or an unresolved symlink would be forgotten and re-warn on the next clean
 // scan.
 func (o *observationLog) forget(seen map[string]struct{}) {
-	for rel := range o.seenInputs {
+	for rel := range o.seen {
 		if _, ok := seen[rel]; !ok {
-			delete(o.seenInputs, rel)
+			delete(o.seen, rel)
 		}
 	}
 }
@@ -598,6 +619,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	if err != nil {
 		return failEntry(rel, "conversion failed", err)
 	}
+	observations := analysis.Observations()
 	current, err := sw.out.isCurrent(ctx, pfxRel, &analysis, sw.enc, sw.password)
 	if err != nil {
 		// Only shutdown gets here: isCurrent resolves every unreadable-output case to
@@ -611,12 +633,12 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		// The observations describe the INPUT, so a semantically equivalent input
 		// edit still has to be named once even though the bundle on disk stays
 		// correct; observationLog.note owns that once-per-change rule.
-		sw.observations.note(rel, fingerprint, analysis.Observations())
+		sw.observations.note(rel, fingerprint, observations)
 		slog.Debug("skipping unchanged cert pair", "path", rel)
 		return statusUnchanged
 	}
 
-	logConversionObservations(rel, analysis.Observations())
+	logConversionObservations(rel, observations)
 	slog.Debug("converting cert pair", "path", rel)
 	pfxData, err := convert.Encode(&analysis, sw.enc, sw.password)
 	if err != nil {
@@ -629,7 +651,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 			"remediation", "check /output ownership and permissions for the UID in user:, "+
 				"and that no symlink is planted at the output path")
 	}
-	sw.observations.record(rel, fingerprint)
+	sw.observations.record(rel, fingerprint, observations)
 
 	slog.Info("wrote pfx", "path", pfxRel)
 	return statusConverted

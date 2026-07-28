@@ -69,20 +69,28 @@ func EncoderName(raw string) (name EncoderType, known bool) {
 	return EncNameModern2023, false
 }
 
-// resolvedName reports the profile name an EncoderType actually selects: the name
-// itself when this package knows it, and the modern2023 default otherwise — the
-// same total fallback encoderFor applies. It exists so the write side and the
-// read-back side cannot disagree about an unrecognized name: Encode would write a
-// modern2023 bundle while CheckCurrency compared the file against the name it was
-// handed, reporting profile-mismatch on every scan and rewriting the bundle
-// forever.
-func resolvedName(name EncoderType) EncoderType {
+// resolvedProfile resolves an EncoderType to the profile row it selects: the
+// matching row when this package knows the name, and the modern2023 row
+// otherwise. It is the ONE home of the matching-and-fallback rule, because the
+// write side and the read-back side must agree about an unrecognized name — with
+// each side searching the table itself, Encode could write a modern2023 bundle
+// while CheckCurrency compared the file against the name it was handed, reporting
+// profile-mismatch on every scan and rewriting the bundle forever. Both values are
+// returned together so a caller cannot take one side's answer from a different row.
+func resolvedProfile(name EncoderType) (EncoderType, *pkcs12.Encoder) {
 	for _, p := range profiles {
 		if p.name == name {
-			return name
+			return p.name, p.encoder
 		}
 	}
-	return EncNameModern2023
+	return EncNameModern2023, pkcs12.Modern2023
+}
+
+// resolvedName reports the profile name an EncoderType actually selects — the same
+// total fallback encoderFor applies, since both read it from resolvedProfile.
+func resolvedName(name EncoderType) EncoderType {
+	resolved, _ := resolvedProfile(name)
+	return resolved
 }
 
 // encoderFor resolves an already-normalized encoder name to its PKCS#12
@@ -91,10 +99,6 @@ func resolvedName(name EncoderType) EncoderType {
 // vendor type stays confined to this package while callers pass the app-owned
 // name around.
 func encoderFor(name EncoderType) *pkcs12.Encoder {
-	for _, p := range profiles {
-		if p.name == name {
-			return p.encoder
-		}
-	}
-	return pkcs12.Modern2023
+	_, encoder := resolvedProfile(name)
+	return encoder
 }

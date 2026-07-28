@@ -79,11 +79,19 @@ func TestDecode_bounds_the_library_message(t *testing.T) {
 // comes back.
 func TestEncode_refuses_an_analysis_that_did_not_come_from_Analyse(t *testing.T) {
 	t.Parallel()
-	_, err := Encode(&Analysis{}, EncNameModern2023, "pw")
-	if err == nil {
-		t.Fatal("Encode(zero Analysis) = nil error, want a refusal rather than a nil-leaf panic in the encoder")
-	}
-	if !strings.Contains(err.Error(), "no leaf certificate") {
-		t.Errorf("Encode(zero Analysis) error = %q, want it to name the missing leaf", err.Error())
+	for name, a := range map[string]*Analysis{
+		"the zero Analysis": {},
+		"a nil Analysis":    nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Encode(a, EncNameModern2023, "pw")
+			if err == nil {
+				t.Fatalf("Encode(%s) = nil error, want a refusal rather than a nil-leaf panic in the encoder", name)
+			}
+			if !strings.Contains(err.Error(), "no leaf certificate") {
+				t.Errorf("Encode(%s) error = %q, want it to name the missing leaf", name, err.Error())
+			}
+		})
 	}
 }

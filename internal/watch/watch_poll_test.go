@@ -67,25 +67,20 @@ func stubFSWatcherFailingOnce(t *testing.T) {
 	t.Cleanup(func() { newFSWatcher = prev })
 }
 
-// TestPollLoopWithUpgrade_hands_the_upgraded_watcher_back_and_releases_poll_mode
-// pins ownership transfer and ticker release. The recovery path itself is pinned
-// end to end, one level up, by
-// TestRun_upgrades_from_poll_to_watch_and_keeps_detecting_events.
+// TestPollLoopWithUpgrade_hands_the_upgraded_watcher_back_without_scanning
+// pins ownership transfer and the no-duplicate-scan handoff. Poll mode has ONE
+// exit: on the tick where fsnotify becomes available again it rebuilds the watch
+// set and returns the watcher for Run to run watch mode over, while ctx is still
+// live. Because that is a return and not a nested call, the poll loop cannot run
+// another scan after the handoff.
 //
-// Poll mode has ONE exit: on the tick where fsnotify becomes available again it
-// rebuilds the watch set and RETURNS the watcher for Run to run watch mode over,
-// while ctx is still live. Because that is a return and not a nested call, poll
-// mode's `defer ticker.Stop()` runs here, before watch mode begins — the ticker
-// does not fire for the whole watch-mode lifetime into a receiver nobody selects
-// on. The assertions below pin that single exit (a build that ran the watch loop
-// inside the tick would block until shutdown and hand back no watcher), that the
-// watcher handed back is the attached one rather than a bare constructor result,
-// that the upgrade tick itself performs NO scan (the post-attach scan belongs to
-// watch mode's attach-then-scan), and that poll mode is quiescent afterwards: no
-// further poll scan for many tick periods.
+// The assertions pin that single exit, that the watcher handed back is the
+// attached one rather than a bare constructor result, and that the upgrade tick
+// itself performs no scan: the post-attach scan belongs to watch mode's
+// attach-then-scan sequence.
 //
 // Runs serially (no t.Parallel): it swaps the process-global slog default.
-func TestPollLoopWithUpgrade_hands_the_upgraded_watcher_back_and_releases_poll_mode(t *testing.T) {
+func TestPollLoopWithUpgrade_hands_the_upgraded_watcher_back_without_scanning(t *testing.T) {
 	logs := capture.Default(t)
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "example.com"), 0o750); err != nil {
@@ -98,8 +93,6 @@ func TestPollLoopWithUpgrade_hands_the_upgraded_watcher_back_and_releases_poll_m
 	ctx := t.Context()
 	done := runPollLoop(ctx, w)
 
-	// The immediate initial scan, which poll mode performs before entering the
-	// ticker loop.
 	select {
 	case <-scans:
 	case <-time.After(10 * time.Second):
@@ -110,7 +103,7 @@ func TestPollLoopWithUpgrade_hands_the_upgraded_watcher_back_and_releases_poll_m
 	select {
 	case res = <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("pollLoopWithUpgrade did not return after fsnotify became available; poll mode must hand the watcher back instead of running watch mode inside its own tick, or its ticker lives for the whole watch-mode lifetime")
+		t.Fatal("pollLoopWithUpgrade did not return after fsnotify became available; poll mode must hand the watcher back instead of running watch mode inside its own tick")
 	}
 	if res.upgraded == nil {
 		t.Fatalf("pollLoopWithUpgrade returned no watcher (err = %v); watch mode has nothing to run", res.err)
@@ -129,12 +122,8 @@ func TestPollLoopWithUpgrade_hands_the_upgraded_watcher_back_and_releases_poll_m
 	if !logs.Contains("fsnotify recovered, upgrading from poll to watch") {
 		t.Errorf("upgrade log missing; log = %v", logs.Messages())
 	}
-
-	// The upgrade tick must not scan, and nothing may keep polling after the
-	// handover: 300ms is fifteen poll intervals.
-	time.Sleep(300 * time.Millisecond)
 	if n := len(scans); n != 0 {
-		t.Errorf("poll mode ran %d scans after handing the watcher back, want 0: the post-attach scan belongs to watch mode, and no ticker may still be driving poll scans", n)
+		t.Errorf("upgrade tick ran %d scans, want 0: the post-attach scan belongs to watch mode", n)
 	}
 	if n := logs.Count("poll scan triggered"); n != 1 {
 		t.Errorf("poll mode logged %d poll ticks, want exactly the one that upgraded; log = %v", n, logs.Messages())

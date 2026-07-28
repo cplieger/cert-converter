@@ -61,6 +61,13 @@ const (
 	// therefore not part of the bundle. A private-key block is deliberately not
 	// reported: a combined cert+key file is a supported input.
 	ObsUnrelatedBlocksSkipped ObservationKind = "unrelated-blocks-skipped"
+	// ObsUnusableKeyBlocksSkipped reports key blocks in the KEY file that yielded no
+	// usable key — unparseable DER, armour encoding/pem could not decode, or
+	// ciphertext — while another block did yield one, so conversion continued. The
+	// canonical cause is a rotation that appended a damaged or encrypted key next to
+	// the old one: the old key still matches today, and the only other signal is the
+	// "no certificate matches any key" failure a later renewal produces.
+	ObsUnusableKeyBlocksSkipped ObservationKind = "unusable-key-blocks-skipped"
 )
 
 // Observation is one non-fatal finding about the input. Detail is already bounded
@@ -88,10 +95,12 @@ type Analysis struct {
 	// own decoder assumes the first certificate is the leaf), so this order is a
 	// contract rather than an implementation detail.
 	//
-	// One exception, always accompanied by ObsChainUnverified: when no issuer of
-	// leaf could be established from the bundle, chain carries the remaining
-	// certificates in INPUT order instead. There is no ancestry to order them by,
-	// and carrying a CA a deployment may rely on beats emitting an empty chain.
+	// One exception, always accompanied by ObsChainUnverified: when the issuer of
+	// the certificate the discovered path ended on could not be established from
+	// the bundle, chain carries the certificates whose ancestry IS established
+	// first and the remaining ones in INPUT order after them. There is no ancestry
+	// to order the remainder by, and carrying a CA a deployment may rely on beats
+	// truncating the chain at the last provable link.
 	chain []*x509.Certificate
 	// key is the private half of leaf. Typed crypto.Signer rather than
 	// crypto.PrivateKey because that is what parsePrivateKeys already proved it is:
@@ -152,13 +161,96 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 // to analyse a bundle at anything other than now, and widening the exported
 // surface to hand one in would invite exactly that.
 func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
+	in, err := prepareAnalysisInput(certPEM, keyPEM)
+	if err != nil {
+		return Analysis{}, err
+	}
+	certs, obs := in.certs, in.observations
+
+	g, err := newCertGraph(certs, now)
+	if err != nil {
+		return Analysis{}, err
+	}
+
+	identity, tieObs, err := g.selectIdentity(in.signers, in.keyIssues)
+	if err != nil {
+		return Analysis{}, err
+	}
+	obs = append(obs, tieObs...)
+
+	leaf := certs[identity.cert]
+
+	// Role check. A certificate that signed another certificate in this bundle
+	// is an issuer, not an end-entity certificate, and emitting it as the
+	// identity would produce a bundle no consumer can use as a server identity.
+	// This is the case a positional "leaf = certs[0]" rule cannot see.
+	if g.isIssuer(identity.cert) {
+		return Analysis{}, fmt.Errorf(
+			"the private key matches %q, which is an issuer of another certificate in this bundle, not an end-entity certificate; if you meant to export that CA itself, remove the certificates it issued from the bundle",
+			boundSubject(leaf.Subject.String()))
+	}
+	if leaf.BasicConstraintsValid && leaf.IsCA {
+		obs = append(obs, Observation{
+			Kind:   ObsCAAsIdentity,
+			Detail: fmt.Sprintf("selected identity %q asserts IsCA", boundSubject(leaf.Subject.String())),
+		})
+	}
+
+	if identity.cert != 0 {
+		obs = append(obs, Observation{
+			Kind: ObsLeafNotFirst,
+			Detail: fmt.Sprintf("the end-entity certificate is block %d of %d, not the first; the bundle was reordered leaf-first",
+				in.certAt[identity.cert]+1, len(certs)+in.duplicateCerts),
+		})
+	}
+	obs = append(obs, validityObservations(leaf, now)...)
+
+	chain, extra, chainObs := g.assembleChain(identity.cert, leaf)
+	obs = append(obs, chainObs...)
+	obs = append(obs, chainValidityObservations(chain, now)...)
+
+	return Analysis{
+		leaf:         leaf,
+		chain:        chain,
+		key:          in.signers[identity.key],
+		extra:        extra,
+		observations: obs,
+	}, nil
+}
+
+// analysisInput is the parsed, deduplicated bundle analyseAt reasons over, plus
+// the observations that describe what parsing had to leave out. It exists so the
+// input phase and the graph phase are separately readable: everything here is a
+// pure function of the PEM bytes, with no reference to the scan instant.
+type analysisInput struct {
+	// certs are the certificates in input order with duplicates removed, and
+	// certAt maps each one back to its block index in the original file.
+	certs  []*x509.Certificate
+	certAt []int
+	// signers are the distinct usable private keys, and keyIssues the key blocks
+	// that yielded none.
+	signers      []crypto.Signer
+	observations []Observation
+	keyIssues    keyDefects
+	// duplicateCerts is how many blocks dedupeCerts removed, which the
+	// leaf-not-first observation needs to name the original block count.
+	duplicateCerts int
+}
+
+// prepareAnalysisInput parses both PEM files, drops the duplicates, and reports
+// everything the operator has to be told about the input itself: unrelated blocks,
+// duplicate certificates, more than one key, and key blocks that yielded no key.
+//
+// Observation order is part of the contract and matches the order the defects are
+// discovered in the file, so it is fixed here rather than assembled by the caller.
+func prepareAnalysisInput(certPEM, keyPEM []byte) (analysisInput, error) {
 	certs, unrelatedBlocks, err := parseCertChain(certPEM)
 	if err != nil {
-		return Analysis{}, fmt.Errorf("parse cert chain: %w", err)
+		return analysisInput{}, fmt.Errorf("parse cert chain: %w", err)
 	}
 	keys, keyIssues, err := parsePrivateKeys(keyPEM)
 	if err != nil {
-		return Analysis{}, fmt.Errorf("parse private key: %w", err)
+		return analysisInput{}, fmt.Errorf("parse private key: %w", err)
 	}
 
 	var obs []Observation
@@ -187,54 +279,25 @@ func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 		})
 	}
 
-	g, err := newCertGraph(certs, now)
-	if err != nil {
-		return Analysis{}, err
-	}
-
-	identity, tieObs, err := g.selectIdentity(signers, keyIssues)
-	if err != nil {
-		return Analysis{}, err
-	}
-	obs = append(obs, tieObs...)
-
-	leaf := certs[identity.cert]
-
-	// Role check. A certificate that signed another certificate in this bundle
-	// is an issuer, not an end-entity certificate, and emitting it as the
-	// identity would produce a bundle no consumer can use as a server identity.
-	// This is the case a positional "leaf = certs[0]" rule cannot see.
-	if g.isIssuer(identity.cert) {
-		return Analysis{}, fmt.Errorf(
-			"the private key matches %q, which is an issuer of another certificate in this bundle, not an end-entity certificate; if you meant to export that CA itself, remove the certificates it issued from the bundle",
-			boundSubject(leaf.Subject.String()))
-	}
-	if leaf.BasicConstraintsValid && leaf.IsCA {
+	// Reported whether or not identity selection goes on to succeed. When it fails,
+	// noMatchError names the same blocks in its own sentence; when it succeeds
+	// because an OLDER key still matches, this observation is the only signal that
+	// the appended one is damaged, and without it the operator first hears about it
+	// as a conversion failure at the next renewal.
+	if defects := keyIssues.details(); defects != "" {
 		obs = append(obs, Observation{
-			Kind:   ObsCAAsIdentity,
-			Detail: fmt.Sprintf("selected identity %q asserts IsCA", boundSubject(leaf.Subject.String())),
+			Kind:   ObsUnusableKeyBlocksSkipped,
+			Detail: "the key file holds block(s) that yielded no key: " + defects,
 		})
 	}
 
-	if identity.cert != 0 {
-		obs = append(obs, Observation{
-			Kind: ObsLeafNotFirst,
-			Detail: fmt.Sprintf("the end-entity certificate is block %d of %d, not the first; the bundle was reordered leaf-first",
-				certAt[identity.cert]+1, len(certs)+dupCerts),
-		})
-	}
-	obs = append(obs, validityObservations(leaf, now)...)
-
-	chain, extra, chainObs := g.assembleChain(identity.cert, leaf)
-	obs = append(obs, chainObs...)
-	obs = append(obs, chainValidityObservations(chain, now)...)
-
-	return Analysis{
-		leaf:         leaf,
-		chain:        chain,
-		key:          signers[identity.key],
-		extra:        extra,
-		observations: obs,
+	return analysisInput{
+		certs:          certs,
+		certAt:         certAt,
+		signers:        signers,
+		observations:   obs,
+		keyIssues:      keyIssues,
+		duplicateCerts: dupCerts,
 	}, nil
 }
 
@@ -456,6 +519,13 @@ func (g *certGraph) oversizedIssuerError() error {
 // signature check, so it is algorithm-agnostic and keeps working for algorithms
 // Go declines to verify.
 //
+// Neither signal is consulted for a candidate the certificate's own extensions
+// positively disqualify from signing certificates: relationship evidence says two
+// certificates LOOK related, while canIssueCertificates says this one cannot be
+// anybody's issuer whatever the names line up to. Without that gate a same-named
+// certificate asserting CA:false is recorded as an edge and can be emitted as
+// chain material, which makes downstream path validation reject the PFX.
+//
 // The key-reuse exclusion is not cosmetic. Two DISTINCT self-signed certificates
 // sharing a subject AND a public key — a regenerated self-signed certificate left
 // beside the one it replaces, which `openssl req -x509` produces with
@@ -465,6 +535,9 @@ func (g *certGraph) oversizedIssuerError() error {
 // cannot have issued another certificate carrying its own key.
 func (g *certGraph) plausibleIssuer(child, parent int) bool {
 	c, p := g.certs[child], g.certs[parent]
+	if !canIssueCertificates(p) {
+		return false
+	}
 	if bytes.Equal(c.RawSubject, p.RawSubject) && samePublicKey(c.PublicKey, p.PublicKey) {
 		return false
 	}
@@ -473,6 +546,25 @@ func (g *certGraph) plausibleIssuer(child, parent int) bool {
 		return true
 	}
 	return bytes.Equal(c.RawIssuer, p.RawSubject)
+}
+
+// canIssueCertificates reports whether c's own extensions leave it able to issue
+// certificates, mirroring the eligibility crypto/x509 applies to a parent without
+// doing any signature work.
+//
+// Three disqualifications, each of them positive proof rather than absent evidence:
+// a v3 certificate carrying no Basic Constraints at all (which CheckSignatureFrom
+// refuses as a parent), one whose Basic Constraints say CA:false, and one whose
+// stated KeyUsage omits KeyCertSign. An absent KeyUsage (the zero value) states
+// nothing, so it disqualifies nothing.
+func canIssueCertificates(c *x509.Certificate) bool {
+	if c.Version == 3 && !c.BasicConstraintsValid {
+		return false
+	}
+	if c.BasicConstraintsValid && !c.IsCA {
+		return false
+	}
+	return c.KeyUsage == 0 || c.KeyUsage&x509.KeyUsageCertSign != 0
 }
 
 // verifies reports whether certs[parent]'s signature over certs[child] checks out,
@@ -887,19 +979,40 @@ func samePublicKey(a, b crypto.PublicKey) bool {
 	return matched
 }
 
+// partitionIssuerEligible splits certificates into the ones that could still be
+// somebody's issuer and the ones their own extensions disqualify, preserving input
+// order in both halves. It is what keeps the additive chain fallback from emitting
+// a certificate that provably cannot sign certificates as chain material.
+func partitionIssuerEligible(certs []*x509.Certificate) (eligible, disqualified []*x509.Certificate) {
+	for _, c := range certs {
+		if canIssueCertificates(c) {
+			eligible = append(eligible, c)
+			continue
+		}
+		disqualified = append(disqualified, c)
+	}
+	return eligible, disqualified
+}
+
 // assembleChain builds the emitted chain for the selected identity, the
 // certificates deliberately left out of it, and the observations describing
 // either outcome.
 //
-// The additive-only fallback lives here: if NO issuer for the identity could be
-// established even on the inclusive edge signal, the remaining certificates are
-// KEPT rather than dropped: silently removing a CA a working deployment relied
-// on is far worse than carrying one it did not need, so exclusion is reserved
-// for certificates positively shown to sit off the chain.
+// The additive-only fallback lives here: whenever the discovered path stops at a
+// certificate that is not PROVEN self-signed — no issuer of the identity could be
+// established at all, or none of the certificate the path ended on — the remaining
+// certificates are KEPT rather than dropped: silently removing a CA a working
+// deployment relied on is far worse than carrying one it did not need, so exclusion
+// is reserved for certificates positively shown to sit off the chain.
 //
 // A SELF-SIGNED identity is excluded from the fallback: it has no issuer by
 // construction, so an empty chain there is proof rather than a failure to prove,
 // and anything else in the bundle genuinely is unrelated.
+//
+// The fallback is not indiscriminate: a certificate canIssueCertificates
+// disqualifies is not a possible issuer of anything, so keeping it would emit
+// chain material downstream path validation rejects. Those are excluded and named,
+// while every certificate whose relationship is merely unproven is kept.
 func (g *certGraph) assembleChain(identityCert int, leaf *x509.Certificate) (chain, extra []*x509.Certificate, obs []Observation) {
 	path := g.pathFrom(identityCert)
 	chain = make([]*x509.Certificate, 0, len(path)-1)
@@ -908,12 +1021,28 @@ func (g *certGraph) assembleChain(identityCert int, leaf *x509.Certificate) (cha
 	}
 	extra = g.outsidePath(path)
 
-	if len(chain) == 0 && len(extra) > 0 && !g.isSelfSigned(identityCert) {
-		return extra, nil, []Observation{{
+	// The discovered path ends where relationship evidence ran out. If that terminus
+	// is not PROVEN self-signed, the chain above it is unfinished, whether the path
+	// stopped at the identity itself or three links up, so the additive fallback
+	// applies to both: a permitted name-encoding difference in the middle of a
+	// bundle must not silently truncate the chain either.
+	terminal := path[len(path)-1]
+	if len(extra) > 0 && !g.isSelfSigned(terminal) {
+		kept, disqualified := partitionIssuerEligible(extra)
+		chain = append(chain, kept...)
+		fallbackObs := []Observation{{
 			Kind: ObsChainUnverified,
-			Detail: fmt.Sprintf("no issuer of %q could be established from the bundle; the other %d certificate(s) were kept rather than dropped",
-				boundSubject(leaf.Subject.String()), len(extra)),
+			Detail: fmt.Sprintf("no issuer of %q could be established from the bundle; the remaining %d certificate(s) were kept rather than dropped",
+				boundSubject(g.certs[terminal].Subject.String()), len(kept)),
 		}}
+		if len(disqualified) > 0 {
+			fallbackObs = append(fallbackObs, Observation{
+				Kind: ObsExtraCertsExcluded,
+				Detail: fmt.Sprintf("%d certificate(s) cannot issue certificates, so they are no issuer of %q and were excluded: %s",
+					len(disqualified), boundSubject(leaf.Subject.String()), subjectsForLog(disqualified)),
+			})
+		}
+		return chain, disqualified, fallbackObs
 	}
 
 	if len(extra) > 0 {
