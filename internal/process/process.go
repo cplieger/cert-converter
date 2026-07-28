@@ -592,8 +592,9 @@ func noteUnreadableInput(rel, what string, err error) {
 // or password changed). Every output touch — the prior-bundle read, the directory
 // creation and the atomic write — is confined to the store's root, so a symlink
 // planted under the output tree cannot redirect the private-key-bearing PFX
-// outside it. The only thing recorded on success is the pair's input fingerprint,
-// which gates one-shot input diagnostics and never currency, so every failure path
+// outside it. The only thing recorded on success is the pair's observation
+// signature (input fingerprint plus the observations derived from it), which gates
+// one-shot input diagnostics and never currency, so every failure path
 // leaves the pair due for a retry without needing a rollback. All per-cert logs
 // use the certsRoot-relative path for a stable, non-leaky identifier.
 func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStatus {
@@ -664,9 +665,11 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 // the duplicate-block artefact, which is noise at that level.
 //
 // Observations are emitted on the conversion path, and on the unchanged path only
-// when the pair's raw input bytes differ from the last ones observed, which is what
-// keeps them from becoming noise: an odd-but-convertible input is reported on the
-// scan that introduced it rather than on every scan for the life of the deployment.
+// when the pair's observation signature (input bytes plus the observations derived
+// from them) differs from the last one observed, which is what keeps them from
+// becoming noise: an odd-but-convertible input, or a newly derived expiry over
+// unchanged bytes, is reported on the scan that introduced it rather than on every
+// scan for the life of the deployment.
 // A pair that keeps FAILING re-emits per attempt, matching how the failure itself is
 // logged.
 // Detail is already bounded by convert, so it needs no further truncation here.

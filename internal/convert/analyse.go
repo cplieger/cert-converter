@@ -40,9 +40,9 @@ const (
 	// ObsCAAsIdentity reports that the selected identity asserts IsCA. Legal (a
 	// self-signed CA can serve as an identity) but unusual enough to surface.
 	ObsCAAsIdentity ObservationKind = "ca-as-identity"
-	// ObsChainUnverified reports that no issuer for the selected identity could be
-	// established from the bundle, so the remaining certificates were included
-	// as-is rather than dropped.
+	// ObsChainUnverified reports that no issuer of the certificate the discovered
+	// path ended on could be established from the bundle, so the remaining
+	// issuer-eligible certificates were included as-is rather than dropped.
 	ObsChainUnverified ObservationKind = "chain-unverified"
 	// ObsIdentityNotYetValid reports a selected identity whose NotBefore is in
 	// the future. Conversion still proceeds; consumers will reject it.
@@ -98,8 +98,10 @@ type Analysis struct {
 	// One exception, always accompanied by ObsChainUnverified: when the issuer of
 	// the certificate the discovered path ended on could not be established from
 	// the bundle, chain carries the certificates whose ancestry IS established
-	// first and the remaining ones in INPUT order after them. There is no ancestry
-	// to order the remainder by, and carrying a CA a deployment may rely on beats
+	// first and the remaining issuer-eligible ones in INPUT order after them (a
+	// certificate canIssueCertificates disqualifies is excluded instead, and
+	// reported by ObsExtraCertsExcluded). There is no ancestry to order the
+	// remainder by, and carrying a CA a deployment may rely on beats
 	// truncating the chain at the last provable link.
 	chain []*x509.Certificate
 	// key is the private half of leaf. Typed crypto.Signer rather than
@@ -553,10 +555,16 @@ func (g *certGraph) plausibleIssuer(child, parent int) bool {
 // doing any signature work.
 //
 // Three disqualifications, each of them positive proof rather than absent evidence:
-// a v3 certificate carrying no Basic Constraints at all (which CheckSignatureFrom
-// refuses as a parent), one whose Basic Constraints say CA:false, and one whose
+// a v3 certificate carrying no Basic Constraints at all (RFC 5280 4.2.1.9 says such
+// a key MUST NOT verify certificate signatures, which is why CheckSignatureFrom
+// refuses it as a parent), one whose Basic Constraints say CA:false, and one whose
 // stated KeyUsage omits KeyCertSign. An absent KeyUsage (the zero value) states
 // nothing, so it disqualifies nothing.
+//
+// This answers only whether c may be somebody's PARENT. Whether c is SELF-SIGNED is a
+// different question, and isSelfSigned deliberately answers it without this gate: a
+// self-signed certificate with no basic constraints is still a root here, even though
+// it can issue nothing else.
 func canIssueCertificates(c *x509.Certificate) bool {
 	if c.Version == 3 && !c.BasicConstraintsValid {
 		return false
@@ -1030,10 +1038,14 @@ func (g *certGraph) assembleChain(identityCert int, leaf *x509.Certificate) (cha
 	if len(extra) > 0 && !g.isSelfSigned(terminal) {
 		kept, disqualified := partitionIssuerEligible(extra)
 		chain = append(chain, kept...)
+		disposition := fmt.Sprintf("the remaining %d certificate(s) were kept rather than dropped", len(kept))
+		if len(kept) == 0 {
+			disposition = "nothing in the bundle could be kept as chain material"
+		}
 		fallbackObs := []Observation{{
 			Kind: ObsChainUnverified,
-			Detail: fmt.Sprintf("no issuer of %q could be established from the bundle; the remaining %d certificate(s) were kept rather than dropped",
-				boundSubject(g.certs[terminal].Subject.String()), len(kept)),
+			Detail: fmt.Sprintf("no issuer of %q could be established from the bundle; %s",
+				boundSubject(g.certs[terminal].Subject.String()), disposition),
 		}}
 		if len(disqualified) > 0 {
 			fallbackObs = append(fallbackObs, Observation{

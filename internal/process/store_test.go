@@ -197,12 +197,13 @@ func TestStoreWrite_refuses_a_bundle_larger_than_the_read_bound(t *testing.T) {
 }
 
 // TestStoreIsCurrent_names_a_non_regular_prior_output pins the WARN on the arm
-// that refuses a prior output which is not a regular file. Nothing else records
-// it: the verdict is "stale, regenerate", and the rewrite that follows FAILS for
-// every one of these shapes (atomicfile refuses a symlink target outright, and a
-// directory or device node cannot be renamed over), so this line is what names the
-// occupied output path before the bare conversion error arrives. Runs serially: it
-// swaps slog.Default().
+// that refuses a prior output which is not a regular file. Nothing else records it:
+// the verdict is "stale, regenerate", and for the two shapes covered here the
+// rewrite that follows FAILS (atomicfile refuses a symlink target outright, and a
+// directory cannot be renamed over), so this line is what names the occupied output
+// path before the bare conversion error arrives. A device node, FIFO or socket IS
+// replaced by the rename instead, which makes this line that case's only trace.
+// Runs serially: it swaps slog.Default().
 func TestStoreIsCurrent_names_a_non_regular_prior_output(t *testing.T) {
 	const wantMsg = "prior output path is not a regular file; regenerating"
 	for _, tc := range []struct {
@@ -244,6 +245,9 @@ func TestStoreIsCurrent_names_a_non_regular_prior_output(t *testing.T) {
 			}
 			if got := logs.CountLevel(slog.LevelWarn, wantMsg); got != 1 {
 				t.Fatalf("isCurrent(non-regular) logged %q, want %q once at WARN", logs.Messages(), wantMsg)
+			}
+			if !logs.HasAttr(wantMsg, "path", "out.pfx") {
+				t.Errorf("isCurrent(non-regular) logged %q, want path=out.pfx so the operator can identify the occupied output", logs.Messages())
 			}
 			if _, ok := logs.AttrValue(wantMsg, "mode"); !ok {
 				t.Errorf("isCurrent(non-regular) logged %q, want the mode named so the operator knows what occupies the path", logs.Messages())

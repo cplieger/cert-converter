@@ -140,7 +140,7 @@ func Load() (Config, error) {
 	password, source, secretErr := envx.SecretWithSource("PFX_PASSWORD")
 	// Emitted here rather than from logPasswordDelivery because every startup
 	// REFUSAL below is about the file channel while PFX_PASSWORD is the variable the
-	// operator can see is set: ErrEmptyPassword's "set it" and envx's "read secret
+	// operator can see is set: ErrEmptyPassword's "set PFX_PASSWORD" and envx's "read secret
 	// file for PFX_PASSWORD" both point at the ignored variable unless this line
 	// says the file wins. envx reports SourceFile on its error paths for exactly
 	// this purpose.

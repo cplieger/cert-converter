@@ -214,15 +214,17 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 		// content could satisfy the check.
 		//
 		// Named at WARN like the other "cannot tell what is on disk" arms, because
-		// nothing else records the SHAPE. The rewrite this verdict triggers cannot
-		// succeed for any of these: atomicfile refuses a symlink target outright
-		// ("atomicfile: target is a symlink"), and a directory or device node cannot be
-		// renamed over either — so the pair fails and the container goes unhealthy. What
-		// the operator would otherwise get is a bare "conversion failed"; this line names
-		// the occupied output path and its mode before that error arrives. It also records
-		// the attempt itself, which matters when the occupant is a symlink pointing out of
-		// the mounted volume: that is a redirection attempt on a private-key-bearing file,
-		// and the confined root refusing it should not be the only trace.
+		// nothing else records the SHAPE. What happens next depends on the occupant:
+		// atomicfile refuses a symlink target outright ("atomicfile: target is a
+		// symlink") and a directory cannot be renamed over, so those fail the pair and
+		// flip health — where the operator would otherwise get a bare "conversion
+		// failed", this line names the occupied output path and its mode before that
+		// error arrives. Any other non-regular occupant (a device node, FIFO or socket)
+		// IS replaced by the rename, and then this line is the only trace that anything
+		// unusual was there at all. It also records the attempt itself, which matters
+		// when the occupant is a symlink pointing out of the mounted volume: that is a
+		// redirection attempt on a private-key-bearing file, and the confined root
+		// refusing it should not be the only trace.
 		slog.Warn("prior output path is not a regular file; regenerating",
 			"path", rel, "mode", fi.Mode().String(),
 			"remediation", "remove whatever occupies the output path; this app writes only regular files there")

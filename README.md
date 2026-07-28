@@ -76,9 +76,9 @@ services:
 | `/output` | PFX output directory; must be writable by the UID in `user:` |
 
 Create the host output directory owned by the UID you set in `user:` before
-the first start (`mkdir -p /path/to/pfx/output && chown 1000:1000 /path/to/pfx/output`
-for the defaults; replace `1000:1000` with the numeric PUID:PGID from `.env`
-when you override them). Unlike anything under `/input` the scan cannot read, which is
+the first start. Export `PUID` and `PGID` with the same values Compose uses,
+then run `mkdir -p /path/to/pfx/output && chown "${PUID:-1000}:${PGID:-1000}" /path/to/pfx/output`
+(both default to `1000`, matching `compose.yaml`). Unlike anything under `/input` the scan cannot read, which is
 only warned about and skipped, an unwritable `/output` fails every conversion and
 keeps the container unhealthy. Generated `.pfx` files are mode `0600` and their
 directories `0750`, both owned by that UID, so whatever consumes them must run

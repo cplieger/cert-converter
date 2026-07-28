@@ -1053,12 +1053,13 @@ func TestParseProfilePBKDF2_rejects_every_invalid_salt_shape(t *testing.T) {
 	}
 }
 
-// TestParseProfilePBKDF2_bounds_both_nested_identifiers pins the allocation bound
-// at the two identifier fields nested inside a PBKDF2 block. The bound is tested at
-// the outer MAC, authSafe, safe-bag, encryption and message-authentication sites,
-// but not here: either nested decode could lose it while every other test stays
-// green, letting an unauthenticated bundle drive oversized identifier decoding on
-// the scan's only goroutine.
+// TestParseProfilePBKDF2_bounds_both_nested_identifiers pins that the two identifier
+// fields nested inside a PBKDF2 block are read through the BOUNDED decoder. The bound
+// itself is one shared helper (decodeOID) already pinned at the outer MAC, authSafe,
+// safe-bag, encryption and message-authentication sites, so what can regress here is
+// not the bound but the routing: a nested field re-read with a raw asn1.Unmarshal would
+// let an unauthenticated bundle drive oversized identifier decoding on the scan's only
+// goroutine while every bound test stayed green.
 func TestParseProfilePBKDF2_bounds_both_nested_identifiers(t *testing.T) {
 	t.Parallel()
 
