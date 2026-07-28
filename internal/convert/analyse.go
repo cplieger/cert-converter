@@ -61,12 +61,13 @@ const (
 	// therefore not part of the bundle. A private-key block is deliberately not
 	// reported: a combined cert+key file is a supported input.
 	ObsUnrelatedBlocksSkipped ObservationKind = "unrelated-blocks-skipped"
-	// ObsUnusableKeyBlocksSkipped reports key blocks in the KEY file that yielded no
-	// usable key — unparseable DER, armour encoding/pem could not decode, or
-	// ciphertext — while another block did yield one, so conversion continued. The
-	// canonical cause is a rotation that appended a damaged or encrypted key next to
-	// the old one: the old key still matches today, and the only other signal is the
-	// "no certificate matches any key" failure a later renewal produces.
+	// ObsUnusableKeyBlocksSkipped reports PEM blocks in the KEY file that yielded no
+	// usable key — unparseable DER, armour encoding/pem could not decode, ciphertext,
+	// or a label naming no key format this app reads — while another block did yield
+	// one, so conversion continued. The canonical cause is a rotation that appended a
+	// damaged or encrypted key next to the old one: the old key still matches today,
+	// and the only other signal is the "no certificate matches any key" failure a
+	// later renewal produces.
 	ObsUnusableKeyBlocksSkipped ObservationKind = "unusable-key-blocks-skipped"
 	// ObsIssuerMatchIgnored reports that a supplied key also matched a certificate
 	// that verifiably issued another certificate in this bundle. Such a certificate
@@ -1102,7 +1103,7 @@ func (g *certGraph) assembleChain(identityCert int) (chain, extra []*x509.Certif
 		chain = append(chain, kept...)
 		disposition := fmt.Sprintf("the remaining %d certificate(s) were kept rather than dropped", len(kept))
 		if len(kept) == 0 {
-			disposition = "nothing in the bundle could be kept as chain material"
+			disposition = "none of the remaining certificate(s) could be kept as chain material"
 		}
 		fallbackObs := []Observation{{
 			Kind: ObsChainUnverified,

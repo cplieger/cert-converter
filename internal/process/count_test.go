@@ -10,6 +10,7 @@ func TestCountResults(t *testing.T) {
 		name       string
 		results    []conversionStatus
 		unreadable int
+		unresolved int
 		want       ScanResult
 	}{
 		{
@@ -28,7 +29,8 @@ func TestCountResults(t *testing.T) {
 				statusFailed,
 			},
 			unreadable: 3,
-			want:       ScanResult{Total: 5, Converted: 2, Unchanged: 1, Orphan: 1, Failed: 1, Unreadable: 3},
+			unresolved: 2,
+			want:       ScanResult{Total: 5, Converted: 2, Unchanged: 1, Orphan: 1, Failed: 1, Unreadable: 3, Unresolved: 2},
 		},
 		{
 			name:       "unreadable not counted in total",
@@ -50,10 +52,10 @@ func TestCountResults(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := countResults(tt.results, tt.unreadable)
+			got := countResults(tt.results, tt.unreadable, tt.unresolved)
 			if got != tt.want {
-				t.Errorf("countResults(%d results, unreadable=%d) = %+v, want %+v",
-					len(tt.results), tt.unreadable, got, tt.want)
+				t.Errorf("countResults(%d results, unreadable=%d, unresolved=%d) = %+v, want %+v",
+					len(tt.results), tt.unreadable, tt.unresolved, got, tt.want)
 			}
 		})
 	}

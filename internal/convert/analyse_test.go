@@ -709,6 +709,33 @@ func TestAnalyse_reports_no_key_block_observation_for_a_certificate_passenger(t 
 	}
 }
 
+// TestAnalyse_reports_no_key_block_observation_for_an_ec_parameters_passenger
+// pins the second expected companion of a real key file. `openssl ecparam
+// -genkey` writes an EC PARAMETERS block immediately before the EC PRIVATE KEY
+// it describes, so that two-block file is the ordinary output of a standard
+// keygen command, not a key this app failed to read. Reporting it would emit a
+// WARN on every scan of a perfectly healthy pair, forever.
+func TestAnalyse_reports_no_key_block_observation_for_an_ec_parameters_passenger(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+
+	// The DER `openssl ecparam` writes for a named curve: the prime256v1 OID
+	// (1.2.840.10045.3.1.7). Only the label drives the rule under test.
+	ecParams := pem.EncodeToMemory(&pem.Block{
+		Type:  "EC PARAMETERS",
+		Bytes: []byte{0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07},
+	})
+
+	got, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), concatPEM(ecParams, m.LeafKeyPEM))
+	if err != nil {
+		t.Fatalf("Analyse(ecparam -genkey key file) = %v, want success", err)
+	}
+	if hasObservation(got.Observations(), convert.ObsUnusableKeyBlocksSkipped) {
+		t.Errorf("observations = %v, want no %q for the EC PARAMETERS block `openssl ecparam -genkey` writes beside the key",
+			got.Observations(), convert.ObsUnusableKeyBlocksSkipped)
+	}
+}
+
 // TestAnalyse_reports_no_key_block_observation_for_a_clean_key_file guards the
 // other direction: the observation must stay absent for the ordinary input, or
 // every scan of every healthy pair emits a WARN nobody can act on.

@@ -17,8 +17,9 @@ var EncoderFor = encoderFor
 // parseCertChain and parsePrivateKeys themselves stay unexported: Analyse is the
 // package's only production conversion edge (it owns the cert/key match and the
 // leaf/chain split), so no production package outside internal/convert may bypass
-// those invariants. This wrapper keeps their unit, property and fuzz coverage
-// available to the external convert_test package without widening the app's API.
+// those invariants. This wrapper, and ParsePrivateKey below, keep their unit,
+// property and fuzz coverage available to the external convert_test package
+// without widening the app's API.
 func ParseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
 	certs, _, err := parseCertChain(pemBytes)
 	return certs, err

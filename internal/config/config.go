@@ -431,16 +431,22 @@ func warnBothPasswordChannels(source envx.SecretSource) {
 // before resolution so it precedes both outcomes.
 //
 // Deliberately a warning, not a refusal: an empty pointer resolving through
-// PFX_PASSWORD is envx's documented rule (IsBlankSecretFilePath's doc comment), and
-// refusing here would break a deployment that materialises the variable empty on
-// purpose.
+// PFX_PASSWORD is envx's documented rule (SecretWithSource's non-empty gate; envx
+// v1.4.0 documents the caller contract on IsBlankSecretFilePath, absent from the
+// pinned v1.3.0), and refusing here would break a deployment that materialises the
+// variable empty on purpose.
 func warnBlankPasswordFilePointer() {
 	path, set := os.LookupEnv("PFX_PASSWORD_FILE")
 	if !set || strings.TrimSpace(path) != "" {
 		return
 	}
-	slog.Warn("PFX_PASSWORD_FILE is set but blank, so it names no secret file; "+
-		"the PFX password is taken from PFX_PASSWORD instead",
+	outcome := "the PFX password is taken from PFX_PASSWORD instead"
+	if path != "" {
+		// A whitespace-only pointer is non-empty to envx, so it IS the file
+		// channel: envx opens it and startup fails on the read.
+		outcome = "startup will fail trying to open a file whose name is whitespace"
+	}
+	slog.Warn("PFX_PASSWORD_FILE is set but blank, so it names no secret file; "+outcome,
 		"remediation", "unset PFX_PASSWORD_FILE to configure the secret through PFX_PASSWORD, "+
 			"or point it at the mounted secret file (a compose ${PFX_PASSWORD_FILE:-} whose source variable is undefined is the usual cause)")
 }

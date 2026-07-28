@@ -345,6 +345,60 @@ func isolatePasswordFile(t *testing.T) {
 	t.Setenv("PFX_PASSWORD_FILE", "")
 }
 
+// TestLoad_warns_only_for_a_blank_PFX_PASSWORD_FILE_pointer pins both halves of
+// warnBlankPasswordFilePointer's guard. A pointer that expands to nothing inverts the
+// file-wins rule silently, so the WARN must fire; an UNSET pointer is the normal
+// deployment, so it must stay silent, and dropping the LookupEnv "set" check (an
+// os.Getenv "simplification") would warn every correctly configured operator that
+// their secret pointer is broken. Serial: it swaps slog.Default().
+func TestLoad_warns_only_for_a_blank_PFX_PASSWORD_FILE_pointer(t *testing.T) {
+	const blankPointer = "PFX_PASSWORD_FILE is set but blank"
+	for _, tc := range []struct {
+		name     string
+		set      bool
+		wantWarn bool
+	}{
+		{"set but empty warns", true, true},
+		{"unset is silent", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv("PFX_PASSWORD_FILE", "")
+			} else {
+				// t.Setenv cannot unset, so restore by hand.
+				prev, had := os.LookupEnv("PFX_PASSWORD_FILE")
+				if err := os.Unsetenv("PFX_PASSWORD_FILE"); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if had {
+						if err := os.Setenv("PFX_PASSWORD_FILE", prev); err != nil {
+							t.Error(err)
+						}
+					}
+				})
+			}
+			t.Setenv("PFX_PASSWORD", "a-real-password")
+
+			logs := capture.Default(t)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() = %v, want nil", err)
+			}
+
+			got := logs.CountLevel(slog.LevelWarn, blankPointer)
+			want := 0
+			if tc.wantWarn {
+				want = 1
+			}
+			if got != want {
+				t.Errorf("Load() logged %d %q WARN records, want %d: the WARN reports a pointer that expands to nothing and must stay silent when PFX_PASSWORD_FILE is unset (logs %v)",
+					got, blankPointer, want, logs.Messages())
+			}
+		})
+	}
+}
+
 // TestLoad_blank_password_reports_only_the_strength_warning pins the suppression
 // logPasswordDelivery applies to a blank value. A whitespace-only PFX_PASSWORD is
 // padded and (for a tab or newline) control-character-bearing by construction, so

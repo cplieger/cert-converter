@@ -474,6 +474,40 @@ func TestInspect_rejects_a_non_v3_pfx_version(t *testing.T) {
 	}
 }
 
+// TestInspect_rejects_a_non_zero_encrypted_safe_version pins the encrypted-safe
+// version guard, the sibling of the preamble's v3 check: go-pkcs12 writes version 0
+// and its decoder refuses any other value before it decrypts the safe, so a
+// different version is not a shape this app emits.
+func TestInspect_rejects_a_non_zero_encrypted_safe_version(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+
+	var preamble pfxPreamble
+	testASN1Unmarshal(t, pfx, &preamble)
+	mutateTestAuthenticatedSafe(t, &preamble, oidEncryptedDataContentType, func(safe *contentInfo) {
+		var encrypted encryptedData
+		testASN1Unmarshal(t, safe.Content.Bytes, &encrypted)
+		encrypted.Version = 7
+		safe.Content.Bytes = testASN1Marshal(t, encrypted)
+		safe.Content.FullBytes = nil
+	})
+	got, err := Inspect(testASN1Marshal(t, preamble))
+	if !errors.Is(err, ErrProfileUnknown) {
+		t.Fatalf("Inspect(encrypted safe v7) = (%+v, %v), want ErrProfileUnknown", got, err)
+	}
+	if !strings.Contains(err.Error(), "encrypted safe version 7, want 0") {
+		t.Errorf("Inspect(encrypted safe v7) = %v, want the refusal to name the version", err)
+	}
+}
+
 // testAuthenticatedSafes decodes the authenticated safe list out of a preamble.
 func testAuthenticatedSafes(t *testing.T, p *pfxPreamble) []contentInfo {
 	t.Helper()

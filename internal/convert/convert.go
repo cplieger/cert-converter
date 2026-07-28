@@ -24,6 +24,7 @@ const (
 	pemTypeRSAPrivateKey       = "RSA PRIVATE KEY"
 	pemTypeECPrivateKey        = "EC PRIVATE KEY"
 	pemTypeEncryptedPrivateKey = "ENCRYPTED PRIVATE KEY"
+	pemTypeECParameters        = "EC PARAMETERS"
 )
 
 // --- Certificate chain parsing ---
@@ -113,6 +114,21 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, skippedBlocks, error)
 func isPrivateKeyBlockType(blockType string) bool {
 	switch blockType {
 	case pemTypePrivateKey, pemTypeRSAPrivateKey, pemTypeECPrivateKey, pemTypeEncryptedPrivateKey:
+		return true
+	}
+	return false
+}
+
+// isExpectedKeyFilePassenger reports whether a non-key PEM label in the KEY file is
+// an expected companion of the key rather than something the operator meant this app
+// to read as one. Two of them, and both are silent on purpose: a CERTIFICATE block is
+// the combined cert+key file (the mirror of parseCertChain's private-key rule), and an
+// EC PARAMETERS block is what `openssl ecparam -genkey` writes immediately before the
+// EC PRIVATE KEY it describes, so reporting it would WARN about a healthy file on
+// every scan.
+func isExpectedKeyFilePassenger(blockType string) bool {
+	switch blockType {
+	case pemTypeCertificate, pemTypeECParameters:
 		return true
 	}
 	return false
@@ -305,12 +321,10 @@ func (s *keyScan) visit(block *pem.Block) {
 		s.sawEncrypted = true
 	default:
 		s.skipped.add(block.Type)
-		// A CERTIFICATE block is an expected passenger, the mirror of parseCertChain's
-		// private-key rule: a combined cert+key file is a supported input. Any other
-		// label names something this app cannot read as a key at all (an OpenSSH-format
-		// key, for instance), so the operator hears about it even when another block
-		// did yield one.
-		if block.Type != pemTypeCertificate {
+		// Only a label naming something this app cannot read as a key AT ALL (an
+		// OpenSSH-format key, for instance) is reported; the expected companions of a
+		// real key file are not.
+		if !isExpectedKeyFilePassenger(block.Type) {
 			s.unrelated.add(block.Type)
 		}
 	}

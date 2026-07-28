@@ -618,7 +618,7 @@ func (s *store) reconcile(ctx context.Context, mode outputpolicy.Lifecycle, seen
 	if mode != outputpolicy.LifecycleSync || !reapable {
 		slog.Warn("output bundles have no matching input",
 			"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),
-			"action", lifecycleInaction(mode, reapable),
+			"action", lifecycleInaction(mode, reapable, walkSafe),
 			"remediation", orphanReportRemediation(walkSafe))
 		return 0, nil
 	}
@@ -661,16 +661,21 @@ func sampleOrphanPaths(paths []string) string {
 		fmt.Sprintf(" (+%d more)", len(paths)-maxLoggedOrphans)
 }
 
-// lifecycleInaction explains why an orphan was reported rather than removed. Two
-// independent reasons can apply and the mode alone does not pick between them: a
-// non-sync mode reports by configuration, AND any mode reaches this point when the
-// scan could not prove every candidate is genuinely orphaned (a failed conversion
-// or an unsafe OUTPUT walk; reconcile returns before this point when the INPUT
-// enumeration is incomplete). The unproven reason wins, because it is the one that
-// changes what the operator may safely do with the list.
-func lifecycleInaction(mode outputpolicy.Lifecycle, reapable bool) string {
-	if !reapable {
+// lifecycleInaction explains why an orphan was reported rather than removed. Three
+// independent reasons can apply and the mode alone does not pick between them, so
+// each is named separately and the strongest wins: an OUTPUT walk that could not
+// enumerate the tree makes the LIST itself untrustworthy (orphanReportRemediation
+// withholds the delete advice for exactly this case, so the two attributes must
+// agree on it); a failed conversion leaves the list trustworthy — the input
+// enumeration was complete, or reconcile would have returned earlier — and only
+// withholds this app's own deletion until a clean scan; otherwise the mode is the
+// reason.
+func lifecycleInaction(mode outputpolicy.Lifecycle, reapable, walkSafe bool) string {
+	switch {
+	case !walkSafe:
 		return "kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle"
+	case !reapable:
+		return "kept: a conversion failed on this scan, so nothing is removed until a scan with no failures"
 	}
 	return "reported only (OUTPUT_LIFECYCLE=" + string(mode) + ")"
 }
