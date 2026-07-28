@@ -124,10 +124,10 @@ func TestInspect_rejects_an_oversized_identifier(t *testing.T) {
 			if !errors.Is(inspectErr, ErrProfileUnknown) {
 				t.Fatalf("Inspect(%s) = %v, want ErrProfileUnknown", tc.name, inspectErr)
 			}
-			// The sentinel alone does not pin the bound: bypassing decodeOID at the
-			// authSafe content-type site leaves the oversized identifier syntactically
-			// valid, and bundleAlgorithms then refuses it as a non-data ContentInfo with
-			// the SAME sentinel. Only the guard's own wording distinguishes the two.
+			// Both halves of the refusal are pinned: the sentinel (a bound bypass fails
+			// it, because an unbounded decode of this arc errors with asn1's own "base
+			// 128 integer too large" rather than ErrProfileUnknown), and the guard's own
+			// wording, so a bound relaxed instead of removed is caught too.
 			if want := "object identifier exceeds"; !strings.Contains(inspectErr.Error(), want) {
 				t.Errorf("Inspect(%s) = %v, want the refusal to name %q", tc.name, inspectErr, want)
 			}

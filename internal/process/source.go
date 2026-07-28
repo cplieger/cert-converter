@@ -2,6 +2,8 @@ package process
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"os"
 
 	"github.com/cplieger/atomicfile/v2"
@@ -29,6 +31,32 @@ type source struct {
 // it. Used to classify a pair's sibling key before committing to a read.
 func (s *source) stat(rel string) (os.FileInfo, error) {
 	return s.root.Stat(rel)
+}
+
+// pathVanished reports whether an ENOENT read of rel means the PATH ITSELF is gone,
+// which is what separates the transient renewal race from a steady-state input the
+// scan will never be able to read.
+//
+// It answers with Lstat, the one question Stat and the read cannot: a read gets the
+// same ENOENT whether the entry disappeared between readdir and the open (a renewal
+// or an atomic-write temp — gone, and the next scan converts the replacement) or the
+// entry is still sitting there as a symlink whose target does not exist (a certbot
+// live/ -> archive/ layout with only live/ mounted, a link left behind by a removed
+// cert — the same ENOENT on every scan, forever, with no PFX produced).
+//
+// A path that is gone, or that is now a NON-symlink (it was replaced under the read),
+// is the race. A surviving symlink is not. Any other Lstat failure answers false: an
+// input the scan cannot even classify is the steady-state case, which is the arm that
+// tells an operator something is wrong.
+func (s *source) pathVanished(rel string) bool {
+	fi, err := s.root.Lstat(rel)
+	if errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&fs.ModeSymlink == 0
 }
 
 // readBounded opens rel within the input tree and reads it under maxFileSize,

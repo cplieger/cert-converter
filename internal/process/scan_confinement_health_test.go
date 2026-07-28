@@ -192,15 +192,21 @@ func TestScannerRun_directory_in_cert_path_does_not_authorise_reaping(t *testing
 	}
 }
 
-// TestScannerRun_vanished_cert_is_not_an_unreadable_path pins the split between a
-// transient renewal race and a steady-state unreadable path. A cert that is gone by
-// the time the bounded read runs (here a dangling symlink, the same ENOENT the read
-// sees when a renewal replaces the file between readdir and read) must land in
-// ScanResult.Vanished and NOT in Unreadable: that count feeds the documented
-// unreadable-path alert and its /input-permissions remediation, which is the wrong
-// diagnosis — and a false page — for the ordinary renewal this daemon exists to
-// process. It stays health-neutral and still blocks reaping.
-func TestScannerRun_vanished_cert_is_not_an_unreadable_path(t *testing.T) {
+// TestScannerRun_dangling_cert_symlink_stays_an_unreadable_path pins the steady-state
+// side of the ENOENT split. A .crt that is a symlink to a target that does not exist
+// hands the confined read the SAME ENOENT a renewal race does, but it is not a race:
+// the link is still there, so every future scan gets the same answer and that
+// certificate produces no PFX until an operator fixes the link. It therefore belongs
+// in ScanResult.Unreadable — the count behind the documented unreadable-path alert and
+// its /input remediation — and NOT in Vanished, whose Debug-only reporting would leave
+// the condition invisible at the default log level forever.
+//
+// The transient arm (a path that is genuinely gone, or replaced under the read) is
+// pinned by TestNoteUnreadableInput_levels, where the filesystem state can be arranged
+// exactly; reaching it from Run would need a deletion racing the scan's own read.
+//
+// Either outcome stays health-neutral and still blocks reaping.
+func TestScannerRun_dangling_cert_symlink_stays_an_unreadable_path(t *testing.T) {
 	t.Parallel()
 	certsRoot := t.TempDir()
 	outRoot := t.TempDir()
@@ -209,14 +215,14 @@ func TestScannerRun_vanished_cert_is_not_an_unreadable_path(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(certsRoot, "gone.key"), keyPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// The cert entry exists for the walk and is gone for the read. A RELATIVE target
+	// The cert entry exists for the walk and its target never will. A RELATIVE target
 	// inside the root, so the confined read reaches ENOENT rather than a confinement
-	// refusal (which is the steady-state unreadable case, not this one).
+	// refusal (which is a different unreadable case, counted the same way).
 	if err := os.Symlink("already-renewed.pem", filepath.Join(certsRoot, "gone.crt")); err != nil {
 		t.Fatal(err)
 	}
 
-	// A prior output nothing in this tree claims: the vanished cert must not authorise
+	// A prior output nothing in this tree claims: the unreadable cert must not authorise
 	// reaping it either, because the scan did not enumerate the whole tree.
 	prior := filepath.Join(outRoot, "unrelated.pfx")
 	if err := os.WriteFile(prior, []byte("prior bundle"), 0o600); err != nil {
@@ -225,16 +231,16 @@ func TestScannerRun_vanished_cert_is_not_an_unreadable_path(t *testing.T) {
 
 	res, err := newSyncScanner(certsRoot, outRoot).Run(t.Context())
 	if err != nil {
-		t.Fatalf("Run(vanished cert) = %v, want nil: a replaced input is not a scan error", err)
+		t.Fatalf("Run(dangling cert symlink) = %v, want nil: an unreadable input is not a scan error", err)
 	}
-	if res.Vanished != 1 {
-		t.Errorf("Vanished = %d, want 1: a cert gone by the time it is read is the renewal race", res.Vanished)
+	if res.Unreadable != 1 {
+		t.Errorf("Unreadable = %d, want 1: a link whose target is missing on every scan is the steady-state condition an operator must hear about", res.Unreadable)
 	}
-	if res.Unreadable != 0 {
-		t.Errorf("Unreadable = %d, want 0: folding the renewal race into this count raises the operator alert for /input permissions on an ordinary renewal", res.Unreadable)
+	if res.Vanished != 0 {
+		t.Errorf("Vanished = %d, want 0: a symlink that is still there did not vanish, and reporting it as the renewal race hides it at Debug forever", res.Vanished)
 	}
 	if res.Failed != 0 {
-		t.Errorf("Failed = %d, want 0: a transient race must not flip health", res.Failed)
+		t.Errorf("Failed = %d, want 0: an unreadable input is health-neutral, because no restart clears it", res.Failed)
 	}
 	if res.Removed != 0 {
 		t.Errorf("Removed = %d, want 0: a scan that missed part of /input cannot prove any output orphaned", res.Removed)

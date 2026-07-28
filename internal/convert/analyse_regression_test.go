@@ -1430,3 +1430,124 @@ func TestAnalyse_drops_a_shared_key_issuer_across_a_name_encoding_difference(t *
 		t.Errorf("observations = %v, want the passed-over issuer match reported", got.Observations())
 	}
 }
+
+// rdnSequence builds a distinguished name as an explicit RDN SEQUENCE, one
+// single-valued RDN per attribute in the order given, encoded as PrintableStrings.
+//
+// The order is the point: pkix.Name cannot express it (ToRDNSequence rebuilds the
+// attributes it knows in a fixed order), so a test that needs two names holding the
+// same values in a DIFFERENT order has to marshal the sequence itself.
+func rdnSequence(attrs ...pkix.AttributeTypeAndValue) pkix.RDNSequence {
+	seq := make(pkix.RDNSequence, 0, len(attrs))
+	for _, at := range attrs {
+		seq = append(seq, pkix.RelativeDistinguishedNameSET{at})
+	}
+	return seq
+}
+
+// printableAttr is one RDN attribute carrying a PrintableString value.
+func printableAttr(oid asn1.ObjectIdentifier, value string) pkix.AttributeTypeAndValue {
+	return pkix.AttributeTypeAndValue{Type: oid, Value: asn1.RawValue{
+		Class: asn1.ClassUniversal,
+		Tag:   asn1.TagPrintableString,
+		Bytes: []byte(value),
+	}}
+}
+
+var (
+	oidCommonName   = asn1.ObjectIdentifier{2, 5, 4, 3}  // id-at-commonName
+	oidOrganisation = asn1.ObjectIdentifier{2, 5, 4, 10} // id-at-organizationName
+)
+
+// rawNameOf marshals an RDN sequence to DER for use as a template's RawSubject.
+func rawNameOf(t *testing.T, seq pkix.RDNSequence) []byte {
+	t.Helper()
+	der, err := asn1.Marshal(seq)
+	if err != nil {
+		t.Fatalf("setup: marshal RDNSequence: %v", err)
+	}
+	return der
+}
+
+// reorderedSubjectView returns a parent VIEW of c whose subject is seq rather than
+// c's own, with the subject key identifier removed.
+//
+// A certificate minted against this view carries an issuer name that is byte- AND
+// semantically distinct from c's subject (a different RDN order is a different DN
+// under RFC 5280) while c's key still signs it, and no authority key identifier —
+// the shape that separates "this CA's key signed it" from "this CA issued it".
+func reorderedSubjectView(t *testing.T, c *x509.Certificate, seq pkix.RDNSequence) *x509.Certificate {
+	t.Helper()
+	view := *c
+	view.RawSubject = rawNameOf(t, seq)
+	view.SubjectKeyId = nil
+	view.Subject = pkix.Name{}
+	return &view
+}
+
+// TestAnalyse_keeps_a_ca_identity_whose_subject_only_matches_an_issuer_name_approximately
+// pins the semantic-name fallback against the OTHER half of RFC 5280 name equality:
+// two DNs holding the same attribute values in a different RDN order are different
+// names, and a CA whose key happens to have signed a certificate naming that other
+// DN did not issue it.
+//
+// Comparing pkix.Name.ToRDNSequence() conflated the two — crypto/x509 documents
+// pkix.Name as an approximation, and the round trip rebuilds known attributes in a
+// fixed order — so the fallback read this CA as an issuer of the co-bundled
+// certificate. As the only match for the supplied key it then hit the role check
+// and the whole conversion was refused, with an error telling the operator to
+// remove certificates this CA never issued.
+func TestAnalyse_keeps_a_ca_identity_whose_subject_only_matches_an_issuer_name_approximately(t *testing.T) {
+	t.Parallel()
+	now := time.Now().Truncate(time.Second)
+	caKey := newKey(t)
+	caPEM, caCert := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(700),
+		// O then CN.
+		RawSubject: rawNameOf(t, rdnSequence(
+			printableAttr(oidOrganisation, "Reordered Name Ltd"),
+			printableAttr(oidCommonName, "Reordered Name CA"),
+		)),
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(48 * time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
+	}, &caKey.PublicKey, nil, caKey)
+
+	// Signed by the CA's key, but naming an issuer whose RDNs are in the other
+	// order: CN then O.
+	otherKey := newKey(t)
+	otherPEM, otherCert := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(701),
+		Subject:      pkix.Name{CommonName: "reordered-leaf.example.com"},
+		NotBefore:    now.Add(-2 * time.Hour), NotAfter: now.Add(24 * time.Hour),
+	}, &otherKey.PublicKey, reorderedSubjectView(t, caCert, rdnSequence(
+		printableAttr(oidCommonName, "Reordered Name CA"),
+		printableAttr(oidOrganisation, "Reordered Name Ltd"),
+	)), caKey)
+
+	if bytes.Equal(otherCert.RawIssuer, caCert.RawSubject) {
+		t.Fatal("setup: the co-bundled certificate's issuer name matches the CA's subject byte for byte, so this bundle does not reproduce a distinct DN")
+	}
+	if len(otherCert.AuthorityKeyId) > 0 {
+		t.Fatal("setup: the co-bundled certificate carries an authority key identifier, so a candidate edge would exist and the fallback would never be asked")
+	}
+	if err := otherCert.CheckSignatureFrom(caCert); err != nil {
+		t.Fatalf("setup: the CA's key did not sign the co-bundled certificate, so the fallback's signature gate would answer instead of its name comparison: %v", err)
+	}
+	// The trap being pinned: the pkix approximation of the two names collides even
+	// though the names differ. Without this the test would pass against the
+	// approximate comparison too and prove nothing.
+	if !bytes.Equal(rawNameOf(t, caCert.Subject.ToRDNSequence()), rawNameOf(t, otherCert.Issuer.ToRDNSequence())) {
+		t.Fatal("setup: the pkix.Name approximations of the two names differ, so this bundle no longer reproduces the false issuer match")
+	}
+
+	got, err := convert.Analyse(concatPEM(caPEM, otherPEM), keyPEMOf(t, caKey))
+	if err != nil {
+		t.Fatalf("Analyse(CA whose subject only approximately matches a co-bundled issuer name) = error %v, want the CA identity: it issued nothing in this bundle", err)
+	}
+	if got.Leaf().SerialNumber.Cmp(big.NewInt(700)) != 0 {
+		t.Errorf("selected identity serial = %s, want 700 (the CA, the only certificate the supplied key matches)", got.Leaf().SerialNumber)
+	}
+	if !hasObservation(got.Observations(), convert.ObsCAAsIdentity) {
+		t.Errorf("observations = %v, want the CA-as-identity observation", got.Observations())
+	}
+}

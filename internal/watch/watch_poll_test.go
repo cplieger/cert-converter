@@ -186,8 +186,15 @@ func TestPollLoopWithUpgrade_treats_shutdown_before_the_first_scan_as_a_clean_st
 // TestPollTick_treats_shutdown_during_the_watch_set_rebuild_as_a_stop pins the
 // ctx check inside pollTick's rebuild-failure branch: a shutdown mid-walk stops
 // the poll loop instead of logging a degraded upgrade failure and scanning again.
+//
+// The ctx must be LIVE when pollTick is entered, or its entry guard answers first
+// and this branch is never reached. The seam hands back a real watcher and cancels
+// on the way out, so the shutdown lands while the watch-set walk is running — the
+// same deterministic-race trick
+// TestPollLoopWithUpgrade_returns_when_a_shutdown_interrupts_a_poll_tick uses for
+// the constructor arm.
+// Not parallel: it swaps the package-level newFSWatcher seam.
 func TestPollTick_treats_shutdown_during_the_watch_set_rebuild_as_a_stop(t *testing.T) {
-	t.Parallel()
 	// Availability probe only: skips on hosts without inotify, so this test cannot
 	// pass through pollTick's NewWatcher-failure branch instead of the rebuild one.
 	newTestWatcher(t)
@@ -198,7 +205,14 @@ func TestPollTick_treats_shutdown_during_the_watch_set_rebuild_as_a_stop(t *test
 	scans := 0
 	w := New(root, func(context.Context) { scans++ }, WithFallback(time.Hour))
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
+	prev := newFSWatcher
+	t.Cleanup(func() { newFSWatcher = prev })
+	newFSWatcher = func() (*fsnotify.Watcher, error) {
+		fw, err := prev()
+		cancel() // the shutdown lands after the upgrade, while the walk is running
+		return fw, err
+	}
 
 	upgraded, stopped := w.pollTick(ctx)
 	if upgraded != nil {
@@ -319,12 +333,19 @@ func TestPollTick_stays_in_poll_mode_when_fsnotify_remains_unavailable(t *testin
 	}
 }
 
-// TestPollTick_treats_shutdown_during_fsnotify_retry_as_a_stop pins the
-// cancellation precedence of the same arm: a shutdown arriving during the retry
-// must stop the poll loop (stopped=true) without a scan that would still drive the
-// health marker on the way out.
+// TestPollTick_does_no_work_when_the_ctx_is_already_cancelled pins pollTick's entry
+// guard: a tick that fires in the same instant as a shutdown must attempt no
+// upgrade and run no scan (which would still drive the health marker), and must
+// report stopped=true so the poll loop returns. fsnotify is stubbed UNAVAILABLE so
+// the guard is what the assertions turn on: without it the retry arm would log its
+// degraded notice and scan, making both stopped and scans wrong.
+//
+// The mid-attempt arms are pinned separately — the rebuild branch by
+// TestPollTick_treats_shutdown_during_the_watch_set_rebuild_as_a_stop above, the
+// constructor branch by
+// TestPollLoopWithUpgrade_returns_when_a_shutdown_interrupts_a_poll_tick.
 // Not parallel: it swaps the package-level newFSWatcher seam.
-func TestPollTick_treats_shutdown_during_fsnotify_retry_as_a_stop(t *testing.T) {
+func TestPollTick_does_no_work_when_the_ctx_is_already_cancelled(t *testing.T) {
 	stubFSWatcherUnavailable(t)
 
 	scans := 0

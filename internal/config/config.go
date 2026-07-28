@@ -426,9 +426,10 @@ func warnBothPasswordChannels(source envx.SecretSource) {
 // indistinguishable from unset and resolution silently falls through to
 // PFX_PASSWORD: the file-wins rule the deployment relies on quietly inverts and
 // warnBothPasswordChannels cannot fire (it keys on source == SourceFile). A
-// whitespace-only pointer is opened instead and fails startup with envx's
-// "no such file or directory" for a filename made of spaces. The WARN is emitted
-// before resolution so it precedes both outcomes.
+// whitespace-only pointer is opened as a filename instead: it names the file
+// channel, so PFX_PASSWORD is never consulted, and startup normally fails with
+// envx's "no such file or directory" for a filename made of spaces. The WARN is
+// emitted before resolution so it precedes both outcomes.
 //
 // Deliberately a warning, not a refusal: an empty pointer resolving through
 // PFX_PASSWORD is envx's documented rule (SecretWithSource's non-empty gate, whose
@@ -445,8 +446,10 @@ func warnBlankPasswordFilePointer() {
 	outcome := "the PFX password is taken from PFX_PASSWORD instead"
 	if os.Getenv("PFX_PASSWORD_FILE") != "" {
 		// A whitespace-only pointer is non-empty to envx, so it IS the file
-		// channel: envx opens it and startup fails on the read.
-		outcome = "startup will fail trying to open a file whose name is whitespace"
+		// channel: envx treats the raw value as a filename rather than falling
+		// back. Whether opening it then fails is up to the filesystem, so the
+		// outcome states the channel choice, which is the part that is certain.
+		outcome = "the whitespace value is treated as a filename instead of falling back to PFX_PASSWORD"
 	}
 	slog.Warn("PFX_PASSWORD_FILE is set but blank, so it names no secret file; "+outcome,
 		"remediation", "unset PFX_PASSWORD_FILE to configure the secret through PFX_PASSWORD, "+

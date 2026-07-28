@@ -401,13 +401,18 @@ func TestLoad_warns_only_for_a_blank_PFX_PASSWORD_FILE_pointer(t *testing.T) {
 
 // TestLoad_blank_password_file_pointer_reports_whitespace_outcome pins the second
 // arm of that WARN's message, which the test above does not reach: a WHITESPACE-only
-// pointer is non-empty to envx, so it IS the selected channel and startup fails while
-// opening a filename made of spaces. Reporting the empty-pointer outcome here would
-// tell an operator the env password was used on a startup that never got that far.
+// pointer is non-empty to envx, so it IS the selected channel and PFX_PASSWORD is
+// never consulted. Reporting the empty-pointer outcome here would tell an operator
+// the env password was used when it was not. The message names that channel choice
+// rather than predicting the open: whether a file whose name is whitespace exists is
+// the filesystem's business, and only the channel selection is certain.
 // Serial: it swaps slog.Default().
 func TestLoad_blank_password_file_pointer_reports_whitespace_outcome(t *testing.T) {
 	t.Setenv("PFX_PASSWORD_FILE", " \t ")
 	t.Setenv("PFX_PASSWORD", "a-real-password")
+	// An empty working directory, so the "opening it fails" assertion below cannot
+	// depend on whether the package directory happens to hold a whitespace-named file.
+	t.Chdir(t.TempDir())
 
 	logs := capture.Default(t)
 
@@ -419,7 +424,7 @@ func TestLoad_blank_password_file_pointer_reports_whitespace_outcome(t *testing.
 	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
 		t.Errorf("Load() logged %d %q WARN records, want 1 (logs %v)", n, msg, logs.Messages())
 	}
-	const outcome = "startup will fail trying to open a file whose name is whitespace"
+	const outcome = "the whitespace value is treated as a filename instead of falling back to PFX_PASSWORD"
 	if !logs.Contains(outcome) {
 		t.Errorf("Load() WARN does not report %q (logs %v)", outcome, logs.Messages())
 	}

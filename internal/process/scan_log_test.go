@@ -314,31 +314,88 @@ func TestLogConversionObservations_is_silent_without_observations(t *testing.T) 
 // remediation hint, and is classified statusVanished rather than statusUnreadable.
 // Promoting either would put an operator-facing warning, pointing at /input
 // permissions, into the log (or into the alerted unreadable count) every time a
-// certificate is atomically replaced. Runs serially: it swaps slog.Default().
+// certificate is atomically replaced.
+//
+// ENOENT alone does not make it that race, which is the other half pinned here: a
+// symlink that is STILL THERE pointing at a missing target returns the same ENOENT
+// on every scan for as long as it exists, so it is the steady-state arm — Warn, the
+// remediation hint, and the alerted unreadable count — not the transient one. Reading
+// it as a race left such a certificate producing no PFX indefinitely with no
+// default-level signal anywhere. Runs serially: it swaps slog.Default().
 func TestNoteUnreadableInput_levels(t *testing.T) {
+	const logRel = "example.com/tls.crt"
 	for _, tc := range []struct {
 		err        error
 		name       string
 		what       string
+		inputRel   string
+		setup      func(t *testing.T, dir string)
 		wantMsg    string
 		wantLevel  slog.Level
 		wantStatus conversionStatus
 	}{
-		{fs.ErrNotExist, "a vanished certificate is a benign race", "certificate", "certificate vanished during the scan", slog.LevelDebug, statusVanished},
-		{fs.ErrNotExist, "a vanished key is a benign race", "private key", "private key vanished during the scan", slog.LevelDebug, statusVanished},
-		{errors.New("permission denied"), "an unreadable certificate warns", "certificate", "cannot read certificate", slog.LevelWarn, statusUnreadable},
-		{context.Canceled, "a cancelled read is the shutdown, not an unreadable path", "certificate", "certificate read interrupted by shutdown", slog.LevelDebug, statusUnreadable},
+		{
+			err: fs.ErrNotExist, name: "a vanished certificate is a benign race", what: "certificate",
+			inputRel: "tls.crt", wantMsg: "certificate vanished during the scan",
+			wantLevel: slog.LevelDebug, wantStatus: statusVanished,
+		},
+		{
+			err: fs.ErrNotExist, name: "a vanished key is a benign race", what: "private key",
+			inputRel: "tls.key", wantMsg: "private key vanished during the scan",
+			wantLevel: slog.LevelDebug, wantStatus: statusVanished,
+		},
+		{
+			err: fs.ErrNotExist, name: "a path replaced under the read is a benign race too", what: "certificate",
+			inputRel: "tls.crt",
+			setup: func(t *testing.T, dir string) {
+				if err := os.WriteFile(filepath.Join(dir, "tls.crt"), []byte("the replacement"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantMsg: "certificate vanished during the scan", wantLevel: slog.LevelDebug, wantStatus: statusVanished,
+		},
+		{
+			err: fs.ErrNotExist, name: "a surviving symlink to a missing target is steady-state, not a race", what: "certificate",
+			inputRel: "tls.crt",
+			setup: func(t *testing.T, dir string) {
+				if err := os.Symlink("never-existed.pem", filepath.Join(dir, "tls.crt")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantMsg: "cannot read certificate", wantLevel: slog.LevelWarn, wantStatus: statusUnreadable,
+		},
+		{
+			err: errors.New("permission denied"), name: "an unreadable certificate warns", what: "certificate",
+			inputRel: "tls.crt", wantMsg: "cannot read certificate",
+			wantLevel: slog.LevelWarn, wantStatus: statusUnreadable,
+		},
+		{
+			err: context.Canceled, name: "a cancelled read is the shutdown, not an unreadable path", what: "certificate",
+			inputRel: "tls.crt", wantMsg: "certificate read interrupted by shutdown",
+			wantLevel: slog.LevelDebug, wantStatus: statusUnreadable,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.setup != nil {
+				tc.setup(t, dir)
+			}
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatalf("setup: os.OpenRoot: %v", err)
+			}
+			t.Cleanup(func() { _ = root.Close() })
+			sw := &scanWalk{src: &source{root: root}}
 			logs := captureLogs(t)
-			if got := noteUnreadableInput("example.com/tls.crt", tc.what, tc.err); got != tc.wantStatus {
+
+			if got := sw.noteUnreadableInput(logRel, tc.inputRel, tc.what, tc.err); got != tc.wantStatus {
 				t.Errorf("noteUnreadableInput(%v) = %v, want %v: the diagnostic and the counted outcome must agree",
 					tc.err, got, tc.wantStatus)
 			}
 			if got := logs.CountLevel(tc.wantLevel, tc.wantMsg); got != 1 {
 				t.Fatalf("noteUnreadableInput(%v) logged %q, want %q at %s", tc.err, logs.Messages(), tc.wantMsg, tc.wantLevel)
 			}
-			if !logs.HasAttr(tc.wantMsg, "path", "example.com/tls.crt") {
+			if !logs.HasAttr(tc.wantMsg, "path", logRel) {
 				t.Errorf("noteUnreadableInput(%v) logged %q, want the cert's relative path", tc.err, logs.Messages())
 			}
 			// The remediation hint belongs to the actionable arm only: on the benign
@@ -373,6 +430,7 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key(t *
 		{nil, "a fully converted tree stays quiet", ScanResult{Total: 2, Converted: 2}, false},
 		{nil, "an unreadable sub-path stays quiet", ScanResult{Total: 3, Converted: 1, Orphan: 1, Unreadable: 1}, false},
 		{nil, "an unresolved symlink stays quiet", ScanResult{Total: 2, Converted: 1, Orphan: 1, Unresolved: 1}, false},
+		{nil, "a cert that vanished mid-scan stays quiet", ScanResult{Total: 3, Converted: 1, Orphan: 1, Vanished: 1}, false},
 		{errors.New("permission denied"), "an aborted scan stays quiet", ScanResult{Total: 2, Converted: 1, Orphan: 1}, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -411,5 +469,21 @@ func TestLogScanOutcome_names_the_unresolved_symlink_count(t *testing.T) {
 	if !logs.HasAttr("scan complete", "unresolved", "2") {
 		got, _ := logs.AttrValue("scan complete", "unresolved")
 		t.Errorf("logScanOutcome(unresolved=2) logged unresolved=%q, want the unresolved-symlink count in the summary", got)
+	}
+}
+
+// TestLogScanOutcome_names_the_vanished_count pins the summary's vanished
+// attribute. A cert replaced between readdir and the bounded read is counted in its
+// own ScanResult field, deliberately never folded into Unreadable, so this attribute
+// is the only aggregate trace that a scan ran while /input was being rewritten.
+// Runs serially: it swaps slog.Default().
+func TestLogScanOutcome_names_the_vanished_count(t *testing.T) {
+	logs := captureLogs(t)
+
+	logScanOutcome(t.Context(), ScanResult{Total: 1, Vanished: 1}, nil)
+
+	if !logs.HasAttr("scan complete", "vanished", "1") {
+		got, _ := logs.AttrValue("scan complete", "vanished")
+		t.Errorf("logScanOutcome(vanished=1) logged vanished=%q, want the renewal-race count in the summary", got)
 	}
 }

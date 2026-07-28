@@ -256,11 +256,12 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 	sw.results = append(sw.results, sw.convertEntry(ctx, rel))
 	// A cancellation that landed *during* the conversion above already turned that
 	// entry into a shutdown artifact, but not always the same one: an interrupted
-	// /input read is statusUnreadable (readPair routes every failed read there, so it
-	// is health-neutral), while an interrupted prior-bundle read or atomic write is
-	// statusFailed. Re-check here so the walk aborts and Run reports the cancellation,
-	// instead of returning a "completed" scan whose unreadable or failed count is
-	// really that artifact.
+	// /input read is statusUnreadable (noteUnreadableInput routes a cancelled read
+	// there, health-neutral, and reserves statusVanished for an ENOENT race), while an
+	// interrupted prior-bundle read or atomic write is statusFailed. Re-check here so
+	// the walk aborts and Run reports the cancellation, instead of returning a
+	// "completed" scan whose unreadable, vanished or failed count is really that
+	// artifact.
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -569,11 +570,11 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 
 	certPEM, err := sw.src.readBounded(ctx, rel)
 	if err != nil {
-		return pairInputs{}, noteUnreadableInput(rel, "certificate", err)
+		return pairInputs{}, sw.noteUnreadableInput(rel, rel, "certificate", err)
 	}
 	keyPEM, err := sw.src.readBounded(ctx, keyRel)
 	if err != nil {
-		return pairInputs{}, noteUnreadableInput(rel, "private key", err)
+		return pairInputs{}, sw.noteUnreadableInput(rel, keyRel, "private key", err)
 	}
 	return pairInputs{certPEM: certPEM, keyPEM: keyPEM}, statusUnset
 }
@@ -585,6 +586,10 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 // otherwise -- the last matching readPair's sibling-key stat. Both outcomes are
 // health-neutral.
 //
+// logRel is the .crt path every per-entry log line names (so the cert-side and the
+// key-side line of one pair are attributable to the same entry); inputRel is the path
+// the failed read actually used, which is what the ENOENT arm re-examines.
+//
 // Every OPERATOR-ACTIONABLE reason a read fails here is a steady-state condition a
 // restart cannot clear. A confinement refusal in particular cannot be identified by
 // sentinel — os.Root reports "path escapes from parent", which matches none of
@@ -594,28 +599,34 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 // agree, which was the actual defect: the sibling key's stat failure was already
 // health-neutral while the cert's read failure flipped the container unhealthy.
 //
-// ENOENT is a benign race — the entry existed at readdir and was gone by the read (a
-// renewal replacing a file, an atomic-write temp) — so it stays at Debug AND out of
-// the Unreadable count: folding it in raised the documented unreadable-path alert,
-// with its permissions remediation, on the ordinary renewal this daemon exists to
-// process. It becomes statusVanished instead, which the next scan clears.
+// ENOENT alone is not enough to call the entry a benign race. It IS one when the path
+// itself is gone — the entry existed at readdir and was gone by the read (a renewal
+// replacing a file, an atomic-write temp) — so that stays at Debug AND out of the
+// Unreadable count: folding it in raised the documented unreadable-path alert, with its
+// permissions remediation, on the ordinary renewal this daemon exists to process. It
+// becomes statusVanished instead, which the next scan clears. But the SAME ENOENT comes
+// back on every scan from a symlink that is still there and points at a target that is
+// not (the certbot live/ -> archive/ layout with only live/ mounted, or a link left
+// behind by a removed cert): that is a steady-state operator-actionable condition, and
+// reporting it as a transient race would leave a certificate producing no PFX forever
+// with no default-level signal anywhere. sw.src.pathVanished separates the two.
 //
 // The pair is still not converted either way, so both outcomes block orphan reaping:
 // an input tree the scan could not fully read cannot prove an output is orphaned.
-func noteUnreadableInput(rel, what string, err error) conversionStatus {
+func (sw *scanWalk) noteUnreadableInput(logRel, inputRel, what string, err error) conversionStatus {
 	if IsShutdown(err) {
 		// A cancelled read is the shutdown itself, not an unreadable path: the WARN
 		// below is the message the README recommends alerting on, so emitting it for
 		// a normal SIGTERM would page an operator for a mount that is fine.
-		slog.Debug("skipping cert: "+what+" read interrupted by shutdown", "path", rel, "error", err)
+		slog.Debug("skipping cert: "+what+" read interrupted by shutdown", "path", logRel, "error", err)
 		return statusUnreadable
 	}
-	if errors.Is(err, fs.ErrNotExist) {
-		slog.Debug("skipping cert: "+what+" vanished during the scan", "path", rel, "error", err)
+	if errors.Is(err, fs.ErrNotExist) && sw.src.pathVanished(inputRel) {
+		slog.Debug("skipping cert: "+what+" vanished during the scan", "path", logRel, "error", err)
 		return statusVanished
 	}
 	slog.Warn("skipping cert: cannot read "+what,
-		"path", rel, "error", err,
+		"path", logRel, "error", err,
 		"remediation", inputPermRemediation)
 	return statusUnreadable
 }

@@ -5,6 +5,8 @@ import (
 	"crypto"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"fmt"
 	"reflect"
 	"slices"
@@ -59,8 +61,10 @@ const (
 	// ObsUnrelatedBlocksSkipped reports PEM blocks in the CERTIFICATE file that are
 	// neither a certificate nor a private key — an OpenSSL "TRUSTED CERTIFICATE",
 	// the legacy "X509 CERTIFICATE" alias, a stray CERTIFICATE REQUEST — and were
-	// therefore not part of the bundle. A private-key block is deliberately not
-	// reported: a combined cert+key file is a supported input.
+	// therefore not part of the bundle. Two labels are deliberately not reported: a
+	// private-key block (a combined cert+key file is a supported input) and EC
+	// PARAMETERS (an expected companion of an EC key); isExpectedCertFilePassenger
+	// owns that set.
 	ObsUnrelatedBlocksSkipped ObservationKind = "unrelated-blocks-skipped"
 	// ObsUnusableKeyBlocksSkipped reports PEM blocks in the KEY file that yielded no
 	// usable key — unparseable DER, armour encoding/pem could not decode, ciphertext,
@@ -341,6 +345,12 @@ type certGraph struct {
 	// verified-distance walk, chain assembly at the few candidates of one hop, and
 	// the role check on the selected identity's candidate children — and the memo
 	// means an edge is verified at most once for all of them.
+	//
+	// One asker reaches OUTSIDE the candidate set: isIssuerByName, the role check's
+	// fallback, verifies a pair whose names are semantically equal but whose
+	// encodings differ, which is exactly the edge the candidate graph deliberately
+	// does not record. It is bounded the same way — one pass over the certificates
+	// of the one bundle, only for the selected identity.
 	verified map[[2]int]bool
 	// selfSigned memoises the self-signature check per certificate, for the same
 	// reason verified memoises edges: it is a real signature verification whose cost
@@ -621,16 +631,17 @@ func (g *certGraph) verifies(child, parent int) bool {
 // attacker or a careless paste could arrange.
 //
 // The candidate graph is not sufficient evidence on its own here, which is why the
-// second loop exists. plausibleIssuer recognises an issuer name by raw DER equality
-// (or an AKI/SKI match), so a permitted encoding difference between a leaf's issuer
-// name and its CA's subject name — same name, UTF8String against the canonical
-// encoding, no key identifiers — records NO candidate edge. That is deliberate for
-// the additive chain fallback, which must not treat an unestablished edge as chain
-// material, but for ROLE it hid a cryptographically verified issuance: the CA read
-// as a non-issuer, competed with its own leaf for identity, and won on NotBefore,
-// producing a PFX whose identity was the CA. So role selection falls back to
-// SEMANTIC name equality (RDNSequence, which compares parsed name values rather
-// than their encoding) and still requires the same signature verification.
+// isIssuerByName fallback below exists. plausibleIssuer recognises an issuer name
+// by raw DER equality (or an AKI/SKI match), so a permitted encoding difference
+// between a leaf's issuer name and its CA's subject name — same name, UTF8String
+// against the canonical encoding, no key identifiers — records NO candidate edge.
+// That is deliberate for the additive chain fallback, which must not treat an
+// unestablished edge as chain material, but for ROLE it hid a cryptographically
+// verified issuance: the CA read as a non-issuer, competed with its own leaf for
+// identity, and won on NotBefore, producing a PFX whose identity was the CA. So role
+// selection falls back to SEMANTIC name equality (the ASN.1-decoded name, which
+// compares parsed attribute values rather than their string encoding) and still
+// requires the same signature verification.
 //
 // The fallback keeps plausibleIssuer's key-reuse exclusion: a distinct self-signed
 // certificate sharing both a subject and a public key with certs[i] is a
@@ -652,18 +663,46 @@ func (g *certGraph) isIssuer(i int) bool {
 //
 // Split out of isIssuer so each half stays readable on its own: the first half asks
 // the candidate graph, this one re-asks the question the graph's byte comparison
-// cannot. RDNSequence equality compares the parsed name values, so a leaf naming
-// its issuer as a UTF8String matches a CA whose subject uses the canonical
-// encoding. The signature check is still the only thing that admits an edge; the
-// name equality only decides which pairs are worth checking.
+// cannot — so it is the one place a signature is checked for a pair the candidate
+// graph never recorded an edge for.
+//
+// "Semantically equal" is the ASN.1-decoded name, NOT pkix.Name: crypto/x509
+// documents pkix.Name as an approximation of a distinguished name and says accurate
+// name work must unmarshal RawSubject/RawIssuer. Round-tripping through
+// pkix.Name.ToRDNSequence rebuilds the known attributes in a FIXED order, flattens
+// multi-entry RDNs and drops non-standard attribute types, so `O=Acme, CN=x` and
+// `CN=x, O=Acme` — two different DNs under RFC 5280 — compared equal. Combined with
+// a shared signing key that made an unrelated CA look like the child's issuer, and
+// dropped it from identity selection. Decoding the raw names instead keeps RDN
+// order, multi-valued grouping and unknown OIDs, while still normalising the
+// permitted DirectoryString tag difference (a leaf naming its issuer as a
+// UTF8String matches a CA whose subject uses the canonical encoding) because both
+// decode to the same Go string.
+//
+// The signature check is still the only thing that admits an edge; the name
+// equality only decides which pairs are worth checking.
 func (g *certGraph) isIssuerByName(i int) bool {
 	parent := g.certs[i]
-	parentSubject := parent.Subject.ToRDNSequence()
+	parentSubject, parentOK := decodedName(parent.RawSubject)
+	if !parentOK {
+		return false
+	}
 	for child, cert := range g.certs {
-		if child == i || !reflect.DeepEqual(cert.Issuer.ToRDNSequence(), parentSubject) {
+		if child == i {
 			continue
 		}
-		if reflect.DeepEqual(cert.Subject.ToRDNSequence(), parentSubject) &&
+		childIssuer, issuerOK := decodedName(cert.RawIssuer)
+		if !issuerOK || !reflect.DeepEqual(childIssuer, parentSubject) {
+			continue
+		}
+		// The key-reuse exclusion, same as plausibleIssuer's: a name the decoder
+		// cannot read is not admitted either, because the exclusion cannot be
+		// applied to it.
+		childSubject, subjectOK := decodedName(cert.RawSubject)
+		if !subjectOK {
+			continue
+		}
+		if reflect.DeepEqual(childSubject, parentSubject) &&
 			samePublicKey(cert.PublicKey, parent.PublicKey) {
 			continue
 		}
@@ -672,6 +711,18 @@ func (g *certGraph) isIssuerByName(i int) bool {
 		}
 	}
 	return false
+}
+
+// decodedName ASN.1-decodes a raw DER distinguished name. The false result means
+// the name could not be read as an RDNSequence (or carried trailing bytes), which
+// no caller may treat as a match: an undecodable name is compared against nothing.
+func decodedName(raw []byte) (pkix.RDNSequence, bool) {
+	var seq pkix.RDNSequence
+	rest, err := asn1.Unmarshal(raw, &seq)
+	if err != nil || len(rest) != 0 {
+		return nil, false
+	}
+	return seq, true
 }
 
 // isSelfSigned reports whether certs[i] is its own issuer, which is what makes it

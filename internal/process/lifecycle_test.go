@@ -206,6 +206,41 @@ func TestStoreReconcile_unsafe_output_walk_never_advises_deletion(t *testing.T) 
 	}
 }
 
+// TestStoreReconcile_vanished_input_is_reported_at_debug_not_as_a_mount_warning pins
+// the diagnostic split for a scan whose only incomplete-enumeration cause is a cert
+// replaced between readdir and the read. Reaping stays blocked either way, but the
+// operator-facing WARN points at the /input mount and its unreadable-path warnings,
+// which is the wrong diagnosis — and a false page — for the ordinary renewal this
+// daemon exists to process. Serial: captureLogs swaps the process-global
+// slog.Default.
+func TestStoreReconcile_vanished_input_is_reported_at_debug_not_as_a_mount_warning(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	logs := captureLogs(t)
+	s := &store{root: root}
+
+	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync,
+		map[string]struct{}{}, reapContext{scanTotal: 1, vanished: 1, walkCompleted: true})
+	if reconcileErr != nil {
+		t.Fatalf("reconcile(vanished input) = error %v, want nil", reconcileErr)
+	}
+	if deleted != 0 {
+		t.Errorf("reconcile(vanished input) deleted = %d, want 0: an incomplete enumeration cannot prove any output orphaned", deleted)
+	}
+	const warn = "orphan removal is disabled for this scan: the scan did not fully enumerate the input tree, so no output can be proven orphaned"
+	if logs.Contains(warn) {
+		t.Errorf("reconcile(vanished input) logged the /input-mount WARN, want the transient renewal race reported at Debug: %q", logs.Messages())
+	}
+	const dbg = "skipping orphan reconciliation; input files were replaced during the scan"
+	if logs.CountLevel(slog.LevelDebug, dbg) != 1 {
+		t.Errorf("reconcile(vanished input) logged %q, want the transient notice at Debug", logs.Messages())
+	}
+}
+
 // TestSampleOrphanPaths_bounds_the_logged_sample pins the bound on the orphan report's
 // paths attribute. reconcile emits that line on every scan for as long as an orphan
 // exists, so an unbounded sample is a permanent multi-kilobyte log record per scan,
