@@ -65,7 +65,7 @@ func TestScanWalkVisit_classifies_walk_errors(t *testing.T) {
 	})
 }
 
-// TestOutputIsCurrent_degrades_when_the_output_cannot_be_inspected pins a DELIBERATE
+// TestStoreIsCurrent_degrades_when_the_output_cannot_be_inspected pins a DELIBERATE
 // reversal. This test previously required an ERROR when the confined root refused to stat
 // a prior output, on the reasoning that a refusal is evidence the output tree cannot be
 // inspected and should therefore be reported rather than papered over.
@@ -81,7 +81,7 @@ func TestScanWalkVisit_classifies_walk_errors(t *testing.T) {
 // same confined root, so a genuinely broken tree fails at the write, which DOES flip
 // health. The honest signal moves from the read to the write rather than disappearing.
 // Runs serially: it swaps slog.Default().
-func TestOutputIsCurrent_degrades_when_the_output_cannot_be_inspected(t *testing.T) {
+func TestStoreIsCurrent_degrades_when_the_output_cannot_be_inspected(t *testing.T) {
 	base := t.TempDir()
 	outDir := filepath.Join(base, "out")
 	outside := filepath.Join(base, "outside")

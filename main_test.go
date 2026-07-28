@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/cert-converter/internal/watch"
@@ -29,6 +30,9 @@ func newTestScanner(certsRoot, outRoot, password string, enc convert.EncoderType
 		OutRoot:   outRoot,
 		Password:  password,
 		Encoder:   enc,
+		// main always passes the parsed cfg.Lifecycle, which ParseLifecycle
+		// guarantees is one of the three modes; the zero value is not.
+		Lifecycle: outputpolicy.LifecycleWarn,
 	})
 }
 
@@ -186,6 +190,40 @@ func TestScanAndSetHealth_clears_marker_after_conversion_failure(t *testing.T) {
 
 	if _, err := os.Stat(markerPath); err == nil {
 		t.Error("health marker should be cleared when a certificate conversion fails")
+	}
+}
+
+// TestScanAndSetHealth_clean_scan_emits_no_unreadable_warning pins the NEGATIVE
+// half of the unreadable WARN, which its positive twin above cannot: a scan
+// with nothing unreadable must not emit that message at all. README's Alerting
+// section tells operators running at LOG_LEVEL=warn to alert on the line "some
+// /input paths were unreadable and were skipped" to keep the coverage the
+// healthcheck deliberately omits, so a guard that stops discriminating turns
+// every clean cycle into that alert. Widening result.Unreadable > 0 to >= 0
+// leaves the whole rest of this package green.
+// Serial (no t.Parallel): it swaps the process-global slog default.
+func TestScanAndSetHealth_clean_scan_emits_no_unreadable_warning(t *testing.T) {
+	marker, markerPath := newTestMarker(t)
+
+	inDir, outDir := t.TempDir(), t.TempDir()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "clean", "ecdsa")
+	writeCertAndKey(t, inDir, "clean", certPEM, keyPEM)
+	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
+
+	logs := capture.Default(t)
+
+	scanAndSetHealth(t.Context(), scanner, marker)
+
+	const unreadableMsg = "some /input paths were unreadable and were skipped; health is unaffected"
+	if n := logs.Count(unreadableMsg); n != 0 {
+		t.Errorf("a scan with nothing unreadable logged %d records mentioning %q, want 0: operators alert on that message, so it must stay specific to Unreadable > 0; got logs %q",
+			n, unreadableMsg, logs.Messages())
+	}
+	if n := logs.CountLevel(slog.LevelWarn, ""); n != 0 {
+		t.Errorf("a clean scan logged %d WARN records %q, want none: a healthy cycle must be quiet at warn level", n, logs.Messages())
+	}
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("a clean scan must still set the health marker: %v", err)
 	}
 }
 
@@ -370,8 +408,8 @@ func captureStderr(t *testing.T, fn func()) string {
 	}
 	prev := os.Stderr
 	os.Stderr = f
+	defer func() { os.Stderr = prev }()
 	fn()
-	os.Stderr = prev
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}

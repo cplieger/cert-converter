@@ -5,21 +5,20 @@ import (
 	"crypto/x509"
 )
 
-// Test-only handles on the package-internal PEM parsers. Analyse is the
-// package's only production conversion edge (it owns the cert/key match and the
-// leaf/chain split), so parseCertChain and parsePrivateKeys
-// stay unexported: no production package outside internal/convert may bypass
-// those invariants. Their direct unit, property and fuzz coverage still matters,
-// and the standard-library export_test.go idiom keeps that coverage available to
-// the external convert_test package without widening the app's API — test
-// placement no longer dictates the package surface.
-var (
-	EncoderFor = encoderFor
-)
+// EncoderFor is the package-internal encoder lookup, exported to the external
+// tests so they can assert which pkcs12.Encoder a name selects without the
+// vendor type leaving this package in production.
+var EncoderFor = encoderFor
 
 // ParseCertChain drops the skipped-unrelated-block evidence the parser returns
 // for Analyse's observation, so the parser's own tests keep asserting on the
 // certificates and the error alone.
+//
+// parseCertChain and parsePrivateKeys themselves stay unexported: Analyse is the
+// package's only production conversion edge (it owns the cert/key match and the
+// leaf/chain split), so no production package outside internal/convert may bypass
+// those invariants. This wrapper keeps their unit, property and fuzz coverage
+// available to the external convert_test package without widening the app's API.
 func ParseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
 	certs, _, err := parseCertChain(pemBytes)
 	return certs, err

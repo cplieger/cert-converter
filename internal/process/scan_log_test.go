@@ -35,7 +35,7 @@ func TestLogScanOutcome_levels(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), result, 0, tt.walkErr)
+			logScanOutcome(t.Context(), result, tt.walkErr)
 
 			// CountExact, not a substring: these messages are pinned by the README's
 			// Loki rules, so a superstring must not satisfy them.
@@ -92,8 +92,8 @@ func TestLogEntryFailure_levels(t *testing.T) {
 }
 
 // TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one pins the
-// diagnosability split in readPair. Both outcomes are the same health-neutral
-// health-neutral, so neither flips the container unhealthy -- but they are DIFFERENT
+// diagnosability split in readPair. Both outcomes are health-neutral, so neither
+// flips the container unhealthy -- but they are DIFFERENT
 // conditions and must not be reported as the same one.
 //
 // A cert with no sibling key at all is a genuine orphan: the normal, quiet steady
@@ -143,10 +143,10 @@ func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing
 		// A fresh recorder per case, replacing the buffer reset the text handler needed.
 		logs := captureLogs(t)
 
-		_, outcome, ok := sw.readPair(t.Context(), tt.certRel, tt.keyRel)
+		_, outcome := sw.readPair(t.Context(), tt.certRel, tt.keyRel)
 
-		if ok {
-			t.Errorf("readPair(%q) ok = true, want false (an unusable sibling key is never a readable pair)", tt.certRel)
+		if outcome == statusUnset {
+			t.Errorf("readPair(%q) outcome = statusUnset, want a failure outcome (an unusable sibling key is never a readable pair)", tt.certRel)
 		}
 		if outcome != tt.wantOutcome {
 			t.Errorf("readPair(%q) outcome = %d, want %d", tt.certRel, outcome, tt.wantOutcome)
@@ -174,28 +174,27 @@ func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing
 func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing.T) {
 	const wantMsg = "no certificate pairs found under the input root"
 	tests := []struct {
-		walkErr    error
-		name       string
-		result     ScanResult
-		unresolved int
-		wantWarn   bool
+		walkErr  error
+		name     string
+		result   ScanResult
+		wantWarn bool
 	}{
-		{nil, "an empty input tree is named", ScanResult{}, 0, true},
-		{nil, "a scan that converted a pair stays quiet", ScanResult{Total: 1, Converted: 1}, 0, false},
-		{nil, "an unreadable sub-path already explains the empty result", ScanResult{Unreadable: 1}, 0, false},
+		{nil, "an empty input tree is named", ScanResult{}, true},
+		{nil, "a scan that converted a pair stays quiet", ScanResult{Total: 1, Converted: 1}, false},
+		{nil, "an unreadable sub-path already explains the empty result", ScanResult{Unreadable: 1}, false},
 		// An unresolved input symlink hides part of the tree, so "no certificate
 		// pairs" is not a claim this scan can make. The symlink WARN one flow
 		// earlier already carries the correct diagnosis; repeating it here fires
 		// the README's CertConverterNoCertificatePairs alert with the wrong one.
-		{nil, "an unresolved symlink already explains the empty result", ScanResult{}, 1, false},
-		{errors.New("permission denied"), "an aborted scan stays quiet", ScanResult{}, 0, false},
+		{nil, "an unresolved symlink already explains the empty result", ScanResult{Unresolved: 1}, false},
+		{errors.New("permission denied"), "an aborted scan stays quiet", ScanResult{}, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), tt.result, tt.unresolved, tt.walkErr)
+			logScanOutcome(t.Context(), tt.result, tt.walkErr)
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; empty-input notice present = %v, want %v",
@@ -238,7 +237,7 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_all_lack_a_key(t *testin
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), tt.result, 0, tt.walkErr)
+			logScanOutcome(t.Context(), tt.result, tt.walkErr)
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; all-orphan notice present = %v, want %v",
@@ -357,28 +356,27 @@ func TestNoteUnreadableInput_levels(t *testing.T) {
 func TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key(t *testing.T) {
 	const wantMsg = "some certificates under the input root are missing their sibling .key"
 	for _, tt := range []struct {
-		walkErr    error
-		name       string
-		result     ScanResult
-		unresolved int
-		wantWarn   bool
+		walkErr  error
+		name     string
+		result   ScanResult
+		wantWarn bool
 	}{
-		{nil, "a partially orphaned tree is named", ScanResult{Total: 2, Converted: 1, Orphan: 1}, 0, true},
-		{nil, "an all-orphan tree stays quiet (the earlier arm owns it)", ScanResult{Total: 2, Orphan: 2}, 0, false},
-		{nil, "an empty tree stays quiet (the Total==0 notice owns it)", ScanResult{}, 0, false},
-		{nil, "a fully converted tree stays quiet", ScanResult{Total: 2, Converted: 2}, 0, false},
-		{nil, "an unreadable sub-path stays quiet", ScanResult{Total: 3, Converted: 1, Orphan: 1, Unreadable: 1}, 0, false},
-		{nil, "an unresolved symlink stays quiet", ScanResult{Total: 2, Converted: 1, Orphan: 1}, 1, false},
-		{errors.New("permission denied"), "an aborted scan stays quiet", ScanResult{Total: 2, Converted: 1, Orphan: 1}, 0, false},
+		{nil, "a partially orphaned tree is named", ScanResult{Total: 2, Converted: 1, Orphan: 1}, true},
+		{nil, "an all-orphan tree stays quiet (the earlier arm owns it)", ScanResult{Total: 2, Orphan: 2}, false},
+		{nil, "an empty tree stays quiet (the Total==0 notice owns it)", ScanResult{}, false},
+		{nil, "a fully converted tree stays quiet", ScanResult{Total: 2, Converted: 2}, false},
+		{nil, "an unreadable sub-path stays quiet", ScanResult{Total: 3, Converted: 1, Orphan: 1, Unreadable: 1}, false},
+		{nil, "an unresolved symlink stays quiet", ScanResult{Total: 2, Converted: 1, Orphan: 1, Unresolved: 1}, false},
+		{errors.New("permission denied"), "an aborted scan stays quiet", ScanResult{Total: 2, Converted: 1, Orphan: 1}, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), tt.result, tt.unresolved, tt.walkErr)
+			logScanOutcome(t.Context(), tt.result, tt.walkErr)
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
-				t.Errorf("logScanOutcome(%+v, unresolved=%d, %v) logged %q; partial-orphan notice present = %v, want %v",
-					tt.result, tt.unresolved, tt.walkErr, logs.Messages(), got, tt.wantWarn)
+				t.Errorf("logScanOutcome(%+v, %v) logged %q; partial-orphan notice present = %v, want %v",
+					tt.result, tt.walkErr, logs.Messages(), got, tt.wantWarn)
 			}
 			if !tt.wantWarn {
 				return
@@ -395,14 +393,14 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key(t *
 
 // TestLogScanOutcome_names_the_unresolved_symlink_count pins the summary's
 // unresolved attribute. It is the ONLY aggregate trace of an input symlink the
-// confined root could not resolve: that count is deliberately not a ScanResult
-// field, so without it the summary reports an all-zero, apparently healthy scan
-// while an unresolvable link hid an entire certificate subtree. Runs serially: it
-// swaps slog.Default().
+// confined root could not resolve: the count is carried as its own ScanResult
+// field, never folded into Unreadable, so without naming it here the summary
+// reports an all-zero, apparently healthy scan while an unresolvable link hid an
+// entire certificate subtree. Runs serially: it swaps slog.Default().
 func TestLogScanOutcome_names_the_unresolved_symlink_count(t *testing.T) {
 	logs := captureLogs(t)
 
-	logScanOutcome(t.Context(), ScanResult{Total: 1, Converted: 1}, 2, nil)
+	logScanOutcome(t.Context(), ScanResult{Total: 1, Converted: 1, Unresolved: 2}, nil)
 
 	if !logs.HasAttr("scan complete", "unresolved", "2") {
 		got, _ := logs.AttrValue("scan complete", "unresolved")

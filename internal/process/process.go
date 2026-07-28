@@ -27,6 +27,12 @@ type ScanResult struct {
 	Orphan     int
 	Failed     int
 	Unreadable int
+	// Unresolved counts input symlinks the confined root could not resolve.
+	// Deliberately a SEPARATE field, never folded into Unreadable: the
+	// README's Loki rules match on the `unreadable=` log attribute, and
+	// conflating the two would change that operator-visible signal. Kept on
+	// ScanResult so both coverage dimensions have one accumulator.
+	Unresolved int
 }
 
 // Options carries the process-lifetime scan configuration the composition root
@@ -114,16 +120,20 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		return sw.visit(ctx, rel, d, err)
 	})
 
-	result := countResults(sw.results, sw.unreadable)
+	result := countResults(sw.results, sw.unreadable, sw.unresolved)
 	rc := reapContext{
 		scanTotal: result.Total,
 		failed:    result.Failed,
 		// result.Unreadable, not sw.unreadable: it also carries the per-entry
-		// statusUnreadable count. A cert the scan could not read is absent from `seen`,
-		// so its existing .pfx would read as an orphan and be deleted on the very scan
-		// that failed to read its input.
+		// statusUnreadable count. That term is about the TREE, not about the unreadable
+		// pair's own bundle — visit records every .crt in `seen` before dispatching it,
+		// so a cert whose read failed still matches its .pfx and is never an orphan
+		// candidate. What it vetoes is the claim behind every reap: a scan that could
+		// not READ part of /input has not enumerated the tree completely in the
+		// README's sense ("no unreadable path"), so no output under it can be proven
+		// orphaned.
 		unreadable:    result.Unreadable,
-		unresolved:    sw.unresolved,
+		unresolved:    result.Unresolved,
 		walkCompleted: walkErr == nil,
 		shutdown:      walkErr != nil && IsShutdown(walkErr),
 	}
@@ -146,7 +156,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		walkErr = reconcileErr
 	}
 
-	logScanOutcome(ctx, result, sw.unresolved, walkErr)
+	logScanOutcome(ctx, result, walkErr)
 	return result, walkErr
 }
 
@@ -168,10 +178,10 @@ type scanWalk struct {
 	unreadable   int
 	// unresolved counts input symlinks the confined root could not resolve. Each
 	// one may hide certificates, so `seen` is NOT a complete enumeration of the
-	// input tree afterwards. It is deliberately separate from `unreadable`, which
-	// is a documented ScanResult field feeding the README's alert attributes:
-	// conflating them would change an operator-visible signal to fix an internal
-	// precondition.
+	// input tree afterwards. countResults folds it into ScanResult.Unresolved, a
+	// field deliberately separate from `Unreadable`, which feeds the README's alert
+	// attributes: conflating them would change an operator-visible signal to fix an
+	// internal precondition.
 	unresolved int
 }
 
@@ -232,11 +242,13 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 	}
 	sw.seen[rel] = struct{}{}
 	sw.results = append(sw.results, sw.convertEntry(ctx, rel))
-	// A cancellation that landed *during* the conversion above already turned
-	// that entry into statusFailed (the bounded read and the atomic write both
-	// return ctx.Err()). Re-check here so the walk aborts and Run reports the
-	// cancellation, instead of returning a "completed" scan whose failed count
-	// is really a shutdown artifact.
+	// A cancellation that landed *during* the conversion above already turned that
+	// entry into a shutdown artifact, but not always the same one: an interrupted
+	// /input read is statusUnreadable (readPair routes every failed read there, so it
+	// is health-neutral), while an interrupted prior-bundle read or atomic write is
+	// statusFailed. Re-check here so the walk aborts and Run reports the cancellation,
+	// instead of returning a "completed" scan whose unreadable or failed count is
+	// really that artifact.
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -287,10 +299,10 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 // a walk aborted by shutdown (context cancellation or deadline) logs at Debug;
 // any other abort logs at Warn so an operator sees the partial scan and its
 // error. The count attributes are identical in all three cases (the README's Loki
-// alert matches on them), so they are built once. unresolved is carried as a
-// parameter rather than read off ScanResult, because it is deliberately not one of
-// the documented ScanResult fields.
-func logScanOutcome(ctx context.Context, result ScanResult, unresolved int, walkErr error) {
+// alert matches on them), so they are built once. Unresolved is a separate
+// ScanResult field, never folded into the documented Unreadable field, because the
+// README's alert attributes key on `unreadable=`.
+func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
 	level, msg := slog.LevelInfo, "scan complete"
 	if walkErr != nil {
 		level, msg = slog.LevelWarn, "scan aborted before completion"
@@ -308,15 +320,16 @@ func logScanOutcome(ctx context.Context, result ScanResult, unresolved int, walk
 		"unchanged", result.Unchanged,
 		"orphan", result.Orphan,
 		"unreadable", result.Unreadable,
-		// unresolved is deliberately NOT a ScanResult field (folding it into the
-		// documented Unreadable field would change an operator-visible alert
-		// attribute), so without naming it here the summary reports a clean, empty
-		// scan while an unresolvable input symlink hid an entire certificate subtree.
-		"unresolved", unresolved,
+		// unresolved is deliberately a SEPARATE ScanResult field, never folded into
+		// the documented Unreadable field (that would change an operator-visible
+		// alert attribute), so without naming it here the summary reports a clean,
+		// empty scan while an unresolvable input symlink hid an entire certificate
+		// subtree.
+		"unresolved", result.Unresolved,
 		"removed", result.Removed,
 		"failed", result.Failed)
 	slog.Log(ctx, level, msg, attrs...)
-	logInputCoverageWarnings(result, unresolved, walkErr)
+	logInputCoverageWarnings(result, walkErr)
 }
 
 // logInputCoverageWarnings names the health-neutral outcomes that produce no PFX --
@@ -330,8 +343,8 @@ func logScanOutcome(ctx context.Context, result ScanResult, unresolved int, walk
 // deliberately continues past an unreadable sub-path, so a partial enumeration
 // cannot know what lies beneath it, and the unreadable-path WARN already carries
 // the actionable diagnosis for that shape.
-func logInputCoverageWarnings(result ScanResult, unresolved int, walkErr error) {
-	if walkErr != nil || result.Unreadable > 0 || unresolved > 0 {
+func logInputCoverageWarnings(result ScanResult, walkErr error) {
+	if walkErr != nil || result.Unreadable > 0 || result.Unresolved > 0 {
 		return
 	}
 	switch {
@@ -510,16 +523,17 @@ const inputPermRemediation = "check /input permissions and that the path is a re
 // orphan does not) and then performs both bounded reads through the input
 // source, so every /input byte is read once from within the confined root.
 //
-// The returned conversionStatus is meaningful only when ok is false: it is the
+// The returned conversionStatus is statusUnset on success and, on failure, the
 // outcome convertEntry must propagate for that entry, with the failure already
-// logged. On the ok path it is statusUnset, which is not an outcome, so a status
-// propagated from a successful read can never be mistaken for a conversion.
-func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInputs, conversionStatus, bool) {
+// logged. statusUnset is not an outcome, so it doubles as the success signal: a
+// status propagated from a successful read can never be mistaken for a
+// conversion, and no second return value can disagree with it.
+func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInputs, conversionStatus) {
 	if _, statErr := sw.src.stat(keyRel); statErr != nil {
 		if errors.Is(statErr, fs.ErrNotExist) {
 			// A genuine orphan: the certificate has no sibling key at all.
 			slog.Debug("skipping cert without matching key", "path", rel)
-			return pairInputs{}, statusOrphan, false
+			return pairInputs{}, statusOrphan
 		}
 		// A non-ENOENT stat failure (a sibling key that is a symlink the *os.Root
 		// refuses because it escapes /input, or a permission/IO error) is NOT a
@@ -530,20 +544,20 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 		// way; the message is unchanged because an alert rule keys on it.
 		slog.Warn("skipping cert: cannot stat sibling key", "path", rel, "error", statErr,
 			"remediation", inputPermRemediation)
-		return pairInputs{}, statusUnreadable, false
+		return pairInputs{}, statusUnreadable
 	}
 
 	certPEM, err := sw.src.readBounded(ctx, rel)
 	if err != nil {
 		noteUnreadableInput(rel, "certificate", err)
-		return pairInputs{}, statusUnreadable, false
+		return pairInputs{}, statusUnreadable
 	}
 	keyPEM, err := sw.src.readBounded(ctx, keyRel)
 	if err != nil {
 		noteUnreadableInput(rel, "private key", err)
-		return pairInputs{}, statusUnreadable, false
+		return pairInputs{}, statusUnreadable
 	}
-	return pairInputs{certPEM: certPEM, keyPEM: keyPEM}, statusUnset, true
+	return pairInputs{certPEM: certPEM, keyPEM: keyPEM}, statusUnset
 }
 
 // noteUnreadableInput logs a failed read of an /input file: Debug when the read was
@@ -602,8 +616,8 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	// derive the pairing rule from one place instead of two copies that can drift.
 	keyRel := layout.KeyFor(rel)
 
-	inputs, outcome, ok := sw.readPair(ctx, rel, keyRel)
-	if !ok {
+	inputs, outcome := sw.readPair(ctx, rel, keyRel)
+	if outcome != statusUnset {
 		return outcome
 	}
 	certPEM, keyPEM := inputs.certPEM, inputs.keyPEM
@@ -675,7 +689,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 // Detail is already bounded by convert, so it needs no further truncation here.
 func logConversionObservations(rel string, observations []convert.Observation) {
 	for _, o := range observations {
-		if o.Kind == convert.ObsDuplicateCerts {
+		if o.Kind.Noise() {
 			slog.Debug("cert input observation", "path", rel, "kind", string(o.Kind), "detail", o.Detail)
 			continue
 		}
@@ -689,7 +703,7 @@ func logConversionObservations(rel string, observations []convert.Observation) {
 // (a cert or key the scan could not read) are folded into one Unreadable count on
 // purpose: both mean "an /input path this app could not read", both carry the same
 // operator remediation, both are health-neutral, and both must block orphan reaping.
-func countResults(results []conversionStatus, walkUnreadable int) ScanResult {
+func countResults(results []conversionStatus, walkUnreadable, walkUnresolved int) ScanResult {
 	var converted, unchanged, orphan, failed, unreadable int
 	for _, r := range results {
 		switch r {
@@ -712,5 +726,6 @@ func countResults(results []conversionStatus, walkUnreadable int) ScanResult {
 		Orphan:     orphan,
 		Failed:     failed,
 		Unreadable: walkUnreadable + unreadable,
+		Unresolved: walkUnresolved,
 	}
 }

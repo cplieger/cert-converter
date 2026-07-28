@@ -334,6 +334,16 @@ func inspect(pfx []byte) (inspection, error) {
 		// mean inspecting a prefix while the decoder sees the whole file.
 		return inspection{}, fmt.Errorf("%w: %d trailing byte(s) after the bundle", ErrProfileUnknown, len(rest))
 	}
+	// All four profiles write a v3 PFX (go-pkcs12 v0.7.3 pkcs12.go:665, 835) and
+	// DecodeChain refuses any other version outright, before it verifies the MAC
+	// (pkcs12.go:556), so a different version is not a bundle we wrote. Refusing
+	// it here keeps every caller's diagnosis "not one of ours", the same reasoning
+	// as the no-MAC guard below.
+	const pfxVersion = 3
+	if preamble.Version != pfxVersion {
+		return inspection{}, fmt.Errorf("%w: pfx version %d, want %d",
+			ErrProfileUnknown, preamble.Version, pfxVersion)
+	}
 	macAlg := preamble.MacData.Mac.Algorithm
 	if len(macAlg.Algorithm.FullBytes) == 0 {
 		// A bundle with no MacData is not one of ours: all four profiles set a MAC.
@@ -489,6 +499,13 @@ func boundedSafeAlgorithms(safe *contentInfo) (safeAlgorithms, error) {
 		if len(encRest) != 0 {
 			return safeAlgorithms{}, fmt.Errorf("%w: %d trailing byte(s) after an encrypted safe's contents",
 				ErrProfileUnknown, len(encRest))
+		}
+		// go-pkcs12 writes version 0 (pkcs12.go:984) and its decoder refuses any
+		// other value before it decrypts the safe (pkcs12.go:611), so a different
+		// version is not a shape this app emits.
+		if enc.Version != 0 {
+			return safeAlgorithms{}, fmt.Errorf("%w: encrypted safe version %d, want 0",
+				ErrProfileUnknown, enc.Version)
 		}
 		certEnc := enc.EncryptedContentInfo.ContentEncryptionAlgorithm
 		certOID, err := certEnc.algorithmOID()

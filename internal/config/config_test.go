@@ -289,12 +289,98 @@ func mustAttr(t *testing.T, logs *capture.Recorder, msgSub, key string) string {
 	return got
 }
 
+// messageIndex reports the position of the first captured record whose message
+// contains sub, failing the test when none does: an order assertion against an
+// absent record would otherwise pass vacuously.
+func messageIndex(t *testing.T, logs *capture.Recorder, sub string) int {
+	t.Helper()
+	for i, msg := range logs.Messages() {
+		if strings.Contains(msg, sub) {
+			return i
+		}
+	}
+	t.Fatalf("no captured record matches %q (logs %v)", sub, logs.Messages())
+	return -1
+}
+
+// TestLoad_emits_the_password_strength_warning_last pins the emission order Load
+// chooses deliberately: the weak-password WARN is emitted after the delivery,
+// lifecycle, encoder and fallback diagnostics, so the records explaining the rest
+// of the configuration are not buried beneath it. Nothing else pins the order, so
+// moving the call back beside the classification that feeds it would silently
+// reshuffle every startup log with the suite still green. Serial: it swaps
+// slog.Default().
+func TestLoad_emits_the_password_strength_warning_last(t *testing.T) {
+	isolatePasswordFile(t)
+	t.Setenv("PFX_PASSWORD", "")
+	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "true")
+	t.Setenv("OUTPUT_LIFECYCLE", "delete")
+	t.Setenv("PFX_ENCODER", "modern2029")
+	t.Setenv("FALLBACK_SCAN_HOURS", "abc")
+
+	logs := capture.Default(t)
+
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() = %v, want nil", err)
+	}
+
+	strength := messageIndex(t, logs, "PFX_PASSWORD is empty")
+	for _, earlier := range []string{
+		"unknown OUTPUT_LIFECYCLE",
+		"unknown PFX_ENCODER",
+		"invalid FALLBACK_SCAN_HOURS",
+	} {
+		if i := messageIndex(t, logs, earlier); i > strength {
+			t.Errorf("Load() logged %q at index %d, after the password-strength WARN at index %d: the strength WARN is emitted last so the diagnostics explaining the configuration are not buried beneath it (logs %v)",
+				earlier, i, strength, logs.Messages())
+		}
+	}
+}
+
 // isolatePasswordFile clears PFX_PASSWORD_FILE so an ambient value inherited
 // from the host cannot take precedence over the PFX_PASSWORD the test sets:
 // envx.Secret prefers the <KEY>_FILE indirection whenever it is non-empty.
 func isolatePasswordFile(t *testing.T) {
 	t.Helper()
 	t.Setenv("PFX_PASSWORD_FILE", "")
+}
+
+// TestLoad_blank_password_reports_only_the_strength_warning pins the suppression
+// logPasswordDelivery applies to a blank value. A whitespace-only PFX_PASSWORD is
+// padded and (for a tab or newline) control-character-bearing by construction, so
+// both value-shape WARNs would fire and tell the operator to trim the value or
+// re-generate the secret on one line, when the actual problem is that no password
+// is configured at all. warnPasswordStrength owns that report, and its remediation
+// is the only one that helps. Serial: it swaps slog.Default().
+func TestLoad_blank_password_reports_only_the_strength_warning(t *testing.T) {
+	for _, password := range []string{" ", "\t\n ", "\u00a0"} {
+		t.Run(strconv.Quote(password), func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", password)
+			// A blank password only gets past the guard with the opt-out set.
+			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "true")
+
+			logs := capture.Default(t)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() = %v, want nil", err)
+			}
+
+			if n := logs.CountLevel(slog.LevelWarn, "PFX_PASSWORD is whitespace-only"); n != 1 {
+				t.Errorf("Load(PFX_PASSWORD=%q) logged %d whitespace-only WARN records, want exactly 1 (logs %v)",
+					password, n, logs.Messages())
+			}
+			for _, unwanted := range []string{
+				"PFX_PASSWORD has leading or trailing whitespace",
+				"contains a control character",
+			} {
+				if n := logs.Count(unwanted); n != 0 {
+					t.Errorf("Load(PFX_PASSWORD=%q) logged %d records matching %q, want none: the blank password is already reported, and this line's remediation sends the operator to fix the wrong thing (logs %v)",
+						password, n, unwanted, logs.Messages())
+				}
+			}
+		})
+	}
 }
 
 // TestLoad_warns_when_the_fallback_rescan_is_disabled pins the startup WARN for
@@ -668,24 +754,23 @@ func TestLoad_env_password_logs_no_secret_source(t *testing.T) {
 	// The pre-capture form scanned the whole rendered line, so it also caught the
 	// env var leaking as an ATTR (key or value) under ANY message, not just the
 	// one that happens to carry it today; Count sees messages only. Walk every
-	// captured record end to end to keep that strictly stronger guard, and check
-	// the password VALUE alongside the channel name: the sibling
-	// PFX_PASSWORD_FILE test guards its secret value, and a future diagnostic
-	// that logged the env-sourced password would otherwise keep this test green.
+	// captured record end to end to keep that strictly stronger guard on the
+	// password VALUE: the sibling PFX_PASSWORD_FILE test guards its secret value,
+	// and a future diagnostic that logged the env-sourced password would otherwise
+	// keep this test green.
+	//
+	// The channel NAME is deliberately not guarded here: this test sets
+	// PFX_PASSWORD_FILE to the empty string, which is the blank-pointer shape
+	// warnBlankPasswordFilePointer exists to report, so a record naming the
+	// variable is correct. The "PFX password configured" count above is what pins
+	// the absence of a secret-source delivery record.
 	for _, r := range logs.Records() {
 		if strings.Contains(r.Message, secret) {
 			t.Errorf("Load() leaked the environment-sourced PFX password in message %q", r.Message)
 		}
-		if strings.Contains(r.Message, secretSource) {
-			t.Errorf("Load() logged message %q, want no %s record when the file channel is unused", r.Message, secretSource)
-		}
 		r.Attrs(func(a slog.Attr) bool {
 			if strings.Contains(a.Key, secret) || strings.Contains(a.Value.String(), secret) {
 				t.Errorf("Load() leaked the environment-sourced PFX password in attr %s=%v on %q", a.Key, a.Value, r.Message)
-			}
-			if strings.Contains(a.Key, secretSource) || strings.Contains(a.Value.String(), secretSource) {
-				t.Errorf("Load() logged attr %s=%v on %q, want no %s record when the file channel is unused",
-					a.Key, a.Value, r.Message, secretSource)
 			}
 			return true
 		})

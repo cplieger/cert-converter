@@ -420,3 +420,50 @@ func TestPollLoopWithUpgrade_returns_on_shutdown_while_polling(t *testing.T) {
 		t.Errorf("pollLoopWithUpgrade ran %d extra scans after cancellation, want none", len(scans))
 	}
 }
+
+// TestPollTick_closes_the_watcher_it_could_not_give_a_watch_set pins the resource
+// release of the poll tick's rebuild-failure branch: a watcher that was
+// constructed but could not be given a watch set is closed before the tick stays
+// in poll mode. Poll mode re-attempts the upgrade on EVERY fallback tick for as
+// long as the degradation lasts, so a watcher left open here leaks an fd and a
+// readEvents goroutine per tick -- one every six hours on the documented cadence
+// -- and nothing else in the suite would notice.
+//
+// The seam hands out real watchers and records the one the tick discards, which is
+// the only way to observe a watcher the production path never returns; a closed
+// watcher refuses Add, exactly as watchMode's close is asserted.
+// Not parallel: it swaps the package-level newFSWatcher seam.
+func TestPollTick_closes_the_watcher_it_could_not_give_a_watch_set(t *testing.T) {
+	newTestWatcher(t) // availability probe: skips where inotify is unavailable
+	prev := newFSWatcher
+	var made *fsnotify.Watcher
+	newFSWatcher = func() (*fsnotify.Watcher, error) {
+		fw, err := prev()
+		made = fw
+		return fw, err
+	}
+	t.Cleanup(func() {
+		newFSWatcher = prev
+		if made != nil {
+			_ = made.Close() // a watcher the tick leaked must not outlive the test
+		}
+	})
+	missingRoot := filepath.Join(t.TempDir(), "missing")
+	w := New(missingRoot, func(context.Context) {}, WithFallback(time.Hour))
+
+	upgraded, stopped := w.pollTick(t.Context())
+
+	if upgraded != nil {
+		upgraded.Close()
+		t.Fatal("pollTick(missing root) handed back a watcher, want none")
+	}
+	if stopped {
+		t.Fatal("pollTick(missing root) stopped = true, want false so polling continues")
+	}
+	if made == nil {
+		t.Fatal("pollTick constructed no watcher; the rebuild-failure branch was not reached")
+	}
+	if err := made.Add(t.TempDir()); err == nil {
+		t.Error("pollTick left the unattachable watcher open; its fd and readEvents goroutine leak on every poll tick for as long as the degradation lasts")
+	}
+}

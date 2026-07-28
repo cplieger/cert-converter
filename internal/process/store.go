@@ -125,7 +125,8 @@ func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
 			// walk's own context check reports the cancellation to the caller.
 			slog.Debug("stale temp cleanup cancelled during shutdown", "dir", s.root.Name(), "error", walkErr)
 		} else {
-			slog.Warn("stale temp cleanup failed", "dir", s.root.Name(), "error", walkErr)
+			slog.Warn("stale temp cleanup failed", "dir", s.root.Name(), "error", walkErr,
+				"remediation", outputPermRemediation)
 		}
 	}
 	if res.Removed > 0 {
@@ -143,8 +144,6 @@ func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
 			"dir", s.root.Name(), "count", res.Unreadable, "remediation", outputPermRemediation)
 	}
 }
-
-// --- Input walk ---
 
 // --- Output-derived currency ---
 
@@ -619,8 +618,8 @@ func (s *store) reconcile(ctx context.Context, mode outputpolicy.Lifecycle, seen
 	if mode != outputpolicy.LifecycleSync || !reapable {
 		slog.Warn("output bundles have no matching input",
 			"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),
-			"action", lifecycleInaction(mode),
-			"remediation", "remove them from the output volume, or set OUTPUT_LIFECYCLE=sync to have this app do it")
+			"action", lifecycleInaction(mode, reapable),
+			"remediation", orphanReportRemediation(walkSafe))
 		return 0, nil
 	}
 
@@ -640,7 +639,8 @@ func (s *store) removeOrphans(ctx context.Context, orphaned []string) (int, erro
 			return deleted, err
 		}
 		if err := s.root.Remove(rel); err != nil {
-			slog.Warn("could not remove orphaned output", "path", rel, "error", err)
+			slog.Warn("could not remove orphaned output", "path", rel, "error", err,
+				"remediation", outputPermRemediation)
 			continue
 		}
 		// Every deletion is named. Removing key material without an audit line is
@@ -661,16 +661,29 @@ func sampleOrphanPaths(paths []string) string {
 		fmt.Sprintf(" (+%d more)", len(paths)-maxLoggedOrphans)
 }
 
-// lifecycleInaction explains why an orphan was reported rather than removed. It
-// is only called when no deletion happened, so the mode alone determines which of
-// the two reasons applies: any mode other than sync reports by configuration, and
-// sync reports only when the scan could not prove every candidate is genuinely
-// orphaned — reconcile now returns before this point when the INPUT enumeration is
-// incomplete, so the sync arm is reached via a failed conversion or an unsafe
-// OUTPUT walk.
-func lifecycleInaction(mode outputpolicy.Lifecycle) string {
-	if mode != outputpolicy.LifecycleSync {
-		return "reported only (OUTPUT_LIFECYCLE=" + string(mode) + ")"
+// lifecycleInaction explains why an orphan was reported rather than removed. Two
+// independent reasons can apply and the mode alone does not pick between them: a
+// non-sync mode reports by configuration, AND any mode reaches this point when the
+// scan could not prove every candidate is genuinely orphaned (a failed conversion
+// or an unsafe OUTPUT walk; reconcile returns before this point when the INPUT
+// enumeration is incomplete). The unproven reason wins, because it is the one that
+// changes what the operator may safely do with the list.
+func lifecycleInaction(mode outputpolicy.Lifecycle, reapable bool) string {
+	if !reapable {
+		return "kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle"
 	}
-	return "kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle"
+	return "reported only (OUTPUT_LIFECYCLE=" + string(mode) + ")"
+}
+
+// orphanReportRemediation is the orphan report's operator advice. It must not tell
+// an operator to delete anything on a scan whose OUTPUT walk could not enumerate
+// the tree: the candidate list then holds live bundles — a bundle written through a
+// symlinked output directory is enumerated under its physical path, whose derived
+// input name is absent from `seen`, so it reads as an orphan on the very scan that
+// created it — and every entry in the list carries a private key.
+func orphanReportRemediation(walkSafe bool) string {
+	if !walkSafe {
+		return "do not remove anything from this list yet: fix the /output warnings above, then re-check it on a scan that reports no disabled orphan removal"
+	}
+	return "remove them from the output volume, or set OUTPUT_LIFECYCLE=sync to have this app do it"
 }

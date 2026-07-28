@@ -11,11 +11,6 @@ import (
 	"time"
 )
 
-// The confined bounded read used to live in internal/convert as
-// ReadBoundedFromRoot, on an *os.Root that package neither owned nor could have
-// opened. It moved to the source type here, which owns the input tree, so its
-// tests moved with it.
-
 func TestSourceReadBounded(t *testing.T) {
 	t.Parallel()
 	t.Run("reads file within limit through root", func(t *testing.T) {
@@ -92,7 +87,7 @@ func TestSourceReadBounded(t *testing.T) {
 		defer root.Close()
 		s := &source{root: root}
 		if _, err := s.readBoundedLimit(t.Context(), "leak.pem", 1024); err == nil {
-			t.Fatal("ReadBoundedFromRoot followed a symlink escaping the root; want a confinement error")
+			t.Fatal("source.readBoundedLimit followed a symlink escaping the root; want a confinement error")
 		}
 	})
 
@@ -152,14 +147,14 @@ func TestSourceReadBounded(t *testing.T) {
 		select {
 		case readErr := <-done:
 			if readErr == nil {
-				t.Fatal("ReadBoundedFromRoot read a FIFO; want a not-a-regular-file error")
+				t.Fatal("source.readBoundedLimit read a FIFO; want a not-a-regular-file error")
 			}
 			if !strings.Contains(readErr.Error(), "not a regular file") {
-				t.Errorf("ReadBoundedFromRoot(FIFO) error = %q, want it to mention %q",
+				t.Errorf("source.readBoundedLimit(FIFO) error = %q, want it to mention %q",
 					readErr.Error(), "not a regular file")
 			}
 		case <-time.After(10 * time.Second):
-			t.Fatal("ReadBoundedFromRoot blocked on a FIFO; the O_NONBLOCK open regressed")
+			t.Fatal("source.readBoundedLimit blocked on a FIFO; the O_NONBLOCK open regressed")
 		}
 	})
 }

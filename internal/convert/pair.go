@@ -76,7 +76,7 @@ func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 // conversion failure, and config.ErrUnencodablePassword (which cannot be reused
 // here anyway: internal/config imports this package) exists for callers of Load.
 func unencodablePasswordError(password string) error {
-	switch InspectPasswordEncoding(password).Primary() {
+	switch shape := InspectPasswordEncoding(password).Primary(); shape {
 	case PasswordInvalidUTF8:
 		return errors.New("pfx password is not valid UTF-8, so the PKCS#12 UCS-2 password encoding " +
 			"would replace every invalid byte with U+FFFD and protect the bundle with a different, " +
@@ -91,8 +91,13 @@ func unencodablePasswordError(password string) error {
 			"so no consumer that builds the terminated BMPString itself could open the bundle with the " +
 			"password supplied; strip NUL bytes from the secret " +
 			"(a UTF-16 or NUL-padded secret file is the usual cause)")
+	case PasswordEncodesFine:
+		return nil
+	default:
+		return fmt.Errorf("pfx password carries encoding shape %q, which this codec cannot prove "+
+			"the PKCS#12 UCS-2 password encoding carries intact; refusing rather than writing a "+
+			"bundle that may be protected by a different password than the one supplied", shape)
 	}
-	return nil
 }
 
 // --- Read-back: the currency check ---

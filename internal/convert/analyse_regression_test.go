@@ -347,6 +347,56 @@ func TestAnalyse_reports_a_key_that_belongs_to_an_issuer(t *testing.T) {
 	}
 }
 
+// TestAnalyse_converts_a_key_shared_by_a_ca_and_its_leaf pins the other arm of the
+// same rule: when a supplied key matches BOTH an issuer and an end-entity
+// certificate in the bundle, the end-entity certificate is the identity and the
+// issuer is passed over, rather than the whole pair being refused.
+//
+// An internal PKI that mints everything from one key produces exactly this input,
+// and the refusal was decided by a tie-break: the renewal ranking prefers the later
+// NotBefore, so a CA minted after the leaf it signed won the selection and the
+// end-entity role check then rejected the bundle. The pair carries exactly one
+// usable identity, so it must convert.
+func TestAnalyse_converts_a_key_shared_by_a_ca_and_its_leaf(t *testing.T) {
+	t.Parallel()
+	sharedKey := newKey(t)
+	leafNotBefore := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	caNotBefore := leafNotBefore.Add(time.Hour)
+	caPEM, caCert := mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(72),
+		Subject:               pkix.Name{CommonName: "Shared Key CA"},
+		NotBefore:             caNotBefore,
+		NotAfter:              caNotBefore.Add(48 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &sharedKey.PublicKey, nil, sharedKey)
+
+	leafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(73),
+		Subject:      pkix.Name{CommonName: "shared-key-leaf.example.com"},
+		NotBefore:    leafNotBefore,
+		NotAfter:     leafNotBefore.Add(24 * time.Hour),
+	}, &sharedKey.PublicKey, caCert, sharedKey)
+
+	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), keyPEMOf(t, sharedKey))
+	if err != nil {
+		t.Fatalf("Analyse(one key for a CA and the leaf it signed) = %v, want the leaf to be selected", err)
+	}
+	if got.Leaf().Subject.CommonName != "shared-key-leaf.example.com" {
+		t.Errorf("selected identity = %q, want the end-entity certificate", got.Leaf().Subject.CommonName)
+	}
+	if len(got.Chain()) != 1 {
+		t.Fatalf("chain length = %d, want 1: the CA belongs in the chain", len(got.Chain()))
+	}
+	if got.Chain()[0].Subject.CommonName != "Shared Key CA" {
+		t.Errorf("chain[0] = %q, want the CA", got.Chain()[0].Subject.CommonName)
+	}
+	if !hasObservation(got.Observations(), convert.ObsIssuerMatchIgnored) {
+		t.Errorf("observations = %v, want the passed-over issuer match reported", got.Observations())
+	}
+}
+
 // TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established pins the
 // additive-only fallback.
 //
@@ -1269,8 +1319,15 @@ func TestAnalyse_keeps_the_upper_chain_when_a_middle_issuer_cannot_be_establishe
 		t.Fatalf("chain = %v, want all 3 CA certificates kept: an unprovable middle edge must not truncate the chain",
 			chainSerials(got.Chain()))
 	}
-	if got.Chain()[0].SerialNumber.Cmp(big.NewInt(502)) != 0 {
-		t.Errorf("chain[0] serial = %s, want 502 (the discovered lower CA first)", got.Chain()[0].SerialNumber)
+	// The emitted ORDER is the contract Analysis.chain documents for the fallback:
+	// the certificates whose ancestry IS established come first, then the remaining
+	// issuer-eligible ones in INPUT order. Nothing else pins the tail, so a fallback
+	// that appended the kept certificates ahead of the discovered path, or in
+	// reverse, would emit CA bags in an order no test notices while go-pkcs12's
+	// decoder reads the sequence positionally.
+	if serials := strings.Join(chainSerials(got.Chain()), ","); serials != "502,501,500" {
+		t.Errorf("chain serials = %s, want 502,501,500 (the discovered lower CA first, then the kept remainder in input order)",
+			serials)
 	}
 	if len(got.Extra()) != 0 {
 		t.Errorf("Extra holds %d certificate(s), want 0: neither the upper CA nor the root was shown to be off the chain",

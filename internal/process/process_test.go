@@ -136,7 +136,7 @@ func TestScannerRun_skips_a_cert_recreated_after_removal(t *testing.T) {
 // output-TYPE half of the cache-coherence gate: an unchanged input whose prior
 // PFX has been replaced by a non-regular file must not be reported as an
 // unchanged skip, and the broken output must surface as a conversion failure so
-// health reports it. A revert of outputIsCurrent's Lstat+IsRegular check back to
+// health reports it. A revert of store.isCurrent's Lstat+IsRegular check back to
 // a bare Stat passes the rest of the suite.
 func TestScannerRun_regenerates_pfx_when_output_is_not_a_regular_file(t *testing.T) {
 	t.Parallel()

@@ -23,10 +23,11 @@ func FuzzCheckPasswordEncodable_gate_matches_the_recognizer(f *testing.F) {
 	}
 	f.Fuzz(func(t *testing.T, password string) {
 		issues := convert.InspectPasswordEncoding(password)
-		// Deliberately an independent restatement, NOT issues.Unencodable():
-		// checkPasswordEncodable selects on Primary, so deriving this side of
-		// the comparison from Primary too would make the oracle tautological
-		// and a dropped Primary branch would pass.
+		// Deliberately an independent restatement of the three shapes, not
+		// issues.Primary() != convert.PasswordEncodesFine: checkPasswordEncodable
+		// selects on Primary, so deriving this side of the comparison from Primary
+		// too would make the oracle tautological and a dropped Primary branch
+		// would pass.
 		unusable := issues.InvalidUTF8 || issues.NonBMP || issues.EmbeddedNUL
 
 		err := checkPasswordEncodable(password)

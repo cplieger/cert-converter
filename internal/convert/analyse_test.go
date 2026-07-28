@@ -655,6 +655,60 @@ func TestAnalyse_reports_unusable_key_blocks_when_a_usable_key_still_matches(t *
 	}
 }
 
+// TestAnalyse_reports_unusable_key_blocks_for_an_unreadable_label covers the one
+// mid-rotation shape the three counted defect classes miss: an appended key in an
+// armour label this app does not read (an OpenSSH-format key). encoding/pem
+// decodes the block fine, so no parse failure is counted and the declaration
+// count does not see it either; without the label rule the whole half of the key
+// file is ignored in silence until the next renewal turns it into a cert/key
+// mismatch pointing at the certificate.
+func TestAnalyse_reports_unusable_key_blocks_for_an_unreadable_label(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+
+	// Low-entropy placeholder body: only the label matters to the rule under test.
+	openssh := pem.EncodeToMemory(&pem.Block{Type: "OPENSSH PRIVATE KEY", Bytes: []byte("foo")})
+
+	got, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), concatPEM(m.LeafKeyPEM, openssh))
+	if err != nil {
+		t.Fatalf("Analyse(matching key + OpenSSH-format block) = %v, want success: the usable key still matches", err)
+	}
+	var detail string
+	for _, o := range got.Observations() {
+		if o.Kind == convert.ObsUnusableKeyBlocksSkipped {
+			detail = o.Detail
+		}
+	}
+	if detail == "" {
+		t.Fatalf("observations = %v, want one of kind %q naming the block whose label names no key format this app reads",
+			got.Observations(), convert.ObsUnusableKeyBlocksSkipped)
+	}
+	for _, want := range []string{"1 block(s) carry a label", "OPENSSH PRIVATE KEY"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("observation detail = %q, want it to contain %q", detail, want)
+		}
+	}
+}
+
+// TestAnalyse_reports_no_key_block_observation_for_a_certificate_passenger pins
+// the other half of the label rule: a combined cert+key file is a supported
+// input, so the CERTIFICATE block riding along in the key file must NOT be
+// reported — otherwise every scan of a healthy combined pair emits a WARN nobody
+// can act on. This is the mirror of parseCertChain treating a private-key block
+// as an expected passenger of the chain file.
+func TestAnalyse_reports_no_key_block_observation_for_a_certificate_passenger(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	got, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), concatPEM(m.LeafKeyPEM, m.LeafPEM))
+	if err != nil {
+		t.Fatalf("Analyse(combined cert+key file) = %v, want success", err)
+	}
+	if hasObservation(got.Observations(), convert.ObsUnusableKeyBlocksSkipped) {
+		t.Errorf("observations = %v, want no %q for a CERTIFICATE block riding in the key file",
+			got.Observations(), convert.ObsUnusableKeyBlocksSkipped)
+	}
+}
+
 // TestAnalyse_reports_no_key_block_observation_for_a_clean_key_file guards the
 // other direction: the observation must stay absent for the ordinary input, or
 // every scan of every healthy pair emits a WARN nobody can act on.

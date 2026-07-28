@@ -217,11 +217,9 @@ const maxBlockTypeLogLen = 64
 // becomes the three-byte U+FFFD — and a cut inside a rune would mint exactly the
 // raw 0x80-0x9F tail bytes the sanitizer just removed.
 //
-// This is runesafe.SanitizeSingleLineBounded composed from the library's own
-// primitives, which is how runesafe documents keeping a caller's marker: the preset
-// marks a cut with "..." and this package marks it with truncationMarker. The marker
-// is appended after the cut, so a truncated result exceeds limit by the marker's own
-// length; the bound exists to stop multi-megabyte lines, not to hit limit exactly.
+// The marker is appended AFTER the cut, so a truncated result exceeds limit by the
+// marker's own length: the bound exists to stop multi-megabyte lines, not to hit
+// limit exactly.
 func boundLogText(s string, limit int) string {
 	s = runesafe.SanitizeSingleLine(s)
 	if len(s) <= limit {
@@ -278,6 +276,7 @@ type keyScan struct {
 	keys          []crypto.Signer
 	firstParseErr error
 	skipped       skippedBlocks
+	unrelated     skippedBlocks
 	decodedBlocks int
 	parseFailures int
 	sawEncrypted  bool
@@ -306,6 +305,14 @@ func (s *keyScan) visit(block *pem.Block) {
 		s.sawEncrypted = true
 	default:
 		s.skipped.add(block.Type)
+		// A CERTIFICATE block is an expected passenger, the mirror of parseCertChain's
+		// private-key rule: a combined cert+key file is a supported input. Any other
+		// label names something this app cannot read as a key at all (an OpenSSH-format
+		// key, for instance), so the operator hears about it even when another block
+		// did yield one.
+		if block.Type != pemTypeCertificate {
+			s.unrelated.add(block.Type)
+		}
 	}
 }
 
@@ -358,9 +365,11 @@ func parsePrivateKeys(pemBytes []byte) ([]crypto.Signer, keyDefects, error) {
 			declaredKeyBlocks-scan.decodedBlocks)
 	}
 	return scan.keys, keyDefects{
-		unparseable: scan.parseFailures,
-		undecoded:   declaredKeyBlocks - scan.decodedBlocks,
-		encrypted:   scan.sawEncrypted,
+		firstUnreadable: scan.unrelated.firstTypeForLog(),
+		unreadable:      scan.unrelated.count,
+		unparseable:     scan.parseFailures,
+		undecoded:       declaredKeyBlocks - scan.decodedBlocks,
+		encrypted:       scan.sawEncrypted,
 	}, nil
 }
 
@@ -400,6 +409,14 @@ func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped skippedBl
 // still parses its OLD key, and if the certificate has been renewed the failure
 // the operator then sees is "the key does not match the certificate".
 type keyDefects struct {
+	// firstUnreadable is the first key-file PEM label that names neither a key
+	// format this app reads nor a certificate, already sanitized and bounded for a
+	// log by skippedBlocks.firstTypeForLog.
+	firstUnreadable string
+	// unreadable is how many such blocks the file holds. Counted apart from
+	// unparseable because encoding/pem decoded them fine and no parser was ever
+	// offered them: only the label rules them out.
+	unreadable int
 	// unparseable is the number of key-labelled blocks whose DER no parser accepted.
 	unparseable int
 	// undecoded is the number of private-key declarations encoding/pem could not
@@ -427,8 +444,9 @@ func (d keyDefects) suffix() string {
 // It is the single home of that wording because two diagnostics need it and must
 // not drift: noMatchError's suffix on the hard-failure path, and the
 // unusable-key-blocks observation analyseAt emits when identity selection
-// SUCCEEDED anyway. Every part is a count or a fixed phrase, so the text carries
-// nothing key-file-controlled and needs no bounding before it reaches a log.
+// SUCCEEDED anyway. Every part is a count or a fixed phrase except the unreadable
+// clause's PEM label, which skippedBlocks.firstTypeForLog has already sanitized
+// and bounded, so the text is safe for a log as it stands.
 func (d keyDefects) details() string {
 	var parts []string
 	if d.unparseable > 0 {
@@ -439,6 +457,9 @@ func (d keyDefects) details() string {
 	}
 	if d.undecoded > 0 {
 		parts = append(parts, fmt.Sprintf("%d declared block(s) could not be decoded (truncated armour or a corrupt body)", d.undecoded))
+	}
+	if d.unreadable > 0 {
+		parts = append(parts, fmt.Sprintf("%d block(s) carry a label naming no key format this app reads (first %q)", d.unreadable, d.firstUnreadable))
 	}
 	return strings.Join(parts, ", ")
 }

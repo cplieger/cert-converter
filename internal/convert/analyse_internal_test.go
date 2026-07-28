@@ -101,6 +101,59 @@ func testValidityKinds(a *Analysis) []ObservationKind {
 	return kinds
 }
 
+// TestAnalyseAt_reports_every_input_defect_in_discovery_order pins the
+// observation contract prepareAnalysisInput documents: the input-phase findings
+// are emitted in the order the defects are discovered in the file, and one defect
+// never suppresses another. Every existing test exercises these four one at a
+// time, so a refactor that turned the four independent reports into an if/else
+// chain - or reordered them - keeps the whole suite green while an operator with a
+// multi-defect input silently loses the mid-rotation damaged-key signal that is
+// the only warning before the next renewal fails.
+func TestAnalyseAt_reports_every_input_defect_in_discovery_order(t *testing.T) {
+	t.Parallel()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("setup: GenerateKey: %v", err)
+	}
+	other, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("setup: GenerateKey: %v", err)
+	}
+	now := time.Date(2030, 3, 1, 0, 0, 0, 0, time.UTC)
+	certPEM := testSelfSignedPEM(t, key, "multi-defect.example.com", 1, now.Add(-time.Hour), now.Add(time.Hour))
+
+	// One file carrying all four defects: a block that is neither a certificate
+	// nor a key, the same certificate twice, a second distinct key, and a key
+	// declaration whose armour is cut off mid-body.
+	certFile := slices.Concat(
+		pem.EncodeToMemory(&pem.Block{Type: "TRUSTED CERTIFICATE", Bytes: []byte("not a certificate")}),
+		certPEM, certPEM,
+	)
+	keyFile := slices.Concat(
+		testKeyPEM(t, key),
+		testKeyPEM(t, other),
+		[]byte("-----BEGIN PRIVATE KEY-----\nZm9v\n"),
+	)
+
+	a, err := analyseAt(certFile, keyFile, now)
+	if err != nil {
+		t.Fatalf("analyseAt(a bundle carrying every input defect) = error %v, want a resolved analysis", err)
+	}
+
+	var got []ObservationKind
+	for _, o := range a.observations {
+		switch o.Kind {
+		case ObsUnrelatedBlocksSkipped, ObsDuplicateCerts, ObsMultipleKeys, ObsUnusableKeyBlocksSkipped:
+			got = append(got, o.Kind)
+		}
+	}
+	want := []ObservationKind{ObsUnrelatedBlocksSkipped, ObsDuplicateCerts, ObsMultipleKeys, ObsUnusableKeyBlocksSkipped}
+	if !slices.Equal(got, want) {
+		t.Errorf("input-phase observations = %v, want %v (every defect reported, in file-discovery order)", got, want)
+	}
+}
+
 // TestAnalyseAt_validity_window_is_inclusive_at_both_edges pins the inclusivity of
 // validAt at the exact instants the boundaries sit on. Analyse reads the clock, so
 // through the exported entry point a fixture can only be placed loosely before or
@@ -144,6 +197,39 @@ func TestAnalyseAt_validity_window_is_inclusive_at_both_edges(t *testing.T) {
 					tt.now.UTC().Format(time.RFC3339Nano), got, tt.want)
 			}
 		})
+	}
+}
+
+// testUncomparablePublicKey stands in for a public key type crypto/x509 parses
+// but that carries no Equal(crypto.PublicKey) bool method, which is what makes a
+// certificate unverifiable against a key rather than mismatched with it. The
+// production shape is a legacy DSA certificate: crypto/x509 parses a
+// SubjectPublicKeyInfo carrying the DSA OID into a *dsa.PublicKey, and crypto/dsa
+// declares no methods at all. The stand-in pins the same branch while keeping the
+// deprecated crypto/dsa package out of the test.
+type testUncomparablePublicKey struct{}
+
+// TestNoMatchError_names_a_public_key_type_that_cannot_be_compared pins the
+// unverifiable-key-type half of the no-match diagnosis. Its sibling - a
+// certificate whose algorithm OID crypto/x509 does not recognise at all, leaving
+// PublicKey nil - is covered end to end; this arm, where the key WAS parsed into a
+// type without Equal, is not, so a diagnosis that fell through to "none of the N
+// key block(s) matches any of the M certificate(s)" would send the operator to
+// check the wrong file while every test still passed.
+func TestNoMatchError_names_a_public_key_type_that_cannot_be_compared(t *testing.T) {
+	t.Parallel()
+	g := &certGraph{certs: []*x509.Certificate{{
+		Subject:   pkix.Name{CommonName: "legacy-dsa.example.com"},
+		PublicKey: testUncomparablePublicKey{},
+	}}}
+
+	err := g.noMatchError(1, 0, keyDefects{})
+	if err == nil {
+		t.Fatal("noMatchError(1, 0, keyDefects{}) = nil, want the unverifiable-key-type diagnosis")
+	}
+	want := `certificate "CN=legacy-dsa.example.com" has a public key of type convert.testUncomparablePublicKey that cannot be verified against the private key`
+	if got := err.Error(); got != want {
+		t.Errorf("noMatchError(1, 0, keyDefects{}) = %q, want %q", got, want)
 	}
 }
 

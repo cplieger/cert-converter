@@ -292,9 +292,8 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 // is, so one mis-permissioned certificate directory cannot cost the whole tree
 // its real-time watch.
 //
-// Paths here are AMBIENT (filepath.WalkDir plus watcher.Add), unlike every
-// /input and /output touch in internal/process, which runs through an *os.Root.
-// The divergence is deliberate and bounded: inotify registration takes a path,
+// The ambient-path divergence the package comment points here for is deliberate
+// and bounded: inotify registration takes a path,
 // not a directory handle, so there is no root-confined equivalent of
 // watcher.Add, and nothing in this package reads file CONTENT — filepath.WalkDir
 // stats with Lstat and does not intentionally descend a symlinked directory,
@@ -307,9 +306,7 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 // ambient: a Create event can Lstat and WalkDir beneath event.Name, so a raced
 // ancestor can extend registrations into the replacement target and consume
 // watch descriptors, but it still cannot make the app read or convert content
-// outside the root. Any future read of a watched file must go through
-// internal/process's confined root (source.readBounded, i.e.
-// atomicfile.ReadBoundedInRoot); never build an ambient path here and read it.
+// outside the root.
 //
 // The traversal is cancellable: it checks ctx before each entry and returns
 // ctx.Err() as soon as the process is shutting down, so a shutdown arriving
@@ -783,18 +780,11 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) (upgraded *fsnotify.W
 		if ctx.Err() != nil {
 			return nil, nil
 		}
-		// Return, do not park. Parking here left the container reporting HEALTHY
-		// forever while converting nothing: the initial scan had already written the
-		// marker, and disabling the fallback also disarms the probe's freshness
-		// deadline, so nothing ever contradicted it. Returning ErrWatchLost reaches
-		// main's existing non-zero exit path, which is correct precisely because this
-		// failure IS restart-clearable — inotify instance exhaustion is usually
-		// transient host pressure, so the retry has a real chance of succeeding.
-		//
-		// This also honours Run's own documented contract: dead change detection is
-		// an error return, not a survivable steady state. The error carries the
-		// FALLBACK_SCAN_HOURS remediation out to main, which announces it: this is
-		// the one lost-detection cause an operator can fix.
+		// Return rather than park: with the fallback disabled nothing re-scans and the
+		// probe's freshness deadline is off, so a parked process would report HEALTHY
+		// forever while converting nothing. ErrWatchLost reaches main's non-zero exit,
+		// which is the right answer because inotify exhaustion is usually transient,
+		// and it carries the FALLBACK_SCAN_HOURS remediation main announces.
 		return nil, errNoWatchNoFallback
 	}
 

@@ -137,6 +137,9 @@ func isBlank(password string) bool {
 // unreadable file.
 func Load() (Config, error) {
 	var blankSecretFile error
+	// Emitted before resolution: a blank pointer is not the file channel at all, so
+	// neither warnBothPasswordChannels nor envx's own error can report it.
+	warnBlankPasswordFilePointer()
 	password, source, secretErr := envx.SecretWithSource("PFX_PASSWORD")
 	// Emitted here rather than from logPasswordDelivery because every startup
 	// REFUSAL below is about the file channel while PFX_PASSWORD is the variable the
@@ -412,6 +415,34 @@ func warnBothPasswordChannels(source envx.SecretSource) {
 	slog.Warn("both PFX_PASSWORD and PFX_PASSWORD_FILE are set; the file wins and PFX_PASSWORD is ignored",
 		"source", "PFX_PASSWORD_FILE",
 		"remediation", "remove PFX_PASSWORD from the environment so there is one place to change the secret")
+}
+
+// warnBlankPasswordFilePointer warns when PFX_PASSWORD_FILE is present in the
+// environment but blank — set to the empty string, or to whitespace only — so it
+// names no secret file. A compose "${PFX_PASSWORD_FILE:-}" whose source variable is
+// undefined produces exactly this shape.
+//
+// envx gates the file channel on a NON-EMPTY pointer, so an empty one is
+// indistinguishable from unset and resolution silently falls through to
+// PFX_PASSWORD: the file-wins rule the deployment relies on quietly inverts and
+// warnBothPasswordChannels cannot fire (it keys on source == SourceFile). A
+// whitespace-only pointer is opened instead and fails startup with envx's
+// "no such file or directory" for a filename made of spaces. The WARN is emitted
+// before resolution so it precedes both outcomes.
+//
+// Deliberately a warning, not a refusal: an empty pointer resolving through
+// PFX_PASSWORD is envx's documented rule (IsBlankSecretFilePath's doc comment), and
+// refusing here would break a deployment that materialises the variable empty on
+// purpose.
+func warnBlankPasswordFilePointer() {
+	path, set := os.LookupEnv("PFX_PASSWORD_FILE")
+	if !set || strings.TrimSpace(path) != "" {
+		return
+	}
+	slog.Warn("PFX_PASSWORD_FILE is set but blank, so it names no secret file; "+
+		"the PFX password is taken from PFX_PASSWORD instead",
+		"remediation", "unset PFX_PASSWORD_FILE to configure the secret through PFX_PASSWORD, "+
+			"or point it at the mounted secret file (a compose ${PFX_PASSWORD_FILE:-} whose source variable is undefined is the usual cause)")
 }
 
 // passwordChannel names the environment variable an operator must edit to change the

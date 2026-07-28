@@ -68,7 +68,23 @@ const (
 	// the old one: the old key still matches today, and the only other signal is the
 	// "no certificate matches any key" failure a later renewal produces.
 	ObsUnusableKeyBlocksSkipped ObservationKind = "unusable-key-blocks-skipped"
+	// ObsIssuerMatchIgnored reports that a supplied key also matched a certificate
+	// that verifiably issued another certificate in this bundle. Such a certificate
+	// is no end-entity identity, so the end-entity certificate that also matched was
+	// selected and this one passed over. The canonical causes are one key reused for
+	// both a CA and the leaf it signed, and a key file holding the leaf's key and the
+	// CA's key together.
+	ObsIssuerMatchIgnored ObservationKind = "issuer-match-ignored"
 )
+
+// Noise reports whether an observation of this kind is a benign artefact of how the
+// input file was assembled rather than something the operator probably did not intend.
+// It lives beside the constants because the distinction is a property of the KIND, known
+// where the kinds are minted; how loudly a caller reports each class stays the caller's
+// choice.
+func (k ObservationKind) Noise() bool {
+	return k == ObsDuplicateCerts
+}
 
 // Observation is one non-fatal finding about the input. Detail is already bounded
 // for logging, so a caller may emit it directly without re-truncating
@@ -207,7 +223,7 @@ func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 	}
 	obs = append(obs, validityObservations(leaf, now)...)
 
-	chain, extra, chainObs := g.assembleChain(identity.cert, leaf)
+	chain, extra, chainObs := g.assembleChain(identity.cert)
 	obs = append(obs, chainObs...)
 	obs = append(obs, chainValidityObservations(chain, now)...)
 
@@ -720,14 +736,59 @@ func (g *certGraph) distancesFromRoots(roots []int, edgeOK func(child, parent in
 // every key against every certificate rather than against a positional guess.
 func (g *certGraph) selectIdentity(signers []crypto.Signer, keyIssues keyDefects) (identityMatch, []Observation, error) {
 	matches, firstUnverifiable := g.collectMatches(signers)
+	matches, issuerObs := g.dropIssuerMatches(matches)
 	switch len(matches) {
 	case 0:
 		return identityMatch{}, nil, g.noMatchError(len(signers), firstUnverifiable, keyIssues)
 	case 1:
-		return matches[0], nil, nil
+		return matches[0], issuerObs, nil
 	default:
-		return g.resolveAmbiguousMatches(matches)
+		best, obs, err := g.resolveAmbiguousMatches(matches)
+		if err != nil {
+			return identityMatch{}, nil, err
+		}
+		return best, append(issuerObs, obs...), nil
 	}
+}
+
+// dropIssuerMatches removes the matches whose certificate verifiably issued another
+// certificate in this bundle, whenever at least one match did not, and reports the
+// ones it dropped.
+//
+// The role rule analyseAt enforces AFTER selection - an issuer of another
+// certificate here is not an end-entity certificate - has to participate in
+// selection as well, or a bundle carrying exactly one usable identity is refused
+// whenever an issuer also matches a supplied key. Two reachable shapes: one key
+// reused for both a CA and the leaf it signed (the CA wins the renewal ranking on
+// its later NotBefore, and the role check then rejects the bundle), and a key file
+// holding the leaf's key next to the CA's (counted as two identities, so the
+// "one certificate/key pair per output" refusal fires). In both the end-entity
+// certificate is unambiguous.
+//
+// When EVERY match is an issuer the set is returned unchanged, so the "the key
+// belongs to an issuer" diagnosis is preserved exactly for the bundle that has no
+// end-entity alternative.
+func (g *certGraph) dropIssuerMatches(matches []identityMatch) (kept []identityMatch, obs []Observation) {
+	kept = make([]identityMatch, 0, len(matches))
+	var dropped []*x509.Certificate
+	for _, m := range matches {
+		if g.isIssuer(m.cert) {
+			dropped = append(dropped, g.certs[m.cert])
+			continue
+		}
+		kept = append(kept, m)
+	}
+	if len(kept) == 0 {
+		return matches, nil
+	}
+	if len(dropped) > 0 {
+		obs = append(obs, Observation{
+			Kind: ObsIssuerMatchIgnored,
+			Detail: fmt.Sprintf("%d certificate(s) matching a supplied key issued another certificate in this bundle, so they are no end-entity identity and were passed over: %s",
+				len(dropped), subjectsForLog(dropped)),
+		})
+	}
+	return kept, obs
 }
 
 // collectMatches pairs every key with every certificate whose public half it
@@ -1021,7 +1082,8 @@ func partitionIssuerEligible(certs []*x509.Certificate) (eligible, disqualified 
 // disqualifies is not a possible issuer of anything, so keeping it would emit
 // chain material downstream path validation rejects. Those are excluded and named,
 // while every certificate whose relationship is merely unproven is kept.
-func (g *certGraph) assembleChain(identityCert int, leaf *x509.Certificate) (chain, extra []*x509.Certificate, obs []Observation) {
+func (g *certGraph) assembleChain(identityCert int) (chain, extra []*x509.Certificate, obs []Observation) {
+	leaf := g.certs[identityCert]
 	path := g.pathFrom(identityCert)
 	chain = make([]*x509.Certificate, 0, len(path)-1)
 	for _, i := range path[1:] {
@@ -1051,7 +1113,7 @@ func (g *certGraph) assembleChain(identityCert int, leaf *x509.Certificate) (cha
 			fallbackObs = append(fallbackObs, Observation{
 				Kind: ObsExtraCertsExcluded,
 				Detail: fmt.Sprintf("%d certificate(s) cannot issue certificates, so they are no issuer of %q and were excluded: %s",
-					len(disqualified), boundSubject(leaf.Subject.String()), subjectsForLog(disqualified)),
+					len(disqualified), boundSubject(g.certs[terminal].Subject.String()), subjectsForLog(disqualified)),
 			})
 		}
 		return chain, disqualified, fallbackObs

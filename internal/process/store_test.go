@@ -258,3 +258,86 @@ func TestStoreIsCurrent_names_a_non_regular_prior_output(t *testing.T) {
 		})
 	}
 }
+
+// TestStoreIsCurrent_reports_a_bundle_that_vanishes_mid_inspection pins the two arms
+// isCurrent takes when the prior bundle disappears after the lstat that classified it
+// as a usable regular file: the tightening whose RESULT cannot be observed, and the
+// read that then finds nothing.
+//
+// Both are reachable on a co-mounted /output -- a second writer, or a restore that
+// replaces the tree while a scan runs -- and neither is named anywhere else. The
+// tightening arm is the one a plausible simplification silently inverts: drop
+// chmodAndObserve's re-stat error and the zero FileMode it returns is not laxer than
+// policy, so the switch takes its DEFAULT arm and reports "tightened the file mode of
+// a prior pfx" at INFO, telling an operator that private-key permissions were repaired
+// on a bundle this app can no longer see at all. The read arm must stay a WARN plus a
+// stale verdict rather than an error: an error here fails the pair and pins the
+// container unhealthy over a condition the rewrite itself fixes.
+//
+// want is never dereferenced: both verdicts are reached before any bundle is decoded.
+// The chmod seam stands in for the timing, exactly as the untightenable-mode test uses
+// it for a filesystem that stores no permission bits; neither is stageable in a temp
+// directory. Runs serially: it swaps slog.Default() and the chmod seam.
+func TestStoreIsCurrent_reports_a_bundle_that_vanishes_mid_inspection(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	defer root.Close()
+	s := &store{root: root}
+	if err := s.write(t.Context(), "out.pfx", []byte("prior bundle")); err != nil {
+		t.Fatalf("setup: write: %v", err)
+	}
+	// Lax enough that tightenMode acts at all; the vanishing happens inside it.
+	if err := os.Chmod(filepath.Join(dir, "out.pfx"), 0o644); err != nil {
+		t.Fatalf("setup: Chmod: %v", err)
+	}
+	prev := chmodInRoot
+	chmodInRoot = func(r *os.Root, name string, mode os.FileMode) error {
+		if err := r.Chmod(name, mode); err != nil {
+			return err
+		}
+		return r.Remove(name)
+	}
+	t.Cleanup(func() { chmodInRoot = prev })
+
+	// Spelled out rather than imported from the production consts: an operator's log
+	// query keys on these words, so a silent rename must fail here.
+	const notTightenedMsg = "prior pfx is more permissive than policy and could not be tightened"
+	const tightenedMsg = "tightened the file mode of a prior pfx"
+	const unreadableMsg = "cannot read prior pfx; regenerating"
+
+	logs := captureLogs(t)
+	current, err := s.isCurrent(t.Context(), "out.pfx", nil, convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("isCurrent(bundle removed mid-inspection) = error %v, want nil: an unreadable prior bundle is"+
+			" something this app fixes by rewriting, not a failure that flips health", err)
+	}
+	if current {
+		t.Error("isCurrent(bundle removed mid-inspection) = true, want false: a bundle that is not there cannot be the current one")
+	}
+	if got := logs.CountLevel(slog.LevelWarn, notTightenedMsg); got != 1 {
+		t.Errorf("isCurrent(bundle removed mid-inspection) logged %q at WARN %d times, want exactly 1: %q",
+			notTightenedMsg, got, logs.Messages())
+	}
+	if _, ok := logs.AttrValue(notTightenedMsg, "error"); !ok {
+		t.Errorf("isCurrent(bundle removed mid-inspection) logged %q without an error attribute, want the re-stat"+
+			" failure carried so the operator learns the mode was never observed: %q", notTightenedMsg, logs.Messages())
+	}
+	if got := logs.CountLevel(slog.LevelInfo, tightenedMsg); got != 0 {
+		t.Errorf("isCurrent(bundle removed mid-inspection) logged %q %d times, want 0: the chmod's result was never"+
+			" observed, so claiming the repair tells the operator the opposite of the truth: %q", tightenedMsg, got, logs.Messages())
+	}
+	if got := logs.CountLevel(slog.LevelWarn, unreadableMsg); got != 1 {
+		t.Errorf("isCurrent(bundle removed mid-inspection) logged %q at WARN %d times, want exactly 1: %q",
+			unreadableMsg, got, logs.Messages())
+	}
+	if !logs.HasAttr(unreadableMsg, "path", "out.pfx") {
+		t.Errorf("isCurrent(bundle removed mid-inspection) logged %q, want path=out.pfx so the operator can identify"+
+			" the bundle: %q", unreadableMsg, logs.Messages())
+	}
+	if _, ok := logs.AttrValue(unreadableMsg, "remediation"); !ok {
+		t.Errorf("isCurrent(bundle removed mid-inspection) logged %q without a remediation hint: %q", unreadableMsg, logs.Messages())
+	}
+}

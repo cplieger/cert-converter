@@ -322,3 +322,49 @@ func TestWatchMode_states_the_post_watch_set_sequence_once(t *testing.T) {
 		})
 	}
 }
+
+// TestAttachWatchSet_closes_the_watcher_it_could_not_give_a_watch_set pins the
+// same release on Run's initial mode selection: a watcher whose watch set could
+// not be built is closed HERE rather than handed back, because Run is about to
+// enter a long-lived poll mode where that fd and readEvents goroutine would
+// survive for the process's whole life. Every watcher this function DOES return is
+// closed by watchMode, which is pinned above; the discarded one had no test.
+//
+// The seam hands out real watchers and records the one the attempt discards, which
+// is the only way to observe a watcher the production path never returns; a closed
+// watcher refuses Add.
+// Not parallel: it swaps the package-level newFSWatcher seam.
+func TestAttachWatchSet_closes_the_watcher_it_could_not_give_a_watch_set(t *testing.T) {
+	newTestWatcher(t) // availability probe: skips where inotify is unavailable
+	prev := newFSWatcher
+	var made *fsnotify.Watcher
+	newFSWatcher = func() (*fsnotify.Watcher, error) {
+		fw, err := prev()
+		made = fw
+		return fw, err
+	}
+	t.Cleanup(func() {
+		newFSWatcher = prev
+		if made != nil {
+			_ = made.Close() // a watcher the attempt leaked must not outlive the test
+		}
+	})
+	missingRoot := filepath.Join(t.TempDir(), "missing")
+	w := New(missingRoot, func(context.Context) {}, WithFallback(time.Hour))
+
+	watcher, stopped := w.attachWatchSet(t.Context())
+
+	if watcher != nil {
+		watcher.Close()
+		t.Fatal("attachWatchSet(missing root) returned a watcher, want none so Run selects poll mode")
+	}
+	if stopped {
+		t.Fatal("attachWatchSet(missing root) stopped = true, want false: an unwatchable root is a degradation, not a shutdown")
+	}
+	if made == nil {
+		t.Fatal("attachWatchSet constructed no watcher; the watch-set-failure branch was not reached")
+	}
+	if err := made.Add(t.TempDir()); err == nil {
+		t.Error("attachWatchSet handed Run into poll mode with the unattachable watcher still open; its fd and readEvents goroutine would outlive the attempt")
+	}
+}

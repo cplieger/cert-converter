@@ -446,6 +446,34 @@ func TestInspect_rejects_more_than_one_shrouded_key_bag(t *testing.T) {
 	}
 }
 
+// TestInspect_rejects_a_non_v3_pfx_version pins the preamble version guard: every
+// profile this app writes is a v3 PFX and go-pkcs12's decoder refuses anything else
+// before it verifies the MAC, so a different version is not a bundle we wrote and
+// must not be reported as a known profile.
+func TestInspect_rejects_a_non_v3_pfx_version(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+
+	var preamble pfxPreamble
+	testASN1Unmarshal(t, pfx, &preamble)
+	preamble.Version = 1
+	got, err := Inspect(testASN1Marshal(t, preamble))
+	if !errors.Is(err, ErrProfileUnknown) {
+		t.Fatalf("Inspect(v1 pfx) = (%+v, %v), want ErrProfileUnknown", got, err)
+	}
+	if !strings.Contains(err.Error(), "pfx version 1, want 3") {
+		t.Errorf("Inspect(v1 pfx) = %v, want the refusal to name the version", err)
+	}
+}
+
 // testAuthenticatedSafes decodes the authenticated safe list out of a preamble.
 func testAuthenticatedSafes(t *testing.T, p *pfxPreamble) []contentInfo {
 	t.Helper()
