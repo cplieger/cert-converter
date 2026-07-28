@@ -223,13 +223,13 @@ func TestNoMatchError_names_a_public_key_type_that_cannot_be_compared(t *testing
 		PublicKey: testUncomparablePublicKey{},
 	}}}
 
-	err := g.noMatchError(1, 0, keyDefects{})
+	err := g.noMatchError(1, 0, keyDefects{}, skippedBlocks{})
 	if err == nil {
-		t.Fatal("noMatchError(1, 0, keyDefects{}) = nil, want the unverifiable-key-type diagnosis")
+		t.Fatal("noMatchError(1, 0, keyDefects{}, skippedBlocks{}) = nil, want the unverifiable-key-type diagnosis")
 	}
 	want := `certificate "CN=legacy-dsa.example.com" has a public key of type convert.testUncomparablePublicKey that cannot be verified against the private key`
 	if got := err.Error(); got != want {
-		t.Errorf("noMatchError(1, 0, keyDefects{}) = %q, want %q", got, want)
+		t.Errorf("noMatchError(1, 0, keyDefects{}, skippedBlocks{}) = %q, want %q", got, want)
 	}
 }
 

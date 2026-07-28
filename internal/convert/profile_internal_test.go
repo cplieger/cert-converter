@@ -271,16 +271,26 @@ func TestInspect_rejects_excessive_iterations_in_every_derivation_location(t *te
 	}
 }
 
-// mutateTestEncryptedSafe rewrites the content-encryption AlgorithmIdentifier of
-// the bundle's encrypted certificate safe.
-func mutateTestEncryptedSafe(t *testing.T, p *pfxPreamble, mutate func(*algorithmIdentifier)) {
+// mutateTestEncryptedData applies mutate to the decoded EncryptedData of the
+// bundle's encrypted certificate safe and re-encodes the safe around it. One home
+// for that re-encode, so a caller cannot forget to clear Content.FullBytes.
+func mutateTestEncryptedData(t *testing.T, p *pfxPreamble, mutate func(*encryptedData)) {
 	t.Helper()
 	mutateTestAuthenticatedSafe(t, p, oidEncryptedDataContentType, func(safe *contentInfo) {
 		var encrypted encryptedData
 		testASN1Unmarshal(t, safe.Content.Bytes, &encrypted)
-		mutate(&encrypted.EncryptedContentInfo.ContentEncryptionAlgorithm)
+		mutate(&encrypted)
 		safe.Content.Bytes = testASN1Marshal(t, encrypted)
 		safe.Content.FullBytes = nil
+	})
+}
+
+// mutateTestEncryptedSafe rewrites the content-encryption AlgorithmIdentifier of
+// the bundle's encrypted certificate safe.
+func mutateTestEncryptedSafe(t *testing.T, p *pfxPreamble, mutate func(*algorithmIdentifier)) {
+	t.Helper()
+	mutateTestEncryptedData(t, p, func(encrypted *encryptedData) {
+		mutate(&encrypted.EncryptedContentInfo.ContentEncryptionAlgorithm)
 	})
 }
 
@@ -500,13 +510,7 @@ func TestInspect_rejects_a_non_zero_encrypted_safe_version(t *testing.T) {
 
 	var preamble pfxPreamble
 	testASN1Unmarshal(t, pfx, &preamble)
-	mutateTestAuthenticatedSafe(t, &preamble, oidEncryptedDataContentType, func(safe *contentInfo) {
-		var encrypted encryptedData
-		testASN1Unmarshal(t, safe.Content.Bytes, &encrypted)
-		encrypted.Version = 7
-		safe.Content.Bytes = testASN1Marshal(t, encrypted)
-		safe.Content.FullBytes = nil
-	})
+	mutateTestEncryptedData(t, &preamble, func(encrypted *encryptedData) { encrypted.Version = 7 })
 	got, err := Inspect(testASN1Marshal(t, preamble))
 	if !errors.Is(err, ErrProfileUnknown) {
 		t.Fatalf("Inspect(encrypted safe v7) = (%+v, %v), want ErrProfileUnknown", got, err)
@@ -891,18 +895,14 @@ func TestInspect_rejects_more_safe_bags_than_it_admits(t *testing.T) {
 			var preamble pfxPreamble
 			testASN1Unmarshal(t, pfx, &preamble)
 			mutateTestAuthenticatedSafe(t, &preamble, oidDataContentType, func(safe *contentInfo) {
-				var inner []byte
-				testASN1Unmarshal(t, safe.Content.Bytes, &inner)
-				var bags []safeBag
-				testASN1Unmarshal(t, inner, &bags)
-				filler := bags[0]
-				filler.ID = rawOID(t, oidDataContentType)
-				for range tc.fillers {
-					bags = append(bags, filler)
-				}
-				safeDER := testASN1Marshal(t, bags)
-				safe.Content.Bytes = testASN1Marshal(t, safeDER)
-				safe.Content.FullBytes = nil
+				mutateTestSafeBags(t, safe, func(bags []safeBag) []safeBag {
+					filler := bags[0]
+					filler.ID = rawOID(t, oidDataContentType)
+					for range tc.fillers {
+						bags = append(bags, filler)
+					}
+					return bags
+				})
 			})
 			got, err := Inspect(testASN1Marshal(t, preamble))
 			if tc.wantErrText == "" {
@@ -1154,6 +1154,102 @@ func TestParseProfilePBKDF2_bounds_both_nested_identifiers(t *testing.T) {
 			}
 			if want := "object identifier exceeds"; !strings.Contains(err.Error(), want) {
 				t.Errorf("parseProfilePBKDF2(oversized %s) = %v, want the refusal to name %q", name, err, want)
+			}
+		})
+	}
+}
+
+// setTestAuthenticatedSafeDER wraps arbitrary AuthenticatedSafe DER in the OCTET
+// STRING the authSafe carries, so a test can hand the walk a payload that is not a
+// well-framed SEQUENCE OF ContentInfo. Distinct from setTestAuthenticatedSafes,
+// which frames a safe list correctly.
+func setTestAuthenticatedSafeDER(t *testing.T, p *pfxPreamble, der []byte) {
+	t.Helper()
+	p.AuthSafe.Content.Bytes = testASN1Marshal(t, der)
+	p.AuthSafe.Content.FullBytes = nil
+}
+
+// TestInspect_rejects_malformed_sequence_framing pins sequenceElements' two
+// framing refusals at both of its call sites: the authenticated-safe list and a
+// plaintext safe's bag list.
+//
+// The trailing-byte half is a parse differential, not a cosmetic check. These
+// bytes sit INSIDE an OCTET STRING payload, so the four trailing-byte refusals the
+// package already pins never see them: with the guard gone, Inspect identifies the
+// bundle as modern2023 from a PREFIX of a structure whose remaining bytes it never
+// reads, while the decoder acts on the whole file. The shape half refuses a payload
+// that is not a SEQUENCE at all, keeping every refusal in this parser diagnosable
+// as ErrProfileUnknown rather than a raw asn1 syntax error.
+//
+// Nothing else reaches either clause: every bundle this app writes is correctly
+// framed here, and FuzzInspect_boundedProfile cannot catch the trailing-byte case
+// because the mutated bundle is ACCEPTED as one of the four known profiles, which
+// satisfies that target's invariants.
+func TestInspect_rejects_malformed_sequence_framing(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name        string
+		wantErrText string
+		mutate      func(*testing.T, *pfxPreamble)
+	}{
+		{
+			name:        "trailing bytes after the authenticated safe list",
+			wantErrText: "trailing byte(s) after authenticated safe",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				setTestAuthenticatedSafeDER(t, p, append(testASN1Marshal(t, testAuthenticatedSafes(t, p)), 0x00))
+			},
+		},
+		{
+			name:        "an authenticated safe list that is not a SEQUENCE",
+			wantErrText: "authenticated safe is not a SEQUENCE",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				setTestAuthenticatedSafeDER(t, p, testASN1Marshal(t, 3))
+			},
+		},
+		{
+			name:        "trailing bytes after a plaintext safe's bag list",
+			wantErrText: "trailing byte(s) after plaintext safe bags",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestAuthenticatedSafe(t, p, oidDataContentType, func(safe *contentInfo) {
+					var inner []byte
+					testASN1Unmarshal(t, safe.Content.Bytes, &inner)
+					safe.Content.Bytes = testASN1Marshal(t, append(slices.Clone(inner), 0x00))
+					safe.Content.FullBytes = nil
+				})
+			},
+		},
+		{
+			name:        "a plaintext safe whose bag list is not a SEQUENCE",
+			wantErrText: "plaintext safe bags is not a SEQUENCE",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestAuthenticatedSafe(t, p, oidDataContentType, func(safe *contentInfo) {
+					safe.Content.Bytes = testASN1Marshal(t, testASN1Marshal(t, 3))
+					safe.Content.FullBytes = nil
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var preamble pfxPreamble
+			testASN1Unmarshal(t, pfx, &preamble)
+			tc.mutate(t, &preamble)
+			got, err := Inspect(testASN1Marshal(t, preamble))
+			if !errors.Is(err, ErrProfileUnknown) {
+				t.Fatalf("Inspect(%s) = (%+v, %v), want ErrProfileUnknown", tc.name, got, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrText) {
+				t.Errorf("Inspect(%s) = %v, want the refusal to name %q", tc.name, err, tc.wantErrText)
 			}
 		})
 	}

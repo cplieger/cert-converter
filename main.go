@@ -116,6 +116,8 @@ func volumesReady(dirs []volumeDir) bool {
 // runProbe is a seam: health.RunProbe exits the process, so tests replace it.
 var runProbe = health.RunProbe
 
+const healthSubcommand = "health"
+
 // dispatchArgs runs the health probe when argv requests it and REJECTS an
 // unrecognized argument. It returns the process exit code, or
 // continueToWatcher when argv asks for the watcher. Returning rather than
@@ -126,7 +128,7 @@ func dispatchArgs(args []string) int {
 		return continueToWatcher
 	}
 	switch {
-	case len(args) == 2 && args[1] == "health":
+	case len(args) == 2 && args[1] == healthSubcommand:
 		// The fallback rescan is the marker's guaranteed refresh floor
 		// (fs events refresh it sooner), so a marker older than 3 fallback
 		// intervals means the watch loop is wedged and a restart fixes it.
@@ -153,7 +155,9 @@ func dispatchArgs(args []string) int {
 		//
 		// The ENTRYPOINT takes no arguments, so anything here is a mistake and a
 		// usage error is the honest response.
-		if len(args) == 2 {
+		if args[1] != healthSubcommand {
+			// Names the unrecognized token even when extra operands follow it: the
+			// token IS the mistake, and reporting only the operands hides it.
 			fmt.Fprintf(os.Stderr, "cert-watcher: unrecognized argument %q\n", args[1])
 		} else {
 			fmt.Fprintf(os.Stderr, "cert-watcher: unexpected trailing arguments %q\n", args[2:])

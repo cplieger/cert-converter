@@ -117,11 +117,8 @@ type certScan struct {
 func (s *certScan) visit(block *pem.Block) error {
 	if block.Type != pemTypeCertificate {
 		s.skipped.add(block.Type)
-		// A private-key block is an expected passenger: a combined cert+key file
-		// is a supported input, so it is skipped silently, as is the EC PARAMETERS
-		// block OpenSSL writes beside an EC key. Anything else was neither a
-		// certificate this app can put in the bundle nor a key companion, and the
-		// operator hears about it.
+		// Only a label naming neither a certificate nor a key companion is reported;
+		// isExpectedCertFilePassenger owns that set.
 		if !isExpectedCertFilePassenger(block.Type) {
 			s.unrelated.add(block.Type)
 		}

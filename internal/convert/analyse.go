@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -196,7 +197,7 @@ func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 		return Analysis{}, err
 	}
 
-	identity, tieObs, err := g.selectIdentity(in.signers, in.keyIssues)
+	identity, tieObs, err := g.selectIdentity(in.signers, in.keyIssues, in.certIssues)
 	if err != nil {
 		return Analysis{}, err
 	}
@@ -255,7 +256,13 @@ type analysisInput struct {
 	// that yielded none.
 	signers      []crypto.Signer
 	observations []Observation
-	keyIssues    keyDefects
+	// certIssues are the certificate-file PEM blocks that were neither a
+	// certificate nor an expected key companion. Carried alongside keyIssues
+	// rather than only as an observation, because the observations are dropped
+	// when identity selection fails, and that is exactly when a certificate-shaped
+	// block left out of the bundle is the likely cause of the mismatch.
+	certIssues skippedBlocks
+	keyIssues  keyDefects
 	// duplicateCerts is how many blocks dedupeCerts removed, which the
 	// leaf-not-first observation needs to name the original block count.
 	duplicateCerts int
@@ -321,6 +328,7 @@ func prepareAnalysisInput(certPEM, keyPEM []byte) (analysisInput, error) {
 		signers:        signers,
 		observations:   obs,
 		keyIssues:      keyIssues,
+		certIssues:     unrelatedBlocks,
 		duplicateCerts: dupCerts,
 	}, nil
 }
@@ -350,13 +358,27 @@ type certGraph struct {
 	// fallback, verifies a pair whose names are semantically equal but whose
 	// encodings differ, which is exactly the edge the candidate graph deliberately
 	// does not record. It is bounded the same way — one pass over the certificates
-	// of the one bundle, only for the selected identity.
+	// of the one bundle, per certificate a supplied key matched: dropIssuerMatches
+	// asks BEFORE selection, once for every match, and analyseAt's role check asks
+	// again for the one it picked. Every ask goes through this memo, so a pair is
+	// still verified at most once per analysis and the total stays inside the same
+	// maxChainCerts-squared envelope the candidate-edge walks already pay. Anything
+	// that function recomputes per call is paid up to that many times, which is why
+	// the raw names it decodes are memoised too (decodedSubjects/decodedIssuers).
 	verified map[[2]int]bool
 	// selfSigned memoises the self-signature check per certificate, for the same
 	// reason verified memoises edges: it is a real signature verification whose cost
 	// the input file dictates, and three places ask — the root set, every hop of
 	// pathFrom, and assembleChain's self-signed carve-out.
 	selfSigned map[int]bool
+	// decodedSubjects[i] / decodedIssuers[i] memoise the ASN.1-decoded raw subject
+	// and issuer names, for the same reason verified memoises edges: the decode is
+	// O(name size) work the FILE dictates, and isIssuerByName re-asks for the
+	// subject and the issuer of every certificate on every call. Measured on a
+	// 64-block, 8.87 MB bundle inside both existing caps: 12.4s of a 15.2s Analyse
+	// went on those repeated decodes, against 97ms to parse all 64 blocks once.
+	decodedSubjects []decodedDN
+	decodedIssuers  []decodedDN
 	// candidateParents[i]: indices that are plausibly issuers of certs[i], by key
 	// identifier or by issuer/subject name, whether or not a signature could be
 	// verified. The inclusive signal, used to assemble the emitted chain, where
@@ -483,6 +505,8 @@ func newCertGraph(certs []*x509.Certificate, now time.Time) (*certGraph, error) 
 		children:         make([][]int, len(certs)),
 		verified:         make(map[[2]int]bool),
 		selfSigned:       make(map[int]bool, len(certs)),
+		decodedSubjects:  make([]decodedDN, len(certs)),
+		decodedIssuers:   make([]decodedDN, len(certs)),
 	}
 	for child := range certs {
 		for parent := range certs {
@@ -683,7 +707,7 @@ func (g *certGraph) isIssuer(i int) bool {
 // equality only decides which pairs are worth checking.
 func (g *certGraph) isIssuerByName(i int) bool {
 	parent := g.certs[i]
-	parentSubject, parentOK := decodedName(parent.RawSubject)
+	parentSubject, parentOK := g.subjectName(i)
 	if !parentOK {
 		return false
 	}
@@ -691,14 +715,14 @@ func (g *certGraph) isIssuerByName(i int) bool {
 		if child == i {
 			continue
 		}
-		childIssuer, issuerOK := decodedName(cert.RawIssuer)
+		childIssuer, issuerOK := g.issuerName(child)
 		if !issuerOK || !reflect.DeepEqual(childIssuer, parentSubject) {
 			continue
 		}
 		// The key-reuse exclusion, same as plausibleIssuer's: a name the decoder
 		// cannot read is not admitted either, because the exclusion cannot be
 		// applied to it.
-		childSubject, subjectOK := decodedName(cert.RawSubject)
+		childSubject, subjectOK := g.subjectName(child)
 		if !subjectOK {
 			continue
 		}
@@ -723,6 +747,34 @@ func decodedName(raw []byte) (pkix.RDNSequence, bool) {
 		return nil, false
 	}
 	return seq, true
+}
+
+// decodedDN is one memoised raw-name decode: the decoded sequence, whether the
+// decode succeeded, and whether it has been attempted at all (a name that cannot
+// be decoded is a legitimate result worth caching, so "not yet asked" needs its
+// own flag).
+type decodedDN struct {
+	seq    pkix.RDNSequence
+	ok     bool
+	cached bool
+}
+
+// subjectName is decodedName over certs[i]'s raw subject, memoised.
+func (g *certGraph) subjectName(i int) (pkix.RDNSequence, bool) {
+	if !g.decodedSubjects[i].cached {
+		seq, ok := decodedName(g.certs[i].RawSubject)
+		g.decodedSubjects[i] = decodedDN{seq: seq, ok: ok, cached: true}
+	}
+	return g.decodedSubjects[i].seq, g.decodedSubjects[i].ok
+}
+
+// issuerName is decodedName over certs[i]'s raw issuer, memoised.
+func (g *certGraph) issuerName(i int) (pkix.RDNSequence, bool) {
+	if !g.decodedIssuers[i].cached {
+		seq, ok := decodedName(g.certs[i].RawIssuer)
+		g.decodedIssuers[i] = decodedDN{seq: seq, ok: ok, cached: true}
+	}
+	return g.decodedIssuers[i].seq, g.decodedIssuers[i].ok
 }
 
 // isSelfSigned reports whether certs[i] is its own issuer, which is what makes it
@@ -833,12 +885,12 @@ func (g *certGraph) distancesFromRoots(roots []int, edgeOK func(child, parent in
 
 // selectIdentity resolves which certificate and key form the identity, matching
 // every key against every certificate rather than against a positional guess.
-func (g *certGraph) selectIdentity(signers []crypto.Signer, keyIssues keyDefects) (identityMatch, []Observation, error) {
+func (g *certGraph) selectIdentity(signers []crypto.Signer, keyIssues keyDefects, certIssues skippedBlocks) (identityMatch, []Observation, error) {
 	matches, firstUnverifiable := g.collectMatches(signers)
 	matches, issuerObs := g.dropIssuerMatches(matches)
 	switch len(matches) {
 	case 0:
-		return identityMatch{}, nil, g.noMatchError(len(signers), firstUnverifiable, keyIssues)
+		return identityMatch{}, nil, g.noMatchError(len(signers), firstUnverifiable, keyIssues, certIssues)
 	case 1:
 		return matches[0], issuerObs, nil
 	default:
@@ -920,8 +972,13 @@ func (g *certGraph) collectMatches(signers []crypto.Signer) (matches []identityM
 // no key at all are named after the base sentence (keyDefects.suffix), because
 // the count in that sentence is of USABLE keys: a mid-rotation key file whose
 // appended block is damaged otherwise reads as "the key does not match the
-// certificate" with no hint that half the file was unreadable.
-func (g *certGraph) noMatchError(keyCount, firstUnverifiable int, keyIssues keyDefects) error {
+// certificate" with no hint that half the file was unreadable. The same sentence
+// also names the certificate-file blocks that were neither a certificate nor a
+// private key, because the observation that reports them (ObsUnrelatedBlocksSkipped)
+// is only reachable when the analysis SUCCEEDS: a chain link relabelled "TRUSTED
+// CERTIFICATE" by `openssl x509 -trustout` is a common cause of exactly this
+// mismatch, and without the clause nothing anywhere names it.
+func (g *certGraph) noMatchError(keyCount, firstUnverifiable int, keyIssues keyDefects, certIssues skippedBlocks) error {
 	if firstUnverifiable >= 0 {
 		c := g.certs[firstUnverifiable]
 		if c.PublicKey == nil {
@@ -938,9 +995,14 @@ func (g *certGraph) noMatchError(keyCount, firstUnverifiable int, keyIssues keyD
 			"certificate %q has a public key of type %T that cannot be verified against the private key",
 			boundSubject(c.Subject.String()), c.PublicKey)
 	}
-	return fmt.Errorf(
+	msg := fmt.Sprintf(
 		"none of the %d private key block(s) matches any of the %d certificate(s) in the chain%s",
 		keyCount, len(g.certs), keyIssues.suffix())
+	if certIssues.count > 0 {
+		msg += fmt.Sprintf("; the certificate file also holds %d block(s) that are neither a certificate nor a private key and were left out of the bundle (first %q)",
+			certIssues.count, certIssues.firstTypeForLog())
+	}
+	return errors.New(msg)
 }
 
 // resolveAmbiguousMatches rules on more than one (key, certificate) match.

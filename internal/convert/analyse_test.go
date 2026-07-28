@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -19,11 +20,7 @@ import (
 
 // concatPEM joins PEM blobs in the given order.
 func concatPEM(blobs ...[]byte) []byte {
-	var out []byte
-	for _, b := range blobs {
-		out = append(out, b...)
-	}
-	return out
+	return slices.Concat(blobs...)
 }
 
 // truncatedKeyBlock returns a key declaration whose armour is cut off mid-body,
@@ -776,5 +773,62 @@ func TestAnalyse_reports_no_key_block_observation_for_a_clean_key_file(t *testin
 	if hasObservation(got.Observations(), convert.ObsUnusableKeyBlocksSkipped) {
 		t.Errorf("observations = %v, want no %q for a key file whose every block yielded a key",
 			got.Observations(), convert.ObsUnusableKeyBlocksSkipped)
+	}
+}
+
+// TestAnalyse_names_the_original_block_number_of_a_leaf_that_is_not_first pins the
+// only thing dedupeCerts' kept-at mapping exists for: the leaf-not-first
+// observation names the block number an operator will find in THEIR file, not a
+// post-dedupe position. Every existing test asserts the observation's KIND alone,
+// so a mapping that regressed to the deduped index still reports a plausible
+// "block N of M" and the operator opens the wrong block. The bundle repeats the CA
+// ahead of the leaf, which is what makes the two numbers differ (block 3 of 3
+// against a deduped 2 of 2).
+func TestAnalyse_names_the_original_block_number_of_a_leaf_that_is_not_first(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+
+	got, err := convert.Analyse(concatPEM(m.CAPEM, m.CAPEM, m.LeafPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("Analyse(duplicated CA ahead of the leaf) = error %v, want nil", err)
+	}
+	var detail string
+	for _, o := range got.Observations() {
+		if o.Kind == convert.ObsLeafNotFirst {
+			detail = o.Detail
+		}
+	}
+	if detail == "" {
+		t.Fatalf("observations = %v, want one of kind %q", got.Observations(), convert.ObsLeafNotFirst)
+	}
+	const want = "the end-entity certificate is block 3 of 3, not the first; the bundle was reordered leaf-first"
+	if detail != want {
+		t.Errorf("observation detail = %q, want %q: the block number and the total must count the blocks in the input file, duplicates included", detail, want)
+	}
+}
+
+// TestAnalysis_Observations_returns_a_copy pins the copy semantics Observations
+// documents. It is the whole of Analysis's exported surface, and the value is
+// handed back to Encode and CheckCurrency afterwards, so a caller that filters or
+// sorts the returned slice in place must not be able to rewrite the analysis it
+// came from.
+func TestAnalysis_Observations_returns_a_copy(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+
+	// A duplicated certificate guarantees at least one observation to mutate.
+	got, err := convert.Analyse(concatPEM(m.LeafPEM, m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("Analyse(duplicated leaf) = error %v, want nil", err)
+	}
+	first := got.Observations()
+	if len(first) == 0 {
+		t.Fatal("Analyse(duplicated leaf) reported no observations, so this test cannot pin the copy")
+	}
+	first[0] = convert.Observation{Kind: "clobbered-by-the-caller"}
+
+	second := got.Observations()
+	if second[0].Kind == "clobbered-by-the-caller" {
+		t.Errorf("Observations()[0] = %q after the caller overwrote its own slice, want the analysis unchanged", second[0].Kind)
 	}
 }

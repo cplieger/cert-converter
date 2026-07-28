@@ -1,7 +1,6 @@
 package process
 
 import (
-	"context"
 	"errors"
 	"io/fs"
 	"log/slog"
@@ -102,7 +101,7 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 
 		logs := captureLogs(t)
 		s := &store{root: root}
-		_, safe, err := s.orphans(context.Background(), map[string]struct{}{})
+		_, safe, err := s.orphans(t.Context(), map[string]struct{}{})
 		if err != nil {
 			t.Fatalf("orphans = %v, want nil: one unreadable sub-path must not abort the walk", err)
 		}
@@ -127,7 +126,7 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 
 		logs := captureLogs(t)
 		s := &store{root: root}
-		_, safe, err := s.orphans(context.Background(), map[string]struct{}{})
+		_, safe, err := s.orphans(t.Context(), map[string]struct{}{})
 		if err != nil {
 			t.Fatalf("orphans = %v, want nil", err)
 		}
@@ -136,7 +135,7 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 		}
 
 		assertDebugOnly(t, logs, "output tree contains a symlink", "loop")
-		assertOneAggregateWarn(t, logs, "orphan removal is disabled for this scan", "1")
+		assertOneAggregateWarn(t, logs, "output tree contains symlinks", "1")
 	})
 }
 
@@ -177,19 +176,77 @@ func assertDebugOnly(t *testing.T, logs *capture.Recorder, msg, wantPath string)
 // condition once per scan regardless of how many paths are affected.
 func assertOneAggregateWarn(t *testing.T, logs *capture.Recorder, msg, wantCount string) {
 	t.Helper()
-	if got := logs.CountLevel(slog.LevelWarn, ""); got != 1 {
-		t.Fatalf("got %d WARN records, want exactly 1 aggregate: %q", got, logs.Messages())
+	assertWarnRecords(t, logs, 1)
+	assertAggregateWarnCount(t, logs, msg, wantCount)
+}
+
+// assertWarnRecords requires exactly want WARN records in the batch, whatever they
+// say. The count is the policy: the default level reports each condition once per
+// scan, so an extra record means one condition was reported twice and a missing one
+// means it was not reported at all.
+func assertWarnRecords(t *testing.T, logs *capture.Recorder, want int) {
+	t.Helper()
+	if got := logs.CountLevel(slog.LevelWarn, ""); got != want {
+		t.Fatalf("got %d WARN records, want exactly %d: %q", got, want, logs.Messages())
 	}
+}
+
+// assertAggregateWarnCount requires one WARN record carrying msg, with wantCount in
+// its count attribute and a remediation hint. Unlike assertOneAggregateWarn it does
+// not require msg to be the batch's only WARN, because the orphan walk's two
+// disabling conditions are independent and one scan can report both.
+func assertAggregateWarnCount(t *testing.T, logs *capture.Recorder, msg, wantCount string) {
+	t.Helper()
 	if got := logs.CountLevel(slog.LevelWarn, msg); got != 1 {
-		t.Errorf("aggregate WARN = %q, want it to contain %q", logs.Messages(), msg)
+		t.Errorf("%q logged at WARN %d times, want exactly 1: %q", msg, got, logs.Messages())
 	}
 	if !logs.HasAttr(msg, "count", wantCount) {
 		got, _ := logs.AttrValue(msg, "count")
-		t.Errorf("aggregate WARN count = %q, want %q", got, wantCount)
+		t.Errorf("aggregate WARN %q count = %q, want %q", msg, got, wantCount)
 	}
 	if _, ok := logs.AttrValue(msg, "remediation"); !ok {
 		t.Errorf("aggregate WARN %q has no remediation hint: it is the only line the operator sees", msg)
 	}
+}
+
+// TestStoreLogOrphanWalkOutcome_reports_each_disabling_condition pins both aggregate
+// WARNs of the orphan walk by calling the reporter directly, so the contract holds
+// whatever uid the suite runs as: the walk-level subtest above can only produce an
+// unreadable output path with a chmod, which does nothing under uid 0. It also pins
+// that the two conditions are reported INDEPENDENTLY -- a scan can hit both, and
+// collapsing them would hide one behind the other.
+func TestStoreLogOrphanWalkOutcome_reports_each_disabling_condition(t *testing.T) {
+	const unreadableMsg = "some output paths could not be read while looking for orphans; orphan removal is disabled for this scan"
+	const symlinkMsg = "output tree contains symlinks; orphan removal is disabled for this scan because writes and the orphan walk resolve paths differently"
+
+	root, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	s := &store{root: root}
+
+	t.Run("unreadable output paths are reported with their count", func(t *testing.T) {
+		logs := captureLogs(t)
+		s.logOrphanWalkOutcome(2, 0)
+		assertWarnRecords(t, logs, 1)
+		assertAggregateWarnCount(t, logs, unreadableMsg, "2")
+	})
+
+	t.Run("symlinked output paths are reported with their count", func(t *testing.T) {
+		logs := captureLogs(t)
+		s.logOrphanWalkOutcome(0, 3)
+		assertWarnRecords(t, logs, 1)
+		assertAggregateWarnCount(t, logs, symlinkMsg, "3")
+	})
+
+	t.Run("both conditions are reported independently", func(t *testing.T) {
+		logs := captureLogs(t)
+		s.logOrphanWalkOutcome(1, 4)
+		assertWarnRecords(t, logs, 2)
+		assertAggregateWarnCount(t, logs, unreadableMsg, "1")
+		assertAggregateWarnCount(t, logs, symlinkMsg, "4")
+	})
 }
 
 // TestWalkLogPolicy_quiet_when_nothing_is_wrong pins the steady state: a readable
@@ -205,10 +262,67 @@ func TestWalkLogPolicy_quiet_when_nothing_is_wrong(t *testing.T) {
 
 	logs := captureLogs(t)
 	s := &store{root: root}
-	if _, safe, orphanErr := s.orphans(context.Background(), map[string]struct{}{}); orphanErr != nil || !safe {
+	if _, safe, orphanErr := s.orphans(t.Context(), map[string]struct{}{}); orphanErr != nil || !safe {
 		t.Fatalf("orphans(clean tree) = safe %v, err %v; want true, nil", safe, orphanErr)
 	}
 	if logs.Len() != 0 {
 		t.Errorf("orphans(clean tree) logged %q, want no output at all", logs.Messages())
 	}
+}
+
+// TestLogIncompleteInputEnumeration_quiet_arms pins which reasons for skipping
+// orphan reconciliation reach the operator and which stay at DEBUG.
+//
+// The default-level line here is an alert-worthy WARN whose remediation points at
+// the /input mount, so the two arms that must NOT reach it are the contract: a
+// shutdown (every graceful container stop lands mid-scan sooner or later) and a
+// clean walk that simply found no pair yet (a deployment whose first certificate has
+// not been issued, on every scan). Lose either arm and the alert fires with a
+// diagnosis the operator cannot act on. The third case is the converse: a genuinely
+// incomplete enumeration must still reach WARN with its hint.
+//
+// Runs serially: it swaps slog.Default().
+func TestLogIncompleteInputEnumeration_quiet_arms(t *testing.T) {
+	const mountWarn = "orphan removal is disabled for this scan: the scan did not fully enumerate the input tree, so no output can be proven orphaned"
+
+	t.Run("a shutdown is not an operator-actionable incomplete enumeration", func(t *testing.T) {
+		logs := captureLogs(t)
+		logIncompleteInputEnumeration(&reapContext{shutdown: true})
+		const dbg = "skipping orphan reconciliation; scan cancelled during shutdown"
+		if got := logs.CountLevel(slog.LevelWarn, ""); got != 0 {
+			t.Fatalf("logIncompleteInputEnumeration(shutdown) logged %d WARN records, want 0: a container"+
+				" stop must not raise the /input-mount warning: %q", got, logs.Messages())
+		}
+		if got := logs.CountLevel(slog.LevelDebug, dbg); got != 1 {
+			t.Errorf("logIncompleteInputEnumeration(shutdown) logged %q at DEBUG %d times, want exactly 1: %q",
+				dbg, got, logs.Messages())
+		}
+	})
+
+	t.Run("a clean walk that found no pair is not a mount problem", func(t *testing.T) {
+		logs := captureLogs(t)
+		logIncompleteInputEnumeration(&reapContext{walkCompleted: true})
+		const dbg = "skipping orphan reconciliation; the scan found no certificate pairs to compare the output tree against"
+		if got := logs.CountLevel(slog.LevelWarn, ""); got != 0 {
+			t.Fatalf("logIncompleteInputEnumeration(empty clean tree) logged %d WARN records, want 0: an"+
+				" empty /input is already reported once by the input-coverage warning: %q", got, logs.Messages())
+		}
+		if got := logs.CountLevel(slog.LevelDebug, dbg); got != 1 {
+			t.Errorf("logIncompleteInputEnumeration(empty clean tree) logged %q at DEBUG %d times, want exactly 1: %q",
+				dbg, got, logs.Messages())
+		}
+	})
+
+	t.Run("a genuinely incomplete walk warns with the mount remediation", func(t *testing.T) {
+		logs := captureLogs(t)
+		logIncompleteInputEnumeration(&reapContext{result: ScanResult{Total: 2, Unreadable: 1}, walkCompleted: true})
+		if got := logs.CountLevel(slog.LevelWarn, mountWarn); got != 1 {
+			t.Fatalf("logIncompleteInputEnumeration(unreadable path) logged %q, want %q once at WARN",
+				logs.Messages(), mountWarn)
+		}
+		if _, ok := logs.AttrValue(mountWarn, "remediation"); !ok {
+			t.Errorf("logIncompleteInputEnumeration(unreadable path) logged %q with no remediation hint: it is"+
+				" the only line the operator sees", logs.Messages())
+		}
+	})
 }

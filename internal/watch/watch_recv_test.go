@@ -88,14 +88,14 @@ func TestHandleErrorRecv_stops_on_close_and_resyncs_on_overflow(t *testing.T) {
 
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
-	if got := w.handleErrorRecv(t.Context(), watcher, st, nil, false); got {
-		t.Error("handleErrorRecv(ok=false) = true, want false so watchLoop exits and the process restarts")
+	if got := w.handleErrorRecv(t.Context(), watcher, st, nil, false); got != errErrorsChannelClosed {
+		t.Errorf("handleErrorRecv(ok=false) = %v, want the errors-channel-closed loss (%v) so watchLoop exits and the process restarts", got, errErrorsChannelClosed)
 	}
 
 	overflowState := newWatchState(w)
 	t.Cleanup(overflowState.stop)
-	if got := w.handleErrorRecv(t.Context(), watcher, overflowState, fsnotify.ErrEventOverflow, true); !got {
-		t.Error("handleErrorRecv(ErrEventOverflow) = false, want true (an overflow is recoverable, not fatal)")
+	if got := w.handleErrorRecv(t.Context(), watcher, overflowState, fsnotify.ErrEventOverflow, true); got != nil {
+		t.Errorf("handleErrorRecv(ErrEventOverflow) = %v, want nil (an overflow is recoverable, not fatal)", got)
 	}
 	if !overflowState.pending {
 		t.Error("handleErrorRecv(ErrEventOverflow) did not schedule a rescan; a renewal in the dropped events would be missed")
@@ -107,8 +107,8 @@ func TestHandleErrorRecv_stops_on_close_and_resyncs_on_overflow(t *testing.T) {
 
 	otherState := newWatchState(w)
 	t.Cleanup(otherState.stop)
-	if got := w.handleErrorRecv(t.Context(), watcher, otherState, errors.New("transient watcher failure"), true); !got {
-		t.Error("handleErrorRecv(non-overflow error) = false, want true (the loop keeps running)")
+	if got := w.handleErrorRecv(t.Context(), watcher, otherState, errors.New("transient watcher failure"), true); got != nil {
+		t.Errorf("handleErrorRecv(non-overflow error) = %v, want nil (the loop keeps running)", got)
 	}
 	if otherState.pending {
 		t.Error("handleErrorRecv(non-overflow error) scheduled a scan; want the error logged only")
@@ -177,8 +177,8 @@ func TestHandleErrorRecv_keeps_the_loop_running_when_the_overflow_resync_fails(t
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
-	if got := w.handleErrorRecv(t.Context(), watcher, st, fsnotify.ErrEventOverflow, true); !got {
-		t.Error("handleErrorRecv(overflow, re-sync failing) = false, want true: a failed re-sync is warned about, not fatal to the loop")
+	if got := w.handleErrorRecv(t.Context(), watcher, st, fsnotify.ErrEventOverflow, true); got != nil {
+		t.Errorf("handleErrorRecv(overflow, re-sync failing) = %v, want nil: a failed re-sync is warned about, not fatal to the loop", got)
 	}
 	if !st.pending {
 		t.Error("handleErrorRecv(overflow, re-sync failing) did not schedule the recovery rescan; a renewal in the dropped events would be missed")
@@ -204,8 +204,8 @@ func TestHandleErrorRecv_does_not_resync_the_watch_set_for_a_benign_error(t *tes
 		t.Fatal(err)
 	}
 
-	if got := w.handleErrorRecv(t.Context(), watcher, st, errors.New("transient watcher failure"), true); !got {
-		t.Error("handleErrorRecv(non-overflow error) = false, want true (the loop keeps running)")
+	if got := w.handleErrorRecv(t.Context(), watcher, st, errors.New("transient watcher failure"), true); got != nil {
+		t.Errorf("handleErrorRecv(non-overflow error) = %v, want nil (the loop keeps running)", got)
 	}
 	if watched := watcher.WatchList(); slices.Contains(watched, late) {
 		t.Errorf("handleErrorRecv(non-overflow error) re-walked the tree and picked up %q; only an event-queue overflow warrants a full re-sync", late)

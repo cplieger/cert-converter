@@ -268,8 +268,9 @@ func allowEmptyPassword(raw string) bool {
 	return false
 }
 
-// checkPasswordEncodable rejects password shapes PKCS#12 cannot preserve.
-// Empty-password policy is handled separately by PFX_ALLOW_EMPTY_PASSWORD.
+// checkPasswordEncodable rejects password shapes PKCS#12 cannot preserve. The empty
+// password is not one of them — InspectPasswordEncoding reports it as encodable — so
+// this gate accepts it and PFX_ALLOW_EMPTY_PASSWORD owns whether it may be used.
 //
 // A startup refusal rather than a warning: a non-BMP rune fails every Encode, so the
 // container would be unhealthy on every tick, while invalid UTF-8 (each bad byte
@@ -285,9 +286,6 @@ func allowEmptyPassword(raw string) bool {
 // This startup gate fails before scanning, while Encode's codec-level guard protects
 // callers that bypass config loading — both are wanted.
 func checkPasswordEncodable(password string) error {
-	if password == "" {
-		return nil
-	}
 	switch convert.InspectPasswordEncoding(password).Primary() {
 	case convert.PasswordInvalidUTF8:
 		return fmt.Errorf("%w: not valid UTF-8, so every invalid byte would be encoded as U+FFFD and generated PFX files would be protected by a different, lower-entropy password than the configured secret; supply a text secret (for example base64) instead of raw binary bytes", ErrUnencodablePassword)
@@ -533,4 +531,25 @@ func logPasswordDelivery(source envx.SecretSource, password string, blankSecretF
 			"source", string(source),
 			"remediation", "supply the secret on a single line (openssl rand -base64 wraps at 64 columns; add -A) so whatever opens the .pfx can reproduce the password")
 	}
+	// An invisible FORMAT character survives every guard above: it is valid UTF-8,
+	// inside the BMP, not a NUL, not a control character, and not whitespace, so
+	// envx does not trim it and checkPasswordEncodable accepts it. A UTF-8 BOM left
+	// by an editor that saved the mounted secret as "UTF-8 with BOM", or a
+	// zero-width space pasted from a web page, therefore becomes part of the
+	// password with nothing to show for it: the bundle is written, health stays
+	// green, and the .pfx cannot be opened with the secret's visible contents.
+	if !isBlank(password) && strings.ContainsFunc(password, isFormatRune) {
+		slog.Warn("the PFX password contains an invisible Unicode formatting character (byte-order mark, zero-width space, or soft hyphen), which is embedded verbatim in every PFX file and cannot be reproduced from the secret's visible contents",
+			"source", string(source),
+			"remediation", "rewrite the secret without the invisible character (an editor saving the secret file as \"UTF-8 with BOM\" is the usual cause; printf %s writes the value verbatim)")
+	}
+}
+
+// isFormatRune reports whether r is a Unicode FORMAT character (category Cf): a
+// byte-order mark, a zero-width space, a soft hyphen, or a word joiner. Kept
+// separate from unicode.IsControl, whose category (Cc) is disjoint from this one,
+// so a password carrying both shapes gets one record per shape rather than two
+// records about the same rune.
+func isFormatRune(r rune) bool {
+	return unicode.Is(unicode.Cf, r)
 }

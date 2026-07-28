@@ -442,6 +442,11 @@ func TestDispatchArgs_usage_error_names_the_offending_argument(t *testing.T) {
 			args:      []string{"cert-watcher", "health", "typo"},
 			wantParts: []string{`unexpected trailing arguments ["typo"]`, "usage: cert-watcher", "cert-watcher health"},
 		},
+		{
+			name:      "an unrecognized argument is named even with trailing operands",
+			args:      []string{"cert-watcher", "helth", "now"},
+			wantParts: []string{`unrecognized argument "helth"`, "usage: cert-watcher"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			prev := runProbe
@@ -565,6 +570,35 @@ func TestReportWatchExit_announces_dead_change_detection_exactly_once(t *testing
 	})
 }
 
+// shutdownCause is a distinguishable cancellation cause: for a plain
+// cancel(), context.Cause(ctx) and ctx.Err() both render as "context
+// canceled", so a test built on cancel() cannot tell the two apart.
+type shutdownCause struct{}
+
+func (shutdownCause) Error() string { return "terminated-under-test" }
+
+// TestReportWatchExit_shutdown_names_the_cancellation_cause pins the only
+// operator-visible detail of the clean-shutdown path: the reason attr names
+// WHICH signal stopped the container. reportWatchExit reports
+// context.Cause(ctx), which signal.NotifyContext sets to the signal that was
+// received; replacing it with ctx.Err() or dropping the attr turns every stop
+// into an indistinguishable "context canceled" and leaves the rest of this
+// file green.
+// Serial (no t.Parallel): it swaps the process-global slog default.
+func TestReportWatchExit_shutdown_names_the_cancellation_cause(t *testing.T) {
+	logs := capture.Default(t)
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(shutdownCause{})
+
+	if got := reportWatchExit(ctx, nil); got != 0 {
+		t.Fatalf("reportWatchExit(nil) = %d, want 0: a clean shutdown is not a failure", got)
+	}
+	if !logs.AttrContains("shutting down", "reason", "terminated-under-test") {
+		t.Errorf("the shutdown record carries no cancellation cause in its reason attr, so an operator cannot tell which signal stopped the container; got logs %q", logs.Messages())
+	}
+}
+
 func TestHealthyAfterScan(t *testing.T) {
 	t.Parallel()
 
@@ -585,6 +619,46 @@ func TestHealthyAfterScan(t *testing.T) {
 				t.Errorf("healthyAfterScan(%+v) = %v, want %v", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestRun_argv_dispatch_precedes_the_log_level_diagnostic pins the ORDER of
+// run()'s first two steps, which nothing else in this package can see: the
+// invalid-LOG_LEVEL WARN sits BELOW the argv dispatch on purpose, because the
+// health subcommand re-reads LOG_LEVEL on every probe (roughly every 30s under
+// the image's HEALTHCHECK), so a WARN above the dispatch turns one startup line
+// into a permanent stream. TestDispatchArgs_health_probe_emits_no_startup_diagnostics
+// calls dispatchArgs directly and therefore cannot see the ordering at all:
+// moving those three lines up in run() leaves this whole file green without
+// this test.
+//
+// The unrecognized-argument path is the cheap way in: dispatchArgs returns
+// exitUsage, so run() returns before it touches the health marker, the config,
+// or the /input and /output mounts. Asserting the quoted usage line first is
+// the precondition that keeps the absence assertion from passing vacuously.
+// Serial (no t.Parallel): it uses t.Setenv and swaps os.Args, os.Stderr and the
+// process-global slog default.
+func TestRun_argv_dispatch_precedes_the_log_level_diagnostic(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "bogus")
+
+	prevArgs, prevLogger := os.Args, slog.Default()
+	os.Args = []string{"cert-watcher", "helth"}
+	t.Cleanup(func() {
+		os.Args = prevArgs
+		slog.SetDefault(prevLogger)
+	})
+
+	var code int
+	out := captureStderr(t, func() { code = run() })
+
+	if code != exitUsage {
+		t.Fatalf("run() with an unrecognized argument = %d, want %d; stderr %q", code, exitUsage, out)
+	}
+	if !strings.Contains(out, `unrecognized argument "helth"`) {
+		t.Fatalf("precondition failed: run() never reached the argv dispatch; stderr %q", out)
+	}
+	if strings.Contains(out, "invalid LOG_LEVEL") {
+		t.Errorf("run() diagnosed LOG_LEVEL before dispatching argv, so every health probe would reprint the startup WARN; stderr %q", out)
 	}
 }
 

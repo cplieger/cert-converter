@@ -24,13 +24,13 @@ func TestStoreReconcile(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		mode        outputpolicy.Lifecycle
-		rc          reapContext
+		rc          *reapContext
 		wantDeleted int
 		wantPresent bool
 	}{
 		{
 			name: "sync removes an orphan after a clean complete scan",
-			mode: outputpolicy.LifecycleSync, rc: reapContext{scanTotal: 1, walkCompleted: true},
+			mode: outputpolicy.LifecycleSync, rc: &reapContext{result: ScanResult{Total: 1}, walkCompleted: true},
 			wantDeleted: 1, wantPresent: false,
 		},
 		{
@@ -38,17 +38,17 @@ func TestStoreReconcile(t *testing.T) {
 			// produces a clean, complete walk, so without this the first scan after
 			// a slow or wrong mount would delete every bundle.
 			name: "sync refuses when the scan found no pairs at all",
-			mode: outputpolicy.LifecycleSync, rc: reapContext{scanTotal: 0, walkCompleted: true},
+			mode: outputpolicy.LifecycleSync, rc: &reapContext{result: ScanResult{Total: 0}, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
 			name: "sync refuses when the walk did not complete",
-			mode: outputpolicy.LifecycleSync, rc: reapContext{scanTotal: 1, walkCompleted: false},
+			mode: outputpolicy.LifecycleSync, rc: &reapContext{result: ScanResult{Total: 1}, walkCompleted: false},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
 			name: "sync refuses when a sub-path was unreadable",
-			mode: outputpolicy.LifecycleSync, rc: reapContext{scanTotal: 1, unreadable: 1, walkCompleted: true},
+			mode: outputpolicy.LifecycleSync, rc: &reapContext{result: ScanResult{Total: 1, Unreadable: 1}, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
@@ -56,24 +56,24 @@ func TestStoreReconcile(t *testing.T) {
 			// so `seen` is incomplete even though the walk reported no error and
 			// nothing was unreadable. Reproduced as a live-bundle deletion.
 			name: "sync refuses when an input symlink could not be resolved",
-			mode: outputpolicy.LifecycleSync, rc: reapContext{scanTotal: 1, unresolved: 1, walkCompleted: true},
+			mode: outputpolicy.LifecycleSync, rc: &reapContext{result: ScanResult{Total: 1, Unresolved: 1}, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
 			// The design promised this rail and the first implementation dropped it: a
 			// scan already failing conversions must not also delete.
 			name: "sync refuses when a conversion failed",
-			mode: outputpolicy.LifecycleSync, rc: reapContext{scanTotal: 1, failed: 1, walkCompleted: true},
+			mode: outputpolicy.LifecycleSync, rc: &reapContext{result: ScanResult{Total: 1, Failed: 1}, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
 			name: "warn, the default, reports but never deletes",
-			mode: outputpolicy.LifecycleWarn, rc: reapContext{scanTotal: 1, walkCompleted: true},
+			mode: outputpolicy.LifecycleWarn, rc: &reapContext{result: ScanResult{Total: 1}, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
 			name: "keep is silent and never deletes",
-			mode: outputpolicy.LifecycleKeep, rc: reapContext{scanTotal: 1, walkCompleted: true},
+			mode: outputpolicy.LifecycleKeep, rc: &reapContext{result: ScanResult{Total: 1}, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
 		},
 	} {
@@ -143,7 +143,7 @@ func TestStoreReconcile_warn_mode_reports_report_only_despite_a_conversion_failu
 	s := &store{root: root}
 
 	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleWarn,
-		map[string]struct{}{}, reapContext{scanTotal: 1, failed: 1, walkCompleted: true})
+		map[string]struct{}{}, &reapContext{result: ScanResult{Total: 1, Failed: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Fatalf("reconcile(warn, one failed conversion) = error %v, want nil", reconcileErr)
 	}
@@ -183,7 +183,7 @@ func TestStoreReconcile_unsafe_output_walk_never_advises_deletion(t *testing.T) 
 	s := &store{root: root}
 
 	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync,
-		map[string]struct{}{}, reapContext{scanTotal: 1, walkCompleted: true})
+		map[string]struct{}{}, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Fatalf("reconcile(unsafe output walk) = error %v, want nil", reconcileErr)
 	}
@@ -224,7 +224,7 @@ func TestStoreReconcile_vanished_input_is_reported_at_debug_not_as_a_mount_warni
 	s := &store{root: root}
 
 	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync,
-		map[string]struct{}{}, reapContext{scanTotal: 1, vanished: 1, walkCompleted: true})
+		map[string]struct{}{}, &reapContext{result: ScanResult{Total: 1, Vanished: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Fatalf("reconcile(vanished input) = error %v, want nil", reconcileErr)
 	}
@@ -349,7 +349,7 @@ func TestStoreReconcile_propagates_a_shutdown_from_the_orphan_walk(t *testing.T)
 	// sync over a tree with one orphan: the mode that would delete, so nothing about
 	// the arrangement excuses the refusal except the cancellation itself.
 	deleted, err := s.reconcile(ctx, outputpolicy.LifecycleSync, map[string]struct{}{},
-		reapContext{scanTotal: 1, walkCompleted: true})
+		&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("reconcile(cancelled ctx) error = %v, want context.Canceled so Run does not report a complete scan", err)
@@ -448,7 +448,7 @@ func TestStoreReconcile_sync_spares_a_nested_live_bundle(t *testing.T) {
 	s := &store{root: root}
 	seen := map[string]struct{}{filepath.Join("acme-v02", "example.com", "live.crt"): {}}
 
-	got, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync, seen, reapContext{scanTotal: 1, walkCompleted: true})
+	got, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync, seen, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Errorf("reconcile(nested output tree) = error %v, want nil", reconcileErr)
 	}
@@ -677,12 +677,19 @@ func TestStoreIsCurrent_tightens_a_lax_mode_without_regenerating(t *testing.T) {
 		name        string
 		mode        os.FileMode
 		wantTighten bool
+		// wantMode is the mode expected after the tightening; zero means the generic
+		// ceiling every mode carrying an owner bit masks to (tc.mode & pfxFileMode). A
+		// lax mode with NO owner bit masks to 0000, which is not a tightening at all —
+		// the app could not read its own bundle back through it — so that case names
+		// the mode it must land on instead.
+		wantMode os.FileMode
 	}{
-		{"the policy mode is left alone", pfxFileMode, false},
-		{"a stricter read-only bundle is left alone", 0o400, false},
-		{"a group-readable bundle is tightened", 0o640, true},
-		{"a world-readable bundle is tightened", 0o644, true},
-		{"an execute bit is cleared too", 0o700, true},
+		{"the policy mode is left alone", pfxFileMode, false, 0},
+		{"a stricter read-only bundle is left alone", 0o400, false, 0},
+		{"a group-readable bundle is tightened", 0o640, true, 0},
+		{"a world-readable bundle is tightened", 0o644, true, 0},
+		{"an execute bit is cleared too", 0o700, true, 0},
+		{"a mode with no owner bit is tightened to policy, not to 0000", 0o044, true, pfxFileMode},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -734,7 +741,11 @@ func TestStoreIsCurrent_tightens_a_lax_mode_without_regenerating(t *testing.T) {
 					t.Errorf("isCurrent(mode %o) logged %q, want only the tighten notice: a repaired mode is"+
 						" not also a warning", tc.mode, logs.Messages())
 				}
-				if got, want := after.Mode().Perm(), tc.mode&pfxFileMode; got != want {
+				want := tc.wantMode
+				if want == 0 {
+					want = tc.mode & pfxFileMode
+				}
+				if got := after.Mode().Perm(); got != want {
 					t.Errorf("isCurrent(mode %o) tightened mode to %o, want %o: allowed owner bits must survive", tc.mode, got, want)
 				}
 				return

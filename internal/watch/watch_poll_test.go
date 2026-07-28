@@ -130,33 +130,6 @@ func TestPollLoopWithUpgrade_hands_the_upgraded_watcher_back_without_scanning(t 
 	}
 }
 
-// TestPollTick_stays_in_poll_mode_when_watch_set_rebuild_fails pins the poll
-// tick's independently reachable middle branch: fsnotify constructs fine but the
-// watch set cannot be rebuilt (a missing root), so the tick must stay in poll
-// mode (stopped=false) and still run the safety-net scan that keeps change
-// detection alive.
-func TestPollTick_stays_in_poll_mode_when_watch_set_rebuild_fails(t *testing.T) {
-	t.Parallel()
-	// Availability probe only: skips on hosts without inotify so this test cannot
-	// pass through pollTick's NewWatcher-failure branch instead of the rebuild one.
-	newTestWatcher(t)
-	scans := 0
-	missingRoot := filepath.Join(t.TempDir(), "missing")
-	w := New(missingRoot, func(context.Context) { scans++ }, WithFallback(time.Hour))
-
-	upgraded, stopped := w.pollTick(t.Context())
-	if upgraded != nil {
-		upgraded.Close()
-		t.Error("pollTick(missing root) handed back a watcher, want none: the watch set could not be rebuilt, so there is no watch mode to enter")
-	}
-	if stopped {
-		t.Error("pollTick(missing root) stopped = true, want false so polling continues")
-	}
-	if scans != 1 {
-		t.Errorf("pollTick(missing root) ran %d scans, want 1", scans)
-	}
-}
-
 // TestPollLoopWithUpgrade_treats_shutdown_before_the_first_scan_as_a_clean_stop
 // pins the ctx guard that opens pollLoopWithUpgrade: a shutdown arriving before
 // the initial scan outranks the dead-change-detection exit.
@@ -470,10 +443,14 @@ func TestPollTick_closes_the_watcher_it_could_not_give_a_watch_set(t *testing.T)
 		}
 	})
 	missingRoot := filepath.Join(t.TempDir(), "missing")
-	w := New(missingRoot, func(context.Context) {}, WithFallback(time.Hour))
+	scans := 0
+	w := New(missingRoot, func(context.Context) { scans++ }, WithFallback(time.Hour))
 
 	upgraded, stopped := w.pollTick(t.Context())
 
+	if scans != 1 {
+		t.Errorf("pollTick(missing root) ran %d scans, want 1: the tick must still run the safety-net scan that keeps change detection alive", scans)
+	}
 	if upgraded != nil {
 		upgraded.Close()
 		t.Fatal("pollTick(missing root) handed back a watcher, want none")

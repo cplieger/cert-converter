@@ -53,11 +53,11 @@ func TestLogScanOutcome_levels(t *testing.T) {
 	}
 }
 
-// TestLogEntryFailure_levels pins the per-entry failure level split: a failure
+// TestFailEntry_levels pins the per-entry failure level split: a failure
 // caused by shutdown stays at Debug, so stopping the container never emits an
 // operator-facing error line, while every real conversion failure is an Error
 // the log-based alerting can act on. Both cases keep the cert's relative path.
-func TestLogEntryFailure_levels(t *testing.T) {
+func TestFailEntry_levels(t *testing.T) {
 	tests := []struct {
 		err       error
 		name      string
@@ -74,18 +74,20 @@ func TestLogEntryFailure_levels(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logEntryFailure("example.com/tls.crt", "conversion failed", tt.err)
+			if got := failEntry("example.com/tls.crt", "conversion failed", tt.err); got != statusFailed {
+				t.Errorf("failEntry(%v) = %v, want statusFailed", tt.err, got)
+			}
 
 			// CountExact: the shutdown variant is a SUPERSTRING of the plain message, so
 			// a substring check would let the wrong one pass for the real-failure case.
 			if got := logs.CountExact(tt.wantMsg); got != 1 {
-				t.Errorf("logEntryFailure(%v) logged %q, want %s", tt.err, logs.Messages(), tt.wantMsg)
+				t.Errorf("failEntry(%v) logged %q, want %s", tt.err, logs.Messages(), tt.wantMsg)
 			}
 			if got := logs.CountLevel(tt.wantLevel, tt.wantMsg); got != 1 {
-				t.Errorf("logEntryFailure(%v) logged %q at %s %d times, want 1", tt.err, tt.wantMsg, tt.wantLevel, got)
+				t.Errorf("failEntry(%v) logged %q at %s %d times, want 1", tt.err, tt.wantMsg, tt.wantLevel, got)
 			}
 			if !logs.HasAttr(tt.wantMsg, "path", "example.com/tls.crt") {
-				t.Errorf("logEntryFailure(%v) logged %q, want the cert's relative path", tt.err, logs.Messages())
+				t.Errorf("failEntry(%v) logged %q, want the cert's relative path", tt.err, logs.Messages())
 			}
 		})
 	}

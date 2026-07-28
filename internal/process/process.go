@@ -43,6 +43,25 @@ type ScanResult struct {
 	Vanished int
 }
 
+// durablyEnumerated reports whether every DURABLE veto on the input enumeration is
+// clear: nothing under /input was unreadable and no symlink was unresolvable. It is
+// the ONE spelling of that veto set, kept on the type that owns the counters, so a
+// new durable coverage dimension cannot be added to one asker and missed in another.
+// Vanished is deliberately excluded: it is the transient renewal race, and the two
+// predicates that differ only in their Vanished term compose this one.
+func (r ScanResult) durablyEnumerated() bool {
+	return r.Unreadable == 0 && r.Unresolved == 0
+}
+
+// inputFullyEnumerated reports whether nothing prevented this scan from observing
+// every /input path: no unreadable path, no unresolved symlink, nothing that vanished
+// mid-walk. It is the ONE spelling of that veto set — reapContext.enumerationClean
+// and logInputCoverageWarnings both ask this question, so a new coverage dimension
+// cannot be added to one of them and missed in the other.
+func (r ScanResult) inputFullyEnumerated() bool {
+	return r.durablyEnumerated() && r.Vanished == 0
+}
+
 // Options carries the process-lifetime scan configuration the composition root
 // chooses once at startup: the confined input and output roots, the password
 // embedded in generated PFX files, and the PKCS#12 encoder profile. The encoder
@@ -99,13 +118,13 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	certsRoot, outRoot := s.opts.CertsRoot, s.opts.OutRoot
 	inHandle, err := os.OpenRoot(certsRoot)
 	if err != nil {
-		return ScanResult{}, fmt.Errorf("open input root %q: %w", certsRoot, err)
+		return ScanResult{}, failScan(ctx, fmt.Errorf("open input root %q: %w", certsRoot, err))
 	}
 	defer func() { _ = inHandle.Close() }()
 
 	outHandle, err := os.OpenRoot(outRoot)
 	if err != nil {
-		return ScanResult{}, fmt.Errorf("open output root %q: %w", outRoot, err)
+		return ScanResult{}, failScan(ctx, fmt.Errorf("open output root %q: %w", outRoot, err))
 	}
 	defer func() { _ = outHandle.Close() }()
 
@@ -130,22 +149,18 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 
 	result := countResults(sw.results, sw.unreadable, sw.unresolved)
 	rc := reapContext{
-		scanTotal: result.Total,
-		failed:    result.Failed,
-		// result.Unreadable, not sw.unreadable: it also carries the per-entry
-		// statusUnreadable count. That term is about the TREE, not about the unreadable
-		// pair's own bundle — visit records every .crt in `seen` before dispatching it,
-		// so a cert whose read failed still matches its .pfx and is never an orphan
-		// candidate. What it vetoes is the claim behind every reap: a scan that could
-		// not READ part of /input has not enumerated the tree completely in the
-		// README's sense ("no unreadable path"), so no output under it can be proven
-		// orphaned.
-		unreadable: result.Unreadable,
-		unresolved: result.Unresolved,
-		// A cert that vanished mid-walk leaves the same hole in `seen` as one that
-		// could not be read, so it vetoes reaping too — but transiently: the next
-		// scan sees the replacement and reconciles then.
-		vanished:      result.Vanished,
+		// The scan's counts are carried whole rather than copied field-by-field:
+		// result.Unreadable (not sw.unreadable) is what the veto needs, because it also
+		// carries the per-entry statusUnreadable count. That term is about the TREE, not
+		// about the unreadable pair's own bundle — visit records every .crt in `seen`
+		// before dispatching it, so a cert whose read failed still matches its .pfx and
+		// is never an orphan candidate. What it vetoes is the claim behind every reap: a
+		// scan that could not READ part of /input has not enumerated the tree completely
+		// in the README's sense ("no unreadable path"), so no output under it can be
+		// proven orphaned. A cert that vanished mid-walk leaves the same hole in `seen`,
+		// so it vetoes reaping too — but transiently: the next scan sees the replacement
+		// and reconciles then.
+		result:        result,
 		walkCompleted: walkErr == nil,
 		shutdown:      walkErr != nil && IsShutdown(walkErr),
 	}
@@ -153,12 +168,12 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	// proved the enumeration complete: an aborted walk, an unreadable sub-path or
 	// an unresolved symlink means `seen` is not the whole input tree, so a pair
 	// hidden behind it would be forgotten and re-warn on the next clean scan.
-	// scanTotal is deliberately NOT part of this gate (unlike enumeratedInput): a
+	// result.Total is deliberately NOT part of this gate (unlike enumeratedInput): a
 	// clean walk that found nothing proves every remembered pair is gone.
 	if rc.enumerationClean() {
 		s.observations.forget(sw.seen)
 	}
-	removed, reconcileErr := out.reconcile(ctx, s.opts.Lifecycle, sw.seen, rc)
+	removed, reconcileErr := out.reconcile(ctx, s.opts.Lifecycle, sw.seen, &rc)
 	result.Removed = removed
 	// A shutdown that arrives after the input walk completed cancels reconciliation
 	// instead, and that scan is NOT complete: without folding the error in, the
@@ -308,6 +323,20 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 
 // --- Logging policy ---
 
+// failScan reports a scan that ended before the walk began: a certs or output
+// root that could not be opened as an *os.Root. It routes the error through
+// logScanOutcome so the "scan aborted before completion" record — the one the
+// README's CertConverterScanAborted rule matches — is emitted for an unusable
+// root too, not only for a walk that aborted at ".". The counts it logs are all
+// zero, which is accurate: nothing was visited. logInputCoverageWarnings
+// self-vetoes on a non-nil walk error, so no coverage WARN is emitted alongside
+// it. The error is returned unchanged so the caller pairs it with a zero
+// ScanResult at the return site.
+func failScan(ctx context.Context, err error) error {
+	logScanOutcome(ctx, ScanResult{}, err)
+	return err
+}
+
 // logScanOutcome emits the end-of-scan summary. A completed walk logs at Info;
 // a walk aborted by shutdown (context cancellation or deadline) logs at Debug;
 // any other abort logs at Warn so an operator sees the partial scan and its
@@ -365,7 +394,7 @@ func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
 // the walk was not observed, so "every certificate lacks its key" is not a claim
 // this scan can make, and the next one can.
 func logInputCoverageWarnings(result ScanResult, walkErr error) {
-	if walkErr != nil || result.Unreadable > 0 || result.Unresolved > 0 || result.Vanished > 0 {
+	if walkErr != nil || !result.inputFullyEnumerated() {
 		return
 	}
 	switch {
@@ -413,28 +442,24 @@ func IsShutdown(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
-// logEntryFailure logs a per-entry failure. A failure caused by shutdown
+// failEntry records one per-entry failure: it logs the failure and returns the
+// failed status for the caller to propagate. A failure caused by shutdown
 // (context cancellation or deadline) logs at Debug -- it is not an operator
-// actionable conversion error -- while every real failure logs at Error, the
-// same split logScanOutcome applies to the walk-level error.
-// Callers may pass extra slog key/value pairs (a remediation hint, the output
-// path) for failures whose cause is not evident from the input path alone.
-func logEntryFailure(logPath, msg string, err error, extra ...any) {
+// actionable conversion error -- while every real failure logs at Error, the same
+// split logScanOutcome applies to the walk-level error. Callers may pass extra
+// slog key/value pairs (a remediation hint, the output path) for failures whose
+// cause is not evident from the input path alone.
+//
+// It carries no rollback obligation: currency is derived from the output file
+// itself, so a failed entry leaves the previous bundle (or nothing) at the output
+// path and the next scan reaches the same verdict and retries the pair.
+func failEntry(logPath, msg string, err error, extra ...any) conversionStatus {
 	attrs := append([]any{"path", logPath, "error", err}, extra...)
 	if IsShutdown(err) {
 		slog.Debug(msg+" (shutdown)", attrs...)
-		return
+	} else {
+		slog.Error(msg, attrs...)
 	}
-	slog.Error(msg, attrs...)
-}
-
-// failEntry records one per-entry failure: it logs via logEntryFailure and
-// returns the failed status for the caller to propagate. It carries no rollback
-// obligation: currency is derived from the output file itself, so a failed entry
-// leaves the previous bundle (or nothing) at the output path and the next scan
-// reaches the same verdict and retries the pair.
-func failEntry(logPath, msg string, err error, extra ...any) conversionStatus {
-	logEntryFailure(logPath, msg, err, extra...)
 	return statusFailed
 }
 

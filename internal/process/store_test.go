@@ -8,7 +8,71 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/outputpolicy"
 )
+
+// TestStoreReconcile_reports_an_output_tree_it_cannot_enumerate pins the arm that
+// fires when the ORPHAN WALK cannot enumerate /output at its ROOT, as opposed to
+// under it: the walk error must reach the operator at WARN with the /output
+// ownership hint, and it must degrade to "reap nothing" rather than fail the scan,
+// because a scan error there would flip health over a condition the WARN already
+// names and a restart cannot fix.
+//
+// Both halves are load-bearing and neither is observable elsewhere. Swallow the
+// root-level error and orphans() returns an empty candidate list, so sync mode
+// reports nothing to reap and looks exactly like a healthy tree; return it as an
+// error instead and a mount whose permissions an operator has to fix pins the
+// container unhealthy.
+//
+// A closed root is the failure injection: it fails at the tree root itself, which
+// is the shape a chmod-based test cannot produce when the suite runs as uid 0.
+// Runs serially: it swaps slog.Default().
+func TestStoreReconcile_reports_an_output_tree_it_cannot_enumerate(t *testing.T) {
+	// Spelled out rather than imported from the production const: an operator's log
+	// query keys on these words, so a silent rewording must fail here.
+	const wantMsg = "could not enumerate output orphans; orphan removal is disabled for this scan"
+
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, "orphan.pfx")
+	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	if err := root.Close(); err != nil {
+		t.Fatalf("setup: root.Close: %v", err)
+	}
+	s := &store{root: root}
+	logs := captureLogs(t)
+
+	// sync over a tree holding one orphan: the mode that would delete, so nothing
+	// about the arrangement excuses the refusal except the unwalkable tree.
+	deleted, err := s.reconcile(t.Context(), outputpolicy.LifecycleSync, map[string]struct{}{"a.crt": {}},
+		&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+	if err != nil {
+		t.Fatalf("reconcile(unwalkable output tree) = error %v, want nil: an unreadable /output is an"+
+			" operator condition a restart cannot fix, so it must not fail the scan", err)
+	}
+	if deleted != 0 {
+		t.Errorf("reconcile(unwalkable output tree) deleted = %d, want 0", deleted)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, wantMsg); got != 1 {
+		t.Fatalf("reconcile(unwalkable output tree) logged %q at WARN %d times, want exactly 1: %q",
+			wantMsg, got, logs.Messages())
+	}
+	if _, ok := logs.AttrValue(wantMsg, "error"); !ok {
+		t.Errorf("reconcile(unwalkable output tree) logged %q with no error attribute, want the walk"+
+			" failure carried so the operator can diagnose it: %q", wantMsg, logs.Messages())
+	}
+	if got, ok := logs.AttrValue(wantMsg, "remediation"); !ok || got != outputPermRemediation {
+		t.Errorf("reconcile(unwalkable output tree) logged remediation %q, want %q", got, outputPermRemediation)
+	}
+	if _, statErr := os.Stat(orphan); statErr != nil {
+		t.Errorf("a bundle was deleted on a scan that could not enumerate the output tree: %v", statErr)
+	}
+}
 
 // TestStoreWrite_creates_the_parent_directory pins that a nested output path has its
 // parent created rather than failing, so an input tree with domain subdirectories

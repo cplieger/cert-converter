@@ -57,13 +57,6 @@ func TestParseCertChain(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid PEM", func(t *testing.T) {
-		t.Parallel()
-		if _, err := convert.ParseCertChain([]byte("not a pem")); err == nil {
-			t.Error("expected error for invalid PEM")
-		}
-	})
-
 	t.Run("excessive PEM blocks", func(t *testing.T) {
 		t.Parallel()
 		certPEM, _ := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
@@ -111,6 +104,38 @@ func TestParseCertChain_corrupted_DER(t *testing.T) {
 	_, err := convert.ParseCertChain(badPEM)
 	if err == nil {
 		t.Fatal("convert.ParseCertChain should fail for corrupted DER inside CERTIFICATE block")
+	}
+}
+
+// TestParseCertChain_names_which_block_holds_the_corrupt_DER pins the block number
+// in the chain-rejecting diagnostic. parseCertChain refuses the whole file rather
+// than truncating it, so that number is the only thing telling an operator WHICH
+// certificate in a bundle to replace; an off-by-one sends them to the wrong one and
+// nothing else in the package would notice.
+func TestParseCertChain_names_which_block_holds_the_corrupt_DER(t *testing.T) {
+	t.Parallel()
+	goodPEM, _ := testcerts.GenerateSelfSignedCert(t, "block-index", "ecdsa")
+	corrupt := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("this is not valid DER")})
+
+	for _, tc := range []struct {
+		name string
+		in   []byte
+		want string
+	}{
+		{"the first block is corrupt", append(bytes.Clone(corrupt), goodPEM...), "certificate PEM block 1:"},
+		{"the second block is corrupt", append(bytes.Clone(goodPEM), corrupt...), "certificate PEM block 2:"},
+		{"the third block is corrupt", append(append(bytes.Clone(goodPEM), goodPEM...), corrupt...), "certificate PEM block 3:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := convert.ParseCertChain(tc.in)
+			if err == nil {
+				t.Fatalf("convert.ParseCertChain(%s) = nil error, want the chain refused", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("convert.ParseCertChain(%s) error = %q, want it to contain %q", tc.name, err.Error(), tc.want)
+			}
+		})
 	}
 }
 
@@ -234,21 +259,6 @@ func TestParsePrivateKey(t *testing.T) {
 			t.Errorf("expected *rsa.PrivateKey, got %T", key)
 		}
 	})
-
-	t.Run("invalid PEM", func(t *testing.T) {
-		t.Parallel()
-		if _, err := convert.ParsePrivateKey([]byte("not a key")); err == nil {
-			t.Error("expected error for invalid key PEM")
-		}
-	})
-
-	t.Run("PEM with only CERTIFICATE blocks", func(t *testing.T) {
-		t.Parallel()
-		certPEM, _ := testcerts.GenerateSelfSignedCert(t, "test", "ecdsa")
-		if _, err := convert.ParsePrivateKey(certPEM); err == nil {
-			t.Error("expected error when PEM contains only CERTIFICATE blocks")
-		}
-	})
 }
 
 // TestParsePrivateKey_bounds_the_declared_key_blocks pins the key-side half of
@@ -353,6 +363,33 @@ func TestParsePrivateKey_diagnoses_a_malformed_block_with_its_own_parser(t *test
 	}
 }
 
+// TestParsePrivateKey_diagnoses_a_malformed_RSA_block_with_the_PKCS1_parser is the
+// RSA half of the label-specific error selection parsePrivateKeyBlock documents.
+// The EC half is pinned above; without this one, reporting the PKCS#8 failure for
+// an "RSA PRIVATE KEY" block would send an operator holding a damaged traditional
+// OpenSSL key after the wrong encoding, and no test would fail.
+func TestParsePrivateKey_diagnoses_a_malformed_RSA_block_with_the_PKCS1_parser(t *testing.T) {
+	t.Parallel()
+	badRSA := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: []byte("this is not valid DER")})
+
+	_, err := convert.ParsePrivateKey(badRSA)
+	if err == nil {
+		t.Fatal("convert.ParsePrivateKey(malformed RSA PRIVATE KEY block) = nil error, want a parse failure")
+	}
+	got := err.Error()
+	if !strings.Contains(got, "RSA PRIVATE KEY") {
+		t.Errorf("error = %q, want it to name the block label it failed on", got)
+	}
+	// asn1's structure error names the Go type it could not fill, which is what
+	// identifies the parser that produced it: pkcs1PrivateKey for PKCS#1.
+	if !strings.Contains(got, "pkcs1PrivateKey") {
+		t.Errorf("error = %q, want the PKCS#1 parser's own failure for an RSA-labelled block", got)
+	}
+	if strings.Contains(got, "pkcs8") || strings.Contains(got, "failed to parse EC private key") {
+		t.Errorf("error = %q, want no PKCS#8 or SEC1 diagnosis: either names the wrong encoding", got)
+	}
+}
+
 func TestParsePrivateKey_empty_input(t *testing.T) {
 	t.Parallel()
 	_, err := convert.ParsePrivateKey([]byte{})
@@ -452,7 +489,9 @@ func TestParsePrivateKey_traditional_openssl_encrypted_returns_distinct_error(t 
 // TestConvertPair_round_trips_chain_for_every_encoder_profile pins the four PFX
 // encoding profiles PFX_ENCODER can select and the CA-chain handling: each
 // profile must produce a PKCS#12 file that decodes back to the same leaf AND
-// the same CA chain, at mode 0600.
+// the same CA chain. The output file mode is not this package's contract: Encode
+// returns bytes, and internal/process owns the confined write and its
+// pfxFileMode.
 func TestConvertPair_round_trips_chain_for_every_encoder_profile(t *testing.T) {
 	t.Parallel()
 	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
@@ -842,7 +881,8 @@ func TestConvertPair_rejects_a_certificate_whose_public_key_type_is_unverifiable
 
 // TestInspectPasswordEncoding_classifies_all_unencodable_shapes pins the
 // single home of the PKCS#12 UCS-2 password rule that both the conversion gate
-// (toPFXInRoot) and the config startup diagnostic consume. The shapes are
+// (pair.go's unencodablePasswordError, called by Encode) and the config startup
+// diagnostic consume. The shapes are
 // independent: invalid UTF-8 loses entropy silently, a non-BMP rune makes every
 // Encode call fail, an interior NUL makes the generated PFX unopenable by any
 // consumer that builds the NUL-terminated BMPString itself, and a password can

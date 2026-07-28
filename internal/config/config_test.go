@@ -213,6 +213,17 @@ func TestLoad_warns_when_the_fallback_value_is_repaired(t *testing.T) {
 			name: "excessive value is clamped", raw: "87601", want: 87600 * time.Hour,
 			message: "FALLBACK_SCAN_HOURS too large, clamping", attrKey: "max_hours", attrWant: "87600",
 		},
+		// Both WARNs quote the value as CONFIGURED, untrimmed: a value that is
+		// unusable only because of a stray space or newline looks correct in the
+		// log once it is trimmed, and nothing else reports the difference.
+		{
+			name: "padded invalid value is quoted untrimmed", raw: " abc\t", want: 6 * time.Hour,
+			message: "invalid FALLBACK_SCAN_HOURS, using default", attrKey: "default", attrWant: "6h0m0s",
+		},
+		{
+			name: "padded excessive value is quoted untrimmed", raw: " 87601 ", want: 87600 * time.Hour,
+			message: "FALLBACK_SCAN_HOURS too large, clamping", attrKey: "max_hours", attrWant: "87600",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			isolatePasswordFile(t)
@@ -1496,5 +1507,40 @@ func TestLoad_unencodable_secret_file_names_the_file_channel(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), secret) {
 		t.Errorf("Load(unencodable secret file) leaked the secret into %q", err.Error())
+	}
+}
+
+// TestFallbackInterval_agrees_with_the_interval_Load_reports pins the shared
+// source of truth behind the health-marker freshness deadline: main derives the
+// probe's max age from cfg.FallbackInterval, while the `health` subcommand
+// derives it from the exported FallbackInterval() (which exists precisely so the
+// probe need not load a full Config). Both read FALLBACK_SCAN_HOURS through
+// fallbackIntervalFromEnv today, and nothing else notices if one of them stops:
+// the deadline would then describe a cadence the watch loop does not run, either
+// restarting a healthy container or never firing at all. Every parse class is
+// exercised, because a divergence could be introduced in the clamp or repair
+// arms alone. Serial: it mutates the environment and swaps slog.Default().
+func TestFallbackInterval_agrees_with_the_interval_Load_reports(t *testing.T) {
+	for _, raw := range []string{
+		"", "   ", "abc", "-1", "00", "12", "87600", "87601",
+		"999999999999999999999999999999", "0", "false", " FALSE ",
+	} {
+		t.Run(strconv.Quote(raw), func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", "pw")
+			t.Setenv("FALLBACK_SCAN_HOURS", raw)
+
+			capture.Default(t)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() = %v, want nil", err)
+			}
+			if got := FallbackInterval(); got != cfg.FallbackInterval {
+				t.Errorf("FallbackInterval() = %v but Load() reported FallbackInterval = %v for FALLBACK_SCAN_HOURS=%q: "+
+					"the health probe's freshness deadline is 3x this value, so a divergence either restarts a healthy container or never fires",
+					got, cfg.FallbackInterval, raw)
+			}
+		})
 	}
 }

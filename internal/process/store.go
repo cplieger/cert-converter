@@ -177,11 +177,15 @@ const maxPFXSize = 2*maxFileSize + 64<<10
 //
 // Every "I cannot tell what is on disk" outcome resolves to stale: rewrite. That
 // covers a decode failure (Debug: a rotated password, a truncated or foreign file)
-// and, at WARN with a remediation hint, a stat failure, an oversized file, or an
-// unreadable file — the app can fix all of those itself by rewriting, and if the
-// rewrite genuinely cannot happen THAT failure flips health, which is the honest
-// signal. Only shutdown is a hard error: it is neither current nor stale, and
-// treating it as stale would rewrite every in-flight pair on the way out.
+// and, at WARN, a stat failure, an unreadable file, or an oversized file — the app
+// can fix all of those itself by rewriting, and if the rewrite genuinely cannot
+// happen THAT failure flips health, which is the honest signal. The first two carry
+// the /output ownership hint, because that is what they mean; the oversized arm
+// deliberately carries none, because store.write refuses to emit a bundle above
+// maxPFXSize, so a file over the bound was written by something else and the rewrite
+// itself is the whole remedy. Only shutdown is a hard error: it is neither current
+// nor stale, and treating it as stale would rewrite every in-flight pair on the way
+// out.
 //
 // Permission bits are NOT one of those outcomes and never reach the verdict: a
 // bundle laxer than pfxFileMode is tightened in place with a chmod (tightenMode,
@@ -356,8 +360,11 @@ func laxerThanPolicy(perm os.FileMode) bool {
 // deliberate 0400 mode and would churn the bundle forever on filesystems that
 // accept chmod without storing permission bits.
 //
-// Only the EXTRA bits are cleared, so the tightening can never add a bit the file
-// did not already carry and a deliberately stricter mode survives untouched.
+// Only the EXTRA bits are cleared, so a deliberately stricter mode survives
+// untouched (laxerThanPolicy is what protects it) and the tightening adds no bit the
+// file did not already carry — with one exception: a lax mode with no owner bit at
+// all masks to 0000, a mode this app could not read its own bundle back through, so
+// that case targets pfxFileMode instead. See the inline comment.
 //
 // The chmod goes through the store's confined root like every other output touch, so
 // a symlink planted under the output tree cannot redirect it outside the mounted
@@ -370,6 +377,20 @@ func (s *store) tightenMode(rel string, perm os.FileMode) {
 		return
 	}
 	want := perm & pfxFileMode
+	// A lax mode carrying NO owner bit (0044, 0060, 0004) masks to 0000, which is
+	// not a tightening: it takes away this app's own read of the bundle. Output-derived
+	// currency then fails on the very next read — "cannot read prior pfx; regenerating"
+	// plus a rewrite with fresh KDF salts and a fresh mtime, the downstream
+	// re-replication maxPFXSize's comment exists to prevent — or, where the process can
+	// still read it (running as root), the private-key bundle sits at 0000 for the life
+	// of the deployment, unreadable to the documented downstream replicator, while this
+	// function logs a successful tighten at INFO. pfxFileMode is the right target there:
+	// it is the mode a rewrite would install anyway, it still removes every group/other
+	// bit, and the deliberately-stricter case is protected by laxerThanPolicy above, not
+	// by this mask.
+	if want == 0 {
+		want = pfxFileMode
+	}
 	got, err := s.chmodAndObserve(rel, want)
 	switch {
 	case err != nil:
@@ -512,18 +533,16 @@ func (s *store) logOrphanWalkOutcome(unreadable, symlinked int) {
 
 // reapContext is everything the gate needs to decide whether `seen` can be
 // trusted as a COMPLETE enumeration of the input tree. It is a struct rather than
-// five positional parameters because every field is a veto and a caller must not
+// positional parameters because every field is a veto and a caller must not
 // be able to transpose two of them silently.
 type reapContext struct {
-	scanTotal  int
-	failed     int
-	unreadable int
-	unresolved int
-	// vanished counts input files that were replaced between readdir and the read.
-	// A veto like the two above — the scan did not observe those certs, so `seen` is
-	// not the whole tree — but a transient one, which is why it is reported at Debug
-	// rather than as the operator-actionable WARN.
-	vanished      int
+	// result is the scan's own outcome counts, carried whole rather than copied
+	// field-by-field: several same-typed ints copied by hand is the transposition this
+	// struct exists to prevent, and it is where a new coverage dimension would go
+	// missing. The veto set itself is spelled once on ScanResult
+	// (inputFullyEnumerated / durablyEnumerated), so the predicates below and
+	// logInputCoverageWarnings cannot drift apart.
+	result        ScanResult
 	walkCompleted bool
 	// shutdown is true when the walk ended because the process is stopping, which
 	// is not an operator-actionable incomplete enumeration.
@@ -532,42 +551,45 @@ type reapContext struct {
 
 // enumerationClean reports whether nothing PREVENTED the walk from enumerating the
 // whole input tree. It is the shared half of two decisions that differ by one term:
-// enumeratedInput adds scanTotal > 0 (an empty tree is clean but gives the output
+// enumeratedInput adds result.Total > 0 (an empty tree is clean but gives the output
 // nothing to be compared against), while Scanner.Run's observation-state prune does
-// not. Spelling the veto set once means a new veto field cannot be added to one
+// not. The veto set is ScanResult.inputFullyEnumerated, the same one
+// logInputCoverageWarnings asks, so a new veto dimension cannot be added to one
 // caller and missed in the other.
-func (r reapContext) enumerationClean() bool {
-	return r.walkCompleted && r.unreadable == 0 && r.unresolved == 0 && r.vanished == 0
+func (r *reapContext) enumerationClean() bool {
+	return r.walkCompleted && r.result.inputFullyEnumerated()
 }
 
 // vanishedOnly reports whether a mid-scan replacement is the ONLY thing that left the
 // enumeration incomplete. It exists to split the diagnostic, not the gate: reaping is
 // blocked either way, but this shape is an ordinary renewal that the next scan
 // resolves by itself, so it must not raise the WARN whose remediation tells the
-// operator to check the /input mount.
-func (r reapContext) vanishedOnly() bool {
-	return r.walkCompleted && r.unreadable == 0 && r.unresolved == 0 && r.vanished > 0
+// operator to check the /input mount. It differs from enumerationClean only in its
+// Vanished term, and both compose ScanResult.durablyEnumerated so that shared half is
+// spelled once.
+func (r *reapContext) vanishedOnly() bool {
+	return r.walkCompleted && r.result.durablyEnumerated() && r.result.Vanished > 0
 }
 
 // enumeratedInput reports whether `seen` can be trusted as a COMPLETE enumeration
 // of the input tree. It is the precondition for calling an output an orphan AT ALL,
 // not just for deleting one: without it every bundle whose cert the scan never
 // reached reads as an orphan.
-func (r reapContext) enumeratedInput() bool {
-	return r.enumerationClean() && r.scanTotal > 0
+func (r *reapContext) enumeratedInput() bool {
+	return r.enumerationClean() && r.result.Total > 0
 }
 
 // safeToReap reports whether the input enumeration is complete enough to justify
 // deleting anything.
-func (r reapContext) safeToReap() bool {
-	return r.enumeratedInput() && r.failed == 0
+func (r *reapContext) safeToReap() bool {
+	return r.enumeratedInput() && r.result.Failed == 0
 }
 
 // logIncompleteInputEnumeration reports why orphan reconciliation is skipped when
 // the input enumeration is incomplete. Without a complete enumeration, "this output
 // has no matching input" is not a claim the scan can make: a bundle whose cert the
 // walk never reached is indistinguishable from one whose cert was deleted.
-func logIncompleteInputEnumeration(rc reapContext) {
+func logIncompleteInputEnumeration(rc *reapContext) {
 	switch {
 	case rc.shutdown:
 		slog.Debug("skipping orphan reconciliation; scan cancelled during shutdown")
@@ -577,7 +599,7 @@ func logIncompleteInputEnumeration(rc reapContext) {
 		// needs no operator action: the WARN below points at the /input mount, which
 		// would be the wrong diagnosis for the activity this daemon exists to process.
 		slog.Debug("skipping orphan reconciliation; input files were replaced during the scan",
-			"vanished", rc.vanished)
+			"vanished", rc.result.Vanished)
 	case rc.enumerationClean():
 		// A complete walk that found no pair at all: the enumeration did not fail, there
 		// is simply nothing to compare the output tree against. logInputCoverageWarnings
@@ -588,8 +610,9 @@ func logIncompleteInputEnumeration(rc reapContext) {
 		slog.Debug("skipping orphan reconciliation; the scan found no certificate pairs to compare the output tree against")
 	default:
 		slog.Warn("orphan removal is disabled for this scan: the scan did not fully enumerate the input tree, so no output can be proven orphaned",
-			"walk_completed", rc.walkCompleted, "unreadable", rc.unreadable,
-			"unresolved", rc.unresolved, "vanished", rc.vanished, "total", rc.scanTotal,
+			"walk_completed", rc.walkCompleted, "unreadable", rc.result.Unreadable,
+			"unresolved", rc.result.Unresolved, "vanished", rc.result.Vanished,
+			"total", rc.result.Total,
 			"remediation", "check the /input mount and the unreadable-path warnings above")
 	}
 }
@@ -599,7 +622,7 @@ func logIncompleteInputEnumeration(rc reapContext) {
 // removed plus a cancellation error when the process is shutting down: the walk
 // caller folds that error into the scan's outcome, so a scan interrupted after the
 // input walk finished is not reported as a clean, complete scan.
-func (s *store) reconcile(ctx context.Context, mode outputpolicy.Lifecycle, seen map[string]struct{}, rc reapContext) (int, error) {
+func (s *store) reconcile(ctx context.Context, mode outputpolicy.Lifecycle, seen map[string]struct{}, rc *reapContext) (int, error) {
 	if mode == outputpolicy.LifecycleKeep {
 		return 0, nil
 	}
@@ -630,7 +653,7 @@ func (s *store) reconcile(ctx context.Context, mode outputpolicy.Lifecycle, seen
 		slog.Warn("output bundles have no matching input",
 			"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),
 			"action", lifecycleInaction(mode, reapable, walkSafe),
-			"remediation", orphanReportRemediation(walkSafe))
+			"remediation", orphanReportRemediation(mode, walkSafe))
 		return 0, nil
 	}
 
@@ -704,9 +727,12 @@ func lifecycleInaction(mode outputpolicy.Lifecycle, reapable, walkSafe bool) str
 // symlinked output directory is enumerated under its physical path, whose derived
 // input name is absent from `seen`, so it reads as an orphan on the very scan that
 // created it — and every entry in the list carries a private key.
-func orphanReportRemediation(walkSafe bool) string {
+func orphanReportRemediation(mode outputpolicy.Lifecycle, walkSafe bool) string {
 	if !walkSafe {
 		return "do not remove anything from this list yet: fix the /output warnings above, then re-check it on a scan that reports no disabled orphan removal"
+	}
+	if mode == outputpolicy.LifecycleSync {
+		return "this app removes them itself on the next scan with no conversion failures: fix the conversion failure reported above, or remove them from the output volume by hand"
 	}
 	return "remove them from the output volume, or set OUTPUT_LIFECYCLE=sync to have this app do it"
 }

@@ -2,6 +2,8 @@ package process
 
 import (
 	"bytes"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +12,37 @@ import (
 	"testing"
 	"time"
 )
+
+// TestSourcePathVanished_reports_an_unclassifiable_path_as_steady_state pins
+// pathVanished's fallback arm, the one its godoc states and no test reaches: any
+// Lstat failure that is NOT ENOENT answers false, so an /input path the scan cannot
+// even classify is reported as the steady-state condition (Warn plus the unreadable
+// count the documented alert keys on) rather than as the transient renewal race
+// (Debug only, health green, no default-level line). Inverting it would leave such a
+// certificate producing no PFX forever with nothing naming it.
+//
+// A regular file standing in for a path component is the reachable non-ENOENT
+// failure: the confined Lstat answers ENOTDIR, which satisfies neither fs.ErrNotExist
+// nor the surviving-symlink arm.
+func TestSourcePathVanished_reports_an_unclassifiable_path_as_steady_state(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "plain"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	s := &source{root: root}
+
+	if s.pathVanished("plain/tls.crt") {
+		t.Error("source.pathVanished(path under a non-directory) = true, want false: " +
+			"an input the scan cannot even classify is the steady-state condition an operator " +
+			"must hear about, not the transient renewal race")
+	}
+}
 
 func TestSourceReadBounded(t *testing.T) {
 	t.Parallel()
@@ -60,8 +93,16 @@ func TestSourceReadBounded(t *testing.T) {
 		}
 		defer root.Close()
 		s := &source{root: root}
-		if _, err := s.readBoundedLimit(t.Context(), "missing.pem", 1024); err == nil {
-			t.Error("expected error for nonexistent file")
+		// errors.Is, not merely non-nil: noteUnreadableInput splits the transient
+		// renewal race from a steady-state unreadable input on exactly
+		// errors.Is(err, fs.ErrNotExist) over THIS error. A wrapper anywhere in the
+		// confined-read path that drops the chain (a %v instead of a %w) sends every
+		// vanished cert down the Warn arm and back into the alerted unreadable count,
+		// which is the false page the vanished classification exists to prevent -- and
+		// a bare non-nil assertion cannot see it.
+		_, err = s.readBoundedLimit(t.Context(), "missing.pem", 1024)
+		if !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("source.readBoundedLimit(nonexistent file) error = %v, want it to satisfy errors.Is(err, fs.ErrNotExist)", err)
 		}
 	})
 

@@ -81,6 +81,8 @@ var (
 	}
 )
 
+// --- Watcher construction and options ---
+
 // newFSWatcher is the fsnotify construction seam. It is a package var rather
 // than a direct call so a test can drive the "fsnotify unavailable" dispatch
 // (attachWatchSet's selection of poll mode, pollTick's stay-in-poll) on a host
@@ -156,6 +158,8 @@ func New(root string, onChange func(ctx context.Context), opts ...Option) *Watch
 	}
 	return w
 }
+
+// --- Run: mode supervision ---
 
 // Run starts watching. It supervises two SIBLING change-detection modes and
 // blocks until change detection ends.
@@ -284,6 +288,8 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 	return w.watchLoop(ctx, watcher)
 }
 
+// --- Watch-set maintenance ---
+
 // addWatchDirs recursively adds all directories under root to the watcher. Only
 // a failure on root itself is fatal (Run uses it to fall back to polling); a
 // directory below root that cannot be watched — unreadable to this UID, or a
@@ -348,6 +354,9 @@ func (w *Watcher) visitWatchPath(
 			// can reach, while the scan (os.OpenRoot DOES follow a symlinked root)
 			// keeps the health marker green. Reporting it lets Run degrade to
 			// polling, or return ErrWatchLost when the fallback is disabled too.
+			if d.Type()&fs.ModeSymlink != 0 {
+				return fmt.Errorf("watch root %q is a symlink; fsnotify registers watches by path and does not follow it, so bind-mount the target directory at %s instead", path, path)
+			}
 			return fmt.Errorf("watch root %q is not a directory", path)
 		}
 		return nil
@@ -358,10 +367,8 @@ func (w *Watcher) visitWatchPath(
 	return nil
 }
 
-// handleWatchAddError classifies a failed watch registration: the root failing
-// is fatal (it is the signal Run uses to fall back to polling), while a child
-// directory failing is warned about and skipped so one mis-permissioned
-// certificate directory cannot cost the whole tree its real-time watch.
+// handleWatchAddError applies addWatchDirs' walk-error policy to a failed watch
+// REGISTRATION: fatal at the root, warn-and-skip below it.
 func (w *Watcher) handleWatchAddError(root, path string, addErr error) error {
 	if path == root {
 		return addErr
@@ -370,6 +377,8 @@ func (w *Watcher) handleWatchAddError(root, path string, addErr error) error {
 		"path", path, "fallback_scan", w.fallbackStatus(), "error", addErr)
 	return nil
 }
+
+// --- Event classification ---
 
 // handleFsEvent keeps directory watches current and reports whether an event
 // warrants a rescan. Remove and Rename always rescan because the old path can
@@ -487,6 +496,8 @@ func (w *Watcher) handleChmod(ctx context.Context, watcher *fsnotify.Watcher, ev
 		"failed to watch a directory whose permissions changed; renewals under it are covered only by the periodic rescan")
 }
 
+// --- Watch loop, its receive arms, and its timer state ---
+
 // watchLoop uses fsnotify for immediate reaction to cert changes,
 // with a periodic full scan as a safety net. It returns nil when ctx is
 // cancelled and ErrWatchLost when the watcher's Events or Errors channel closes
@@ -513,8 +524,8 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) erro
 			w.handleFallbackTick(ctx, watcher, st)
 
 		case err, ok := <-watcher.Errors:
-			if !w.handleErrorRecv(ctx, watcher, st, err, ok) {
-				return lostOrShutdown(ctx, errErrorsChannelClosed)
+			if lost := w.handleErrorRecv(ctx, watcher, st, err, ok); lost != nil {
+				return lostOrShutdown(ctx, lost)
 			}
 		}
 	}
@@ -541,10 +552,8 @@ func (w *Watcher) handleRootWatchLoss(ctx context.Context, watcher *fsnotify.Wat
 	if w.fallback <= 0 {
 		return false
 	}
-	// watcher.Add is idempotent, exactly as on the event-queue-overflow re-sync
-	// path, so this only restores what the root's removal took away; a root that is
-	// genuinely gone surfaces as the WARN below plus the scan error the debounced
-	// rescan reports.
+	// A root that is genuinely gone surfaces as the WARN below plus the scan error
+	// the debounced rescan reports.
 	slog.Warn("fsnotify root watch lost; re-attaching the watch set, renewals until it succeeds are covered only by the periodic rescan",
 		"root", w.root, "op", event.Op.String(), "fallback_scan", w.fallbackStatus())
 	w.resyncWatchSet(ctx, watcher,
@@ -594,30 +603,29 @@ func (w *Watcher) handleEventRecv(
 	return nil
 }
 
-// handleErrorRecv processes one receive from the watcher's error channel and
-// reports whether the loop should keep running. A closed channel means the
-// watcher is dead, so the loop must exit (lostOrShutdown classifies it as a
-// genuine loss or a shutdown); an event-queue overflow additionally
-// re-syncs the watch set.
-func (w *Watcher) handleErrorRecv(ctx context.Context, watcher *fsnotify.Watcher, st *watchState, err error, ok bool) bool {
+// handleErrorRecv owns watchLoop's whole error-channel arm: it reports which
+// terminal loss that arm observed, or nil while change detection is live. A closed
+// channel means the fsnotify watcher is dead (errErrorsChannelClosed); an
+// event-queue overflow additionally re-syncs the watch set. Naming the loss here
+// rather than at the call site keeps the loss taxonomy in the arm that observes it,
+// exactly as handleEventRecv does.
+func (w *Watcher) handleErrorRecv(
+	ctx context.Context, watcher *fsnotify.Watcher, st *watchState, err error, ok bool,
+) *LostError {
 	if !ok {
-		return false
+		return errErrorsChannelClosed
 	}
 	if st.handleWatcherError(err) {
-		// The dropped events may have included the Create of a new
-		// directory, which would otherwise stay unwatched for the rest of
-		// the process's life. watcher.Add is idempotent for a directory
-		// already in the watch set, so re-walking the tree only
-		// re-attaches what the overflow lost.
+		// The dropped events may have included the Create of a new directory, which
+		// would otherwise stay unwatched for the rest of the process's life.
 		w.resyncWatchSet(ctx, watcher,
 			"failed to re-sync the watch set after an event-queue overflow; a directory whose Create was dropped stays unwatched until the next re-sync")
 	}
-	return true
+	return nil
 }
 
 // handleFallbackTick runs the periodic safety-net rescan, re-asserting the
-// watch set first. addWatchDirs is idempotent for a directory already watched,
-// so this only restores what was lost: a directory whose watcher.Add failed
+// watch set first. That restores what was lost: a directory whose watcher.Add failed
 // while it was unreadable (or while fs.inotify.max_user_watches was exhausted)
 // and whose condition has since been repaired, or one whose Create event never
 // arrived. Without it such a directory stays outside the watch set for the life
@@ -639,7 +647,8 @@ func (w *Watcher) handleFallbackTick(ctx context.Context, watcher *fsnotify.Watc
 	st.runFallbackScan(ctx)
 }
 
-// resyncWatchSet re-asserts the watch set over the root and, when that fails under a
+// resyncWatchSet re-asserts the watch set over the root (watcher.Add is idempotent,
+// so a re-walk only restores what was lost) and, when that fails under a
 // live ctx, reports it with the three diagnostics every re-sync site owes the
 // operator: WHICH root, whether anything will revisit what is now unwatched
 // (fallback_scan), and the error. It is the single home of that triple and of the
@@ -744,6 +753,8 @@ func (st *watchState) handleWatcherError(err error) bool {
 		"root", st.w.root, "fallback_scan", st.w.fallbackStatus(), "error", err)
 	return false
 }
+
+// --- Poll mode ---
 
 // pollLoopWithUpgrade polls on the fallback interval and attempts to
 // upgrade to fsnotify on every tick. It is one of Run's two modes and has a

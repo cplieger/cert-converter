@@ -1285,7 +1285,7 @@ func utf8SubjectView(c *x509.Certificate, cn string) *x509.Certificate {
 	view.RawSubject = nil
 	view.SubjectKeyId = nil
 	view.Subject = pkix.Name{ExtraNames: []pkix.AttributeTypeAndValue{{
-		Type: asn1.ObjectIdentifier{2, 5, 4, 3}, // id-at-commonName
+		Type: oidCommonName,
 		Value: asn1.RawValue{
 			Class: asn1.ClassUniversal,
 			Tag:   asn1.TagUTF8String,
@@ -1381,8 +1381,21 @@ func TestAnalyse_keeps_the_upper_chain_when_a_middle_issuer_cannot_be_establishe
 		t.Errorf("Extra holds %d certificate(s), want 0: neither the upper CA nor the root was shown to be off the chain",
 			len(got.Extra()))
 	}
-	if !hasObservation(got.Observations(), convert.ObsChainUnverified) {
+	// The detail must name the certificate whose issuer could not be established --
+	// the path's TERMINUS, the lower CA -- rather than the identity the path started
+	// from. Naming the leaf instead sends the operator to the one link in this bundle
+	// whose issuance IS established.
+	var unverified string
+	for _, o := range got.Observations() {
+		if o.Kind == convert.ObsChainUnverified {
+			unverified = o.Detail
+		}
+	}
+	if unverified == "" {
 		t.Errorf("observations = %v, want the unverified upper chain reported", got.Observations())
+	} else if !strings.Contains(unverified, "Encoding Lower CA") {
+		t.Errorf("chain-unverified detail = %q, want it to name %q, the certificate the discovered path ended on and whose issuer could not be established",
+			unverified, "Encoding Lower CA")
 	}
 	if hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
 		t.Errorf("observations = %v, want NO exclusion: nothing was proven unrelated", got.Observations())

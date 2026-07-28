@@ -368,3 +368,109 @@ func TestAttachWatchSet_closes_the_watcher_it_could_not_give_a_watch_set(t *test
 		t.Error("attachWatchSet handed Run into poll mode with the unattachable watcher still open; its fd and readEvents goroutine would outlive the attempt")
 	}
 }
+
+// TestRun_reports_a_watch_mode_loss_to_the_caller pins the restart contract at
+// Run's boundary: a watcher that dies while watch mode is running must surface
+// the loss to the CALLER, not be swallowed or degraded back into poll mode.
+// watchLoop's own loss exit is pinned, but nothing pinned that Run's supervisor
+// hands it out: with the supervisor looping back to poll mode instead, main
+// would never exit non-zero, so the container would keep the last clean scan's
+// health marker while nothing detects a renewal -- the silent-healthy state this
+// package is built to avoid.
+// Not parallel: it swaps the package-level newFSWatcher seam.
+func TestRun_reports_a_watch_mode_loss_to_the_caller(t *testing.T) {
+	newTestWatcher(t) // availability probe: skips where inotify is unavailable
+	prev := newFSWatcher
+	made := make(chan *fsnotify.Watcher, 4)
+	newFSWatcher = func() (*fsnotify.Watcher, error) {
+		fw, err := prev()
+		if err == nil {
+			made <- fw
+		}
+		return fw, err
+	}
+	t.Cleanup(func() { newFSWatcher = prev })
+
+	scanned := make(chan struct{}, 4)
+	w := New(t.TempDir(), func(context.Context) { scanned <- struct{}{} },
+		WithDebounce(20*time.Millisecond), WithFallback(time.Hour))
+
+	done := make(chan error, 1)
+	go func() { done <- w.Run(t.Context()) }()
+
+	// The post-attach scan means watch mode is live, so the close below lands on
+	// a running watch loop rather than during the attach.
+	select {
+	case <-scanned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run never ran the post-attach scan; watch mode was not reached")
+	}
+	if err := (<-made).Close(); err != nil {
+		t.Fatalf("watcher.Close() = %v", err)
+	}
+
+	select {
+	case err := <-done:
+		// Closing the watcher closes BOTH channels and watchLoop's select picks a
+		// ready case at random, so either closure loss is correct here; a nil error
+		// (the loss swallowed) or a neighbouring cause is not.
+		if err != error(errEventsChannelClosed) && err != error(errErrorsChannelClosed) {
+			t.Errorf("Run(watcher died in watch mode) = %v, want one of the channel-closure losses (%v / %v) so main exits non-zero and the container restarts with a fresh watcher",
+				err, errEventsChannelClosed, errErrorsChannelClosed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after the watcher died in watch mode; the process would keep reporting healthy while detecting no renewal")
+	}
+}
+
+// TestAttachWatchSet_names_the_rescan_cadence_when_it_degrades_to_polling pins
+// the fallback_scan attribute on the two WARNs that announce poll mode. It is
+// the operator's only statement of whether anything will revisit /input while
+// fsnotify is unusable -- "disabled" means nothing does for the life of the
+// process -- and the same attribute is already pinned on this package's other
+// degraded-path WARNs, so only the mode-entry pair could lose it silently.
+// Not parallel: it swaps the process-global slog default and the newFSWatcher seam.
+func TestAttachWatchSet_names_the_rescan_cadence_when_it_degrades_to_polling(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		msg          string
+		unavailable  bool
+		fallback     time.Duration
+		wantFallback string
+	}{
+		{"an unusable fsnotify names the cadence", "fsnotify unavailable, using polling", true, 6 * time.Hour, "6h0m0s"},
+		{"an unusable fsnotify reports a disabled rescan as disabled", "fsnotify unavailable, using polling", true, 0, "disabled"},
+		{"an unwatchable root names the cadence", "failed to watch directories, using polling", false, 6 * time.Hour, "6h0m0s"},
+		{"an unwatchable root reports a disabled rescan as disabled", "failed to watch directories, using polling", false, 0, "disabled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unavailable {
+				stubFSWatcherUnavailable(t)
+			} else {
+				newTestWatcher(t) // availability probe: the root, not fsnotify, must fail here
+			}
+			logs := capture.Default(t)
+			w := New(filepath.Join(t.TempDir(), "missing"), func(context.Context) {}, WithFallback(tc.fallback))
+
+			watcher, stopped := w.attachWatchSet(t.Context())
+
+			if watcher != nil {
+				watcher.Close()
+				t.Fatal("attachWatchSet returned a watcher, want none so Run selects poll mode")
+			}
+			if stopped {
+				t.Fatal("attachWatchSet stopped = true, want false: an unusable watch set is a degradation, not a shutdown")
+			}
+			if n := logs.CountLevel(slog.LevelWarn, tc.msg); n != 1 {
+				t.Fatalf("WARN %q logged %d times, want exactly 1; log = %v", tc.msg, n, logs.Messages())
+			}
+			got, ok := logs.AttrValue(tc.msg, "fallback_scan")
+			if !ok {
+				t.Fatalf("WARN %q carries no fallback_scan attribute; an operator cannot tell whether anything will revisit /input while fsnotify is unusable; log = %v", tc.msg, logs.Messages())
+			}
+			if got != tc.wantFallback {
+				t.Errorf("WARN %q fallback_scan = %q with WithFallback(%v), want %q", tc.msg, got, tc.fallback, tc.wantFallback)
+			}
+		})
+	}
+}
