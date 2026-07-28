@@ -1300,16 +1300,26 @@ func utf8SubjectView(c *x509.Certificate, cn string) *x509.Certificate {
 }
 
 // TestAnalyse_keeps_the_upper_chain_when_a_middle_issuer_cannot_be_established
-// makes the additive fallback depend on whether the discovered path reached a
-// self-signed terminus, not on whether it found anything at all.
+// pins what a permitted name-encoding difference in the MIDDLE of a bundle costs
+// now: nothing.
 //
-// Reproduced shape: leaf -> lower CA -> upper CA -> root, where the lower CA's
-// issuer name is a permitted but byte-distinct encoding of the upper CA's subject
-// and no key-identifier edge exists. The leaf-to-lower edge is discovered, so the
-// old `len(chain) == 0` gate never fired, and the upper CA and the root were
-// reported as unrelated and EXCLUDED — the silent chain shrink the fallback exists
-// to prevent, one link further up. A consumer of the PFX then cannot build the path
-// that was present in the PEM bundle.
+// Shape: leaf -> lower CA -> upper CA -> root, where the lower CA's issuer name is a
+// permitted but byte-distinct encoding of the upper CA's subject and no
+// key-identifier edge exists. Two earlier defects lived here. The first EXCLUDED the
+// upper CA and the root as unrelated, because a `len(chain) == 0` gate never fired
+// for a path that had found one hop — the silent chain shrink, one link up. The
+// second kept them, but only through the additive fallback: the edge was not in the
+// graph, so the certificates arrived as an input-ordered tail with
+// ObsChainUnverified beside them, even though the upper CA's signature over the
+// lower one verifies and the app was able to prove exactly that when it picked the
+// identity.
+//
+// Both are gone because semantic name equality is now a candidate-edge signal in the
+// one evidence graph, so this bundle's every hop is PROVEN: the emitted order is
+// ancestry order because the path walk produced it, and a bundle whose chain is
+// provable says nothing at all. What still uses the fallback is a bundle where no
+// signature can be checked (TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established
+// pins that half).
 func TestAnalyse_keeps_the_upper_chain_when_a_middle_issuer_cannot_be_established(t *testing.T) {
 	t.Parallel()
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
@@ -1371,38 +1381,23 @@ func TestAnalyse_keeps_the_upper_chain_when_a_middle_issuer_cannot_be_establishe
 		t.Fatalf("chain = %v, want all 3 CA certificates kept: an unprovable middle edge must not truncate the chain",
 			chainSerials(got.Chain()))
 	}
-	// The emitted ORDER is the contract Analysis.chain documents for the fallback:
-	// the certificates whose ancestry IS established come first, then the remaining
-	// issuer-eligible ones in INPUT order. Nothing else pins the tail, so a fallback
-	// that appended the kept certificates ahead of the discovered path, or in
-	// reverse, would emit CA bags in an order no test notices while go-pkcs12's
-	// decoder reads the sequence positionally.
+	// The emitted ORDER is the PKCS#12 contract: go-pkcs12's decoder reads the bag
+	// SEQUENCE positionally, so nearest-parent-first is what a consumer needs. It is
+	// now produced by the path walk rather than by an input-ordered fallback tail, so
+	// a bundle listing its CAs in any order emits them in ancestry order.
 	if serials := strings.Join(chainSerials(got.Chain()), ","); serials != "502,501,500" {
-		t.Errorf("chain serials = %s, want 502,501,500 (the discovered lower CA first, then the kept remainder in input order)",
-			serials)
+		t.Errorf("chain serials = %s, want 502,501,500 (nearest parent first, by ancestry)", serials)
 	}
 	if len(got.Extra()) != 0 {
 		t.Errorf("Extra holds %d certificate(s), want 0: neither the upper CA nor the root was shown to be off the chain",
 			len(got.Extra()))
 	}
-	// The detail must name the certificate whose issuer could not be established --
-	// the path's TERMINUS, the lower CA -- rather than the identity the path started
-	// from. Naming the leaf instead sends the operator to the one link in this bundle
-	// whose issuance IS established.
-	var unverified string
-	for _, o := range got.Observations() {
-		if o.Kind == convert.ObsChainUnverified {
-			unverified = o.Detail
-		}
-	}
-	if unverified == "" {
-		t.Errorf("observations = %v, want the unverified upper chain reported", got.Observations())
-	} else if !strings.Contains(unverified, "Encoding Lower CA") {
-		t.Errorf("chain-unverified detail = %q, want it to name %q, the certificate the discovered path ended on and whose issuer could not be established",
-			unverified, "Encoding Lower CA")
-	}
-	if hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
-		t.Errorf("observations = %v, want NO exclusion: nothing was proven unrelated", got.Observations())
+	// Every hop is proven, so nothing here is unestablished and nothing is excluded:
+	// the contradictory pair of signals this bundle used to emit — an issuer named as
+	// verified for role selection, and "no issuer could be established" for the chain
+	// — cannot occur once one graph answers both questions.
+	if len(got.Observations()) != 0 {
+		t.Errorf("observations = %v, want none: every edge in this bundle is proven by signature", got.Observations())
 	}
 }
 
@@ -1730,5 +1725,236 @@ func TestAnalyse_emits_a_compliant_chain_unchanged_and_silently(t *testing.T) {
 	}
 	if len(got.Observations()) != 0 {
 		t.Errorf("observations = %v, want none: every certificate here is well-formed, in order and current", got.Observations())
+	}
+}
+
+// TestAnalyse_orders_a_chain_proven_across_a_name_encoding_difference is the
+// behaviour the unified evidence graph exists for, asserted on ORDER rather than
+// membership.
+//
+// Shape: leaf -> lower CA -> upper CA -> root, with the lower CA naming the upper
+// one through a permitted but byte-distinct DirectoryString encoding and no key
+// identifiers, and the CAs listed in the file in an order that is NOT ancestry
+// order. While issuance was decided by raw DER names for the chain and by decoded
+// names only for identity/role selection, the app could PROVE the upper CA signed
+// the lower one when it picked the identity and still fail to place that edge in the
+// chain: the certificates arrived through the additive fallback, which appends what
+// it keeps in INPUT order, so the emitted bag sequence stopped matching ancestry --
+// and go-pkcs12's decoder reads that sequence positionally.
+//
+// With one graph carrying name linkage at both fidelities, every hop here is proven,
+// the path walk emits nearest-parent-first, and the fallback never fires. Membership
+// alone cannot see this: the OLD code also emitted all three CAs.
+func TestAnalyse_orders_a_chain_proven_across_a_name_encoding_difference(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	rootKey := newKey(t)
+	rootPEM, rootCert := mint(t, unverifiableCA(800, "Ordered Encoding Root CA", notBefore, notBefore.Add(96*time.Hour)),
+		&rootKey.PublicKey, nil, rootKey)
+	upperKey := newKey(t)
+	upperPEM, upperCert := mint(t, unverifiableCA(801, "Ordered Encoding Upper CA", notBefore, notBefore.Add(72*time.Hour)),
+		&upperKey.PublicKey, rootCert, rootKey)
+	lowerKey := newKey(t)
+	lowerPEM, lowerCert := mint(t, unverifiableCA(802, "Ordered Encoding Lower CA", notBefore, notBefore.Add(48*time.Hour)),
+		&lowerKey.PublicKey, utf8SubjectView(upperCert, "Ordered Encoding Upper CA"), upperKey)
+	leafKey := newKey(t)
+	leafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(803),
+		Subject:      pkix.Name{CommonName: "ordered-encoding-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, lowerCert, lowerKey)
+
+	if bytes.Equal(lowerCert.RawIssuer, upperCert.RawSubject) {
+		t.Fatal("setup: the lower CA's issuer name matches the upper CA's subject byte for byte, so this bundle does not reproduce the encoding difference")
+	}
+	if len(lowerCert.AuthorityKeyId) > 0 {
+		t.Fatal("setup: the lower CA carries an authority key identifier, so the key-identifier signal would find the upper CA without the name comparison")
+	}
+	if err := upperCert.CheckSignature(lowerCert.SignatureAlgorithm, lowerCert.RawTBSCertificate, lowerCert.Signature); err != nil {
+		t.Fatalf("setup: the upper CA did not sign the lower CA, so there is no proof for the graph to find: %v", err)
+	}
+
+	// Input order deliberately breaks ancestry: root before upper. The additive
+	// fallback would emit 802,800,801.
+	got, err := convert.Analyse(concatPEM(leafPEM, lowerPEM, rootPEM, upperPEM), keyPEMOf(t, leafKey))
+	if err != nil {
+		t.Fatalf("Analyse(chain proven across an encoding difference) = error %v, want nil", err)
+	}
+	if serials := strings.Join(chainSerials(got.Chain()), ","); serials != "802,801,800" {
+		t.Errorf("chain serials = %s, want 802,801,800 (ancestry order from the path walk, not the input order an additive tail would emit)",
+			serials)
+	}
+	if len(got.Extra()) != 0 {
+		t.Errorf("Extra holds %d certificate(s), want 0", len(got.Extra()))
+	}
+	if hasObservation(got.Observations(), convert.ObsChainUnverified) {
+		t.Errorf("observations = %v, want no %q: every edge in this bundle is proven by signature",
+			got.Observations(), convert.ObsChainUnverified)
+	}
+	if len(got.Observations()) != 0 {
+		t.Errorf("observations = %v, want none for a fully proven, in-window bundle", got.Observations())
+	}
+}
+
+// TestAnalyse_keeps_an_unproven_name_match_from_being_promoted holds the other side
+// of the widened name signal: teaching the graph semantically-equal names must not
+// let a name alone stand in for a signature.
+//
+// Both halves were reproduced against a model that compared decoded names without
+// re-applying the exclusions the raw-name model already had.
+func TestAnalyse_keeps_an_unproven_name_match_from_being_promoted(t *testing.T) {
+	t.Parallel()
+
+	// Proof outranks name fidelity: the certificate that actually signed the leaf is
+	// linked to it only SEMANTICALLY, while an impostor matching the leaf's issuer
+	// name byte for byte holds a different key and expires later, so every ranking
+	// key below edge strength -- and any rule preferring an exact name match to a
+	// decoded one -- would emit the impostor as the leaf's CA.
+	t.Run("an exact name match does not outrank a proven signature", func(t *testing.T) {
+		t.Parallel()
+		notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+		realKey := newKey(t)
+		realPEM, realCert := mint(t, unverifiableCA(810, "Promoted Encoding CA", notBefore, notBefore.Add(48*time.Hour)),
+			&realKey.PublicKey, nil, realKey)
+		leafKey := newKey(t)
+		leafPEM, leafCert := mint(t, &x509.Certificate{
+			SerialNumber: big.NewInt(811),
+			Subject:      pkix.Name{CommonName: "promoted-encoding-leaf.example.com"},
+			NotBefore:    notBefore,
+			NotAfter:     notBefore.Add(24 * time.Hour),
+		}, &leafKey.PublicKey, utf8SubjectView(realCert, "Promoted Encoding CA"), realKey)
+
+		// The impostor's subject is the leaf's issuer name EXACTLY, copied from the
+		// leaf so the DER cannot drift, and it signed nothing here.
+		impostorKey := newKey(t)
+		impostor := unverifiableCA(812, "", notBefore, notBefore.Add(240*time.Hour))
+		impostor.RawSubject = leafCert.RawIssuer
+		impostorPEM, impostorCert := mint(t, impostor, &impostorKey.PublicKey, nil, impostorKey)
+
+		if !bytes.Equal(impostorCert.RawSubject, leafCert.RawIssuer) {
+			t.Fatal("setup: the impostor's subject is not the leaf's issuer name byte for byte, so it is not the exact-match candidate under test")
+		}
+		if bytes.Equal(realCert.RawSubject, leafCert.RawIssuer) {
+			t.Fatal("setup: the real signer's subject matches the leaf's issuer name byte for byte, so the semantic signal is not exercised")
+		}
+
+		for _, order := range []struct {
+			name  string
+			certs [][]byte
+		}{
+			{"impostor first", [][]byte{leafPEM, impostorPEM, realPEM}},
+			{"real signer first", [][]byte{leafPEM, realPEM, impostorPEM}},
+		} {
+			t.Run(order.name, func(t *testing.T) {
+				t.Parallel()
+				got, err := convert.Analyse(concatPEM(order.certs...), keyPEMOf(t, leafKey))
+				if err != nil {
+					t.Fatalf("Analyse = error %v, want nil", err)
+				}
+				if len(got.Chain()) == 0 {
+					t.Fatal("chain is empty; want the CA that signed the leaf")
+				}
+				if got.Chain()[0].SerialNumber.Cmp(big.NewInt(810)) != 0 {
+					t.Errorf("chain[0] serial = %s, want 810 (the proven signer named through an encoding difference, not the byte-exact same-name impostor)",
+						got.Chain()[0].SerialNumber)
+				}
+			})
+		}
+	})
+
+	// The key-reuse exclusion has to survive the decoded comparison too. Two
+	// self-signed certificates holding ONE key, the second re-encoding the same
+	// subject, are a regenerated certificate beside its predecessor: each verifies
+	// against the other, so without the exclusion both read as issuers, both matches
+	// are dropped, and the role check refuses a bundle that converts fine today.
+	t.Run("key reuse across an encoding difference is not issuance", func(t *testing.T) {
+		t.Parallel()
+		notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+		sharedKey := newKey(t)
+
+		firstPEM, firstCert := mint(t, unverifiableCA(820, "Regenerated Encoding CA", notBefore, notBefore.Add(48*time.Hour)),
+			&sharedKey.PublicKey, nil, sharedKey)
+		// Same name, encoded the other permitted way, same key: a regeneration.
+		reissued := unverifiableCA(821, "", notBefore.Add(time.Minute), notBefore.Add(96*time.Hour))
+		reissuedView := utf8SubjectView(firstCert, "Regenerated Encoding CA")
+		reissued.RawSubject = nil
+		reissued.Subject = reissuedView.Subject
+		secondPEM, secondCert := mint(t, reissued, &sharedKey.PublicKey, reissuedView, sharedKey)
+
+		if bytes.Equal(firstCert.RawSubject, secondCert.RawSubject) {
+			t.Fatal("setup: both certificates encode the subject identically, so the raw-name exclusion alone would cover this bundle")
+		}
+		if !bytes.Equal(secondCert.RawSubject, secondCert.RawIssuer) {
+			t.Fatal("setup: the regenerated certificate is not self-signed under its own re-encoded name")
+		}
+
+		got, err := convert.Analyse(concatPEM(firstPEM, secondPEM), keyPEMOf(t, sharedKey))
+		if err != nil {
+			t.Fatalf("Analyse(a regenerated self-signed certificate re-encoding its own subject) = error %v, want nil: reusing a key is not issuing a certificate", err)
+		}
+		if got.Leaf().SerialNumber.Cmp(big.NewInt(821)) != 0 {
+			t.Errorf("selected identity serial = %s, want 821 (the later-issued certificate of the pair)", got.Leaf().SerialNumber)
+		}
+		if len(got.Chain()) != 0 {
+			t.Errorf("chain = %v, want empty: a self-signed identity has no chain, and its predecessor did not issue it",
+				chainSerials(got.Chain()))
+		}
+	})
+}
+
+// TestAnalyse_excludes_a_stranger_once_the_encoding_gap_is_proven names the emitted
+// content this change moves, which is the reason it is a decision and not a cleanup.
+//
+// The additive fallback keeps every issuer-eligible extra whenever the discovered
+// path does not reach a proven self-signed terminus. While a permitted name-encoding
+// difference blocked the leaf's own edge, that condition held for this bundle, so an
+// unrelated CA sitting beside the real one was swept into the PFX as well. Proving
+// the edge ends the path at a self-signed root, so the fallback does not fire and the
+// stranger is excluded and named instead.
+//
+// This is the fallback's over-inclusion shrinking to the bundles that are genuinely
+// unprovable; the fallback's own policy for those is unchanged
+// (TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established still pins
+// it).
+func TestAnalyse_excludes_a_stranger_once_the_encoding_gap_is_proven(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	caKey := newKey(t)
+	caPEM, caCert := mint(t, unverifiableCA(830, "Proven Gap CA", notBefore, notBefore.Add(48*time.Hour)),
+		&caKey.PublicKey, nil, caKey)
+	leafKey := newKey(t)
+	leafPEM, leafCert := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(831),
+		Subject:      pkix.Name{CommonName: "proven-gap-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, utf8SubjectView(caCert, "Proven Gap CA"), caKey)
+	strangerKey := newKey(t)
+	strangerPEM, _ := mint(t, unverifiableCA(832, "Unrelated Bystander CA", notBefore, notBefore.Add(240*time.Hour)),
+		&strangerKey.PublicKey, nil, strangerKey)
+
+	if bytes.Equal(leafCert.RawIssuer, caCert.RawSubject) {
+		t.Fatal("setup: issuer and subject encodings unexpectedly match, so the gap under test is absent")
+	}
+
+	got, err := convert.Analyse(concatPEM(leafPEM, caPEM, strangerPEM), keyPEMOf(t, leafKey))
+	if err != nil {
+		t.Fatalf("Analyse = error %v, want nil", err)
+	}
+	if serials := strings.Join(chainSerials(got.Chain()), ","); serials != "830" {
+		t.Errorf("chain serials = %s, want 830 alone: the proven CA is the whole chain, and the bystander is not part of it", serials)
+	}
+	if len(got.Extra()) != 1 || got.Extra()[0].SerialNumber.Cmp(big.NewInt(832)) != 0 {
+		t.Fatalf("Extra = %v, want the unrelated bystander alone", chainSerials(got.Extra()))
+	}
+	if !hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
+		t.Errorf("observations = %v, want the exclusion reported: a certificate left out of the bundle is never silent", got.Observations())
+	}
+	if hasObservation(got.Observations(), convert.ObsChainUnverified) {
+		t.Errorf("observations = %v, want no %q: the leaf's issuer is proven", got.Observations(), convert.ObsChainUnverified)
 	}
 }

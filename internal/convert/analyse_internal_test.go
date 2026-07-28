@@ -7,8 +7,11 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
+	"fmt"
 	"math/big"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -278,5 +281,244 @@ func TestAnalyseAt_renewed_cert_tie_turns_on_validity_at_the_instant(t *testing.
 					tt.now.UTC().Format(time.RFC3339), got.Format(time.RFC3339), tt.wantNotBefore.UTC().Format(time.RFC3339))
 			}
 		})
+	}
+}
+
+// testEvidenceCert builds one certificate for the evidence-model tests and returns
+// it parsed. A nil parent means self-signed.
+//
+// The internal tests need names the pkix.Name template cannot express -- an explicit
+// RDN order, a chosen DirectoryString tag -- so the template carries RawSubject
+// directly and the parent is passed as a view whose RawSubject is the issuer name to
+// embed.
+func testEvidenceCert(t *testing.T, tmpl *x509.Certificate, key *ecdsa.PrivateKey,
+	parent *x509.Certificate, parentKey *ecdsa.PrivateKey,
+) *x509.Certificate {
+	t.Helper()
+	if parent == nil {
+		parent, parentKey = tmpl, key
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &key.PublicKey, parentKey)
+	if err != nil {
+		t.Fatalf("setup: CreateCertificate: %v", err)
+	}
+	got, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("setup: ParseCertificate: %v", err)
+	}
+	return got
+}
+
+// testRDN is one attribute of a distinguished name for testRawDN.
+type testRDN struct {
+	oid   asn1.ObjectIdentifier
+	value string
+}
+
+var (
+	testOIDOrg = asn1.ObjectIdentifier{2, 5, 4, 10} // id-at-organizationName
+	testOIDCN  = asn1.ObjectIdentifier{2, 5, 4, 3}  // id-at-commonName
+)
+
+// testRawDN marshals rdns as one RDN SEQUENCE, one single-valued RDN each, in the
+// order given and with the DirectoryString tag given. Both are the point: the same
+// attributes in a different RDN ORDER are a different DN, while a different TAG over
+// the same values is the same DN, and pkix.Name can express neither.
+func testRawDN(t *testing.T, tag int, rdns ...testRDN) []byte {
+	t.Helper()
+	seq := make(pkix.RDNSequence, 0, len(rdns))
+	for _, r := range rdns {
+		seq = append(seq, pkix.RelativeDistinguishedNameSET{{
+			Type: r.oid,
+			Value: asn1.RawValue{
+				Class: asn1.ClassUniversal,
+				Tag:   tag,
+				Bytes: []byte(r.value),
+			},
+		}})
+	}
+	der, err := asn1.Marshal(seq)
+	if err != nil {
+		t.Fatalf("setup: marshal RDNSequence: %v", err)
+	}
+	return der
+}
+
+// testNameLinkGraph builds a graph over certs at a fixed instant.
+func testNameLinkGraph(t *testing.T, certs ...*x509.Certificate) *certGraph {
+	t.Helper()
+	g, err := newCertGraph(certs, time.Now())
+	if err != nil {
+		t.Fatalf("setup: newCertGraph: %v", err)
+	}
+	return g
+}
+
+// TestNameLink_separates_a_re_encoded_name_from_a_reordered_one pins the name half of
+// the evidence model at both ends, because the two failure directions cost opposite
+// things and one comparison decides both.
+//
+// Too strict (a byte comparison alone) and a leaf naming its issuer as a UTF8String
+// where the CA's subject uses the canonical encoding records no linkage, which is the
+// permitted-encoding case RFC 5280 allows and which cost the app a chain it could
+// prove. Too loose (pkix.Name.ToRDNSequence, which rebuilds known attributes in a
+// FIXED order and flattens multi-valued RDNs) and `O=Acme,CN=x` compares equal to
+// `CN=x,O=Acme` -- two different DNs -- so a CA whose key happened to sign a
+// certificate naming that OTHER DN reads as its issuer. crypto/x509 documents
+// pkix.Name as an approximation and says accurate name work must unmarshal the raw
+// names, which is what nameLink does.
+func TestNameLink_separates_a_re_encoded_name_from_a_reordered_one(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("setup: GenerateKey: %v", err)
+	}
+
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(900),
+		RawSubject:            testRawDN(t, asn1.TagPrintableString, testRDN{testOIDOrg, "Acme"}, testRDN{testOIDCN, "Evidence CA"}),
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(96 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	ca := testEvidenceCert(t, caTmpl, caKey, nil, nil)
+
+	// A view of the CA whose subject is the given name and which carries no subject
+	// key identifier, so a certificate minted against it embeds that issuer name and
+	// no authority key identifier: the name comparison then decides alone.
+	view := func(raw []byte) *x509.Certificate {
+		v := *ca
+		v.RawSubject = raw
+		v.SubjectKeyId = nil
+		v.Subject = pkix.Name{}
+		return &v
+	}
+	child := func(serial int64, issuer []byte) *x509.Certificate {
+		key, keyErr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if keyErr != nil {
+			t.Fatalf("setup: GenerateKey: %v", keyErr)
+		}
+		return testEvidenceCert(t, &x509.Certificate{
+			SerialNumber: big.NewInt(serial),
+			Subject:      pkix.Name{CommonName: fmt.Sprintf("child-%d.example.com", serial)},
+			NotBefore:    notBefore,
+			NotAfter:     notBefore.Add(24 * time.Hour),
+		}, key, view(issuer), caKey)
+	}
+
+	exact := child(901, testRawDN(t, asn1.TagPrintableString, testRDN{testOIDOrg, "Acme"}, testRDN{testOIDCN, "Evidence CA"}))
+	reEncoded := child(902, testRawDN(t, asn1.TagUTF8String, testRDN{testOIDOrg, "Acme"}, testRDN{testOIDCN, "Evidence CA"}))
+	reordered := testEvidenceCert(t, &x509.Certificate{
+		SerialNumber: big.NewInt(903),
+		Subject:      pkix.Name{CommonName: "child-903.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, caKey, view(testRawDN(t, asn1.TagPrintableString, testRDN{testOIDCN, "Evidence CA"}, testRDN{testOIDOrg, "Acme"})), caKey)
+
+	g := testNameLinkGraph(t, ca, exact, reEncoded, reordered)
+	const caIdx = 0
+	for _, tc := range []struct {
+		name  string
+		child int
+		want  nameLinkage
+	}{
+		{"byte-identical issuer name", 1, nameLinkExact},
+		{"same name, other DirectoryString encoding", 2, nameLinkSemantic},
+		{"same attribute values in a different RDN order", 3, nameLinkNone},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := g.nameLink(tc.child, caIdx); got != tc.want {
+				t.Errorf("nameLink(%s) = %d, want %d", tc.name, got, tc.want)
+			}
+			if got := g.edge(tc.child, caIdx).linked(); got != (tc.want != nameLinkNone) {
+				t.Errorf("edge(%s).linked() = %t, want %t", tc.name, got, tc.want != nameLinkNone)
+			}
+		})
+	}
+
+	// The reordered name is the trap: assert the pkix approximation of the two names
+	// COLLIDES, so a comparison built on it would have called them equal and this
+	// test would prove nothing.
+	approxCA, approxIssuer := ca.Subject.ToRDNSequence(), reordered.Issuer.ToRDNSequence()
+	if !reflect.DeepEqual(approxCA, approxIssuer) {
+		t.Fatal("setup: the pkix.Name approximations of the two names differ, so this fixture no longer reproduces the ToRDNSequence collision")
+	}
+	// And assert the CA's key really did sign it, so only the name comparison keeps
+	// the pair unlinked.
+	if err := ca.CheckSignature(reordered.SignatureAlgorithm, reordered.RawTBSCertificate, reordered.Signature); err != nil {
+		t.Fatalf("setup: the CA's key did not sign the reordered-name certificate: %v", err)
+	}
+	if g.isIssuer(caIdx) != true {
+		t.Error("isIssuer(the CA) = false, want true: it signed two certificates whose issuer name IS its own")
+	}
+}
+
+// TestCertGraph_never_verifies_a_signature_for_an_unlinked_pair pins the model's cost
+// contract: name and key linkage are cheap comparisons and are computed for every
+// pair, but the signature is expensive and is only ever asked about a pair something
+// already links.
+//
+// This is unobservable from Analyse's result -- an eager all-pairs verification
+// returns the same chain -- and it is exactly what the RSA modulus and public-exponent
+// ceilings exist to bound: one verification runs to milliseconds at the ceilings, and
+// a 64-certificate bundle has 4032 ordered pairs. The fixture is the strongest form of
+// the case: the CA's key genuinely signed the other certificate, so a model that
+// verified first and asked about names afterwards would find a valid signature here,
+// and only the linkage gate stops it looking.
+func TestCertGraph_never_verifies_a_signature_for_an_unlinked_pair(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("setup: GenerateKey: %v", err)
+	}
+
+	ca := testEvidenceCert(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(910),
+		RawSubject:            testRawDN(t, asn1.TagPrintableString, testRDN{testOIDOrg, "Acme"}, testRDN{testOIDCN, "Unlinked CA"}),
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(96 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, caKey, nil, nil)
+
+	// Signed by the CA's key, but naming an issuer whose RDNs are in the other order:
+	// a different DN, so nothing links the pair.
+	strangerView := *ca
+	strangerView.RawSubject = testRawDN(t, asn1.TagPrintableString, testRDN{testOIDCN, "Unlinked CA"}, testRDN{testOIDOrg, "Acme"})
+	strangerView.SubjectKeyId = nil
+	strangerView.Subject = pkix.Name{}
+	strangerKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("setup: GenerateKey: %v", err)
+	}
+	stranger := testEvidenceCert(t, &x509.Certificate{
+		SerialNumber: big.NewInt(911),
+		Subject:      pkix.Name{CommonName: "unlinked-stranger.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, strangerKey, &strangerView, caKey)
+
+	if err := ca.CheckSignature(stranger.SignatureAlgorithm, stranger.RawTBSCertificate, stranger.Signature); err != nil {
+		t.Fatalf("setup: the CA's key did not sign the stranger, so this fixture cannot show a verifiable signature going unchecked: %v", err)
+	}
+
+	g := testNameLinkGraph(t, ca, stranger)
+	const strangerIdx, caIdx = 1, 0
+	if g.edge(strangerIdx, caIdx).linked() {
+		t.Fatal("setup: the pair is linked, so the cost contract under test does not apply to it")
+	}
+	if got := g.proofChecks; got != 0 {
+		t.Errorf("building the graph paid for %d signature verification(s), want 0: no pair here is linked", got)
+	}
+	if g.proven(strangerIdx, caIdx) {
+		t.Error("proven(stranger, CA) = true, want false: a signature is not evidence of issuance for a pair no name or key identifier links")
+	}
+	if got := g.proofChecks; got != 0 {
+		t.Errorf("asking about an unlinked pair paid for %d signature verification(s), want 0", got)
 	}
 }

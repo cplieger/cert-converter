@@ -353,84 +353,164 @@ type identityMatch struct {
 	cert int
 }
 
-// certGraph holds the certificates plus the issuance relationships derived from
-// them, in TWO sets of differing strength, plus how far each certificate is from
-// a self-signed root present in the bundle.
+// certGraph holds the certificates plus everything this bundle can say about which
+// of them issued which, derived once and shared by every consumer, plus how far each
+// certificate is from a self-signed root present in the bundle.
+//
+// "Did certs[parent] issue certs[child]" is deliberately NOT a boolean here. It is
+// four independent facts per ordered pair (issuanceEvidence): how the names line up
+// and with what fidelity, whether the key identifiers line up, whether parent's key
+// provably produced child's signature, and whether parent's own extensions permit it
+// to issue certificates at all. One boolean forces every consumer to accept some
+// other consumer's choice of which evidence counts, which is exactly how a second
+// issuance predicate once grew beside this graph: the app could PROVE a CA issued the
+// leaf while selecting the identity and still fail to place that proven edge in the
+// ordered chain, falling back to an unordered additive tail instead.
+//
+// With the facts separate, each consumer asks the question it actually has: chain
+// assembly and ranking want the strongest PROVEN path (a proven edge outranks a
+// merely linked one), identity role selection wants cryptographic proof alone, and
+// the diagnostics want eligibility plus the reason a link is weak — which are two
+// different operator messages, "the name matched but the signature did not verify"
+// (a possible impostor, reported by ObsChainUnverified) and "the signature verified
+// but the CA is not RFC-eligible" (a non-compliant CA, reported by
+// ObsChainCertCannotIssue), and nothing here may merge them.
+//
+// This is a LAYOUT and DIAGNOSTICS structure, not a certificate-path validator. The
+// app holds no trust store and validates nothing for security: the graph decides
+// which certificates enter the PKCS#12 bag sequence and in what order, and what the
+// operator is told about them. A proven edge here does not mean the chain is
+// trusted, and trust semantics must not be added to it.
 type certGraph struct {
 	now   time.Time
 	certs []*x509.Certificate
-	// verified memoises signature checks, keyed by (child, parent). Checks are made
-	// per CANDIDATE EDGE, never for all pairs: an eager all-pairs pass cost O(n^2)
-	// real signature verifications on the scan goroutine, while the plausible-issuer
-	// filter leaves only the edges that could matter. Three places ask — the
-	// verified-distance walk, chain assembly at the few candidates of one hop, and
-	// the role check on the selected identity's candidate children — and the memo
-	// means an edge is verified at most once for all of them.
+	// evidence holds the cheap facts for every ORDERED pair, flattened row-major by
+	// child (edge indexes it). Filled eagerly by newCertGraph, because every fact in
+	// it is a byte, OID or decoded-name comparison over data already in memory. The
+	// one expensive fact — the signature — is deliberately not in here; see proof.
+	evidence []issuanceEvidence
+	// proof memoises the cryptographic fact "certs[parent]'s public key verifies
+	// certs[child]'s signature", keyed by (child, parent) and computed LAZILY,
+	// because it is the only fact in the model whose cost the FILE dictates rather
+	// than the certificate count: one verification runs from 69us at RSA-2048 to
+	// milliseconds at the maxVerifiableKeyBits / maxVerifiablePublicExponent
+	// ceilings, and one analysis can ask about maxChainCerts^2 pairs.
 	//
-	// One asker reaches OUTSIDE the candidate set: isIssuerByName, the role check's
-	// fallback, verifies a pair whose names are semantically equal but whose
-	// encodings differ, which is exactly the edge the candidate graph deliberately
-	// does not record. It is bounded the same way — one pass over the certificates
-	// of the one bundle, per certificate a supplied key matched: dropIssuerMatches
-	// asks BEFORE selection, once for every match, and analyseAt's role check asks
-	// again for the one it picked. Every ask goes through this memo, so a pair is
-	// still verified at most once per analysis and the total stays inside the same
-	// maxChainCerts-squared envelope the candidate-edge walks already pay. Anything
-	// that function recomputes per call is paid up to that many times, which is why
-	// the raw names it decodes are memoised too (decodedSubjects/decodedIssuers).
-	verified map[[2]int]bool
-	// rawSigned memoises the RAW signature check verified's RFC gate cannot answer,
-	// keyed the same way. It is a separate memo because it is a DIFFERENT predicate:
-	// "parent's key produced child's signature", with no issuer-eligibility gate and
-	// (like isSelfSigned's own check) no SHA-1 refusal. Only plausibleIssuer asks,
-	// and only for a name-matched pair whose parent canIssueCertificates
-	// disqualifies, which is the one place the cheap answer would discard a real
-	// signer. Folding it into verified would silently promote such an edge to the
-	// STRONG signal that ranking and the role check read, and those deliberately
-	// still mean "verified under RFC 5280's parent rules".
-	rawSigned map[[2]int]bool
+	// Two rules bound it, both enforced by proven: a pair with no name or key
+	// linkage at all is NEVER verified (nothing links it, so no consumer's question
+	// turns on its signature), and every answer is memoised, so candidate
+	// construction, the proven-distance walk, chain assembly and the identity role
+	// check together pay at most one verification per pair.
+	proof map[[2]int]bool
 	// selfSigned memoises the self-signature check per certificate, for the same
 	// reason verified memoises edges: it is a real signature verification whose cost
 	// the input file dictates, and three places ask — the root set, every hop of
 	// pathFrom, and assembleChain's self-signed carve-out.
 	selfSigned map[int]bool
 	// decodedSubjects[i] / decodedIssuers[i] memoise the ASN.1-decoded raw subject
-	// and issuer names, for the same reason verified memoises edges: the decode is
-	// O(name size) work the FILE dictates, and isIssuerByName re-asks for the
-	// subject and the issuer of every certificate on every call. Measured on a
+	// and issuer names, for the same reason proof memoises a signature: the decode is
+	// O(name size) work the FILE dictates, and the linkage classifier asks for the
+	// subject and the issuer of every certificate against every other one. This is
+	// the ONE decoded-name cache in the package; semantic name equality is computed
+	// here, once per certificate, and stored as a fact on the edge. Measured on a
 	// 64-block, 8.87 MB bundle inside both existing caps: 12.4s of a 15.2s Analyse
-	// went on those repeated decodes, against 97ms to parse all 64 blocks once.
+	// went on repeated decodes, against 97ms to parse all 64 blocks once.
 	decodedSubjects []decodedDN
 	decodedIssuers  []decodedDN
-	// candidateParents[i]: indices that are plausibly issuers of certs[i], by key
-	// identifier or by issuer/subject name, whether or not a signature could be
-	// verified. The inclusive signal, used to assemble the emitted chain, where
-	// over-including costs one stray certificate and under-including silently
-	// breaks path building at the consumer.
+	// candidateParents[i]: indices that could be issuers of certs[i] — linked to it
+	// by key identifier or by name (byte-identical DER, or semantically equal after
+	// an ASN.1 decode) and not excluded as key reuse, and either RFC-eligible to
+	// issue or proven to have signed this child. The inclusive signal, used to
+	// assemble the emitted chain, where over-including costs one stray certificate
+	// and under-including silently breaks path building at the consumer.
 	//
-	// The sets diverge for causes unrelated to the chain being wrong: Go refuses
-	// to verify a SHA-1 signature at all (no x509sha1 GODEBUG remains in
-	// go1.26), and RFC 5280 permits issuer and subject names to be encoded
-	// differently in ways a byte comparison rejects. Treating "could not prove
-	// related" as "proved unrelated" drops genuine CA certificates.
+	// It is wider than the PROVEN set for causes unrelated to the chain being wrong:
+	// crypto/x509 refuses some signature algorithms outright (MD5, DSA), a key above
+	// the verification ceilings is never verified, and a bundle can carry a
+	// same-named certificate while the real signer is absent. Treating "could not
+	// prove related" as "proved unrelated" drops genuine CA certificates.
 	candidateParents [][]int
 	children         [][]int
 	// distToRoot[i]: fewest parent hops from certs[i] to a self-signed certificate
 	// in this bundle over the INCLUSIVE candidate edges, or -1 when none is
-	// reachable. Kept for the documented SHA-1 and name-encoding fallback, where no
-	// signature can be checked at all.
+	// reachable. Kept for the bundles where no signature can be checked at all — a
+	// refused algorithm, an over-ceiling key, an absent real signer.
 	distToRoot []int
-	// verifiedDistToRoot[i]: the same distance measured over VERIFIED edges only,
+	// provenDistToRoot[i]: the same distance measured over PROVEN edges only,
 	// or -1 when no root is reachable by signatures alone.
 	//
 	// The inclusive measure cannot tell a parent with a real route to a root apart
-	// from one whose route depends on an unverifiable hop: two intermediates sharing
+	// from one whose route depends on an unprovable hop: two intermediates sharing
 	// a subject and a key, one continuing to an included root that actually signed
 	// it and one naming an impostor root of the same name holding a DIFFERENT key,
 	// score identically. Ranking on the inclusive measure alone therefore emitted a
 	// chain whose selected intermediate did not verify under the root beside it,
-	// while the fully verified alternative sat in the same input.
-	verifiedDistToRoot []int
+	// while the fully proven alternative sat in the same input.
+	provenDistToRoot []int
+	// proofChecks counts the signature verifications proven actually paid for.
+	// Nothing in production reads it: the lazy cost model above is otherwise
+	// unobservable, and an eager regression there is a performance defect no
+	// assertion about Analyse's result can catch. Self-signature checks are not
+	// counted — those are per certificate, one each, bounded by selfSigned. It sits
+	// last because it is the struct's only non-pointer word (govet fieldalignment).
+	proofChecks int
+}
+
+// nameLinkage says how a child's issuer name relates to a candidate parent's subject
+// name, and with what fidelity. The fidelity is kept rather than collapsed to a
+// boolean because the two cases are reached by different work and mean different
+// things to a reader: an exact match is a byte comparison and the ordinary shape of a
+// well-formed bundle, while a semantic match is an ASN.1 decode of both names and the
+// RFC 5280 permitted-encoding case (a leaf naming its issuer as a UTF8String where
+// the CA's subject uses the canonical encoding) that a byte comparison cannot see.
+type nameLinkage uint8
+
+const (
+	// nameLinkNone means the two names are not the same name.
+	nameLinkNone nameLinkage = iota
+	// nameLinkSemantic means the decoded names are equal but their DER differs.
+	nameLinkSemantic
+	// nameLinkExact means the raw DER of the two names is byte-identical.
+	nameLinkExact
+)
+
+// issuanceEvidence is what this bundle can cheaply say about one ordered pair, "did
+// certs[parent] issue certs[child]", as separate facts rather than one verdict. The
+// fourth fact, the signature, is not here: it is the expensive one, so it is asked
+// lazily through certGraph.proven and only for a pair this record already links.
+//
+// Each field is a fact about the certificates, never a decision about them. Who is a
+// candidate parent, who is an issuer, and what the operator is told are decisions,
+// and they are made by the consumers that hold those questions.
+type issuanceEvidence struct {
+	// name is how child's issuer name relates to parent's subject name.
+	name nameLinkage
+	// keyID reports RFC 5280's Authority Key Identifier on the child matching the
+	// Subject Key Identifier on the parent. A byte comparison rather than a
+	// signature check, so it is algorithm-agnostic and survives a permitted
+	// name-encoding difference.
+	keyID bool
+	// keyReuse reports that child and parent hold the SAME public key under the same
+	// subject name — a regenerated self-signed certificate left beside the one it
+	// replaces, which `openssl req -x509` produces with CA:TRUE by default. Each
+	// verifies against the other, so a naive rule records a mutual issuance edge,
+	// both then look like issuers, and the identity role check rejects the bundle
+	// outright. Key reuse is not issuance: a certificate cannot have issued another
+	// certificate carrying its own key. It is computed only for a pair that is
+	// otherwise linked, because there is nothing to exclude otherwise.
+	keyReuse bool
+	// eligible reports whether parent's OWN extensions leave it able to issue
+	// certificates under RFC 5280 4.2.1.9. It is POLICY — what a strict path
+	// validator will accept — never a fact about what happened, which is why it can
+	// never on its own remove a certificate a signature puts in the chain.
+	eligible bool
+}
+
+// linked reports whether anything in this bundle ties the two certificates together
+// at all. It is the gate on the expensive fact: a pair with no name and no key-id
+// relationship has nothing for a signature to confirm, so proven never verifies one.
+func (e issuanceEvidence) linked() bool {
+	return !e.keyReuse && (e.name != nameLinkNone || e.keyID)
 }
 
 // maxVerifiableKeyBits bounds the public-key size this app will run a signature
@@ -511,18 +591,24 @@ func rsaModulusBits(pub crypto.PublicKey) int {
 	return k.N.BitLen()
 }
 
-// newCertGraph derives both issuance edge sets, or refuses the bundle outright
-// when a candidate issuer's key is one no signature can be checked against.
+// newCertGraph derives the evidence for every pair and the candidate edge set that
+// follows from it, or refuses the bundle outright when a candidate issuer's key is
+// one no signature can be checked against.
 //
-// Signature verification via x509.CheckSignatureFrom is CRYPTOGRAPHIC PARENT
-// EVIDENCE WITH LIMITED CA GATING, not path validation. Go documents it as
-// performing "very limited checks" and explicitly not being a full path verifier.
-// It does NOT check validity periods, path length, name constraints, EKU nesting,
-// unhandled critical extensions, or revocation; a certificate whose KeyUsage is
-// zero passes its CertSign check; and a v1/v2 certificate with no
-// basic-constraints extension is not rejected by its IsCA check. Identity role is
-// therefore enforced separately, by Analyse's own issuer check, and that check
-// reads only the verified set.
+// Two passes, in this order for a cost reason. The first fills issuanceEvidence for
+// every ordered pair from byte, OID and decoded-name comparisons alone — no
+// signature work, and one name decode per certificate however many pairs read it.
+// The second turns that into candidate edges, and it is the only place the expensive
+// fact is reached for during construction: a pair the evidence links whose parent is
+// NOT RFC-eligible is admitted only when it demonstrably signed the child, which is
+// the one case where the cheap answer would discard a real signer.
+//
+// Cryptographic proof here (certGraph.proven) is the raw question "did parent's key
+// produce child's signature", NOT path validation and not RFC 5280 parent policy.
+// Eligibility is a separate fact, so a consumer that wants both asks for both, and
+// nothing has to accept the other's bundle of the two. It does NOT check validity
+// periods, path length, name constraints, EKU nesting, unhandled critical extensions
+// or revocation; identity role is enforced separately by Analyse's own issuer check.
 //
 // The refusal is decided on the candidate edges alone, before either distance walk
 // runs, so a bundle this app will not reason about costs it no signature
@@ -531,17 +617,18 @@ func newCertGraph(certs []*x509.Certificate, now time.Time) (*certGraph, error) 
 	g := &certGraph{
 		now:              now,
 		certs:            certs,
+		evidence:         make([]issuanceEvidence, len(certs)*len(certs)),
 		candidateParents: make([][]int, len(certs)),
 		children:         make([][]int, len(certs)),
-		verified:         make(map[[2]int]bool),
-		rawSigned:        make(map[[2]int]bool),
+		proof:            make(map[[2]int]bool),
 		selfSigned:       make(map[int]bool, len(certs)),
 		decodedSubjects:  make([]decodedDN, len(certs)),
 		decodedIssuers:   make([]decodedDN, len(certs)),
 	}
+	g.fillEvidence()
 	for child := range certs {
 		for parent := range certs {
-			if child == parent || !g.plausibleIssuer(child, parent) {
+			if child == parent || !g.candidateEdge(child, parent) {
 				continue
 			}
 			g.candidateParents[child] = append(g.candidateParents[child], parent)
@@ -553,6 +640,121 @@ func newCertGraph(certs []*x509.Certificate, now time.Time) (*certGraph, error) 
 	}
 	g.computeDistances()
 	return g, nil
+}
+
+// fillEvidence computes the cheap facts for every ordered pair. Issuer eligibility is
+// a property of the PARENT alone, so it is decided once per certificate and copied
+// onto that parent's edges rather than re-derived per pair.
+func (g *certGraph) fillEvidence() {
+	eligible := make([]bool, len(g.certs))
+	for i, c := range g.certs {
+		eligible[i] = canIssueCertificates(c)
+	}
+	for child := range g.certs {
+		for parent := range g.certs {
+			if child == parent {
+				continue
+			}
+			e := issuanceEvidence{
+				name:     g.nameLink(child, parent),
+				keyID:    g.keyIDLink(child, parent),
+				eligible: eligible[parent],
+			}
+			// Only a pair something already links can be excluded as key reuse, and
+			// the exclusion costs a public-key comparison, so it is asked last.
+			if e.name != nameLinkNone || e.keyID {
+				e.keyReuse = g.sameNameSameKey(child, parent)
+			}
+			g.evidence[child*len(g.certs)+parent] = e
+		}
+	}
+}
+
+// edge returns the evidence for the ordered pair (child, parent). A self-pair carries
+// the zero value, which links nothing: a certificate is not its own issuer here, and
+// self-signature is isSelfSigned's separate question.
+func (g *certGraph) edge(child, parent int) issuanceEvidence {
+	return g.evidence[child*len(g.certs)+parent]
+}
+
+// nameLink classifies certs[child]'s issuer name against certs[parent]'s subject
+// name, preferring the byte comparison so an ordinary bundle never pays a decode.
+//
+// "Semantically equal" is the ASN.1-decoded name, NOT pkix.Name: crypto/x509
+// documents pkix.Name as an approximation of a distinguished name and says accurate
+// name work must unmarshal RawSubject/RawIssuer. Round-tripping through
+// pkix.Name.ToRDNSequence rebuilds the known attributes in a FIXED order, flattens
+// multi-entry RDNs and drops non-standard attribute types, so `O=Acme, CN=x` and
+// `CN=x, O=Acme` — two different DNs under RFC 5280 — compared equal, and a CA whose
+// key had signed a certificate naming that other DN read as its issuer. Decoding the
+// raw names instead keeps RDN order, multi-valued grouping and unknown OIDs, while
+// still normalising the permitted DirectoryString tag difference because both decode
+// to the same Go string.
+//
+// A name that cannot be decoded matches nothing: an unreadable name is compared
+// against no other name rather than against everything.
+func (g *certGraph) nameLink(child, parent int) nameLinkage {
+	if bytes.Equal(g.certs[child].RawIssuer, g.certs[parent].RawSubject) {
+		return nameLinkExact
+	}
+	childIssuer, issuerOK := g.issuerName(child)
+	parentSubject, subjectOK := g.subjectName(parent)
+	if issuerOK && subjectOK && reflect.DeepEqual(childIssuer, parentSubject) {
+		return nameLinkSemantic
+	}
+	return nameLinkNone
+}
+
+// keyIDLink reports RFC 5280's Authority Key Identifier on the child matching the
+// Subject Key Identifier on the parent. Both must be present: two certificates that
+// simply carry no key identifiers are not thereby related.
+func (g *certGraph) keyIDLink(child, parent int) bool {
+	c, p := g.certs[child], g.certs[parent]
+	return len(c.AuthorityKeyId) > 0 && len(p.SubjectKeyId) > 0 &&
+		bytes.Equal(c.AuthorityKeyId, p.SubjectKeyId)
+}
+
+// sameNameSameKey reports the key-reuse exclusion issuanceEvidence.keyReuse records:
+// the two certificates hold the same public key under the same subject name. The name
+// comparison accepts either fidelity, because a regenerated certificate re-encoding
+// its own subject is the same shape of artefact as one repeating it byte for byte.
+func (g *certGraph) sameNameSameKey(child, parent int) bool {
+	c, p := g.certs[child], g.certs[parent]
+	if !bytes.Equal(c.RawSubject, p.RawSubject) {
+		childSubject, childOK := g.subjectName(child)
+		parentSubject, parentOK := g.subjectName(parent)
+		if !childOK || !parentOK || !reflect.DeepEqual(childSubject, parentSubject) {
+			return false
+		}
+	}
+	return samePublicKey(c.PublicKey, p.PublicKey)
+}
+
+// candidateEdge decides whether certs[parent] belongs in certs[child]'s candidate
+// parent set: the pair has to be linked, and the parent has to be either eligible to
+// issue certificates or proven to have signed this child.
+//
+// The asymmetry is the whole point: eligibility is a POLICY ASSERTION about whether a
+// certificate SHOULD have issued anything, while a signature is GROUND TRUTH about
+// whether it DID. This app converts formats and holds no trust store, so policy
+// informs diagnostics (ObsChainCertCannotIssue names such a certificate wherever it
+// lands in the emitted chain) and never silently removes content: a legacy internal
+// CA minted without basicConstraints — the shape a bare `openssl req -x509` produces
+// — really did sign the leaf, and dropping its edge dropped the only CA bag the
+// operator's PFX needed. What the gate still keeps out is a certificate that merely
+// LOOKS related: a same-named stranger asserting CA:false signed nothing here, so
+// admitting it would emit a chain no consumer can build a path through and no
+// evidence supports.
+//
+// The linkage question is answered before the eligibility one, so a signature is
+// checked here only for a pair that is already linked and whose parent is ineligible.
+// Every other pair costs comparisons alone.
+func (g *certGraph) candidateEdge(child, parent int) bool {
+	e := g.edge(child, parent)
+	if !e.linked() {
+		return false
+	}
+	return e.eligible || g.proven(child, parent)
 }
 
 // oversizedIssuerError refuses a bundle in which a certificate named as the
@@ -594,80 +796,41 @@ func (g *certGraph) oversizedIssuerError() error {
 	return nil
 }
 
-// plausibleIssuer reports whether certs[parent] could be the issuer of
-// certs[child].
+// proven reports whether certs[parent]'s public key produced certs[child]'s
+// signature: the model's one CRYPTOGRAPHIC fact, and the only expensive one, so it is
+// computed lazily and memoised.
 //
-// Two independent relationship signals, either sufficient. Issuer/subject name
-// chaining is the ordinary one. A key-identifier match (RFC 5280's Authority Key
-// Identifier against the candidate's Subject Key Identifier) is the one that
-// survives a permitted name-encoding difference, and it is a byte comparison rather
-// than a signature check, so it is algorithm-agnostic and keeps working for
-// algorithms Go declines to verify.
+// It is the RAW question, with no issuer-eligibility gate folded in.
+// x509.CheckSignatureFrom cannot answer it, because it applies RFC 5280 4.2.1.9 to
+// the parent before it looks at any signature, so an eligibility question and a
+// signature question asked through it are inseparable — and inseparable is exactly
+// what made two consumers disagree about what an issuance edge is. Checking with the
+// parent's own public key separates them, as checkSelfSigned already does for the
+// self-signature, and a consumer that wants "verified AND RFC-eligible" reads both
+// facts. crypto/x509's CheckSignature also accepts SHA-1 where CheckSignatureFrom
+// refuses it, so a legacy SHA-1 chain becomes provable rather than merely plausible.
 //
-// A candidate the certificate's own extensions disqualify from signing
-// certificates (canIssueCertificates) is admitted ONLY when it demonstrably signed
-// this child, which is what signedBy answers. The asymmetry is the whole point:
-// eligibility is a POLICY ASSERTION about whether a certificate SHOULD have issued
-// anything, while a signature is GROUND TRUTH about whether it DID. This app
-// converts formats and holds no trust store, so policy informs diagnostics
-// (ObsChainCertCannotIssue names such a certificate wherever it lands in the
-// emitted chain) and never silently removes content: a legacy internal CA minted
-// without basicConstraints — the shape a bare `openssl req -x509` produces — really
-// did sign the leaf, and dropping its edge dropped the only CA bag the operator's
-// PFX needed. What the gate still keeps out is a certificate that merely LOOKS
-// related: a same-named stranger asserting CA:false signed nothing here, so
-// admitting it would emit a chain no consumer can build a path through and no
-// evidence supports.
-//
-// The key-reuse exclusion is not cosmetic. Two DISTINCT self-signed certificates
-// sharing a subject AND a public key — a regenerated self-signed certificate left
-// beside the one it replaces, which `openssl req -x509` produces with
-// basicConstraints CA:TRUE by default — each verify against the other, so a naive
-// rule records a mutual issuance edge, both then look like issuers, and the role
-// check rejects the identity outright. Key reuse is not issuance: a certificate
-// cannot have issued another certificate carrying its own key.
-//
-// The relationship signals are evaluated BEFORE the eligibility question, so the
-// signature check only ever runs for a pair that already looks related and whose
-// parent is ineligible. Every other pair still costs byte comparisons alone.
-func (g *certGraph) plausibleIssuer(child, parent int) bool {
-	c, p := g.certs[child], g.certs[parent]
-	if bytes.Equal(c.RawSubject, p.RawSubject) && samePublicKey(c.PublicKey, p.PublicKey) {
-		return false
-	}
-	keyIDMatch := len(c.AuthorityKeyId) > 0 && len(p.SubjectKeyId) > 0 &&
-		bytes.Equal(c.AuthorityKeyId, p.SubjectKeyId)
-	if !keyIDMatch && !bytes.Equal(c.RawIssuer, p.RawSubject) {
-		return false
-	}
-	return canIssueCertificates(p) || g.signedBy(child, parent)
-}
-
-// signedBy reports whether certs[parent]'s key produced certs[child]'s signature,
-// memoised. It is the RAW cryptographic answer to "did parent sign child", which
-// verifies cannot give: CheckSignatureFrom refuses an ineligible parent before it
-// looks at any signature (crypto/x509 applies RFC 5280 4.2.1.9 there), so an
-// eligibility question and a signature question asked through it are inseparable.
-// Checking with the parent's own public key separates them, exactly as
-// checkSelfSigned already does for the self-signature.
-//
-// Two deliberate differences from verifies, both consequences of asking only "did
-// it sign this": no issuer-eligibility gate, and SHA-1 is accepted (crypto/x509's
-// CheckSignature allows it where CheckSignatureFrom does not). Neither promotes an
-// edge to the strong signal — that stays verifies' answer — so ranking, the
-// verified-distance walk and the role check are untouched by anything decided here.
-//
-// The verification ceiling still applies: a parent key above it is refused without
-// the modexp, for the same cost reason verifies applies it.
-func (g *certGraph) signedBy(child, parent int) bool {
+// Two bounds, both load-bearing. A pair with no linkage is refused without a
+// verification: nothing ties those certificates together, so no consumer's question
+// turns on the answer, and verifying anyway would put a file-controlled modexp on
+// every one of the maxChainCerts^2 pairs. A parent key above either verification
+// ceiling is refused too, which is the cost the ceilings exist to refuse; after
+// newCertGraph's oversizedIssuerError that state is only reachable for a certificate
+// this bundle names as nobody's issuer.
+func (g *certGraph) proven(child, parent int) bool {
 	key := [2]int{child, parent}
-	if got, ok := g.rawSigned[key]; ok {
+	if got, ok := g.proof[key]; ok {
 		return got
 	}
-	c, p := g.certs[child], g.certs[parent]
-	got := verifiableKey(p.PublicKey) &&
-		p.CheckSignature(c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) == nil
-	g.rawSigned[key] = got
+	got := false
+	if g.edge(child, parent).linked() {
+		c, p := g.certs[child], g.certs[parent]
+		if verifiableKey(p.PublicKey) {
+			g.proofChecks++
+			got = p.CheckSignature(c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) == nil
+		}
+	}
+	g.proof[key] = got
 	return got
 }
 
@@ -678,8 +841,8 @@ func (g *certGraph) signedBy(child, parent int) bool {
 //
 // This answers only whether c may be somebody's PARENT, and only as POLICY: it says
 // what a strict path validator will accept, never what happened. Whether c actually
-// signed a certificate here is signedBy's question, and a signature outranks this
-// answer wherever the two disagree (plausibleIssuer). Whether c is SELF-SIGNED is a
+// signed a certificate here is certGraph.proven's question, and a signature outranks
+// this answer wherever the two disagree (candidateEdge). Whether c is SELF-SIGNED is a
 // third question, and isSelfSigned deliberately answers it without this gate: a
 // self-signed certificate with no basic constraints is still a root here, even
 // though a strict validator would let it issue nothing else.
@@ -712,110 +875,26 @@ func issuerIneligibilityReason(c *x509.Certificate) string {
 	return ""
 }
 
-// verifies reports whether certs[parent]'s signature over certs[child] checks out,
-// memoised. This is the STRONG signal: a candidate edge only says the two names or
-// key identifiers line up, which an impostor sharing a subject can also satisfy.
+// isIssuer reports whether certs[i] provably signed another certificate here.
 //
-// A parent whose RSA key exceeds either verification ceiling is never verified: that
-// modexp is the cost the ceiling exists to refuse. No candidate parent reaches
-// here in that state, because newCertGraph refuses such a bundle before either
-// distance walk runs — an edge that can never be proven, standing beside a
-// same-subject certificate that can, is how an impostor wins a branch. The guard
-// stays as the backstop that keeps the expensive call unreachable whatever asks.
-func (g *certGraph) verifies(child, parent int) bool {
-	key := [2]int{child, parent}
-	if got, ok := g.verified[key]; ok {
-		return got
-	}
-	got := verifiableKey(g.certs[parent].PublicKey) &&
-		g.certs[child].CheckSignatureFrom(g.certs[parent]) == nil
-	g.verified[key] = got
-	return got
-}
-
-// isIssuer reports whether certs[i] VERIFIABLY signed another certificate here.
+// Cryptographic proof is the only evidence that counts, and it is the same proof
+// every other consumer reads. A name match alone would reject an identity because
+// some unrelated certificate happens to claim it as issuer, which an attacker or a
+// careless paste could arrange; conversely, refusing to look past a byte-identical
+// name match would miss the issuance this bundle can actually prove — a leaf naming
+// its CA through a permitted encoding difference with no key identifiers, where the
+// CA then competed with its own leaf for identity, won on NotBefore, and produced a
+// PFX whose identity was the CA.
 //
-// Only a verified signature counts. A name match alone would reject an identity
-// because some unrelated certificate happens to claim it as issuer, which an
-// attacker or a careless paste could arrange.
-//
-// The candidate graph is not sufficient evidence on its own here, which is why the
-// isIssuerByName fallback below exists. plausibleIssuer recognises an issuer name
-// by raw DER equality (or an AKI/SKI match), so a permitted encoding difference
-// between a leaf's issuer name and its CA's subject name — same name, UTF8String
-// against the canonical encoding, no key identifiers — records NO candidate edge.
-// That is deliberate for the additive chain fallback, which must not treat an
-// unestablished edge as chain material, but for ROLE it hid a cryptographically
-// verified issuance: the CA read as a non-issuer, competed with its own leaf for
-// identity, and won on NotBefore, producing a PFX whose identity was the CA. So role
-// selection falls back to SEMANTIC name equality (the ASN.1-decoded name, which
-// compares parsed attribute values rather than their string encoding) and still
-// requires the same signature verification.
-//
-// The fallback keeps plausibleIssuer's key-reuse exclusion: a distinct self-signed
-// certificate sharing both a subject and a public key with certs[i] is a
-// regenerated certificate left beside its predecessor, not something certs[i]
-// issued, and admitting it would make both look like issuers and reject the
-// identity outright.
+// Both of those now come out of one graph: the candidate edges already include the
+// semantically-equal-name case and already exclude key reuse, so this reads the same
+// edges chain assembly and ranking read, and the two can no longer disagree about
+// what an issuance is. RFC eligibility is deliberately NOT consulted: a legacy CA
+// with no basicConstraints that demonstrably signed the certificate beside it is an
+// issuer of it, whatever a strict validator would say about its extensions.
 func (g *certGraph) isIssuer(i int) bool {
 	for _, child := range g.children[i] {
-		if g.verifies(child, i) {
-			return true
-		}
-	}
-	return g.isIssuerByName(i)
-}
-
-// isIssuerByName is isIssuer's semantic-name fallback: it reports whether any
-// certificate whose issuer name is SEMANTICALLY certs[i]'s subject name verifies
-// against certs[i], regardless of how either name is encoded.
-//
-// Split out of isIssuer so each half stays readable on its own: the first half asks
-// the candidate graph, this one re-asks the question the graph's byte comparison
-// cannot — so it is the one place a signature is checked for a pair the candidate
-// graph never recorded an edge for.
-//
-// "Semantically equal" is the ASN.1-decoded name, NOT pkix.Name: crypto/x509
-// documents pkix.Name as an approximation of a distinguished name and says accurate
-// name work must unmarshal RawSubject/RawIssuer. Round-tripping through
-// pkix.Name.ToRDNSequence rebuilds the known attributes in a FIXED order, flattens
-// multi-entry RDNs and drops non-standard attribute types, so `O=Acme, CN=x` and
-// `CN=x, O=Acme` — two different DNs under RFC 5280 — compared equal. Combined with
-// a shared signing key that made an unrelated CA look like the child's issuer, and
-// dropped it from identity selection. Decoding the raw names instead keeps RDN
-// order, multi-valued grouping and unknown OIDs, while still normalising the
-// permitted DirectoryString tag difference (a leaf naming its issuer as a
-// UTF8String matches a CA whose subject uses the canonical encoding) because both
-// decode to the same Go string.
-//
-// The signature check is still the only thing that admits an edge; the name
-// equality only decides which pairs are worth checking.
-func (g *certGraph) isIssuerByName(i int) bool {
-	parent := g.certs[i]
-	parentSubject, parentOK := g.subjectName(i)
-	if !parentOK {
-		return false
-	}
-	for child, cert := range g.certs {
-		if child == i {
-			continue
-		}
-		childIssuer, issuerOK := g.issuerName(child)
-		if !issuerOK || !reflect.DeepEqual(childIssuer, parentSubject) {
-			continue
-		}
-		// The key-reuse exclusion, same as plausibleIssuer's: a name the decoder
-		// cannot read is not admitted either, because the exclusion cannot be
-		// applied to it.
-		childSubject, subjectOK := g.subjectName(child)
-		if !subjectOK {
-			continue
-		}
-		if reflect.DeepEqual(childSubject, parentSubject) &&
-			samePublicKey(cert.PublicKey, parent.PublicKey) {
-			continue
-		}
-		if g.verifies(child, i) {
+		if g.proven(child, i) {
 			return true
 		}
 	}
@@ -865,6 +944,11 @@ func (g *certGraph) issuerName(i int) (pkix.RDNSequence, bool) {
 // isSelfSigned reports whether certs[i] is its own issuer, which is what makes it
 // a root rather than a link.
 //
+// It is deliberately not an edge in the evidence model: a self-pair links nothing
+// there, because "did this certificate issue itself" is a different question from
+// "did A issue B", and the answer feeds only the root set of the distance walks and
+// assembleChain's carve-out.
+//
 // It verifies the signature with the certificate's OWN public key rather than
 // calling CheckSignatureFrom(self). That distinction is load-bearing:
 // CheckSignatureFrom rejects any v3 certificate acting as a parent when
@@ -880,7 +964,7 @@ func (g *certGraph) issuerName(i int) (pkix.RDNSequence, bool) {
 //
 // A certificate whose own RSA key exceeds either verification ceiling is reported as
 // not self-signed — unverified rather than disproven — for the same cost reason
-// verifies applies the ceiling. After newCertGraph's refusal that answer is only
+// proven applies the ceiling. After newCertGraph's refusal that answer is only
 // reachable for a certificate this bundle names as nobody's issuer, so it decides
 // only two harmless things: such a stray is no root for the distance walk, and if
 // it is the IDENTITY itself its empty chain counts as a failure to prove rather
@@ -907,7 +991,7 @@ func (g *certGraph) checkSelfSigned(i int) bool {
 }
 
 // computeDistances fills both distance maps: distToRoot over the inclusive
-// candidate edges, and verifiedDistToRoot over the verified edges only.
+// candidate edges, and provenDistToRoot over the proven edges only.
 //
 // Both are multi-source breadth-first walks DOWNWARD from every root over the
 // children edges. The obvious alternative — a memoised depth-first walk upward
@@ -920,12 +1004,12 @@ func (g *certGraph) checkSelfSigned(i int) bool {
 // certificates for one CA name. BFS from the roots has no path state to leak, so
 // it is cycle-safe and order-independent by construction.
 //
-// The verified walk costs at most one signature check per CANDIDATE edge, all
-// memoised in g.verified and reused by chain assembly and the role check. That is
+// The proven walk costs at most one signature check per CANDIDATE edge, all
+// memoised in g.proof and reused by chain assembly and the role check. That is
 // far below all pairs for an ordinary bundle, but it is not a smaller bound in
-// principle: plausibleIssuer accepts on an issuer/subject name match alone, so a
-// bundle whose certificates all share one issuer name still yields O(n^2) edges,
-// and this walk pays for them eagerly.
+// principle: a linked pair needs only a matching name, so a bundle whose
+// certificates all share one issuer name still yields O(n^2) edges, and this walk
+// pays for them eagerly.
 func (g *certGraph) computeDistances() {
 	// One self-signature check per certificate, shared by both walks: the root set
 	// is the same for either edge predicate, and isSelfSigned is a real signature
@@ -937,7 +1021,7 @@ func (g *certGraph) computeDistances() {
 		}
 	}
 	g.distToRoot = g.distancesFromRoots(roots, nil)
-	g.verifiedDistToRoot = g.distancesFromRoots(roots, g.verifies)
+	g.provenDistToRoot = g.distancesFromRoots(roots, g.proven)
 }
 
 // distancesFromRoots runs the root-down BFS from roots, traversing only the child
@@ -1149,7 +1233,7 @@ func (g *certGraph) betterIdentity(a, b int) bool {
 //
 // At a branch point (a cross-signed certificate has more than one issuer here)
 // the choice is deterministic: prefer a parent that is currently valid, then one
-// with a route to a self-signed root in this bundle that verifies by signature at
+// with a route to a self-signed root in this bundle proven by signature at
 // every hop, then the shorter such route, then the inclusive route, then the later
 // NotAfter, then a byte comparison of the certificate DER. One path is emitted
 // rather than every ancestor, because a consumer reading the bag sequence
@@ -1180,18 +1264,19 @@ func (g *certGraph) pathFrom(start int) []int {
 
 // bestParent picks the next hop from cur, or -1 when the chain ends here.
 //
-// Edge STRENGTH outranks every other ranking key. A candidate edge is only a name
-// or key-identifier match, which a same-subject certificate holding a different key
-// also satisfies; ranking such an impostor above the certificate that actually
-// signed this one would emit a chain a consumer cannot verify. So verified parents
-// are considered alone whenever any exists, and unverified candidates only when
-// none does — which is the SHA-1 and name-encoding case the inclusive set exists
-// for.
+// Edge STRENGTH outranks every other ranking key. A candidate edge on its own is
+// only a name or key-identifier match, which a same-subject certificate holding a
+// different key also satisfies; ranking such an impostor above the certificate that
+// actually signed this one would emit a chain a consumer cannot verify. So proven
+// parents are considered alone whenever any exists, and merely linked candidates
+// only when none does — the case where no signature can be checked at all: a
+// refused algorithm, a key above the verification ceilings, or a bundle carrying a
+// same-named certificate while the real signer is absent.
 func (g *certGraph) bestParent(cur int, onPath []bool) int {
-	for _, verifiedOnly := range []bool{true, false} {
+	for _, provenOnly := range []bool{true, false} {
 		best := -1
 		for _, p := range g.candidateParents[cur] {
-			if onPath[p] || g.verifies(cur, p) != verifiedOnly {
+			if onPath[p] || g.proven(cur, p) != provenOnly {
 				continue
 			}
 			if best == -1 || g.betterParent(p, best) {
@@ -1225,16 +1310,16 @@ func (g *certGraph) betterParent(a, b int) bool {
 	// Then route STRENGTH, ahead of the inclusive measure, for the same reason edge
 	// strength outranks everything in bestParent: a candidate whose route to a root
 	// is only a chain of NAME matches may be an impostor's, and preferring it over a
-	// candidate that verifies all the way to an included root emits a chain the
-	// consumer cannot validate. The inclusive ranking below is consulted only when
-	// neither candidate has a fully verified route — the SHA-1 and name-encoding
-	// case, where no signature can be checked at all.
-	vra, vrb := g.verifiedDistToRoot[a] >= 0, g.verifiedDistToRoot[b] >= 0
+	// candidate whose route is proven all the way to an included root emits a chain
+	// the consumer cannot validate. The inclusive ranking below is consulted only
+	// when neither candidate has a fully proven route — the case where no signature
+	// can be checked at all.
+	vra, vrb := g.provenDistToRoot[a] >= 0, g.provenDistToRoot[b] >= 0
 	if vra != vrb {
 		return vra
 	}
-	if vra && g.verifiedDistToRoot[a] != g.verifiedDistToRoot[b] {
-		return g.verifiedDistToRoot[a] < g.verifiedDistToRoot[b]
+	if vra && g.provenDistToRoot[a] != g.provenDistToRoot[b] {
+		return g.provenDistToRoot[a] < g.provenDistToRoot[b]
 	}
 	ra, rb := g.distToRoot[a] >= 0, g.distToRoot[b] >= 0
 	if ra != rb {
@@ -1340,8 +1425,13 @@ func (g *certGraph) assembleChain(identityCert int) (chain, extra []*x509.Certif
 	// The discovered path ends where relationship evidence ran out. If that terminus
 	// is not PROVEN self-signed, the chain above it is unfinished, whether the path
 	// stopped at the identity itself or three links up, so the additive fallback
-	// applies to both: a permitted name-encoding difference in the middle of a
-	// bundle must not silently truncate the chain either.
+	// applies to both: an unprovable edge in the middle of a bundle must not silently
+	// truncate the chain either. What can still stop the walk mid-bundle is a
+	// signature no signature check can settle — an algorithm crypto/x509 refuses, a
+	// key above the verification ceilings, or a real signer that is simply absent
+	// while a same-named certificate is present. A permitted name-encoding difference
+	// no longer does: the evidence graph proves those edges and the path walk carries
+	// them, so this fallback is not reached for them at all.
 	terminal := path[len(path)-1]
 	if len(extra) > 0 && !g.isSelfSigned(terminal) {
 		kept, disqualified := partitionIssuerEligible(extra)
@@ -1430,7 +1520,7 @@ func chainValidityObservations(chain []*x509.Certificate, now time.Time) []Obser
 // that RFC 5280 4.2.1.9 disqualifies from issuing certificates, without removing
 // them.
 //
-// This is the diagnostic half of the split plausibleIssuer draws: a signature is
+// This is the diagnostic half of the split candidateEdge draws: a signature is
 // ground truth about what a certificate DID, its extensions are policy about what
 // it SHOULD have done, and this app converts formats rather than validating paths,
 // so the two disagreeing is the operator's problem to fix in their PKI. Carrying
