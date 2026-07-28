@@ -345,7 +345,7 @@ func TestStoreIsCurrent_names_a_non_regular_prior_output(t *testing.T) {
 
 			// want is never dereferenced on this arm: the verdict is reached from the
 			// lstat alone, before any bundle is read.
-			current, err := s.isCurrent(t.Context(), "out.pfx", nil, convert.EncNameModern2023, "pw")
+			current, _, err := s.isCurrent(t.Context(), "out.pfx", nil, convert.EncNameModern2023, "pw")
 
 			if err != nil || current {
 				t.Fatalf("isCurrent(non-regular) = %v, %v, want false, nil: an occupied output path is never a usable prior bundle", current, err)
@@ -416,7 +416,7 @@ func TestStoreIsCurrent_reports_a_bundle_that_vanishes_mid_inspection(t *testing
 	const unreadableMsg = "cannot read prior pfx; regenerating"
 
 	logs := captureLogs(t)
-	current, err := s.isCurrent(t.Context(), "out.pfx", nil, convert.EncNameModern2023, "pw")
+	current, _, err := s.isCurrent(t.Context(), "out.pfx", nil, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("isCurrent(bundle removed mid-inspection) = error %v, want nil: an unreadable prior bundle is"+
 			" something this app fixes by rewriting, not a failure that flips health", err)

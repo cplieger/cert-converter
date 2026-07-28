@@ -35,6 +35,17 @@ type conversionStatus int
 // and its permissions remediation, and the next scan converts the replacement, so
 // naming the renewal race there would alert an operator on exactly the activity this
 // daemon exists to process.
+//
+// statusUnwritable is the /output-side member of the same health-neutral family, and
+// it covers exactly one shape: a prior bundle whose CONTENT is already correct, whose
+// mode is laxer than policy, whose chmod the filesystem refused, and whose repairing
+// rewrite the filesystem refused too — the "operator changed PUID and left root-owned
+// output behind" deployment, where the file and its directory are both foreign-owned.
+// Nothing about the operator's PFX is missing or out of date, and no restart can grant
+// a permission the UID does not have, so counting it as statusFailed would restart-loop
+// the container over a condition a restart cannot clear. Every OTHER failed PFX write
+// stays statusFailed and still flips health. Like the two /input members it is
+// health-neutral, reported by its own standing WARN, and it blocks orphan reaping.
 const (
 	statusUnset conversionStatus = iota
 	statusConverted
@@ -43,4 +54,5 @@ const (
 	statusOrphan
 	statusUnreadable
 	statusVanished
+	statusUnwritable
 )

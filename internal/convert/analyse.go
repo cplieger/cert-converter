@@ -59,6 +59,18 @@ const (
 	// a gate here), but the bundle will fail path validation at the consumer and no
 	// other signal names which link is at fault.
 	ObsChainCertOutOfWindow ObservationKind = "chain-cert-out-of-window"
+	// ObsChainCertCannotIssue reports a certificate in the EMITTED chain whose own
+	// extensions leave it unable to issue certificates under RFC 5280 4.2.1.9 (no
+	// basic constraints on a v3 certificate, CA:false, or a stated keyUsage without
+	// keyCertSign). It is reported rather than acted on: this app converts formats
+	// and holds no trust store, PKCS#12 CA bags are a bag of certificates rather
+	// than a validated path (RFC 7292 imposes no path-validation semantics on them),
+	// and a certificate that demonstrably SIGNED the one below it is chain material
+	// whatever its extensions claim. So the certificate is carried and the operator
+	// is told its CA is non-compliant and that a strict path validator will reject
+	// the chain — the thing they have to act on with their PKI, not something this
+	// converter can fix by dropping content.
+	ObsChainCertCannotIssue ObservationKind = "chain-cert-cannot-issue"
 	// ObsUnrelatedBlocksSkipped reports PEM blocks in the CERTIFICATE file that are
 	// neither a certificate nor a private key — an OpenSSL "TRUSTED CERTIFICATE",
 	// the legacy "X509 CERTIFICATE" alias, a stray CERTIFICATE REQUEST — and were
@@ -233,6 +245,7 @@ func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 	chain, extra, chainObs := g.assembleChain(identity.cert)
 	obs = append(obs, chainObs...)
 	obs = append(obs, chainValidityObservations(chain, now)...)
+	obs = append(obs, chainIssuerEligibilityObservations(chain)...)
 
 	return Analysis{
 		leaf:         leaf,
@@ -366,6 +379,16 @@ type certGraph struct {
 	// that function recomputes per call is paid up to that many times, which is why
 	// the raw names it decodes are memoised too (decodedSubjects/decodedIssuers).
 	verified map[[2]int]bool
+	// rawSigned memoises the RAW signature check verified's RFC gate cannot answer,
+	// keyed the same way. It is a separate memo because it is a DIFFERENT predicate:
+	// "parent's key produced child's signature", with no issuer-eligibility gate and
+	// (like isSelfSigned's own check) no SHA-1 refusal. Only plausibleIssuer asks,
+	// and only for a name-matched pair whose parent canIssueCertificates
+	// disqualifies, which is the one place the cheap answer would discard a real
+	// signer. Folding it into verified would silently promote such an edge to the
+	// STRONG signal that ranking and the role check read, and those deliberately
+	// still mean "verified under RFC 5280's parent rules".
+	rawSigned map[[2]int]bool
 	// selfSigned memoises the self-signature check per certificate, for the same
 	// reason verified memoises edges: it is a real signature verification whose cost
 	// the input file dictates, and three places ask — the root set, every hop of
@@ -511,6 +534,7 @@ func newCertGraph(certs []*x509.Certificate, now time.Time) (*certGraph, error) 
 		candidateParents: make([][]int, len(certs)),
 		children:         make([][]int, len(certs)),
 		verified:         make(map[[2]int]bool),
+		rawSigned:        make(map[[2]int]bool),
 		selfSigned:       make(map[int]bool, len(certs)),
 		decodedSubjects:  make([]decodedDN, len(certs)),
 		decodedIssuers:   make([]decodedDN, len(certs)),
@@ -571,21 +595,29 @@ func (g *certGraph) oversizedIssuerError() error {
 }
 
 // plausibleIssuer reports whether certs[parent] could be the issuer of
-// certs[child], on the evidence available without cryptography.
+// certs[child].
 //
-// Two independent signals, either sufficient. Issuer/subject name chaining is the
-// ordinary one. A key-identifier match (RFC 5280's Authority Key Identifier
-// against the candidate's Subject Key Identifier) is the one that survives a
-// permitted name-encoding difference, and it is a byte comparison rather than a
-// signature check, so it is algorithm-agnostic and keeps working for algorithms
-// Go declines to verify.
+// Two independent relationship signals, either sufficient. Issuer/subject name
+// chaining is the ordinary one. A key-identifier match (RFC 5280's Authority Key
+// Identifier against the candidate's Subject Key Identifier) is the one that
+// survives a permitted name-encoding difference, and it is a byte comparison rather
+// than a signature check, so it is algorithm-agnostic and keeps working for
+// algorithms Go declines to verify.
 //
-// Neither signal is consulted for a candidate the certificate's own extensions
-// positively disqualify from signing certificates: relationship evidence says two
-// certificates LOOK related, while canIssueCertificates says this one cannot be
-// anybody's issuer whatever the names line up to. Without that gate a same-named
-// certificate asserting CA:false is recorded as an edge and can be emitted as
-// chain material, which makes downstream path validation reject the PFX.
+// A candidate the certificate's own extensions disqualify from signing
+// certificates (canIssueCertificates) is admitted ONLY when it demonstrably signed
+// this child, which is what signedBy answers. The asymmetry is the whole point:
+// eligibility is a POLICY ASSERTION about whether a certificate SHOULD have issued
+// anything, while a signature is GROUND TRUTH about whether it DID. This app
+// converts formats and holds no trust store, so policy informs diagnostics
+// (ObsChainCertCannotIssue names such a certificate wherever it lands in the
+// emitted chain) and never silently removes content: a legacy internal CA minted
+// without basicConstraints — the shape a bare `openssl req -x509` produces — really
+// did sign the leaf, and dropping its edge dropped the only CA bag the operator's
+// PFX needed. What the gate still keeps out is a certificate that merely LOOKS
+// related: a same-named stranger asserting CA:false signed nothing here, so
+// admitting it would emit a chain no consumer can build a path through and no
+// evidence supports.
 //
 // The key-reuse exclusion is not cosmetic. Two DISTINCT self-signed certificates
 // sharing a subject AND a public key — a regenerated self-signed certificate left
@@ -594,24 +626,69 @@ func (g *certGraph) oversizedIssuerError() error {
 // rule records a mutual issuance edge, both then look like issuers, and the role
 // check rejects the identity outright. Key reuse is not issuance: a certificate
 // cannot have issued another certificate carrying its own key.
+//
+// The relationship signals are evaluated BEFORE the eligibility question, so the
+// signature check only ever runs for a pair that already looks related and whose
+// parent is ineligible. Every other pair still costs byte comparisons alone.
 func (g *certGraph) plausibleIssuer(child, parent int) bool {
 	c, p := g.certs[child], g.certs[parent]
-	if !canIssueCertificates(p) {
-		return false
-	}
 	if bytes.Equal(c.RawSubject, p.RawSubject) && samePublicKey(c.PublicKey, p.PublicKey) {
 		return false
 	}
-	if len(c.AuthorityKeyId) > 0 && len(p.SubjectKeyId) > 0 &&
-		bytes.Equal(c.AuthorityKeyId, p.SubjectKeyId) {
-		return true
+	keyIDMatch := len(c.AuthorityKeyId) > 0 && len(p.SubjectKeyId) > 0 &&
+		bytes.Equal(c.AuthorityKeyId, p.SubjectKeyId)
+	if !keyIDMatch && !bytes.Equal(c.RawIssuer, p.RawSubject) {
+		return false
 	}
-	return bytes.Equal(c.RawIssuer, p.RawSubject)
+	return canIssueCertificates(p) || g.signedBy(child, parent)
+}
+
+// signedBy reports whether certs[parent]'s key produced certs[child]'s signature,
+// memoised. It is the RAW cryptographic answer to "did parent sign child", which
+// verifies cannot give: CheckSignatureFrom refuses an ineligible parent before it
+// looks at any signature (crypto/x509 applies RFC 5280 4.2.1.9 there), so an
+// eligibility question and a signature question asked through it are inseparable.
+// Checking with the parent's own public key separates them, exactly as
+// checkSelfSigned already does for the self-signature.
+//
+// Two deliberate differences from verifies, both consequences of asking only "did
+// it sign this": no issuer-eligibility gate, and SHA-1 is accepted (crypto/x509's
+// CheckSignature allows it where CheckSignatureFrom does not). Neither promotes an
+// edge to the strong signal — that stays verifies' answer — so ranking, the
+// verified-distance walk and the role check are untouched by anything decided here.
+//
+// The verification ceiling still applies: a parent key above it is refused without
+// the modexp, for the same cost reason verifies applies it.
+func (g *certGraph) signedBy(child, parent int) bool {
+	key := [2]int{child, parent}
+	if got, ok := g.rawSigned[key]; ok {
+		return got
+	}
+	c, p := g.certs[child], g.certs[parent]
+	got := verifiableKey(p.PublicKey) &&
+		p.CheckSignature(c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) == nil
+	g.rawSigned[key] = got
+	return got
 }
 
 // canIssueCertificates reports whether c's own extensions leave it able to issue
 // certificates, mirroring the eligibility crypto/x509 applies to a parent without
-// doing any signature work.
+// doing any signature work. It is issuerIneligibilityReason's predicate form, so
+// the gate and every message that names a disqualification cannot drift.
+//
+// This answers only whether c may be somebody's PARENT, and only as POLICY: it says
+// what a strict path validator will accept, never what happened. Whether c actually
+// signed a certificate here is signedBy's question, and a signature outranks this
+// answer wherever the two disagree (plausibleIssuer). Whether c is SELF-SIGNED is a
+// third question, and isSelfSigned deliberately answers it without this gate: a
+// self-signed certificate with no basic constraints is still a root here, even
+// though a strict validator would let it issue nothing else.
+func canIssueCertificates(c *x509.Certificate) bool {
+	return issuerIneligibilityReason(c) == ""
+}
+
+// issuerIneligibilityReason names why c's own extensions disqualify it from issuing
+// certificates, or "" when they do not.
 //
 // Three disqualifications, each of them positive proof rather than absent evidence:
 // a v3 certificate carrying no Basic Constraints at all (RFC 5280 4.2.1.9 says such
@@ -620,18 +697,19 @@ func (g *certGraph) plausibleIssuer(child, parent int) bool {
 // stated KeyUsage omits KeyCertSign. An absent KeyUsage (the zero value) states
 // nothing, so it disqualifies nothing.
 //
-// This answers only whether c may be somebody's PARENT. Whether c is SELF-SIGNED is a
-// different question, and isSelfSigned deliberately answers it without this gate: a
-// self-signed certificate with no basic constraints is still a root here, even though
-// it can issue nothing else.
-func canIssueCertificates(c *x509.Certificate) bool {
-	if c.Version == 3 && !c.BasicConstraintsValid {
-		return false
+// The reason is prose an operator can act on, because the only thing this app does
+// with a disqualification is TELL them: the certificate stays in the bundle when a
+// signature puts it there, and the fix is in their PKI, not in the conversion.
+func issuerIneligibilityReason(c *x509.Certificate) string {
+	switch {
+	case c.Version == 3 && !c.BasicConstraintsValid:
+		return "carries no basicConstraints extension, which RFC 5280 4.2.1.9 requires of a v3 certificate whose key verifies certificate signatures"
+	case c.BasicConstraintsValid && !c.IsCA:
+		return "asserts basicConstraints CA:false"
+	case c.KeyUsage != 0 && c.KeyUsage&x509.KeyUsageCertSign == 0:
+		return "states a keyUsage that omits keyCertSign"
 	}
-	if c.BasicConstraintsValid && !c.IsCA {
-		return false
-	}
-	return c.KeyUsage == 0 || c.KeyUsage&x509.KeyUsageCertSign != 0
+	return ""
 }
 
 // verifies reports whether certs[parent]'s signature over certs[child] checks out,
@@ -1343,6 +1421,39 @@ func chainValidityObservations(chain []*x509.Certificate, now time.Time) []Obser
 				"chain certificate %d of %d, %q, is outside its validity window (NotBefore %s, NotAfter %s)",
 				i+1, len(chain), boundSubject(c.Subject.String()),
 				c.NotBefore.UTC().Format(time.RFC3339), c.NotAfter.UTC().Format(time.RFC3339)),
+		})
+	}
+	return obs
+}
+
+// chainIssuerEligibilityObservations reports certificates in the EMITTED chain
+// that RFC 5280 4.2.1.9 disqualifies from issuing certificates, without removing
+// them.
+//
+// This is the diagnostic half of the split plausibleIssuer draws: a signature is
+// ground truth about what a certificate DID, its extensions are policy about what
+// it SHOULD have done, and this app converts formats rather than validating paths,
+// so the two disagreeing is the operator's problem to fix in their PKI. Carrying
+// the certificate keeps the PFX usable for the lenient consumers this app exists to
+// feed (the Synology/Windows import path puts CA bags straight into a store);
+// naming it is what keeps that from being silent, because a strict path validator
+// WILL reject the chain and nothing else in the output would say why.
+//
+// It reports only what is IN the chain. A certificate the additive fallback held
+// back is already named by ObsExtraCertsExcluded, so the two never describe the
+// same certificate twice.
+func chainIssuerEligibilityObservations(chain []*x509.Certificate) []Observation {
+	var obs []Observation
+	for i, c := range chain {
+		reason := issuerIneligibilityReason(c)
+		if reason == "" {
+			continue
+		}
+		obs = append(obs, Observation{
+			Kind: ObsChainCertCannotIssue,
+			Detail: fmt.Sprintf(
+				"chain certificate %d of %d, %q, %s; it is included in the bundle because it is part of the chain established here, but a strict consumer will reject the chain until that CA is re-issued",
+				i+1, len(chain), boundSubject(c.Subject.String()), reason),
 		})
 	}
 	return obs

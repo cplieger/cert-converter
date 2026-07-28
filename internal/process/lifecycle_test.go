@@ -10,10 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
@@ -562,7 +564,7 @@ func TestStoreIsCurrent_rewrites_on_an_encoder_change(t *testing.T) {
 	}
 
 	// Same configured profile: current, nothing to do.
-	current, err := s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+	current, _, err := s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("isCurrent(same profile) = error %v, want nil", err)
 	}
@@ -579,7 +581,7 @@ func TestStoreIsCurrent_rewrites_on_an_encoder_change(t *testing.T) {
 		convert.EncNameLegacyRC2,
 	} {
 		t.Run(string(other), func(t *testing.T) {
-			current, err := s.isCurrent(t.Context(), "out.pfx", &analysis, other, "pw")
+			current, _, err := s.isCurrent(t.Context(), "out.pfx", &analysis, other, "pw")
 			if err != nil {
 				t.Fatalf("isCurrent(configured %s) = error %v, want nil", other, err)
 			}
@@ -704,7 +706,7 @@ func TestStoreIsCurrent_rewrites_after_a_password_rotation(t *testing.T) {
 		t.Fatalf("setup: write: %v", err)
 	}
 
-	current, err := s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "old-password")
+	current, _, err := s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "old-password")
 	if err != nil {
 		t.Fatalf("isCurrent(unrotated password) = error %v, want nil", err)
 	}
@@ -712,7 +714,7 @@ func TestStoreIsCurrent_rewrites_after_a_password_rotation(t *testing.T) {
 		t.Fatal("isCurrent(unrotated password) = false, want true: nothing about this bundle changed")
 	}
 
-	current, err = s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "new-password")
+	current, _, err = s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "new-password")
 	if err != nil {
 		t.Fatalf("isCurrent(rotated password) = error %v, want nil: a bundle that will not decode is stale, not fatal", err)
 	}
@@ -759,7 +761,7 @@ func TestStoreIsCurrent_treats_an_undecodable_prior_as_stale(t *testing.T) {
 				t.Fatalf("setup: WriteFile: %v", err)
 			}
 			logs := captureLogs(t)
-			current, err := s.isCurrent(t.Context(), tc.rel, &analysis, convert.EncNameModern2023, "pw")
+			current, _, err := s.isCurrent(t.Context(), tc.rel, &analysis, convert.EncNameModern2023, "pw")
 			if err != nil {
 				t.Errorf("isCurrent(%s) = error %v, want nil: an undecodable prior output is stale, not a failed pair", tc.name, err)
 			}
@@ -804,7 +806,7 @@ func TestStoreIsCurrent_regenerates_an_oversized_prior(t *testing.T) {
 	s := &store{root: root}
 
 	logs := captureLogs(t)
-	current, err := s.isCurrent(t.Context(), "big.pfx", &convert.Analysis{}, convert.EncNameModern2023, "pw")
+	current, _, err := s.isCurrent(t.Context(), "big.pfx", &convert.Analysis{}, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("isCurrent(oversized prior) = error %v, want nil: it must resolve to stale, not fail the pair", err)
 	}
@@ -884,7 +886,7 @@ func TestStoreIsCurrent_tightens_a_lax_mode_without_regenerating(t *testing.T) {
 			// Spelled out rather than imported from the production const: an operator's
 			// log query keys on these words, so a silent rename must fail here.
 			const tightenedMsg = "tightened the file mode of a prior pfx"
-			current, err := s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+			current, _, err := s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
 			if err != nil {
 				t.Fatalf("isCurrent(mode %o) = error %v, want nil", tc.mode, err)
 			}
@@ -932,19 +934,29 @@ func TestStoreIsCurrent_tightens_a_lax_mode_without_regenerating(t *testing.T) {
 }
 
 // TestStoreIsCurrent_keeps_a_bundle_whose_mode_cannot_be_tightened pins the
-// convergence property the retired mode arm got wrong.
+// convergence property the retired mode arm got wrong, for every tightening failure a
+// rewrite would NOT fix.
 //
 // On a filesystem that will not store the bit — CIFS/vfat with mount-forced modes, an
 // NFS squash config, all plausible for the /output volume of a Synology deployment —
 // the old design called every bundle stale on every scan, so the "fix" was a
 // permanent rewrite loop: fresh KDF salts, fresh mtimes, and the documented
-// downstream rsync re-replicating the entire output tree every cycle. Here the bundle
-// stays CURRENT and the whole cost is one WARN per scan naming the mode found and the
-// mode wanted, which a second scan repeats rather than compounding.
+// downstream rsync re-replicating the entire output tree every cycle. A read-only or
+// mode-forcing mount that fails the chmod outright (EROFS, EINVAL) is the same
+// situation: the error proves the chmod did not land, never that a rewrite would, and
+// rewriting there trades one WARN per scan for a failed encode+write per scan. Here
+// the bundle stays CURRENT and the whole cost is one WARN per scan naming the mode
+// found and the mode wanted, which a second scan repeats rather than compounding.
 //
-// The chmod is stubbed because neither failure is reproducible in a temp directory:
-// the suite runs as root, so a refused chmod cannot be staged, and no local
-// filesystem ignores permission bits.
+// The one failure that IS convergeable — a REFUSED chmod, i.e. a bundle owned by
+// another UID — deliberately does not appear in this table; it belongs to
+// TestScannerRun_regenerates_a_bundle_whose_mode_repair_was_refused, which pins the
+// opposite verdict. Keeping the two in separate tests is what stops a future
+// simplification from collapsing them back into one non-action.
+//
+// The chmod is stubbed because none of these failures is reproducible in a temp
+// directory: no local filesystem ignores permission bits or refuses a chmod to the
+// UID running the suite.
 // Runs serially: it swaps slog.Default() and the chmod seam.
 func TestStoreIsCurrent_keeps_a_bundle_whose_mode_cannot_be_tightened(t *testing.T) {
 	m := testcerts.GenerateChainMaterial(t)
@@ -961,8 +973,21 @@ func TestStoreIsCurrent_keeps_a_bundle_whose_mode_cannot_be_tightened(t *testing
 			func(*os.Root, string, os.FileMode) error { return nil },
 		},
 		{
-			"a chmod the filesystem refuses",
-			func(*os.Root, string, os.FileMode) error { return fs.ErrPermission },
+			// A read-only mount: the chmod fails, but replacing the file would fail too,
+			// so the error is no reason to try.
+			"a chmod a read-only filesystem fails",
+			func(_ *os.Root, name string, _ os.FileMode) error {
+				return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EROFS}
+			},
+		},
+		{
+			// A filesystem that rejects the mode itself rather than the caller's right to
+			// set it. Same reasoning, and it is what proves the refusal test below keys on
+			// the ERROR rather than on "the chmod failed".
+			"a chmod the filesystem rejects as invalid",
+			func(_ *os.Root, name string, _ os.FileMode) error {
+				return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EINVAL}
+			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -988,7 +1013,7 @@ func TestStoreIsCurrent_keeps_a_bundle_whose_mode_cannot_be_tightened(t *testing
 			// Spelled out rather than imported from the production const: an operator's
 			// log query keys on these words, so a silent rename must fail here.
 			const notTightenedMsg = "prior pfx is more permissive than policy and could not be tightened"
-			current, err := s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+			current, _, err := s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
 			if err != nil {
 				t.Fatalf("isCurrent(untightenable mode) = error %v, want nil", err)
 			}
@@ -1011,13 +1036,339 @@ func TestStoreIsCurrent_keeps_a_bundle_whose_mode_cannot_be_tightened(t *testing
 
 			// The next scan reaches the same verdict and says the same thing once more:
 			// steady state, not an escalation and not a rewrite.
-			current, err = s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+			current, _, err = s.isCurrent(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
 			if err != nil || !current {
 				t.Fatalf("isCurrent(untightenable mode, second scan) = (%v, %v), want (true, nil)", current, err)
 			}
 			if got := logs.CountLevel(slog.LevelWarn, notTightenedMsg); got != 2 {
 				t.Errorf("two scans logged %q at WARN %d times, want exactly 2 (one per scan): %q",
 					notTightenedMsg, got, logs.Messages())
+			}
+			// Neither the refusal message nor a repair notice belongs here: this bundle is
+			// not being regenerated and its mode was not repaired.
+			for _, unwanted := range []string{
+				"prior pfx is more permissive than policy and the mode repair was refused; regenerating",
+				"tightened the file mode of a prior pfx",
+			} {
+				if logs.Contains(unwanted) {
+					t.Errorf("isCurrent(untightenable mode) logged %q; %q is the wrong message for a"+
+						" tightening no rewrite can fix", logs.Messages(), unwanted)
+				}
+			}
+			if _, after := readBundle(t, filepath.Join(dir, "out.pfx")); after.Mode().Perm() != 0o644 {
+				t.Errorf("isCurrent(untightenable mode) left mode %o, want 0644 untouched: the stub stored"+
+					" nothing, so nothing may claim otherwise", after.Mode().Perm())
+			}
+		})
+	}
+}
+
+// TestScannerRun_regenerates_a_bundle_whose_mode_repair_was_refused pins the other
+// half of the mode policy, and the reason it is a WHOLE-SCAN test rather than an
+// isCurrent one: the property that matters is that the refusal ends in a REPLACED
+// bundle, which only the scan can show.
+//
+// The scenario is the one this file's stat-failure arm already names as realistic: a
+// prior .pfx owned by another UID (a root-owned bundle left behind by an earlier
+// deployment, before the user: mapping changed) whose bytes are still correct but
+// whose mode is 0644 — a private key readable by every process on the /output volume
+// and by the documented downstream rsync replica. A chmod cannot fix that, because
+// os.Root.Chmod needs ownership; a temp+rename rewrite can, because it needs write
+// permission on the output DIRECTORY instead. Before this arm existed the bundle kept
+// mode 0644 for the life of the deployment and produced one WARN per scan forever.
+//
+// Both refusal errnos are covered because they are two different refusals of the same
+// kind (EPERM: not the owner; EACCES: the path denies it) and only the errno
+// classification tells them apart from the EROFS/EINVAL failures the sibling test
+// keeps WARN-only. The third scan is the point of the test as much as the second: a
+// permanently refusing chmod must still converge, because the REPLACEMENT is
+// owner-only and never reaches the repair path again.
+//
+// Runs serially: it swaps slog.Default() and the chmod seam.
+func TestScannerRun_regenerates_a_bundle_whose_mode_repair_was_refused(t *testing.T) {
+	// Spelled out rather than imported from the production consts: an operator's log
+	// query keys on these words, so a silent rename must fail here.
+	const refusedMsg = "prior pfx is more permissive than policy and the mode repair was refused; regenerating"
+	const notTightenedMsg = "prior pfx is more permissive than policy and could not be tightened"
+	for _, tc := range []struct {
+		name  string
+		errno syscall.Errno
+	}{
+		{"a bundle owned by another UID", syscall.EPERM},
+		{"a chmod the path denies", syscall.EACCES},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			certsRoot := t.TempDir()
+			outRoot := t.TempDir()
+			_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
+			if err := os.WriteFile(filepath.Join(certsRoot, "chain.crt"), chainPEM, 0o644); err != nil {
+				t.Fatalf("setup: write crt: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(certsRoot, "chain.key"), keyPEM, 0o600); err != nil {
+				t.Fatalf("setup: write key: %v", err)
+			}
+			scanner := New(&Options{
+				CertsRoot: certsRoot,
+				OutRoot:   outRoot,
+				Password:  "pw",
+				Encoder:   convert.EncNameModern2023,
+			})
+			if res, err := scanner.Run(t.Context()); err != nil || res.Converted != 1 {
+				t.Fatalf("setup: initial Run = %+v, %v, want Converted 1 and nil", res, err)
+			}
+			pfxPath := filepath.Join(outRoot, "chain.pfx")
+			before, _ := readBundle(t, pfxPath)
+			// Correct bytes, wrong mode: a restore of the output volume, or a bundle
+			// written by an earlier deployment under a different UID.
+			if err := os.Chmod(pfxPath, 0o644); err != nil {
+				t.Fatalf("setup: Chmod: %v", err)
+			}
+			// The refusal itself cannot be staged in a temp directory the suite's own UID
+			// owns, so it comes from the seam — in the shape os.Root.Chmod really returns
+			// it, an *fs.PathError around the errno, because the classification reads
+			// through that wrapping.
+			prev := chmodInRoot
+			chmodInRoot = func(_ *os.Root, name string, _ os.FileMode) error {
+				return &fs.PathError{Op: "chmod", Path: name, Err: tc.errno}
+			}
+			t.Cleanup(func() { chmodInRoot = prev })
+
+			logs := captureLogs(t)
+			res, err := scanner.Run(t.Context())
+			if err != nil {
+				t.Fatalf("Run(refused mode repair) = error %v, want nil", err)
+			}
+			if res.Converted != 1 || res.Unchanged != 0 || res.Failed != 0 {
+				t.Errorf("Run(refused mode repair) = %+v, want Converted 1 Unchanged 0 Failed 0: a repair"+
+					" this app cannot make with a chmod is one it must make by rewriting", res)
+			}
+			if got := logs.CountLevel(slog.LevelWarn, refusedMsg); got != 1 {
+				t.Errorf("Run(refused mode repair) logged %q at WARN %d times, want exactly 1: %q",
+					refusedMsg, got, logs.Messages())
+			}
+			if logs.Contains(notTightenedMsg) {
+				t.Errorf("Run(refused mode repair) logged %q, want the refusal message instead: the two"+
+					" causes now end differently and must not share one line", logs.Messages())
+			}
+			// The refusal is an ownership problem, so it must carry the ownership hint and
+			// name both modes under their own keys.
+			for key, want := range map[string]string{
+				"mode":        "-rw-r--r--",
+				"want":        "-rw-------",
+				"remediation": "check /output ownership and permissions for the UID in user:",
+			} {
+				if !logs.HasAttr(refusedMsg, key, want) {
+					got, _ := logs.AttrValue(refusedMsg, key)
+					t.Errorf("Run(refused mode repair) logged %s=%q, want %q", key, got, want)
+				}
+			}
+			after, afterInfo := readBundle(t, pfxPath)
+			if bytes.Equal(after, before) {
+				t.Error("Run(refused mode repair) left the bundle's bytes untouched, want a rewritten bundle:" +
+					" a replacement is encoded with a fresh KDF salt, so identical bytes mean nothing was written")
+			}
+			if got := afterInfo.Mode().Perm(); got != pfxFileMode {
+				t.Errorf("Run(refused mode repair) left mode %o, want %o: the rewrite is what converges the"+
+					" mode the chmod could not", got, pfxFileMode)
+			}
+
+			// Converged: the replacement is owner-only, so the next scan has nothing to
+			// repair, nothing to say, and nothing to rewrite. Without this the fix would
+			// trade one WARN per scan for one rewrite per scan.
+			res, err = scanner.Run(t.Context())
+			if err != nil {
+				t.Fatalf("Run(after the rewrite) = error %v, want nil", err)
+			}
+			if res.Unchanged != 1 || res.Converted != 0 {
+				t.Errorf("Run(after the rewrite) = %+v, want Unchanged 1 Converted 0: the rewritten bundle is"+
+					" already at policy", res)
+			}
+			if got := logs.CountLevel(slog.LevelWarn, refusedMsg); got != 1 {
+				t.Errorf("two scans logged %q at WARN %d times, want exactly 1 (the second scan has nothing"+
+					" left to repair): %q", refusedMsg, got, logs.Messages())
+			}
+		})
+	}
+}
+
+// TestScannerRun_when_the_repairing_rewrite_is_also_refused splits the outcome of a
+// refused mode repair by WHY its rewrite failed, which is this arm's whole health
+// contract.
+//
+// The sibling test above covers the convergent case: a foreign-owned bundle in a
+// directory this UID CAN write is rewritten on the first scan and goes quiet. But the
+// deployment that leaves a foreign-owned FILE behind plausibly leaves a foreign-owned
+// DIRECTORY too — an operator who changed PUID and left root-owned output behind owns
+// neither — and there the rewrite is refused as well. Counting that as a conversion
+// failure flips health on a condition no restart can clear, i.e. a restart loop in the
+// most likely instance of the very case the mode arm exists to fix. It is the same
+// mistake statusUnreadable exists to prevent on the /input side, where treating a read
+// refusal as a conversion failure once made a symlinked /input restart-loop forever.
+//
+// So a PERMISSION refusal of that rewrite is health-neutral: the bundle on disk still
+// holds the right bytes, the operator gets a standing WARN naming ownership as the
+// remedy, and the outcome is accounted in ScanResult.Unwritable instead of Failed —
+// which is the field main.healthyAfterScan reads, and TestHealthyAfterScan pins that
+// this shape stays healthy through that real predicate. Any OTHER failure of the same
+// write stays a conversion failure and still flips health: a failed PFX write is a
+// conversion failure, as the README documents, and an ENOSPC is no evidence about
+// ownership.
+//
+// The second scan matters as much as the first: the condition is steady state, so the
+// WARN repeats once per scan rather than compounding, and nothing may be deleted or
+// corrupted while it persists.
+//
+// Both seams are the only way in: the suite owns every file it creates (and here runs
+// as root), so no temp directory can refuse it either a chmod or a write.
+// Runs serially: it swaps slog.Default(), the chmod seam and the write seam.
+func TestScannerRun_when_the_repairing_rewrite_is_also_refused(t *testing.T) {
+	// Spelled out rather than imported from the production consts: an operator's log
+	// query keys on these words, so a silent rename must fail here.
+	const refusedMsg = "prior pfx is more permissive than policy and the mode repair was refused; regenerating"
+	const unwritableMsg = "prior pfx is more permissive than policy and neither the mode repair nor the replacing" +
+		" write was permitted; leaving the existing bundle in place, health is unaffected"
+	const failedMsg = "conversion failed"
+	for _, tc := range []struct {
+		writeErr       error
+		name           string
+		wantUnwritable int
+		wantFailed     int
+	}{
+		{
+			// The temp cannot be created: /output itself belongs to another UID.
+			name:           "a refused write leaves the bundle in place without flipping health",
+			writeErr:       &fs.PathError{Op: "openat", Path: "chain.pfx", Err: syscall.EACCES},
+			wantUnwritable: 1,
+		},
+		{
+			// The other refusal errno, for the same reason the sibling test covers both:
+			// only the classification tells them apart from the failures below.
+			name:           "an EPERM refusal of the same write is the same condition",
+			writeErr:       &fs.PathError{Op: "renameat", Path: "chain.pfx", Err: syscall.EPERM},
+			wantUnwritable: 1,
+		},
+		{
+			// A full volume is not an ownership problem, and the next scan might well
+			// succeed, so the general rule stands: an unwritten PFX is a conversion failure.
+			name:       "a write that fails for any other reason is still a conversion failure",
+			writeErr:   &fs.PathError{Op: "renameat", Path: "chain.pfx", Err: syscall.ENOSPC},
+			wantFailed: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			certsRoot := t.TempDir()
+			outRoot := t.TempDir()
+			_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
+			if err := os.WriteFile(filepath.Join(certsRoot, "chain.crt"), chainPEM, 0o644); err != nil {
+				t.Fatalf("setup: write crt: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(certsRoot, "chain.key"), keyPEM, 0o600); err != nil {
+				t.Fatalf("setup: write key: %v", err)
+			}
+			scanner := New(&Options{
+				CertsRoot: certsRoot,
+				OutRoot:   outRoot,
+				Password:  "pw",
+				Encoder:   convert.EncNameModern2023,
+			})
+			// The first scan runs with both seams live, so the bundle under test is a real
+			// one this app wrote.
+			if res, err := scanner.Run(t.Context()); err != nil || res.Converted != 1 {
+				t.Fatalf("setup: initial Run = %+v, %v, want Converted 1 and nil", res, err)
+			}
+			pfxPath := filepath.Join(outRoot, "chain.pfx")
+			before, _ := readBundle(t, pfxPath)
+			// Correct bytes, wrong mode: the foreign-owned bundle the mode arm exists for.
+			if err := os.Chmod(pfxPath, 0o644); err != nil {
+				t.Fatalf("setup: Chmod: %v", err)
+			}
+			prevChmod := chmodInRoot
+			chmodInRoot = func(_ *os.Root, name string, _ os.FileMode) error {
+				return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EPERM}
+			}
+			t.Cleanup(func() { chmodInRoot = prevChmod })
+			prevWrite := writeFileInRoot
+			writeFileInRoot = func(context.Context, *os.Root, string, []byte,
+				...atomicfile.Option,
+			) (atomicfile.Result, error) {
+				return atomicfile.Result{}, tc.writeErr
+			}
+			t.Cleanup(func() { writeFileInRoot = prevWrite })
+
+			logs := captureLogs(t)
+			res, err := scanner.Run(t.Context())
+			if err != nil {
+				t.Fatalf("Run(refused repair, refused rewrite) = error %v, want nil: neither outcome is a"+
+					" scan-level failure", err)
+			}
+			if res.Unwritable != tc.wantUnwritable || res.Failed != tc.wantFailed || res.Converted != 0 {
+				t.Errorf("Run(refused repair, refused rewrite) = %+v, want Unwritable %d Failed %d Converted 0",
+					res, tc.wantUnwritable, tc.wantFailed)
+			}
+			// The refusal of the chmod is announced either way: it is what schedules the
+			// rewrite, so its absence would mean this test is not exercising the arm at all.
+			if got := logs.CountLevel(slog.LevelWarn, refusedMsg); got != 1 {
+				t.Errorf("Run(refused repair, refused rewrite) logged %q at WARN %d times, want exactly 1: %q",
+					refusedMsg, got, logs.Messages())
+			}
+			wantUnwritableLines, wantFailedLines := 0, 1
+			if tc.wantUnwritable > 0 {
+				wantUnwritableLines, wantFailedLines = 1, 0
+			}
+			// Once per scan for this bundle, not once per attempt: the entry is written at
+			// most once per scan, and an operator watching a permanently foreign-owned
+			// volume must not get a line per retry behind it.
+			if got := logs.CountLevel(slog.LevelWarn, unwritableMsg); got != wantUnwritableLines {
+				t.Errorf("Run(refused repair, refused rewrite) logged %q at WARN %d times, want %d: %q",
+					unwritableMsg, got, wantUnwritableLines, logs.Messages())
+			}
+			if got := logs.CountLevel(slog.LevelError, failedMsg); got != wantFailedLines {
+				t.Errorf("Run(refused repair, refused rewrite) logged %q at ERROR %d times, want %d: %q",
+					failedMsg, got, wantFailedLines, logs.Messages())
+			}
+			if tc.wantUnwritable > 0 {
+				// The standing WARN has to name the bundle and the operator action; ownership,
+				// not a restart, is what clears this.
+				for key, want := range map[string]string{
+					"path":        "chain.crt",
+					"output_path": "chain.pfx",
+					"remediation": "check /output ownership and permissions for the UID in user:",
+				} {
+					if !logs.HasAttr(unwritableMsg, key, want) {
+						got, _ := logs.AttrValue(unwritableMsg, key)
+						t.Errorf("Run(refused repair, refused rewrite) logged %s=%q, want %q", key, got, want)
+					}
+				}
+			}
+			// Nothing deleted, nothing truncated, nothing half-written: the bundle an
+			// operator is still serving must survive a refused replacement untouched.
+			after, afterInfo := readBundle(t, pfxPath)
+			if !bytes.Equal(after, before) {
+				t.Error("Run(refused repair, refused rewrite) changed the bundle's bytes, want them untouched:" +
+					" a write that never landed must leave the served bundle alone")
+			}
+			if got := afterInfo.Mode().Perm(); got != 0o644 {
+				t.Errorf("Run(refused repair, refused rewrite) left mode %o, want 0644 untouched: both the"+
+					" chmod and the rewrite were refused, so nothing may claim otherwise", got)
+			}
+
+			// Steady state: the same verdict, the same one line, no compounding and still no
+			// deletion. This is what a restart-looping container would look like instead if
+			// the permission arm were counted as a conversion failure.
+			res, err = scanner.Run(t.Context())
+			if err != nil {
+				t.Fatalf("Run(second scan) = error %v, want nil", err)
+			}
+			if res.Unwritable != tc.wantUnwritable || res.Failed != tc.wantFailed {
+				t.Errorf("Run(second scan) = %+v, want Unwritable %d Failed %d unchanged",
+					res, tc.wantUnwritable, tc.wantFailed)
+			}
+			if got := logs.CountLevel(slog.LevelWarn, unwritableMsg); got != 2*wantUnwritableLines {
+				t.Errorf("two scans logged %q at WARN %d times, want %d (one per scan): %q",
+					unwritableMsg, got, 2*wantUnwritableLines, logs.Messages())
+			}
+			if _, statErr := os.Stat(pfxPath); statErr != nil {
+				t.Errorf("os.Stat(%s) = %v, want the bundle still in place", pfxPath, statErr)
 			}
 		})
 	}
@@ -1066,7 +1417,7 @@ func TestStoreIsCurrent_propagates_a_shutdown_instead_of_reporting_stale(t *test
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	current, err := s.isCurrent(ctx, "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+	current, _, err := s.isCurrent(ctx, "out.pfx", &analysis, convert.EncNameModern2023, "pw")
 
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("isCurrent(cancelled ctx) error = %v, want context.Canceled: a shutdown is neither current nor stale", err)

@@ -41,6 +41,29 @@ type ScanResult struct {
 	// next scan converts. It is health-neutral, and like Unreadable it still blocks
 	// orphan reaping.
 	Vanished int
+	// Unwritable counts prior bundles whose mode repair AND repairing rewrite were both
+	// refused for a permission reason (statusUnwritable). Health-neutral for the same
+	// reason Unreadable is — no restart grants the UID a permission it does not have —
+	// and a SEPARATE field for the same reason as the two above: `unreadable=` carries
+	// an /input remediation and drives the documented alert, while this condition is
+	// entirely on the /output side. It blocks orphan reaping like every other outcome
+	// that left a bundle this app is not satisfied with (conversionsClean).
+	Unwritable int
+}
+
+// conversionsClean reports whether nothing this scan did leaves the output tree in a
+// state this app is still trying to repair. It is the ONE spelling of the reap veto
+// that is about the OUTPUT rather than the input enumeration: Failed is the obvious
+// member, and Unwritable joins it because a bundle whose permission repair the volume
+// refused is one this app wanted to replace and could not — deleting other bundles on
+// the strength of that same volume is exactly what the Failed veto refuses. Health
+// deliberately does NOT ask this question; it asks Failed alone
+// (main.healthyAfterScan), because a restart can clear one and never the other.
+// Pointer receiver like its two siblings below: ScanResult reached gocritic's
+// hugeParam threshold when Unwritable was added, and a read-only predicate is the
+// wrong place to copy 80 bytes.
+func (r *ScanResult) conversionsClean() bool {
+	return r.Failed == 0 && r.Unwritable == 0
 }
 
 // durablyEnumerated reports whether every DURABLE veto on the input enumeration is
@@ -49,7 +72,7 @@ type ScanResult struct {
 // new durable coverage dimension cannot be added to one asker and missed in another.
 // Vanished is deliberately excluded: it is the transient renewal race, and the two
 // predicates that differ only in their Vanished term compose this one.
-func (r ScanResult) durablyEnumerated() bool {
+func (r *ScanResult) durablyEnumerated() bool {
 	return r.Unreadable == 0 && r.Unresolved == 0
 }
 
@@ -58,7 +81,7 @@ func (r ScanResult) durablyEnumerated() bool {
 // mid-walk. It is the ONE spelling of that veto set — reapContext.enumerationClean
 // and logInputCoverageWarnings both ask this question, so a new coverage dimension
 // cannot be added to one of them and missed in the other.
-func (r ScanResult) inputFullyEnumerated() bool {
+func (r *ScanResult) inputFullyEnumerated() bool {
 	return r.durablyEnumerated() && r.Vanished == 0
 }
 
@@ -183,7 +206,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		walkErr = reconcileErr
 	}
 
-	logScanOutcome(ctx, result, walkErr)
+	logScanOutcome(ctx, &result, walkErr)
 	return result, walkErr
 }
 
@@ -333,7 +356,7 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 // it. The error is returned unchanged so the caller pairs it with a zero
 // ScanResult at the return site.
 func failScan(ctx context.Context, err error) error {
-	logScanOutcome(ctx, ScanResult{}, err)
+	logScanOutcome(ctx, &ScanResult{}, err)
 	return err
 }
 
@@ -344,7 +367,7 @@ func failScan(ctx context.Context, err error) error {
 // alert matches on them), so they are built once. Unresolved is a separate
 // ScanResult field, never folded into the documented Unreadable field, because the
 // README's alert attributes key on `unreadable=`.
-func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
+func logScanOutcome(ctx context.Context, result *ScanResult, walkErr error) {
 	level, msg := slog.LevelInfo, "scan complete"
 	if walkErr != nil {
 		level, msg = slog.LevelWarn, "scan aborted before completion"
@@ -352,7 +375,7 @@ func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
 			level, msg = slog.LevelDebug, "scan cancelled during shutdown"
 		}
 	}
-	attrs := make([]any, 0, 20)
+	attrs := make([]any, 0, 24)
 	if walkErr != nil {
 		attrs = append(attrs, "error", walkErr)
 	}
@@ -373,6 +396,14 @@ func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
 		// permissions or layout problem; naming it here is what keeps a scan whose
 		// certs were being replaced mid-walk distinguishable from a clean one.
 		"vanished", result.Vanished,
+		// unwritable is the /output-side health-neutral count, kept out of both failed
+		// and unreadable: folding it into failed would restart-loop the container on a
+		// condition a restart cannot clear (it is what the documented
+		// `(failed|unreadable)=[1-9]` alert matches), and folding it into unreadable
+		// would report an /input remediation for an /output ownership problem. Named
+		// here so a scan that left a foreign-owned bundle in place is distinguishable
+		// from a clean one in the summary as well as in its own per-bundle WARN.
+		"unwritable", result.Unwritable,
 		"removed", result.Removed,
 		"failed", result.Failed)
 	slog.Log(ctx, level, msg, attrs...)
@@ -393,7 +424,7 @@ func logScanOutcome(ctx context.Context, result ScanResult, walkErr error) {
 // Vanished == 0 is the same argument for the transient case: a cert replaced during
 // the walk was not observed, so "every certificate lacks its key" is not a claim
 // this scan can make, and the next one can.
-func logInputCoverageWarnings(result ScanResult, walkErr error) {
+func logInputCoverageWarnings(result *ScanResult, walkErr error) {
 	if walkErr != nil || !result.inputFullyEnumerated() {
 		return
 	}
@@ -693,7 +724,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		return failEntry(rel, "conversion failed", err)
 	}
 	observations := analysis.Observations()
-	current, err := sw.out.isCurrent(ctx, pfxRel, &analysis, sw.enc, sw.password)
+	current, cause, err := sw.out.isCurrent(ctx, pfxRel, &analysis, sw.enc, sw.password)
 	if err != nil {
 		// Only shutdown gets here: isCurrent resolves every unreadable-output case to
 		// "stale" itself and reserves an error for cancellation, which is neither
@@ -718,16 +749,57 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		return failEntry(rel, "conversion failed", err)
 	}
 	if err := sw.out.write(ctx, pfxRel, pfxData); err != nil {
-		// The message is unchanged (an operator's log query keys on it); the
-		// remediation names the two steady-state output-side causes.
-		return failEntry(rel, "conversion failed", err, "output_path", pfxRel,
-			"remediation", "check /output ownership and permissions for the UID in user:, "+
-				"and that no symlink is planted at the output path")
+		return sw.noteWriteFailure(rel, pfxRel, cause, err)
 	}
 	sw.observations.record(rel, fingerprint, observations)
 
 	slog.Info("wrote pfx", "path", pfxRel)
 	return statusConverted
+}
+
+// unwritableBundleMsg is the standing WARN for the one /output write refusal that is
+// NOT a conversion failure: a prior bundle whose bytes are already correct, whose mode
+// is laxer than policy, whose chmod the filesystem refused, and whose repairing
+// rewrite it refused too. It is its own message rather than a variant of
+// modeRepairRefusedMsg because that line announces an attempt this one reports the
+// outcome of, and an operator correlating a permanently-lax private key with a log
+// query must find the standing condition rather than the attempt.
+const unwritableBundleMsg = "prior pfx is more permissive than policy and neither the mode repair nor the replacing write was permitted; leaving the existing bundle in place, health is unaffected"
+
+// noteWriteFailure classifies a failed PFX write and returns the outcome the entry
+// must propagate, with the failure already logged.
+//
+// The general rule is unchanged and stays the default: a PFX this app could not write
+// is a conversion failure, logged at ERROR, counted in ScanResult.Failed, and health
+// goes unhealthy — which is right, because the bundle those inputs produce is not on
+// disk. The single exception is the one condition where nothing is missing: the rewrite
+// was scheduled ONLY to repair a mode a refused chmod could not
+// (staleModeRepairRefused), and the write was refused for a permission reason too. The
+// bundle on disk still holds exactly the bytes these inputs produce, so the operator's
+// PFX is neither stale nor absent; what is wrong is ownership of /output, which no
+// restart can change. Counting that in Failed made the container restart-loop on a
+// condition a restart cannot clear — the same mistake statusUnreadable exists to avoid
+// on the /input side, and the more likely half of the deployment this arm exists for,
+// since a UID that does not own the bundle plausibly does not own its directory either.
+//
+// A NON-permission failure of that same rewrite (EROFS, ENOSPC, a symlink refusal, an
+// occupied path) stays a conversion failure: it is not evidence about ownership, and it
+// is exactly the class where a rewrite might genuinely be able to land later.
+//
+// The WARN is emitted once per bundle per scan, because the entry is written at most
+// once per scan: there is no retry loop behind it.
+func (sw *scanWalk) noteWriteFailure(logRel, pfxRel string, cause staleCause, err error) conversionStatus {
+	if cause == staleModeRepairRefused && isPermissionRefusal(err) {
+		slog.Warn(unwritableBundleMsg,
+			"path", logRel, "output_path", pfxRel, "error", err,
+			"remediation", outputPermRemediation)
+		return statusUnwritable
+	}
+	// The message is unchanged (an operator's log query keys on it); the
+	// remediation names the two steady-state output-side causes.
+	return failEntry(logRel, "conversion failed", err, "output_path", pfxRel,
+		"remediation", "check /output ownership and permissions for the UID in user:, "+
+			"and that no symlink is planted at the output path")
 }
 
 // logConversionObservations surfaces Analyse's non-fatal findings about a pair's
@@ -763,9 +835,11 @@ func logConversionObservations(rel string, observations []convert.Observation) {
 // operator remediation, both are health-neutral, and both must block orphan reaping.
 //
 // statusVanished is NOT folded in with them: it is the transient renewal race, so it
-// gets its own count and stays out of the documented unreadable alert.
+// gets its own count and stays out of the documented unreadable alert. statusUnwritable
+// is not folded in either, in the other direction: it is an /output condition, so
+// naming it under a count whose remediation points at /input would misdiagnose it.
 func countResults(results []conversionStatus, walkUnreadable, walkUnresolved int) ScanResult {
-	var converted, unchanged, orphan, failed, unreadable, vanished int
+	var converted, unchanged, orphan, failed, unreadable, vanished, unwritable int
 	for _, r := range results {
 		switch r {
 		case statusConverted:
@@ -780,6 +854,8 @@ func countResults(results []conversionStatus, walkUnreadable, walkUnresolved int
 			unreadable++
 		case statusVanished:
 			vanished++
+		case statusUnwritable:
+			unwritable++
 		}
 	}
 	return ScanResult{
@@ -791,5 +867,6 @@ func countResults(results []conversionStatus, walkUnreadable, walkUnresolved int
 		Unreadable: walkUnreadable + unreadable,
 		Unresolved: walkUnresolved,
 		Vanished:   vanished,
+		Unwritable: unwritable,
 	}
 }

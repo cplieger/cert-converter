@@ -612,10 +612,20 @@ func TestHealthyAfterScan(t *testing.T) {
 		{"unreadable path alone stays healthy", process.ScanResult{Total: 1, Converted: 1, Unreadable: 1}, true},
 		{"failure stays unhealthy even with unreadable", process.ScanResult{Failed: 2, Unreadable: 3}, false},
 		{"orphan-only scan stays healthy", process.ScanResult{Total: 1, Orphan: 1}, true},
+		// The /output-side member of the health-neutral family: a prior bundle whose mode
+		// repair AND whose repairing rewrite were both refused for a permission reason. It
+		// already holds the right bytes and no restart grants the UID ownership of the
+		// volume, so restarting would loop forever on a condition it cannot clear — the
+		// mistake the unreadable case above exists to avoid, in the shape
+		// TestScannerRun_when_the_repairing_rewrite_is_also_refused produces (Unwritable 1,
+		// Failed 0). That test asserts the counts; this one asserts what health does with
+		// them.
+		{"refused output permission repair stays healthy", process.ScanResult{Total: 1, Unwritable: 1}, true},
+		{"failure stays unhealthy even with unwritable", process.ScanResult{Total: 2, Failed: 1, Unwritable: 1}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := healthyAfterScan(tc.in); got != tc.want {
+			if got := healthyAfterScan(&tc.in); got != tc.want {
 				t.Errorf("healthyAfterScan(%+v) = %v, want %v", tc.in, got, tc.want)
 			}
 		})

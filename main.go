@@ -35,10 +35,17 @@ const watchDebounce = 2 * time.Second
 // a half-written renewal). Unreadable /input sub-paths are deliberately NOT a
 // health input: they are a steady-state permissions/UID misconfiguration that
 // a restart cannot fix, so they are surfaced as a WARN in scanAndSetHealth
-// rather than flapping the container unhealthy in a restart loop. It is the
+// rather than flapping the container unhealthy in a restart loop. The same
+// reasoning covers ScanResult.Unwritable, the /output-side member of that
+// family: a prior bundle whose mode repair AND whose repairing rewrite were
+// both refused for a permission reason already holds the right bytes, and no
+// restart grants the UID ownership of the volume, so it carries its own
+// standing WARN and leaves health alone — while every other failed PFX write is
+// still a conversion failure that clears the marker. It is the
 // single source of truth for the health boundary so the gate can be
-// unit-tested without reimplementing it.
-func healthyAfterScan(r process.ScanResult) bool {
+// unit-tested without reimplementing it. The pointer parameter is gocritic's
+// hugeParam threshold, not a mutation: the result is read, never modified.
+func healthyAfterScan(r *process.ScanResult) bool {
 	return r.Failed == 0
 }
 
@@ -63,7 +70,7 @@ func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *hea
 			"unreadable", result.Unreadable,
 			"remediation", "fix /input permissions or run as a UID that can read it")
 	}
-	marker.Set(healthyAfterScan(result))
+	marker.Set(healthyAfterScan(&result))
 }
 
 // --- Entrypoint ---

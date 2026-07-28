@@ -1169,17 +1169,21 @@ func TestAnalyse_prefers_the_shorter_inclusive_route(t *testing.T) {
 }
 
 // TestAnalyse_excludes_a_certificate_that_cannot_issue_certificates keeps the
-// additive fallback from emitting chain material RFC 5280 positively disqualifies.
+// additive fallback from emitting chain material nothing supports.
 //
-// The inclusive edge signal exists so an UNPROVABLE relationship does not drop a
-// real CA, and the fallback keeps whatever is left for the same reason. Neither may
-// keep a certificate whose own extensions say it cannot have issued anything: with
-// the leaf's real issuer absent and a same-named certificate asserting CA:false
-// beside it, the reproduced defect emitted that certificate as the sole CA bag, so
-// every consumer's path validation rejected the generated PFX while conversion
-// reported success. A certificate that is merely unverifiable must still be kept
-// (TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established pins that
-// half); only positive disqualification excludes.
+// The rule this pins is narrow, and the narrowing is the point. RFC 5280
+// eligibility on its own never removes a certificate — a CA that demonstrably
+// SIGNED the leaf is emitted whatever its extensions claim, with
+// ObsChainCertCannotIssue naming it
+// (TestAnalyse_keeps_a_signing_CA_that_is_not_issuer_eligible pins that half).
+// What is excluded here is a certificate for which BOTH kinds of evidence are
+// absent: it signed nothing in this bundle, and its own extensions say it could not
+// have. With the leaf's real issuer absent and a same-named certificate asserting
+// CA:false beside it, the reproduced defect emitted that stranger as the sole CA
+// bag, so every consumer's path validation rejected the generated PFX while
+// conversion reported success. A certificate that is merely unverifiable must still
+// be kept (TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established pins
+// that half).
 func TestAnalyse_excludes_a_certificate_that_cannot_issue_certificates(t *testing.T) {
 	t.Parallel()
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
@@ -1562,5 +1566,169 @@ func TestAnalyse_keeps_a_ca_identity_whose_subject_only_matches_an_issuer_name_a
 	}
 	if !hasObservation(got.Observations(), convert.ObsCAAsIdentity) {
 		t.Errorf("observations = %v, want the CA-as-identity observation", got.Observations())
+	}
+}
+
+// observationDetail returns the detail of the first observation of kind k. Tests
+// that assert an observation NAMES a certificate need the text, not just the kind:
+// a diagnostic that fires without saying which certificate is at fault costs the
+// operator the same investigation as no diagnostic at all.
+func observationDetail(obs []convert.Observation, k convert.ObservationKind) (string, bool) {
+	for _, o := range obs {
+		if o.Kind == k {
+			return o.Detail, true
+		}
+	}
+	return "", false
+}
+
+// TestAnalyse_keeps_a_signing_CA_that_is_not_issuer_eligible pins the split
+// between what a certificate DID and what its extensions say it SHOULD have done.
+//
+// The shape is an internal CA minted by a bare `openssl req -x509`: self-signed,
+// no basicConstraints extension at all, and it genuinely signed the leaf. RFC 5280
+// 4.2.1.9 says such a key must not be used to verify certificate signatures, which
+// is why crypto/x509's CheckSignatureFrom refuses it as a parent, so no VERIFIED
+// edge to it can ever exist. Applying that eligibility rule to candidacy as well
+// removed the certificate from the graph outright: the emitted PFX lost its only CA
+// bag, and the operator was told the chain was unverified and the CA excluded --
+// worse than the silence that preceded it, because the material was gone too.
+//
+// This app converts formats and holds no trust store; PKCS#12 CA bags are a bag of
+// certificates, not a validated path. So a signature is ground truth and eligibility
+// is a diagnostic: the CA is emitted, and ObsChainCertCannotIssue tells the operator
+// their CA is non-compliant and that a strict consumer will reject the chain. The
+// fallback observations must be absent, because there is nothing unestablished here
+// -- the chain was proven by signature.
+func TestAnalyse_keeps_a_signing_CA_that_is_not_issuer_eligible(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	// A self-signed CA with NO basic constraints: BasicConstraintsValid false emits
+	// no extension, and a zero KeyUsage emits none either, so its only
+	// disqualification is the missing basicConstraints RFC 5280 requires of a v3
+	// issuer. This is what `openssl req -x509` produces without CA flags.
+	caKey := newKey(t)
+	caPEM, caCert := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(500),
+		Subject:      pkix.Name{CommonName: "No-BC Internal CA"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(72 * time.Hour),
+	}, &caKey.PublicKey, nil, caKey)
+	if caCert.BasicConstraintsValid {
+		t.Fatal("setup: the CA fixture carries basic constraints; the shape under test is a CA without them")
+	}
+
+	leafKey := newKey(t)
+	leafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(501),
+		Subject:      pkix.Name{CommonName: "no-bc-ca-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, caCert, caKey)
+
+	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), keyPEMOf(t, leafKey))
+	if err != nil {
+		t.Fatalf("Analyse(leaf signed by a CA with no basic constraints) = error %v, want nil", err)
+	}
+
+	if len(got.Chain()) != 1 {
+		t.Fatalf("chain = %v, want the signing CA as the one CA bag: a certificate that demonstrably signed the leaf is chain material whatever its extensions claim",
+			chainSerials(got.Chain()))
+	}
+	if !bytes.Equal(got.Chain()[0].Raw, caCert.Raw) {
+		t.Errorf("chain[0] = %q, want %q", got.Chain()[0].Subject.CommonName, caCert.Subject.CommonName)
+	}
+	if len(got.Extra()) != 0 {
+		t.Errorf("Extra holds %d certificate(s), want 0: the CA belongs in the chain, not beside it", len(got.Extra()))
+	}
+
+	detail, ok := observationDetail(got.Observations(), convert.ObsChainCertCannotIssue)
+	if !ok {
+		t.Fatalf("observations = %v, want %q: carrying a non-compliant CA silently is the defect that preceded the exclusion",
+			got.Observations(), convert.ObsChainCertCannotIssue)
+	}
+	if !strings.Contains(detail, "No-BC Internal CA") {
+		t.Errorf("%s detail = %q, want it to name the non-compliant CA", convert.ObsChainCertCannotIssue, detail)
+	}
+	if !strings.Contains(detail, "basicConstraints") {
+		t.Errorf("%s detail = %q, want it to name the missing extension the operator has to fix", convert.ObsChainCertCannotIssue, detail)
+	}
+
+	// The chain IS established -- by signature -- so neither fallback observation
+	// applies, and nothing may report the emitted CA as excluded.
+	if hasObservation(got.Observations(), convert.ObsChainUnverified) {
+		t.Errorf("observations = %v, want no %q: the CA's signature over the leaf establishes the chain",
+			got.Observations(), convert.ObsChainUnverified)
+	}
+	if excluded, ok := observationDetail(got.Observations(), convert.ObsExtraCertsExcluded); ok {
+		t.Errorf("observations report %q = %q, want no exclusion: the only other certificate is in the emitted chain",
+			convert.ObsExtraCertsExcluded, excluded)
+	}
+}
+
+// TestAnalyse_emits_a_compliant_chain_unchanged_and_silently is the common-path
+// guard for the eligibility/signature split: an ordinary leaf + intermediate + root
+// bundle must emit exactly the same three bags in the same order it always did, and
+// say nothing at all.
+//
+// Both halves are load-bearing. The bag sequence is a PKCS#12 contract (decoders
+// read it positionally), so it is asserted on the DER rather than on subject names.
+// The silence is what keeps the new non-compliance diagnostic from becoming noise:
+// a warning that fires on every well-formed renewal in the deployment would be
+// tuned out long before the one bundle that needs it appears.
+func TestAnalyse_emits_a_compliant_chain_unchanged_and_silently(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	rootKey := newKey(t)
+	rootPEM, rootCert := mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(510),
+		Subject:               pkix.Name{CommonName: "Compliant Root CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(96 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &rootKey.PublicKey, nil, rootKey)
+
+	interKey := newKey(t)
+	interPEM, interCert := mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(511),
+		Subject:               pkix.Name{CommonName: "Compliant Intermediate CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(72 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &interKey.PublicKey, rootCert, rootKey)
+
+	leafKey := newKey(t)
+	leafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(512),
+		Subject:      pkix.Name{CommonName: "compliant-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, interCert, interKey)
+
+	got, err := convert.Analyse(concatPEM(leafPEM, interPEM, rootPEM), keyPEMOf(t, leafKey))
+	if err != nil {
+		t.Fatalf("Analyse(compliant leaf+intermediate+root) = error %v, want nil", err)
+	}
+
+	want := []*x509.Certificate{interCert, rootCert}
+	if len(got.Chain()) != len(want) {
+		t.Fatalf("chain = %v, want %v (intermediate then root)", chainSerials(got.Chain()), chainSerials(want))
+	}
+	for i := range want {
+		if !bytes.Equal(got.Chain()[i].Raw, want[i].Raw) {
+			t.Errorf("chain[%d] = serial %s, want serial %s", i, got.Chain()[i].SerialNumber, want[i].SerialNumber)
+		}
+	}
+	if len(got.Extra()) != 0 {
+		t.Errorf("Extra holds %d certificate(s), want 0", len(got.Extra()))
+	}
+	if len(got.Observations()) != 0 {
+		t.Errorf("observations = %v, want none: every certificate here is well-formed, in order and current", got.Observations())
 	}
 }

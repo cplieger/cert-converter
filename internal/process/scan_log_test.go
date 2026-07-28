@@ -35,7 +35,7 @@ func TestLogScanOutcome_levels(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), result, tt.walkErr)
+			logScanOutcome(t.Context(), &result, tt.walkErr)
 
 			// CountExact, not a substring: these messages are pinned by the README's
 			// Loki rules, so a superstring must not satisfy them.
@@ -196,7 +196,7 @@ func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), tt.result, tt.walkErr)
+			logScanOutcome(t.Context(), &tt.result, tt.walkErr)
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; empty-input notice present = %v, want %v",
@@ -239,7 +239,7 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_all_lack_a_key(t *testin
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), tt.result, tt.walkErr)
+			logScanOutcome(t.Context(), &tt.result, tt.walkErr)
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; all-orphan notice present = %v, want %v",
@@ -269,6 +269,10 @@ func TestLogConversionObservations_levels(t *testing.T) {
 		{convert.ObsMultipleKeys, slog.LevelWarn},
 		{convert.ObsIdentityExpired, slog.LevelWarn},
 		{convert.ObsChainUnverified, slog.LevelWarn},
+		// A non-compliant CA is carried in the bundle rather than dropped, so this
+		// WARN is the only thing that tells the operator a strict consumer will
+		// reject the chain. Classifying it as noise would make that silent.
+		{convert.ObsChainCertCannotIssue, slog.LevelWarn},
 	} {
 		t.Run(string(tc.kind), func(t *testing.T) {
 			logs := captureLogs(t)
@@ -438,7 +442,7 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key(t *
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), tt.result, tt.walkErr)
+			logScanOutcome(t.Context(), &tt.result, tt.walkErr)
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; partial-orphan notice present = %v, want %v",
@@ -466,7 +470,7 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key(t *
 func TestLogScanOutcome_names_the_unresolved_symlink_count(t *testing.T) {
 	logs := captureLogs(t)
 
-	logScanOutcome(t.Context(), ScanResult{Total: 1, Converted: 1, Unresolved: 2}, nil)
+	logScanOutcome(t.Context(), &ScanResult{Total: 1, Converted: 1, Unresolved: 2}, nil)
 
 	if !logs.HasAttr("scan complete", "unresolved", "2") {
 		got, _ := logs.AttrValue("scan complete", "unresolved")
@@ -482,7 +486,7 @@ func TestLogScanOutcome_names_the_unresolved_symlink_count(t *testing.T) {
 func TestLogScanOutcome_names_the_vanished_count(t *testing.T) {
 	logs := captureLogs(t)
 
-	logScanOutcome(t.Context(), ScanResult{Total: 1, Vanished: 1}, nil)
+	logScanOutcome(t.Context(), &ScanResult{Total: 1, Vanished: 1}, nil)
 
 	if !logs.HasAttr("scan complete", "vanished", "1") {
 		got, _ := logs.AttrValue("scan complete", "vanished")

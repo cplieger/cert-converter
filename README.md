@@ -80,7 +80,11 @@ the first start. Export `PUID` and `PGID` with the same values Compose uses,
 then run `mkdir -p /path/to/pfx/output && chown "${PUID:-1000}:${PGID:-1000}" /path/to/pfx/output`
 (both default to `1000`, matching `compose.yaml`). Unlike anything under `/input` the scan cannot read, which is
 only warned about and skipped, an unwritable `/output` fails every conversion and
-keeps the container unhealthy. Generated `.pfx` files are mode `0600` and their
+keeps the container unhealthy — except where the bundle already on disk holds the
+right bytes and is only being rewritten to tighten a file mode a refused `chmod`
+could not, in which case a permission-refused write leaves it in place, warns with
+the same ownership remediation and does not flip health, since no restart grants
+the UID ownership of the volume. Generated `.pfx` files are mode `0600` and their
 directories `0750`, both owned by that UID, so whatever consumes them must run
 as the same UID (or as a privileged process); group membership alone is
 insufficient because mode `0600` grants no group read access.

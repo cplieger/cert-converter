@@ -104,7 +104,7 @@ func TestStoreIsCurrent_degrades_when_the_output_cannot_be_inspected(t *testing.
 
 	s := &store{root: outHandle}
 
-	current, err := s.isCurrent(t.Context(), "swapped/tls.pfx", &convert.Analysis{}, convert.EncNameModern2023, "pw")
+	current, _, err := s.isCurrent(t.Context(), "swapped/tls.pfx", &convert.Analysis{}, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("isCurrent(uninspectable output) = %v, want nil: an unreadable prior output is stale, not fatal", err)
 	}
