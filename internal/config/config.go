@@ -126,14 +126,15 @@ func isBlank(password string) bool {
 // set the secret is read from that file (bounded, whitespace-trimmed) so it
 // never appears in the process environment; otherwise PFX_PASSWORD is used. It
 // returns ErrEmptyPassword when neither supplies a value, or when the value is
-// blank (empty or whitespace-only), unless PFX_ALLOW_EMPTY_PASSWORD is set to
-// true; it returns ErrUnencodablePassword when the configured password is a
-// shape PKCS#12 cannot carry (invalid UTF-8, a non-BMP rune, or an embedded
-// NUL); and it fails loudly when a
-// configured PFX_PASSWORD_FILE cannot be used — including a path envx
-// rejects (it must already be cleaned and contain no ".." anywhere, so even
-// a "pfx..v2" filename is refused), an oversized file, and a file whose
-// trimmed content is empty.
+// blank (empty or whitespace-only) — a whitespace-only PFX_PASSWORD_FILE
+// included, because a blank file routes through the same guard as a blank
+// PFX_PASSWORD — unless PFX_ALLOW_EMPTY_PASSWORD is set to true; it returns
+// ErrUnencodablePassword when the configured password is a shape PKCS#12 cannot
+// carry (invalid UTF-8, a non-BMP rune, or an embedded NUL); and it fails
+// loudly, with no opt-out, when a configured PFX_PASSWORD_FILE cannot be used
+// at all — a path envx rejects (it must already be cleaned and contain no ".."
+// anywhere, so even a "pfx..v2" filename is refused), or an oversized or
+// unreadable file.
 func Load() (Config, error) {
 	var blankSecretFile error
 	password, source, secretErr := envx.SecretWithSource("PFX_PASSWORD")

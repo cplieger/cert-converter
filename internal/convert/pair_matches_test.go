@@ -18,7 +18,7 @@ import (
 // The nil cases are not defensive padding: a decode that yielded no leaf, or an
 // analysis that produced none, must report "not current" rather than dereference.
 //
-// Lives here rather than in main's test file (deferred finding l-f13) — this is
+// Lives here rather than in main's test file — this is
 // the decoded bundle's own contract. It is reached through export_test.go, like
 // parseCertChain: the comparison is a step of convert.CheckCurrency and is not
 // exported, so no production caller can compare a bundle without the preflight

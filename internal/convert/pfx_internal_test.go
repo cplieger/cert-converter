@@ -70,3 +70,20 @@ func TestDecode_bounds_the_library_message(t *testing.T) {
 		t.Errorf("decode error = %q, want it to name the stage that failed", err.Error())
 	}
 }
+
+// TestEncode_refuses_an_analysis_that_did_not_come_from_Analyse pins the leaf guard
+// Encode grew this cycle. The zero Analysis is constructible from outside the package,
+// and without the guard the encoder dereferences the nil *x509.Certificate inside
+// go-pkcs12 (sha1.Sum(certificate.Raw)), killing the process instead of failing one
+// conversion. Delete the guard and no other test in this package notices; the panic
+// comes back.
+func TestEncode_refuses_an_analysis_that_did_not_come_from_Analyse(t *testing.T) {
+	t.Parallel()
+	_, err := Encode(&Analysis{}, EncNameModern2023, "pw")
+	if err == nil {
+		t.Fatal("Encode(zero Analysis) = nil error, want a refusal rather than a nil-leaf panic in the encoder")
+	}
+	if !strings.Contains(err.Error(), "no leaf certificate") {
+		t.Errorf("Encode(zero Analysis) error = %q, want it to name the missing leaf", err.Error())
+	}
+}

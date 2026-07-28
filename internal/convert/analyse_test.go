@@ -580,3 +580,35 @@ func TestAnalyse_names_the_unusable_key_blocks_when_nothing_matches(t *testing.T
 		}
 	}
 }
+
+// TestAnalyse_names_an_unparseable_and_an_encrypted_key_block_when_nothing_matches
+// covers the other two keyDefects clauses. Only the undecoded one is exercised by
+// the test above, so a mutation to either of these strings — or to the
+// parseFailures / sawEncrypted plumbing that feeds them — survives the whole
+// suite while the operator loses the same mid-rotation diagnosis.
+func TestAnalyse_names_an_unparseable_and_an_encrypted_key_block_when_nothing_matches(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	_, unrelatedKeyPEM := testcerts.GenerateSelfSignedCert(t, "unrelated.example.com", "ecdsa")
+
+	// A key-labelled block whose DER no parser accepts, and a PKCS#8 encrypted
+	// block: both decode as PEM, neither yields a key, so both are counted while
+	// the unrelated key still makes parsePrivateKeys succeed.
+	garbage := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("not a DER key")})
+	encrypted := pem.EncodeToMemory(&pem.Block{Type: "ENCRYPTED PRIVATE KEY", Bytes: []byte("ciphertext")})
+
+	_, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), concatPEM(unrelatedKeyPEM, garbage, encrypted))
+	if err == nil {
+		t.Fatal("Analyse(unrelated key + unparseable key + encrypted key) = nil error, want a no-match error")
+	}
+	got := err.Error()
+	for _, want := range []string{
+		"none of the 1 private key block(s) matches any of the 2 certificate(s) in the chain",
+		"1 could not be parsed",
+		"at least one is encrypted",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Analyse error = %q, want it to contain %q", got, want)
+		}
+	}
+}

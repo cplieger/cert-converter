@@ -479,7 +479,7 @@ func (g *certGraph) plausibleIssuer(child, parent int) bool {
 // memoised. This is the STRONG signal: a candidate edge only says the two names or
 // key identifiers line up, which an impostor sharing a subject can also satisfy.
 //
-// A parent whose public key exceeds maxVerifiableKeyBits is never verified: that
+// A parent whose RSA key exceeds either verification ceiling is never verified: that
 // modexp is the cost the ceiling exists to refuse. No candidate parent reaches
 // here in that state, because newCertGraph refuses such a bundle before either
 // distance walk runs — an edge that can never be proven, standing beside a
@@ -526,7 +526,7 @@ func (g *certGraph) isIssuer(i int) bool {
 // CA-ness is irrelevant to the question asked here: a self-signed end-entity
 // certificate is still self-signed.
 //
-// A certificate whose own public key exceeds maxVerifiableKeyBits is reported as
+// A certificate whose own RSA key exceeds either verification ceiling is reported as
 // not self-signed — unverified rather than disproven — for the same cost reason
 // verifies applies the ceiling. After newCertGraph's refusal that answer is only
 // reachable for a certificate this bundle names as nobody's issuer, so it decides

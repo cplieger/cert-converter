@@ -345,3 +345,67 @@ func TestNoteUnreadableInput_levels(t *testing.T) {
 		})
 	}
 }
+
+// TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key pins the
+// partial-orphan notice, the sibling of the all-orphan one above: when only SOME
+// .crt files lack their .key, the pairs that do have a key still convert, so the
+// scan reports failed=0 and the health marker stays set while those certificates
+// produce no PFX and their existing bundles go stale unreaped. It must fire for
+// exactly that shape, stay quiet when the all-orphan or empty-tree notice owns the
+// case (they are earlier switch arms), and stay quiet on an unproven enumeration.
+// Runs serially: it swaps slog.Default().
+func TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key(t *testing.T) {
+	const wantMsg = "some certificates under the input root are missing their sibling .key"
+	for _, tt := range []struct {
+		walkErr    error
+		name       string
+		result     ScanResult
+		unresolved int
+		wantWarn   bool
+	}{
+		{nil, "a partially orphaned tree is named", ScanResult{Total: 2, Converted: 1, Orphan: 1}, 0, true},
+		{nil, "an all-orphan tree stays quiet (the earlier arm owns it)", ScanResult{Total: 2, Orphan: 2}, 0, false},
+		{nil, "an empty tree stays quiet (the Total==0 notice owns it)", ScanResult{}, 0, false},
+		{nil, "a fully converted tree stays quiet", ScanResult{Total: 2, Converted: 2}, 0, false},
+		{nil, "an unreadable sub-path stays quiet", ScanResult{Total: 3, Converted: 1, Orphan: 1, Unreadable: 1}, 0, false},
+		{nil, "an unresolved symlink stays quiet", ScanResult{Total: 2, Converted: 1, Orphan: 1}, 1, false},
+		{errors.New("permission denied"), "an aborted scan stays quiet", ScanResult{Total: 2, Converted: 1, Orphan: 1}, 0, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureLogs(t)
+
+			logScanOutcome(t.Context(), tt.result, tt.unresolved, tt.walkErr)
+
+			if got := logs.Contains(wantMsg); got != tt.wantWarn {
+				t.Errorf("logScanOutcome(%+v, unresolved=%d, %v) logged %q; partial-orphan notice present = %v, want %v",
+					tt.result, tt.unresolved, tt.walkErr, logs.Messages(), got, tt.wantWarn)
+			}
+			if !tt.wantWarn {
+				return
+			}
+			if logs.CountLevel(slog.LevelWarn, wantMsg) != 1 {
+				t.Errorf("logScanOutcome(%+v, nil) logged %q, want the partial-orphan notice at level WARN", tt.result, logs.Messages())
+			}
+			if !logs.HasAttr(wantMsg, "orphan", "1") {
+				t.Errorf("logScanOutcome(%+v, nil) logged %q, want the orphan count on the notice", tt.result, logs.Messages())
+			}
+		})
+	}
+}
+
+// TestLogScanOutcome_names_the_unresolved_symlink_count pins the summary's
+// unresolved attribute. It is the ONLY aggregate trace of an input symlink the
+// confined root could not resolve: that count is deliberately not a ScanResult
+// field, so without it the summary reports an all-zero, apparently healthy scan
+// while an unresolvable link hid an entire certificate subtree. Runs serially: it
+// swaps slog.Default().
+func TestLogScanOutcome_names_the_unresolved_symlink_count(t *testing.T) {
+	logs := captureLogs(t)
+
+	logScanOutcome(t.Context(), ScanResult{Total: 1, Converted: 1}, 2, nil)
+
+	if !logs.HasAttr("scan complete", "unresolved", "2") {
+		got, _ := logs.AttrValue("scan complete", "unresolved")
+		t.Errorf("logScanOutcome(unresolved=2) logged unresolved=%q, want the unresolved-symlink count in the summary", got)
+	}
+}

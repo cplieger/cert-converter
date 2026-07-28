@@ -75,9 +75,10 @@ services:
 | `/input` | PEM certificate directory (read-only). Each certificate must be named `<name>.crt` with its private key as the sibling `<name>.key` in the same directory (Caddy's layout); files with any other extension are ignored, so a certbot-style directory of `fullchain.pem`/`privkey.pem` produces no output and logs `no certificate pairs found under the input root`. Sub-directories are scanned recursively and mirrored under `/output` as `<name>.pfx`. Must be readable by the UID in `user:`; Caddy's certificate directory is often root-owned and mode `0700`, so either `chgrp`/`chmod` it for that UID or run the container as a UID that can read it. |
 | `/output` | PFX output directory; must be writable by the UID in `user:` |
 
-Create the host output directory owned by the UID you set in `user:`
-(`mkdir -p /path/to/pfx/output && chown "${PUID:-1000}:${PGID:-1000}" /path/to/pfx/output`) before
-the first start. Unlike anything under `/input` the scan cannot read, which is
+Create the host output directory owned by the UID you set in `user:` before
+the first start (`mkdir -p /path/to/pfx/output && chown 1000:1000 /path/to/pfx/output`
+for the defaults; replace `1000:1000` with the numeric PUID:PGID from `.env`
+when you override them). Unlike anything under `/input` the scan cannot read, which is
 only warned about and skipped, an unwritable `/output` fails every conversion and
 keeps the container unhealthy. Generated `.pfx` files are mode `0600` and their
 directories `0750`, both owned by that UID, so whatever consumes them must run

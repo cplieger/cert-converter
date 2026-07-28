@@ -429,10 +429,22 @@ func TestLoad_unreadable_password_file_fails_loudly(t *testing.T) {
 			// The opt-out must not rescue a broken secret file.
 			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "true")
 
+			// Serial: capture.Default swaps slog.Default().
+			logs := capture.Default(t)
+
 			if _, err := Load(); err == nil {
 				t.Fatal("Load() = nil error, want a startup failure for an unusable PFX_PASSWORD_FILE")
 			} else if errors.Is(err, ErrEmptyPassword) {
 				t.Errorf("Load() = %v, want the underlying secret-file error, not ErrEmptyPassword", err)
+			}
+			// The refusal quotes envx's message, which names PFX_PASSWORD — the
+			// variable the file-wins rule ignores. The conflict WARN is the only
+			// record that redirects the operator to PFX_PASSWORD_FILE, so it must be
+			// emitted before this gate returns, not from logPasswordDelivery.
+			const conflict = "both PFX_PASSWORD and PFX_PASSWORD_FILE are set"
+			if n := logs.CountLevel(slog.LevelWarn, conflict); n != 1 {
+				t.Errorf("Load(unusable file, PFX_PASSWORD set) logged %d WARN records matching %q, want exactly 1 (logs %v)",
+					n, conflict, logs.Messages())
 			}
 		})
 	}

@@ -47,7 +47,9 @@ func hugeKDFIterations(t *testing.T, pfx []byte) []byte {
 // diagnosis, and the reason is asserted:
 //
 //   - an out-of-range iteration count is a preflight refusal; run the decoder
-//     first and it becomes a decode failure, after paying for 32767 rounds;
+//     first and it becomes a decode failure (the patched bytes invalidate the
+//     MAC, which the decoder verifies with the intact 2048-iteration count
+//     before any content derivation);
 //   - a bundle from another profile is a profile mismatch; run the decoder first
 //     (here with a password that cannot open it) and it becomes a decode failure.
 func TestCheckCurrency_runs_the_preflight_and_profile_check_before_the_decode(t *testing.T) {

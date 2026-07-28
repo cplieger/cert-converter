@@ -53,7 +53,7 @@ func TestVerifiableKey_bounds_rsa_only(t *testing.T) {
 		t.Errorf("verifiableKey(an RSA key with exponent %d) = false, want true: the exponent ceiling is inclusive", maxVerifiablePublicExponent)
 	}
 	if verifiableKey(pastExponentLimit) {
-		t.Errorf("verifiableKey(an RSA key with exponent %d) = true, want false: the exponent sets the squaring count, so one modexp with it costs the scan goroutine seconds", maxVerifiablePublicExponent+1)
+		t.Errorf("verifiableKey(an RSA key with exponent %d) = true, want false: the exponent sets the squaring count and exceeds the cost this app permits an input to dictate", maxVerifiablePublicExponent+1)
 	}
 	if !verifiableKey(atLimit) {
 		t.Error("verifiableKey(a ceiling-sized RSA key with exponent 65537) = false, want true: conventional exponents stay verifiable")

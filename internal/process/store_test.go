@@ -1,10 +1,13 @@
 package process
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cplieger/cert-converter/internal/convert"
 )
 
 // TestStoreWrite_creates_the_parent_directory pins the half of store.write that
@@ -190,5 +193,64 @@ func TestStoreWrite_refuses_a_bundle_larger_than_the_read_bound(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Errorf("the output directory holds %d entries, want 1: a refused write must stage no temp file", len(entries))
+	}
+}
+
+// TestStoreIsCurrent_names_a_non_regular_prior_output pins the WARN on the arm
+// that refuses a prior output which is not a regular file. Nothing else records
+// it: the verdict is "stale, regenerate", and the rewrite that follows FAILS for
+// every one of these shapes (atomicfile refuses a symlink target outright, and a
+// directory or device node cannot be renamed over), so this line is what names the
+// occupied output path before the bare conversion error arrives. Runs serially: it
+// swaps slog.Default().
+func TestStoreIsCurrent_names_a_non_regular_prior_output(t *testing.T) {
+	const wantMsg = "prior output path is not a regular file; regenerating"
+	for _, tc := range []struct {
+		name  string
+		plant func(t *testing.T, dir string)
+	}{
+		{"a symlink is refused without being followed", func(t *testing.T, dir string) {
+			target := filepath.Join(t.TempDir(), "elsewhere.pfx")
+			if err := os.WriteFile(target, []byte("unrelated"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, filepath.Join(dir, "out.pfx")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a directory is refused", func(t *testing.T, dir string) {
+			if err := os.Mkdir(filepath.Join(dir, "out.pfx"), 0o750); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tc.plant(t, dir)
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatalf("setup: os.OpenRoot: %v", err)
+			}
+			defer root.Close()
+			s := &store{root: root}
+			logs := captureLogs(t)
+
+			// want is never dereferenced on this arm: the verdict is reached from the
+			// lstat alone, before any bundle is read.
+			current, err := s.isCurrent(t.Context(), "out.pfx", nil, convert.EncNameModern2023, "pw")
+
+			if err != nil || current {
+				t.Fatalf("isCurrent(non-regular) = %v, %v, want false, nil: an occupied output path is never a usable prior bundle", current, err)
+			}
+			if got := logs.CountLevel(slog.LevelWarn, wantMsg); got != 1 {
+				t.Fatalf("isCurrent(non-regular) logged %q, want %q once at WARN", logs.Messages(), wantMsg)
+			}
+			if _, ok := logs.AttrValue(wantMsg, "mode"); !ok {
+				t.Errorf("isCurrent(non-regular) logged %q, want the mode named so the operator knows what occupies the path", logs.Messages())
+			}
+			if _, ok := logs.AttrValue(wantMsg, "remediation"); !ok {
+				t.Errorf("isCurrent(non-regular) logged %q, want a remediation hint", logs.Messages())
+			}
+		})
 	}
 }

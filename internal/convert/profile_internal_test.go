@@ -414,6 +414,8 @@ func TestInspect_rejects_more_than_one_shrouded_key_bag(t *testing.T) {
 		{"the control: re-encoded unchanged", "", func(_ *testing.T, safes []contentInfo) []contentInfo { return safes }},
 		{"a second bag inside one plaintext safe", "more than one shrouded private-key bag in one safe", duplicateTestKeyBag},
 		{"trailing bytes after the plaintext safe's content", "trailing byte(s) after a plaintext safe's content", appendTestTrailingByteToPlaintextSafe},
+		{"trailing bytes after an encrypted safe's contents", "trailing byte(s) after an encrypted safe's contents", appendTestTrailingByteToEncryptedSafe},
+		{"trailing bytes after the shrouded key bag", "trailing byte(s) after a shrouded key bag's EncryptedPrivateKeyInfo", appendTestTrailingByteToKeyBag},
 		{"a second plaintext safe carrying its own bag", "more than one shrouded private-key bag", duplicateTestPlaintextSafe},
 		{"a second encrypted certificate safe", "more than one encrypted certificate bag", duplicateTestEncryptedSafe},
 		{"more authenticated safes than the preflight admits", "more than 2 element(s)", appendTestPlaintextSafe},
@@ -488,6 +490,30 @@ func appendTestTrailingByteToPlaintextSafe(t *testing.T, safes []contentInfo) []
 	safe := &safes[plaintextTestSafeIndex(t, safes)]
 	safe.Content.Bytes = append(slices.Clone(safe.Content.Bytes), 0x00)
 	safe.Content.FullBytes = nil
+	return safes
+}
+
+// appendTestTrailingByteToEncryptedSafe appends one byte after the encrypted
+// certificate safe's contents, the second of the preflight's four trailing-byte
+// refusals.
+func appendTestTrailingByteToEncryptedSafe(t *testing.T, safes []contentInfo) []contentInfo {
+	t.Helper()
+	safe := &safes[testSafeIndex(t, safes, oidEncryptedDataContentType)]
+	safe.Content.Bytes = append(slices.Clone(safe.Content.Bytes), 0x00)
+	safe.Content.FullBytes = nil
+	return safes
+}
+
+// appendTestTrailingByteToKeyBag appends one byte after the shrouded key bag's
+// EncryptedPrivateKeyInfo, the innermost of the four.
+func appendTestTrailingByteToKeyBag(t *testing.T, safes []contentInfo) []contentInfo {
+	t.Helper()
+	mutateTestSafeBags(t, &safes[plaintextTestSafeIndex(t, safes)], func(bags []safeBag) []safeBag {
+		bag := &bags[testShroudedKeyBagIndex(t, bags)]
+		bag.Value.Bytes = append(slices.Clone(bag.Value.Bytes), 0x00)
+		bag.Value.FullBytes = nil
+		return bags
+	})
 	return safes
 }
 
@@ -871,5 +897,35 @@ func TestInspect_rejects_a_non_positive_iteration_count(t *testing.T) {
 				t.Errorf("Inspect(%s) = %v, want the refusal to name %q", tc.name, err, tc.wantErrText)
 			}
 		})
+	}
+}
+
+// TestInspect_rejects_trailing_bytes_after_the_authSafe_content pins the outermost
+// of the preflight's four trailing-byte refusals. Nothing else reaches it: every
+// own-profile bundle leaves exactly one element at this position, so the guard can
+// be deleted with the whole package still green.
+func TestInspect_rejects_trailing_bytes_after_the_authSafe_content(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+
+	var preamble pfxPreamble
+	testASN1Unmarshal(t, pfx, &preamble)
+	preamble.AuthSafe.Content.Bytes = append(slices.Clone(preamble.AuthSafe.Content.Bytes), 0x00)
+	preamble.AuthSafe.Content.FullBytes = nil
+
+	_, err = Inspect(testASN1Marshal(t, preamble))
+	if !errors.Is(err, ErrProfileUnknown) {
+		t.Fatalf("Inspect(bundle with a byte after the authSafe content) = %v, want ErrProfileUnknown", err)
+	}
+	if want := "trailing byte(s) after the authSafe content"; !strings.Contains(err.Error(), want) {
+		t.Errorf("Inspect = %v, want the refusal to name %q", err, want)
 	}
 }

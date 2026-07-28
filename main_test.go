@@ -140,9 +140,12 @@ func TestScanAndSetHealth_unreadable_pair_stays_healthy(t *testing.T) {
 
 	scanAndSetHealth(t.Context(), scanner, marker)
 
-	// CountExact, not Count: the README's unreadable-path alerting keys on this
-	// exact message, so a superstring reword must fail here rather than in an
-	// operator's Loki rule that silently stops matching.
+	// CountExact, not Count: README's Alerting section tells operators running at
+	// LOG_LEVEL=warn to alert on the prefix "some /input paths were unreadable and
+	// were skipped". Pinning the whole message byte-for-byte is the superset of
+	// that contract: any reword fails here - loudly, with the message in the
+	// failure - rather than in an operator's Loki rule that silently stops
+	// matching. Count would pass on a superstring reword.
 	const unreadableMsg = "some /input paths were unreadable and were skipped; health is unaffected"
 	if n := logs.CountLevel(slog.LevelWarn, unreadableMsg); n != 1 {
 		t.Errorf("scanAndSetHealth logged %d WARN records with the alerted message %q, want exactly 1; got logs %q",
