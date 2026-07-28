@@ -75,9 +75,11 @@ const (
 	// neither a certificate nor a private key — an OpenSSL "TRUSTED CERTIFICATE",
 	// the legacy "X509 CERTIFICATE" alias, a stray CERTIFICATE REQUEST — and were
 	// therefore not part of the bundle. Two labels are deliberately not reported: a
-	// private-key block (a combined cert+key file is a supported input) and EC
-	// PARAMETERS (an expected companion of an EC key); isExpectedCertFilePassenger
-	// owns that set.
+	// private-key block (a combined cert+key file is a supported input) and, in a
+	// file that also holds the EC private key it describes, EC PARAMETERS (the
+	// combined `openssl ecparam -genkey` bundle); isExpectedCertFilePassenger owns
+	// that set. EC PARAMETERS with no EC key beside it IS reported: nothing then
+	// establishes it as a companion, and it really was left out of the bundle.
 	ObsUnrelatedBlocksSkipped ObservationKind = "unrelated-blocks-skipped"
 	// ObsUnusableKeyBlocksSkipped reports PEM blocks in the KEY file that yielded no
 	// usable key — unparseable DER, armour encoding/pem could not decode, ciphertext,
@@ -94,6 +96,20 @@ const (
 	// both a CA and the leaf it signed, and a key file holding the leaf's key and the
 	// CA's key together.
 	ObsIssuerMatchIgnored ObservationKind = "issuer-match-ignored"
+	// ObsKeyReusedAcrossCerts reports that one private key in the key file serves
+	// several certificates in this input, at least one of which issued another
+	// certificate here: the operator has a single key acting as both a CA key and an
+	// end-entity key. Legal, and the bundle converts, but a single key compromise
+	// then affects both certificates and neither can be retired without the other,
+	// which is a fact about their PKI worth acting on.
+	//
+	// It is emitted ALONGSIDE ObsIssuerMatchIgnored and states a different fact: that
+	// one names a match this app set aside for identity selection, this one names the
+	// key reuse itself. Nothing else reports it — dropping the issuer match collapses
+	// the candidate set to one, so the ambiguity report that used to mention the
+	// second certificate is never reached. It is deliberately NOT ObsRenewedCertTie:
+	// a CA is not a renewal of the leaf it signed, and that kind's name would say so.
+	ObsKeyReusedAcrossCerts ObservationKind = "key-reused-across-certs"
 )
 
 // Noise reports whether an observation of this kind is a benign artefact of how the
@@ -1088,12 +1104,20 @@ func (g *certGraph) selectIdentity(signers []crypto.Signer, keyIssues keyDefects
 // When EVERY match is an issuer the set is returned unchanged, so the "the key
 // belongs to an issuer" diagnosis is preserved exactly for the bundle that has no
 // end-entity alternative.
+//
+// It reports TWO facts, because filtering here is what makes the second one
+// otherwise unreportable: the matches it set aside (ObsIssuerMatchIgnored), and
+// whether any of them shared a private key with a match that survived
+// (ObsKeyReusedAcrossCerts). Collapsing the candidate set to one is what keeps
+// resolveAmbiguousMatches — the only other place that says "one key matches several
+// certificates" — from ever being reached for the shared-key CA/leaf bundle, so
+// without the second observation the key reuse is reported nowhere.
 func (g *certGraph) dropIssuerMatches(matches []identityMatch) (kept []identityMatch, obs []Observation) {
 	kept = make([]identityMatch, 0, len(matches))
-	var dropped []*x509.Certificate
+	var dropped []identityMatch
 	for _, m := range matches {
 		if g.isIssuer(m.cert) {
-			dropped = append(dropped, g.certs[m.cert])
+			dropped = append(dropped, m)
 			continue
 		}
 		kept = append(kept, m)
@@ -1105,10 +1129,57 @@ func (g *certGraph) dropIssuerMatches(matches []identityMatch) (kept []identityM
 		obs = append(obs, Observation{
 			Kind: ObsIssuerMatchIgnored,
 			Detail: fmt.Sprintf("%d certificate(s) matching a supplied key issued another certificate in this bundle, so they are no end-entity identity and were passed over: %s",
-				len(dropped), subjectsForLog(dropped)),
+				len(dropped), subjectsForLog(g.certsOf(dropped))),
 		})
+		obs = append(obs, g.keyReuseObservation(kept, dropped)...)
 	}
 	return kept, obs
+}
+
+// keyReuseObservation reports the certificates dropped as issuers that share a
+// private key with one this app kept as an identity candidate, or nothing when the
+// key file simply held both keys (a leaf key beside its CA's key is two keys, not
+// one key doing two jobs).
+//
+// The count it names is of certificates the shared key(s) match, which is the fact
+// the operator has to act on: a CA key that also belongs to an end-entity
+// certificate cannot be rotated or revoked independently of it. The wording says
+// nothing about renewal — the dropped certificate is an issuer of the one that
+// survived, not an older version of it.
+func (g *certGraph) keyReuseObservation(kept, dropped []identityMatch) []Observation {
+	sharedKey := func(m identityMatch, others []identityMatch) bool {
+		return slices.ContainsFunc(others, func(o identityMatch) bool { return o.key == m.key })
+	}
+	var reusedIssuers []*x509.Certificate
+	for _, d := range dropped {
+		if sharedKey(d, kept) {
+			reusedIssuers = append(reusedIssuers, g.certs[d.cert])
+		}
+	}
+	if len(reusedIssuers) == 0 {
+		return nil
+	}
+	var alsoMatched int
+	for _, k := range kept {
+		if sharedKey(k, dropped) {
+			alsoMatched++
+		}
+	}
+	return []Observation{{
+		Kind: ObsKeyReusedAcrossCerts,
+		Detail: fmt.Sprintf("one private key is shared by %d certificate(s) in this input and %d of them issued another certificate here (%s); a key serving both a CA and an end-entity certificate means one key compromise affects both, and neither can be replaced without replacing the other",
+			alsoMatched+len(reusedIssuers), len(reusedIssuers), subjectsForLog(reusedIssuers)),
+	}}
+}
+
+// certsOf resolves the certificates a set of matches selected, for a diagnostic
+// that names them.
+func (g *certGraph) certsOf(matches []identityMatch) []*x509.Certificate {
+	certs := make([]*x509.Certificate, 0, len(matches))
+	for _, m := range matches {
+		certs = append(certs, g.certs[m.cert])
+	}
+	return certs
 }
 
 // collectMatches pairs every key with every certificate whose public half it

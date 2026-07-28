@@ -99,9 +99,18 @@ func TestScanAndSetHealth_clears_marker_when_scan_errors(t *testing.T) {
 }
 
 // TestScanAndSetHealth_unreadable_pair_stays_healthy pins the health-neutral
-// half of scanAndSetHealth: an /input path the scan could not read is WARNed
-// about but must never flip the marker unhealthy, because no restart can clear
-// a permissions/layout misconfiguration.
+// half of the unreadable-path contract end to end: an /input path the scan could
+// not read is WARNed about but must never flip the marker unhealthy, because no
+// restart can clear a permissions/layout misconfiguration.
+//
+// The WARN itself is rendered by internal/process (logInputCoverageWarnings owns
+// every default-level /input-coverage diagnostic); this test asserts it still
+// reaches an operator through the composition root, which is the only place the
+// scan, the diagnostic and the marker meet. Its remediation must name the LAYOUT
+// shapes too, not permissions alone: the count aggregates a directory occupying a
+// <name>.crt path and an escaping symlink as well, and permission-only advice
+// sent an operator with a layout mistake to re-check permissions that were
+// already correct.
 //
 // The unreadable input is an escaping symlink pair (the certbot live/ ->
 // archive/ layout with only live/ mounted), which the confined /input root
@@ -152,18 +161,26 @@ func TestScanAndSetHealth_unreadable_pair_stays_healthy(t *testing.T) {
 	// matching. Count would pass on a superstring reword.
 	const unreadableMsg = "some /input paths were unreadable and were skipped; health is unaffected"
 	if n := logs.CountLevel(slog.LevelWarn, unreadableMsg); n != 1 {
-		t.Errorf("scanAndSetHealth logged %d WARN records with the alerted message %q, want exactly 1; got logs %q",
+		t.Errorf("a scan with one unreadable pair logged %d WARN records with the alerted message %q, want exactly 1; got logs %q",
 			n, unreadableMsg, logs.Messages())
 	}
 	if n := logs.CountExact(unreadableMsg); n != 1 {
-		t.Errorf("scanAndSetHealth logged %d records exactly matching the alerted message %q, want 1; got logs %q",
+		t.Errorf("a scan with one unreadable pair logged %d records exactly matching the alerted message %q, want 1; got logs %q",
 			n, unreadableMsg, logs.Messages())
 	}
 	if !logs.HasAttr(unreadableMsg, "unreadable", "1") {
-		t.Errorf("scanAndSetHealth WARN does not report unreadable=1 for one escaping pair; got logs %q", logs.Messages())
+		t.Errorf("the unreadable aggregate does not report unreadable=1 for one escaping pair; got logs %q", logs.Messages())
 	}
-	if !logs.AttrContains(unreadableMsg, "remediation", "fix /input permissions") {
-		t.Errorf("scanAndSetHealth WARN carries no actionable remediation attr; got logs %q", logs.Messages())
+	if !logs.AttrContains(unreadableMsg, "remediation", "check /input permissions") {
+		t.Errorf("the unreadable aggregate carries no actionable remediation attr; got logs %q", logs.Messages())
+	}
+	// The layout half of the same hint. The count aggregates shapes that are not
+	// permission problems at all (a directory occupying a <name>.crt path, a symlink
+	// out of the mount), and their per-path diagnosis is Debug-only, so this attr is
+	// the only default-level place that advice exists.
+	if !logs.AttrContains(unreadableMsg, "remediation", "not a directory or a symlink out of it") {
+		t.Errorf("the unreadable aggregate's remediation covers permissions only, so an operator with a layout mistake"+
+			" re-checks permissions that are already correct; got logs %q", logs.Messages())
 	}
 	if _, err := os.Stat(markerPath); err != nil {
 		t.Fatalf("marker must stay healthy when only Unreadable>0 and no conversion failed: %v", err)
@@ -199,8 +216,10 @@ func TestScanAndSetHealth_clears_marker_after_conversion_failure(t *testing.T) {
 // section tells operators running at LOG_LEVEL=warn to alert on the line "some
 // /input paths were unreadable and were skipped" to keep the coverage the
 // healthcheck deliberately omits, so a guard that stops discriminating turns
-// every clean cycle into that alert. Widening result.Unreadable > 0 to >= 0
-// leaves the whole rest of this package green.
+// every clean cycle into that alert. The guard itself now lives in
+// internal/process (logInputCoverageWarnings); this is the composition-root
+// assertion that a clean cycle is silent all the way through, which no
+// package-level test of that function can make.
 // Serial (no t.Parallel): it swaps the process-global slog default.
 func TestScanAndSetHealth_clean_scan_emits_no_unreadable_warning(t *testing.T) {
 	marker, markerPath := newTestMarker(t)
@@ -482,9 +501,10 @@ func TestDispatchArgs_usage_error_names_the_offending_argument(t *testing.T) {
 //     alert and lets the two wordings drift apart again.
 //   - The message keeps the exact "change detection is dead" wording that alert
 //     matches, and the specific loss travels in the error attr.
-//   - The FALLBACK_SCAN_HOURS remediation still reaches the operator on the one
-//     path that carries it, and is absent on the paths that have none — a
-//     dead fsnotify fd is not something the operator misconfigured.
+//   - The FALLBACK_SCAN_HOURS remediation still reaches the operator on every
+//     loss that carries one (both disabled-fallback losses do), and is absent on
+//     the paths that have none — a dead fsnotify fd is not something the operator
+//     misconfigured.
 //   - A shutdown (nil error) says only that it is shutting down, at Info. If it
 //     announced dead change detection, every SIGTERM would fire a critical alert.
 //

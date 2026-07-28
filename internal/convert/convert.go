@@ -54,7 +54,8 @@ const maxKeyBlocks = 16
 // report that they were left out of the bundle instead of dropping them
 // silently. Two kinds of label are exempt from that second result: any private-key
 // label, including the encrypted one (a combined cert+key file is a supported input),
-// and EC PARAMETERS (what `openssl ecparam -genkey` writes beside an EC key). Both are
+// and EC PARAMETERS, but only in a file that also holds the EC private key it
+// describes (what `openssl ecparam -genkey` writes as one combined bundle). Both are
 // expected companions rather than something left out by mistake;
 // isExpectedCertFilePassenger owns that set. It returns an error if no CERTIFICATE
 // block is present, and also if any CERTIFICATE block holds DER
@@ -73,6 +74,16 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, skippedBlocks, error)
 			declaredCertBlocks, maxChainCerts)
 	}
 	var scan certScan
+	// EC PARAMETERS is an expected passenger only as the companion of the EC key
+	// `openssl ecparam -genkey` writes beside it, so whether this file carries that
+	// key is a property of the file as a whole and is settled BEFORE the blocks are
+	// classified in order (the parameters block precedes the key it describes, and
+	// the report names the FIRST unrelated label, so the answer cannot be deferred
+	// to the end of the drain). The pre-scan is gated on the label being declared at
+	// all, so an ordinary bundle pays one line scan and no second decode.
+	if countDeclaredBlocks(pemBytes, pemBeginMarker(pemTypeECParameters)) > 0 {
+		scan.ecKeyPresent = holdsECPrivateKey(pemBytes)
+	}
 
 	for {
 		var block *pem.Block
@@ -111,6 +122,11 @@ type certScan struct {
 	certs     []*x509.Certificate
 	skipped   skippedBlocks
 	unrelated skippedBlocks
+	// ecKeyPresent says whether the file also holds an EC private key, which is what
+	// makes an EC PARAMETERS block in it an expected companion rather than a stray.
+	// It is a property of the whole file, so parseCertChain settles it before the
+	// drain rather than the visit loop discovering it.
+	ecKeyPresent bool
 }
 
 // visit classifies one PEM block, applying the parser's per-block rules. The
@@ -121,7 +137,7 @@ func (s *certScan) visit(block *pem.Block) error {
 		s.skipped.add(block.Type)
 		// Only a label naming neither a certificate nor a key companion is reported;
 		// isExpectedCertFilePassenger owns that set.
-		if !isExpectedCertFilePassenger(block.Type) {
+		if !isExpectedCertFilePassenger(block.Type, s.ecKeyPresent) {
 			s.unrelated.add(block.Type)
 		}
 		return nil
@@ -137,19 +153,90 @@ func (s *certScan) visit(block *pem.Block) error {
 // isExpectedCertFilePassenger reports whether a non-certificate PEM label in the
 // CERTIFICATE file is an expected companion rather than something the operator meant
 // this app to read as a certificate. The private-key labels are the combined cert+key
-// file (a supported input), and EC PARAMETERS is what `openssl ecparam -genkey` writes
-// immediately before the EC PRIVATE KEY it describes — the mirror of
-// isExpectedKeyFilePassenger, so a combined file classifies the same whichever input
-// it is passed as. It reads the same pemType* constants keyBeginMarkers is built from,
+// file (a supported input). EC PARAMETERS is what `openssl ecparam -genkey` writes
+// immediately before the EC PRIVATE KEY it describes, so it is expected only when
+// ecKeyPresent says this same file carries that key — the mirror of
+// isExpectedKeyFilePassenger for the combined bundle, without extending the silence
+// to a certificate file whose matching key is separate or is not an EC key at all.
+// That narrowing is the difference between "these parameters belong to the key beside
+// them" and "the label alone excuses the block": in the latter case the parameters
+// really were left out of the bundle, and ObsUnrelatedBlocksSkipped is the only thing
+// that says so. It reads the same pemType* constants keyBeginMarkers is built from,
 // so the "a key in the certificate file is expected" rule cannot drift from the
 // parser's own set.
-func isExpectedCertFilePassenger(blockType string) bool {
+func isExpectedCertFilePassenger(blockType string, ecKeyPresent bool) bool {
 	switch blockType {
 	case pemTypePrivateKey, pemTypeRSAPrivateKey, pemTypeECPrivateKey,
-		pemTypeEncryptedPrivateKey, pemTypeECParameters:
+		pemTypeEncryptedPrivateKey:
 		return true
+	case pemTypeECParameters:
+		return ecKeyPresent
 	}
 	return false
+}
+
+// holdsECPrivateKey reports whether pemBytes carries an EC private key: a SEC1
+// "EC PRIVATE KEY" block, or a PKCS#8 "PRIVATE KEY" block whose
+// AlgorithmIdentifier names id-ecPublicKey. Both spellings occur in a combined
+// `openssl ecparam -genkey` bundle depending on whether the key was converted to
+// PKCS#8 afterwards, and only the second needs to look past the label.
+//
+// It reads the PKCS#8 algorithm OID rather than parsing the key, for the reason
+// oversizedRSAKeyError documents: parsing a file-supplied private key runs RSA
+// precomputation inside crypto/x509 before anything can reject it, and this
+// question is asked about a CERTIFICATE file whose key blocks are otherwise never
+// offered to a parser. Walking the DER header costs bytes, not milliseconds, and an
+// encrypted or malformed key answers "no" — unproven rather than disproven, which
+// is the safe direction here: an unproven companion is reported, not hidden.
+func holdsECPrivateKey(pemBytes []byte) bool {
+	for {
+		var block *pem.Block
+		block, pemBytes = pem.Decode(pemBytes)
+		if block == nil {
+			return false
+		}
+		switch block.Type {
+		case pemTypeECPrivateKey:
+			return true
+		case pemTypePrivateKey:
+			if pkcs8HoldsECKey(block.Bytes) {
+				return true
+			}
+		}
+	}
+}
+
+// ecPublicKeyOID is id-ecPublicKey (1.2.840.10045.2.1, RFC 5480 2.1.1), the
+// algorithm a PKCS#8 container names when it holds an EC private key.
+var ecPublicKeyOID = asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}
+
+// pkcs8HoldsECKey reports whether PKCS#8 PrivateKeyInfo DER declares an EC key,
+// reading only the AlgorithmIdentifier's OID: SEQUENCE { INTEGER version, SEQUENCE
+// { OBJECT IDENTIFIER algorithm, ... }, OCTET STRING privateKey }. It shares
+// rsaModulusBitsFromKeyDER's asn1.RawValue walk, so nothing is decoded beyond the
+// tag-length headers and the OID itself, and anything it cannot read is false.
+func pkcs8HoldsECKey(der []byte) bool {
+	outer, _, ok := asn1Element(der)
+	if !ok || !isASN1(outer, asn1.TagSequence) {
+		return false
+	}
+	version, afterVersion, ok := asn1Element(outer.Bytes)
+	if !ok || !isASN1(version, asn1.TagInteger) {
+		return false
+	}
+	algorithm, _, ok := asn1Element(afterVersion)
+	if !ok || !isASN1(algorithm, asn1.TagSequence) {
+		return false
+	}
+	oid, _, ok := asn1Element(algorithm.Bytes)
+	if !ok || !isASN1(oid, asn1.TagOID) {
+		return false
+	}
+	var parsed asn1.ObjectIdentifier
+	if rest, err := asn1.Unmarshal(oid.FullBytes, &parsed); err != nil || len(rest) != 0 {
+		return false
+	}
+	return parsed.Equal(ecPublicKeyOID)
 }
 
 // isExpectedKeyFilePassenger reports whether a non-key PEM label in the KEY file is

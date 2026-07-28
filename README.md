@@ -200,7 +200,8 @@ groups:
             and every renewal is silently missed. Ensure the deployment restarts
             it (`restart: unless-stopped`), and if the record carries a
             `remediation` field naming FALLBACK_SCAN_HOURS, unset it or set it
-            above 0 so the periodic rescan covers the missing watch. Exhausted
+            above 0 so the periodic rescan covers the missing watch or
+            re-attaches the removed one. Exhausted
             inotify instances on the host are the usual root cause and are often
             transient.
       - alert: CertConverterInputPathUnreachable

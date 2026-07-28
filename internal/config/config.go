@@ -285,16 +285,27 @@ func allowEmptyPassword(raw string) bool {
 // precedence, so this gate and convert.Encode's own guard cannot disagree.
 // This startup gate fails before scanning, while Encode's codec-level guard protects
 // callers that bypass config loading — both are wanted.
+//
+// The switch is exhaustive and fails CLOSED, mirroring convert's
+// unencodablePasswordError: PasswordEncodesFine is the explicit success arm, and any
+// shape this gate does not recognise is refused rather than accepted by fallthrough.
+// No shape escapes today (Primary returns exactly these four), so the default arm is
+// unreachable for every current input; it exists so that a future recognised shape
+// stops the container at startup instead of silently shipping bundles this gate never
+// proved openable.
 func checkPasswordEncodable(password string) error {
-	switch convert.InspectPasswordEncoding(password).Primary() {
+	switch shape := convert.InspectPasswordEncoding(password).Primary(); shape {
 	case convert.PasswordInvalidUTF8:
 		return fmt.Errorf("%w: not valid UTF-8, so every invalid byte would be encoded as U+FFFD and generated PFX files would be protected by a different, lower-entropy password than the configured secret; supply a text secret (for example base64) instead of raw binary bytes", ErrUnencodablePassword)
 	case convert.PasswordNonBMP:
 		return fmt.Errorf("%w: contains a character outside the Basic Multilingual Plane, which PKCS#12 cannot encode, so every conversion would fail; use a password made only of BMP characters (ASCII is safest)", ErrUnencodablePassword)
 	case convert.PasswordEmbeddedNUL:
 		return fmt.Errorf("%w: contains a NUL byte, and PKCS#12 passwords are NUL-terminated, so generated PFX files could not be opened with any password a consumer can supply; strip NUL bytes from the secret file (a UTF-16 or NUL-padded file is the usual cause)", ErrUnencodablePassword)
+	case convert.PasswordEncodesFine:
+		return nil
+	default:
+		return fmt.Errorf("%w: carries encoding shape %q, which this startup gate cannot prove PKCS#12 carries intact; refusing to start rather than writing bundles that may be protected by a different password than the configured secret", ErrUnencodablePassword, shape)
 	}
-	return nil
 }
 
 // parseFallbackInterval parses a FALLBACK_SCAN_HOURS value into a re-scan
@@ -457,6 +468,14 @@ func warnBlankPasswordFilePointer() {
 // passwordChannel names the environment variable an operator must edit to change the
 // configured PFX password. A startup refusal that always named PFX_PASSWORD sent an
 // operator using a mounted secret to a variable the file-wins rule ignores.
+//
+// It is also the single rendering of the "source" log attribute, so every
+// operator-facing password record — the both-channels WARN, the blank-file WARN, the
+// configured INFO, and the control-character and invisible-formatting WARNs — carries
+// ONE vocabulary in that key: the variable name. Rendering envx's internal
+// SourceEnv/SourceFile enum instead would make a Loki matcher or a saved query
+// selecting the mounted-secret channel (source="PFX_PASSWORD_FILE") silently miss the
+// records that explain an unopenable bundle.
 func passwordChannel(source envx.SecretSource) string {
 	if source == envx.SourceFile {
 		return "PFX_PASSWORD_FILE"
@@ -501,7 +520,10 @@ func warnPasswordStrength(status PasswordStatus, blankFileReported bool) {
 //
 // The source is the one envx reported rather than one re-derived here, so the log
 // cannot disagree with what was read, and an operator can confirm a mounted secret
-// was consumed instead of falling back to PFX_PASSWORD. The configured path is
+// was consumed instead of falling back to PFX_PASSWORD. It is rendered through
+// passwordChannel, not as envx's SourceEnv/SourceFile enum, so the "source" attribute
+// carries the same variable-name vocabulary on every record this package emits about
+// the password. The configured path is
 // omitted from these steady-state lines so a healthy startup does not publish the
 // secret-mount topology to every aggregator; a startup FAILURE is the deliberate
 // exception, because an unusable secret file cannot be diagnosed without it.
@@ -528,7 +550,7 @@ func logPasswordDelivery(source envx.SecretSource, password string, blankSecretF
 	// remediation that helps (set a real password) rather than this one's.
 	if !isBlank(password) && strings.ContainsFunc(password, unicode.IsControl) {
 		slog.Warn("the PFX password contains a control character (newline, carriage return, or tab), which is embedded verbatim in every PFX file and cannot be typed into most PKCS#12 consumers",
-			"source", string(source),
+			"source", passwordChannel(source),
 			"remediation", "supply the secret on a single line (openssl rand -base64 wraps at 64 columns; add -A) so whatever opens the .pfx can reproduce the password")
 	}
 	// An invisible FORMAT character survives every guard above: it is valid UTF-8,
@@ -540,7 +562,7 @@ func logPasswordDelivery(source envx.SecretSource, password string, blankSecretF
 	// green, and the .pfx cannot be opened with the secret's visible contents.
 	if !isBlank(password) && strings.ContainsFunc(password, isFormatRune) {
 		slog.Warn("the PFX password contains an invisible Unicode formatting character (byte-order mark, zero-width space, or soft hyphen), which is embedded verbatim in every PFX file and cannot be reproduced from the secret's visible contents",
-			"source", string(source),
+			"source", passwordChannel(source),
 			"remediation", "rewrite the secret without the invisible character (an editor saving the secret file as \"UTF-8 with BOM\" is the usual cause; printf %s writes the value verbatim)")
 	}
 }

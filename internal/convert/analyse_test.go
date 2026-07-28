@@ -3,6 +3,7 @@ package convert_test
 import (
 	"bytes"
 	"crypto"
+	"crypto/ecdsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -716,14 +717,7 @@ func TestAnalyse_reports_no_key_block_observation_for_an_ec_parameters_passenger
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
 
-	// The DER `openssl ecparam` writes for a named curve: the prime256v1 OID
-	// (1.2.840.10045.3.1.7). Only the label drives the rule under test.
-	ecParams := pem.EncodeToMemory(&pem.Block{
-		Type:  "EC PARAMETERS",
-		Bytes: []byte{0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07},
-	})
-
-	got, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), concatPEM(ecParams, m.LeafKeyPEM))
+	got, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), concatPEM(ecParametersPEM(), m.LeafKeyPEM))
 	if err != nil {
 		t.Fatalf("Analyse(ecparam -genkey key file) = %v, want success", err)
 	}
@@ -733,30 +727,133 @@ func TestAnalyse_reports_no_key_block_observation_for_an_ec_parameters_passenger
 	}
 }
 
+// ecParametersPEM is the block `openssl ecparam` writes for a named curve: the
+// prime256v1 OID (1.2.840.10045.3.1.7). Only the LABEL drives the certificate- and
+// key-file passenger rules, so the body is a fixed valid encoding rather than
+// anything derived from a test's key.
+func ecParametersPEM() []byte {
+	return pem.EncodeToMemory(&pem.Block{
+		Type:  "EC PARAMETERS",
+		Bytes: []byte{0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07},
+	})
+}
+
+// sec1ECKeyPEM re-encodes a PKCS#8 EC private key as the SEC1 "EC PRIVATE KEY"
+// block `openssl ecparam -genkey` actually emits, so a test can build the combined
+// bundle in the spelling the command produces as well as the PKCS#8 spelling a
+// later `openssl pkcs8 -topk8` leaves behind.
+func sec1ECKeyPEM(tb testing.TB, pkcs8KeyPEM []byte) []byte {
+	tb.Helper()
+	block, _ := pem.Decode(pkcs8KeyPEM)
+	if block == nil {
+		tb.Fatal("setup: key PEM did not decode")
+		return nil
+	}
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		tb.Fatalf("setup: ParsePKCS8PrivateKey: %v", err)
+	}
+	ecKey, ok := key.(*ecdsa.PrivateKey)
+	if !ok {
+		tb.Fatalf("setup: key is %T, want an ECDSA key", key)
+		return nil
+	}
+	der, err := x509.MarshalECPrivateKey(ecKey)
+	if err != nil {
+		tb.Fatalf("setup: MarshalECPrivateKey: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
+}
+
 // TestAnalyse_reports_no_unrelated_block_observation_for_a_combined_ec_file pins
 // the CERTIFICATE-side half of the same rule. A single `openssl ecparam -genkey`
-// bundle (CERTIFICATE + EC PARAMETERS + EC PRIVATE KEY) is a supported combined
-// input, so passing it as both files must stay silent: when only the key-side
-// predicate knew about EC PARAMETERS, the certificate parser filed it as unrelated
-// and WARNed about a healthy file on every scan.
+// bundle (CERTIFICATE + EC PARAMETERS + the EC key) is a supported combined input,
+// so passing it as both files must stay silent: when only the key-side predicate
+// knew about EC PARAMETERS, the certificate parser filed it as unrelated and WARNed
+// about a healthy file on every scan.
+//
+// The silence is now conditional on the file carrying the EC key those parameters
+// describe (see the reported-passenger test below), so both spellings of that key
+// are covered here: the PKCS#8 "PRIVATE KEY" block a `openssl pkcs8 -topk8` pass
+// leaves behind, whose EC-ness is only readable from the PKCS#8 algorithm OID, and
+// the SEC1 "EC PRIVATE KEY" block the keygen command itself emits.
 func TestAnalyse_reports_no_unrelated_block_observation_for_a_combined_ec_file(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
 
-	// Same named-curve DER as the key-side test above; only the label drives the rule.
-	ecParams := pem.EncodeToMemory(&pem.Block{
-		Type:  "EC PARAMETERS",
-		Bytes: []byte{0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07},
-	})
-	combined := concatPEM(m.LeafPEM, ecParams, m.LeafKeyPEM)
+	for name, keyPEM := range map[string][]byte{
+		"pkcs8 EC key": m.LeafKeyPEM,
+		"sec1 EC key":  sec1ECKeyPEM(t, m.LeafKeyPEM),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			combined := concatPEM(m.LeafPEM, ecParametersPEM(), keyPEM)
 
-	got, err := convert.Analyse(combined, combined)
-	if err != nil {
-		t.Fatalf("Analyse(combined ecparam -genkey file) = %v, want success", err)
+			got, err := convert.Analyse(combined, combined)
+			if err != nil {
+				t.Fatalf("Analyse(combined ecparam -genkey file) = %v, want success", err)
+			}
+			if hasObservation(got.Observations(), convert.ObsUnrelatedBlocksSkipped) {
+				t.Errorf("observations = %v, want no %q for the EC PARAMETERS block riding in the certificate file",
+					got.Observations(), convert.ObsUnrelatedBlocksSkipped)
+			}
+		})
 	}
-	if hasObservation(got.Observations(), convert.ObsUnrelatedBlocksSkipped) {
-		t.Errorf("observations = %v, want no %q for the EC PARAMETERS block riding in the certificate file",
-			got.Observations(), convert.ObsUnrelatedBlocksSkipped)
+}
+
+// TestAnalyse_reports_ec_parameters_the_certificate_file_cannot_account_for is the
+// boundary of that exemption. EC PARAMETERS is silent because it is the companion
+// of the EC key written beside it; a certificate file holding the parameters with no
+// such key beside them has a block that really was left out of the bundle, and
+// ObsUnrelatedBlocksSkipped is the only thing that says so.
+//
+// Exempting the label alone (which is what the exemption first did) suppressed this
+// pre-existing warning for every input below, widening the silence well past the
+// combined bundle it was added for. Both shapes convert either way, so the
+// observation is the entire operator-visible difference.
+func TestAnalyse_reports_ec_parameters_the_certificate_file_cannot_account_for(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	rsaCertPEM, rsaKeyPEM := testcerts.GenerateSelfSignedCert(t, "rsa-leaf.example.com", "rsa")
+
+	for name, tc := range map[string]struct {
+		certFile []byte
+		keyFile  []byte
+	}{
+		// Stray parameters in the chain file while the key is mounted separately: the
+		// motivating combined-file case does not cover it, and nothing in the
+		// certificate file establishes the parameters as a companion of anything.
+		"the matching key is in a separate file": {
+			certFile: concatPEM(m.LeafPEM, ecParametersPEM(), m.CAPEM),
+			keyFile:  m.LeafKeyPEM,
+		},
+		// A combined file whose key is RSA: EC parameters cannot describe it, so they
+		// are a leftover from an earlier key, not a passenger of this one.
+		"the combined file's key is not an EC key": {
+			certFile: concatPEM(rsaCertPEM, ecParametersPEM(), rsaKeyPEM),
+			keyFile:  rsaKeyPEM,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got, err := convert.Analyse(tc.certFile, tc.keyFile)
+			if err != nil {
+				t.Fatalf("Analyse(certificate file with stray EC parameters) = %v, want success", err)
+			}
+			var detail string
+			for _, o := range got.Observations() {
+				if o.Kind == convert.ObsUnrelatedBlocksSkipped {
+					detail = o.Detail
+				}
+			}
+			if detail == "" {
+				t.Fatalf("observations = %v, want one of kind %q naming the EC PARAMETERS block",
+					got.Observations(), convert.ObsUnrelatedBlocksSkipped)
+			}
+			if !strings.Contains(detail, "EC PARAMETERS") {
+				t.Errorf("observation detail = %q, want the skipped block's label named", detail)
+			}
+		})
 	}
 }
 

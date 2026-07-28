@@ -105,6 +105,12 @@ func TestFailEntry_levels(t *testing.T) {
 // the all-orphan diagnostic, and Warn is what makes the broken layout diagnosable
 // instead of hidden behind LOG_LEVEL=debug. Runs serially: it
 // swaps slog.Default().
+//
+// The observation log is EMPTY here, which is the condition that makes the orphan arm
+// the right reading: nothing in this process has ever read either pair whole, so there
+// is no evidence any of these keys was ever there, and noteMissingKey's transient arm
+// must not be reached. TestReadPair_separates_a_key_that_vanished_from_a_key_that_was_never_there
+// pins the other side of that split.
 func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing.T) {
 	base := t.TempDir()
 	input := filepath.Join(base, "input")
@@ -132,7 +138,7 @@ func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = inHandle.Close() })
-	sw := &scanWalk{src: &source{root: inHandle}}
+	sw := &scanWalk{src: &source{root: inHandle}, observations: newObservationLog()}
 
 	for _, tt := range []struct {
 		certRel, keyRel, wantMsg string

@@ -1404,7 +1404,14 @@ func TestLoad_wires_output_lifecycle(t *testing.T) {
 // miss: envx trims only surrounding whitespace and PKCS#12 encodes a newline or
 // tab verbatim, so the bundle is written, health stays green, and the password
 // cannot be typed into the consumers that need it. The clean case is what keeps
-// the WARN from firing on every healthy startup. Serial: it swaps slog.Default().
+// the WARN from firing on every healthy startup.
+//
+// The "source" attribute is pinned to the exact env-var NAME, not envx's internal
+// SourceEnv/SourceFile enum: every other password record in this package renders the
+// variable name, so an operator or Loki matcher selecting a delivery channel by
+// source= must see this record too. Equality, not substring, because "PFX_PASSWORD"
+// is a prefix of "PFX_PASSWORD_FILE" and a substring assertion would pass for either
+// channel. Serial: it swaps slog.Default().
 func TestLoad_warns_when_the_password_contains_a_control_character(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -1430,8 +1437,8 @@ func TestLoad_warns_when_the_password_contains_a_control_character(t *testing.T)
 			if warned != tc.wantWarn {
 				t.Errorf("Load(%s) control-character WARN = %v, want %v (logs %v)", tc.name, warned, tc.wantWarn, logs.Messages())
 			}
-			if tc.wantWarn && !logs.AttrContains(msg, "source", "env") {
-				t.Errorf("control-character WARN does not name the delivery channel (logs %v)", logs.Messages())
+			if tc.wantWarn && !logs.HasAttr(msg, "source", "PFX_PASSWORD") {
+				t.Errorf("control-character WARN does not name the delivery channel as the env-var name an operator filters on (logs %v)", logs.Messages())
 			}
 		})
 	}
@@ -1444,7 +1451,12 @@ func TestLoad_warns_when_the_password_contains_a_control_character(t *testing.T)
 // interior newline, PKCS#12 embeds it verbatim, and no consumer can type the
 // password back. The guard is channel-agnostic today while its sibling padding WARN
 // is env-only, so folding the two together would silence the file channel with
-// every other test still green. Serial: it swaps slog.Default().
+// every other test still green.
+//
+// It also pins the record's "source" attribute to PFX_PASSWORD_FILE: this is the
+// mounted-secret channel an operator filters on, and rendering envx's "file" enum
+// here instead would drop this WARN out of exactly that filter. Serial: it swaps
+// slog.Default().
 func TestLoad_warns_when_a_mounted_secret_contains_a_control_character(t *testing.T) {
 	const secret = "line1\nline2"
 	path := filepath.Join(t.TempDir(), "pfx-password")
@@ -1468,6 +1480,9 @@ func TestLoad_warns_when_a_mounted_secret_contains_a_control_character(t *testin
 	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
 		t.Errorf("Load() with a wrapped mounted secret logged %d WARN records matching %q, want exactly 1 (logs %v)",
 			n, msg, logs.Messages())
+	}
+	if !logs.HasAttr(msg, "source", "PFX_PASSWORD_FILE") {
+		t.Errorf("control-character WARN does not name the mounted-secret channel an operator filters on (logs %v)", logs.Messages())
 	}
 	for _, r := range logs.Records() {
 		if strings.Contains(r.Message, secret) || strings.Contains(r.Message, path) {
@@ -1552,7 +1567,10 @@ func TestFallbackInterval_agrees_with_the_interval_Load_reports(t *testing.T) {
 // operator's only signal that the bundle's password is not the secret's visible
 // contents. The clean case keeps it from firing on every healthy startup, and the
 // control-character-only case pins the Cc/Cf disjointness that keeps one rune from
-// producing two records. Serial: it swaps slog.Default().
+// producing two records. The "source" attribute is pinned to the env-var NAME by
+// equality for the same reason its control-character sibling is: one vocabulary per
+// attribute key, and "PFX_PASSWORD" is a prefix of "PFX_PASSWORD_FILE". Serial: it
+// swaps slog.Default().
 func TestLoad_warns_when_the_password_contains_an_invisible_formatting_character(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -1580,8 +1598,8 @@ func TestLoad_warns_when_the_password_contains_an_invisible_formatting_character
 			if warned != tc.wantWarn {
 				t.Errorf("Load(%s) invisible-formatting WARN = %v, want %v (logs %v)", tc.name, warned, tc.wantWarn, logs.Messages())
 			}
-			if tc.wantWarn && !logs.AttrContains(msg, "source", "env") {
-				t.Errorf("invisible-formatting WARN does not name the delivery channel (logs %v)", logs.Messages())
+			if tc.wantWarn && !logs.HasAttr(msg, "source", "PFX_PASSWORD") {
+				t.Errorf("invisible-formatting WARN does not name the delivery channel as the env-var name an operator filters on (logs %v)", logs.Messages())
 			}
 		})
 	}
@@ -1592,7 +1610,9 @@ func TestLoad_warns_when_the_password_contains_an_invisible_formatting_character
 // the mounted file is where the failure mode actually originates (an editor saving
 // the secret as "UTF-8 with BOM"). Without this, folding the guard into the env-only
 // shape of its sibling padding WARN would silence the file channel with every other
-// test still green. Serial: it swaps slog.Default().
+// test still green. It pins "source" to PFX_PASSWORD_FILE by equality, the channel
+// name an operator's saved query and Loki matcher select on. Serial: it swaps
+// slog.Default().
 func TestLoad_warns_when_a_mounted_secret_contains_a_format_character(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -1630,8 +1650,8 @@ func TestLoad_warns_when_a_mounted_secret_contains_a_format_character(t *testing
 			if got := logs.CountLevel(slog.LevelWarn, msg); got != wantCount {
 				t.Errorf("Load(%s) logged %d invisible-formatting WARNs, want %d (logs %v)", tc.name, got, wantCount, logs.Messages())
 			}
-			if tc.wantWarn && !logs.AttrContains(msg, "source", "file") {
-				t.Errorf("invisible-formatting WARN does not name the file delivery channel (logs %v)", logs.Messages())
+			if tc.wantWarn && !logs.HasAttr(msg, "source", "PFX_PASSWORD_FILE") {
+				t.Errorf("invisible-formatting WARN does not name the mounted-secret channel an operator filters on (logs %v)", logs.Messages())
 			}
 		})
 	}

@@ -266,11 +266,18 @@ func TestLostOrShutdown_gives_cancellation_precedence(t *testing.T) {
 }
 
 // TestLostError_carries_the_remediation_only_where_one_exists pins the split
-// that lets main say the right thing per loss: the disabled-fallback case is the
-// only operator-fixable one, so it is the only one that names
-// FALLBACK_SCAN_HOURS. Dropping that field would silently strip the one
-// actionable hint this package has ever given, and adding one to a dead
-// fsnotify fd would tell an operator to fix something they did not cause.
+// that lets main say the right thing per loss: the two disabled-fallback cases
+// are the operator-fixable ones, so they are the two that name
+// FALLBACK_SCAN_HOURS. Both are reached ONLY because the periodic rescan was
+// switched off — with it enabled, a removed root watch is re-attached in place
+// by resyncWatchSet and no watch-set failure ends the loop.
+//
+// The field is load-bearing, not decoration: main.reportWatchExit attaches the
+// remediation attr only where Remediation is non-empty, and the
+// CertConverterChangeDetectionDead runbook tells the operator to act on that
+// attr, so a loss that leaves it empty ships its actionable half only inside the
+// error text. Dropping either field strips that; adding one to a dead fsnotify
+// fd would tell an operator to fix something they did not cause.
 func TestLostError_carries_the_remediation_only_where_one_exists(t *testing.T) {
 	t.Parallel()
 
@@ -278,7 +285,7 @@ func TestLostError_carries_the_remediation_only_where_one_exists(t *testing.T) {
 		lost            *LostError
 		wantRemediation bool
 	}{
-		{errRootWatchRemoved, false},
+		{errRootWatchRemoved, true},
 		{errEventsChannelClosed, false},
 		{errErrorsChannelClosed, false},
 		{errNoWatchNoFallback, true},

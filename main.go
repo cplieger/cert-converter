@@ -33,9 +33,11 @@ const watchDebounce = 2 * time.Second
 // restart this container?" — so it is driven solely by conversion failures,
 // the only outcome a restart could plausibly clear (a transient mount glitch,
 // a half-written renewal). Unreadable /input sub-paths are deliberately NOT a
-// health input: they are a steady-state permissions/UID misconfiguration that
-// a restart cannot fix, so they are surfaced as a WARN in scanAndSetHealth
-// rather than flapping the container unhealthy in a restart loop. The same
+// health input: they are a steady-state permissions/UID misconfiguration or a
+// layout mistake that a restart cannot fix, so internal/process surfaces them
+// as a once-per-scan WARN (logInputCoverageWarnings, which owns every
+// default-level /input-coverage diagnostic) rather than flapping the container
+// unhealthy in a restart loop. The same
 // reasoning covers ScanResult.Unwritable, the /output-side member of that
 // family: a prior bundle whose mode repair AND whose repairing rewrite were
 // both refused for a permission reason already holds the right bytes, and no
@@ -52,8 +54,10 @@ func healthyAfterScan(r *process.ScanResult) bool {
 // scanAndSetHealth runs one scan with the scanner's configured input and output
 // roots and flips the health marker via healthyAfterScan (zero conversion
 // failures). A shutdown cancellation leaves the marker untouched; any other
-// scan error clears it. Unreadable input sub-paths are logged as a WARN but
-// never affect health — see healthyAfterScan.
+// scan error clears it. It renders no diagnostic of its own: internal/process
+// owns the whole /input-coverage taxonomy and every default-level warning
+// derived from it (including the unreadable-paths aggregate), so this function
+// is only the health boundary — see healthyAfterScan.
 func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *health.Marker) {
 	result, err := scanner.Run(ctx)
 	if err != nil {
@@ -64,11 +68,6 @@ func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *hea
 		slog.Error("processing failed", "error", err)
 		marker.Set(false)
 		return
-	}
-	if result.Unreadable > 0 {
-		slog.Warn("some /input paths were unreadable and were skipped; health is unaffected",
-			"unreadable", result.Unreadable,
-			"remediation", "fix /input permissions or run as a UID that can read it")
 	}
 	marker.Set(healthyAfterScan(&result))
 }

@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -357,6 +358,11 @@ func TestAnalyse_reports_a_key_that_belongs_to_an_issuer(t *testing.T) {
 // NotBefore, so a CA minted after the leaf it signed won the selection and the
 // end-entity role check then rejected the bundle. The pair carries exactly one
 // usable identity, so it must convert.
+//
+// Both records it emits are asserted: the issuer match that was set aside, and the
+// key reuse that filtering the match out would otherwise leave unreported. The
+// whole-set version of this bundle, in the ordinary cadence where the CA is the
+// OLDER certificate, is pinned below.
 func TestAnalyse_converts_a_key_shared_by_a_ca_and_its_leaf(t *testing.T) {
 	t.Parallel()
 	sharedKey := newKey(t)
@@ -394,6 +400,180 @@ func TestAnalyse_converts_a_key_shared_by_a_ca_and_its_leaf(t *testing.T) {
 	}
 	if !hasObservation(got.Observations(), convert.ObsIssuerMatchIgnored) {
 		t.Errorf("observations = %v, want the passed-over issuer match reported", got.Observations())
+	}
+	if !hasObservation(got.Observations(), convert.ObsKeyReusedAcrossCerts) {
+		t.Errorf("observations = %v, want the shared key reported as reuse", got.Observations())
+	}
+}
+
+// observationKinds lists the kinds an analysis reported, in the order it reported
+// them, so a test can pin the whole SET rather than the presence of one member. A
+// membership assertion cannot see an observation that STOPPED being emitted, which
+// is exactly how a filtering change silently swapped one WARN for another.
+func observationKinds(obs []convert.Observation) []convert.ObservationKind {
+	kinds := make([]convert.ObservationKind, 0, len(obs))
+	for _, o := range obs {
+		kinds = append(kinds, o.Kind)
+	}
+	return kinds
+}
+
+// TestAnalyse_reports_the_shared_key_as_reuse_when_the_issuer_match_is_dropped pins
+// the whole observation set for the bundle an internal PKI mints from one key, in
+// the ordinary cadence where the CA is minted BEFORE the leaf it signs.
+//
+// Dropping the issuer match collapses the candidate set to one, so
+// resolveAmbiguousMatches — the only other place that says "one private key matches
+// several certificates" — is never reached, and the fact that the operator's CA key
+// is also an end-entity key went unreported anywhere. Two records are emitted
+// because they are two different facts: a match was set aside for identity
+// selection, AND one key serves two certificates. Neither calls the CA a renewal of
+// the leaf, which is what reporting this through ObsRenewedCertTie claimed.
+func TestAnalyse_reports_the_shared_key_as_reuse_when_the_issuer_match_is_dropped(t *testing.T) {
+	t.Parallel()
+	sharedKey := newKey(t)
+	caNotBefore := time.Now().Add(-3 * time.Hour).Truncate(time.Second)
+	leafNotBefore := caNotBefore.Add(time.Hour)
+	caPEM, caCert := mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(9000),
+		Subject:               pkix.Name{CommonName: "Reused Key CA"},
+		NotBefore:             caNotBefore,
+		NotAfter:              caNotBefore.Add(72 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &sharedKey.PublicKey, nil, sharedKey)
+
+	leafPEM, leafCert := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(9001),
+		Subject:      pkix.Name{CommonName: "reused-key-leaf.example.com"},
+		NotBefore:    leafNotBefore,
+		NotAfter:     leafNotBefore.Add(24 * time.Hour),
+	}, &sharedKey.PublicKey, caCert, sharedKey)
+	if err := leafCert.CheckSignatureFrom(caCert); err != nil {
+		t.Fatalf("setup: CA did not actually sign the leaf: %v", err)
+	}
+
+	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), keyPEMOf(t, sharedKey))
+	if err != nil {
+		t.Fatalf("Analyse(one key for a CA and the leaf it signed) = %v, want the leaf selected", err)
+	}
+	if got.Leaf().SerialNumber.Cmp(big.NewInt(9001)) != 0 {
+		t.Errorf("selected identity serial = %s, want 9001 (the end-entity certificate)", got.Leaf().SerialNumber)
+	}
+	if len(got.Chain()) != 1 || got.Chain()[0].SerialNumber.Cmp(big.NewInt(9000)) != 0 {
+		t.Errorf("chain serials = %v, want [9000]", chainSerials(got.Chain()))
+	}
+	want := []convert.ObservationKind{convert.ObsIssuerMatchIgnored, convert.ObsKeyReusedAcrossCerts}
+	if kinds := observationKinds(got.Observations()); !slices.Equal(kinds, want) {
+		t.Errorf("observation kinds = %v, want exactly %v", kinds, want)
+	}
+	var reuse string
+	for _, o := range got.Observations() {
+		if o.Kind == convert.ObsKeyReusedAcrossCerts {
+			reuse = o.Detail
+		}
+	}
+	if !strings.Contains(reuse, "Reused Key CA") {
+		t.Errorf("key-reuse detail = %q, want the CA that shares the key named", reuse)
+	}
+	// The miswording that made this a deferred decision rather than a fix: the CA is
+	// an issuer of the identity, not an older version of it.
+	if strings.Contains(strings.ToLower(reuse), "renew") {
+		t.Errorf("key-reuse detail = %q, want no renewal wording for an issuer", reuse)
+	}
+}
+
+// TestAnalyse_reports_both_a_renewal_tie_and_key_reuse pins the shape that keeps
+// the genuine renewal tie honest: two end-entity certificates sharing one key (a
+// renewal) plus the CA that signed them, minted from the SAME key. The issuer match
+// is dropped, two end-entity matches survive, so the renewal tie is still reported
+// — and the key reuse across the CA is reported beside it. A change that restored
+// the tie by keeping the issuer match, or that reported reuse INSTEAD of the tie,
+// would lose one of the two facts here.
+func TestAnalyse_reports_both_a_renewal_tie_and_key_reuse(t *testing.T) {
+	t.Parallel()
+	sharedKey := newKey(t)
+	caNotBefore := time.Now().Add(-4 * time.Hour).Truncate(time.Second)
+	caPEM, caCert := mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(9100),
+		Subject:               pkix.Name{CommonName: "Renewal Tie CA"},
+		NotBefore:             caNotBefore,
+		NotAfter:              caNotBefore.Add(96 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &sharedKey.PublicKey, nil, sharedKey)
+
+	oldLeafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(9101),
+		Subject:      pkix.Name{CommonName: "tie-leaf.example.com"},
+		NotBefore:    caNotBefore.Add(time.Hour),
+		NotAfter:     caNotBefore.Add(48 * time.Hour),
+	}, &sharedKey.PublicKey, caCert, sharedKey)
+	newLeafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(9102),
+		Subject:      pkix.Name{CommonName: "tie-leaf.example.com"},
+		NotBefore:    caNotBefore.Add(2 * time.Hour),
+		NotAfter:     caNotBefore.Add(72 * time.Hour),
+	}, &sharedKey.PublicKey, caCert, sharedKey)
+
+	got, err := convert.Analyse(concatPEM(oldLeafPEM, newLeafPEM, caPEM), keyPEMOf(t, sharedKey))
+	if err != nil {
+		t.Fatalf("Analyse(renewed leaf pair plus their shared-key CA) = %v, want the newest leaf selected", err)
+	}
+	if got.Leaf().SerialNumber.Cmp(big.NewInt(9102)) != 0 {
+		t.Errorf("selected identity serial = %s, want 9102 (the newer renewal)", got.Leaf().SerialNumber)
+	}
+	for _, want := range []convert.ObservationKind{
+		convert.ObsIssuerMatchIgnored,
+		convert.ObsKeyReusedAcrossCerts,
+		convert.ObsRenewedCertTie,
+	} {
+		if !hasObservation(got.Observations(), want) {
+			t.Errorf("observations = %v, want %q reported", got.Observations(), want)
+		}
+	}
+}
+
+// TestAnalyse_reports_no_key_reuse_when_the_key_file_holds_two_keys guards the other
+// direction of the same rule: a key file carrying the leaf's key AND the CA's key is
+// two keys doing one job each, so the issuer match is still set aside but there is no
+// key-reuse fact to report. Emitting one here would WARN about correct PKI hygiene on
+// every scan.
+func TestAnalyse_reports_no_key_reuse_when_the_key_file_holds_two_keys(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	caKey := newKey(t)
+	caPEM, caCert := mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(9200),
+		Subject:               pkix.Name{CommonName: "Two Key CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(48 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &caKey.PublicKey, nil, caKey)
+
+	leafKey := newKey(t)
+	leafPEM, _ := mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(9201),
+		Subject:      pkix.Name{CommonName: "two-key-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, caCert, caKey)
+
+	got, err := convert.Analyse(
+		concatPEM(leafPEM, caPEM),
+		concatPEM(keyPEMOf(t, leafKey), keyPEMOf(t, caKey)),
+	)
+	if err != nil {
+		t.Fatalf("Analyse(leaf and issuer certificates with both private keys) = %v, want the leaf selected", err)
+	}
+	want := []convert.ObservationKind{convert.ObsMultipleKeys, convert.ObsIssuerMatchIgnored}
+	if kinds := observationKinds(got.Observations()); !slices.Equal(kinds, want) {
+		t.Errorf("observation kinds = %v, want exactly %v: two distinct keys are not key reuse", kinds, want)
 	}
 }
 

@@ -26,9 +26,11 @@ type conversionStatus int
 // "a certificate with no key" — reporting it as an orphan would misdescribe the
 // condition in the scan summary and in the all-orphan diagnostic.
 //
-// statusVanished is the TRANSIENT sibling of statusUnreadable: the entry existed at
-// readdir and was gone by the bounded read, which is what an ordinary renewal
-// replacing a cert looks like from inside the scan. It is health-neutral and it
+// statusVanished is the TRANSIENT sibling of statusUnreadable: the entry was there a
+// moment ago and is gone now — it existed at readdir and was gone by the bounded read,
+// or its sibling key was read whole by an earlier scan of this process and is gone by
+// this scan's stat — which is what an ordinary renewal replacing a cert or a key looks
+// like from inside the scan. It is health-neutral and it
 // still blocks orphan reaping (an input tree the scan could not fully read cannot
 // prove an output orphaned), but it is deliberately NOT folded into
 // ScanResult.Unreadable: that count drives the documented `unreadable=` Loki alert

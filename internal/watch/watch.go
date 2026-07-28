@@ -61,12 +61,25 @@ func (e *LostError) Error() string { return ErrWatchLost.Error() + ": " + e.Caus
 func (e *LostError) Unwrap() error { return ErrWatchLost }
 
 // The lost-change-detection conditions this package can reach. Each is returned
-// as-is (they are immutable), and the caller distinguishes them by Cause; only
-// the disabled-fallback one is operator-fixable, so only it carries a
-// remediation.
+// as-is (they are immutable), and the caller distinguishes them by Cause. The two
+// disabled-fallback losses are the operator-fixable ones, so they are the two that
+// carry a remediation: both are reached ONLY because FALLBACK_SCAN_HOURS was set to
+// 0/false, and with the periodic rescan enabled neither ends the watch (a removed
+// root watch is re-attached in place by resyncWatchSet). A dead fsnotify channel is
+// not a misconfiguration, so it has none to give.
 var (
 	errRootWatchRemoved = &LostError{
 		Cause: "the fsnotify root watch was removed while the periodic rescan is disabled",
+		// The Cause still has to name the root Remove/Rename: enabling the rescan
+		// restores a recovery mechanism, but it does not restore a root that is
+		// genuinely gone, so the operator needs both facts to tell mount repair from
+		// fallback hardening. main's reportWatchExit only attaches the remediation attr
+		// when this field is non-empty, and the README's
+		// CertConverterChangeDetectionDead runbook tells the operator to act on that
+		// field — with it empty, this loss was the one cause on that alert whose
+		// actionable half reached them only inside the error text.
+		Remediation: "unset FALLBACK_SCAN_HOURS (or set it above 0) so the periodic rescan re-attaches the root " +
+			"watch after it is removed; if /input itself is gone, restore the mount",
 	}
 	errEventsChannelClosed = &LostError{
 		Cause: "the fsnotify events channel closed",

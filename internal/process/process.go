@@ -33,8 +33,11 @@ type ScanResult struct {
 	// conflating the two would change that operator-visible signal. Kept on
 	// ScanResult so both coverage dimensions have one accumulator.
 	Unresolved int
-	// Vanished counts /input files that existed at readdir and were gone by the
-	// bounded read — the ordinary renewal race. Deliberately a SEPARATE field, never
+	// Vanished counts /input files this scan saw evidence of and then could not find:
+	// a cert or key that existed at readdir and was gone by the bounded read, and a
+	// sibling .key that a previous scan of this process read whole and that is gone by
+	// this scan's stat (noteMissingKey). Both are the ordinary renewal race, one
+	// observed a moment later than the other. Deliberately a SEPARATE field, never
 	// folded into Unreadable, for the same reason as Unresolved: the README's Loki
 	// rules match on the `unreadable=` attribute and carry a permissions
 	// remediation, which is the wrong diagnosis for a transient replacement that the
@@ -412,20 +415,51 @@ func logScanOutcome(ctx context.Context, result *ScanResult, walkErr error) {
 
 // logInputCoverageWarnings names the health-neutral outcomes that produce no PFX --
 // for the whole input tree, or for one certificate in it -- and that the summary
-// counts alone cannot distinguish from a healthy steady state: an input tree holding
-// no certificate pair at all, one whose every certificate lacks its sibling .key, and
-// one where only some of them do.
+// counts alone cannot distinguish from a healthy steady state: an input tree the scan
+// could not fully read, one holding no certificate pair at all, one whose every
+// certificate lacks its sibling .key, and one where only some of them do.
 //
-// All require a completed walk with no unreadable sub-path, no unresolved
-// symlink and nothing that vanished mid-scan. Unreadable == 0 is what makes "every
-// certificate" provable, because Run deliberately continues past an unreadable
-// sub-path, so a partial enumeration cannot know what lies beneath it, and the
-// unreadable-path WARN already carries the actionable diagnosis for that shape.
-// Vanished == 0 is the same argument for the transient case: a cert replaced during
-// the walk was not observed, so "every certificate lacks its key" is not a claim
-// this scan can make, and the next one can.
+// This is the single home for EVERY default-level /input-coverage diagnostic. The
+// unreadable aggregate used to be rendered by the composition root instead, from the
+// exported count, which split one taxonomy across two packages: a change to the
+// classification here silently changed what that WARN covered, with no compile-time
+// or structural signal. main keeps only healthyAfterScan, the health boundary.
+//
+// The unreadable arm fires ahead of the full-enumeration gate below because it IS the
+// diagnosis for an incomplete enumeration; it needs only a completed walk (walkErr ==
+// nil), the same condition the composition root applied by returning early on a scan
+// error. The three arms after the gate require a completed walk with no unreadable
+// sub-path, no unresolved symlink and nothing that vanished mid-scan. Unreadable == 0
+// is what makes "every certificate" provable, because Run deliberately continues past
+// an unreadable sub-path, so a partial enumeration cannot know what lies beneath it,
+// and the unreadable arm already carries the actionable diagnosis for that shape.
+// Vanished == 0 is the same argument for the transient case: a cert, or the key that
+// pairs with one, replaced during the walk was not observed whole, so "every
+// certificate lacks its key" is not a claim this scan can make, and the next one can.
 func logInputCoverageWarnings(result *ScanResult, walkErr error) {
-	if walkErr != nil || !result.inputFullyEnumerated() {
+	if walkErr != nil {
+		return
+	}
+	if result.Unreadable > 0 {
+		// Message byte-identical to the one the composition root emitted: README's
+		// Alerting section tells an operator at LOG_LEVEL=warn to alert on this exact
+		// line, so its wording is a contract regardless of which package renders it.
+		// Health is deliberately unaffected (see main.healthyAfterScan): nothing the
+		// scan merely could not READ is clearable by a restart.
+		slog.Warn("some /input paths were unreadable and were skipped; health is unaffected",
+			"unreadable", result.Unreadable,
+			// inputPermRemediation, not a permission-only hint of its own: the count
+			// aggregates every unreadable shape this package classifies, and only some
+			// of them are permission problems. A directory occupying a <name>.crt path
+			// is a LAYOUT mistake whose per-path Debug line names the right action, so
+			// an aggregate that said only "fix /input permissions or run as a UID that
+			// can read it" sent the operator to re-check permissions that were already
+			// correct. Sharing the package's one /input-side hint keeps the aggregate
+			// and the per-path lines from prescribing two different actions for one
+			// condition.
+			"remediation", inputPermRemediation)
+	}
+	if !result.inputFullyEnumerated() {
 		return
 	}
 	switch {
@@ -525,6 +559,12 @@ func pairFingerprint(certPEM, keyPEM []byte) [sha256.Size]byte {
 // re-reports each pair exactly once.
 //
 // The map is plain, so it inherits Scanner's single-goroutine Run contract.
+//
+// Its map carries a SECOND, structural fact that readPair's missing-key classifier
+// depends on: an entry exists for a path only if this process read that pair WHOLE —
+// cert and sibling key both — because note and record are reached only past readPair's
+// success. That PRESENCE is the one piece of in-process evidence that a key which is
+// missing now was there before (completedPair).
 type observationLog struct {
 	seen map[string][sha256.Size]byte
 }
@@ -574,6 +614,28 @@ func (o *observationLog) record(rel string, fp [sha256.Size]byte, obs []convert.
 	o.seen[rel] = observationSignature(fp, obs)
 }
 
+// completedPair reports whether this process has already read rel's pair whole, which
+// is what noteMissingKey reads as "this certificate HAD its sibling key".
+//
+// A false answer is the safe direction, and it is deliberately the answer for every
+// pair this process never got through: a first scan after a restart, a cert whose PEM
+// does not parse, a key that was already missing when the daemon started. All of them
+// keep the default-level missing-key diagnostic they have today, because no memory
+// exists to suppress it.
+func (o *observationLog) completedPair(rel string) bool {
+	_, remembered := o.seen[rel]
+	return remembered
+}
+
+// forgetPair drops one pair's memory, spending the single scan of grace completedPair
+// grants: the scan that reports a vanished key forgets the pair, so a key that is STILL
+// missing on the next scan — one fsnotify event or one fallback tick later — has no
+// memory behind it and is reported as the genuine orphan it is. It is the per-path
+// sibling of forget, which prunes every path a COMPLETE walk did not see.
+func (o *observationLog) forgetPair(rel string) {
+	delete(o.seen, rel)
+}
+
 // forget drops entries for paths a COMPLETE walk did not see, so a pair that
 // comes back is reported once again. Callers must gate this on a complete
 // enumeration: with a partial one, a pair hidden behind an unreadable sub-path
@@ -588,17 +650,26 @@ func (o *observationLog) forget(seen map[string]struct{}) {
 }
 
 // inputPermRemediation is the one remediation hint every /input-side WARN in this
-// package carries, the mirror of store.go's outputPermRemediation: both WARNs name
-// the SAME operator action for the same root cause, so an operator who sees the
-// cert-side and the key-side line in one scan must not read two variants of it.
-const inputPermRemediation = "check /input permissions and that the path is a regular file inside the mount, not a symlink out of it"
+// package carries -- the per-path cert and key lines AND the once-per-scan unreadable
+// aggregate -- and the mirror of store.go's outputPermRemediation: they all name the
+// SAME operator action for the same root cause, so an operator who sees the cert-side
+// line, the key-side line and the aggregate in one scan must not read three variants
+// of it.
+//
+// It names all three shapes the unreadable count aggregates, not permissions alone: a
+// permission or UID problem, a path that is not a regular file (a directory occupying
+// a <name>.crt path, a FIFO), and a symlink whose target escapes the mount. The
+// aggregate previously offered permission/UID advice only, which sent an operator with
+// a layout mistake to re-check permissions that were already correct.
+const inputPermRemediation = "check /input permissions and that the container runs as a UID that can read it, and that each certificate path is a regular file inside the mount, not a directory or a symlink out of it"
 
 // readPair resolves and reads the input side of one .crt entry: it classifies
-// the sibling .key (a missing key is a health-neutral statusOrphan; a non-ENOENT
-// stat failure is statusUnreadable instead, because the key is there and cannot
-// be read — health-neutral too, but it also blocks orphan reaping, which an
-// orphan does not) and then performs both bounded reads through the input
-// source, so every /input byte is read once from within the confined root.
+// the sibling .key (a key that is not there is a health-neutral statusOrphan, or the
+// transient statusVanished when this process had already read the pair whole — see
+// noteMissingKey; a non-ENOENT stat failure is statusUnreadable instead, because the
+// key is there and cannot be read — health-neutral too, but it also blocks orphan
+// reaping, which an orphan does not) and then performs both bounded reads through the
+// input source, so every /input byte is read once from within the confined root.
 //
 // The returned conversionStatus is statusUnset on success and, on failure, the
 // outcome convertEntry must propagate for that entry, with the failure already
@@ -608,9 +679,7 @@ const inputPermRemediation = "check /input permissions and that the path is a re
 func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInputs, conversionStatus) {
 	if _, statErr := sw.src.stat(keyRel); statErr != nil {
 		if errors.Is(statErr, fs.ErrNotExist) {
-			// A genuine orphan: the certificate has no sibling key at all.
-			slog.Debug("skipping cert without matching key", "path", rel)
-			return pairInputs{}, statusOrphan
+			return pairInputs{}, sw.noteMissingKey(rel, keyRel)
 		}
 		// A non-ENOENT stat failure (a sibling key that is a symlink the *os.Root
 		// refuses because it escapes /input, or a permission/IO error) is NOT a
@@ -633,6 +702,56 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 		return pairInputs{}, sw.noteUnreadableInput(rel, keyRel, "private key", err)
 	}
 	return pairInputs{certPEM: certPEM, keyPEM: keyPEM}, statusUnset
+}
+
+// noteMissingKey classifies a sibling .key that is not there at the stat and returns the
+// outcome, with its diagnosis already logged.
+//
+// One ENOENT, two conditions. The STEADY STATE is a key that was never named
+// <name>.key beside its <name>.crt: no PFX is produced, any existing bundle goes
+// indefinitely stale, and logInputCoverageWarnings' once-per-scan aggregate is the only
+// default-level trace of it — so that case stays statusOrphan and keeps that WARN and
+// its rename remediation. The TRANSIENT is a key being replaced while the scan reads
+// the tree: the same renewal window the cert and key READS classify as statusVanished,
+// where naming a misnamed key would tell an operator to rename files that are correct.
+//
+// One ENOENT cannot separate them, so this needs a second observation, and the only
+// honest one available in-process is memory: observationLog holds an entry for a pair
+// only once this process has read that pair WHOLE, so its presence is evidence the key
+// was there (completedPair). The memory is SPENT on use, which is what keeps the
+// genuine case loud — see forgetPair — and a pair this process never read whole has no
+// memory at all, so every shape that is missing its key from the start keeps today's
+// default-level diagnostic.
+//
+// src.pathVanished is the read side's primitive, asked here for the question its
+// second arm was written for. Its answers all read correctly for a stat that just
+// returned ENOENT: the key path is GONE (the replacement has not landed yet), or it is
+// a non-symlink again (it landed between this stat and that Lstat) — either way the
+// tree moved under the scan; against a SURVIVING symlink whose target does not exist,
+// which is the steady-state certbot live/ -> archive/ shape and stays an orphan. Any
+// other Lstat failure answers false there, so a key the scan cannot even classify
+// stays an orphan too: no arm that fails to prove a replacement takes the quieter
+// reading.
+//
+// statusVanished rather than a count of its own, because it is the same condition the
+// read side already named: health-neutral, out of the documented unreadable= alert and
+// its permissions remediation, Debug-only per path, and — for this one scan — a veto on
+// both the orphan aggregate (ScanResult.inputFullyEnumerated) and the reap, exactly as
+// a vanished cert is. This pair's OWN bundle was never at risk either way: visit
+// records the .crt in `seen` before dispatching it, so it is not an orphan candidate,
+// and the next scan sees the replacement and reconciles the rest.
+func (sw *scanWalk) noteMissingKey(rel, keyRel string) conversionStatus {
+	if sw.observations.completedPair(rel) && sw.src.pathVanished(keyRel) {
+		sw.observations.forgetPair(rel)
+		// Byte-identical to the read side's vanish line for the same condition on the
+		// same pair, so an operator correlating one renewal does not meet two
+		// vocabularies for it.
+		slog.Debug("skipping cert: private key vanished during the scan", "path", rel)
+		return statusVanished
+	}
+	// A genuine orphan: the certificate has no sibling key at all.
+	slog.Debug("skipping cert without matching key", "path", rel)
+	return statusOrphan
 }
 
 // noteUnreadableInput logs a failed read of an /input file and RETURNS the outcome it
