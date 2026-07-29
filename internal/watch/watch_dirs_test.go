@@ -269,14 +269,14 @@ func TestHandleWatchAddError_classifies_root_and_child_registration_failures(t *
 
 // TestResyncWatchSet_stays_silent_when_shutdown_cut_the_walk_short pins the
 // shutdown half of resyncWatchSet's contract, the single home of that rule for all
-// three re-sync sites (the periodic fallback tick, the event-queue-overflow
+// three re-sync sites (the periodic safety-net tick, the event-queue-overflow
 // recovery, and the root-watch re-attach): a walk that failed only because
 // cancellation stopped it is a clean stop, not a watch degradation, so it must warn
 // nothing. Without the guard every graceful shutdown that lands on one of those
 // sites logs "failed to re-sync the watch set", telling an operator that renewals
 // are uncovered on a container that is merely stopping.
 //
-// The live-ctx half is pinned at its own sites (handleFallbackTick still scans, the
+// The live-ctx half is pinned at its own sites (handleSafetyNetTick still scans, the
 // root-loss re-attach WARN carries root and fallback_scan); only the silence was
 // unpinned.
 // Not parallel: it swaps the process-global slog default.

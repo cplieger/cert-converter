@@ -105,8 +105,10 @@ type Config struct {
 //
 // Load reads environment variables and returns a populated Config. The PFX
 // password follows the Docker-secrets convention: when PFX_PASSWORD_FILE is
-// set the secret is read from that file (bounded, whitespace-trimmed) so it
-// never appears in the process environment; otherwise PFX_PASSWORD is used. It
+// set the secret is read from that file (bounded, and delivered verbatim apart
+// from at most one trailing line ending, so whitespace an operator put in the
+// password is part of it on both channels) so it never appears in the process
+// environment; otherwise PFX_PASSWORD is used. It
 // returns ErrEmptyPassword when neither supplies a value, or when the value is
 // blank (empty, whitespace-only, or invisible formatting runes only) — a
 // whitespace-only or BOM-only PFX_PASSWORD_FILE included, because a blank file
@@ -180,7 +182,8 @@ func Load() (Config, error) {
 		}
 		if source == envx.SourceFile {
 			// A mounted secret that is blank only after classification (an
-			// invisible-only value; envx trimmed nothing) reaches here with no
+			// invisible-only value, which envx does not consider blank because
+			// an invisible rune is not whitespace) reaches here with no
 			// envx error to carry the channel, so name it here or the refusal
 			// sends a file-channel operator to the variable file-wins ignores.
 			return Config{}, fmt.Errorf("%w (supplied via %s)", ErrEmptyPassword, passwordChannel(source))
@@ -427,25 +430,25 @@ func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
 	}
 }
 
-// warnFallbackDisabled warns when periodic recovery and the health-marker
-// freshness deadline are both gone, because nothing else in the process ever
-// reports it: either the explicit 0/false opt-out removed them, or the configured
-// cadence sits at maxFallbackHours, where the rescan that refreshes the marker
-// never arrives and the 3x deadline can never expire. The two are operationally
-// the same state, so both earn the same tradeoff record.
+// warnFallbackDisabled warns when the operator's own periodic rescan is gone,
+// because nothing else in the process reports it: either the explicit 0/false
+// opt-out removed it, or the configured cadence sits at maxFallbackHours, where a
+// rescan on that cadence never arrives. The two are operationally the same state,
+// so both earn the same tradeoff record.
 //
-// Three things go away together: the periodic re-scan that would convert a renewal
-// whose fsnotify event never arrived; the marker's freshness deadline (main hands the
-// probe WithMaxAge(3*interval), and health treats a non-positive max-age as no
-// deadline), so the last clean scan reports HEALTHY for as long as the container
-// runs; and any chance of noticing an /input watch dropped by an unmount or remount,
-// which the kernel reports as IN_UNMOUNT/IN_IGNORED — fsnotify emits no event and
-// closes no channel, so watch's root-watch-loss guard never fires.
+// What actually goes away is the operator's CADENCE, not the app's convergence: the
+// watcher keeps a reconciliation floor in every configuration (internal/watch's
+// reconcileFloor), the health marker's freshness deadline is derived from that floor
+// rather than from this value, and the startup line's scan_floor attribute names it.
+// So the tradeoff is latency — a renewal whose fsnotify event never arrived, and an
+// /input watch the kernel dropped silently on an unmount or remount
+// (IN_UNMOUNT/IN_IGNORED, which fsnotify neither reports as an event nor as a closed
+// channel), both wait for that slower reconciliation instead of for the cadence the
+// operator would otherwise have chosen.
 //
-// Deliberately a warning rather than a detector: with the fallback off, an idle
-// deployment and a wedged one are indistinguishable without active probing, so any
-// liveness timer would either restore the periodic work this setting exists to avoid
-// or report a quiet deployment unhealthy.
+// Deliberately a warning rather than a detector: whether a day of extra latency on a
+// missed renewal is acceptable is the operator's judgment, and the app cannot infer
+// it. A wedged loop IS now detected, by the marker deadline.
 //
 // It keys on the parsed interval, which is zero only for the explicit "0"/"false"
 // opt-out and at the ceiling for a value at or above maxFallbackHours (including one
@@ -453,21 +456,23 @@ func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
 // remain enabled and silent here (warnFallbackRepaired reports those).
 func warnFallbackDisabled(interval time.Duration) {
 	if interval >= maxFallbackHours*time.Hour {
-		// The ceiling is documented as far beyond any real cadence, so a rescan
-		// at it never arrives: the periodic recovery and the marker's 3x
-		// freshness deadline are both inert, exactly as with the 0/false opt-out.
-		slog.Warn("FALLBACK_SCAN_HOURS is at the "+strconv.Itoa(maxFallbackHours)+"h ceiling, so no periodic re-scan will run and the health-marker freshness deadline (3x the interval) can never expire; "+
-			"a wedged watch loop keeps reporting healthy while converting nothing",
+		// The ceiling is documented as far beyond any real cadence, so a rescan at it
+		// never arrives: the operator's periodic recovery is inert, exactly as with the
+		// 0/false opt-out, and the watcher's reconciliation floor is what still covers
+		// a missed renewal.
+		slog.Warn("FALLBACK_SCAN_HOURS is at the "+strconv.Itoa(maxFallbackHours)+"h ceiling, so no re-scan will ever run on that cadence; "+
+			"a renewal whose fsnotify event never arrived, and an /input watch silently dropped by an unmount or remount, then wait for the watcher's slower "+
+			"full-tree reconciliation instead (the startup line's scan_floor names it, and the health-marker freshness deadline is derived from it)",
 			"hours", maxFallbackHours,
-			"remediation", "set FALLBACK_SCAN_HOURS to a real cadence (unset it for the 6h default) so a missed fsnotify event is recovered and a wedged loop is reported unhealthy")
+			"remediation", "set FALLBACK_SCAN_HOURS to a real cadence (unset it for the 6h default) if a missed renewal should be recovered on your own cadence rather than on the reconciliation floor")
 		return
 	}
 	if interval > 0 {
 		return
 	}
-	slog.Warn("FALLBACK_SCAN_HOURS is 0/false: no periodic re-scan, and no health-marker freshness deadline with it; "+
-		"an /input watch silently dropped by an unmount or remount emits no fsnotify event, so it goes undetected "+
-		"and the container keeps reporting healthy while converting nothing",
-		"remediation", "unset FALLBACK_SCAN_HOURS (or set it above 0) so the periodic rescan re-attaches the watch set "+
-			"and the health marker's freshness deadline can report a wedged loop")
+	slog.Warn("FALLBACK_SCAN_HOURS is 0/false: no routine periodic re-scan on your own cadence; "+
+		"a renewal whose fsnotify event never arrived, and an /input watch silently dropped by an unmount or remount, "+
+		"wait for the watcher's slower full-tree reconciliation instead (the startup line's scan_floor names it, and the health-marker "+
+		"freshness deadline is derived from it, so a wedged watch loop is still reported unhealthy)",
+		"remediation", "unset FALLBACK_SCAN_HOURS (or set it above 0) if a missed renewal should be recovered on your own cadence rather than on the reconciliation floor")
 }

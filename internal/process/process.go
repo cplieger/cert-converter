@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
@@ -44,13 +45,15 @@ type ScanResult struct {
 	// next scan converts. It is health-neutral, and like Unreadable it still blocks
 	// orphan reaping.
 	Vanished int
-	// Unwritable counts prior bundles whose mode repair AND repairing rewrite were both
-	// refused for a permission reason (statusUnwritable). Health-neutral for the same
-	// reason Unreadable is — no restart grants the UID a permission it does not have —
-	// and a SEPARATE field for the same reason as the two above: `unreadable=` carries
-	// an /input remediation and drives the documented alert, while this condition is
-	// entirely on the /output side. It blocks orphan reaping like every other outcome
-	// that left a bundle this app is not satisfied with (conversionsClean).
+	// Unwritable counts prior bundles this app could not replace, where it never proved the
+	// bundle on disk wrong and no restart can clear what refused the write
+	// (statusUnwritable, whose doc comment states the promise in full). Health-neutral for
+	// the same reason Unreadable is — no restart grants the UID a permission it does not
+	// have, frees a full volume or remounts a read-only one — and a SEPARATE field for the
+	// same reason as the two above: `unreadable=` carries an /input remediation and drives
+	// the documented alert, while this condition is entirely on the /output side. It blocks
+	// orphan reaping like every other outcome that left a bundle this app is not satisfied
+	// with (conversionsClean).
 	Unwritable int
 }
 
@@ -83,8 +86,8 @@ var summaryAttrs = []struct {
 // conversionsClean reports whether nothing this scan did leaves the output tree in a
 // state this app is still trying to repair. It is the ONE spelling of the reap veto
 // that is about the OUTPUT rather than the input enumeration: Failed is the obvious
-// member, and Unwritable joins it because a bundle whose permission repair the volume
-// refused is one this app wanted to replace and could not — deleting other bundles on
+// member, and Unwritable joins it because a bundle the volume refused to let this app
+// replace is one it wanted to replace and could not — deleting other bundles on
 // the strength of that same volume is exactly what the Failed veto refuses. Health
 // deliberately does NOT ask this question; it asks Failed alone
 // (main.healthyAfterScan), because a restart can clear one and never the other.
@@ -259,7 +262,14 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	// /output stale-temp sweep does: every step is an openat-relative
 	// syscall and every path handed downstream is root-relative, so no
 	// ambient absolute path exists for a later read to reach for.
-	walkErr := walkRoot(inHandle, func(rel string, d fs.DirEntry, err error) error {
+	//
+	// atomicfile owns the traversal mechanics (streaming ReadDir batches, one
+	// directory handle at a time, O_DIRECTORY so a planted FIFO is refused rather
+	// than blocking this goroutine, no descent into a symlinked directory). The
+	// per-entry policy — the budget, the classification, the diagnostics — is
+	// sw.visit's, and the walk is the same one store.listOutputs uses, so the two
+	// mounts cannot drift apart in how much of a stranger's tree they take on.
+	walkErr := atomicfile.WalkDirInRoot(ctx, inHandle, func(rel string, d fs.DirEntry, err error) error {
 		return sw.visit(ctx, rel, d, err)
 	})
 	// A tree over the entry budget is REPORTED, not failed. It stops the walk (so
@@ -379,8 +389,8 @@ func (sw *scanWalk) entryBudget() int {
 	return fallbackScanEntries
 }
 
-// visit is the walk's per-entry callback (walkRoot -> streamRootDir ->
-// visitRootBatch). The context is checked before and after each
+// visit is the walk's per-entry callback (atomicfile.WalkDirInRoot). The context is
+// checked before and after each
 // entry: a walk error at the root ("."), or a cancelled context, aborts the
 // walk; an error below the root marks one unreadable sub-path and continues.
 // Every path is root-relative (the walk runs through the *os.Root). Directories
@@ -399,8 +409,8 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		}
 		// An ENOENT below the root is the WALK's half of the renewal race the read
 		// side already classifies as statusVanished. Only real directories are ever
-		// ReadDir-ed: visitRootBatch queues a subdirectory on the DIRENT type
-		// (entry.IsDir(), which is false for a symlink), so the walk never descends a
+		// ReadDir-ed: the walk queues a subdirectory on the DIRENT type
+		// (entry.IsDir(), which is false for a symlink), so it never descends a
 		// link -- and the only way a path it just enumerated answers ENOENT is that it
 		// was removed under the walk;
 		// there is no surviving-symlink reading to rule out here, which is why this
@@ -484,8 +494,8 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 }
 
 // noteUnwalkableSymlink reports a symlink under the input root that the walk
-// cannot follow. The walk never descends a symlinked directory (visitRootBatch
-// queues a subdirectory only on the dirent type, which is never a directory for a
+// cannot follow. The walk never descends a symlinked directory (it queues a
+// subdirectory only on the dirent type, which is never a directory for a
 // symlink), and a link
 // the confined handle cannot resolve at all (a target outside the root, or an
 // unreadable component of an in-root target) tells us nothing about what it
@@ -736,7 +746,7 @@ func pairFingerprint(certPEM, keyPEM []byte) [sha256.Size]byte {
 // odd-but-convertible input is named on the scan that introduced it and stays
 // silent on every later fsnotify event and fallback tick. It maps each cert path
 // to a signature of the last input bytes AND the observations derived from them,
-// and is NEVER consulted for currency, which store.isCurrent derives from the
+// and is NEVER consulted for currency, which store.inspect derives from the
 // bundle on disk. It is process-lifetime state held by the Scanner, so a restart
 // re-reports each pair exactly once.
 //
@@ -898,7 +908,7 @@ func (o *observationLog) maxObservedPairs() int {
 // pair when it is full.
 //
 // Eviction spends the signature freely — the evicted pair re-emits its observation WARN
-// once, and no currency decision reads this log at all, since store.isCurrent derives
+// once, and no currency decision reads this log at all, since store.inspect derives
 // currency from the bundle on disk. What it must NOT spend silently is the WHOLENESS
 // evidence: dropping it makes completedPair answer false, and that answer is what
 // downgrades a later missing key from the reap-vetoing statusVanished to the ordinary
@@ -1236,18 +1246,19 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		return failEntry(rel, "conversion failed", err)
 	}
 	observations := analysis.Observations()
-	current, cause, err := sw.out.isCurrent(ctx, pfxRel, &analysis, sw.enc, sw.password)
+	state, err := sw.out.inspect(ctx, pfxRel, &analysis, sw.enc, sw.password)
 	if err != nil {
-		// A cancellation, and nothing else: isCurrent resolves every "I cannot tell what
+		// A cancellation, and nothing else: inspect resolves every "I cannot tell what
 		// is on disk" outcome (an unreadable, oversized, non-regular or undecodable
-		// bundle, a lax directory) to "stale" itself, and its only two error returns are
-		// the prior-bundle read that raced a cancellation and currentFromCurrency's
-		// pre-verdict context check. failEntry logs it at Debug, and visit's
-		// post-conversion context check turns it into the walk-level cancellation the
-		// caller reports, so this entry's statusFailed never reaches the health marker.
+		// bundle, a lax directory) into a content FACT itself, and its only two error
+		// returns are the prior-bundle read that raced a cancellation and
+		// contentFromCurrency's pre-verdict context check. failEntry logs it at Debug,
+		// and visit's post-conversion context check turns it into the walk-level
+		// cancellation the caller reports, so this entry's statusFailed never reaches the
+		// health marker.
 		return failEntry(rel, "failed to inspect existing pfx", err)
 	}
-	if current {
+	if state.upToDate() {
 		// The observations describe the INPUT, so a semantically equivalent input
 		// edit still has to be named once even though the bundle on disk stays
 		// correct; observationLog.note owns that once-per-change rule.
@@ -1262,79 +1273,153 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		logConversionObservations(rel, observations)
 		return failEntry(rel, "conversion failed", err)
 	}
-	if err := sw.out.write(ctx, pfxRel, pfxData); err != nil {
-		outcome := sw.noteWriteFailure(rel, pfxRel, cause, err)
-		if outcome == statusUnwritable {
-			// The bundle on disk already holds the bytes these inputs produce and the
-			// refusal is steady state (no restart grants the UID ownership), so the
-			// observations describe an input that will be re-analysed on every scan for
-			// as long as the operator leaves /output as it is. note emits them once per
-			// CHANGE and commits the signature, exactly as the unchanged path does:
-			// re-emitting per attempt is reserved for statusFailed, where the bundle
-			// those inputs produce is genuinely not on disk. That is why the emission
-			// waits for the write outcome instead of running before it — a persistently
-			// foreign-owned bundle is non-current on every scan, so an unconditional
-			// emission there repeated the input WARN on every scan forever.
-			// unwritableBundleMsg remains the standing per-scan diagnostic for the
-			// condition itself.
-			sw.observations.note(rel, fingerprint, observations)
-			return outcome
-		}
-		logConversionObservations(rel, observations)
+	writeErr := sw.out.write(ctx, pfxRel, pfxData)
+	// The one derivation, after the write, from the three facts this entry resolved:
+	// what the bundle on disk was, whether the mode repair converged, and how the write
+	// itself ended. Nothing below re-decides it; the logging and the observation
+	// bookkeeping only read the outcome.
+	outcome = writeOutcome(state, writeErr)
+	if writeErr != nil {
+		reportWriteFailure(rel, pfxRel, state, writeErr, outcome)
+	}
+	if outcome == statusUnwritable {
+		// The bundle on disk is one this app never proved wrong and the refusal is steady
+		// state (no restart clears it), so the observations describe an input that will be
+		// re-analysed on every scan for as long as the operator leaves /output as it is.
+		// note emits them once per CHANGE and commits the signature, exactly as the
+		// unchanged path does: re-emitting per attempt is reserved for statusFailed, where
+		// the bundle those inputs produce is genuinely not on disk. That is why the
+		// emission waits for the write outcome instead of running before it — a
+		// persistently foreign-owned bundle is non-current on every scan, so an
+		// unconditional emission there repeated the input WARN on every scan forever.
+		// The standing per-scan WARN for the condition itself is reportWriteFailure's.
+		sw.observations.note(rel, fingerprint, observations)
 		return outcome
 	}
 	logConversionObservations(rel, observations)
+	if outcome == statusFailed {
+		return outcome
+	}
 	sw.observations.record(rel, fingerprint, observations)
 
 	slog.Info("wrote pfx", "path", pfxRel)
-	return statusConverted
+	return outcome
 }
 
-// unwritableBundleMsg is the standing WARN for the one /output write refusal that is
-// NOT a conversion failure: a prior bundle whose bytes are already correct, whose mode
-// is laxer than policy, whose chmod the filesystem refused, and whose repairing
-// rewrite it refused too. It is its own message rather than a variant of
-// modeRepairRefusedMsg because that line announces an attempt this one reports the
-// outcome of, and an operator correlating a permanently-lax private key with a log
-// query must find the standing condition rather than the attempt.
+// writeOutcome derives one entry's conversionStatus, and it is the ONLY place that
+// derivation happens. Its inputs are the three facts this scan resolved independently:
+// what this app learned about the bundle already on disk (state.content), whether the
+// mode repair converged (state.repair, the one non-content reason a matching bundle is
+// rewritten at all), and — when the write failed — whether a restart could clear that
+// failure (restartCanClearWrite). Deriving it once, after the write, is what replaced
+// threading a staleness cause into the failure handler: each fact now arrives unmodified,
+// so a fix to one of them cannot overwrite another on the way here.
+//
+// The default is unchanged and stays the loud one: a PFX this app could not write is a
+// conversion failure, counted in ScanResult.Failed, and health goes unhealthy — right,
+// because the bundle those inputs produce is not on disk. Two independent things must
+// BOTH hold before the health-neutral outcome is granted instead:
+//
+//  1. This app never proved the bundle on disk wrong (bundleState.bundleNotProvenWrong):
+//     it either compared the bytes and they matched, or it could not read them at all. A
+//     bundle it DID compare and find stale — a renewal behind, a rotated password, an
+//     absent or non-regular output path — stays a conversion failure whatever refused the
+//     write, because the operator is being served the wrong bundle and that has to be
+//     loud (the README's /output contract).
+//  2. No restart can clear what refused the write (restartCanClearWrite): a permission
+//     denial, a read-only mount, a full volume, an exhausted quota.
+//
+// Together those two are exactly the condition health exists to exclude: restarting the
+// container cannot change the outcome, so restarting is the wrong answer and Failed is the
+// wrong count — the same mistake statusUnreadable exists to avoid on the /input side. The
+// condition is not silence: it carries a standing WARN once per scan and it still blocks
+// orphan reaping (ScanResult.conversionsClean).
+func writeOutcome(state bundleState, writeErr error) conversionStatus {
+	switch {
+	case writeErr == nil:
+		return statusConverted
+	case state.bundleNotProvenWrong() && !restartCanClearWrite(writeErr):
+		return statusUnwritable
+	default:
+		return statusFailed
+	}
+}
+
+// unwritableBundleMsg is the standing WARN for the ORIGINAL health-neutral /output
+// shape, and its promise is unchanged: a prior bundle whose bytes were COMPARED and
+// MATCHED, whose mode is laxer than policy, whose chmod the filesystem refused, and whose
+// repairing rewrite it refused for a permission reason too. It is its own message rather
+// than a variant of modeRepairRefusedMsg because that line announces an attempt this one
+// reports the outcome of, and an operator correlating a permanently-lax private key with a
+// log query must find the standing condition rather than the attempt.
+//
+// It is emitted for exactly the condition it was emitted for before this routing was
+// restructured, so the README's alerting section and any operator query keyed on it are
+// untouched. Every OTHER health-neutral write refusal — one over content this app could
+// not verify, or one refused by the volume rather than by ownership — carries
+// unreplaceableBundleMsg instead, because widening this text would quietly widen what it
+// promises about the operator's bytes.
 const unwritableBundleMsg = "prior pfx is more permissive than policy and neither the mode repair nor the replacing write was permitted; leaving the existing bundle in place, health is unaffected"
 
-// noteWriteFailure classifies a failed PFX write and returns the outcome the entry
-// must propagate, with the failure already logged.
+// unreplaceableBundleMsg is the standing WARN for every other health-neutral write
+// refusal: a prior bundle this app could not VERIFY at all (above the readable bound,
+// unreadable, un-stat-able, or refused by the codec's preflight) whose replacing write was
+// refused by a steady-state /output condition, and the mode-repair shape above when that
+// refusal is not a permission denial (a full or read-only volume).
 //
-// The general rule is unchanged and stays the default: a PFX this app could not write
-// is a conversion failure, logged at ERROR, counted in ScanResult.Failed, and health
-// goes unhealthy — which is right, because the bundle those inputs produce is not on
-// disk. The single exception is the one condition where nothing is missing: the rewrite
-// was scheduled ONLY to repair a mode a refused chmod could not
-// (staleModeRepairRefused, which store.isCurrent reports only after the content
-// comparison confirmed the bytes on disk already match), and the write was refused
-// for a permission reason too. The bundle on disk still holds exactly the bytes these
-// inputs produce, so the operator's
-// PFX is neither stale nor absent; what is wrong is ownership of /output, which no
-// restart can change. Counting that in Failed made the container restart-loop on a
-// condition a restart cannot clear — the same mistake statusUnreadable exists to avoid
-// on the /input side, and the more likely half of the deployment this arm exists for,
-// since a UID that does not own the bundle plausibly does not own its directory either.
+// A separate message rather than a widened unwritableBundleMsg because that one promises
+// the bytes on disk were compared and matched, which is precisely what this one cannot
+// promise. The record carries a `content` attribute naming which fact the app actually
+// had, so an operator reading this line knows whether the bundle left in place was
+// verified or merely unexamined.
+const unreplaceableBundleMsg = "prior pfx could not be replaced and the /output condition that refused the write is not one a restart clears; leaving the existing bundle in place, health is unaffected"
+
+// outputVolumeRemediation is the remediation for a write the VOLUME refused rather than
+// ownership: this app may write /output, but the filesystem will not take the bytes.
+// Deliberately not outputPermRemediation — chowning /output frees no space and does not
+// remount it read-write, and an operator sent after the wrong cause reads the WARN as
+// noise.
+const outputVolumeRemediation = "check /output for free space, a quota and a read-only mount"
+
+// reportWriteFailure logs a failed PFX write in the register the DERIVED outcome calls
+// for. It decides nothing — writeOutcome already did — so the count and the log can never
+// disagree about an entry, which is what the previous shape risked by classifying inside
+// the logger.
 //
-// A NON-permission failure of that same rewrite (EROFS, ENOSPC, a symlink refusal, an
-// occupied path) stays a conversion failure: it is not evidence about ownership, and it
-// is exactly the class where a rewrite might genuinely be able to land later.
-//
-// The WARN is emitted once per bundle per scan, because the entry is written at most
-// once per scan: there is no retry loop behind it.
-func (sw *scanWalk) noteWriteFailure(logRel, pfxRel string, cause staleCause, err error) conversionStatus {
-	if cause == staleModeRepairRefused && isPermissionRefusal(err) {
-		slog.Warn(unwritableBundleMsg,
+// The WARN is emitted once per bundle per scan, because the entry is written at most once
+// per scan: there is no retry loop behind it.
+func reportWriteFailure(logRel, pfxRel string, state bundleState, err error, outcome conversionStatus) {
+	if outcome == statusUnwritable {
+		msg, remediation := unwritableReport(state, err)
+		slog.Warn(msg,
 			"path", logRel, "output_path", pfxRel, "error", err,
-			"remediation", outputPermRemediation)
-		return statusUnwritable
+			"content", state.content.String(), "remediation", remediation)
+		return
 	}
-	// The message is unchanged (an operator's log query keys on it); the
-	// remediation names the two steady-state output-side causes.
-	return failEntry(logRel, "conversion failed", err, "output_path", pfxRel,
+	// failEntry is called for its LOG: the statusFailed it returns is the same value
+	// writeOutcome already derived, and taking it from there keeps one derivation.
+	// The message is unchanged (an operator's log query keys on it); the remediation names
+	// the two steady-state output-side causes.
+	failEntry(logRel, "conversion failed", err, "output_path", pfxRel,
 		"remediation", "check /output ownership and permissions for the UID in user:, "+
 			"and that no symlink is planted at the output path")
+}
+
+// unwritableReport picks the standing WARN for a health-neutral write refusal: which
+// message can honestly describe the bundle being left in place, and which operator action
+// clears the refusal. Two axes, because they are two different questions for the operator
+// — what is on disk, and what refused the replacement — and neither answer implies the
+// other.
+func unwritableReport(state bundleState, err error) (msg, remediation string) {
+	if isPermissionRefusal(err) {
+		remediation = outputPermRemediation
+	} else {
+		remediation = outputVolumeRemediation
+	}
+	if state.modeRepairOnly() && isPermissionRefusal(err) {
+		return unwritableBundleMsg, remediation
+	}
+	return unreplaceableBundleMsg, remediation
 }
 
 // logConversionObservations surfaces Analyse's non-fatal findings about a pair's

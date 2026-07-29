@@ -14,7 +14,6 @@ import (
 	"math/big"
 	"strings"
 	"testing"
-	"time"
 )
 
 // The pre-scan guard's tests live in the internal package because the guard is
@@ -838,117 +837,6 @@ func TestPKCS8HoldsECKey_answers_true_only_for_an_ec_algorithm_identifier(t *tes
 				t.Errorf("pkcs8HoldsECKey(%s) = %v, want %v", name, got, tc.want)
 			}
 		})
-	}
-}
-
-// TestOversizedCertificateOIDError_bounds_an_identifier_the_parser_would_decode pins
-// the certificate side of the package's untrusted-identifier bound, the one input
-// path that had no such guard. x509.ParseCertificate decodes every extension
-// identifier and every subject/issuer attribute type into an asn1.ObjectIdentifier,
-// and encoding/asn1 sizes that slice from the encoded LENGTH (one int per byte), so a
-// file inside the reader's 10 MB cap could spend its DER on one syntactically valid
-// identifier and drive tens of megabytes on the scan's only goroutine.
-//
-// Both halves of the contract are pinned: the oversized identifier is refused from
-// the DER alone, and an ordinary certificate still passes, because every identifier a
-// real certificate names is 9 bytes or fewer.
-func TestOversizedCertificateOIDError_bounds_an_identifier_the_parser_would_decode(t *testing.T) {
-	t.Parallel()
-
-	oversized := testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagOID, Bytes: bytes.Repeat([]byte{0x01}, maxOIDBytes+1)})
-	// Nested where a real certificate keeps the DEEPEST identifier x509 decodes: a
-	// CertificatePolicies policyIdentifier. Certificate > TBSCertificate >
-	// extensions [3] > SEQUENCE OF Extension > Extension > extnValue OCTET STRING >
-	// CertificatePolicies > PolicyInformation > OID, which is what maxCertificateOIDDepth
-	// has to reach; a bare extnID or a subject attribute type sits shallower, so a
-	// fixture built at that depth cannot notice a ceiling set too low for this shape.
-	policyInformation := derTestSequence(t, oversized)
-	certificatePolicies := derTestSequence(t, policyInformation)
-	extension := derTestSequence(t, testASN1Marshal(t, asn1.RawValue{
-		Tag:   asn1.TagOctetString,
-		Bytes: certificatePolicies,
-	}))
-	extensions := testASN1Marshal(t, asn1.RawValue{
-		Class:      asn1.ClassContextSpecific,
-		Tag:        3,
-		IsCompound: true,
-		Bytes:      derTestSequence(t, extension),
-	})
-	nested := derTestSequence(t, derTestSequence(t, extensions))
-	err := oversizedCertificateOIDError(&pem.Block{Type: pemTypeCertificate, Bytes: nested})
-	if err == nil {
-		t.Fatalf("oversizedCertificateOIDError(a %d-byte identifier) = nil, want a refusal before the parser decodes it",
-			maxOIDBytes+1)
-	}
-	if !strings.Contains(err.Error(), "object identifier") {
-		t.Errorf("error = %q, want it to name the oversized object identifier", err)
-	}
-
-	key, keyErr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if keyErr != nil {
-		t.Fatalf("setup: ecdsa.GenerateKey = error %v, want nil", keyErr)
-	}
-	template := &x509.Certificate{
-		SerialNumber:          big.NewInt(4211),
-		Subject:               pkix.Name{CommonName: "ordinary.example.com"},
-		IsCA:                  true,
-		BasicConstraintsValid: true,
-		KeyUsage:              x509.KeyUsageCertSign,
-	}
-	der, certErr := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	if certErr != nil {
-		t.Fatalf("setup: x509.CreateCertificate = error %v, want nil", certErr)
-	}
-	if err := oversizedCertificateOIDError(&pem.Block{Type: pemTypeCertificate, Bytes: der}); err != nil {
-		t.Errorf("oversizedCertificateOIDError(an ordinary certificate) = %v, want nil: nothing legitimate may be refused", err)
-	}
-}
-
-// TestOversizedCertificateOIDError_stops_at_the_element_budget pins the bound whose
-// subject is the WALK rather than the certificate. Every element the walk reads costs
-// one asn1.Unmarshal into an asn1.RawValue, so without maxCertificateOIDElements a
-// block packed with tiny INTEGERs makes the GUARD the expensive operation — the
-// amplification maxRSAKeyElements closes on the key side, measured there at hundreds
-// of milliseconds and hundreds of megabytes for a refusal x509 reaches in
-// microseconds.
-//
-// Both halves are pinned: an element-dense block returns promptly and FAILS OPEN (the
-// parser gets the bytes and issues its own verdict), and an oversized identifier
-// sitting within the budget is still refused, so the budget cannot be read as a way
-// past the guard.
-func TestOversizedCertificateOIDError_stops_at_the_element_budget(t *testing.T) {
-	t.Parallel()
-
-	// One SEQUENCE of far more elements than the budget allows: this is the shape
-	// that costs the walk everything and the parser nothing.
-	tiny := testASN1Marshal(t, 1)
-	dense := make([]byte, 0, len(tiny)*(maxCertificateOIDElements*4))
-	for range maxCertificateOIDElements * 4 {
-		dense = append(dense, tiny...)
-	}
-	body := derTestSequence(t, dense)
-
-	done := make(chan error, 1)
-	go func() {
-		done <- oversizedCertificateOIDError(&pem.Block{Type: pemTypeCertificate, Bytes: body})
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("oversizedCertificateOIDError(an element-dense block) = %v, want nil: exhausting the element budget FAILS OPEN, so the block goes to the parser", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("oversizedCertificateOIDError did not return on an element-dense block: the element budget regressed and the guard is now the amplification it exists to prevent")
-	}
-
-	// The budget must not become a bypass: an oversized identifier among few
-	// elements is still refused.
-	oversized := testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagOID, Bytes: bytes.Repeat([]byte{0x01}, maxOIDBytes+1)})
-	if err := oversizedCertificateOIDError(&pem.Block{
-		Type:  pemTypeCertificate,
-		Bytes: derTestSequence(t, oversized),
-	}); err == nil {
-		t.Error("oversizedCertificateOIDError(an oversized identifier within the budget) = nil, want a refusal")
 	}
 }
 

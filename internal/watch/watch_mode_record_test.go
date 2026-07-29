@@ -317,7 +317,7 @@ func TestWatchModeScans_report_watch_mode_at_info(t *testing.T) {
 			scan: func(ctx context.Context, t *testing.T, _ context.CancelFunc, scans *int) {
 				st := newWatchState(New(absentWatchRoot, func(context.Context) { *scans++ }, WithFallback(6*time.Hour)))
 				t.Cleanup(st.stop)
-				st.runFallbackScan(ctx)
+				st.runSafetyNetScan(ctx)
 			},
 		},
 	} {

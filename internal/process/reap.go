@@ -112,13 +112,13 @@ func (r *reapContext) safeToReap() bool {
 	return r.enumeratedInput() && r.result.conversionsClean()
 }
 
-// permissionRefusalOnly reports whether the only thing this scan is still trying to
-// repair on the output tree is a REFUSED PERMISSION REPAIR rather than a failed
-// conversion. The two need different operator advice: a conversion failure is
-// reported as one and can be fixed, while a refused repair is reported by
-// unwritableBundleMsg and is cleared by chowning /output, not by fixing a conversion
-// nothing logged.
-func (r *reapContext) permissionRefusalOnly() bool {
+// unreplaceableOnly reports whether the only thing this scan is still trying to repair on
+// the output tree is a REPLACEMENT THE VOLUME REFUSED rather than a failed conversion. The
+// two need different operator advice: a conversion failure is reported as one and can be
+// fixed, while a refused replacement is reported by unwritableBundleMsg or
+// unreplaceableBundleMsg and is cleared on the volume — a chown, free space, a read-write
+// remount — not by fixing a conversion nothing logged.
+func (r *reapContext) unreplaceableOnly() bool {
 	return r.result.Failed == 0 && r.result.Unwritable > 0
 }
 
@@ -222,7 +222,7 @@ func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *r
 	}
 
 	reapable := rc.safeToReap() && walkSafe
-	d := resolveReap(rp.mode, reapable, walkSafe, rc.permissionRefusalOnly())
+	d := resolveReap(rp.mode, reapable, walkSafe, rc.unreplaceableOnly())
 	if !d.reap {
 		slog.Warn("output bundles have no matching input",
 			"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),
@@ -594,11 +594,12 @@ func resolveReap(mode outputpolicy.Lifecycle, reapable, walkSafe, refusalOnly bo
 // removes anything cannot deliver — and the operator would wait for a recovery that
 // cannot happen while a stale bundle stays served.
 //
-// The refused-permission repair (ScanResult.Unwritable, via conversionsClean) is a
-// veto of its own and gets its own arm ahead of the conversion-failure one: it logs
-// no conversion failure anywhere, so telling the operator one failed contradicts the
-// same scan's failed=0 summary, and it is cleared by chowning /output rather than by
-// fixing a conversion.
+// The refused REPLACEMENT (ScanResult.Unwritable, via conversionsClean) is a veto of its
+// own and gets its own arm ahead of the conversion-failure one: it logs no conversion
+// failure anywhere, so telling the operator one failed contradicts the same scan's
+// failed=0 summary, and it is cleared on the output volume — ownership, free space, a
+// read-write remount, whichever the standing WARN named — rather than by fixing a
+// conversion.
 //
 // Otherwise the list is trustworthy — the input enumeration was complete, or
 // reconcile would have returned earlier — and sync mode is only withholding this
@@ -608,7 +609,7 @@ func lifecycleInaction(mode outputpolicy.Lifecycle, reapable, walkSafe, refusalO
 	case !walkSafe:
 		return "kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle"
 	case mode == outputpolicy.LifecycleSync && !reapable && refusalOnly:
-		return "kept: a prior bundle's permission repair was refused on this scan, so nothing is removed until a scan with no refused repair"
+		return "kept: the output volume refused to let this app replace a prior bundle on this scan, so nothing is removed until a scan with no refused replacement"
 	case mode == outputpolicy.LifecycleSync && !reapable:
 		return "kept: a conversion failed on this scan, so nothing is removed until a scan with no failures"
 	}
@@ -626,7 +627,11 @@ func orphanReportRemediation(mode outputpolicy.Lifecycle, walkSafe, refusalOnly 
 		return "do not remove anything from this list yet: fix the /output warnings above, then re-check it on a scan that reports no disabled orphan removal"
 	}
 	if mode == outputpolicy.LifecycleSync && refusalOnly {
-		return "this app removes them itself on the next scan with no failed conversion and no refused permission repair: " + outputPermRemediation + ", or remove these from the output volume by hand"
+		// The specific volume condition — ownership, free space, a read-only mount — is named
+		// by the standing WARN for the bundle itself, which is where the errno is known; this
+		// line only has to send the operator there rather than at a conversion that never
+		// failed.
+		return "this app removes them itself on the next scan with no failed conversion and no refused replacement: fix the /output condition named in the warning above, or remove these from the output volume by hand"
 	}
 	if mode == outputpolicy.LifecycleSync {
 		return "this app removes them itself on the next scan with no conversion failures: fix the conversion failure reported above, or remove them from the output volume by hand"

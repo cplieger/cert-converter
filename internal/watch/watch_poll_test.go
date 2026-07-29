@@ -429,7 +429,7 @@ func TestPollLoopWithUpgrade_returns_on_shutdown_while_polling(t *testing.T) {
 // TestPollTick_closes_the_watcher_it_could_not_give_a_watch_set pins the resource
 // release of the poll tick's rebuild-failure branch: a watcher that was
 // constructed but could not be given a watch set is closed before the tick stays
-// in poll mode. Poll mode re-attempts the upgrade on EVERY fallback tick for as
+// in poll mode. Poll mode re-attempts the upgrade on EVERY poll tick for as
 // long as the degradation lasts, so a watcher left open here leaks an fd and a
 // readEvents goroutine per tick -- one every six hours on the documented cadence
 // -- and nothing else in the suite would notice.

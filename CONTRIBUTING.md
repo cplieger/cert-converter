@@ -59,8 +59,10 @@ scan, then hand off to the watcher. The real work lives under
   writes PFX files to `/output`, returning a `ScanResult` count summary.
   `reap.go` owns the `OUTPUT_LIFECYCLE` reconciliation, including the vetoes
   that must hold before anything is deleted.
-- `internal/watch`: fsnotify watch loop with a debounce window and a
-  periodic full-scan fallback. Falls back to polling (with periodic
+- `internal/watch`: fsnotify watch loop with a debounce window, a periodic
+  full-scan safety net (the `FALLBACK_SCAN_HOURS` cadence, or the 24h
+  reconciliation floor that stands in for it) and a deferred watch-set repair on
+  its own bounded schedule. Falls back to polling (with periodic
   upgrade attempts) when fsnotify is unavailable.
 - `internal/testcerts`: test-only helpers that generate certificates;
   imported only from `_test.go`.
@@ -98,9 +100,10 @@ them.
   poll tick and its upgrade handoff (`watch_poll_test.go`), event classification
   (`handleFsEvent`), watch-set construction (`addWatchDirs`),
   the per-arm receive helpers (`handleEventRecv`, `handleErrorRecv`,
-  `handleFallbackTick`), the channel-closed-vs-shutdown translation
-  (`lostOrShutdown`), the mode records (`watch_mode_record_test.go`) and the
-  debounce/fallback timer accounting
+  `handleSafetyNetTick`), the channel-closed-vs-shutdown translation
+  (`lostOrShutdown`), the mode records (`watch_mode_record_test.go`), the
+  deferred watch-set repair (`watch_repair_test.go`) and the
+  debounce/safety-net/repair timer accounting
   (`watchState`, under `testing/synctest`). New logic in this package follows
   the same shape: put it in a helper the loop calls, and test the helper.
 - **Health is a file marker, not a probe endpoint.** A successful cycle

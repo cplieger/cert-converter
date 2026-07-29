@@ -6,6 +6,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/cplieger/slogx/capture"
 )
 
 // absentWatchRoot is a path that does not exist, so a watch-set walk over it fails at
@@ -15,30 +17,123 @@ import (
 // synctest bubble's fake clock cannot advance past.
 const absentWatchRoot = "/nonexistent-cert-converter-watch-root"
 
-// TestNewWatchState_leaves_nothing_armed_when_fallback_disabled pins the
-// disabled-fallback contract: fallbackChan must be nil (a receive on a nil
-// channel blocks forever, which is what keeps watchLoop's fallback case from
-// firing without a timer) and the debounce timer must start stopped so no scan
-// runs before an event arrives.
-func TestNewWatchState_leaves_nothing_armed_when_fallback_disabled(t *testing.T) {
+// TestNewWatchState_arms_the_reconciliation_floor_when_the_fallback_is_disabled
+// pins the liveness guarantee FALLBACK_SCAN_HOURS=0/false may NOT remove: the
+// loop's periodic safety-net timer is armed in every configuration, on the
+// reconciliation floor when the operator switched their own cadence off. Before
+// this contract the disabled fallback left the loop holding no clock at all, so a
+// silently dropped watch, a directory past the registration budget, and a wedged
+// watcher were all permanent and the health marker never went stale.
+//
+// The other two timers must still start stopped: nothing is pending until an event
+// arrives, and nothing is deferred until a scan lands inside the re-assert floor.
+func TestNewWatchState_arms_the_reconciliation_floor_when_the_fallback_is_disabled(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		st := newWatchState(New("/input", func(context.Context) {}, WithDebounce(time.Second), WithFallback(0)))
 		defer st.stop()
 
-		if st.fallbackTimer != nil {
-			t.Error("newWatchState armed a fallback timer with WithFallback(0); want none")
-		}
-		if st.fallbackChan() != nil {
-			t.Error("fallbackChan() != nil with the fallback disabled; a non-nil channel makes watchLoop's fallback case reachable")
+		if st.safetyNetTimer == nil {
+			t.Fatal("newWatchState armed no safety-net timer with WithFallback(0); the loop then holds no clock at all and nothing recovers a dropped watch or refreshes the health marker")
 		}
 
-		time.Sleep(10 * time.Second)
+		start := time.Now()
+		fired := <-st.safetyNetTimer.C
+		if elapsed := fired.Sub(start); elapsed != reconcileFloor {
+			t.Errorf("the safety-net timer fired after %v with the fallback disabled, want exactly the %v reconciliation floor", elapsed, reconcileFloor)
+		}
+
 		select {
 		case <-st.debounceTimer.C:
 			t.Error("debounce timer fired without any event; newWatchState must leave it stopped")
+		case <-st.repairTimer.C:
+			t.Error("repair timer fired with nothing deferred; newWatchState must leave it stopped")
 		default:
 		}
 	})
+}
+
+// TestRunSafetyNetScan_reconciles_and_re_arms_with_the_fallback_disabled pins the
+// scan half of the same guarantee: the floor's tick is a REAL reconciliation (it
+// drives onChange, which is what converts a renewal whose event was lost and what
+// refreshes the health marker) and it re-arms itself, so the guarantee is standing
+// rather than one-shot. Its record names the floor as the trigger, which is how an
+// operator confirms both that FALLBACK_SCAN_HOURS=0 took effect and that the app
+// still walks the tree.
+// Serial (no t.Parallel): it swaps the process-global slog default.
+func TestRunSafetyNetScan_reconciles_and_re_arms_with_the_fallback_disabled(t *testing.T) {
+	logs := capture.Default(t)
+	synctest.Test(t, func(t *testing.T) {
+		scans := 0
+		st := newWatchState(New(absentWatchRoot, func(context.Context) { scans++ }, WithFallback(0)))
+		defer st.stop()
+
+		start := time.Now()
+		first := <-st.safetyNetTimer.C
+		st.runSafetyNetScan(t.Context())
+
+		if scans != 1 {
+			t.Fatalf("the reconciliation tick ran %d scans, want 1: a re-assert without a certificate scan converts nothing and never refreshes the health marker", scans)
+		}
+		next := <-st.safetyNetTimer.C
+		if want := first.Add(reconcileFloor); !next.Equal(want) {
+			t.Errorf("the second reconciliation fired at %v, want %v (the floor must re-arm itself)", next.Sub(start), want.Sub(start))
+		}
+		if scans != 1 {
+			t.Errorf("onChange ran %d times, want 1: only the tick that was serviced may scan", scans)
+		}
+	})
+
+	rec := requireOneRecord(t, logs, msgScanState)
+	assertAttrs(t, "the reconciliation scan record", rec, map[string]string{
+		"mode":          "watch",
+		"trigger":       triggerReconcile,
+		"fallback_scan": "disabled",
+		"scan_floor":    reconcileFloor.String(),
+	})
+}
+
+// TestSafetyNetInterval_never_exceeds_the_reconciliation_floor pins the one rule
+// behind both the loop's cadence and the health probe's staleness deadline: the
+// operator's FALLBACK_SCAN_HOURS cadence is used as configured while it is below
+// the floor, and the floor covers every other case — the 0/false opt-out, a
+// negative interval, and a cadence above the floor (including the 10-year ceiling
+// internal/config clamps to, at which the old code armed a timer that would never
+// fire in any real container's lifetime).
+//
+// MarkerRefreshFloor is asserted against the same table because main derives the
+// probe's max-age from it: a divergence would either restart a healthy container or
+// arm a deadline the loop cannot meet.
+func TestSafetyNetInterval_never_exceeds_the_reconciliation_floor(t *testing.T) {
+	t.Parallel()
+	// Strings first, then the durations: govet fieldalignment reads this table too.
+	for _, tc := range []struct {
+		name        string
+		wantTrigger string
+		fallback    time.Duration
+		want        time.Duration
+	}{
+		{"the documented default is used as configured", triggerFallback, 6 * time.Hour, 6 * time.Hour},
+		{"the 0/false opt-out falls to the floor", triggerReconcile, 0, reconcileFloor},
+		{"a negative interval falls to the floor", triggerReconcile, -time.Second, reconcileFloor},
+		{"a cadence at the floor is the operator's", triggerFallback, reconcileFloor, reconcileFloor},
+		{"a cadence above the floor is capped", triggerReconcile, 48 * time.Hour, reconcileFloor},
+		{"the config ceiling is capped", triggerReconcile, 87600 * time.Hour, reconcileFloor},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := New("/input", func(context.Context) {}, WithFallback(tc.fallback))
+			if got := w.safetyNetInterval(); got != tc.want {
+				t.Errorf("safetyNetInterval() with WithFallback(%v) = %v, want %v", tc.fallback, got, tc.want)
+			}
+			if got := MarkerRefreshFloor(tc.fallback); got != tc.want {
+				t.Errorf("MarkerRefreshFloor(%v) = %v, want %v: the probe's deadline is derived from this and must match the loop's own cadence",
+					tc.fallback, got, tc.want)
+			}
+			if got := w.safetyNetTrigger(); got != tc.wantTrigger {
+				t.Errorf("safetyNetTrigger() with WithFallback(%v) = %q, want %q: the record must name which clock ran the scan",
+					tc.fallback, got, tc.wantTrigger)
+			}
+		})
+	}
 }
 
 // TestWatchState_scheduleScan_does_not_extend_the_debounce_window pins the
@@ -99,14 +194,14 @@ func TestWatchState_scans_re_arm_the_fallback_from_the_last_scan(t *testing.T) {
 		<-st.debounceTimer.C
 		st.runDebouncedScan(t.Context(), nil)
 
-		fired := <-st.fallbackChan()
+		fired := <-st.safetyNetTimer.C
 		if want := start.Add(2*time.Second + 6*time.Hour); !fired.Equal(want) {
 			t.Errorf("fallback fired at %v, want %v (a real scan must re-arm the fallback interval)", fired.Sub(start), want.Sub(start))
 		}
 
 		// The fallback scan itself re-arms on the same interval.
-		st.runFallbackScan(t.Context())
-		next := <-st.fallbackChan()
+		st.runSafetyNetScan(t.Context())
+		next := <-st.safetyNetTimer.C
 		if want := fired.Add(6 * time.Hour); !next.Equal(want) {
 			t.Errorf("second fallback fired at %v, want %v (the fallback must keep its interval)", next.Sub(start), want.Sub(start))
 		}
@@ -158,7 +253,7 @@ func (c liveForNCtx) Err() error {
 // TestRunDebouncedScan_skips_the_scan_when_shutdown_cut_the_resync_short pins
 // runDebouncedScan's SECOND cancellation guard, the one after the watch-set
 // re-assert. Its sibling arm has that half pinned
-// (TestHandleFallbackTick_skips_the_scan_when_shutdown_cut_the_resync_short);
+// (TestHandleSafetyNetTick_skips_the_scan_when_shutdown_cut_the_resync_short);
 // here only the entry guard was covered, so the post-re-sync guard could be
 // deleted and a shutdown landing mid-re-sync would still start a full /input
 // scan whose ScanResult drives the health marker on the way out.

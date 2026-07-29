@@ -342,14 +342,28 @@ func TestDispatchArgs(t *testing.T) {
 }
 
 // TestDispatchArgs_arms_the_marker_lease pins the staleness deadline the health
-// subcommand hands the probe: three fallback intervals (18h on the default 6h
-// cadence), and no deadline at all when FALLBACK_SCAN_HOURS disables the
-// fallback rescan, because watch-only mode has no guaranteed refresh cadence.
+// subcommand hands the probe: three refresh floors — 18h on the default 6h cadence,
+// and three reconciliation floors when FALLBACK_SCAN_HOURS switches the routine
+// rescan off, because the watcher still reconciles on that floor and every
+// reconciliation refreshes the marker. A cadence ABOVE the floor is capped by the
+// same rule, so the config package's 10-year ceiling can no longer arm a deadline
+// that never expires.
+//
+// The disabled case is the one that changed: it used to disarm the deadline entirely
+// (WithMaxAge(0) is a no-op), which is what let a wedged watcher keep a container
+// healthy indefinitely. A marker past the lease must now fail, so both sides of that
+// boundary are asserted.
+//
 // The captured options are applied with health.ProbeCheck to markers whose
 // mtimes straddle the deadline, so a wrong multiplier or a dropped option fails
 // here rather than in production. No t.Parallel: it swaps runProbe and mutates
 // the environment.
 func TestDispatchArgs_arms_the_marker_lease(t *testing.T) {
+	// Three reconciliation floors: the watcher's own guarantee rather than a
+	// configured value, so it is derived from the same function main arms the probe
+	// with.
+	reconcileLease := 3 * watch.MarkerRefreshFloor(0)
+
 	for _, tc := range []struct {
 		name          string
 		fallbackHours string
@@ -358,7 +372,9 @@ func TestDispatchArgs_arms_the_marker_lease(t *testing.T) {
 	}{
 		{"default cadence keeps a marker inside the 18h lease healthy", "", 17 * time.Hour, 0},
 		{"default cadence fails a marker past the 18h lease", "", 19 * time.Hour, 1},
-		{"a disabled fallback disarms the lease entirely", "0", 100 * time.Hour, 0},
+		{"a disabled fallback keeps a marker inside the reconciliation lease healthy", "0", reconcileLease - time.Hour, 0},
+		{"a disabled fallback fails a marker past the reconciliation lease", "0", reconcileLease + time.Hour, 1},
+		{"a cadence above the floor is capped to the reconciliation lease", "87600", reconcileLease + time.Hour, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("FALLBACK_SCAN_HOURS", tc.fallbackHours)
@@ -639,15 +655,17 @@ func TestHealthyAfterScan(t *testing.T) {
 		{"unreadable path alone stays healthy", process.ScanResult{Total: 1, Converted: 1, Unreadable: 1}, true},
 		{"failure stays unhealthy even with unreadable", process.ScanResult{Failed: 2, Unreadable: 3}, false},
 		{"orphan-only scan stays healthy", process.ScanResult{Total: 1, Orphan: 1}, true},
-		// The /output-side member of the health-neutral family: a prior bundle whose mode
-		// repair AND whose repairing rewrite were both refused for a permission reason. It
-		// already holds the right bytes and no restart grants the UID ownership of the
-		// volume, so restarting would loop forever on a condition it cannot clear — the
-		// mistake the unreadable case above exists to avoid, in the shape
-		// TestScannerRun_when_the_repairing_rewrite_is_also_refused produces (Unwritable 1,
-		// Failed 0). That test asserts the counts; this one asserts what health does with
-		// them.
-		{"refused output permission repair stays healthy", process.ScanResult{Total: 1, Unwritable: 1}, true},
+		// The /output-side member of the health-neutral family: a prior bundle this app
+		// could not replace, that it never proved wrong (its bytes matched, or it could not
+		// read them at all), where the volume refused the write for a reason no restart
+		// clears. No restart grants the UID ownership, frees a full volume or remounts a
+		// read-only one, so restarting would loop forever on a condition it cannot clear —
+		// the mistake the unreadable case above exists to avoid, in the shapes
+		// TestScannerRun_when_the_repairing_rewrite_is_also_refused and
+		// TestScannerRun_when_an_unverifiable_bundle_cannot_be_rewritten produce
+		// (Unwritable 1, Failed 0). Those tests assert the counts; this one asserts what
+		// health does with them.
+		{"refused output replacement stays healthy", process.ScanResult{Total: 1, Unwritable: 1}, true},
 		{"failure stays unhealthy even with unwritable", process.ScanResult{Total: 2, Failed: 1, Unwritable: 1}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -793,7 +811,7 @@ func TestRun_refuses_to_start_when_a_required_volume_is_missing(t *testing.T) {
 	if !strings.Contains(out, "starting cert watcher") {
 		t.Fatalf("precondition failed: run() refused before it loaded the configuration; stderr %q", out)
 	}
-	for _, attr := range []string{"password", "fallback_scan", "encoder", "output_lifecycle", "max_scan_entries"} {
+	for _, attr := range []string{"password", "fallback_scan", "scan_floor", "encoder", "output_lifecycle", "max_scan_entries"} {
 		if !strings.Contains(out, attr) {
 			t.Errorf("the startup line omits %q, so the effective configuration is not observable; stderr %q", attr, out)
 		}

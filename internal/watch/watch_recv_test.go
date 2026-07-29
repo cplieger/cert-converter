@@ -116,12 +116,12 @@ func TestHandleErrorRecv_stops_on_close_and_resyncs_on_overflow(t *testing.T) {
 	}
 }
 
-// TestHandleFallbackTick_resyncs_the_watch_set_before_scanning pins the second
-// half of the fallback tick: besides firing the safety-net rescan it re-asserts
+// TestHandleSafetyNetTick_resyncs_the_watch_set_before_scanning pins the second
+// half of the safety-net tick: besides firing the safety-net rescan it re-asserts
 // the watch set, so a directory whose watcher.Add failed earlier (unreadable, or
 // the inotify watch limit exhausted) is picked up again once the condition is
 // repaired instead of staying outside the watch set for the process's life.
-func TestHandleFallbackTick_resyncs_the_watch_set_before_scanning(t *testing.T) {
+func TestHandleSafetyNetTick_resyncs_the_watch_set_before_scanning(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)
 	root := t.TempDir()
@@ -141,21 +141,21 @@ func TestHandleFallbackTick_resyncs_the_watch_set_before_scanning(t *testing.T) 
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
-	w.handleFallbackTick(t.Context(), watcher, st)
+	w.handleSafetyNetTick(t.Context(), watcher, st)
 
 	if scans != 1 {
-		t.Errorf("handleFallbackTick scans = %d, want 1 (the safety-net rescan must still fire)", scans)
+		t.Errorf("handleSafetyNetTick scans = %d, want 1 (the safety-net rescan must still fire)", scans)
 	}
 	if !slices.Contains(watchedAtScan, nested) {
 		t.Errorf("watch set at scan time = %v, want %q already re-attached: the re-sync must run BEFORE the scan so a change landing during the scan still arrives as an event", watchedAtScan, nested)
 	}
 }
 
-// TestHandleFallbackTick_skips_the_scan_when_shutdown_cut_the_resync_short pins
-// the shutdown half of the fallback tick: a re-sync cut short by cancellation
+// TestHandleSafetyNetTick_skips_the_scan_when_shutdown_cut_the_resync_short pins
+// the shutdown half of the safety-net tick: a re-sync cut short by cancellation
 // must not go on to start a full /input scan whose result would still drive the
 // health marker while the loop is already returning.
-func TestHandleFallbackTick_skips_the_scan_when_shutdown_cut_the_resync_short(t *testing.T) {
+func TestHandleSafetyNetTick_skips_the_scan_when_shutdown_cut_the_resync_short(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)
 	root := t.TempDir()
@@ -166,10 +166,10 @@ func TestHandleFallbackTick_skips_the_scan_when_shutdown_cut_the_resync_short(t 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	w.handleFallbackTick(ctx, watcher, st)
+	w.handleSafetyNetTick(ctx, watcher, st)
 
 	if scans != 0 {
-		t.Errorf("handleFallbackTick(cancelled ctx) ran %d scans, want 0 (the loop is about to return; a shutdown must not start a scan)", scans)
+		t.Errorf("handleSafetyNetTick(cancelled ctx) ran %d scans, want 0 (the loop is about to return; a shutdown must not start a scan)", scans)
 	}
 }
 
@@ -313,11 +313,11 @@ func TestLostError_carries_the_remediation_only_where_one_exists(t *testing.T) {
 	}
 }
 
-// TestHandleFallbackTick_runs_the_scan_when_resync_fails pins the safety-net
-// half of the fallback tick: when watcher.Add fails while the context is still
+// TestHandleSafetyNetTick_runs_the_scan_when_resync_fails pins the safety-net
+// half of the safety-net tick: when watcher.Add fails while the context is still
 // live, the periodic full scan is the only remaining renewal-detection path, so
 // a failed watch-set repair must warn and still scan rather than skip the tick.
-func TestHandleFallbackTick_runs_the_scan_when_resync_fails(t *testing.T) {
+func TestHandleSafetyNetTick_runs_the_scan_when_resync_fails(t *testing.T) {
 	t.Parallel()
 	watcher := newClosedTestWatcher(t)
 	scans := 0
@@ -325,10 +325,10 @@ func TestHandleFallbackTick_runs_the_scan_when_resync_fails(t *testing.T) {
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
-	w.handleFallbackTick(t.Context(), watcher, st)
+	w.handleSafetyNetTick(t.Context(), watcher, st)
 
 	if scans != 1 {
-		t.Errorf("handleFallbackTick(resync failing) ran %d scans, want 1: a failed watch-set repair must not disable the polling safety net", scans)
+		t.Errorf("handleSafetyNetTick(resync failing) ran %d scans, want 1: a failed watch-set repair must not disable the polling safety net", scans)
 	}
 }
 

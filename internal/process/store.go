@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"path"
-	"strings"
 	"syscall"
 	"time"
 
@@ -43,7 +42,7 @@ const outputPermRemediation = "check /output ownership and permissions for the U
 type store struct {
 	root *os.Root
 	// laxDirsReported dedupes the lax-output-directory WARN to once per directory
-	// per scan. The check is asked per bundle (isCurrent runs for every .crt), but
+	// per scan. The check is asked per bundle (inspect runs for every .crt), but
 	// the fact it reports is a property of the DIRECTORY, so a flat /output holding
 	// twenty certificates must not emit twenty identical records every scan. The
 	// store is constructed per Scanner.Run, so this lasts exactly one scan.
@@ -120,11 +119,11 @@ func (s *store) reportLaxDirAt(dir string) {
 
 // writeFileInRoot is store.write's confined atomic write, indirected through a
 // package var for the same reason chmodInRoot is: the failure that now decides a
-// HEALTH outcome — an /output directory whose write is refused for a permission
-// reason, while the bundle already there holds the right bytes — cannot be staged in
+// HEALTH outcome — an /output write the volume refuses for a reason no restart clears,
+// while the bundle already there is one this app never proved wrong — cannot be staged in
 // a temp directory. The suite owns everything it creates, and as root nothing refuses
 // it at all, so without this seam the health-neutral arm in
-// scanWalk.noteWriteFailure would go unpinned and a future simplification could fold
+// writeOutcome would go unpinned and a future simplification could fold
 // it back into the ordinary conversion failure that restart-loops the container.
 var writeFileInRoot = atomicfile.WriteFileInRoot
 
@@ -139,7 +138,7 @@ func (s *store) write(ctx context.Context, rel string, pfx []byte) error {
 	if _, err := writeFileInRoot(ctx, s.root, rel, pfx,
 		atomicfile.WithMode(pfxFileMode),
 		atomicfile.WithMkdirMode(pfxDirMode),
-		// Mirror the read bound: isCurrent reads this same file back under
+		// Mirror the read bound: inspect reads this same file back under
 		// maxPFXSize, so a bundle this app writes above that cap is one its own
 		// currency check would refuse, which is the permanent rewrite loop
 		// maxPFXSize's comment exists to prevent. The cap is checked before the
@@ -248,64 +247,139 @@ func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
 // read cap here and the preflight's own bounds cannot drift apart.
 const maxPFXSize = convert.MaxBundleBytes
 
-// staleCause names WHY a bundle was reported stale, for the ONE consumer that has to
-// tell the difference: convertEntry, which must know whether an /output write the
-// filesystem refuses is a conversion failure or the health-neutral ownership condition
-// the mode repair has already reported. It is meaningful only alongside a stale
-// verdict; a current bundle carries staleOrdinary and nothing reads it.
-type staleCause int
+// contentState is the first of the two facts one prior-bundle inspection resolves:
+// what this app KNOWS about the bytes already at the output path. It answers only that
+// question — never "should a write happen", never "is this a failure" — so the facts
+// that used to be smuggled through a single currency verdict each have a home of their
+// own instead.
+//
+// Three outcomes rather than two, and that is the point. "Could not verify" is a
+// first-class value and NOT a synonym for stale: a bundle this app could not read is one
+// it cannot compare, which is a different fact from one it compared and found out of
+// date, and only the second is evidence that the operator is being served the wrong
+// bundle. Collapsing the two is what let a permission-refused rewrite of an unverifiable
+// bundle count as a conversion failure and pin the container unhealthy on every scan,
+// unclearable by a restart.
+type contentState int
 
 const (
-	// staleOrdinary covers every reason a rewrite is the WHOLE remedy: absent, renewed,
-	// unreadable, oversized, a changed encoder profile or password, a non-regular
-	// occupant. A write that fails here means the bundle those inputs produce is not on
-	// disk, so it is a conversion failure whatever the errno.
-	staleOrdinary staleCause = iota
-	// staleModeRepairRefused means the bundle's CONTENT was never in question: it is
-	// stale only because its mode is laxer than policy and the chmod was refused, so the
-	// rewrite is a permission repair rather than a conversion. When that rewrite is
-	// ALSO refused for a permission reason, nothing about the operator's PFX is missing
-	// or out of date and no restart can change the outcome, which is what makes that one
-	// case health-neutral (see scanWalk.noteWriteFailure).
-	staleModeRepairRefused
+	// contentUnresolved is the zero value and is deliberately NOT an outcome: inspect
+	// returns it only alongside an error (a shutdown), where the caller returns before any
+	// outcome is derived. Like statusUnset it exists so a value propagated by mistake
+	// cannot read as one of the two facts that grant health-neutrality.
+	contentUnresolved contentState = iota
+	// contentVerifiedCurrent: the bytes on disk were read, decoded and compared, and they
+	// ARE the bundle these inputs produce. The strongest fact here, and the only one that
+	// lets a scan skip the write entirely.
+	contentVerifiedCurrent
+	// contentVerifiedStale: this app established that the output path does not hold a
+	// usable copy of the bundle these inputs produce — it holds nothing at all, holds
+	// something that is not a regular file, holds a bundle whose encoder profile or
+	// content differs, or holds one that will not decode with the configured password.
+	// The operator is being served the wrong bundle, or none, so the rewrite is the WHOLE
+	// remedy and a rewrite that fails is a conversion failure whatever the errno.
+	contentVerifiedStale
+	// contentUnverified: nobody compared the bytes. The stat failed, the file is above
+	// maxPFXSize, the read failed, or the codec's preflight refused to look at it. A
+	// rewrite is still the right move — this app can answer "I cannot tell" by writing
+	// what it knows — but the fact carries NO claim that the bundle on disk is wrong, so
+	// on its own it never affects health.
+	contentUnverified
 )
 
-// isCurrent reports whether the output at rel is already the bundle want would
-// produce, by READING it rather than by remembering what was written.
+// String names the fact for an operator. The standing WARN for a health-neutral write
+// refusal carries it, because "which of these three did the app actually know?" is the
+// first thing an operator has to establish about a bundle left in place, and one message
+// text cannot carry all three.
+func (c contentState) String() string {
+	switch c {
+	case contentVerifiedCurrent:
+		return "verified-current"
+	case contentVerifiedStale:
+		return "verified-stale"
+	case contentUnverified:
+		return "unverified"
+	default:
+		return "unresolved"
+	}
+}
+
+// bundleState is what one inspection of the output path resolved, as two INDEPENDENT
+// facts rather than one verdict: what this app knows about the bytes on disk
+// (contentState) and whether the mode repair converged (tightenResult). Neither says
+// what should happen next — convertEntry derives that once, after the write, from these
+// two facts plus the write's own outcome (writeOutcome).
+//
+// Two ints: cheap to pass by value, and nothing here is mutated after inspect returns.
+type bundleState struct {
+	content contentState
+	repair  tightenResult
+}
+
+// upToDate reports whether the output path needs no write at all: the bytes on disk are
+// already the bundle these inputs produce AND the mode repair converged. A REFUSED mode
+// repair is the one non-content reason to rewrite — a chmod this process may not perform
+// on a file it does not own, which a temp+rename replacement can still converge because
+// it needs permission on the output DIRECTORY rather than on the file (tightenMode owns
+// that reasoning).
+func (st bundleState) upToDate() bool {
+	return st.content == contentVerifiedCurrent && st.repair != tightenRefused
+}
+
+// modeRepairOnly reports the one shape whose rewrite carries no new bytes: the content
+// was compared and matched, the mode is laxer than policy, and the chmod was refused.
+// It is DERIVED from the two facts here rather than remembered by whoever noticed the
+// refusal first, which is the whole reason they are separate — the previous shape had to
+// tag its currency verdict to keep this promise, and the arms that could not read the
+// bundle overwrote the tag.
+func (st bundleState) modeRepairOnly() bool {
+	return st.content == contentVerifiedCurrent && st.repair == tightenRefused
+}
+
+// bundleNotProvenWrong reports whether a failed rewrite leaves the operator with a
+// bundle this app has no evidence against: one it compared and matched, or one it could
+// not read at all. Spelled as an ALLOWLIST of exactly those two facts, so the zero value
+// and any fact added later take the loud direction — a conversion failure — by
+// construction rather than by omission.
+func (st bundleState) bundleNotProvenWrong() bool {
+	return st.content == contentVerifiedCurrent || st.content == contentUnverified
+}
+
+// inspect resolves what this app knows about the output at rel, by READING it rather
+// than by remembering what was written: the state of its content, and the outcome of the
+// mode repair. It decides nothing else — not whether to write, not whether a failure is
+// a failure. Those are derived once, after the write, in writeOutcome.
 //
 // Reading the output keeps currency stable across process restarts and detects
 // out-of-band replacement, password rotation, and encoder-profile changes without
 // persisted state.
 //
-// Every "I cannot tell what is on disk" outcome resolves to stale: rewrite. That
-// covers a decode failure (Debug: a rotated password, a truncated or foreign file)
-// and, at WARN, a stat failure, an unreadable file, or an oversized file — the app
-// can fix all of those itself by rewriting, and if the rewrite genuinely cannot
-// happen THAT failure flips health, which is the honest signal. The first two carry
-// the /output ownership hint, because that is what they mean; the oversized arm
-// deliberately carries none, because store.write refuses to emit a bundle above
-// maxPFXSize, so a file over the bound was written by something else and the rewrite
-// itself is the whole remedy. Only shutdown is a hard error: it is neither current
-// nor stale, and treating it as stale would rewrite every in-flight pair on the way
-// out.
+// Every "I cannot tell what is on disk" outcome resolves to contentUnverified: a decode
+// failure is the exception, because the codec DID look and the bundle will not open with
+// the configured password, which proves it is not the one these inputs produce
+// (contentVerifiedStale). The unverified arms are the stat failure, the file above
+// maxPFXSize, the read failure and the codec's preflight refusing to look. All of them
+// still lead to a rewrite — the app can answer "I cannot tell" by writing what it knows —
+// but none of them claims the bundle on disk is wrong, and that distinction is exactly
+// what health has to respect. The stat and read arms carry the /output ownership hint,
+// because that is what they mean; the oversized arm deliberately carries none, because
+// store.write refuses to emit a bundle above maxPFXSize, so a file over the bound was
+// written by something else and the rewrite itself is the whole remedy. Only shutdown is
+// a hard error: it is neither current nor stale, and treating it as stale would rewrite
+// every in-flight pair on the way out.
 //
-// Permission bits reach the verdict in ONE case only: a mode repair the filesystem
-// REFUSED. A bundle laxer than pfxFileMode is normally tightened in place with a
-// chmod (tightenMode, which owns the reasoning) and stays current, so no mode a chmod
-// can fix ever triggers a rewrite. When the chmod is refused outright (EPERM/EACCES,
-// i.e. the bundle belongs to another UID), the chmod cannot converge but a rewrite
-// can — the temp+rename needs write permission on the output DIRECTORY, not on the
-// file it replaces — so that case resolves to stale like every other "this app can
-// fix it itself" outcome. It is reported as staleModeRepairRefused rather than as a
-// plain stale verdict, because it is the one stale reason whose FAILED rewrite is not
-// a conversion failure — and ONLY when the content comparison below has already said the
-// bytes on disk are the bundle these inputs produce. That is what makes the cause's promise
-// to scanWalk.noteWriteFailure ("the bundle's CONTENT was never in question") true. A bundle
-// that is stale for any other reason, or whose content this app could not read at all, keeps
-// staleOrdinary, so a refused rewrite of it stays a conversion failure.
-func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysis,
+// Permission bits never reach the content fact. A bundle laxer than pfxFileMode is
+// normally tightened in place with a chmod (tightenMode, which owns the reasoning) and
+// its content is compared as usual; when that chmod is REFUSED outright (EPERM/EACCES,
+// i.e. the bundle belongs to another UID) the chmod can never converge but a rewrite can,
+// because the temp+rename needs write permission on the output DIRECTORY rather than on
+// the file it replaces. That refusal is REPORTED as the repair fact and nothing else:
+// bundleState.upToDate is what turns it into a rewrite, and bundleState.modeRepairOnly is
+// what lets the caller say afterwards that this rewrite carried no new bytes. Returning
+// it folded into the currency verdict is what previously made those two facts one value.
+func (s *store) inspect(ctx context.Context, rel string, want *convert.Analysis,
 	wantEncoder convert.EncoderType, password string,
-) (bool, staleCause, error) {
+) (bundleState, error) {
 	// Asked before the bundle's own lstat so it covers the absent-bundle arm too: the
 	// directory is lax whether or not a prior bundle sits in it. Report-only, so it
 	// never changes the currency answer, the write, the reap or health — see
@@ -314,24 +388,29 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 	fi, err := s.lstat(rel)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return false, staleOrdinary, nil
+		// Nothing on disk is the strongest form of "not the bundle these inputs produce":
+		// there is no copy for a consumer to read, so a rewrite that fails here is a
+		// conversion failure whatever refused it.
+		return bundleState{content: contentVerifiedStale}, nil
 	case err != nil:
 		// Degrade rather than fail the pair. This question is only "is the file on disk
 		// already the bundle these inputs produce?", and "I cannot tell" answers it: treat
-		// it as stale and rewrite. Failing here instead flipped the pair to statusFailed
-		// and pinned the container unhealthy over something the app can fix ITSELF — the
-		// realistic cause is a root-owned .pfx left behind by an earlier deployment before
-		// the user: mapping changed. If the rewrite genuinely cannot happen, THAT failure
-		// flips health, which is the honest signal. Consistent with the oversized case
-		// below, which already regenerates.
+		// it as unverified and rewrite. Failing here instead flipped the pair to
+		// statusFailed and pinned the container unhealthy over something the app can fix
+		// ITSELF — the realistic cause is a root-owned .pfx left behind by an earlier
+		// deployment before the user: mapping changed. If the rewrite genuinely cannot
+		// happen and a restart could clear the reason, THAT failure flips health, which is
+		// the honest signal. Consistent with the oversized case below, which already
+		// regenerates.
 		slog.Warn("cannot stat prior pfx; regenerating",
 			"path", rel, "error", err,
 			"remediation", outputPermRemediation)
-		return false, staleOrdinary, nil
+		return bundleState{content: contentUnverified}, nil
 	case !fi.Mode().IsRegular():
 		// A directory, symlink or device node at the output name is not a usable
 		// prior bundle, and a symlink must never be followed here or unrelated
-		// content could satisfy the check.
+		// content could satisfy the check. It is a VERIFIED absence of a usable bundle
+		// rather than an unverified one: the shape alone settles it, no read required.
 		//
 		// Named at WARN like the other "cannot tell what is on disk" arms, because
 		// nothing else records the SHAPE. What happens next depends on the occupant:
@@ -348,22 +427,20 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 		slog.Warn("prior output path is not a regular file; regenerating",
 			"path", rel, "mode", fi.Mode().String(),
 			"remediation", "remove whatever occupies the output path; this app writes only regular files there")
-		return false, staleOrdinary, nil
+		return bundleState{content: contentVerifiedStale}, nil
 	}
 
-	// Permission repair, not a verdict — with one exception. It runs before every
-	// return below so a bundle this app keeps and one it is about to replace are
-	// treated alike, and so a rewrite that then fails does not leave a private key
-	// readable by the world with nothing logged.
-	// The refusal is REMEMBERED rather than returned: staleModeRepairRefused promises
-	// the caller (scanWalk.noteWriteFailure) that the bundle's CONTENT was never in
-	// question, and returning here made that promise without ever reading the bundle.
-	modeRepairRefused := s.tightenMode(rel, fi) == tightenRefused
+	// Fact two, resolved in full rather than reduced to a boolean. It runs before every
+	// return below so a bundle this app keeps and one it is about to replace are treated
+	// alike, and so a rewrite that then fails does not leave a private key readable by the
+	// world with nothing logged. The three arms above return before it because no repair
+	// was attempted there, which is exactly what tightenNotNeeded (the zero value) says.
+	repair := s.tightenMode(rel, fi)
 
 	if fi.Size() > maxPFXSize {
 		slog.Warn("prior pfx exceeds the readable bound; regenerating",
 			"path", rel, "size", fi.Size(), "limit", maxPFXSize)
-		return false, staleOrdinary, nil
+		return bundleState{content: contentUnverified, repair: repair}, nil
 	}
 
 	prior, err := s.readBoundedPFX(ctx, rel)
@@ -376,14 +453,13 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 			// and wrapping that alone made IsShutdown false and logged a routine
 			// shutdown at ERROR. The decode-failure gate below already wraps ctx.Err()
 			// for the same reason; joining keeps the read error for diagnosis.
-			return false, staleOrdinary, fmt.Errorf("read prior pfx: %w", errors.Join(ctxErr, err))
+			return bundleState{repair: repair}, fmt.Errorf("read prior pfx: %w", errors.Join(ctxErr, err))
 		}
-		// Same reasoning as the stat failure above: unreadable means "cannot tell",
-		// which resolves to stale.
+		// Same reasoning as the stat failure above: unreadable means "cannot tell".
 		slog.Warn("cannot read prior pfx; regenerating",
 			"path", rel, "error", err,
 			"remediation", outputPermRemediation)
-		return false, staleOrdinary, nil
+		return bundleState{content: contentUnverified, repair: repair}, nil
 	}
 
 	// CheckCurrency owns the mandatory preflight -> profile -> decode -> content
@@ -397,25 +473,17 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 	// would bound how long this caller waits, not the work done. See
 	// internal/convert profile.go maxKDFIterations.
 	res := convert.CheckCurrency(prior, password, want, wantEncoder)
-	current, err := currentFromCurrency(ctx, rel, res, wantEncoder)
-	if err == nil && current && modeRepairRefused {
-		// Stale for the MODE alone: the bundle already holds the bytes these inputs
-		// produce, so the rewrite is a permission repair and a refusal of it is the
-		// health-neutral condition noteWriteFailure reports. A bundle that is stale for
-		// any OTHER reason keeps staleOrdinary, so a refused rewrite of it stays a
-		// conversion failure — the README's /output contract conditions the exception on
-		// exactly this ("except where the bundle already on disk holds the right bytes").
-		return false, staleModeRepairRefused, nil
-	}
-	return current, staleOrdinary, err
+	content, err := contentFromCurrency(ctx, rel, res, wantEncoder)
+	return bundleState{content: content, repair: repair}, err
 }
 
-// currentFromCurrency turns a convert.Currency outcome into isCurrent's verdict:
-// what each outcome MEANS for the output tree, with its own diagnostic. Only
-// shutdown is a hard error; every other non-match resolves to "rewrite it".
-func currentFromCurrency(ctx context.Context, rel string, res convert.Currency,
+// contentFromCurrency turns a convert.Currency outcome into a content fact: what each
+// outcome MEANS about the bytes on disk, with its own diagnostic. Only shutdown is a hard
+// error; every other outcome resolves to a fact, and every fact but contentVerifiedCurrent
+// leads to a rewrite.
+func contentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 	wantEncoder convert.EncoderType,
-) (bool, error) {
+) (contentState, error) {
 	// Shutdown is a third category, neither current nor stale, and it is
 	// state-independent: it wins before every verdict arm below. Checked here rather
 	// than inside one arm, because a stale verdict returned from any other arm makes
@@ -423,12 +491,16 @@ func currentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 	// requested. Treating it as stale would make every in-flight pair rewrite on the
 	// way out.
 	if err := ctx.Err(); err != nil {
-		return false, fmt.Errorf("inspect prior pfx: %w", err)
+		return contentUnresolved, fmt.Errorf("inspect prior pfx: %w", err)
 	}
 	switch res.Reason {
 	case convert.CurrencyPreflightFailed:
+		// The preflight REFUSED TO LOOK — a bundle whose declared key-derivation counts
+		// are outside what this app will spend CPU on, or one whose structure it will not
+		// parse. Nothing about the bytes was compared, so this is the unverified fact and
+		// not a claim that the operator's bundle is wrong.
 		slog.Debug("prior pfx failed preflight; regenerating", "path", rel, "error", res.Err)
-		return false, nil
+		return contentUnverified, nil
 	case convert.CurrencyProfileMismatch:
 		// A deliberate PFX_ENCODER change. Without this the switch would rewrite
 		// nothing: the leaf, key and chain all still match, so the bundle would keep
@@ -436,16 +508,22 @@ func currentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 		// profile.
 		slog.Info("prior pfx uses a different encoder profile; regenerating",
 			"path", rel, "found", string(res.Profile), "configured", string(wantEncoder))
-		return false, nil
+		return contentVerifiedStale, nil
 	case convert.CurrencyDecodeFailed:
-		// Expected and non-fatal: a rotated password, a truncated file, a foreign
-		// file at that path. All mean the same thing — rewrite it.
+		// Expected and non-fatal: a rotated password, a truncated file, a foreign file at
+		// that path. Verified STALE rather than unverified, because the codec did look and
+		// the bundle will not open with the configured password — which is the password
+		// every consumer of this output uses, so what is on disk is not a usable copy of
+		// the bundle these inputs produce.
 		slog.Debug("prior pfx did not decode; regenerating", "path", rel, "error", res.Err)
-		return false, nil
+		return contentVerifiedStale, nil
 	default:
 		// A match, or a plain content mismatch: the ordinary renewed-certificate
 		// outcome, which needs no diagnostic of its own.
-		return res.Current(), nil
+		if res.Current() {
+			return contentVerifiedCurrent, nil
+		}
+		return contentVerifiedStale, nil
 	}
 }
 
@@ -461,8 +539,9 @@ const modeNotTightenedMsg = "prior pfx is more permissive than policy and could 
 // because the two now differ in what happens next — this one is followed by a
 // regeneration, which converges wherever the output DIRECTORY is writable — and an
 // operator must not read one message for two causes with two outcomes. When the
-// directory refuses the write too, this line is followed by unwritableBundleMsg, which
-// names the standing condition; this one only ever announces the attempt.
+// directory refuses the write too, this line is followed by unwritableBundleMsg (or, for
+// a refusal that is not a permission denial, unreplaceableBundleMsg), which names the
+// standing condition; this one only ever announces the attempt.
 const modeRepairRefusedMsg = "prior pfx is more permissive than policy and the mode repair was refused; regenerating"
 
 // outputModeRemediation is modeNotTightenedMsg's hint. Deliberately NOT
@@ -492,7 +571,7 @@ func laxerThanPolicy(perm os.FileMode) bool {
 	return perm&^pfxFileMode != 0
 }
 
-// tightenResult is the outcome of one mode-repair attempt, as isCurrent needs to see
+// tightenResult is the outcome of one mode-repair attempt, as its caller needs to see
 // it: whether the extra permission bits are gone, and when they are not, whether a
 // rewrite could still remove them. The distinction is the whole point of the type —
 // exactly one failure shape (a refusal) is convergeable by rewriting, so collapsing
@@ -518,9 +597,10 @@ const (
 )
 
 // isPermissionRefusal reports whether err is the filesystem REFUSING an operation for
-// a permission reason, as opposed to failing it for any other reason. Both /output
-// touches whose outcome turns on that distinction ask it: tightenMode's chmod, and the
-// rewrite that a refused chmod schedules (scanWalk.noteWriteFailure).
+// a permission reason, as opposed to failing it for any other reason. Two /output
+// questions turn on that distinction and both ask it here: tightenMode's chmod, where a
+// refusal is the evidence that another UID owns the bundle, and restartCanClearWrite,
+// where it is the first of the classes no restart clears.
 //
 // fs.ErrPermission is the whole test rather than two errors.Is calls against
 // syscall.EPERM and syscall.EACCES: os.Root.Chmod and atomicfile's confined write both
@@ -531,6 +611,42 @@ const (
 // test seam injects directly.
 func isPermissionRefusal(err error) bool {
 	return errors.Is(err, fs.ErrPermission)
+}
+
+// restartCanClearWrite reports whether a FAILED /output write is one a container restart
+// could plausibly clear. That is the only question health has to answer — health means
+// "should an orchestrator restart this container?" — so it is the third fact writeOutcome
+// derives an entry's status from.
+//
+// It is a property of the ERROR and of nothing else. The previous shape asked the
+// STALENESS CAUSE instead, which is why a rewrite refused for permissions was counted as
+// a conversion failure whenever the bundle happened to be one this app could not read:
+// why the app decided to rewrite says nothing about whether restarting changes the
+// outcome.
+//
+// The unclearable classes are enumerated, and everything else is clearable — the safe
+// direction, because an error this app cannot attribute to a steady-state condition of
+// the operator's volume might genuinely be gone on the next attempt, and a conversion
+// failure is the loud outcome:
+//
+//   - EACCES / EPERM (isPermissionRefusal): a UID does not gain a permission by
+//     restarting. Only a chown or a chmod on /output clears it.
+//   - EROFS: a read-only mount is a mount option, not process state.
+//   - ENOSPC / EDQUOT: a full volume or an exhausted quota. A restarted container writes
+//     the same bytes into the same full volume.
+//
+// It says nothing about whether the write SHOULD have succeeded: writeOutcome asks this
+// only after establishing that the bundle already on disk is not one this app proved
+// wrong.
+func restartCanClearWrite(err error) bool {
+	switch {
+	case isPermissionRefusal(err):
+		return false
+	case errors.Is(err, syscall.EROFS), errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT):
+		return false
+	default:
+		return true
+	}
 }
 
 // fileOwnedByProcess is tightenMode's ownership question, indirected through a
@@ -570,10 +686,11 @@ func ownedByThisProcess(fi os.FileInfo) bool {
 // deliberate 0400 mode and would churn the bundle forever on filesystems that
 // accept chmod without storing permission bits.
 //
-// The ONE exception is a REFUSED chmod (tightenRefused), which the caller turns into
-// a stale verdict: there the chmod can never converge — this process does not own the
-// file — while a temp+rename rewrite can, because it needs permission on the output
-// directory rather than on the file. Without that arm a private-key-bearing bundle
+// The ONE exception is a REFUSED chmod (tightenRefused), which is the one repair
+// outcome bundleState.upToDate turns into a rewrite even over content that matched:
+// there the chmod can never converge — this process does not own the file — while a
+// temp+rename rewrite can, because it needs permission on the output directory rather
+// than on the file. Without that arm a private-key-bearing bundle
 // left world-readable by another UID keeps its mode for the life of the deployment
 // and is re-warned once per scan. Every other failure stays WARN-only
 // (tightenIneffective): a chmod error is not evidence that a rewrite would land, and
@@ -588,7 +705,7 @@ func ownedByThisProcess(fi os.FileInfo) bool {
 //
 // The chmod goes through the store's confined root like every other output touch, so
 // a symlink planted under the output tree cannot redirect it outside the mounted
-// volume. os.Root.Chmod does follow a symlink, and isCurrent's lstat cannot rule out
+// volume. os.Root.Chmod does follow a symlink, and inspect's lstat cannot rule out
 // a swap in the window before this call, but the reach of that race is one permission
 // bit: it never touches content, and anyone able to stage the swap on a co-mounted
 // /output can already replace the bundle itself.
@@ -639,8 +756,8 @@ func (s *store) tightenMode(rel string, fi os.FileInfo) tightenResult {
 			"error", err, "remediation", outputModeRemediation)
 		return tightenIneffective
 	case err != nil && isPermissionRefusal(err):
-		// Not ours to chmod, but ours to replace: the caller reads this outcome as
-		// stale, and the ordinary write path converges it. Named with the ownership
+		// Not ours to chmod, but ours to replace: bundleState.upToDate reads this outcome
+		// as a reason to rewrite, and the ordinary write path converges it. Named with the ownership
 		// remediation rather than the filesystem one, because that is what a refusal
 		// means.
 		slog.Warn(modeRepairRefusedMsg,
@@ -700,7 +817,7 @@ func (s *store) chmodAndObserve(rel string, want os.FileMode) (os.FileMode, erro
 // FIFO or device node planted at an output name is rejected rather than wedging
 // the scan's only goroutine in open(2) forever), requires a regular file, and
 // stats the OPEN HANDLE rather than the path — closing the window between
-// isCurrent's lstat and this open on a volume other containers write to. Those
+// inspect's lstat and this open on a volume other containers write to. Those
 // are the same three guarantees the input side already delegates in
 // source.readBoundedLimit.
 func (s *store) readBoundedPFX(ctx context.Context, rel string) ([]byte, error) {
@@ -724,9 +841,16 @@ func (s *store) readBoundedPFX(ctx context.Context, rel string) ([]byte, error) 
 // candidate. WHICH of these outputs has no input is not this function's call — that
 // comparison spans both trees, so it stays with the rest of the deletion-admission
 // rule in reap.go.
+//
+// The enumeration itself is atomicfile's (WalkDirInRoot), the same walk the /input scan
+// and the library's own stale-temp sweep use: confined descent, streaming ReadDir
+// batches, one directory handle at a time, and no descent into a symlinked directory. It
+// is a single decision for both mounts on purpose — this is the path that DELETES
+// private-key material, and it had already drifted once when each mount enumerated
+// itself.
 func (s *store) listOutputs(ctx context.Context) (found []string, safe bool, err error) {
 	walk := outputWalk{ctx: ctx, safe: true}
-	if err := walkRoot(s.root, walk.visit); err != nil {
+	if err := atomicfile.WalkDirInRoot(ctx, s.root, walk.visit); err != nil {
 		return nil, false, fmt.Errorf("walk output tree: %w", err)
 	}
 	s.logOrphanWalkOutcome(walk.unreadable, walk.symlinked)
@@ -747,7 +871,7 @@ type outputWalk struct {
 	safe       bool
 }
 
-// visit is listOutputs' walkRoot callback: one entry, one verdict.
+// visit is listOutputs' walk callback: one entry, one verdict.
 func (w *outputWalk) visit(rel string, d fs.DirEntry, err error) error {
 	// Same per-entry cancellation contract the input walk and the stale-temp
 	// sweep already honour: this walk runs on the shutdown path, because the
@@ -770,7 +894,7 @@ func (w *outputWalk) visit(rel string, d fs.DirEntry, err error) error {
 	}
 	// A symlink anywhere in the output tree makes this walk and the WRITE path
 	// disagree about where a bundle lives: writes resolve through *os.Root,
-	// which follows a symlink that stays inside the root, while walkRoot does
+	// which follows a symlink that stays inside the root, while the walk does
 	// not follow symlinks at all (its entries come from ReadDir, so a symlink
 	// reports fs.ModeSymlink and is never descended into). So a bundle written
 	// through a symlinked
@@ -846,22 +970,26 @@ const pinRedirectedMsg = "could not pin the output directory of an orphaned bund
 // removeOrphan re-checks one confirmed orphan and unlinks it through a PINNED parent
 // root, reporting whether it was deleted.
 //
-// The parent root is what makes the unlink safe. os.Root deliberately follows a
-// symlink component that stays inside the root, so a path string re-checked with
-// Lstat and then removed with Remove can address two different files if an ANCESTOR
-// is swapped in between — and reapDeferral leaves a 30-second window for exactly that:
-// replacing an approved candidate's parent directory with a symlink to a live
-// directory would make this code stat and unlink a live bundle while the input
-// confirmation was asked about the approved path. Descending component by component
-// (pinnedParent) and then naming only the BASENAME removes every ancestor from the
-// remove path, so no in-root symlink can redirect it, while the open root keeps the
+// The parent root is what makes the unlink safe, and it is atomicfile's descent
+// (OpenParentInRoot) because the hazard is a property of *os.Root rather than of this
+// app: a root deliberately follows a symlink component that stays inside it, so a path
+// string re-checked with Lstat and then removed with Remove can address two different
+// files if an ANCESTOR is swapped in between — and reapDeferral leaves a 30-second window
+// for exactly that: replacing an approved candidate's parent directory with a symlink to
+// a live directory would make this code stat and unlink a live bundle while the input
+// confirmation was asked about the approved path. The library descends component by
+// component, refusing a symlink and confirming each directory's identity, so naming only
+// the BASENAME removes every ancestor from the remove path, and the open root keeps the
 // directory pinned even if it is renamed afterwards.
+//
+// What stays here is this app's policy: which failures are transient races and which are
+// operator-actionable, and what an operator is told about each.
 func (s *store) removeOrphan(rel string) bool {
-	parent, closeParent, err := s.pinnedParent(rel)
+	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			// An ancestor vanished with its bundle during the deferral: the same
-			// transient race as the basename arm below, not a redirection. pinChild
+			// transient race as the basename arm below, not a redirection. The pin
 			// wraps its Lstat error, so this is the nested layout's spelling of the
 			// disappearance the flat layout reports from Lstat directly — and the
 			// symlink remediation on the WARN below would send an operator looking for
@@ -873,14 +1001,18 @@ func (s *store) removeOrphan(rel string) bool {
 			"remediation", "mount the real output directory instead of linking to it, and check /output for paths replaced while the scan was running")
 		return false
 	}
-	defer closeParent()
+	defer func() { _ = parent.Close() }()
 	// The walk classified this entry up to reapDeferral ago, and only a REGULAR
 	// file is a bundle this app wrote. Re-check through the pinned parent right
 	// before the unlink: it is the same durability question reapConfirmed asks of
 	// the input side, and it is what makes the README's promise ("sync only ever
 	// removes files matching this app's own output shape") true of a non-regular
 	// occupant and of one swapped in after the walk.
-	base := path.Base(rel)
+	//
+	// Spelled out here rather than delegated to atomicfile.RemoveFileInRoot, which
+	// performs the same three steps: this app has to tell a vanished candidate from an
+	// uninspectable one from a non-regular occupant, name the mode it found, and attach a
+	// different remediation to each. A single error return cannot carry that.
 	fi, statErr := parent.Lstat(base)
 	switch {
 	case errors.Is(statErr, fs.ErrNotExist):
@@ -907,59 +1039,4 @@ func (s *store) removeOrphan(rel string) bool {
 	// the audit at the default level once per path.
 	slog.Debug("removed orphaned output whose input is gone", "path", rel)
 	return true
-}
-
-// pinnedParent opens rel's parent directory as an *os.Root whose physical identity
-// has been checked component by component: every component must be a real DIRECTORY
-// (Lstat, so a symlink is refused rather than followed), and the root opened for it
-// must still address the directory that was inspected (os.SameFile against the opened
-// root's own ".").
-//
-// The returned close is the caller's to call, and is a no-op for a bundle sitting
-// directly under the output root (the flat /output layout), where the store's own root
-// already IS the pinned parent.
-func (s *store) pinnedParent(rel string) (*os.Root, func(), error) {
-	current, closeCurrent := s.root, func() {}
-	dir := path.Dir(rel)
-	if dir == "." {
-		return current, closeCurrent, nil
-	}
-	for name := range strings.SplitSeq(dir, "/") {
-		next, err := pinChild(current, name)
-		closeCurrent()
-		if err != nil {
-			return nil, nil, err
-		}
-		current, closeCurrent = next, func() { _ = next.Close() }
-	}
-	return current, closeCurrent, nil
-}
-
-// pinChild opens one directory component of parent as its own root, refusing anything
-// that is not a real directory and anything whose identity changed between the Lstat
-// and the open. Split out of pinnedParent so the descent reads as one step per
-// component rather than carrying four failure arms inline.
-func pinChild(parent *os.Root, name string) (*os.Root, error) {
-	fi, err := parent.Lstat(name)
-	if err != nil {
-		return nil, fmt.Errorf("inspect output directory %q: %w", name, err)
-	}
-	if !fi.IsDir() {
-		// A symlink lands here too, which is the point: os.Root would follow it.
-		return nil, fmt.Errorf("output path component %q is not a directory (mode %s)", name, fi.Mode().String())
-	}
-	next, err := parent.OpenRoot(name)
-	if err != nil {
-		return nil, fmt.Errorf("open output directory %q: %w", name, err)
-	}
-	opened, err := next.Stat(".")
-	if err != nil {
-		_ = next.Close()
-		return nil, fmt.Errorf("confirm output directory %q: %w", name, err)
-	}
-	if !os.SameFile(fi, opened) {
-		_ = next.Close()
-		return nil, fmt.Errorf("output directory %q changed while it was being opened", name)
-	}
-	return next, nil
 }

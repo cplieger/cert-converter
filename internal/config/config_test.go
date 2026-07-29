@@ -468,7 +468,7 @@ func TestLoad_blank_password_reports_only_the_strength_warning(t *testing.T) {
 					password, n, logs.Messages())
 			}
 			for _, unwanted := range []string{
-				"PFX_PASSWORD has leading or trailing whitespace",
+				paddedPasswordWarn,
 				"contains a control character",
 				// U+00A0 in the table above is both blank and Zs, so this is the
 				// record that the one blank guard in logPasswordDelivery suppresses;
@@ -486,11 +486,12 @@ func TestLoad_blank_password_reports_only_the_strength_warning(t *testing.T) {
 }
 
 // TestLoad_warns_when_the_fallback_rescan_is_disabled pins the startup WARN for
-// the FALLBACK_SCAN_HOURS opt-out, the only configuration in which the app
-// cannot notice that it has stopped working: no periodic re-scan, no
-// health-marker freshness deadline, and a watch dropped by an unmount that
-// fsnotify never reports. The warning is the whole detector, so its firing rule
-// matters as much as its text.
+// the FALLBACK_SCAN_HOURS opt-out. The tradeoff it names is now a LATENCY one: the
+// watcher keeps a reconciliation floor and a health-marker deadline in every
+// configuration, so what the operator gives up is recovery on their own cadence, not
+// the app's ability to notice that it has stopped working. The record must say that
+// much, or an operator reads the old "converting nothing while reporting healthy"
+// wording and either panics or ignores the line.
 //
 // It must fire ONLY for the explicit opt-out. An empty, whitespace-only, or
 // invalid value falls back to the 6h default, which is supervised and must stay
@@ -547,12 +548,18 @@ func TestLoad_warns_when_the_fallback_rescan_is_disabled(t *testing.T) {
 				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q logged %d opt-out WARN records, want exactly 1 (logs %v)",
 					tc.raw, warnings, logs.Messages())
 			}
-			// The three losses an operator has to weigh, plus the way back.
-			for _, want := range []string{"no periodic re-scan", "freshness deadline", "reporting healthy"} {
+			// What the operator gives up, what still covers them, and the way back.
+			for _, want := range []string{"no routine periodic re-scan", "reconciliation", "freshness deadline"} {
 				if !logs.Contains(want) {
 					t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN does not name %q (logs %v)",
 						tc.raw, want, logs.Messages())
 				}
+			}
+			// The old wording promised the opposite of the current contract, and an
+			// operator who has read it must not find it here again.
+			if logs.Contains("converting nothing") {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN still claims the container reports healthy while converting nothing; the reconciliation floor and the marker deadline both hold in this mode now (logs %v)",
+					tc.raw, logs.Messages())
 			}
 			if !logs.AttrContains(optOutWarn, "remediation", "FALLBACK_SCAN_HOURS") {
 				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN carries no remediation naming the variable (logs %v)",
@@ -562,22 +569,46 @@ func TestLoad_warns_when_the_fallback_rescan_is_disabled(t *testing.T) {
 	}
 }
 
-func TestLoad_password_file_takes_precedence_over_env(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "pfx-password")
-	if err := os.WriteFile(path, []byte("  from-file\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PFX_PASSWORD", "from-env")
-	t.Setenv("PFX_PASSWORD_FILE", path)
-	t.Setenv("PFX_ENCODER", "")
+// TestLoad_password_file_is_verbatim_and_takes_precedence_over_env pins BOTH halves
+// of the mounted-secret contract as envx v1.5.0 defines it: the file still wins over
+// PFX_PASSWORD, and the value it delivers is the file's bytes VERBATIM apart from at
+// most ONE trailing line ending. Edge spaces and tabs, a second trailing newline and a
+// leading newline are content, because whitespace an operator put in a secret is part
+// of the credential and trimming it turns a valid password into a subtly wrong one.
+// envx used to run TrimSpace over the file's content, which is why this test used to
+// expect a trimmed value: rewriting the secret on the way in protects every generated
+// .pfx with a password nobody configured, encoding succeeds either way, and health
+// never notices.
+func TestLoad_password_file_is_verbatim_and_takes_precedence_over_env(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		contents string
+		want     string
+	}{
+		{"edge whitespace is content, one trailing newline is not", "  from-file\n", "  from-file"},
+		{"a trailing tab is content", "from-file\t\n", "from-file\t"},
+		{"a CRLF line ending is removed whole", "from-file\r\n", "from-file"},
+		{"only ONE trailing newline is removed", "from-file\n\n", "from-file\n"},
+		{"a leading newline is content", "\nfrom-file", "\nfrom-file"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "pfx-password")
+			if err := os.WriteFile(path, []byte(tc.contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PFX_PASSWORD", "from-env")
+			t.Setenv("PFX_PASSWORD_FILE", path)
+			t.Setenv("PFX_ENCODER", "")
 
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() with PFX_PASSWORD_FILE = %v, want nil", err)
-	}
-	if cfg.Password != "from-file" {
-		t.Errorf("Load() Password = %q, want %q (file wins over env, whitespace trimmed)",
-			cfg.Password, "from-file")
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() with PFX_PASSWORD_FILE = %v, want nil", err)
+			}
+			if cfg.Password != tc.want {
+				t.Errorf("Load() Password = %q, want %q (the file wins over PFX_PASSWORD, and its bytes are the password apart from one trailing line ending)",
+					cfg.Password, tc.want)
+			}
+		})
 	}
 }
 
@@ -1333,10 +1364,11 @@ func TestLoad_blank_secret_file_error_names_configured_path(t *testing.T) {
 	}
 }
 
-// TestLoad_warns_when_the_env_password_is_padded pins the whitespace diagnostic:
-// envx trims a PFX_PASSWORD_FILE secret but PFX_PASSWORD is used verbatim, so a
-// padded env value silently yields a different password than the same secret
-// delivered as a file. The WARN is the only signal an operator gets. Serial: it
+// TestLoad_warns_when_the_env_password_is_padded pins the whitespace diagnostic on the
+// env channel: PFX_PASSWORD is used verbatim, so the padding is part of the password
+// embedded in every bundle and the WARN is the only signal an operator gets.
+// TestLoad_warns_when_a_mounted_secret_password_is_padded pins the same record on the
+// file channel, which envx v1.5.0 made reachable. Serial: it
 // swaps slog.Default().
 func TestLoad_warns_when_the_env_password_is_padded(t *testing.T) {
 	for _, tc := range []struct {
@@ -1358,10 +1390,77 @@ func TestLoad_warns_when_the_env_password_is_padded(t *testing.T) {
 			if _, err := Load(); err != nil {
 				t.Fatalf("Load() with PFX_PASSWORD=%q = %v, want nil", tc.password, err)
 			}
-			const msg = "PFX_PASSWORD has leading or trailing whitespace"
-			if warned := logs.CountLevel(slog.LevelWarn, msg) > 0; warned != tc.wantWarn {
+			if warned := logs.CountLevel(slog.LevelWarn, paddedPasswordWarn) > 0; warned != tc.wantWarn {
 				t.Errorf("Load() with PFX_PASSWORD=%q warned = %v, want %v (logs %v)",
 					tc.password, warned, tc.wantWarn, logs.Messages())
+			}
+			if tc.wantWarn && !logs.HasAttr(paddedPasswordWarn, "source", "PFX_PASSWORD") {
+				t.Errorf("padding WARN does not name the delivery channel as the env-var name an operator filters on (logs %v)", logs.Messages())
+			}
+		})
+	}
+}
+
+// TestLoad_warns_when_a_mounted_secret_password_is_padded pins the padding WARN on the
+// channel envx v1.5.0 made reachable. The file channel used to run the secret's content
+// through TrimSpace, so a padded PFX_PASSWORD_FILE could not produce a padded password
+// and the WARN was gated on the env channel. It now returns every byte the operator
+// wrote apart from at most one trailing line ending, so a mounted secret an editor left
+// with a leading space or a trailing tab yields a .pfx nobody can open with the secret's
+// visible contents — written, health green, and (before this record) with no diagnostic
+// at all. Restoring the source == envx.SourceEnv gate must fail this test.
+//
+// The quiet cases are what keep it honest: one trailing newline is the line ending every
+// editor and `kubectl create secret --from-file` appends, so a secret that only carries
+// that must NOT warn, or the record fires on every correctly mounted deployment. Serial:
+// it swaps slog.Default().
+func TestLoad_warns_when_a_mounted_secret_password_is_padded(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		contents     string
+		wantPassword string
+		wantWarn     bool
+	}{
+		{"leading and trailing spaces warn", "  s3cret  \n", "  s3cret  ", true},
+		{"a trailing tab warns", "s3cret\t\n", "s3cret\t", true},
+		{"the second trailing newline is padding and warns", "s3cret\n\n", "s3cret\n", true},
+		{"a leading newline warns", "\ns3cret\n", "\ns3cret", true},
+		{"the one trailing line ending is not padding", "s3cret\n", "s3cret", false},
+		{"a CRLF line ending is not padding", "s3cret\r\n", "s3cret", false},
+		{"inner spaces are not padding", "two words\n", "two words", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "pfx-password")
+			if err := os.WriteFile(path, []byte(tc.contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PFX_PASSWORD", "")
+			t.Setenv("PFX_PASSWORD_FILE", path)
+			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
+
+			logs := capture.Default(t)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() with PFX_PASSWORD_FILE=%q = %v, want nil: padding is a WARN, not a startup refusal", tc.contents, err)
+			}
+			// Asserted alongside the WARN so the two cannot drift: the record is only
+			// truthful if the padding really is part of the delivered password.
+			if cfg.Password != tc.wantPassword {
+				t.Errorf("Load() with PFX_PASSWORD_FILE=%q Password = %q, want %q verbatim",
+					tc.contents, cfg.Password, tc.wantPassword)
+			}
+			wantCount := 0
+			if tc.wantWarn {
+				wantCount = 1
+			}
+			if n := logs.CountLevel(slog.LevelWarn, paddedPasswordWarn); n != wantCount {
+				t.Errorf("Load() with PFX_PASSWORD_FILE=%q logged %d padding WARN records, want %d (logs %v)",
+					tc.contents, n, wantCount, logs.Messages())
+			}
+			if tc.wantWarn && !logs.HasAttr(paddedPasswordWarn, "source", "PFX_PASSWORD_FILE") {
+				t.Errorf("padding WARN does not name the mounted-secret channel an operator filters on, got source=%q (logs %v)",
+					mustAttr(t, logs, paddedPasswordWarn, "source"), logs.Messages())
 			}
 		})
 	}
@@ -1369,8 +1468,9 @@ func TestLoad_warns_when_the_env_password_is_padded(t *testing.T) {
 
 // TestLoad_uses_the_env_password_verbatim pins the contract the padding WARN only
 // describes: PFX_PASSWORD is embedded in every bundle exactly as configured,
-// surrounding whitespace included, while envx trims the FILE channel
-// (TestLoad_password_file_takes_precedence_over_env pins that half). Normalising the
+// surrounding whitespace included — and since envx v1.5.0 the FILE channel is
+// verbatim too (TestLoad_password_file_is_verbatim_and_takes_precedence_over_env
+// pins that half). Normalising the
 // value on the way into Config keeps the padding WARN -- and every other test in this
 // package -- green while silently protecting every generated .pfx with a password the
 // operator never configured; encoding succeeds either way, so health never notices.
@@ -1551,7 +1651,7 @@ func TestLoad_wires_output_lifecycle(t *testing.T) {
 
 // TestLoad_warns_when_the_password_contains_a_control_character pins the
 // interior-control-character diagnostic, the one shape both existing guards
-// miss: envx trims only surrounding whitespace and PKCS#12 encodes a newline or
+// miss: envx delivers the configured value verbatim and PKCS#12 encodes a newline or
 // tab verbatim, so the bundle is written, health stays green, and the password
 // cannot be typed into the consumers that need it. The clean case is what keeps
 // the WARN from firing on every healthy startup.
@@ -1603,11 +1703,11 @@ func TestLoad_warns_when_the_password_contains_a_control_character(t *testing.T)
 
 // TestLoad_warns_when_a_mounted_secret_contains_a_control_character pins the
 // control-character WARN on the delivery channel that actually produces one: envx
-// trims only surrounding whitespace, so a secret file written from wrapped
+// removes at most one trailing line ending, so a secret file written from wrapped
 // `openssl rand -base64` output -- the exact cause the remediation names -- keeps its
 // interior newline, PKCS#12 embeds it verbatim, and no consumer can type the
-// password back. The guard is channel-agnostic today while its sibling padding WARN
-// is env-only, so folding the two together would silence the file channel with
+// password back. Both this guard and its sibling padding WARN are channel-agnostic,
+// so folding either into an env-only branch would silence the file channel with
 // every other test still green.
 //
 // It also pins the record's "source" attribute to PFX_PASSWORD_FILE: this is the
@@ -1631,7 +1731,7 @@ func TestLoad_warns_when_a_mounted_secret_contains_a_control_character(t *testin
 		t.Fatalf("Load() = %v, want nil: a control character is a WARN, not a startup refusal", err)
 	}
 	if cfg.Password != secret {
-		t.Fatalf("Load() Password = %q, want the file contents with only surrounding whitespace trimmed", cfg.Password)
+		t.Fatalf("Load() Password = %q, want the file contents with only the one trailing line ending removed", cfg.Password)
 	}
 	const msg = "contains a control character"
 	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
@@ -1764,8 +1864,8 @@ func TestLoad_warns_when_the_password_contains_an_invisible_formatting_character
 
 // TestLoad_warns_when_the_password_contains_a_non_ascii_space pins the third shape
 // guard beside its Cc and Cf siblings: U+00A0, U+3000 and U+2028 are Zs/Zl, so they
-// are neither control characters nor Cf, TrimSpace does not reach an interior one,
-// and each renders as (or invisibly as) the ordinary space a consumer retypes --
+// are neither control characters nor Cf, nothing trims the delivered value on either
+// channel, and each renders as (or invisibly as) the ordinary space a consumer retypes --
 // this WARN is the operator's only signal that the bundle's password is not what
 // the secret appears to say. The ASCII-space case keeps it from firing on every
 // password with a space in it; the Cc-only and Cf-only cases pin the disjointness
@@ -1905,7 +2005,8 @@ func TestLoad_warns_when_a_mounted_secret_contains_a_format_character(t *testing
 // delivered it.
 //
 // The file channel is the one that matters in practice and the one that used to
-// escape every guard: envx trims whitespace, so a secret file holding nothing but a
+// escape every guard: envx judges a secret file blank on its whitespace-trimmed
+// content and a BOM is not whitespace, so a secret file holding nothing but a
 // BOM an editor added is NOT blank to envx, arrived here as a real password, and
 // started a container whose bundles are protected by a password nobody can retype.
 // Serial: it mutates env and slog.Default.
@@ -1949,17 +2050,14 @@ func TestLoad_refuses_an_invisible_only_password_on_both_channels(t *testing.T) 
 				}
 				// The opt-out accepts the value verbatim, exactly as it does a
 				// whitespace-only one: the guard is what the opt-out waives, not
-				// the classification. envx trims a FILE secret, so the delivered
-				// value drops surrounding whitespace on that channel — the
-				// invisible runes themselves are never trimmed, which is why the
-				// value still reaches the encoder unseen.
-				wantPassword := tc.password
-				if ch.channel == "PFX_PASSWORD_FILE" {
-					wantPassword = strings.TrimSpace(tc.password)
-				}
-				if cfg.Password != wantPassword {
-					t.Errorf("Load(%s=%q, opt-out) Password = %q, want %q",
-						ch.channel, tc.password, cfg.Password, wantPassword)
+				// the classification. Both channels deliver the configured bytes
+				// verbatim (a secret file loses at most one trailing line ending,
+				// and these cases write none), so the delivered value is identical
+				// on either channel — which is why an invisible rune beside padding
+				// still reaches the encoder unseen.
+				if cfg.Password != tc.password {
+					t.Errorf("Load(%s=%q, opt-out) Password = %q, want %q verbatim",
+						ch.channel, tc.password, cfg.Password, tc.password)
 				}
 				if cfg.PasswordStatus != PasswordInvisibleOnly {
 					t.Errorf("Load(%s=%q, opt-out) status = %q, want %q: the startup line must not report a password nobody can retype as configured",
@@ -1997,11 +2095,18 @@ func TestLoad_refuses_an_invisible_only_password_on_both_channels(t *testing.T) 
 // matcher selects.
 const invisibleOnlyWarn = "consists only of invisible Unicode formatting characters"
 
+// paddedPasswordWarn is the message substring of the leading/trailing-whitespace WARN.
+// Named once: three tests key on it (both delivery channels plus the blank-password
+// suppression), and it is the operator-facing text a Loki matcher selects. Channel-
+// neutral by design — the record fires for a padded PFX_PASSWORD and a padded
+// PFX_PASSWORD_FILE alike, and names which one in its "source" attribute.
+const paddedPasswordWarn = "the PFX password has leading or trailing whitespace"
+
 // setPasswordChannel configures the PFX password through exactly one delivery
 // channel, so a test can assert that both channels reach the same decision without
 // each case re-deriving the isolation. The file channel writes the value verbatim
-// (no trailing newline), because a trailing newline is whitespace envx trims and
-// would change the classification under test.
+// (no trailing newline), because envx removes at most one trailing line ending from a
+// secret file and that removal would change the classification under test.
 func setPasswordChannel(t *testing.T, channel, password string) {
 	t.Helper()
 	switch channel {
@@ -2051,7 +2156,8 @@ func TestLoad_derives_status_and_warnings_from_one_classification(t *testing.T) 
 		{"env whitespace-only", "PFX_PASSWORD", " \t", PasswordWhitespaceOnly, []string{whitespaceWarn}},
 		{"env invisible-only", "PFX_PASSWORD", "\ufeff", PasswordInvisibleOnly, []string{invisibleOnlyWarn}},
 		{"env configured", "PFX_PASSWORD", "hunter2", PasswordConfigured, nil},
-		// envx trims a file secret, so an empty and a whitespace-only file are the
+		// envx judges a secret file's blankness on its whitespace-trimmed content, so
+		// an empty and a whitespace-only file are the
 		// same delivery failure and both arrive as ErrBlankSecretFile with an empty
 		// password: the channel-specific record reports it and the generic
 		// empty-password line is deliberately suppressed.

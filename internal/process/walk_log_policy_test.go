@@ -240,7 +240,7 @@ func TestStoreLogOrphanWalkOutcome_reports_each_disabling_condition(t *testing.T
 
 // TestOutputWalkVisit_an_unreadable_path_vetoes_the_reap pins the orphan walk's
 // deletion-safety accounting on the arm no uid can be relied on to reach: an
-// /output sub-path walkRoot hands back with an error must veto reaping for the
+// /output sub-path the walk hands back with an error must veto reaping for the
 // whole scan (safe = false), must feed the aggregate counter, and must not abort
 // the walk.
 //

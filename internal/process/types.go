@@ -38,16 +38,30 @@ type conversionStatus int
 // naming the renewal race there would alert an operator on exactly the activity this
 // daemon exists to process.
 //
-// statusUnwritable is the /output-side member of the same health-neutral family, and
-// it covers exactly one shape: a prior bundle whose CONTENT is already correct, whose
-// mode is laxer than policy, whose chmod the filesystem refused, and whose repairing
-// rewrite the filesystem refused too — the "operator changed PUID and left root-owned
-// output behind" deployment, where the file and its directory are both foreign-owned.
-// Nothing about the operator's PFX is missing or out of date, and no restart can grant
-// a permission the UID does not have, so counting it as statusFailed would restart-loop
-// the container over a condition a restart cannot clear. Every OTHER failed PFX write
-// stays statusFailed and still flips health. Like the two /input members it is
-// health-neutral, reported by its own standing WARN, and it blocks orphan reaping.
+// statusUnwritable is the /output-side member of the same health-neutral family, and its
+// promise is stated here exactly, because it is the promise health rests on: this app
+// could not replace a bundle at the output path, it never PROVED that bundle wrong, and
+// what refused the replacement is a steady-state condition of the operator's volume that
+// no restart changes (a permission denial, a read-only mount, a full volume, an exhausted
+// quota — restartCanClearWrite enumerates them).
+//
+// "Never proved it wrong" is two facts, not one, and the standing WARN names which of them
+// applied: either the bytes on disk were read, decoded and compared and they MATCHED (the
+// mode-repair shape: correct content, a mode laxer than policy, a refused chmod, and a
+// refused repairing rewrite — the "operator changed PUID and left root-owned output
+// behind" deployment), or this app could not verify the content AT ALL (a bundle above the
+// readable bound, unreadable, un-stat-able, or refused by the codec's preflight). The
+// second shape used to be counted in statusFailed, because the two arms that could not
+// read a bundle overwrote the reason the rewrite was scheduled: that pinned the container
+// unhealthy on every scan over an /output permission state no restart can clear, which is
+// the same restart-loop statusUnreadable exists to prevent on the /input side.
+//
+// A bundle this app DID compare and find stale is never this status. A renewal behind, a
+// rotated password, an encoder-profile change, an absent or non-regular output path: there
+// the operator is being served the wrong bundle or none, so the failure to write stays
+// statusFailed and still flips health however the write failed. Like the two /input
+// members, this status is health-neutral, reported by its own standing WARN, and it blocks
+// orphan reaping.
 const (
 	statusUnset conversionStatus = iota
 	statusConverted

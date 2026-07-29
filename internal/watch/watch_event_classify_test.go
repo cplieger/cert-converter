@@ -347,7 +347,7 @@ func TestHandleRootWatchLoss_only_the_root_being_taken_away_ends_change_detectio
 
 // TestHandleRootWatchLoss_stays_live_when_the_reattach_fails pins the liveness
 // half of the recoverable branch, the same contract its sibling arms carry
-// (handleErrorRecv on an overflow, handleFallbackTick on a failed re-sync): with
+// (handleErrorRecv on an overflow, handleSafetyNetTick on a failed re-sync): with
 // the periodic rescan enabled, a re-attach that fails must be WARNed about and
 // still report change detection live. Reporting a loss there would restart the
 // container over a condition the rescan already covers.

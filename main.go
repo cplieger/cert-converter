@@ -28,9 +28,10 @@ const (
 const watchDebounce = 2 * time.Second
 
 // healthyAfterScan reports whether a completed scan should keep the container
-// healthy. Only conversion failures clear health; input coverage gaps and
-// refused mode-only output repairs are permissions/layout conditions a restart
-// cannot fix. The pointer avoids copying ScanResult and is never mutated.
+// healthy. Only conversion failures clear health; input coverage gaps and output
+// bundles the volume refused to let this app replace are permissions/layout
+// conditions a restart cannot fix. The pointer avoids copying ScanResult and is
+// never mutated.
 func healthyAfterScan(r *process.ScanResult) bool {
 	return r.Failed == 0
 }
@@ -79,19 +80,24 @@ func dispatchArgs(args []string) int {
 	}
 	switch {
 	case len(args) == 2 && args[1] == healthSubcommand:
-		// The fallback rescan is the marker's guaranteed refresh floor
-		// (fs events refresh it sooner), so a marker older than 3 fallback
+		// The periodic safety-net scan is the marker's guaranteed refresh floor
+		// (fs events refresh it sooner), so a marker older than 3 of those
 		// intervals means the watch loop is wedged and a restart fixes it.
-		// FALLBACK_SCAN_HOURS=0/false disables the fallback and with it
-		// the deadline (WithMaxAge(0) is a no-op): watch-only mode has no
-		// guaranteed refresh cadence to hold the marker to.
+		// watch.MarkerRefreshFloor is what converts the configured cadence into
+		// that floor: FALLBACK_SCAN_HOURS=0/false removes the operator's own
+		// cadence, NOT the reconciliation floor the watcher falls back to, so the
+		// deadline is armed in every configuration — on the default 6h cadence it
+		// is 18h, and with the routine rescan disabled it is 3 reconciliation
+		// floors. A cadence above the floor is capped by the same call, so the
+		// config package's 10-year ceiling no longer produces a deadline that can
+		// never expire.
 		// config.FallbackInterval is deliberately silent — a misconfigured or
 		// above-ceiling value is diagnosed once at startup by config.Load, not
 		// here, where Docker's healthcheck would reprint it every 30s forever.
 		// RunProbe exits the process, so this never falls through to the
 		// watcher below.
 		runProbe(health.DefaultPath,
-			health.WithMaxAge(3*config.FallbackInterval()))
+			health.WithMaxAge(3*watch.MarkerRefreshFloor(config.FallbackInterval())))
 		return continueToWatcher // unreachable in production; runProbe exits
 	default:
 		// Refuse rather than fall through: falling through reaches
@@ -166,7 +172,14 @@ func run() int {
 		// may not name it either; the process is the only thing that knows.
 		"uid", os.Getuid(), "gid", os.Getgid(),
 		"password", string(cfg.PasswordStatus),
-		"fallback_scan", watch.FallbackLabel(cfg.FallbackInterval), "encoder", cfg.EncoderName,
+		// Both cadences, because either alone misreads: fallback_scan is the
+		// operator's own rescan interval and reads "disabled" when they switched it
+		// off, while scan_floor is the cadence the watcher guarantees regardless —
+		// the longest it will go without a full re-assert plus scan, and the value
+		// the health probe's staleness deadline is derived from.
+		"fallback_scan", watch.FallbackLabel(cfg.FallbackInterval),
+		"scan_floor", watch.MarkerRefreshFloor(cfg.FallbackInterval).String(),
+		"encoder", cfg.EncoderName,
 		"output_lifecycle", string(cfg.Lifecycle), "max_scan_entries", cfg.MaxScanEntries)
 
 	volumes, ready := process.OpenMounts(requiredVolumes)

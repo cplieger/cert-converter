@@ -80,12 +80,12 @@ func TestScanWalkVisit_classifies_walk_errors(t *testing.T) {
 	})
 }
 
-// TestStoreIsCurrent_degrades_when_the_output_cannot_be_inspected pins a DELIBERATE
+// TestStoreInspect_degrades_when_the_output_cannot_be_inspected pins a DELIBERATE
 // reversal. This test previously required an ERROR when the confined root refused to stat
 // a prior output, on the reasoning that a refusal is evidence the output tree cannot be
 // inspected and should therefore be reported rather than papered over.
 //
-// The reversal: isCurrent answers exactly one question — "is the file on disk already the
+// The reversal: inspect answers exactly one question — "is the file on disk already the
 // bundle these inputs produce?" — and "I cannot tell" answers it. Treating it as stale and
 // rewriting is both correct and self-healing for the realistic cause, a root-owned .pfx
 // left by a deployment that predates the user: mapping. Erroring instead flipped the pair
@@ -96,7 +96,7 @@ func TestScanWalkVisit_classifies_walk_errors(t *testing.T) {
 // same confined root, so a genuinely broken tree fails at the write, which DOES flip
 // health. The honest signal moves from the read to the write rather than disappearing.
 // Runs serially: it swaps slog.Default().
-func TestStoreIsCurrent_degrades_when_the_output_cannot_be_inspected(t *testing.T) {
+func TestStoreInspect_degrades_when_the_output_cannot_be_inspected(t *testing.T) {
 	base := t.TempDir()
 	outDir := filepath.Join(base, "out")
 	outside := filepath.Join(base, "outside")
@@ -113,12 +113,12 @@ func TestStoreIsCurrent_degrades_when_the_output_cannot_be_inspected(t *testing.
 	}
 	s := newOutputStore(t, outDir)
 
-	current, _, err := s.isCurrent(t.Context(), "swapped/tls.pfx", &convert.Analysis{}, convert.EncNameModern2023, "pw")
+	current, err := inspectCurrent(t.Context(), s, "swapped/tls.pfx", &convert.Analysis{}, convert.EncNameModern2023, "pw")
 	if err != nil {
-		t.Fatalf("isCurrent(uninspectable output) = %v, want nil: an unreadable prior output is stale, not fatal", err)
+		t.Fatalf("inspect(uninspectable output) = %v, want nil: an unreadable prior output is stale, not fatal", err)
 	}
 	if current {
-		t.Error("isCurrent(uninspectable output) = true; a bundle that cannot be inspected must never be reported current")
+		t.Error("inspect(uninspectable output) = true; a bundle that cannot be inspected must never be reported current")
 	}
 
 	// The other half: the tree really is broken, so the rewrite this returns false to

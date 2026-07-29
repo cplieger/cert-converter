@@ -1,6 +1,7 @@
 package process
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -24,6 +25,22 @@ func newOutputStore(t *testing.T, dir string) *store {
 	}
 	t.Cleanup(func() { _ = root.Close() })
 	return &store{root: root}
+}
+
+// inspectCurrent asks store.inspect the DERIVED question most currency tests care about:
+// does the bundle on disk need no write at all (bundleState.upToDate)? Those tests are
+// about what a scan does with an output file, not about the shape of the fact set, so they
+// read better through this than through two lines of destructuring.
+//
+// The two facts inspect resolves independently — what it learned about the content, and
+// whether the mode repair converged — are asserted directly by the tests that own them
+// (TestStoreInspect_reports_content_it_could_not_verify and the write-routing tests),
+// which is why this helper is allowed to collapse them.
+func inspectCurrent(ctx context.Context, s *store, rel string, want *convert.Analysis,
+	enc convert.EncoderType, password string,
+) (bool, error) {
+	st, err := s.inspect(ctx, rel, want, enc, password)
+	return st.upToDate(), err
 }
 
 // TestStoreReconcile_reports_an_output_tree_it_cannot_enumerate pins the arm that
@@ -97,8 +114,8 @@ func TestStoreReconcile_reports_an_output_tree_it_cannot_enumerate(t *testing.T)
 // condition actually holding the reap back. In sync mode the report branch is
 // reachable two ways (reconcile returns early unless the input enumeration is
 // complete, so !reapable there means conversionsClean() is false): a failed
-// conversion, or a refused permission repair, which logs no conversion failure at all
-// and is cleared by chowning /output.
+// conversion, or a replacement the output volume refused, which logs no conversion
+// failure at all and is cleared on the volume rather than by fixing a conversion.
 func TestStoreOrphanReportRemediation_advice_matches_the_mode(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -116,9 +133,9 @@ func TestStoreOrphanReportRemediation_advice_matches_the_mode(t *testing.T) {
 			wantLacks: "OUTPUT_LIFECYCLE=sync",
 		},
 		{
-			name: "sync names the refused permission repair, not a conversion failure",
+			name: "sync names the refused replacement, not a conversion failure",
 			mode: outputpolicy.LifecycleSync, walkSafe: true, refusalOnly: true,
-			wantHas:   "no refused permission repair",
+			wantHas:   "no refused replacement",
 			wantLacks: "fix the conversion failure reported above",
 		},
 		{
@@ -236,7 +253,7 @@ func TestStoreWrite_wraps_an_atomic_write_failure(t *testing.T) {
 // half of maxPFXSize, which nothing else exercises: a bundle above the cap must be
 // refused rather than written.
 //
-// The cap mirrors the read bound isCurrent uses. Without it, a bundle this app
+// The cap mirrors the read bound inspect uses. Without it, a bundle this app
 // wrote could be one its own currency check calls unreadable, so every scan would
 // declare it stale and rewrite it -- a permanent write loop with a fresh mtime each
 // time, which the documented downstream rsync re-replicates every cycle. The
@@ -273,7 +290,7 @@ func TestStoreWrite_refuses_a_bundle_larger_than_the_read_bound(t *testing.T) {
 	}
 }
 
-// TestStoreIsCurrent_names_a_non_regular_prior_output pins the WARN on the arm
+// TestStoreInspect_names_a_non_regular_prior_output pins the WARN on the arm
 // that refuses a prior output which is not a regular file. Nothing else records it:
 // the verdict is "stale, regenerate", and for the two shapes covered here the
 // rewrite that follows FAILS (atomicfile refuses a symlink target outright, and a
@@ -281,7 +298,7 @@ func TestStoreWrite_refuses_a_bundle_larger_than_the_read_bound(t *testing.T) {
 // path before the bare conversion error arrives. A device node, FIFO or socket IS
 // replaced by the rename instead, which makes this line that case's only trace.
 // Runs serially: it swaps slog.Default().
-func TestStoreIsCurrent_names_a_non_regular_prior_output(t *testing.T) {
+func TestStoreInspect_names_a_non_regular_prior_output(t *testing.T) {
 	const wantMsg = "prior output path is not a regular file; regenerating"
 	for _, tc := range []struct {
 		name  string
@@ -310,29 +327,29 @@ func TestStoreIsCurrent_names_a_non_regular_prior_output(t *testing.T) {
 
 			// want is never dereferenced on this arm: the verdict is reached from the
 			// lstat alone, before any bundle is read.
-			current, _, err := s.isCurrent(t.Context(), "out.pfx", nil, convert.EncNameModern2023, "pw")
+			current, err := inspectCurrent(t.Context(), s, "out.pfx", nil, convert.EncNameModern2023, "pw")
 
 			if err != nil || current {
-				t.Fatalf("isCurrent(non-regular) = %v, %v, want false, nil: an occupied output path is never a usable prior bundle", current, err)
+				t.Fatalf("inspect(non-regular) = %v, %v, want false, nil: an occupied output path is never a usable prior bundle", current, err)
 			}
 			if got := logs.CountLevel(slog.LevelWarn, wantMsg); got != 1 {
-				t.Fatalf("isCurrent(non-regular) logged %q, want %q once at WARN", logs.Messages(), wantMsg)
+				t.Fatalf("inspect(non-regular) logged %q, want %q once at WARN", logs.Messages(), wantMsg)
 			}
 			if !logs.HasAttr(wantMsg, "path", "out.pfx") {
-				t.Errorf("isCurrent(non-regular) logged %q, want path=out.pfx so the operator can identify the occupied output", logs.Messages())
+				t.Errorf("inspect(non-regular) logged %q, want path=out.pfx so the operator can identify the occupied output", logs.Messages())
 			}
 			if _, ok := logs.AttrValue(wantMsg, "mode"); !ok {
-				t.Errorf("isCurrent(non-regular) logged %q, want the mode named so the operator knows what occupies the path", logs.Messages())
+				t.Errorf("inspect(non-regular) logged %q, want the mode named so the operator knows what occupies the path", logs.Messages())
 			}
 			if _, ok := logs.AttrValue(wantMsg, "remediation"); !ok {
-				t.Errorf("isCurrent(non-regular) logged %q, want a remediation hint", logs.Messages())
+				t.Errorf("inspect(non-regular) logged %q, want a remediation hint", logs.Messages())
 			}
 		})
 	}
 }
 
-// TestStoreIsCurrent_reports_a_bundle_that_vanishes_mid_inspection pins the two arms
-// isCurrent takes when the prior bundle disappears after the lstat that classified it
+// TestStoreInspect_reports_a_bundle_that_vanishes_mid_inspection pins the two arms
+// inspect takes when the prior bundle disappears after the lstat that classified it
 // as a usable regular file: the tightening whose RESULT cannot be observed, and the
 // read that then finds nothing.
 //
@@ -350,7 +367,7 @@ func TestStoreIsCurrent_names_a_non_regular_prior_output(t *testing.T) {
 // The chmod seam stands in for the timing, exactly as the untightenable-mode test uses
 // it for a filesystem that stores no permission bits; neither is stageable in a temp
 // directory. Runs serially: it swaps slog.Default() and the chmod seam.
-func TestStoreIsCurrent_reports_a_bundle_that_vanishes_mid_inspection(t *testing.T) {
+func TestStoreInspect_reports_a_bundle_that_vanishes_mid_inspection(t *testing.T) {
 	dir := t.TempDir()
 	s := newOutputStore(t, dir)
 	if err := s.write(t.Context(), "out.pfx", []byte("prior bundle")); err != nil {
@@ -376,40 +393,40 @@ func TestStoreIsCurrent_reports_a_bundle_that_vanishes_mid_inspection(t *testing
 	const unreadableMsg = "cannot read prior pfx; regenerating"
 
 	logs := captureLogs(t)
-	current, _, err := s.isCurrent(t.Context(), "out.pfx", nil, convert.EncNameModern2023, "pw")
+	current, err := inspectCurrent(t.Context(), s, "out.pfx", nil, convert.EncNameModern2023, "pw")
 	if err != nil {
-		t.Fatalf("isCurrent(bundle removed mid-inspection) = error %v, want nil: an unreadable prior bundle is"+
+		t.Fatalf("inspect(bundle removed mid-inspection) = error %v, want nil: an unreadable prior bundle is"+
 			" something this app fixes by rewriting, not a failure that flips health", err)
 	}
 	if current {
-		t.Error("isCurrent(bundle removed mid-inspection) = true, want false: a bundle that is not there cannot be the current one")
+		t.Error("inspect(bundle removed mid-inspection) = true, want false: a bundle that is not there cannot be the current one")
 	}
 	if got := logs.CountLevel(slog.LevelWarn, notTightenedMsg); got != 1 {
-		t.Errorf("isCurrent(bundle removed mid-inspection) logged %q at WARN %d times, want exactly 1: %q",
+		t.Errorf("inspect(bundle removed mid-inspection) logged %q at WARN %d times, want exactly 1: %q",
 			notTightenedMsg, got, logs.Messages())
 	}
 	if _, ok := logs.AttrValue(notTightenedMsg, "error"); !ok {
-		t.Errorf("isCurrent(bundle removed mid-inspection) logged %q without an error attribute, want the re-stat"+
+		t.Errorf("inspect(bundle removed mid-inspection) logged %q without an error attribute, want the re-stat"+
 			" failure carried so the operator learns the mode was never observed: %q", notTightenedMsg, logs.Messages())
 	}
 	if got := logs.CountLevel(slog.LevelInfo, tightenedMsg); got != 0 {
-		t.Errorf("isCurrent(bundle removed mid-inspection) logged %q %d times, want 0: the chmod's result was never"+
+		t.Errorf("inspect(bundle removed mid-inspection) logged %q %d times, want 0: the chmod's result was never"+
 			" observed, so claiming the repair tells the operator the opposite of the truth: %q", tightenedMsg, got, logs.Messages())
 	}
 	if got := logs.CountLevel(slog.LevelWarn, unreadableMsg); got != 1 {
-		t.Errorf("isCurrent(bundle removed mid-inspection) logged %q at WARN %d times, want exactly 1: %q",
+		t.Errorf("inspect(bundle removed mid-inspection) logged %q at WARN %d times, want exactly 1: %q",
 			unreadableMsg, got, logs.Messages())
 	}
 	if !logs.HasAttr(unreadableMsg, "path", "out.pfx") {
-		t.Errorf("isCurrent(bundle removed mid-inspection) logged %q, want path=out.pfx so the operator can identify"+
+		t.Errorf("inspect(bundle removed mid-inspection) logged %q, want path=out.pfx so the operator can identify"+
 			" the bundle: %q", unreadableMsg, logs.Messages())
 	}
 	if _, ok := logs.AttrValue(unreadableMsg, "remediation"); !ok {
-		t.Errorf("isCurrent(bundle removed mid-inspection) logged %q without a remediation hint: %q", unreadableMsg, logs.Messages())
+		t.Errorf("inspect(bundle removed mid-inspection) logged %q without a remediation hint: %q", unreadableMsg, logs.Messages())
 	}
 }
 
-// TestStoreIsCurrent_reports_a_lax_output_directory pins the /output DIRECTORY
+// TestStoreInspect_reports_a_lax_output_directory pins the /output DIRECTORY
 // permission record — and that it is REPORT-ONLY, which is the whole contract after
 // the 2026-07 user decision ("if it can write to output but not chmod that is fine.
 // that is a user choice. you can throw a warning but dont make the container
@@ -431,11 +448,11 @@ func TestStoreIsCurrent_reports_a_bundle_that_vanishes_mid_inspection(t *testing
 // on CIFS/NFS/vfat (the Synology shares this app serves) the chmod can never succeed,
 // so the container published nothing and restart-looped. A mode at or stricter than
 // policy (a deliberately tighter 0700) is neither touched nor nagged about, and every
-// record is emitted ONCE per directory per scan — isCurrent runs for every .crt, so a
+// record is emitted ONCE per directory per scan — inspect runs for every .crt, so a
 // flat /output holding twenty bundles must not produce twenty identical records on
 // every tick.
 // Runs serially: it swaps slog.Default().
-func TestStoreIsCurrent_reports_a_lax_output_directory(t *testing.T) {
+func TestStoreInspect_reports_a_lax_output_directory(t *testing.T) {
 	// Spelled out rather than imported from the production const: an operator's log
 	// query keys on these words, so a silent rewording must fail here.
 	const wantMsg = "the /output directory holding a pfx is more permissive than policy"
@@ -465,9 +482,9 @@ func TestStoreIsCurrent_reports_a_lax_output_directory(t *testing.T) {
 			// No bundle is planted: the check is asked before the bundle's own lstat, so
 			// the absent-bundle arm must carry it too — a lax directory is lax whether or
 			// not a prior bundle sits in it. want is never dereferenced on that arm.
-			current, _, err := s.isCurrent(t.Context(), "out.pfx", nil, convert.EncNameModern2023, "pw")
+			current, err := inspectCurrent(t.Context(), s, "out.pfx", nil, convert.EncNameModern2023, "pw")
 			if err != nil || current {
-				t.Fatalf("isCurrent(no prior bundle) = %v, %v, want false, nil: a directory mode may never"+
+				t.Fatalf("inspect(no prior bundle) = %v, %v, want false, nil: a directory mode may never"+
 					" fail the pair, whatever its permissions", current, err)
 			}
 
@@ -476,13 +493,13 @@ func TestStoreIsCurrent_reports_a_lax_output_directory(t *testing.T) {
 				want = 1
 			}
 			if got := logs.CountLevel(slog.LevelWarn, wantMsg); got != want {
-				t.Errorf("isCurrent(directory mode %o) logged %q at WARN %d times, want %d: %q",
+				t.Errorf("inspect(directory mode %o) logged %q at WARN %d times, want %d: %q",
 					tc.mode, wantMsg, got, want, logs.Messages())
 			}
 			if fi, statErr := os.Stat(dir); statErr != nil {
 				t.Fatalf("Stat(dir): %v", statErr)
 			} else if got := fi.Mode().Perm(); got != tc.mode {
-				t.Errorf("isCurrent(directory mode %o) left the directory at %o, want it untouched: the mode of"+
+				t.Errorf("inspect(directory mode %o) left the directory at %o, want it untouched: the mode of"+
 					" the operator's own directory is theirs to choose, and repairing it breaks every mount"+
 					" that forces directory modes", tc.mode, got)
 			}
@@ -491,13 +508,13 @@ func TestStoreIsCurrent_reports_a_lax_output_directory(t *testing.T) {
 			}
 			for _, key := range []string{"path", "mode", "want", "remediation"} {
 				if _, ok := logs.AttrValue(wantMsg, key); !ok {
-					t.Errorf("isCurrent(directory mode %o) logged %q without a %s attribute, want the"+
+					t.Errorf("inspect(directory mode %o) logged %q without a %s attribute, want the"+
 						" directory, the mode found, the mode wanted and what to do: %q",
 						tc.mode, wantMsg, key, logs.Messages())
 				}
 			}
 			if !logs.HasAttr(wantMsg, "mode", tc.mode.String()) {
-				t.Errorf("isCurrent(directory mode %o) logged %q without the mode it found, want %s: %q",
+				t.Errorf("inspect(directory mode %o) logged %q without the mode it found, want %s: %q",
 					tc.mode, wantMsg, tc.mode.String(), logs.Messages())
 			}
 		})
@@ -523,18 +540,18 @@ func TestStoreIsCurrent_reports_a_lax_output_directory(t *testing.T) {
 		// share a directory and must report once between them, while the nested one is a
 		// different directory and reports on its own.
 		for _, rel := range []string{"a.pfx", "b.pfx", "c.pfx", "nested/d.pfx"} {
-			if _, _, err := s.isCurrent(t.Context(), rel, nil, convert.EncNameModern2023, "pw"); err != nil {
-				t.Fatalf("isCurrent(%s) = error %v, want nil", rel, err)
+			if _, err := inspectCurrent(t.Context(), s, rel, nil, convert.EncNameModern2023, "pw"); err != nil {
+				t.Fatalf("inspect(%s) = error %v, want nil", rel, err)
 			}
 		}
 
 		if got := logs.CountLevel(slog.LevelWarn, wantMsg); got != 2 {
-			t.Errorf("isCurrent over three bundles in one lax directory plus one in a second logged %q %d"+
+			t.Errorf("inspect over three bundles in one lax directory plus one in a second logged %q %d"+
 				" times, want exactly 2: the fact is a property of the DIRECTORY, and a per-bundle record"+
 				" would repeat on every scan for as long as the mode stands: %q", wantMsg, got, logs.Messages())
 		}
 		if !logs.HasAttr(wantMsg, "path", "nested") {
-			t.Errorf("isCurrent(nested/d.pfx) logged %q without path=nested, want each directory named"+
+			t.Errorf("inspect(nested/d.pfx) logged %q without path=nested, want each directory named"+
 				" separately: %q", wantMsg, logs.Messages())
 		}
 	})
@@ -632,11 +649,13 @@ func TestStoreRemoveOrphans_reports_vanished_candidate_and_continues(t *testing.
 // /output the reap cannot inspect gets no default-level record at all. The whole
 // suite stays green through that change without this test.
 //
-// A closed root is the failure injection, the same one
-// TestStoreReconcile_reports_an_output_tree_it_cannot_enumerate uses: it produces a
-// non-ENOENT Lstat failure whatever uid the suite runs as, where a chmod-based
-// fixture does nothing under uid 0. Deliberately NOT newOutputStore: the closed root
-// IS the injection, so the store must outlive its root handle.
+// A basename past NAME_MAX is the failure injection: it makes the pre-unlink Lstat fail
+// with ENAMETOOLONG — non-ENOENT, whatever uid the suite runs as, where a chmod-based
+// fixture does nothing under uid 0 — while the parent pin itself succeeds, which is
+// exactly the state this arm exists for. A closed root (the previous fixture) now fails
+// one step earlier, in atomicfile's pinned descent, and lands on pinRedirectedMsg
+// instead; that arm is pinned by the ancestor-swap and vanished-ancestor tests.
+// Deliberately NOT newOutputStore: nothing is created on disk for this candidate.
 // Runs serially: it swaps slog.Default().
 func TestStoreRemoveOrphans_leaves_a_candidate_it_cannot_recheck(t *testing.T) {
 	// Spelled out rather than imported from the production call sites: an operator's
@@ -653,13 +672,11 @@ func TestStoreRemoveOrphans_leaves_a_candidate_it_cannot_recheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: os.OpenRoot: %v", err)
 	}
-	if err := root.Close(); err != nil {
-		t.Fatalf("setup: root.Close: %v", err)
-	}
+	t.Cleanup(func() { _ = root.Close() })
 	s := &store{root: root}
 	logs := captureLogs(t)
 
-	deleted, err := s.removeOrphans(t.Context(), []string{"a.pfx"})
+	deleted, err := s.removeOrphans(t.Context(), []string{strings.Repeat("a", 300) + ".pfx"})
 	if err != nil {
 		t.Fatalf("removeOrphans(uninspectable candidate) = %v, want nil: a candidate this app cannot"+
 			" re-check is skipped, not a scan failure", err)
@@ -744,7 +761,8 @@ func TestStoreRemoveOrphans_reports_a_vanished_nested_candidate_as_a_race(t *tes
 // /output walk owes the reap: every bundle this app could have written, at any depth,
 // reaches the candidate list, and nothing else does.
 //
-// It is the /output half of the shared walker's contract (walkRoot, which both mounts
+// It is the /output half of the shared walker's contract (atomicfile.WalkDirInRoot, which
+// both mounts
 // now go through): the reap's whole claim is that a candidate it cannot match to an
 // input is an orphan, so a bundle the walk never reported would be retained forever
 // while a non-bundle it wrongly reported could be deleted. Order is deliberately NOT
