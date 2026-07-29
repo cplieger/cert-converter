@@ -59,6 +59,24 @@ func oversizedRSAKeyDER(t *testing.T, bits int) []byte {
 	return der
 }
 
+// hugePrimeRSAKeyDER builds PKCS#1 DER whose modulus is trivial but whose
+// primes are bits wide: the shape that bypassed the pre-scan when it measured
+// only the modulus, and the one crypto/rsa spends its precompute on.
+func hugePrimeRSAKeyDER(t *testing.T, bits int) []byte {
+	t.Helper()
+	one := big.NewInt(1)
+	p := new(big.Int).Lsh(one, uint(bits-1))
+	p.SetBit(p, 0, 1)
+	der, err := asn1.Marshal(pkcs1KeyDER{
+		N: big.NewInt(196611), E: big.NewInt(65537), D: one, P: p, Q: p,
+		Dp: one, Dq: one, Qinv: one,
+	})
+	if err != nil {
+		t.Fatalf("setup: marshal huge-prime PKCS#1 key: %v", err)
+	}
+	return der
+}
+
 // wrapPKCS8 puts PKCS#1 key DER inside a PKCS#8 PrivateKeyInfo, the second shape
 // an RSA private key arrives in.
 func wrapPKCS8(t *testing.T, pkcs1DER []byte) []byte {
@@ -217,7 +235,7 @@ func TestParsePrivateKeyBlock_refuses_an_oversized_rsa_key(t *testing.T) {
 				t.Fatalf("parsePrivateKeyBlock(a %d-bit RSA key) = nil error, want a refusal", oversizedBits)
 			}
 			got := err.Error()
-			for _, want := range []string{"131072-bit RSA modulus", "16384-bit ceiling", block.Type} {
+			for _, want := range []string{"131072-bit RSA integer", "16384-bit ceiling", block.Type} {
 				if !strings.Contains(got, want) {
 					t.Errorf("error = %q, want it to contain %q", got, want)
 				}
@@ -257,10 +275,13 @@ func TestRSAModulusBitsFromKeyDER_measures_or_fails_open(t *testing.T) {
 		wantBits int
 		wantOK   bool
 	}{
-		"pkcs1 rsa":                 {der: x509.MarshalPKCS1PrivateKey(rsa2048), wantBits: 2048, wantOK: true},
-		"pkcs8 rsa":                 {der: pkcs8RSA, wantBits: 2048, wantOK: true},
-		"pkcs1 at the ceiling":      {der: atCeiling, wantBits: maxVerifiableKeyBits, wantOK: true},
-		"pkcs1 oversized":           {der: oversizedRSAKeyDER(t, 131072), wantBits: 131072, wantOK: true},
+		"pkcs1 rsa":            {der: x509.MarshalPKCS1PrivateKey(rsa2048), wantBits: 2048, wantOK: true},
+		"pkcs8 rsa":            {der: pkcs8RSA, wantBits: 2048, wantOK: true},
+		"pkcs1 at the ceiling": {der: atCeiling, wantBits: maxVerifiableKeyBits, wantOK: true},
+		"pkcs1 oversized":      {der: oversizedRSAKeyDER(t, 131072), wantBits: 131072, wantOK: true},
+		"pkcs1 small modulus, oversized primes": {
+			der: hugePrimeRSAKeyDER(t, 131072), wantBits: 131072, wantOK: true,
+		},
 		"pkcs8 oversized":           {der: wrapPKCS8(t, oversizedRSAKeyDER(t, 131072)), wantBits: 131072, wantOK: true},
 		"sec1 ec":                   {der: mustMarshalEC(t)},
 		"pkcs8 ecdsa":               {der: mustMarshalPKCS8EC(t)},
@@ -281,6 +302,120 @@ func TestRSAModulusBitsFromKeyDER_measures_or_fails_open(t *testing.T) {
 			}
 			if gotOK && gotBits != tc.wantBits {
 				t.Errorf("rsaModulusBitsFromKeyDER(%s) = %d bits, want %d", name, gotBits, tc.wantBits)
+			}
+		})
+	}
+}
+
+// TestRSAModulusBitsFromKeyDER_fails_open_on_shapes_it_cannot_measure covers the
+// container shapes TestRSAModulusBitsFromKeyDER_measures_or_fails_open does not
+// reach. The pre-scan is the guard that keeps an oversized file-supplied RSA
+// modulus out of crypto/x509's precomputation (a measured 369ms stall on the
+// scan's only goroutine, with no cancellation path), so a misread is
+// operator-visible in both directions: a shape wrongly MEASURED refuses a key the
+// app converts today, and a shape wrongly skipped admits the stall the guard
+// exists to prevent. None of these rows is reachable through the DER already in
+// that table, so today a walk missing one of these header checks passes the suite
+// unchanged.
+func TestRSAModulusBitsFromKeyDER_fails_open_on_shapes_it_cannot_measure(t *testing.T) {
+	t.Parallel()
+
+	derSeq := func(elements ...[]byte) []byte {
+		var body []byte
+		for _, e := range elements {
+			body = append(body, e...)
+		}
+		return testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagSequence, IsCompound: true, Bytes: body})
+	}
+	version := testASN1Marshal(t, 0)
+	rsaOID := testASN1Marshal(t, oidRSAEncryption)
+	one := big.NewInt(1)
+	zeroModulus := testASN1Marshal(t, pkcs1KeyDER{
+		N: big.NewInt(0), E: big.NewInt(65537), D: one, P: one, Q: one, Dp: one, Dq: one, Qinv: one,
+	})
+
+	for name, der := range map[string][]byte{
+		"a first element that is not the version":        derSeq(derSeq(rsaOID), version),
+		"nothing after the version":                      derSeq(version),
+		"a pkcs8 shape whose key is not an octet string": derSeq(version, derSeq(rsaOID), testASN1Marshal(t, 5)),
+		"a pkcs8 shape with nothing after the algorithm": derSeq(version, derSeq(rsaOID)),
+		"a zero modulus is no modulus":                   zeroModulus,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			gotBits, gotOK := rsaModulusBitsFromKeyDER(der, 1)
+			if gotOK {
+				t.Errorf("rsaModulusBitsFromKeyDER(%s) measured %d bits, want it to fail open", name, gotBits)
+			}
+		})
+	}
+}
+
+// derTestSequence wraps already-encoded DER elements in a SEQUENCE, so a case can
+// build a container shape by hand without a struct per shape.
+func derTestSequence(t *testing.T, elements ...[]byte) []byte {
+	t.Helper()
+	var body []byte
+	for _, e := range elements {
+		body = append(body, e...)
+	}
+	return testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagSequence, IsCompound: true, Bytes: body})
+}
+
+// TestPKCS8HoldsECKey_answers_true_only_for_an_ec_algorithm_identifier pins the
+// FALSE side of the EC PARAMETERS companion rule, which no existing input reaches:
+// the only production caller (holdsECPrivateKey) reaches this function with a
+// PKCS#8 block, every input the suite builds is an EC one, and an
+// `openssl ecparam -genkey` RSA-key file is PKCS#1-labelled, so it never arrives
+// here at all. A walk that answered "yes" for any PKCS#8 container would pass the
+// whole suite today, and the consequence is silent: an `openssl pkcs8 -topk8` RSA
+// key beside a stray EC PARAMETERS block in the certificate file would be treated
+// as that block's companion, so ObsUnrelatedBlocksSkipped -- the only thing
+// telling the operator a block was left out of the bundle -- would never be
+// emitted.
+//
+// The unreadable shapes are the other half of the contract: the walk must FAIL
+// OPEN (answer "no", so the block is reported) on anything it cannot read, rather
+// than grow into a second key parser.
+func TestPKCS8HoldsECKey_answers_true_only_for_an_ec_algorithm_identifier(t *testing.T) {
+	t.Parallel()
+
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("setup: rsa.GenerateKey: %v", err)
+	}
+	pkcs8RSA, err := x509.MarshalPKCS8PrivateKey(rsaKey)
+	if err != nil {
+		t.Fatalf("setup: MarshalPKCS8PrivateKey(rsa): %v", err)
+	}
+	version := testASN1Marshal(t, 0)
+	ecOID := testASN1Marshal(t, ecPublicKeyOID)
+
+	cases := map[string]struct {
+		der  []byte
+		want bool
+	}{
+		"a pkcs8 ec key is the companion":           {der: mustMarshalPKCS8EC(t), want: true},
+		"a pkcs8 rsa key is not":                    {der: pkcs8RSA},
+		"a pkcs8 ed25519 key is not":                {der: mustMarshalPKCS8Ed25519(t)},
+		"a sec1 ec key is not a pkcs8 container":    {der: mustMarshalEC(t)},
+		"garbage":                                   {der: []byte("this is not valid DER")},
+		"empty":                                     {der: nil},
+		"not a sequence at all":                     {der: testASN1Marshal(t, 42)},
+		"a first element that is not the version":   {der: derTestSequence(t, derTestSequence(t, ecOID), ecOID)},
+		"nothing after the version":                 {der: derTestSequence(t, version)},
+		"an algorithm identifier that is not a seq": {der: derTestSequence(t, version, version)},
+		"an algorithm identifier holding no oid":    {der: derTestSequence(t, version, derTestSequence(t, version))},
+		"an algorithm oid whose body cannot decode": {der: derTestSequence(t, version, derTestSequence(t, []byte{0x06, 0x01, 0x80}))},
+		"a truncated pkcs8 rsa container":           {der: pkcs8RSA[:16]},
+		"a pkcs8 container naming rsaEncryption":    {der: derTestSequence(t, version, derTestSequence(t, testASN1Marshal(t, oidRSAEncryption)))},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := pkcs8HoldsECKey(tc.der); got != tc.want {
+				t.Errorf("pkcs8HoldsECKey(%s) = %v, want %v", name, got, tc.want)
 			}
 		})
 	}

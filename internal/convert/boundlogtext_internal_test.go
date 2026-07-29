@@ -181,7 +181,7 @@ func TestParsePrivateKey_bounds_an_oversized_pkcs8_algorithm_oid(t *testing.T) {
 	}
 	// The static prefix names the block type and the parsers tried; everything
 	// input-derived past it is what the bound has to cover.
-	const staticPrefix = len("failed to parse private key from PRIVATE KEY block (tried PKCS8, PKCS1, SEC1): ")
+	const staticPrefix = len("failed to parse private key from a \"PRIVATE KEY\" block (tried PKCS8, PKCS1, SEC1): ")
 	if want := staticPrefix + maxSubjectLogLen + len(truncationMarker); len(err.Error()) > want {
 		t.Errorf("error is %d bytes, want at most %d: the OID reaches the log unbounded", len(err.Error()), want)
 	}

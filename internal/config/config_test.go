@@ -72,7 +72,7 @@ func TestParseFallbackInterval(t *testing.T) {
 		{"negative", "-1", 6 * time.Hour, fallbackInvalid},
 		// Non-canonical zeros reach the numeric branch (the "0" switch case
 		// only matches the literal string "0"), so they exercise the n > 0
-		// boundary: Atoi yields 0, which must NOT be treated as a positive
+		// boundary: ParseInt yields 0, which must NOT be treated as a positive
 		// interval. Pins the n > 0 guard: a parsed zero falls through to the
 		// default, never accepted as a (disabling) zero interval.
 		{"non-canonical zero", "00", 6 * time.Hour, fallbackInvalid},
@@ -772,15 +772,39 @@ func TestLogLevel(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("LOG_LEVEL", tc.raw)
 
-			lvl, raw, ok := LogLevel()
+			// LogLevel is the silent reader (like FallbackInterval); the
+			// diagnostic is WarnInvalidLogLevel's, so a parse failure is only
+			// observable through the captured WARN. Serial: capture.Default
+			// swaps slog.Default().
+			logs := capture.Default(t)
 
-			if lvl != tc.want || ok != tc.wantOK {
-				t.Errorf("LogLevel() with LOG_LEVEL=%q = (%v, %v), want (%v, %v)",
-					tc.raw, lvl, ok, tc.want, tc.wantOK)
+			if lvl := LogLevel(); lvl != tc.want {
+				t.Errorf("LogLevel() with LOG_LEVEL=%q = %v, want %v", tc.raw, lvl, tc.want)
 			}
-			if raw != tc.raw {
-				t.Errorf("LogLevel() with LOG_LEVEL=%q raw = %q, want %q (reported verbatim for the WARN)",
-					tc.raw, raw, tc.raw)
+			if logs.Len() != 0 {
+				t.Errorf("LogLevel() with LOG_LEVEL=%q logged %v; it must stay silent so the "+
+					"health subcommand does not reprint a startup WARN on every probe",
+					tc.raw, logs.Messages())
+			}
+
+			WarnInvalidLogLevel()
+
+			warned := logs.Contains("invalid LOG_LEVEL")
+			if warned == tc.wantOK {
+				t.Fatalf("WarnInvalidLogLevel() with LOG_LEVEL=%q warned = %v, want %v (logs %v)",
+					tc.raw, warned, !tc.wantOK, logs.Messages())
+			}
+			if tc.wantOK {
+				return
+			}
+			if got := mustAttr(t, logs, "invalid LOG_LEVEL", "value"); got != tc.raw {
+				t.Errorf("the WARN for LOG_LEVEL=%q carried value=%q, want the raw value verbatim so "+
+					"an operator can see what was misspelled", tc.raw, got)
+			}
+			wantDefault := strings.ToLower(tc.want.String())
+			if got := mustAttr(t, logs, "invalid LOG_LEVEL", "default"); got != wantDefault {
+				t.Errorf("the WARN for LOG_LEVEL=%q carried default=%q, want %q (the level actually in effect)",
+					tc.raw, got, wantDefault)
 			}
 		})
 	}
@@ -1421,6 +1445,13 @@ func TestLoad_warns_when_the_password_contains_a_control_character(t *testing.T)
 		{"an interior newline warns", "line1\nline2", true},
 		{"an interior tab warns", "pw\tsecret", true},
 		{"a clean password is silent", "hunter2", false},
+		// The Cc/Cf disjointness isFormatRune's comment relies on, pinned from this
+		// side too: a byte-order mark is not a control character, so one rune must
+		// not produce two records about itself. Widening this guard to "not
+		// printable" catches every Cf rune here as well, and the sibling
+		// invisible-formatting test stays green when it does.
+		{"a byte-order mark alone is silent", "\ufeffhunter2", false},
+		{"a zero-width space alone is silent", "pw\u200bsecret", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			isolatePasswordFile(t)

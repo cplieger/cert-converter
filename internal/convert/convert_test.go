@@ -94,19 +94,6 @@ func TestParseCertChain(t *testing.T) {
 	})
 }
 
-func TestParseCertChain_corrupted_DER(t *testing.T) {
-	t.Parallel()
-	badPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "CERTIFICATE",
-		Bytes: []byte("this is not valid DER"),
-	})
-
-	_, err := convert.ParseCertChain(badPEM)
-	if err == nil {
-		t.Fatal("convert.ParseCertChain should fail for corrupted DER inside CERTIFICATE block")
-	}
-}
-
 // TestParseCertChain_names_which_block_holds_the_corrupt_DER pins the block number
 // in the chain-rejecting diagnostic. parseCertChain refuses the whole file rather
 // than truncating it, so that number is the only thing telling an operator WHICH

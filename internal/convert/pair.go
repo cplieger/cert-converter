@@ -49,7 +49,7 @@ func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 
 	pfxData, err := encoderFor(encName).Encode(a.key, a.leaf, a.chain, password)
 	if err != nil {
-		return nil, fmt.Errorf("encode pfx: %w", err)
+		return nil, fmt.Errorf("encode pfx: %w", boundedTextError{err})
 	}
 	return pfxData, nil
 }
@@ -196,7 +196,7 @@ func (c Currency) Current() bool { return c.Reason == CurrencyMatch }
 func CheckCurrency(pfx []byte, password string, want *Analysis, wantEncoder EncoderType) Currency {
 	insp, err := inspect(pfx)
 	if err != nil {
-		return Currency{Reason: CurrencyPreflightFailed, Err: err}
+		return Currency{Reason: CurrencyPreflightFailed, Err: boundedTextError{err}}
 	}
 	if insp.Profile != resolvedName(wantEncoder) {
 		return Currency{Reason: CurrencyProfileMismatch, Profile: insp.Profile}

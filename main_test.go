@@ -225,6 +225,13 @@ func TestScanAndSetHealth_clean_scan_emits_no_unreadable_warning(t *testing.T) {
 	marker, markerPath := newTestMarker(t)
 
 	inDir, outDir := t.TempDir(), t.TempDir()
+	// The output directory's own mode is fixture noise here, but the scan reports a
+	// /output directory more permissive than 0750, and what t.TempDir creates depends
+	// on the host (an inherited ACL widens it). Pinned so the "quiet at warn level"
+	// assertion below observes the scan's own conclusions only.
+	if err := os.Chmod(outDir, 0o750); err != nil {
+		t.Fatalf("setup: Chmod(outDir): %v", err)
+	}
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "clean", "ecdsa")
 	writeCertAndKey(t, inDir, "clean", certPEM, keyPEM)
 	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
@@ -775,6 +782,104 @@ func TestVolumesReady_names_every_missing_volume(t *testing.T) {
 	for _, role := range []string{"input", "output"} {
 		if !logs.AttrContains(msg, "role", role) {
 			t.Errorf("volumesReady(both absent) ERROR set does not name role %q (logs %v)", role, logs.Messages())
+		}
+	}
+}
+
+func TestRun_startup_failure_diagnoses_the_configuration_and_exits_nonzero(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "bogus")
+	// Unset rather than blank: PFX_PASSWORD_FILE="" is SET-but-blank, which is a
+	// different documented case with its own WARN. The t.Setenv call first is
+	// what registers the restore and marks the test as environment-mutating.
+	for _, key := range []string{"PFX_PASSWORD", "PFX_PASSWORD_FILE", "PFX_ALLOW_EMPTY_PASSWORD"} {
+		t.Setenv(key, "")
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	prevArgs, prevLogger := os.Args, slog.Default()
+	os.Args = []string{"cert-watcher"}
+	t.Cleanup(func() {
+		os.Args = prevArgs
+		slog.SetDefault(prevLogger)
+	})
+
+	var code int
+	out := captureStderr(t, func() { code = run() })
+
+	if code != 1 {
+		t.Errorf("run() with an unusable PFX password = %d, want 1 so the orchestrator does not read the stop as a clean shutdown; stderr %q", code, out)
+	}
+	if !strings.Contains(out, "invalid configuration") {
+		t.Errorf("run() refused to start without naming the configuration as the cause; stderr %q", out)
+	}
+	if !strings.Contains(out, "PFX_ALLOW_EMPTY_PASSWORD") {
+		t.Errorf("the configuration ERROR does not carry the underlying cause, so an operator cannot tell WHICH setting is wrong; stderr %q", out)
+	}
+	if !strings.Contains(out, "invalid LOG_LEVEL") {
+		t.Errorf("run() started the watcher path without diagnosing the invalid LOG_LEVEL, the only signal the value was misspelled; stderr %q", out)
+	}
+}
+
+// TestRun_refuses_to_start_when_a_required_volume_is_missing pins the branch that
+// ACTS on volumesReady's verdict: run() must return 1 before it builds a scanner
+// or a watcher, because starting anyway converts nothing and restart-loops
+// forever on a condition a restart cannot clear. It also pins the startup INFO
+// line, the operator's only statement of the effective configuration.
+// Serial (no t.Parallel): it swaps os.Args, os.Stderr, slog.Default() and the
+// requiredVolumes seam, and uses t.Setenv.
+func TestRun_refuses_to_start_when_a_required_volume_is_missing(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("PFX_PASSWORD", "test-password")
+	for _, key := range []string{"PFX_PASSWORD_FILE", "PFX_ALLOW_EMPTY_PASSWORD"} {
+		t.Setenv(key, "")
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	absentOutput := filepath.Join(t.TempDir(), "absent-output")
+	prevArgs, prevLogger, prevVolumes := os.Args, slog.Default(), requiredVolumes
+	os.Args = []string{"cert-watcher"}
+	requiredVolumes = []volumeDir{{"input", t.TempDir()}, {"output", absentOutput}}
+	t.Cleanup(func() {
+		os.Args = prevArgs
+		slog.SetDefault(prevLogger)
+		requiredVolumes = prevVolumes
+	})
+
+	// run() is called on a goroutine with a deadline because the failure mode
+	// under test is "it started the watcher anyway": w.Run blocks until a signal
+	// arrives, so a dropped guard would hang this test instead of failing it.
+	var code int
+	returned := make(chan int, 1)
+	out := captureStderr(t, func() {
+		go func() { returned <- run() }()
+		select {
+		case code = <-returned:
+		case <-time.After(10 * time.Second):
+			t.Error("run() did not return with a missing output mount: it started the watcher instead of refusing")
+		}
+	})
+
+	if code != 1 {
+		t.Errorf("run() with a missing output mount = %d, want 1: starting anyway converts nothing and restart-loops forever; stderr %q", code, out)
+	}
+	if !strings.Contains(out, "required volume is missing or not a directory") {
+		t.Fatalf("precondition failed: run() never reached the volume guard; stderr %q", out)
+	}
+	if !strings.Contains(out, absentOutput) {
+		t.Errorf("the refusal does not name the missing path, so the operator cannot fix it; stderr %q", out)
+	}
+	// The startup line is the operator's only statement of the effective
+	// configuration; every attr below is a setting they could have got wrong.
+	if !strings.Contains(out, "starting cert watcher") {
+		t.Fatalf("precondition failed: run() refused before it loaded the configuration; stderr %q", out)
+	}
+	for _, attr := range []string{"password", "fallback_scan", "encoder", "output_lifecycle"} {
+		if !strings.Contains(out, attr) {
+			t.Errorf("the startup line omits %q, so the effective configuration is not observable; stderr %q", attr, out)
 		}
 	}
 }

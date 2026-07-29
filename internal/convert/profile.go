@@ -42,6 +42,33 @@ import (
 // maximum-iterations option upstream.
 const maxKDFIterations = 10000
 
+// minKDFIterations is the floor those same counts must clear. Every derivation
+// location all four profiles emit uses 2048 (go-pkcs12 v0.7.3 pkcs12.go:101, 122,
+// 163, 190); the one exception is the legacy profiles' MAC, which uses 1
+// (pkcs12.go:100, 121) and is floored separately in checkMACIterations. Without a
+// floor the bound is one-sided, and the decoder honours ANY count it is given
+// (crypto.go:253 and mac.go pass the stored value straight to pbkdf2.Key), so a
+// bundle whose certificates and private key are wrapped with AES-256-CBC over a
+// ONE-iteration PBKDF2 matches the profile triple, decodes, matches the analysis
+// and is reported current forever — the same missing dimension the PRF and
+// AES-256 checks already close.
+const minKDFIterations = 2048
+
+// minPBKDF2SaltBytes and minLegacySaltBytes are the salt lengths the profiles
+// emit: 16 octets for both modern profiles (go-pkcs12 v0.7.3 pkcs12.go:164, 191
+// saltLen: 16) and 8 for both legacy profiles (pkcs12.go:102, 123 saltLen: 8).
+// The decoder imposes no minimum at all — crypto.go:253 and mac.go hand
+// kdfParams.Salt.Bytes to pbkdf2.Key whatever its length, including zero — so a
+// short or empty salt is accepted, and a zero-length salt makes the derived key a
+// pure function of the password and iteration count, precomputable across every
+// bundle that shares the PFX password. Same missing dimension as the accepted
+// weaker cipher and PRF the preflight already refuses, on the remaining PBKDF2
+// parameter.
+const (
+	minPBKDF2SaltBytes = 16
+	minLegacySaltBytes = 8
+)
+
 // Object identifiers of the algorithms the four encoder profiles emit. Values
 // verified against the pinned go-pkcs12 v0.7.3 (mac.go:64-67, crypto.go:28-31,
 // pkcs12.go:214-215) rather than transcribed from a specification, so they match
@@ -166,14 +193,29 @@ func decodeOID(raw asn1.RawValue) (asn1.ObjectIdentifier, error) {
 			ErrProfileUnknown, len(raw.Bytes), maxOIDBytes)
 	}
 	var oid asn1.ObjectIdentifier
-	rest, err := asn1.Unmarshal(raw.FullBytes, &oid)
-	if err != nil {
-		return nil, fmt.Errorf("parse object identifier: %w", err)
-	}
-	if len(rest) != 0 {
-		return nil, fmt.Errorf("%w: %d trailing byte(s) after an object identifier", ErrProfileUnknown, len(rest))
+	if err := unmarshalExact(raw.FullBytes, &oid, "object identifier", "an object identifier"); err != nil {
+		return nil, err
 	}
 	return oid, nil
+}
+
+// unmarshalExact decodes one complete DER element into out. Every decode in the
+// preflight must consume its whole input: accepting a prefix would mean gating on
+// one shape while go-pkcs12 then decodes another, which is the check the sites that
+// spelled it out by hand repeated ten times and three others dropped.
+//
+// parseWhat names the element for a parse failure ("parse <parseWhat>: ...");
+// trailingWhat names it for the trailing-byte refusal ("... after <trailingWhat>"),
+// which reads as a noun phrase and so differs per site.
+func unmarshalExact(der []byte, out any, parseWhat, trailingWhat string) error {
+	rest, err := asn1.Unmarshal(der, out)
+	if err != nil {
+		return fmt.Errorf("parse %s: %w", parseWhat, err)
+	}
+	if len(rest) != 0 {
+		return fmt.Errorf("%w: %d trailing byte(s) after %s", ErrProfileUnknown, len(rest), trailingWhat)
+	}
+	return nil
 }
 
 const (
@@ -207,12 +249,8 @@ const (
 // whatever the input claims to contain.
 func sequenceElements(der []byte, what string, maxElements int) ([][]byte, error) {
 	var seq asn1.RawValue
-	rest, err := asn1.Unmarshal(der, &seq)
-	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", what, err)
-	}
-	if len(rest) != 0 {
-		return nil, fmt.Errorf("%w: %d trailing byte(s) after %s", ErrProfileUnknown, len(rest), what)
+	if err := unmarshalExact(der, &seq, what, what); err != nil {
+		return nil, err
 	}
 	if seq.Class != asn1.ClassUniversal || seq.Tag != asn1.TagSequence || !seq.IsCompound {
 		return nil, fmt.Errorf("%w: %s is not a SEQUENCE", ErrProfileUnknown, what)
@@ -324,15 +362,12 @@ type inspection struct {
 // makes a parse failure safe by construction.
 func inspect(pfx []byte) (inspection, error) {
 	var preamble pfxPreamble
-	rest, unmarshalErr := asn1.Unmarshal(pfx, &preamble)
-	if unmarshalErr != nil {
-		return inspection{}, fmt.Errorf("parse pkcs12 preamble: %w", unmarshalErr)
-	}
-	if len(rest) != 0 {
-		// asn1.Unmarshal returns trailing bytes rather than rejecting them. A bundle
-		// with anything appended is not one this app wrote, and accepting it would
-		// mean inspecting a prefix while the decoder sees the whole file.
-		return inspection{}, fmt.Errorf("%w: %d trailing byte(s) after the bundle", ErrProfileUnknown, len(rest))
+	// asn1.Unmarshal returns trailing bytes rather than rejecting them. A bundle
+	// with anything appended is not one this app wrote, and accepting it would mean
+	// inspecting a prefix while the decoder sees the whole file, so unmarshalExact
+	// refuses it here and at every other decode below.
+	if err := unmarshalExact(pfx, &preamble, "pkcs12 preamble", "the bundle"); err != nil {
+		return inspection{}, err
 	}
 	// All four profiles write a v3 PFX (go-pkcs12 v0.7.3 pkcs12.go:665, 835) and
 	// DecodeChain refuses any other version outright, before it verifies the MAC
@@ -353,7 +388,8 @@ func inspect(pfx []byte) (inspection, error) {
 	if err != nil {
 		return inspection{}, err
 	}
-	if iterErr := checkMACIterations(macOID, macAlg.Parameters, preamble.MacData.Iterations); iterErr != nil {
+	if iterErr := checkMACIterations(macOID, macAlg.Parameters, preamble.MacData.MacSalt,
+		preamble.MacData.Iterations); iterErr != nil {
 		return inspection{}, iterErr
 	}
 
@@ -415,8 +451,8 @@ func bundleAlgorithms(authSafe *contentInfo) (safeAlgorithms, error) {
 	var algs safeAlgorithms
 	for _, element := range elements {
 		var safe contentInfo
-		if _, unmarshalErr := asn1.Unmarshal(element, &safe); unmarshalErr != nil {
-			return safeAlgorithms{}, fmt.Errorf("parse authenticated safe: %w", unmarshalErr)
+		if unmarshalErr := unmarshalExact(element, &safe, "authenticated safe", "an authenticated safe"); unmarshalErr != nil {
+			return safeAlgorithms{}, unmarshalErr
 		}
 		found, err := boundedSafeAlgorithms(&safe)
 		if err != nil {
@@ -447,13 +483,8 @@ func authenticatedSafeElements(authSafe *contentInfo) ([][]byte, error) {
 		return nil, fmt.Errorf("%w: authSafe is not a data ContentInfo", ErrProfileUnknown)
 	}
 	var inner []byte
-	authRest, unmarshalErr := asn1.Unmarshal(authSafe.Content.Bytes, &inner)
-	if unmarshalErr != nil {
-		return nil, fmt.Errorf("parse authSafe content: %w", unmarshalErr)
-	}
-	if len(authRest) != 0 {
-		return nil, fmt.Errorf("%w: %d trailing byte(s) after the authSafe content",
-			ErrProfileUnknown, len(authRest))
+	if err := unmarshalExact(authSafe.Content.Bytes, &inner, "authSafe content", "the authSafe content"); err != nil {
+		return nil, err
 	}
 	return sequenceElements(inner, "authenticated safe", maxAuthenticatedSafes)
 }
@@ -492,13 +523,9 @@ func boundedSafeAlgorithms(safe *contentInfo) (safeAlgorithms, error) {
 	switch {
 	case contentType.Equal(oidEncryptedDataContentType):
 		var enc encryptedData
-		encRest, encErr := asn1.Unmarshal(safe.Content.Bytes, &enc)
-		if encErr != nil {
-			return safeAlgorithms{}, fmt.Errorf("parse encrypted safe contents: %w", encErr)
-		}
-		if len(encRest) != 0 {
-			return safeAlgorithms{}, fmt.Errorf("%w: %d trailing byte(s) after an encrypted safe's contents",
-				ErrProfileUnknown, len(encRest))
+		if encErr := unmarshalExact(safe.Content.Bytes, &enc, "encrypted safe contents",
+			"an encrypted safe's contents"); encErr != nil {
+			return safeAlgorithms{}, encErr
 		}
 		// go-pkcs12 writes version 0 (pkcs12.go:984) and its decoder refuses any
 		// other value before it decrypts the safe (pkcs12.go:611), so a different
@@ -539,13 +566,8 @@ func boundedSafeAlgorithms(safe *contentInfo) (safeAlgorithms, error) {
 // writes, and the decoder would pay for both derivations before refusing it.
 func keyBagAlgorithm(content []byte) (asn1.ObjectIdentifier, error) {
 	var inner []byte
-	innerRest, err := asn1.Unmarshal(content, &inner)
-	if err != nil {
-		return nil, fmt.Errorf("parse plaintext safe content: %w", err)
-	}
-	if len(innerRest) != 0 {
-		return nil, fmt.Errorf("%w: %d trailing byte(s) after a plaintext safe's content",
-			ErrProfileUnknown, len(innerRest))
+	if err := unmarshalExact(content, &inner, "plaintext safe content", "a plaintext safe's content"); err != nil {
+		return nil, err
 	}
 	elements, err := sequenceElements(inner, "plaintext safe bags", maxSafeBags)
 	if err != nil {
@@ -576,8 +598,8 @@ func keyBagAlgorithm(content []byte) (asn1.ObjectIdentifier, error) {
 // key bag carries a profile-identifying algorithm.
 func shroudedKeyBag(element []byte) (*safeBag, error) {
 	var bag safeBag
-	if _, unmarshalErr := asn1.Unmarshal(element, &bag); unmarshalErr != nil {
-		return nil, fmt.Errorf("parse plaintext safe bags: %w", unmarshalErr)
+	if unmarshalErr := unmarshalExact(element, &bag, "plaintext safe bags", "a plaintext safe bag"); unmarshalErr != nil {
+		return nil, unmarshalErr
 	}
 	id, err := decodeOID(bag.ID)
 	if err != nil {
@@ -593,13 +615,9 @@ func shroudedKeyBag(element []byte) (*safeBag, error) {
 // private-key bag and reports the algorithm the key inside it is encrypted with.
 func boundedKeyBagEncryption(bag *safeBag) (asn1.ObjectIdentifier, error) {
 	var info encryptedPrivateKeyInfo
-	bagRest, unmarshalErr := asn1.Unmarshal(bag.Value.Bytes, &info)
-	if unmarshalErr != nil {
-		return nil, fmt.Errorf("parse shrouded key bag: %w", unmarshalErr)
-	}
-	if len(bagRest) != 0 {
-		return nil, fmt.Errorf("%w: %d trailing byte(s) after a shrouded key bag's EncryptedPrivateKeyInfo",
-			ErrProfileUnknown, len(bagRest))
+	if unmarshalErr := unmarshalExact(bag.Value.Bytes, &info, "shrouded key bag",
+		"a shrouded key bag's EncryptedPrivateKeyInfo"); unmarshalErr != nil {
+		return nil, unmarshalErr
 	}
 	keyOID, err := info.Algorithm.algorithmOID()
 	if err != nil {
@@ -643,11 +661,30 @@ func profileFor(macAlg, certAlg, keyAlg asn1.ObjectIdentifier) (EncoderType, err
 // it. A zero reaching checkIterations therefore comes only from a file that spelled
 // one out, which is not a value any profile emits and is rejected like any other
 // out-of-range count.
-func checkMACIterations(macOID asn1.ObjectIdentifier, params asn1.RawValue, macDataIterations int) error {
+//
+// The salt is floored on the same per-algorithm basis, for the reason recorded on
+// minPBKDF2SaltBytes: an unsalted derivation is precomputable across every bundle
+// sharing the password. PBMAC1 carries its salt inside the nested PBKDF2 block, so
+// that arm is floored by decodeProfilePBKDF2 instead.
+func checkMACIterations(macOID asn1.ObjectIdentifier, params asn1.RawValue, macSalt []byte, macDataIterations int) error {
 	if macOID.Equal(oidPBMAC1) {
 		return checkPBMAC1Parameters(params)
 	}
-	return checkIterations("mac", macDataIterations)
+	// The SHA-1 MAC of the two legacy profiles derives with a single iteration
+	// (go-pkcs12 v0.7.3 pkcs12.go:100, 121); modern2023's SHA-256 MAC uses 2048
+	// (pkcs12.go:162), so the floor is per-algorithm; the salt floors follow the
+	// same split (8 octets legacy, 16 modern).
+	minIterations := 1
+	minSalt := minLegacySaltBytes
+	if macOID.Equal(oidSHA256) {
+		minIterations = minKDFIterations
+		minSalt = minPBKDF2SaltBytes
+	}
+	if len(macSalt) < minSalt {
+		return fmt.Errorf("%w: mac salt is %d octet(s), want at least %d",
+			ErrProfileUnknown, len(macSalt), minSalt)
+	}
+	return checkIterationsRange("mac", macDataIterations, minIterations)
 }
 
 // parseProfilePBKDF2 checks one PBKDF2 AlgorithmIdentifier, nested inside either a
@@ -686,19 +723,19 @@ func decodeProfilePBKDF2(label string, alg *algorithmIdentifier) (pbkdf2Params, 
 		return pbkdf2Params{}, fmt.Errorf("%w: %s key derivation is %v, want PBKDF2", ErrProfileUnknown, label, algOID)
 	}
 	var kdf pbkdf2Params
-	rest, err := asn1.Unmarshal(alg.Parameters.FullBytes, &kdf)
-	if err != nil {
-		return pbkdf2Params{}, fmt.Errorf("parse %s PBKDF2 parameters: %w", label, err)
-	}
-	if len(rest) != 0 {
-		return pbkdf2Params{}, fmt.Errorf("%w: %d trailing byte(s) after the %s PBKDF2 parameters",
-			ErrProfileUnknown, len(rest), label)
+	if err := unmarshalExact(alg.Parameters.FullBytes, &kdf, label+" PBKDF2 parameters",
+		"the "+label+" PBKDF2 parameters"); err != nil {
+		return pbkdf2Params{}, err
 	}
 	// The salt is a CHOICE, and only the specified-OCTET-STRING arm is a shape
 	// either modern profile writes or the decoder can consume (go-pkcs12 v0.7.3
 	// crypto.go:222-224, mac.go:89-91).
 	if kdf.Salt.Class != asn1.ClassUniversal || kdf.Salt.Tag != asn1.TagOctetString || kdf.Salt.IsCompound {
 		return pbkdf2Params{}, fmt.Errorf("%w: %s PBKDF2 salt is not a primitive OCTET STRING", ErrProfileUnknown, label)
+	}
+	if len(kdf.Salt.Bytes) < minPBKDF2SaltBytes {
+		return pbkdf2Params{}, fmt.Errorf("%w: %s PBKDF2 salt is %d octet(s), want at least %d",
+			ErrProfileUnknown, label, len(kdf.Salt.Bytes), minPBKDF2SaltBytes)
 	}
 	if iterErr := checkIterations(label, kdf.Iterations); iterErr != nil {
 		return pbkdf2Params{}, iterErr
@@ -737,12 +774,8 @@ func checkProfilePBKDF2PRF(label string, prf *algorithmIdentifier) error {
 // as modern2023 and kept as current indefinitely.
 func checkPBES2Parameters(params asn1.RawValue) error {
 	var outer pbes2Params
-	rest, err := asn1.Unmarshal(params.FullBytes, &outer)
-	if err != nil {
-		return fmt.Errorf("parse pbes2 parameters: %w", err)
-	}
-	if len(rest) != 0 {
-		return fmt.Errorf("%w: %d trailing byte(s) after the pbes2 parameters", ErrProfileUnknown, len(rest))
+	if err := unmarshalExact(params.FullBytes, &outer, "pbes2 parameters", "the pbes2 parameters"); err != nil {
+		return err
 	}
 	if _, kdfErr := parseProfilePBKDF2("pbes2", &outer.KeyDerivationFunc); kdfErr != nil {
 		return kdfErr
@@ -769,12 +802,8 @@ func checkPBES2Parameters(params asn1.RawValue) error {
 // accepts (down to 20 octets) is a weaker MAC than the profile promises.
 func checkPBMAC1Parameters(params asn1.RawValue) error {
 	var outer pbmac1Params
-	rest, err := asn1.Unmarshal(params.FullBytes, &outer)
-	if err != nil {
-		return fmt.Errorf("parse pbmac1 parameters: %w", err)
-	}
-	if len(rest) != 0 {
-		return fmt.Errorf("%w: %d trailing byte(s) after the pbmac1 parameters", ErrProfileUnknown, len(rest))
+	if err := unmarshalExact(params.FullBytes, &outer, "pbmac1 parameters", "the pbmac1 parameters"); err != nil {
+		return err
 	}
 	kdf, err := parseProfilePBKDF2("pbmac1", &outer.KeyDerivationFunc)
 	if err != nil {
@@ -805,20 +834,34 @@ func checkEncryptionIterations(algOID asn1.ObjectIdentifier, params asn1.RawValu
 		return checkPBES2Parameters(params)
 	default:
 		var legacy legacyPBEParams
-		if _, err := asn1.Unmarshal(params.FullBytes, &legacy); err != nil {
-			return fmt.Errorf("parse PBE parameters: %w", err)
+		if err := unmarshalExact(params.FullBytes, &legacy, "PBE parameters", "the PBE parameters"); err != nil {
+			return err
+		}
+		if len(legacy.Salt) < minLegacySaltBytes {
+			return fmt.Errorf("%w: pbe salt is %d octet(s), want at least %d",
+				ErrProfileUnknown, len(legacy.Salt), minLegacySaltBytes)
 		}
 		return checkIterations("pbe", legacy.Iterations)
 	}
 }
 
-// checkIterations rejects a count outside the range this app is willing to run.
-// Non-positive is rejected too: it is not a value any profile emits, and treating
-// it as "cheap" would accept a file whose framing we do not understand.
+// checkIterations rejects a count outside the range this app is willing to run,
+// at the derivation locations every profile emits 2048 at.
 func checkIterations(label string, n int) error {
-	if n <= 0 || n > maxKDFIterations {
-		return fmt.Errorf("%w: %s iteration count %d outside 1..%d",
-			ErrProfileUnknown, label, n, maxKDFIterations)
+	return checkIterationsRange(label, n, minKDFIterations)
+}
+
+// checkIterationsRange rejects a count outside the range this app is willing to
+// run AND willing to trust. The ceiling is the work cap (see maxKDFIterations);
+// the floor is profile identity — a count below what the profile emits is a
+// weaker derivation than the operator configured, and the decoder accepts it
+// silently. Non-positive is still rejected by the floor: it is not a value any
+// profile emits, and treating it as "cheap" would accept a file whose framing we
+// do not understand.
+func checkIterationsRange(label string, n, minIterations int) error {
+	if n < minIterations || n > maxKDFIterations {
+		return fmt.Errorf("%w: %s iteration count %d outside %d..%d",
+			ErrProfileUnknown, label, n, minIterations, maxKDFIterations)
 	}
 	return nil
 }

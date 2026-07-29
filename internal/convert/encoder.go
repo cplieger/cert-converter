@@ -28,6 +28,12 @@ const (
 // hand-maintained switches and a missed one made Inspect reject this app's own
 // output.
 //
+// The modern2023 row's empty-string alias is not a spelling an operator types: it is the
+// UNSET PFX_ENCODER case, and it is what keeps internal/config's
+// "unknown PFX_ENCODER" WARN off every default deployment (config.go calls EncoderName
+// with the raw environment value and warns whenever known is false). Do not drop it when
+// aligning the alias sets with the documented spellings.
+//
 // All three algorithms are part of a profile's identity because they vary
 // independently: legacyrc2 encrypts certificates with RC2-40 but its private key
 // with 3DES, so a bundle carrying a modern MAC and PBES2 certificates over a
@@ -57,8 +63,10 @@ var profiles = []profile{
 // EncoderName normalizes a raw PFX_ENCODER value to one of the known encoder
 // names. It owns the normalization rule but not the diagnostic: known reports
 // whether raw matched a recognized spelling, so the caller that read the
-// environment variable is the one that names it in a warning. An unrecognized
-// value falls back to modern2023 with known false.
+// environment variable is the one that names it in a warning. An empty or
+// whitespace-only value is the unset case and is RECOGNIZED: it returns modern2023
+// with known true, so leaving PFX_ENCODER unset warns about nothing. Any other
+// unrecognized value falls back to modern2023 with known false.
 func EncoderName(raw string) (name EncoderType, known bool) {
 	v := strings.ToLower(strings.TrimSpace(raw))
 	for _, p := range profiles {
@@ -67,6 +75,18 @@ func EncoderName(raw string) (name EncoderType, known bool) {
 		}
 	}
 	return EncNameModern2023, false
+}
+
+// EncoderNames returns the canonical PFX_ENCODER spellings in profile-table
+// order. The profiles table stays the single home of the value domain, while the
+// caller that read the environment variable names the accepted set in its own
+// diagnostic — the same split EncoderName already documents for the warning.
+func EncoderNames() []EncoderType {
+	names := make([]EncoderType, 0, len(profiles))
+	for _, p := range profiles {
+		names = append(names, p.name)
+	}
+	return names
 }
 
 // resolvedProfile resolves an EncoderType to the profile row it selects: the

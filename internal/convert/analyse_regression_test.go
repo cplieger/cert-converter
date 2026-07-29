@@ -2,15 +2,10 @@ package convert_test
 
 import (
 	"bytes"
-	"crypto"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"encoding/pem"
 	"fmt"
 	"math/big"
 	"slices"
@@ -19,59 +14,17 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/testcerts"
 )
 
 // The shapes in this file all come from adversarial review of the structural
 // Analyse rewrite, and of the guards later added to it. Each one was REPRODUCED
 // against the implementation it found wanting, so each test here fails without its
 // fix.
-
-// mint builds a certificate. parentCert/parentKey nil means self-signed.
 //
-// pub is a crypto.PublicKey rather than an *ecdsa.PublicKey because the subject's
-// key and the SIGNING key are independent inputs to x509.CreateCertificate: an
-// adversarial bundle needs a certificate carrying an RSA key it could not possibly
-// have signed with. Every ordinary caller still passes &key.PublicKey.
-func mint(t *testing.T, tmpl *x509.Certificate, pub crypto.PublicKey,
-	parentCert *x509.Certificate, parentKey *ecdsa.PrivateKey,
-) (certPEM []byte, parsed *x509.Certificate) {
-	t.Helper()
-	if parentCert == nil {
-		parentCert = tmpl // self-signed: the template is its own issuer
-	}
-	if parentKey == nil {
-		t.Fatal("setup: mint needs a signing key")
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, parentCert, pub, parentKey)
-	if err != nil {
-		t.Fatalf("setup: CreateCertificate: %v", err)
-	}
-	parsed, err = x509.ParseCertificate(der)
-	if err != nil {
-		t.Fatalf("setup: ParseCertificate: %v", err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), parsed
-}
-
-// keyPEMOf marshals an ECDSA key as a PKCS#8 PEM block.
-func keyPEMOf(t *testing.T, k *ecdsa.PrivateKey) []byte {
-	t.Helper()
-	der, err := x509.MarshalPKCS8PrivateKey(k)
-	if err != nil {
-		t.Fatalf("setup: MarshalPKCS8PrivateKey: %v", err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
-}
-
-// newKey generates a P-256 key.
-func newKey(t *testing.T) *ecdsa.PrivateKey {
-	t.Helper()
-	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("setup: GenerateKey: %v", err)
-	}
-	return k
-}
+// The certificate/key fixtures come from internal/testcerts (Mint, KeyPEM,
+// NewECDSAKey): how this app mints a test certificate has one home, so a change to
+// it (a new default extension, a signature-algorithm pin) is made once.
 
 // oversizedRSAPublicKey fabricates an RSA public key whose modulus is exactly bits
 // bits long. The modulus is not a product of primes and nothing can sign with it,
@@ -151,9 +104,9 @@ func assertOrderInvariant(t *testing.T, label string, certBlobs [][]byte, keyPEM
 // predecessor's subject by definition.
 func TestAnalyse_selects_the_same_identity_for_indistinguishable_renewals(t *testing.T) {
 	t.Parallel()
-	caKey := newKey(t)
+	caKey := testcerts.NewECDSAKey(t)
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
-	caPEM, caCert := mint(t, &x509.Certificate{
+	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "Tie CA"},
 		NotBefore:             notBefore,
@@ -163,7 +116,7 @@ func TestAnalyse_selects_the_same_identity_for_indistinguishable_renewals(t *tes
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &caKey.PublicKey, nil, caKey)
 
-	leafKey := newKey(t)
+	leafKey := testcerts.NewECDSAKey(t)
 	// Identical subject AND identical NotBefore; only the serial differs.
 	leafTmpl := func(serial int64) *x509.Certificate {
 		return &x509.Certificate{
@@ -173,11 +126,11 @@ func TestAnalyse_selects_the_same_identity_for_indistinguishable_renewals(t *tes
 			NotAfter:     notBefore.Add(24 * time.Hour),
 		}
 	}
-	firstPEM, _ := mint(t, leafTmpl(10), &leafKey.PublicKey, caCert, caKey)
-	secondPEM, _ := mint(t, leafTmpl(11), &leafKey.PublicKey, caCert, caKey)
+	_, firstPEM, _ := testcerts.Mint(t, leafTmpl(10), &leafKey.PublicKey, caCert, caKey)
+	_, secondPEM, _ := testcerts.Mint(t, leafTmpl(11), &leafKey.PublicKey, caCert, caKey)
 
 	assertOrderInvariant(t, "indistinguishable renewals",
-		[][]byte{firstPEM, secondPEM, caPEM}, keyPEMOf(t, leafKey))
+		[][]byte{firstPEM, secondPEM, caPEM}, testcerts.KeyPEM(t, leafKey))
 }
 
 // TestAnalyse_selects_the_same_parent_for_indistinguishable_issuers pins the
@@ -188,7 +141,7 @@ func TestAnalyse_selects_the_same_identity_for_indistinguishable_renewals(t *tes
 // equal distance and equal NotAfter exist.
 func TestAnalyse_selects_the_same_parent_for_indistinguishable_issuers(t *testing.T) {
 	t.Parallel()
-	caKey := newKey(t)
+	caKey := testcerts.NewECDSAKey(t)
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 	caTmpl := func(serial int64) *x509.Certificate {
 		return &x509.Certificate{
@@ -203,11 +156,11 @@ func TestAnalyse_selects_the_same_parent_for_indistinguishable_issuers(t *testin
 	}
 	// Two self-signed CA certificates: same subject, same key, same NotAfter, so
 	// both are valid issuers of the leaf and neither is semantically preferable.
-	caAPEM, caACert := mint(t, caTmpl(20), &caKey.PublicKey, nil, caKey)
-	caBPEM, _ := mint(t, caTmpl(21), &caKey.PublicKey, nil, caKey)
+	_, caAPEM, caACert := testcerts.Mint(t, caTmpl(20), &caKey.PublicKey, nil, caKey)
+	_, caBPEM, _ := testcerts.Mint(t, caTmpl(21), &caKey.PublicKey, nil, caKey)
 
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(30),
 		Subject:      pkix.Name{CommonName: "branch-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -215,7 +168,7 @@ func TestAnalyse_selects_the_same_parent_for_indistinguishable_issuers(t *testin
 	}, &leafKey.PublicKey, caACert, caKey)
 
 	assertOrderInvariant(t, "indistinguishable issuers",
-		[][]byte{leafPEM, caAPEM, caBPEM}, keyPEMOf(t, leafKey))
+		[][]byte{leafPEM, caAPEM, caBPEM}, testcerts.KeyPEM(t, leafKey))
 }
 
 // TestAnalyse_handles_a_cross_certification_cycle pins cycle safety. The first
@@ -227,7 +180,7 @@ func TestAnalyse_selects_the_same_parent_for_indistinguishable_issuers(t *testin
 func TestAnalyse_handles_a_cross_certification_cycle(t *testing.T) {
 	t.Parallel()
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
-	keyA, keyB := newKey(t), newKey(t)
+	keyA, keyB := testcerts.NewECDSAKey(t), testcerts.NewECDSAKey(t)
 
 	caTmpl := func(serial int64, cn string) *x509.Certificate {
 		tmpl := &x509.Certificate{
@@ -244,14 +197,14 @@ func TestAnalyse_handles_a_cross_certification_cycle(t *testing.T) {
 
 	// Root: self-signed under subject "CA-B", holding keyB. This is the cycle's
 	// exit to a trust anchor.
-	rootPEM, rootCert := mint(t, caTmpl(40, "CA-B"), &keyB.PublicKey, nil, keyB)
+	_, rootPEM, rootCert := testcerts.Mint(t, caTmpl(40, "CA-B"), &keyB.PublicKey, nil, keyB)
 	// CA-A, issued by CA-B.
-	caAPEM, caACert := mint(t, caTmpl(41, "CA-A"), &keyA.PublicKey, rootCert, keyB)
+	_, caAPEM, caACert := testcerts.Mint(t, caTmpl(41, "CA-A"), &keyA.PublicKey, rootCert, keyB)
 	// CA-B again, this time issued by CA-A: the second half of the cycle.
-	caBPEM, _ := mint(t, caTmpl(42, "CA-B"), &keyB.PublicKey, caACert, keyA)
+	_, caBPEM, _ := testcerts.Mint(t, caTmpl(42, "CA-B"), &keyB.PublicKey, caACert, keyA)
 
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(50),
 		Subject:      pkix.Name{CommonName: "cycle-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -259,7 +212,7 @@ func TestAnalyse_handles_a_cross_certification_cycle(t *testing.T) {
 	}, &leafKey.PublicKey, caACert, keyA)
 
 	assertOrderInvariant(t, "cross-certification cycle",
-		[][]byte{leafPEM, caAPEM, caBPEM, rootPEM}, keyPEMOf(t, leafKey))
+		[][]byte{leafPEM, caAPEM, caBPEM, rootPEM}, testcerts.KeyPEM(t, leafKey))
 }
 
 // TestAnalyse_accepts_a_regenerated_self_signed_certificate pins the key-reuse
@@ -275,7 +228,7 @@ func TestAnalyse_handles_a_cross_certification_cycle(t *testing.T) {
 // certificate carrying its own key.
 func TestAnalyse_accepts_a_regenerated_self_signed_certificate(t *testing.T) {
 	t.Parallel()
-	key := newKey(t)
+	key := testcerts.NewECDSAKey(t)
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 	tmpl := func(serial int64) *x509.Certificate {
 		return &x509.Certificate{
@@ -289,10 +242,10 @@ func TestAnalyse_accepts_a_regenerated_self_signed_certificate(t *testing.T) {
 			KeyUsage:              x509.KeyUsageCertSign,
 		}
 	}
-	oldPEM, _ := mint(t, tmpl(60), &key.PublicKey, nil, key)
-	newPEM, _ := mint(t, tmpl(61), &key.PublicKey, nil, key)
+	_, oldPEM, _ := testcerts.Mint(t, tmpl(60), &key.PublicKey, nil, key)
+	_, newPEM, _ := testcerts.Mint(t, tmpl(61), &key.PublicKey, nil, key)
 
-	got, err := convert.Analyse(concatPEM(oldPEM, newPEM), keyPEMOf(t, key))
+	got, err := convert.Analyse(concatPEM(oldPEM, newPEM), testcerts.KeyPEM(t, key))
 	if err != nil {
 		t.Fatalf("Analyse(regenerated self-signed cert beside its predecessor) = error %v, want nil", err)
 	}
@@ -311,7 +264,7 @@ func TestAnalyse_accepts_a_regenerated_self_signed_certificate(t *testing.T) {
 
 	// And it must be order-invariant, since the two are indistinguishable apart
 	// from their serial.
-	assertOrderInvariant(t, "regenerated self-signed", [][]byte{oldPEM, newPEM}, keyPEMOf(t, key))
+	assertOrderInvariant(t, "regenerated self-signed", [][]byte{oldPEM, newPEM}, testcerts.KeyPEM(t, key))
 }
 
 // TestAnalyse_reports_a_key_that_belongs_to_an_issuer keeps the diagnosis that
@@ -319,9 +272,9 @@ func TestAnalyse_accepts_a_regenerated_self_signed_certificate(t *testing.T) {
 // another certificate in the bundle is still rejected, and the message says so.
 func TestAnalyse_reports_a_key_that_belongs_to_an_issuer(t *testing.T) {
 	t.Parallel()
-	caKey := newKey(t)
+	caKey := testcerts.NewECDSAKey(t)
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
-	caPEM, caCert := mint(t, &x509.Certificate{
+	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(70),
 		Subject:               pkix.Name{CommonName: "Real Issuer CA"},
 		NotBefore:             notBefore,
@@ -331,15 +284,15 @@ func TestAnalyse_reports_a_key_that_belongs_to_an_issuer(t *testing.T) {
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &caKey.PublicKey, nil, caKey)
 
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(71),
 		Subject:      pkix.Name{CommonName: "issued-leaf.example.com"},
 		NotBefore:    notBefore,
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, caCert, caKey)
 
-	_, err := convert.Analyse(concatPEM(leafPEM, caPEM), keyPEMOf(t, caKey))
+	_, err := convert.Analyse(concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, caKey))
 	if err == nil {
 		t.Fatal("Analyse(CA key beside a certificate it issued) = nil error, want a rejection")
 	}
@@ -365,10 +318,10 @@ func TestAnalyse_reports_a_key_that_belongs_to_an_issuer(t *testing.T) {
 // OLDER certificate, is pinned below.
 func TestAnalyse_converts_a_key_shared_by_a_ca_and_its_leaf(t *testing.T) {
 	t.Parallel()
-	sharedKey := newKey(t)
+	sharedKey := testcerts.NewECDSAKey(t)
 	leafNotBefore := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
 	caNotBefore := leafNotBefore.Add(time.Hour)
-	caPEM, caCert := mint(t, &x509.Certificate{
+	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(72),
 		Subject:               pkix.Name{CommonName: "Shared Key CA"},
 		NotBefore:             caNotBefore,
@@ -378,14 +331,14 @@ func TestAnalyse_converts_a_key_shared_by_a_ca_and_its_leaf(t *testing.T) {
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &sharedKey.PublicKey, nil, sharedKey)
 
-	leafPEM, _ := mint(t, &x509.Certificate{
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(73),
 		Subject:      pkix.Name{CommonName: "shared-key-leaf.example.com"},
 		NotBefore:    leafNotBefore,
 		NotAfter:     leafNotBefore.Add(24 * time.Hour),
 	}, &sharedKey.PublicKey, caCert, sharedKey)
 
-	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), keyPEMOf(t, sharedKey))
+	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, sharedKey))
 	if err != nil {
 		t.Fatalf("Analyse(one key for a CA and the leaf it signed) = %v, want the leaf to be selected", err)
 	}
@@ -431,10 +384,10 @@ func observationKinds(obs []convert.Observation) []convert.ObservationKind {
 // the leaf, which is what reporting this through ObsRenewedCertTie claimed.
 func TestAnalyse_reports_the_shared_key_as_reuse_when_the_issuer_match_is_dropped(t *testing.T) {
 	t.Parallel()
-	sharedKey := newKey(t)
+	sharedKey := testcerts.NewECDSAKey(t)
 	caNotBefore := time.Now().Add(-3 * time.Hour).Truncate(time.Second)
 	leafNotBefore := caNotBefore.Add(time.Hour)
-	caPEM, caCert := mint(t, &x509.Certificate{
+	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(9000),
 		Subject:               pkix.Name{CommonName: "Reused Key CA"},
 		NotBefore:             caNotBefore,
@@ -444,7 +397,7 @@ func TestAnalyse_reports_the_shared_key_as_reuse_when_the_issuer_match_is_droppe
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &sharedKey.PublicKey, nil, sharedKey)
 
-	leafPEM, leafCert := mint(t, &x509.Certificate{
+	_, leafPEM, leafCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(9001),
 		Subject:      pkix.Name{CommonName: "reused-key-leaf.example.com"},
 		NotBefore:    leafNotBefore,
@@ -454,7 +407,7 @@ func TestAnalyse_reports_the_shared_key_as_reuse_when_the_issuer_match_is_droppe
 		t.Fatalf("setup: CA did not actually sign the leaf: %v", err)
 	}
 
-	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), keyPEMOf(t, sharedKey))
+	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, sharedKey))
 	if err != nil {
 		t.Fatalf("Analyse(one key for a CA and the leaf it signed) = %v, want the leaf selected", err)
 	}
@@ -493,9 +446,9 @@ func TestAnalyse_reports_the_shared_key_as_reuse_when_the_issuer_match_is_droppe
 // would lose one of the two facts here.
 func TestAnalyse_reports_both_a_renewal_tie_and_key_reuse(t *testing.T) {
 	t.Parallel()
-	sharedKey := newKey(t)
+	sharedKey := testcerts.NewECDSAKey(t)
 	caNotBefore := time.Now().Add(-4 * time.Hour).Truncate(time.Second)
-	caPEM, caCert := mint(t, &x509.Certificate{
+	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(9100),
 		Subject:               pkix.Name{CommonName: "Renewal Tie CA"},
 		NotBefore:             caNotBefore,
@@ -505,20 +458,20 @@ func TestAnalyse_reports_both_a_renewal_tie_and_key_reuse(t *testing.T) {
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &sharedKey.PublicKey, nil, sharedKey)
 
-	oldLeafPEM, _ := mint(t, &x509.Certificate{
+	_, oldLeafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(9101),
 		Subject:      pkix.Name{CommonName: "tie-leaf.example.com"},
 		NotBefore:    caNotBefore.Add(time.Hour),
 		NotAfter:     caNotBefore.Add(48 * time.Hour),
 	}, &sharedKey.PublicKey, caCert, sharedKey)
-	newLeafPEM, _ := mint(t, &x509.Certificate{
+	_, newLeafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(9102),
 		Subject:      pkix.Name{CommonName: "tie-leaf.example.com"},
 		NotBefore:    caNotBefore.Add(2 * time.Hour),
 		NotAfter:     caNotBefore.Add(72 * time.Hour),
 	}, &sharedKey.PublicKey, caCert, sharedKey)
 
-	got, err := convert.Analyse(concatPEM(oldLeafPEM, newLeafPEM, caPEM), keyPEMOf(t, sharedKey))
+	got, err := convert.Analyse(concatPEM(oldLeafPEM, newLeafPEM, caPEM), testcerts.KeyPEM(t, sharedKey))
 	if err != nil {
 		t.Fatalf("Analyse(renewed leaf pair plus their shared-key CA) = %v, want the newest leaf selected", err)
 	}
@@ -545,8 +498,8 @@ func TestAnalyse_reports_no_key_reuse_when_the_key_file_holds_two_keys(t *testin
 	t.Parallel()
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
-	caKey := newKey(t)
-	caPEM, caCert := mint(t, &x509.Certificate{
+	caKey := testcerts.NewECDSAKey(t)
+	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(9200),
 		Subject:               pkix.Name{CommonName: "Two Key CA"},
 		NotBefore:             notBefore,
@@ -556,8 +509,8 @@ func TestAnalyse_reports_no_key_reuse_when_the_key_file_holds_two_keys(t *testin
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &caKey.PublicKey, nil, caKey)
 
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(9201),
 		Subject:      pkix.Name{CommonName: "two-key-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -566,7 +519,7 @@ func TestAnalyse_reports_no_key_reuse_when_the_key_file_holds_two_keys(t *testin
 
 	got, err := convert.Analyse(
 		concatPEM(leafPEM, caPEM),
-		concatPEM(keyPEMOf(t, leafKey), keyPEMOf(t, caKey)),
+		concatPEM(testcerts.KeyPEM(t, leafKey), testcerts.KeyPEM(t, caKey)),
 	)
 	if err != nil {
 		t.Fatalf("Analyse(leaf and issuer certificates with both private keys) = %v, want the leaf selected", err)
@@ -588,8 +541,8 @@ func TestAnalyse_converts_when_key_file_holds_leaf_and_issuer_keys(t *testing.T)
 	t.Parallel()
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
-	caKey := newKey(t)
-	caPEM, caCert := mint(t, &x509.Certificate{
+	caKey := testcerts.NewECDSAKey(t)
+	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(74),
 		Subject:               pkix.Name{CommonName: "Separate Key CA"},
 		NotBefore:             notBefore,
@@ -599,8 +552,8 @@ func TestAnalyse_converts_when_key_file_holds_leaf_and_issuer_keys(t *testing.T)
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &caKey.PublicKey, nil, caKey)
 
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(75),
 		Subject:      pkix.Name{CommonName: "separate-key-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -609,7 +562,7 @@ func TestAnalyse_converts_when_key_file_holds_leaf_and_issuer_keys(t *testing.T)
 
 	got, err := convert.Analyse(
 		concatPEM(leafPEM, caPEM),
-		concatPEM(keyPEMOf(t, leafKey), keyPEMOf(t, caKey)),
+		concatPEM(testcerts.KeyPEM(t, leafKey), testcerts.KeyPEM(t, caKey)),
 	)
 	if err != nil {
 		t.Fatalf("Analyse(leaf and issuer certificates with both private keys) = %v, want the leaf selected", err)
@@ -646,8 +599,8 @@ func TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established(t *tes
 	// An issuer that is NOT placed in the bundle, so the leaf's issuer name
 	// matches nothing present: the same observable state a signature we cannot
 	// verify produces.
-	absentCAKey := newKey(t)
-	_, absentCACert := mint(t, &x509.Certificate{
+	absentCAKey := testcerts.NewECDSAKey(t)
+	_, _, absentCACert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(80),
 		Subject:               pkix.Name{CommonName: "Absent Issuer CA"},
 		NotBefore:             notBefore,
@@ -657,8 +610,8 @@ func TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established(t *tes
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &absentCAKey.PublicKey, nil, absentCAKey)
 
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(81),
 		Subject:      pkix.Name{CommonName: "orphaned-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -668,8 +621,8 @@ func TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established(t *tes
 	// Some other certificate sits in the bundle. Under the old positional rule it
 	// would have been embedded; it must still be embedded rather than dropped,
 	// because we cannot show it is off the chain.
-	otherKey := newKey(t)
-	otherPEM, _ := mint(t, &x509.Certificate{
+	otherKey := testcerts.NewECDSAKey(t)
+	_, otherPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(82),
 		Subject:               pkix.Name{CommonName: "Possibly Related CA"},
 		NotBefore:             notBefore,
@@ -679,7 +632,7 @@ func TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established(t *tes
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &otherKey.PublicKey, nil, otherKey)
 
-	got, err := convert.Analyse(concatPEM(leafPEM, otherPEM), keyPEMOf(t, leafKey))
+	got, err := convert.Analyse(concatPEM(leafPEM, otherPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(leaf whose issuer is absent) = error %v, want nil", err)
 	}
@@ -710,23 +663,23 @@ func TestAnalyse_still_excludes_an_unrelated_cert_from_a_self_signed_identity(t 
 	t.Parallel()
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
-	key := newKey(t)
-	identityPEM, _ := mint(t, &x509.Certificate{
+	key := testcerts.NewECDSAKey(t)
+	_, identityPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(90),
 		Subject:      pkix.Name{CommonName: "self.example.com"},
 		NotBefore:    notBefore,
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &key.PublicKey, nil, key)
 
-	strangerKey := newKey(t)
-	strangerPEM, _ := mint(t, &x509.Certificate{
+	strangerKey := testcerts.NewECDSAKey(t)
+	_, strangerPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(91),
 		Subject:      pkix.Name{CommonName: "stranger.example.com"},
 		NotBefore:    notBefore,
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &strangerKey.PublicKey, nil, strangerKey)
 
-	got, err := convert.Analyse(concatPEM(identityPEM, strangerPEM), keyPEMOf(t, key))
+	got, err := convert.Analyse(concatPEM(identityPEM, strangerPEM), testcerts.KeyPEM(t, key))
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}
@@ -758,7 +711,7 @@ func TestAnalyse_prefers_the_certificate_that_actually_signed_the_leaf(t *testin
 	t.Parallel()
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
-	realKey := newKey(t)
+	realKey := testcerts.NewECDSAKey(t)
 	realTmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(100),
 		Subject:               pkix.Name{CommonName: "Contested CA"},
@@ -768,12 +721,12 @@ func TestAnalyse_prefers_the_certificate_that_actually_signed_the_leaf(t *testin
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign,
 	}
-	realPEM, realCert := mint(t, realTmpl, &realKey.PublicKey, nil, realKey)
+	_, realPEM, realCert := testcerts.Mint(t, realTmpl, &realKey.PublicKey, nil, realKey)
 
 	// Same subject, different key, and a LATER NotAfter so every ranking key below
 	// edge strength would prefer it.
-	impostorKey := newKey(t)
-	impostorPEM, _ := mint(t, &x509.Certificate{
+	impostorKey := testcerts.NewECDSAKey(t)
+	_, impostorPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(101),
 		Subject:               pkix.Name{CommonName: "Contested CA"},
 		NotBefore:             notBefore,
@@ -783,8 +736,8 @@ func TestAnalyse_prefers_the_certificate_that_actually_signed_the_leaf(t *testin
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &impostorKey.PublicKey, nil, impostorKey)
 
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(102),
 		Subject:      pkix.Name{CommonName: "contested-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -800,7 +753,7 @@ func TestAnalyse_prefers_the_certificate_that_actually_signed_the_leaf(t *testin
 	} {
 		t.Run(order.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := convert.Analyse(concatPEM(order.certs...), keyPEMOf(t, leafKey))
+			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
 			if err != nil {
 				t.Fatalf("Analyse = error %v, want nil", err)
 			}
@@ -824,8 +777,8 @@ func TestAnalyse_role_check_ignores_an_unverified_claim(t *testing.T) {
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
 	// A perfectly ordinary self-signed identity.
-	idKey := newKey(t)
-	idPEM, _ := mint(t, &x509.Certificate{
+	idKey := testcerts.NewECDSAKey(t)
+	_, idPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(110),
 		Subject:      pkix.Name{CommonName: "Claimed Issuer"},
 		NotBefore:    notBefore,
@@ -835,7 +788,7 @@ func TestAnalyse_role_check_ignores_an_unverified_claim(t *testing.T) {
 	// A stranger that CLAIMS the identity as its issuer by name but was signed by
 	// its own key. Name chaining alone would make the identity look like an issuer
 	// and reject it.
-	strangerKey := newKey(t)
+	strangerKey := testcerts.NewECDSAKey(t)
 	strangerTmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(111),
 		Subject:      pkix.Name{CommonName: "Freeloader"},
@@ -848,9 +801,9 @@ func TestAnalyse_role_check_ignores_an_unverified_claim(t *testing.T) {
 		NotBefore:    notBefore,
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}
-	strangerPEM, _ := mint(t, strangerTmpl, &strangerKey.PublicKey, strangerSelf, strangerKey)
+	_, strangerPEM, _ := testcerts.Mint(t, strangerTmpl, &strangerKey.PublicKey, strangerSelf, strangerKey)
 
-	got, err := convert.Analyse(concatPEM(idPEM, strangerPEM), keyPEMOf(t, idKey))
+	got, err := convert.Analyse(concatPEM(idPEM, strangerPEM), testcerts.KeyPEM(t, idKey))
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil: a certificate merely CLAIMING this one as issuer must not make it an issuer", err)
 	}
@@ -891,33 +844,33 @@ func TestAnalyse_prefers_the_issuer_whose_route_to_a_root_verifies(t *testing.T)
 	}
 
 	// The root that actually signed the good intermediate.
-	realRootKey := newKey(t)
-	realRootPEM, realRootCert := mint(t, ca(200, sharedRootCN, notBefore.Add(240*time.Hour)),
+	realRootKey := testcerts.NewECDSAKey(t)
+	_, realRootPEM, realRootCert := testcerts.Mint(t, ca(200, sharedRootCN, notBefore.Add(240*time.Hour)),
 		&realRootKey.PublicKey, nil, realRootKey)
 
 	// A same-named root holding a DIFFERENT key. Present in the bundle, so a
 	// name-only walk reaches a "root" through it, but it signed nothing here.
-	fakeRootKey := newKey(t)
-	fakeRootPEM, _ := mint(t, ca(201, sharedRootCN, notBefore.Add(240*time.Hour)),
+	fakeRootKey := testcerts.NewECDSAKey(t)
+	_, fakeRootPEM, _ := testcerts.Mint(t, ca(201, sharedRootCN, notBefore.Add(240*time.Hour)),
 		&fakeRootKey.PublicKey, nil, fakeRootKey)
 
 	// A third same-named root that is NOT in the bundle. It signs the decoy
 	// intermediate, so no included certificate can verify that intermediate.
-	absentRootKey := newKey(t)
-	_, absentRootCert := mint(t, ca(202, sharedRootCN, notBefore.Add(240*time.Hour)),
+	absentRootKey := testcerts.NewECDSAKey(t)
+	_, _, absentRootCert := testcerts.Mint(t, ca(202, sharedRootCN, notBefore.Add(240*time.Hour)),
 		&absentRootKey.PublicKey, nil, absentRootKey)
 
 	// One key across both intermediates: that is what makes both of them verify the
 	// leaf, so edge strength at the leaf's own hop cannot separate them.
-	interKey := newKey(t)
-	goodInterPEM, goodInterCert := mint(t, ca(203, sharedInterCN, notBefore.Add(24*time.Hour)),
+	interKey := testcerts.NewECDSAKey(t)
+	_, goodInterPEM, goodInterCert := testcerts.Mint(t, ca(203, sharedInterCN, notBefore.Add(24*time.Hour)),
 		&interKey.PublicKey, realRootCert, realRootKey)
 	// The decoy expires LATER, so every ranking key below route strength prefers it.
-	decoyInterPEM, _ := mint(t, ca(204, sharedInterCN, notBefore.Add(72*time.Hour)),
+	_, decoyInterPEM, _ := testcerts.Mint(t, ca(204, sharedInterCN, notBefore.Add(72*time.Hour)),
 		&interKey.PublicKey, absentRootCert, absentRootKey)
 
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(205),
 		Subject:      pkix.Name{CommonName: "verified-route-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -933,7 +886,7 @@ func TestAnalyse_prefers_the_issuer_whose_route_to_a_root_verifies(t *testing.T)
 	} {
 		t.Run(order.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := convert.Analyse(concatPEM(order.certs...), keyPEMOf(t, leafKey))
+			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
 			if err != nil {
 				t.Fatalf("Analyse = error %v, want nil", err)
 			}
@@ -1001,8 +954,8 @@ func TestAnalyse_refuses_an_over_ceiling_rsa_issuer(t *testing.T) {
 	// reads that signature — the refusal is decided on the modulus in the
 	// SubjectPublicKeyInfo — and minting it for real would mean generating a
 	// 16k-bit RSA key, which costs minutes.
-	throwawayKey := newKey(t)
-	oversizedPEM, oversizedCert := mint(t, ca(210, notBefore.Add(240*time.Hour)),
+	throwawayKey := testcerts.NewECDSAKey(t)
+	_, oversizedPEM, oversizedCert := testcerts.Mint(t, ca(210, notBefore.Add(240*time.Hour)),
 		oversizedRSAPublicKey(oversizedBits), nil, throwawayKey)
 	if k, ok := oversizedCert.PublicKey.(*rsa.PublicKey); !ok || k.N.BitLen() != oversizedBits {
 		t.Fatalf("setup: minted certificate carries a %T, want a %d-bit RSA modulus; x509 no longer parses one that large",
@@ -1012,22 +965,34 @@ func TestAnalyse_refuses_an_over_ceiling_rsa_issuer(t *testing.T) {
 	// The same-subject decoy with an ordinary key. Self-signed, so it reaches a root
 	// in zero hops and outranks the oversized certificate on every key left once
 	// neither edge can be verified.
-	decoyKey := newKey(t)
-	decoyPEM, _ := mint(t, ca(211, notBefore.Add(72*time.Hour)), &decoyKey.PublicKey, nil, decoyKey)
+	decoyKey := testcerts.NewECDSAKey(t)
+	_, decoyPEM, _ := testcerts.Mint(t, ca(211, notBefore.Add(72*time.Hour)), &decoyKey.PublicKey, nil, decoyKey)
 
 	// The leaf's real signer shares that subject and is NOT in the bundle, so
 	// neither candidate edge verifies — the state the ceiling produces for a leaf
 	// whose genuine issuer is the oversized one.
-	absentKey := newKey(t)
-	_, absentCACert := mint(t, ca(212, notBefore.Add(240*time.Hour)), &absentKey.PublicKey, nil, absentKey)
+	absentKey := testcerts.NewECDSAKey(t)
+	_, _, absentCACert := testcerts.Mint(t, ca(212, notBefore.Add(240*time.Hour)), &absentKey.PublicKey, nil, absentKey)
 
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(213),
 		Subject:      pkix.Name{CommonName: "oversized-issuer-leaf.example.com"},
 		NotBefore:    notBefore,
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, absentCACert, absentKey)
+
+	// The same oversized key under extensions that DISQUALIFY it from issuing.
+	// candidateEdge admits a non-eligible parent only on a PROVEN signature, which
+	// the ceiling forbids, so these variants never gain a children[] entry — a
+	// refusal keyed on candidate survival skipped them while the decoy still won the
+	// chain, which is precisely the substitution the refusal exists to prevent.
+	oversizedNoCA := ca(220, notBefore.Add(240*time.Hour))
+	oversizedNoCA.IsCA = false
+	_, noCAPEM, _ := testcerts.Mint(t, oversizedNoCA, oversizedRSAPublicKey(oversizedBits), nil, throwawayKey)
+	oversizedNoBC := ca(221, notBefore.Add(240*time.Hour))
+	oversizedNoBC.BasicConstraintsValid = false
+	_, noBCPEM, _ := testcerts.Mint(t, oversizedNoBC, oversizedRSAPublicKey(oversizedBits), nil, throwawayKey)
 
 	for _, order := range []struct {
 		name  string
@@ -1035,10 +1000,14 @@ func TestAnalyse_refuses_an_over_ceiling_rsa_issuer(t *testing.T) {
 	}{
 		{"oversized first", [][]byte{leafPEM, oversizedPEM, decoyPEM}},
 		{"decoy first", [][]byte{leafPEM, decoyPEM, oversizedPEM}},
+		{"CA false, oversized first", [][]byte{leafPEM, noCAPEM, decoyPEM}},
+		{"CA false, decoy first", [][]byte{leafPEM, decoyPEM, noCAPEM}},
+		{"no basic constraints, oversized first", [][]byte{leafPEM, noBCPEM, decoyPEM}},
+		{"no basic constraints, decoy first", [][]byte{leafPEM, decoyPEM, noBCPEM}},
 	} {
 		t.Run(order.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := convert.Analyse(concatPEM(order.certs...), keyPEMOf(t, leafKey))
+			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
 			if err == nil {
 				t.Fatalf("Analyse(leaf + a %d-bit RSA issuer + a same-subject ordinary-key certificate) = nil error and a chain of serial(s) %v, want a refusal: with the oversized edge left unverified the decoy (serial 211) outranks it, so the emitted chain does not verify",
 					oversizedBits, chainSerials(got.Chain()))
@@ -1065,8 +1034,8 @@ func TestAnalyse_converts_beside_an_over_ceiling_certificate_that_issues_nothing
 	t.Parallel()
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
-	identityKey := newKey(t)
-	identityPEM, _ := mint(t, &x509.Certificate{
+	identityKey := testcerts.NewECDSAKey(t)
+	_, identityPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(214),
 		Subject:      pkix.Name{CommonName: "narrow-refusal.example.com"},
 		NotBefore:    notBefore,
@@ -1075,8 +1044,8 @@ func TestAnalyse_converts_beside_an_over_ceiling_certificate_that_issues_nothing
 
 	// Oversized, and unrelated to the identity by name and by key identifier, so it
 	// is a candidate issuer of nothing here.
-	throwawayKey := newKey(t)
-	strangerPEM, _ := mint(t, &x509.Certificate{
+	throwawayKey := testcerts.NewECDSAKey(t)
+	_, strangerPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(215),
 		Subject:               pkix.Name{CommonName: "Unrelated Oversized CA"},
 		NotBefore:             notBefore,
@@ -1086,7 +1055,7 @@ func TestAnalyse_converts_beside_an_over_ceiling_certificate_that_issues_nothing
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, oversizedRSAPublicKey(convert.MaxVerifiableKeyBits+17), nil, throwawayKey)
 
-	got, err := convert.Analyse(concatPEM(identityPEM, strangerPEM), keyPEMOf(t, identityKey))
+	got, err := convert.Analyse(concatPEM(identityPEM, strangerPEM), testcerts.KeyPEM(t, identityKey))
 	if err != nil {
 		t.Fatalf("Analyse(self-signed identity + an unrelated oversized certificate) = error %v, want nil: an oversized certificate that issues nothing here cannot influence the chain", err)
 	}
@@ -1137,7 +1106,7 @@ func TestAnalyse_ranks_verified_issuers_by_validity_then_expiry(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			issuerKey := newKey(t)
+			issuerKey := testcerts.NewECDSAKey(t)
 			issuer := func(serial int64, notBefore, notAfter time.Time) *x509.Certificate {
 				return &x509.Certificate{
 					SerialNumber:          big.NewInt(serial),
@@ -1149,20 +1118,20 @@ func TestAnalyse_ranks_verified_issuers_by_validity_then_expiry(t *testing.T) {
 					KeyUsage:              x509.KeyUsageCertSign,
 				}
 			}
-			firstPEM, _ := mint(t, issuer(220, tt.firstNotBefore, tt.firstNotAfter),
+			_, firstPEM, _ := testcerts.Mint(t, issuer(220, tt.firstNotBefore, tt.firstNotAfter),
 				&issuerKey.PublicKey, nil, issuerKey)
-			secondPEM, secondCert := mint(t, issuer(221, tt.secondNotBefore, tt.secondNotAfter),
+			_, secondPEM, secondCert := testcerts.Mint(t, issuer(221, tt.secondNotBefore, tt.secondNotAfter),
 				&issuerKey.PublicKey, nil, issuerKey)
 
-			leafKey := newKey(t)
-			leafPEM, _ := mint(t, &x509.Certificate{
+			leafKey := testcerts.NewECDSAKey(t)
+			_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 				SerialNumber: big.NewInt(222),
 				Subject:      pkix.Name{CommonName: "ranked-issuer-leaf.example.com"},
 				NotBefore:    now.Add(-time.Hour),
 				NotAfter:     now.Add(24 * time.Hour),
 			}, &leafKey.PublicKey, secondCert, issuerKey)
 
-			got, err := convert.Analyse(concatPEM(leafPEM, firstPEM, secondPEM), keyPEMOf(t, leafKey))
+			got, err := convert.Analyse(concatPEM(leafPEM, firstPEM, secondPEM), testcerts.KeyPEM(t, leafKey))
 			if err != nil {
 				t.Fatalf("Analyse = error %v, want nil", err)
 			}
@@ -1214,36 +1183,36 @@ func TestAnalyse_prefers_an_unverified_issuer_with_a_route_to_a_root(t *testing.
 	// A root present in the bundle, and a same-named root that is NOT, holding a
 	// different key. The absent one signs the routed candidate, so that candidate's
 	// route to the included root is a NAME match no signature can confirm.
-	fakeRootKey := newKey(t)
-	fakeRootPEM, _ := mint(t, unverifiableCA(300, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
+	fakeRootKey := testcerts.NewECDSAKey(t)
+	_, fakeRootPEM, _ := testcerts.Mint(t, unverifiableCA(300, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
 		&fakeRootKey.PublicKey, nil, fakeRootKey)
-	absentRootKey := newKey(t)
-	_, absentRootCert := mint(t, unverifiableCA(301, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
+	absentRootKey := testcerts.NewECDSAKey(t)
+	_, _, absentRootCert := testcerts.Mint(t, unverifiableCA(301, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
 		&absentRootKey.PublicKey, nil, absentRootKey)
 
 	// The routed candidate: names the included root as its issuer, so it has an
 	// inclusive route to a root.
-	routedKey := newKey(t)
-	routedPEM, _ := mint(t, unverifiableCA(302, contestedCN, notBefore, notBefore.Add(24*time.Hour)),
+	routedKey := testcerts.NewECDSAKey(t)
+	_, routedPEM, _ := testcerts.Mint(t, unverifiableCA(302, contestedCN, notBefore, notBefore.Add(24*time.Hour)),
 		&routedKey.PublicKey, absentRootCert, absentRootKey)
 
 	// The stranded candidate: names an issuer nothing in the bundle carries, so it
 	// has no route to a root at all -- and it expires later, which is what every
 	// lower-ranked key would reward.
-	absentOtherKey := newKey(t)
-	_, absentOtherCert := mint(t, unverifiableCA(303, "Nobody CA", notBefore, notBefore.Add(240*time.Hour)),
+	absentOtherKey := testcerts.NewECDSAKey(t)
+	_, _, absentOtherCert := testcerts.Mint(t, unverifiableCA(303, "Nobody CA", notBefore, notBefore.Add(240*time.Hour)),
 		&absentOtherKey.PublicKey, nil, absentOtherKey)
-	strandedKey := newKey(t)
-	strandedPEM, _ := mint(t, unverifiableCA(304, contestedCN, notBefore, notBefore.Add(72*time.Hour)),
+	strandedKey := testcerts.NewECDSAKey(t)
+	_, strandedPEM, _ := testcerts.Mint(t, unverifiableCA(304, contestedCN, notBefore, notBefore.Add(72*time.Hour)),
 		&strandedKey.PublicKey, absentOtherCert, absentOtherKey)
 
 	// The leaf's real signer shares the contested subject and is absent, so neither
 	// candidate verifies the leaf's signature.
-	absentSignerKey := newKey(t)
-	_, absentSignerCert := mint(t, unverifiableCA(305, contestedCN, notBefore, notBefore.Add(240*time.Hour)),
+	absentSignerKey := testcerts.NewECDSAKey(t)
+	_, _, absentSignerCert := testcerts.Mint(t, unverifiableCA(305, contestedCN, notBefore, notBefore.Add(240*time.Hour)),
 		&absentSignerKey.PublicKey, nil, absentSignerKey)
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(306),
 		Subject:      pkix.Name{CommonName: "inclusive-route-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -1259,7 +1228,7 @@ func TestAnalyse_prefers_an_unverified_issuer_with_a_route_to_a_root(t *testing.
 	} {
 		t.Run(order.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := convert.Analyse(concatPEM(order.certs...), keyPEMOf(t, leafKey))
+			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
 			if err != nil {
 				t.Fatalf("Analyse = error %v, want nil", err)
 			}
@@ -1289,35 +1258,35 @@ func TestAnalyse_prefers_the_shorter_inclusive_route(t *testing.T) {
 		contestedCN  = "Contested CA"
 	)
 
-	fakeRootKey := newKey(t)
-	fakeRootPEM, _ := mint(t, unverifiableCA(310, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
+	fakeRootKey := testcerts.NewECDSAKey(t)
+	_, fakeRootPEM, _ := testcerts.Mint(t, unverifiableCA(310, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
 		&fakeRootKey.PublicKey, nil, fakeRootKey)
-	absentRootKey := newKey(t)
-	_, absentRootCert := mint(t, unverifiableCA(311, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
+	absentRootKey := testcerts.NewECDSAKey(t)
+	_, _, absentRootCert := testcerts.Mint(t, unverifiableCA(311, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
 		&absentRootKey.PublicKey, nil, absentRootKey)
 
 	// One name-hop from the included root.
-	nearKey := newKey(t)
-	nearPEM, _ := mint(t, unverifiableCA(312, contestedCN, notBefore, notBefore.Add(24*time.Hour)),
+	nearKey := testcerts.NewECDSAKey(t)
+	_, nearPEM, _ := testcerts.Mint(t, unverifiableCA(312, contestedCN, notBefore, notBefore.Add(24*time.Hour)),
 		&nearKey.PublicKey, absentRootCert, absentRootKey)
 
 	// An intermediate one name-hop from the root, and the far candidate below it:
 	// two hops, and a LATER expiry so the NotAfter key would reward it.
-	midKey := newKey(t)
-	midPEM, _ := mint(t, unverifiableCA(313, midCN, notBefore, notBefore.Add(240*time.Hour)),
+	midKey := testcerts.NewECDSAKey(t)
+	_, midPEM, _ := testcerts.Mint(t, unverifiableCA(313, midCN, notBefore, notBefore.Add(240*time.Hour)),
 		&midKey.PublicKey, absentRootCert, absentRootKey)
-	absentMidKey := newKey(t)
-	_, absentMidCert := mint(t, unverifiableCA(314, midCN, notBefore, notBefore.Add(240*time.Hour)),
+	absentMidKey := testcerts.NewECDSAKey(t)
+	_, _, absentMidCert := testcerts.Mint(t, unverifiableCA(314, midCN, notBefore, notBefore.Add(240*time.Hour)),
 		&absentMidKey.PublicKey, nil, absentMidKey)
-	farKey := newKey(t)
-	farPEM, _ := mint(t, unverifiableCA(315, contestedCN, notBefore, notBefore.Add(72*time.Hour)),
+	farKey := testcerts.NewECDSAKey(t)
+	_, farPEM, _ := testcerts.Mint(t, unverifiableCA(315, contestedCN, notBefore, notBefore.Add(72*time.Hour)),
 		&farKey.PublicKey, absentMidCert, absentMidKey)
 
-	absentSignerKey := newKey(t)
-	_, absentSignerCert := mint(t, unverifiableCA(316, contestedCN, notBefore, notBefore.Add(240*time.Hour)),
+	absentSignerKey := testcerts.NewECDSAKey(t)
+	_, _, absentSignerCert := testcerts.Mint(t, unverifiableCA(316, contestedCN, notBefore, notBefore.Add(240*time.Hour)),
 		&absentSignerKey.PublicKey, nil, absentSignerKey)
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(317),
 		Subject:      pkix.Name{CommonName: "shorter-route-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -1333,7 +1302,7 @@ func TestAnalyse_prefers_the_shorter_inclusive_route(t *testing.T) {
 	} {
 		t.Run(order.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := convert.Analyse(concatPEM(order.certs...), keyPEMOf(t, leafKey))
+			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
 			if err != nil {
 				t.Fatalf("Analyse = error %v, want nil", err)
 			}
@@ -1403,8 +1372,8 @@ func TestAnalyse_excludes_a_certificate_that_cannot_issue_certificates(t *testin
 
 			// The leaf's real issuer is NOT in the bundle, so nothing present can
 			// be proven to be its issuer.
-			absentCAKey := newKey(t)
-			_, absentCACert := mint(t, &x509.Certificate{
+			absentCAKey := testcerts.NewECDSAKey(t)
+			_, _, absentCACert := testcerts.Mint(t, &x509.Certificate{
 				SerialNumber:          big.NewInt(400),
 				Subject:               pkix.Name{CommonName: "Absent Encoding CA"},
 				NotBefore:             notBefore,
@@ -1414,8 +1383,8 @@ func TestAnalyse_excludes_a_certificate_that_cannot_issue_certificates(t *testin
 				KeyUsage:              x509.KeyUsageCertSign,
 			}, &absentCAKey.PublicKey, nil, absentCAKey)
 
-			leafKey := newKey(t)
-			leafPEM, _ := mint(t, &x509.Certificate{
+			leafKey := testcerts.NewECDSAKey(t)
+			_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 				SerialNumber: big.NewInt(401),
 				Subject:      pkix.Name{CommonName: "disqualified-issuer-leaf.example.com"},
 				NotBefore:    notBefore,
@@ -1425,7 +1394,7 @@ func TestAnalyse_excludes_a_certificate_that_cannot_issue_certificates(t *testin
 			// A decoy carrying the absent issuer's NAME, so name chaining alone
 			// admits it, but disqualified from issuing certificates by its own
 			// extensions.
-			decoyKey := newKey(t)
+			decoyKey := testcerts.NewECDSAKey(t)
 			decoy := &x509.Certificate{
 				SerialNumber: big.NewInt(402),
 				Subject:      pkix.Name{CommonName: "Absent Encoding CA"},
@@ -1433,9 +1402,9 @@ func TestAnalyse_excludes_a_certificate_that_cannot_issue_certificates(t *testin
 				NotAfter:     notBefore.Add(48 * time.Hour),
 			}
 			tc.disqualify(decoy)
-			decoyPEM, _ := mint(t, decoy, &decoyKey.PublicKey, nil, decoyKey)
+			_, decoyPEM, _ := testcerts.Mint(t, decoy, &decoyKey.PublicKey, nil, decoyKey)
 
-			got, err := convert.Analyse(concatPEM(leafPEM, decoyPEM), keyPEMOf(t, leafKey))
+			got, err := convert.Analyse(concatPEM(leafPEM, decoyPEM), testcerts.KeyPEM(t, leafKey))
 			if err != nil {
 				t.Fatalf("Analyse(leaf beside a %s) = error %v, want nil", tc.name, err)
 			}
@@ -1504,8 +1473,8 @@ func TestAnalyse_keeps_the_upper_chain_when_a_middle_issuer_cannot_be_establishe
 	t.Parallel()
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
-	rootKey := newKey(t)
-	rootPEM, rootCert := mint(t, &x509.Certificate{
+	rootKey := testcerts.NewECDSAKey(t)
+	_, rootPEM, rootCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(500),
 		Subject:               pkix.Name{CommonName: "Encoding Root CA"},
 		NotBefore:             notBefore,
@@ -1515,8 +1484,8 @@ func TestAnalyse_keeps_the_upper_chain_when_a_middle_issuer_cannot_be_establishe
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &rootKey.PublicKey, nil, rootKey)
 
-	upperKey := newKey(t)
-	upperPEM, upperCert := mint(t, &x509.Certificate{
+	upperKey := testcerts.NewECDSAKey(t)
+	_, upperPEM, upperCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(501),
 		Subject:               pkix.Name{CommonName: "Encoding Upper CA"},
 		NotBefore:             notBefore,
@@ -1527,8 +1496,8 @@ func TestAnalyse_keeps_the_upper_chain_when_a_middle_issuer_cannot_be_establishe
 	}, &upperKey.PublicKey, rootCert, rootKey)
 
 	// Signed by the upper CA, but naming it through the other permitted encoding.
-	lowerKey := newKey(t)
-	lowerPEM, lowerCert := mint(t, &x509.Certificate{
+	lowerKey := testcerts.NewECDSAKey(t)
+	_, lowerPEM, lowerCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(502),
 		Subject:               pkix.Name{CommonName: "Encoding Lower CA"},
 		NotBefore:             notBefore,
@@ -1545,15 +1514,15 @@ func TestAnalyse_keeps_the_upper_chain_when_a_middle_issuer_cannot_be_establishe
 		t.Fatal("setup: the lower CA carries an authority key identifier, so the key-identifier edge signal would find the upper CA anyway")
 	}
 
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(503),
 		Subject:      pkix.Name{CommonName: "middle-gap-leaf.example.com"},
 		NotBefore:    notBefore,
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, lowerCert, lowerKey)
 
-	got, err := convert.Analyse(concatPEM(leafPEM, lowerPEM, upperPEM, rootPEM), keyPEMOf(t, leafKey))
+	got, err := convert.Analyse(concatPEM(leafPEM, lowerPEM, upperPEM, rootPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(chain with an unestablishable middle edge) = error %v, want nil", err)
 	}
@@ -1591,14 +1560,14 @@ func TestAnalyse_keeps_the_upper_chain_when_a_middle_issuer_cannot_be_establishe
 // leaf the operator asked to convert.
 func TestAnalyse_drops_a_shared_key_issuer_across_a_name_encoding_difference(t *testing.T) {
 	t.Parallel()
-	sharedKey := newKey(t)
+	sharedKey := testcerts.NewECDSAKey(t)
 	now := time.Now().Truncate(time.Second)
-	caPEM, caCert := mint(t, &x509.Certificate{
+	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(600), Subject: pkix.Name{CommonName: "Shared Encoding CA"},
 		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(48 * time.Hour),
 		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
 	}, &sharedKey.PublicKey, nil, sharedKey)
-	leafPEM, leafCert := mint(t, &x509.Certificate{
+	_, leafPEM, leafCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(601), Subject: pkix.Name{CommonName: "encoding-leaf.example.com"},
 		NotBefore: now.Add(-2 * time.Hour), NotAfter: now.Add(24 * time.Hour),
 	}, &sharedKey.PublicKey, utf8SubjectView(caCert, "Shared Encoding CA"), sharedKey)
@@ -1608,7 +1577,7 @@ func TestAnalyse_drops_a_shared_key_issuer_across_a_name_encoding_difference(t *
 	if err := leafCert.CheckSignatureFrom(caCert); err != nil {
 		t.Fatalf("setup: CA did not actually sign leaf: %v", err)
 	}
-	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), keyPEMOf(t, sharedKey))
+	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, sharedKey))
 	if err != nil {
 		t.Fatalf("Analyse = %v, want the end-entity identity", err)
 	}
@@ -1692,8 +1661,8 @@ func reorderedSubjectView(t *testing.T, c *x509.Certificate, seq pkix.RDNSequenc
 func TestAnalyse_keeps_a_ca_identity_whose_subject_only_matches_an_issuer_name_approximately(t *testing.T) {
 	t.Parallel()
 	now := time.Now().Truncate(time.Second)
-	caKey := newKey(t)
-	caPEM, caCert := mint(t, &x509.Certificate{
+	caKey := testcerts.NewECDSAKey(t)
+	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(700),
 		// O then CN.
 		RawSubject: rawNameOf(t, rdnSequence(
@@ -1706,8 +1675,8 @@ func TestAnalyse_keeps_a_ca_identity_whose_subject_only_matches_an_issuer_name_a
 
 	// Signed by the CA's key, but naming an issuer whose RDNs are in the other
 	// order: CN then O.
-	otherKey := newKey(t)
-	otherPEM, otherCert := mint(t, &x509.Certificate{
+	otherKey := testcerts.NewECDSAKey(t)
+	_, otherPEM, otherCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(701),
 		Subject:      pkix.Name{CommonName: "reordered-leaf.example.com"},
 		NotBefore:    now.Add(-2 * time.Hour), NotAfter: now.Add(24 * time.Hour),
@@ -1732,7 +1701,7 @@ func TestAnalyse_keeps_a_ca_identity_whose_subject_only_matches_an_issuer_name_a
 		t.Fatal("setup: the pkix.Name approximations of the two names differ, so this bundle no longer reproduces the false issuer match")
 	}
 
-	got, err := convert.Analyse(concatPEM(caPEM, otherPEM), keyPEMOf(t, caKey))
+	got, err := convert.Analyse(concatPEM(caPEM, otherPEM), testcerts.KeyPEM(t, caKey))
 	if err != nil {
 		t.Fatalf("Analyse(CA whose subject only approximately matches a co-bundled issuer name) = error %v, want the CA identity: it issued nothing in this bundle", err)
 	}
@@ -1783,8 +1752,8 @@ func TestAnalyse_keeps_a_signing_CA_that_is_not_issuer_eligible(t *testing.T) {
 	// no extension, and a zero KeyUsage emits none either, so its only
 	// disqualification is the missing basicConstraints RFC 5280 requires of a v3
 	// issuer. This is what `openssl req -x509` produces without CA flags.
-	caKey := newKey(t)
-	caPEM, caCert := mint(t, &x509.Certificate{
+	caKey := testcerts.NewECDSAKey(t)
+	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(500),
 		Subject:      pkix.Name{CommonName: "No-BC Internal CA"},
 		NotBefore:    notBefore,
@@ -1794,15 +1763,15 @@ func TestAnalyse_keeps_a_signing_CA_that_is_not_issuer_eligible(t *testing.T) {
 		t.Fatal("setup: the CA fixture carries basic constraints; the shape under test is a CA without them")
 	}
 
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(501),
 		Subject:      pkix.Name{CommonName: "no-bc-ca-leaf.example.com"},
 		NotBefore:    notBefore,
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, caCert, caKey)
 
-	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), keyPEMOf(t, leafKey))
+	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(leaf signed by a CA with no basic constraints) = error %v, want nil", err)
 	}
@@ -1856,8 +1825,8 @@ func TestAnalyse_emits_a_compliant_chain_unchanged_and_silently(t *testing.T) {
 	t.Parallel()
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
-	rootKey := newKey(t)
-	rootPEM, rootCert := mint(t, &x509.Certificate{
+	rootKey := testcerts.NewECDSAKey(t)
+	_, rootPEM, rootCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(510),
 		Subject:               pkix.Name{CommonName: "Compliant Root CA"},
 		NotBefore:             notBefore,
@@ -1867,8 +1836,8 @@ func TestAnalyse_emits_a_compliant_chain_unchanged_and_silently(t *testing.T) {
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &rootKey.PublicKey, nil, rootKey)
 
-	interKey := newKey(t)
-	interPEM, interCert := mint(t, &x509.Certificate{
+	interKey := testcerts.NewECDSAKey(t)
+	_, interPEM, interCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(511),
 		Subject:               pkix.Name{CommonName: "Compliant Intermediate CA"},
 		NotBefore:             notBefore,
@@ -1878,15 +1847,15 @@ func TestAnalyse_emits_a_compliant_chain_unchanged_and_silently(t *testing.T) {
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &interKey.PublicKey, rootCert, rootKey)
 
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(512),
 		Subject:      pkix.Name{CommonName: "compliant-leaf.example.com"},
 		NotBefore:    notBefore,
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, interCert, interKey)
 
-	got, err := convert.Analyse(concatPEM(leafPEM, interPEM, rootPEM), keyPEMOf(t, leafKey))
+	got, err := convert.Analyse(concatPEM(leafPEM, interPEM, rootPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(compliant leaf+intermediate+root) = error %v, want nil", err)
 	}
@@ -1929,17 +1898,17 @@ func TestAnalyse_orders_a_chain_proven_across_a_name_encoding_difference(t *test
 	t.Parallel()
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
-	rootKey := newKey(t)
-	rootPEM, rootCert := mint(t, unverifiableCA(800, "Ordered Encoding Root CA", notBefore, notBefore.Add(96*time.Hour)),
+	rootKey := testcerts.NewECDSAKey(t)
+	_, rootPEM, rootCert := testcerts.Mint(t, unverifiableCA(800, "Ordered Encoding Root CA", notBefore, notBefore.Add(96*time.Hour)),
 		&rootKey.PublicKey, nil, rootKey)
-	upperKey := newKey(t)
-	upperPEM, upperCert := mint(t, unverifiableCA(801, "Ordered Encoding Upper CA", notBefore, notBefore.Add(72*time.Hour)),
+	upperKey := testcerts.NewECDSAKey(t)
+	_, upperPEM, upperCert := testcerts.Mint(t, unverifiableCA(801, "Ordered Encoding Upper CA", notBefore, notBefore.Add(72*time.Hour)),
 		&upperKey.PublicKey, rootCert, rootKey)
-	lowerKey := newKey(t)
-	lowerPEM, lowerCert := mint(t, unverifiableCA(802, "Ordered Encoding Lower CA", notBefore, notBefore.Add(48*time.Hour)),
+	lowerKey := testcerts.NewECDSAKey(t)
+	_, lowerPEM, lowerCert := testcerts.Mint(t, unverifiableCA(802, "Ordered Encoding Lower CA", notBefore, notBefore.Add(48*time.Hour)),
 		&lowerKey.PublicKey, utf8SubjectView(upperCert, "Ordered Encoding Upper CA"), upperKey)
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(803),
 		Subject:      pkix.Name{CommonName: "ordered-encoding-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -1958,7 +1927,7 @@ func TestAnalyse_orders_a_chain_proven_across_a_name_encoding_difference(t *test
 
 	// Input order deliberately breaks ancestry: root before upper. The additive
 	// fallback would emit 802,800,801.
-	got, err := convert.Analyse(concatPEM(leafPEM, lowerPEM, rootPEM, upperPEM), keyPEMOf(t, leafKey))
+	got, err := convert.Analyse(concatPEM(leafPEM, lowerPEM, rootPEM, upperPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(chain proven across an encoding difference) = error %v, want nil", err)
 	}
@@ -1996,11 +1965,11 @@ func TestAnalyse_keeps_an_unproven_name_match_from_being_promoted(t *testing.T) 
 		t.Parallel()
 		notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
-		realKey := newKey(t)
-		realPEM, realCert := mint(t, unverifiableCA(810, "Promoted Encoding CA", notBefore, notBefore.Add(48*time.Hour)),
+		realKey := testcerts.NewECDSAKey(t)
+		_, realPEM, realCert := testcerts.Mint(t, unverifiableCA(810, "Promoted Encoding CA", notBefore, notBefore.Add(48*time.Hour)),
 			&realKey.PublicKey, nil, realKey)
-		leafKey := newKey(t)
-		leafPEM, leafCert := mint(t, &x509.Certificate{
+		leafKey := testcerts.NewECDSAKey(t)
+		_, leafPEM, leafCert := testcerts.Mint(t, &x509.Certificate{
 			SerialNumber: big.NewInt(811),
 			Subject:      pkix.Name{CommonName: "promoted-encoding-leaf.example.com"},
 			NotBefore:    notBefore,
@@ -2009,10 +1978,10 @@ func TestAnalyse_keeps_an_unproven_name_match_from_being_promoted(t *testing.T) 
 
 		// The impostor's subject is the leaf's issuer name EXACTLY, copied from the
 		// leaf so the DER cannot drift, and it signed nothing here.
-		impostorKey := newKey(t)
+		impostorKey := testcerts.NewECDSAKey(t)
 		impostor := unverifiableCA(812, "", notBefore, notBefore.Add(240*time.Hour))
 		impostor.RawSubject = leafCert.RawIssuer
-		impostorPEM, impostorCert := mint(t, impostor, &impostorKey.PublicKey, nil, impostorKey)
+		_, impostorPEM, impostorCert := testcerts.Mint(t, impostor, &impostorKey.PublicKey, nil, impostorKey)
 
 		if !bytes.Equal(impostorCert.RawSubject, leafCert.RawIssuer) {
 			t.Fatal("setup: the impostor's subject is not the leaf's issuer name byte for byte, so it is not the exact-match candidate under test")
@@ -2030,7 +1999,7 @@ func TestAnalyse_keeps_an_unproven_name_match_from_being_promoted(t *testing.T) 
 		} {
 			t.Run(order.name, func(t *testing.T) {
 				t.Parallel()
-				got, err := convert.Analyse(concatPEM(order.certs...), keyPEMOf(t, leafKey))
+				got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
 				if err != nil {
 					t.Fatalf("Analyse = error %v, want nil", err)
 				}
@@ -2053,16 +2022,16 @@ func TestAnalyse_keeps_an_unproven_name_match_from_being_promoted(t *testing.T) 
 	t.Run("key reuse across an encoding difference is not issuance", func(t *testing.T) {
 		t.Parallel()
 		notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
-		sharedKey := newKey(t)
+		sharedKey := testcerts.NewECDSAKey(t)
 
-		firstPEM, firstCert := mint(t, unverifiableCA(820, "Regenerated Encoding CA", notBefore, notBefore.Add(48*time.Hour)),
+		_, firstPEM, firstCert := testcerts.Mint(t, unverifiableCA(820, "Regenerated Encoding CA", notBefore, notBefore.Add(48*time.Hour)),
 			&sharedKey.PublicKey, nil, sharedKey)
 		// Same name, encoded the other permitted way, same key: a regeneration.
 		reissued := unverifiableCA(821, "", notBefore.Add(time.Minute), notBefore.Add(96*time.Hour))
 		reissuedView := utf8SubjectView(firstCert, "Regenerated Encoding CA")
 		reissued.RawSubject = nil
 		reissued.Subject = reissuedView.Subject
-		secondPEM, secondCert := mint(t, reissued, &sharedKey.PublicKey, reissuedView, sharedKey)
+		_, secondPEM, secondCert := testcerts.Mint(t, reissued, &sharedKey.PublicKey, reissuedView, sharedKey)
 
 		if bytes.Equal(firstCert.RawSubject, secondCert.RawSubject) {
 			t.Fatal("setup: both certificates encode the subject identically, so the raw-name exclusion alone would cover this bundle")
@@ -2071,7 +2040,7 @@ func TestAnalyse_keeps_an_unproven_name_match_from_being_promoted(t *testing.T) 
 			t.Fatal("setup: the regenerated certificate is not self-signed under its own re-encoded name")
 		}
 
-		got, err := convert.Analyse(concatPEM(firstPEM, secondPEM), keyPEMOf(t, sharedKey))
+		got, err := convert.Analyse(concatPEM(firstPEM, secondPEM), testcerts.KeyPEM(t, sharedKey))
 		if err != nil {
 			t.Fatalf("Analyse(a regenerated self-signed certificate re-encoding its own subject) = error %v, want nil: reusing a key is not issuing a certificate", err)
 		}
@@ -2103,25 +2072,25 @@ func TestAnalyse_excludes_a_stranger_once_the_encoding_gap_is_proven(t *testing.
 	t.Parallel()
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
-	caKey := newKey(t)
-	caPEM, caCert := mint(t, unverifiableCA(830, "Proven Gap CA", notBefore, notBefore.Add(48*time.Hour)),
+	caKey := testcerts.NewECDSAKey(t)
+	_, caPEM, caCert := testcerts.Mint(t, unverifiableCA(830, "Proven Gap CA", notBefore, notBefore.Add(48*time.Hour)),
 		&caKey.PublicKey, nil, caKey)
-	leafKey := newKey(t)
-	leafPEM, leafCert := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, leafCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(831),
 		Subject:      pkix.Name{CommonName: "proven-gap-leaf.example.com"},
 		NotBefore:    notBefore,
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, utf8SubjectView(caCert, "Proven Gap CA"), caKey)
-	strangerKey := newKey(t)
-	strangerPEM, _ := mint(t, unverifiableCA(832, "Unrelated Bystander CA", notBefore, notBefore.Add(240*time.Hour)),
+	strangerKey := testcerts.NewECDSAKey(t)
+	_, strangerPEM, _ := testcerts.Mint(t, unverifiableCA(832, "Unrelated Bystander CA", notBefore, notBefore.Add(240*time.Hour)),
 		&strangerKey.PublicKey, nil, strangerKey)
 
 	if bytes.Equal(leafCert.RawIssuer, caCert.RawSubject) {
 		t.Fatal("setup: issuer and subject encodings unexpectedly match, so the gap under test is absent")
 	}
 
-	got, err := convert.Analyse(concatPEM(leafPEM, caPEM, strangerPEM), keyPEMOf(t, leafKey))
+	got, err := convert.Analyse(concatPEM(leafPEM, caPEM, strangerPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}
@@ -2136,5 +2105,52 @@ func TestAnalyse_excludes_a_stranger_once_the_encoding_gap_is_proven(t *testing.
 	}
 	if hasObservation(got.Observations(), convert.ObsChainUnverified) {
 		t.Errorf("observations = %v, want no %q: the leaf's issuer is proven", got.Observations(), convert.ObsChainUnverified)
+	}
+}
+
+// TestAnalyse_reports_an_unproven_emitted_chain_edge pins the observation for the
+// shape ObsChainUnverified cannot reach: the discovered path ends at a certificate
+// that IS proven self-signed, so the additive fallback branch is skipped, while the
+// hop below it rests on a name match alone. Here the leaf's real signer is absent
+// and a same-subject self-signed decoy holding a different key wins the chain, so
+// the emitted issuer never signed anything in this bundle. The chain is deliberate
+// (bestParent falls back to a merely-linked candidate when no proven one exists),
+// but before this observation existed the whole bundle converted with ZERO
+// observations, and a PKCS#12 CA bag a consumer imports into a trust store is the
+// wrong place for that to be silent.
+func TestAnalyse_reports_an_unproven_emitted_chain_edge(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	const issuerCN = "Absent Signer CA"
+
+	// The real signer, absent from the bundle.
+	absentKey := testcerts.NewECDSAKey(t)
+	_, _, absentCert := testcerts.Mint(t, unverifiableCA(840, issuerCN, notBefore, notBefore.Add(240*time.Hour)),
+		&absentKey.PublicKey, nil, absentKey)
+
+	// The decoy: same subject, different key, self-signed - so it is a proven root
+	// and the path terminates on it, while its key never signed the leaf.
+	decoyKey := testcerts.NewECDSAKey(t)
+	_, decoyPEM, _ := testcerts.Mint(t, unverifiableCA(841, issuerCN, notBefore, notBefore.Add(240*time.Hour)),
+		&decoyKey.PublicKey, nil, decoyKey)
+
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(842),
+		Subject:      pkix.Name{CommonName: "unproven-edge-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, absentCert, absentKey)
+
+	got, err := convert.Analyse(concatPEM(leafPEM, decoyPEM), testcerts.KeyPEM(t, leafKey))
+	if err != nil {
+		t.Fatalf("Analyse = error %v, want nil", err)
+	}
+	if serials := strings.Join(chainSerials(got.Chain()), ","); serials != "841" {
+		t.Fatalf("chain serials = %s, want 841 alone: the setup's premise is that the decoy wins the chain", serials)
+	}
+	if !hasObservation(got.Observations(), convert.ObsChainEdgeUnprovenIssuer) {
+		t.Errorf("observations = %v, want %q: the emitted issuer never signed the leaf, and nothing else in the output says so",
+			got.Observations(), convert.ObsChainEdgeUnprovenIssuer)
 	}
 }

@@ -16,7 +16,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
-	"testing"
 	"time"
 )
 
@@ -45,6 +44,54 @@ func signCert(tb FatalTB, template, parent *x509.Certificate, pub crypto.PublicK
 		tb.Fatal(err)
 	}
 	return der, pem.EncodeToMemory(&pem.Block{Type: pemTypeCert, Bytes: der})
+}
+
+// Mint signs template with parent (a nil parent yields a self-signed certificate
+// whose template is its own issuer) and returns the DER, the PEM encoding and the
+// parsed certificate.
+//
+// pub is independent of parentKey so a fixture can carry a key it could not have
+// signed with: an adversarial bundle needs a certificate whose subject key and
+// signing key are unrelated. It sits beside template rather than in
+// x509.CreateCertificate's position because the subject's key is part of the
+// certificate being described, which is the order every caller in this repo
+// already reads. It is the template-level primitive the fixed-shape generators
+// below are built from, exported because the app's test suites otherwise
+// re-derive it per file.
+func Mint(tb FatalTB, template *x509.Certificate, pub crypto.PublicKey,
+	parent *x509.Certificate, parentKey crypto.Signer,
+) (der, pemBytes []byte, parsed *x509.Certificate) {
+	if parent == nil {
+		parent = template // self-signed: the template is its own issuer
+	}
+	if parentKey == nil {
+		tb.Fatal("setup: Mint needs a signing key")
+	}
+	der, pemBytes = signCert(tb, template, parent, pub, parentKey)
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return der, pemBytes, parsed
+}
+
+// KeyPEM marshals key as a PKCS#8 PRIVATE KEY block, the form cert-converter's
+// key parser reads first.
+func KeyPEM(tb FatalTB, key crypto.PrivateKey) []byte {
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: pemTypeKeyPKCS8, Bytes: der})
+}
+
+// NewECDSAKey generates a P-256 key, the default fixture key type.
+func NewECDSAKey(tb FatalTB) *ecdsa.PrivateKey {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return key
 }
 
 // GenerateSelfSignedCert creates a self-signed certificate with the given
@@ -87,8 +134,12 @@ func GenerateSelfSignedCert(tb FatalTB, cn, keyType string) (certPEM, keyPEM []b
 
 // GenerateCertChain creates a CA + leaf certificate chain.
 // Returns leaf PEM, key PEM, CA PEM, and the full chain (leaf + CA).
-func GenerateCertChain(tb testing.TB) (leafPEM, keyPEM, caPEM, chainPEM []byte) {
-	tb.Helper()
+func GenerateCertChain(tb FatalTB) (leafPEM, keyPEM, caPEM, chainPEM []byte) {
+	// Helper() is line-attribution sugar, not part of the contract: *testing.T has it
+	// and *rapid.T (the reason FatalTB exists) does not, so it is taken when offered.
+	if h, ok := tb.(interface{ Helper() }); ok {
+		h.Helper()
+	}
 
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

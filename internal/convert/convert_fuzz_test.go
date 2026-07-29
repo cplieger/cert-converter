@@ -5,7 +5,6 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
-	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -14,6 +13,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -30,8 +30,7 @@ func FuzzParseCertChain(f *testing.F) {
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().Add(time.Hour),
 	}
-	der, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	validPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	_, validPEM, _ := testcerts.Mint(f, tmpl, &key.PublicKey, nil, key)
 	f.Add(validPEM)
 	f.Add([]byte("not a pem"))
 	// A declaration encoding/pem drops silently (BEGIN line, no END) must be
@@ -93,11 +92,10 @@ func FuzzParseCertChain(f *testing.F) {
 
 func FuzzParsePrivateKey(f *testing.F) {
 	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
-	pkcs8Bytes, _ := x509.MarshalPKCS8PrivateKey(rsaKey)
-	rsaPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8Bytes})
+	rsaPEM := testcerts.KeyPEM(f, rsaKey)
 	f.Add(rsaPEM)
 
-	ecKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	ecKey := testcerts.NewECDSAKey(f)
 	ecBytes, _ := x509.MarshalECPrivateKey(ecKey)
 	ecPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: ecBytes})
 	f.Add(ecPEM)
@@ -172,7 +170,7 @@ func FuzzParsePrivateKey(f *testing.F) {
 
 func FuzzToPFXRoundTrip(f *testing.F) {
 	// Seed: valid cert+key PEM concatenation.
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	key := testcerts.NewECDSAKey(f)
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: "roundtrip"},
@@ -180,15 +178,13 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		NotAfter:     time.Now().Add(time.Hour),
 		IsCA:         true,
 	}
-	der, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	keyBytes, _ := x509.MarshalPKCS8PrivateKey(key)
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes})
+	_, certPEM, _ := testcerts.Mint(f, tmpl, &key.PublicKey, nil, key)
+	keyPEM := testcerts.KeyPEM(f, key)
 	f.Add(append(certPEM, keyPEM...))
 
 	// A CA-signed leaf beside its own key: the only seed that reaches the
 	// CA-count invariant below, which a self-signed seed leaves at 0 == 0.
-	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	caKey := testcerts.NewECDSAKey(f)
 	caTmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(2),
 		Subject:               pkix.Name{CommonName: "roundtrip CA"},
@@ -198,20 +194,16 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		KeyUsage:              x509.KeyUsageCertSign,
 		BasicConstraintsValid: true,
 	}
-	caDER, _ := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
-	caCert, _ := x509.ParseCertificate(caDER)
-	leafKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	_, caPEM, caCert := testcerts.Mint(f, caTmpl, &caKey.PublicKey, nil, caKey)
+	leafKey := testcerts.NewECDSAKey(f)
 	leafTmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(3),
 		Subject:      pkix.Name{CommonName: "roundtrip leaf"},
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().Add(time.Hour),
 	}
-	leafDER, _ := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, &leafKey.PublicKey, caKey)
-	leafKeyDER, _ := x509.MarshalPKCS8PrivateKey(leafKey)
-	chainSeed := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
-	chainSeed = append(chainSeed, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})...)
-	chainSeed = append(chainSeed, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: leafKeyDER})...)
+	_, leafPEM, _ := testcerts.Mint(f, leafTmpl, &leafKey.PublicKey, caCert, caKey)
+	chainSeed := slices.Concat(leafPEM, caPEM, testcerts.KeyPEM(f, leafKey))
 	f.Add(chainSeed)
 
 	f.Fuzz(func(t *testing.T, data []byte) {

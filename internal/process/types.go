@@ -57,4 +57,10 @@ const (
 	statusUnreadable
 	statusVanished
 	statusUnwritable
+
+	// statusCount is the enum's LENGTH, not an outcome. It is last so that a status
+	// added above it is counted by construction: countResults indexes a
+	// [statusCount]int by the status itself, where the switch it replaced counted a
+	// new member as nothing at all, silently, with no compile error.
+	statusCount
 )

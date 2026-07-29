@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/layout"
@@ -71,13 +72,8 @@ var (
 	errRootWatchRemoved = &LostError{
 		Cause: "the fsnotify root watch was removed while the periodic rescan is disabled",
 		// The Cause still has to name the root Remove/Rename: enabling the rescan
-		// restores a recovery mechanism, but it does not restore a root that is
-		// genuinely gone, so the operator needs both facts to tell mount repair from
-		// fallback hardening. main's reportWatchExit only attaches the remediation attr
-		// when this field is non-empty, and the README's
-		// CertConverterChangeDetectionDead runbook tells the operator to act on that
-		// field — with it empty, this loss was the one cause on that alert whose
-		// actionable half reached them only inside the error text.
+		// restores a recovery mechanism but not a root that is genuinely gone, so the
+		// operator needs both facts to tell mount repair from fallback hardening.
 		Remediation: "unset FALLBACK_SCAN_HOURS (or set it above 0) so the periodic rescan re-attaches the root " +
 			"watch after it is removed; if /input itself is gone, restore the mount",
 	}
@@ -228,32 +224,65 @@ func (w *Watcher) Run(ctx context.Context) error {
 // retry is pollTick, which logs at Info because staying in poll mode is not a
 // new degradation.
 //
-// A watcher that cannot be given a watch set is closed HERE rather than handed
-// back: its fd and readEvents goroutine must not survive into a long-lived poll
-// mode. Every watcher this returns is closed by watchMode instead.
+// The construct-then-register sequence itself lives in tryAttachWatchSet, the
+// single statement of it shared with pollTick; this function is the record half
+// only.
 func (w *Watcher) attachWatchSet(ctx context.Context) (watcher *fsnotify.Watcher, stopped bool) {
-	fw, err := newFSWatcher()
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, true // shutdown arrived during construction; not a watch failure
-		}
+	fw, stage, err := w.tryAttachWatchSet(ctx)
+	switch stage {
+	case stageStopped:
+		return nil, true // shutdown arrived mid-attempt; not a watch failure
+	case stageConstruct:
 		slog.Warn("fsnotify unavailable, using polling with periodic upgrade attempts",
 			"fallback_scan", w.fallbackStatus(), "error", err)
 		return nil, false
-	}
-
-	if addErr := w.addWatchDirs(ctx, fw, w.root); addErr != nil {
-		fw.Close() // release fd + readEvents goroutine before long-lived fallback
-		if ctx.Err() != nil {
-			return nil, true // shutdown interrupted the walk; not a watch failure
-		}
+	case stageWatchDirs:
 		slog.Warn("failed to watch directories, using polling with periodic upgrade attempts",
-			"fallback_scan", w.fallbackStatus(), "error", addErr)
+			"fallback_scan", w.fallbackStatus(), "error", err)
 		return nil, false
+	case stageAttached:
 	}
 
 	slog.Info("fsnotify active", "directory_count", len(fw.WatchList()))
 	return fw, false
+}
+
+// attachStage names the outcome of one attach attempt, so each mode entry can
+// phrase its own operator record at its own level while the sequence itself has
+// a single home.
+type attachStage int
+
+const (
+	stageAttached  attachStage = iota // the watch set is live
+	stageStopped                      // a shutdown arrived mid-attempt; not a watch failure
+	stageConstruct                    // newFSWatcher failed
+	stageWatchDirs                    // the watch-set walk failed
+)
+
+// tryAttachWatchSet is the construct-then-register sequence both mode entries
+// share (Run's initial attach and pollTick's upgrade retry): it releases the
+// watcher when the walk fails, so no fd or readEvents goroutine survives into a
+// long-lived poll mode, and it reports a shutdown that arrived mid-attempt as
+// stageStopped rather than as a degradation. Stating it once is what keeps a
+// lifecycle or containment fix from repairing one mode entry and leaving the
+// other leaking or mis-reporting. Every watcher it returns is closed by
+// watchMode instead.
+func (w *Watcher) tryAttachWatchSet(ctx context.Context) (*fsnotify.Watcher, attachStage, error) {
+	fw, err := newFSWatcher()
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, stageStopped, nil
+		}
+		return nil, stageConstruct, err
+	}
+	if addErr := w.addWatchDirs(ctx, fw, w.root); addErr != nil {
+		fw.Close() // release fd + readEvents goroutine before long-lived fallback
+		if ctx.Err() != nil {
+			return nil, stageStopped, nil
+		}
+		return nil, stageWatchDirs, addErr
+	}
+	return fw, stageAttached, nil
 }
 
 // watchMode runs one whole watch-mode lifetime over an already-attached watch
@@ -325,7 +354,10 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 // ambient: a Create event can Lstat and WalkDir beneath event.Name, so a raced
 // ancestor can extend registrations into the replacement target and consume
 // watch descriptors, but it still cannot make the app read or convert content
-// outside the root.
+// outside the root. That residual is bounded to the single raced registration:
+// handlePathEvent's insideRoot check refuses to extend the watch set from an
+// event path that lies outside the root, so a registration that once escaped
+// cannot compound through the events fsnotify then delivers under it.
 //
 // The traversal is cancellable: it checks ctx before each entry and returns
 // ctx.Err() as soon as the process is shutting down, so a shutdown arriving
@@ -389,6 +421,40 @@ func (w *Watcher) handleWatchAddError(root, path string, addErr error) error {
 	slog.Warn("skipping unwatchable directory; renewals under it require a full rescan",
 		"path", path, "fallback_scan", w.fallbackStatus(), "error", addErr)
 	return nil
+}
+
+// insideRoot reports whether an event-derived path still denotes a name inside
+// the watched root. Watch-set maintenance is the one place this package can
+// EXTEND its ambient reach: fsnotify hands back the path a watch was registered
+// with, so a registration that once escaped the root (the swapped-ancestor race
+// addWatchDirs documents) would otherwise keep walking and registering further
+// outside it, one event at a time. The check is lexical because it bounds the
+// NAME, not the resolution: a symlink is already refused by handlePathEvent's
+// Lstat and by WalkDir, which does not descend one.
+func (w *Watcher) insideRoot(path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(w.root), filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+// watchSetHas reports whether path is already registered with the watcher. It
+// guards the one piece of unbounded per-event work in this loop: the directory
+// arm of handlePathEvent re-walks event.Name's whole subtree on EVERY directory
+// Create/Chmod, and that walk is NOT covered by the debounce, which coalesces
+// scans rather than watch-set maintenance. A directory already in the watch set
+// has nothing to re-attach - it was walked when it was added, anything that
+// failed underneath it arrives as its own event, and the periodic re-sync
+// restores the rest.
+func watchSetHas(watcher *fsnotify.Watcher, path string) bool {
+	clean := filepath.Clean(path)
+	for _, watched := range watcher.WatchList() {
+		if filepath.Clean(watched) == clean {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Event classification ---
@@ -466,6 +532,14 @@ func (w *Watcher) handlePathEvent(
 	if !info.IsDir() {
 		return layout.IsRelevant(event.Name)
 	}
+	if !w.insideRoot(event.Name) {
+		slog.Warn("refusing to extend the watch set outside the watched root; the event path resolves outside it, so renewals under it are not this app's to convert",
+			"path", event.Name, "root", w.root, "fallback_scan", w.fallbackStatus())
+		return true
+	}
+	if watchSetHas(watcher, event.Name) {
+		return true // already watched: nothing to re-attach, the debounced rescan covers content
+	}
 	if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
 		slog.Warn(addWarning,
 			"path", event.Name, "fallback_scan", w.fallbackStatus(), "error", addErr)
@@ -502,7 +576,11 @@ func (w *Watcher) handleCreate(ctx context.Context, watcher *fsnotify.Watcher, e
 //
 // Scoped to the naming contract, so a chmod on an unrelated file still schedules
 // nothing. A chmod storm is absorbed by the debounce, exactly as a write storm
-// is, and /input is a certificate directory rather than a busy tree.
+// is, and /input is a certificate directory rather than a busy tree. The debounce
+// coalesces SCANS only, so the directory arm's re-attach walk is bounded
+// separately: handlePathEvent skips it for a directory already in the watch set
+// (watchSetHas), leaving the walk for the skipped-directory recovery this arm is
+// here for.
 func (w *Watcher) handleChmod(ctx context.Context, watcher *fsnotify.Watcher, event fsnotify.Event) bool {
 	return w.handlePathEvent(ctx, watcher, event,
 		"cannot classify a path whose permissions changed; rescanning because it may be an unwatched directory",
@@ -669,9 +747,16 @@ func (w *Watcher) handleFallbackTick(ctx context.Context, watcher *fsnotify.Watc
 // degradation -- so neither can be changed for one re-sync site and silently left
 // wrong at the others. warning names what stays uncovered until the next re-sync.
 func (w *Watcher) resyncWatchSet(ctx context.Context, watcher *fsnotify.Watcher, warning string) {
-	if addErr := w.addWatchDirs(ctx, watcher, w.root); addErr != nil && ctx.Err() == nil {
-		slog.Warn(warning, "root", w.root, "fallback_scan", w.fallbackStatus(), "error", addErr)
+	if addErr := w.addWatchDirs(ctx, watcher, w.root); addErr != nil {
+		if ctx.Err() == nil {
+			slog.Warn(warning, "root", w.root, "fallback_scan", w.fallbackStatus(), "error", addErr)
+		}
+		return
 	}
+	// Refresh the Debug dump on success: every re-sync exists to RECOVER watches that were
+	// missing, so the recovered set - not the set as it stood at attach - is what an operator
+	// diagnosing an incomplete watch set needs. The failure half is the WARN above.
+	logWatchSet(watcher)
 }
 
 // watchState carries the mutable accounting for one watchLoop run: the pending
@@ -853,7 +938,9 @@ func (w *Watcher) pollUntilUpgrade(ctx context.Context) *fsnotify.Watcher {
 //
 // The Info level is deliberate: unlike Run's initial attempt (attachWatchSet,
 // which WARNs), a failed retry is a continuation of an already-reported
-// degradation, not a new one.
+// degradation, not a new one. The construct-then-register sequence itself is
+// tryAttachWatchSet, shared with attachWatchSet; this function owns only the
+// poll-mode record and the polling scan that follows a failed upgrade.
 //
 // The cancellation guard is here rather than in the caller's select because this
 // function owns the stopped outcome: a tick that fires in the same instant as a
@@ -865,25 +952,21 @@ func (w *Watcher) pollTick(ctx context.Context) (upgraded *fsnotify.Watcher, sto
 		return nil, true
 	}
 	slog.Debug("poll scan triggered", "interval", w.fallback)
-	fw, newErr := newFSWatcher()
-	if newErr != nil {
-		if ctx.Err() != nil {
-			return nil, true // shutdown interrupted the upgrade attempt; not a poll-mode continuation
-		}
+	fw, stage, attachErr := w.tryAttachWatchSet(ctx)
+	switch stage {
+	case stageStopped:
+		return nil, true // shutdown interrupted the upgrade attempt; not a poll-mode continuation
+	case stageConstruct:
 		slog.Info("fsnotify still unavailable, staying in poll mode",
-			"mode", "poll", "retry_interval", w.fallback, "error", newErr)
+			"mode", "poll", "retry_interval", w.fallback, "error", attachErr)
 		w.onChange(ctx)
 		return nil, false
-	}
-	if addErr := w.addWatchDirs(ctx, fw, w.root); addErr != nil {
-		fw.Close()
-		if ctx.Err() != nil {
-			return nil, true // shutdown interrupted the walk; not an upgrade failure
-		}
+	case stageWatchDirs:
 		slog.Info("fsnotify available but the watch set could not be rebuilt, staying in poll mode",
-			"mode", "poll", "retry_interval", w.fallback, "error", addErr)
+			"mode", "poll", "retry_interval", w.fallback, "error", attachErr)
 		w.onChange(ctx)
 		return nil, false
+	case stageAttached:
 	}
 	slog.Info("fsnotify recovered, upgrading from poll to watch",
 		"directory_count", len(fw.WatchList()))

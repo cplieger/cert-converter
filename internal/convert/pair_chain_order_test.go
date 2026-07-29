@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/testcerts"
 )
 
 // TestEncode_preserves_the_order_of_a_multi_CA_chain pins the bag-order contract
@@ -37,19 +38,19 @@ func TestEncode_preserves_the_order_of_a_multi_CA_chain(t *testing.T) {
 			KeyUsage:              x509.KeyUsageCertSign,
 		}
 	}
-	rootKey := newKey(t)
-	rootPEM, rootCert := mint(t, ca(701, "Chain Order Root"), &rootKey.PublicKey, nil, rootKey)
-	interKey := newKey(t)
-	interPEM, interCert := mint(t, ca(702, "Chain Order Intermediate"), &interKey.PublicKey, rootCert, rootKey)
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	rootKey := testcerts.NewECDSAKey(t)
+	_, rootPEM, rootCert := testcerts.Mint(t, ca(701, "Chain Order Root"), &rootKey.PublicKey, nil, rootKey)
+	interKey := testcerts.NewECDSAKey(t)
+	_, interPEM, interCert := testcerts.Mint(t, ca(702, "Chain Order Intermediate"), &interKey.PublicKey, rootCert, rootKey)
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(703),
 		Subject:      pkix.Name{CommonName: "chain-order-leaf.example.com"},
 		NotBefore:    notBefore,
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, interCert, interKey)
 
-	analysis, err := convert.Analyse(concatPEM(leafPEM, rootPEM, interPEM), keyPEMOf(t, leafKey))
+	analysis, err := convert.Analyse(concatPEM(leafPEM, rootPEM, interPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("setup: Analyse(leaf, root, intermediate) = error %v, want nil", err)
 	}

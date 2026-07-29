@@ -55,12 +55,6 @@ SMOKE_APP_NAME=""
 SMOKE_TIMEOUT=""
 SMOKE_RUN_ARGS=""
 SMOKE_LOG_PATTERN=""
-# Initialised because both post-loop verdicts read it, and the wait loop's body is
-# skippable: SMOKE_TIMEOUT="0" passes the non-negative-integer check above, so the
-# deadline can already have passed at the first test and `status` would be unbound
-# under set -u. An empty value reports honestly ("last status: ") instead of dying
-# with an unbound-variable error that names nothing useful.
-status=""
 CONF="$SMOKE_DIR/image-smoke.conf"
 if [ -f "$CONF" ]; then
   # shellcheck disable=SC1090  # per-app config path, resolved at runtime
@@ -99,6 +93,8 @@ docker run -d --name "$NAME" $SMOKE_RUN_ARGS "$IMG" >/dev/null
 
 start=$(date +%s)
 deadline=$((start + TIMEOUT))
+# Pre-set so both post-loop verdicts have a state to name: a SMOKE_TIMEOUT of 0
+# skips the loop body entirely.
 status=starting
 while [ "$(date +%s)" -lt "$deadline" ]; do
   # Fail fast on an early exit: poll .State.Running before the health status so

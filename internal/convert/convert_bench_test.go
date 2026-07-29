@@ -5,13 +5,13 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/pem"
 	"math/big"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/testcerts"
 )
 
 func BenchmarkConvertPair(b *testing.B) {
@@ -27,16 +27,8 @@ func BenchmarkConvertPair(b *testing.B) {
 		IsCA:         true,
 		KeyUsage:     x509.KeyUsageCertSign,
 	}
-	derBytes, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		b.Fatal(err)
-	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
-	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		b.Fatal(err)
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	_, certPEM, _ := testcerts.Mint(b, tmpl, &key.PublicKey, nil, key)
+	keyPEM := testcerts.KeyPEM(b, key)
 
 	root, err := os.OpenRoot(b.TempDir())
 	if err != nil {

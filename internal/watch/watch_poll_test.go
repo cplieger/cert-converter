@@ -310,11 +310,11 @@ func TestPollTick_stays_in_poll_mode_when_fsnotify_remains_unavailable(t *testin
 // cancelled-tick contract: a tick that fires in the same instant as a shutdown must
 // attempt no upgrade and run no scan (which would still drive the health marker), and
 // must report stopped=true so the poll loop returns. fsnotify is stubbed UNAVAILABLE so
-// the tick runs its cheapest failure path. What this pins is that composite contract
-// (no scan, stopped=true), not the entry guard in isolation: the retry arm's own ctx
-// check keeps both assertions green even with the guard deleted; only the guard
-// additionally suppresses the "poll scan triggered" Debug line, which this test does
-// not capture.
+// the tick runs its cheapest failure path. The composite contract (no scan,
+// stopped=true) is also satisfied by the retry arm's own ctx check, which keeps those
+// assertions green even with the entry guard deleted; the guard's own effect is that a
+// cancelled tick announces no work at all, so the "poll scan triggered" Debug record
+// is what actually pins it and is asserted here.
 //
 // The mid-attempt arms are pinned separately — the rebuild branch by
 // TestPollTick_treats_shutdown_during_the_watch_set_rebuild_as_a_stop above, the
@@ -323,6 +323,7 @@ func TestPollTick_stays_in_poll_mode_when_fsnotify_remains_unavailable(t *testin
 // Not parallel: it swaps the package-level newFSWatcher seam.
 func TestPollTick_does_no_work_when_the_ctx_is_already_cancelled(t *testing.T) {
 	stubFSWatcherUnavailable(t)
+	logs := capture.Default(t)
 
 	scans := 0
 	w := New(t.TempDir(), func(context.Context) { scans++ }, WithFallback(time.Hour))
@@ -339,6 +340,13 @@ func TestPollTick_does_no_work_when_the_ctx_is_already_cancelled(t *testing.T) {
 	}
 	if scans != 0 {
 		t.Errorf("pollTick(cancelled ctx, fsnotify unavailable) ran %d scans, want 0", scans)
+	}
+	// The entry guard's own effect: a cancelled tick announces no work at all. The
+	// retry arm's ctx check keeps every assertion above green even with the guard
+	// deleted, so this record is what actually pins it.
+	if n := logs.Count("poll scan triggered"); n != 0 {
+		t.Errorf("pollTick(cancelled ctx) logged %d %q records, want 0: the entry guard must return before announcing a scan it never runs; log = %v",
+			n, "poll scan triggered", logs.Messages())
 	}
 }
 

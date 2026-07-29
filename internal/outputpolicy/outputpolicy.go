@@ -48,3 +48,10 @@ func ParseLifecycle(raw string) (mode Lifecycle, known bool) {
 		return LifecycleWarn, false
 	}
 }
+
+// LifecycleModes returns the accepted OUTPUT_LIFECYCLE values, so the caller that
+// read the environment variable can name them in its warning without re-listing
+// the domain ParseLifecycle owns.
+func LifecycleModes() []Lifecycle {
+	return []Lifecycle{LifecycleWarn, LifecycleSync, LifecycleKeep}
+}

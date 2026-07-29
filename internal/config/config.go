@@ -190,13 +190,15 @@ func Load() (Config, error) {
 	rawLifecycle := os.Getenv("OUTPUT_LIFECYCLE")
 	lifecycle, lifecycleKnown := outputpolicy.ParseLifecycle(rawLifecycle)
 	if !lifecycleKnown {
-		slog.Warn("unknown OUTPUT_LIFECYCLE, using warn", "value", rawLifecycle)
+		slog.Warn("unknown OUTPUT_LIFECYCLE, using the default",
+			"value", rawLifecycle, "using", string(lifecycle), "expected", outputpolicy.LifecycleModes())
 	}
 
 	rawEncoder := os.Getenv("PFX_ENCODER")
 	encName, known := convert.EncoderName(rawEncoder)
 	if !known {
-		slog.Warn("unknown PFX_ENCODER, using modern2023", "value", rawEncoder)
+		slog.Warn("unknown PFX_ENCODER, using the default profile",
+			"value", rawEncoder, "using", string(encName), "expected", convert.EncoderNames())
 	}
 
 	fallbackInterval, rawFallback, repair := fallbackIntervalFromEnv()
@@ -239,15 +241,37 @@ func fallbackIntervalFromEnv() (interval time.Duration, raw string, repair fallb
 	return interval, raw, repair
 }
 
-// LogLevel returns the effective LOG_LEVEL as a slog level, the raw value as
-// configured, and whether it parsed. Exported separately from Load so the
-// logger can be installed before Load runs (Load emits WARN lines that must
-// honour the configured level), while the LOG_LEVEL name and its info default
-// stay in the config layer — the same reason FallbackInterval is exported.
-func LogLevel() (lvl slog.Level, raw string, ok bool) {
+// LogLevel returns the effective LOG_LEVEL as a slog level. Exported separately
+// from Load so the logger can be installed before Load runs (Load emits WARN
+// lines that must honour the configured level).
+//
+// Deliberately SILENT, like FallbackInterval: WarnInvalidLogLevel owns the
+// diagnostic, so the LOG_LEVEL name, its info default and the wording all stay
+// in this package.
+func LogLevel() slog.Level {
+	lvl, _, _ := logLevelFromEnv()
+	return lvl
+}
+
+// logLevelFromEnv is the single home for the LOG_LEVEL name and its info
+// default, shared by the silent LogLevel reader and by WarnInvalidLogLevel.
+func logLevelFromEnv() (lvl slog.Level, raw string, ok bool) {
 	raw = os.Getenv("LOG_LEVEL")
 	lvl, ok = slogx.ParseLevel(raw, slog.LevelInfo)
 	return lvl, raw, ok
+}
+
+// WarnInvalidLogLevel emits the operator-facing diagnostic for an unparseable
+// LOG_LEVEL. Called by the composition root AFTER the logger is installed and
+// below the argv dispatch, so it fires once per process start and never from the
+// `health` subcommand, which re-reads LOG_LEVEL on every probe.
+func WarnInvalidLogLevel() {
+	lvl, raw, ok := logLevelFromEnv()
+	if ok {
+		return
+	}
+	slog.Warn("invalid LOG_LEVEL, using default",
+		"value", raw, "default", strings.ToLower(lvl.String()))
 }
 
 // allowEmptyPassword reports whether PFX_ALLOW_EMPTY_PASSWORD opts out of the
@@ -422,7 +446,7 @@ func warnBothPasswordChannels(source envx.SecretSource) {
 		return
 	}
 	slog.Warn("both PFX_PASSWORD and PFX_PASSWORD_FILE are set; the file wins and PFX_PASSWORD is ignored",
-		"source", "PFX_PASSWORD_FILE",
+		"source", passwordChannel(source),
 		"remediation", "remove PFX_PASSWORD from the environment so there is one place to change the secret")
 }
 
@@ -471,7 +495,8 @@ func warnBlankPasswordFilePointer() {
 //
 // It is also the single rendering of the "source" log attribute, so every
 // operator-facing password record — the both-channels WARN, the blank-file WARN, the
-// configured INFO, and the control-character and invisible-formatting WARNs — carries
+// configured INFO, the surrounding-whitespace WARN, and the control-character and
+// invisible-formatting WARNs — carries
 // ONE vocabulary in that key: the variable name. Rendering envx's internal
 // SourceEnv/SourceFile enum instead would make a Loki matcher or a saved query
 // selecting the mounted-secret channel (source="PFX_PASSWORD_FILE") silently miss the
@@ -531,15 +556,16 @@ func logPasswordDelivery(source envx.SecretSource, password string, blankSecretF
 	if source == envx.SourceFile {
 		if blankSecretFile != nil {
 			slog.Warn("PFX_PASSWORD_FILE is blank; starting with an empty PFX password because PFX_ALLOW_EMPTY_PASSWORD is set",
-				"source", "PFX_PASSWORD_FILE",
+				"source", passwordChannel(source),
 				"remediation", "write the secret into the mounted file so generated PFX files protect the private key")
 		} else {
-			slog.Info("PFX password configured", "source", "PFX_PASSWORD_FILE")
+			slog.Info("PFX password configured", "source", passwordChannel(source))
 		}
 	}
 	if source == envx.SourceEnv && !isBlank(password) &&
 		password != strings.TrimSpace(password) {
 		slog.Warn("PFX_PASSWORD has leading or trailing whitespace, which is part of the password embedded in every PFX file",
+			"source", passwordChannel(source),
 			"remediation", "remove the surrounding whitespace, or note that PFX_PASSWORD_FILE trims it, so the same value delivered as a mounted secret yields a different password")
 	}
 	// An INTERIOR control character survives both guards: envx trims only
@@ -565,6 +591,15 @@ func logPasswordDelivery(source envx.SecretSource, password string, blankSecretF
 			"source", passwordChannel(source),
 			"remediation", "rewrite the secret without the invisible character (an editor saving the secret file as \"UTF-8 with BOM\" is the usual cause; printf %s writes the value verbatim)")
 	}
+	// A non-ASCII SPACE survives every guard above: U+00A0, U+2007 and U+3000 are
+	// Zs, U+2028/U+2029 are Zl/Zp, none of them is Cc or Cf, and TrimSpace only
+	// reaches the ends, so an interior one is embedded verbatim while rendering
+	// exactly like the ASCII space a consumer retypes.
+	if !isBlank(password) && strings.ContainsFunc(password, isAmbiguousSpaceRune) {
+		slog.Warn("the PFX password contains a non-ASCII space character (no-break space, ideographic space, or line separator), which is embedded verbatim in every PFX file and is indistinguishable from the ordinary space a consumer would type",
+			"source", passwordChannel(source),
+			"remediation", "retype the secret using ordinary ASCII spaces (a value pasted from a rendered document, a PDF, or a word processor is the usual cause)")
+	}
 }
 
 // isFormatRune reports whether r is a Unicode FORMAT character (category Cf): a
@@ -574,4 +609,14 @@ func logPasswordDelivery(source envx.SecretSource, password string, blankSecretF
 // records about the same rune.
 func isFormatRune(r rune) bool {
 	return unicode.Is(unicode.Cf, r)
+}
+
+// isAmbiguousSpaceRune reports whether r is a space-like rune other than the ASCII
+// space: a Zs no-break/figure/ideographic space, or a Zl/Zp line or paragraph
+// separator. Disjoint from unicode.IsControl (Cc) and isFormatRune (Cf), so a
+// password carrying several shapes gets one record per shape; strings.TrimSpace
+// removes these only at the ends, so an interior one reaches the encoder unseen.
+func isAmbiguousSpaceRune(r rune) bool {
+	return r != ' ' && (unicode.Is(unicode.Zs, r) ||
+		unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r))
 }

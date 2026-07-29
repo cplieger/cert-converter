@@ -110,6 +110,21 @@ const (
 	// second certificate is never reached. It is deliberately NOT ObsRenewedCertTie:
 	// a CA is not a renewal of the leaf it signed, and that kind's name would say so.
 	ObsKeyReusedAcrossCerts ObservationKind = "key-reused-across-certs"
+	// ObsChainEdgeUnprovenIssuer reports a certificate in the EMITTED chain that is
+	// there because its subject matches the issuer name (or the authority key
+	// identifier) of the certificate below it, while NO signature proves it issued
+	// that certificate. bestParent selects such a parent only when no proven
+	// candidate exists — an algorithm crypto/x509 refuses, a key above the
+	// verification ceilings, a public key crypto/x509 left nil (a legacy DSA
+	// certificate parses that way, so proven is false for every hop touching it), or
+	// a bundle carrying a same-named certificate while the real signer is absent —
+	// and nothing said so whenever the path still ended at a self-signed certificate
+	// or consumed every certificate in the bundle: ObsChainUnverified fires only for
+	// a terminus that is not proven self-signed WITH certificates left over. The
+	// bundle still converts (this package holds no trust store), but a PKCS#12 CA bag
+	// a consumer imports into a trust store is the wrong place for an unproven link
+	// to be silent.
+	ObsChainEdgeUnprovenIssuer ObservationKind = "chain-edge-unproven-issuer"
 )
 
 // Noise reports whether an observation of this kind is a benign artefact of how the
@@ -237,10 +252,15 @@ func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 	// is an issuer, not an end-entity certificate, and emitting it as the
 	// identity would produce a bundle no consumer can use as a server identity.
 	// This is the case a positional "leaf = certs[0]" rule cannot see.
+	//
+	// It names the key-file defects too: a key file holding the CA's key plus a
+	// damaged or encrypted appended leaf key parses only the CA key, which matches
+	// the CA, so the operator lands here and is told to remove certificates from a
+	// bundle that is fine while the unreadable key block goes unmentioned.
 	if g.isIssuer(identity.cert) {
 		return Analysis{}, fmt.Errorf(
-			"the private key matches %q, which is an issuer of another certificate in this bundle, not an end-entity certificate; if you meant to export that CA itself, remove the certificates it issued from the bundle",
-			boundSubject(leaf.Subject.String()))
+			"the private key matches %q, which is an issuer of another certificate in this bundle, not an end-entity certificate; if you meant to export that CA itself, remove the certificates it issued from the bundle%s",
+			boundSubject(leaf.Subject.String()), in.keyIssues.suffix())
 	}
 	if leaf.BasicConstraintsValid && leaf.IsCA {
 		obs = append(obs, Observation{
@@ -715,7 +735,7 @@ func (g *certGraph) nameLink(child, parent int) nameLinkage {
 	}
 	childIssuer, issuerOK := g.issuerName(child)
 	parentSubject, subjectOK := g.subjectName(parent)
-	if issuerOK && subjectOK && reflect.DeepEqual(childIssuer, parentSubject) {
+	if sameDecodedName(childIssuer, issuerOK, parentSubject, subjectOK) {
 		return nameLinkSemantic
 	}
 	return nameLinkNone
@@ -739,7 +759,7 @@ func (g *certGraph) sameNameSameKey(child, parent int) bool {
 	if !bytes.Equal(c.RawSubject, p.RawSubject) {
 		childSubject, childOK := g.subjectName(child)
 		parentSubject, parentOK := g.subjectName(parent)
-		if !childOK || !parentOK || !reflect.DeepEqual(childSubject, parentSubject) {
+		if !sameDecodedName(childSubject, childOK, parentSubject, parentOK) {
 			return false
 		}
 	}
@@ -798,11 +818,13 @@ func (g *certGraph) candidateEdge(child, parent int) bool {
 // a named refusal.
 func (g *certGraph) oversizedIssuerError() error {
 	for i, c := range g.certs {
-		// A certificate this bundle names as nobody's issuer is never a parent in a
-		// signature check, so its size decides nothing: it can only be excluded, or
-		// kept by the additive fallback, and both say so out loud.
+		// A certificate nothing here names as its issuer — by name at either fidelity,
+		// nor by authority key identifier — is never a parent in a signature check, so
+		// its size decides nothing: it can only be excluded, or kept by the additive
+		// fallback, and both say so out loud. The question is what the bundle NAMES,
+		// not what survived candidate construction: see namedAsIssuer.
 		reason := unverifiableKeyReason(c.PublicKey)
-		if len(g.children[i]) == 0 || reason == "" {
+		if reason == "" || !g.namedAsIssuer(i) {
 			continue
 		}
 		return fmt.Errorf(
@@ -810,6 +832,26 @@ func (g *certGraph) oversizedIssuerError() error {
 			boundSubject(c.Subject.String()), reason)
 	}
 	return nil
+}
+
+// namedAsIssuer reports whether any other certificate in this bundle names
+// certs[parent] as its issuer — by name at either fidelity, or by authority key
+// identifier — whether or not that pair survived candidate construction.
+//
+// The candidate set is the wrong question for the oversized refusal. A certificate
+// whose own extensions disqualify it from issuing enters candidateParents ONLY when
+// a signature proves the edge (candidateEdge), and an over-ceiling key can never be
+// verified, so keying the refusal on children[] let through exactly the decoy
+// substitution it exists to refuse: leaf, its real over-ceiling issuer carrying
+// CA:false or no basicConstraints, and a same-subject certificate with an ordinary
+// key that then wins the chain unverified.
+func (g *certGraph) namedAsIssuer(parent int) bool {
+	for child := range g.certs {
+		if child != parent && g.edge(child, parent).linked() {
+			return true
+		}
+	}
+	return false
 }
 
 // proven reports whether certs[parent]'s public key produced certs[child]'s
@@ -929,6 +971,14 @@ func decodedName(raw []byte) (pkix.RDNSequence, bool) {
 	return seq, true
 }
 
+// sameDecodedName reports whether two ASN.1-decoded names are the same name. It is
+// the single home of the semantic half of the package's name rule: a name that could
+// not be decoded matches nothing, and two decodes are equal only as whole
+// RDNSequences, so RDN order and multi-valued grouping are preserved.
+func sameDecodedName(a pkix.RDNSequence, aOK bool, b pkix.RDNSequence, bOK bool) bool {
+	return aOK && bOK && reflect.DeepEqual(a, b)
+}
+
 // decodedDN is one memoised raw-name decode: the decoded sequence, whether the
 // decode succeeded, and whether it has been attempted at all (a name that cannot
 // be decoded is a legitimate result worth caching, so "not yet asked" needs its
@@ -978,6 +1028,11 @@ func (g *certGraph) issuerName(i int) (pkix.RDNSequence, bool) {
 // CA-ness is irrelevant to the question asked here: a self-signed end-entity
 // certificate is still self-signed.
 //
+// The subject/issuer comparison accepts the same permitted DirectoryString
+// difference nameLink accepts: a certificate that re-encodes its own name is
+// still self-issued, and reading it as a non-root would fire assembleChain's
+// additive fallback on a bundle whose chain is complete.
+//
 // A certificate whose own RSA key exceeds either verification ceiling is reported as
 // not self-signed — unverified rather than disproven — for the same cost reason
 // proven applies the ceiling. After newCertGraph's refusal that answer is only
@@ -998,7 +1053,14 @@ func (g *certGraph) isSelfSigned(i int) bool {
 func (g *certGraph) checkSelfSigned(i int) bool {
 	c := g.certs[i]
 	if !bytes.Equal(c.RawSubject, c.RawIssuer) {
-		return false
+		// Same fidelity rule as nameLink: a permitted DirectoryString difference
+		// between a certificate's own subject and issuer is still one name, and
+		// treating it as two costs the bundle its root.
+		subject, subjectOK := g.subjectName(i)
+		issuer, issuerOK := g.issuerName(i)
+		if !sameDecodedName(subject, subjectOK, issuer, issuerOK) {
+			return false
+		}
 	}
 	if !verifiableKey(c.PublicKey) {
 		return false
@@ -1079,7 +1141,7 @@ func (g *certGraph) selectIdentity(signers []crypto.Signer, keyIssues keyDefects
 	case 1:
 		return matches[0], issuerObs, nil
 	default:
-		best, obs, err := g.resolveAmbiguousMatches(matches)
+		best, obs, err := g.resolveAmbiguousMatches(matches, keyIssues)
 		if err != nil {
 			return identityMatch{}, nil, err
 		}
@@ -1207,8 +1269,10 @@ func (g *certGraph) collectMatches(signers []crypto.Signer) (matches []identityM
 }
 
 // noMatchError explains that no certificate here belongs to any supplied key,
-// naming an unverifiable key algorithm ahead of a plain mismatch because it is
-// the more specific diagnosis. On a plain mismatch the key blocks that yielded
+// naming an unverifiable key algorithm ahead of a plain mismatch when it is the
+// only explanation left — every certificate uncomparable — and otherwise carrying
+// it as a trailing clause on the mismatch sentence. On a plain mismatch the key
+// blocks that yielded
 // no key at all are named after the base sentence (keyDefects.suffix), because
 // the count in that sentence is of USABLE keys: a mid-rotation key file whose
 // appended block is damaged otherwise reads as "the key does not match the
@@ -1219,7 +1283,19 @@ func (g *certGraph) collectMatches(signers []crypto.Signer) (matches []identityM
 // CERTIFICATE" by `openssl x509 -trustout` is a common cause of exactly this
 // mismatch, and without the clause nothing anywhere names it.
 func (g *certGraph) noMatchError(keyCount, firstUnverifiable int, keyIssues keyDefects, certIssues skippedBlocks) error {
-	if firstUnverifiable >= 0 {
+	uncomparable := 0
+	for _, c := range g.certs {
+		if !comparableCertKey(c.PublicKey) {
+			uncomparable++
+		}
+	}
+	// The specific diagnosis is right only when an uncomparable certificate is the
+	// ONLY explanation left. With even one comparable certificate present the real
+	// cause is a plain mismatch, and returning here dropped both clauses this
+	// function exists to attach - so a legacy bundle carrying a DSA root named that
+	// root while saying nothing about the mismatch or about a damaged appended key
+	// block keyDefects had already recorded.
+	if firstUnverifiable >= 0 && uncomparable == len(g.certs) {
 		c := g.certs[firstUnverifiable]
 		if c.PublicKey == nil {
 			// crypto/x509 parses a certificate whose SubjectPublicKeyInfo algorithm OID it
@@ -1238,6 +1314,10 @@ func (g *certGraph) noMatchError(keyCount, firstUnverifiable int, keyIssues keyD
 	msg := fmt.Sprintf(
 		"none of the %d private key block(s) matches any of the %d certificate(s) in the chain%s",
 		keyCount, len(g.certs), keyIssues.suffix())
+	if firstUnverifiable >= 0 {
+		msg += fmt.Sprintf("; certificate %q holds a public key crypto/x509 could not read, so it was compared against no key",
+			boundSubject(g.certs[firstUnverifiable].Subject.String()))
+	}
 	if certIssues.count > 0 {
 		msg += fmt.Sprintf("; the certificate file also holds %d block(s) that are neither a certificate nor a private key and were left out of the bundle (first %q)",
 			certIssues.count, certIssues.firstTypeForLog())
@@ -1253,13 +1333,18 @@ func (g *certGraph) noMatchError(keyCount, firstUnverifiable int, keyIssues keyD
 // usable now, then the newest. Ranking purely on NotBefore would prefer a
 // future-dated renewal over a currently valid certificate, producing a bundle no
 // consumer will accept yet.
-func (g *certGraph) resolveAmbiguousMatches(matches []identityMatch) (identityMatch, []Observation, error) {
+//
+// The distinct-identities refusal names the colliding certificates and the key-file
+// defects: a combined key file in a multi-certificate bundle otherwise yields a bare
+// count with nothing to act on, and a damaged appended key block is a likely cause of
+// the collision the count cannot mention.
+func (g *certGraph) resolveAmbiguousMatches(matches []identityMatch, keyIssues keyDefects) (identityMatch, []Observation, error) {
 	firstKey := matches[0].key
 	for _, m := range matches[1:] {
 		if m.key != firstKey {
 			return identityMatch{}, nil, fmt.Errorf(
-				"the input contains %d distinct certificate/key identities; this app converts one certificate/key pair per output",
-				countDistinctKeys(matches))
+				"the input contains %d distinct certificate/key identities; this app converts one certificate/key pair per output (%s)%s",
+				countDistinctKeys(matches), subjectsForLog(g.certsOf(matches)), keyIssues.suffix())
 		}
 	}
 
@@ -1450,6 +1535,15 @@ func samePublicKey(a, b crypto.PublicKey) bool {
 	return matched
 }
 
+// comparableCertKey reports whether a certificate's public key can be compared
+// against a private key's public half at all. crypto/x509 parses a certificate
+// whose SubjectPublicKeyInfo algorithm it does not recognise and leaves
+// PublicKey nil, and such a certificate is uncomparable rather than unequal.
+func comparableCertKey(pub crypto.PublicKey) bool {
+	_, supported := equalPublicKeys(pub, pub)
+	return supported
+}
+
 // partitionIssuerEligible splits certificates into the ones that could still be
 // somebody's issuer and the ones their own extensions disqualify, preserving input
 // order in both halves. It is what keeps the additive chain fallback from emitting
@@ -1503,6 +1597,8 @@ func (g *certGraph) assembleChain(identityCert int) (chain, extra []*x509.Certif
 	// while a same-named certificate is present. A permitted name-encoding difference
 	// no longer does: the evidence graph proves those edges and the path walk carries
 	// them, so this fallback is not reached for them at all.
+	obs = append(obs, g.unprovenPathObservations(path)...)
+
 	terminal := path[len(path)-1]
 	if len(extra) > 0 && !g.isSelfSigned(terminal) {
 		kept, disqualified := partitionIssuerEligible(extra)
@@ -1523,7 +1619,7 @@ func (g *certGraph) assembleChain(identityCert int) (chain, extra []*x509.Certif
 					len(disqualified), boundSubject(g.certs[terminal].Subject.String()), subjectsForLog(disqualified)),
 			})
 		}
-		return chain, disqualified, fallbackObs
+		return chain, disqualified, append(obs, fallbackObs...)
 	}
 
 	if len(extra) > 0 {
@@ -1582,6 +1678,28 @@ func chainValidityObservations(chain []*x509.Certificate, now time.Time) []Obser
 				"chain certificate %d of %d, %q, is outside its validity window (NotBefore %s, NotAfter %s)",
 				i+1, len(chain), boundSubject(c.Subject.String()),
 				c.NotBefore.UTC().Format(time.RFC3339), c.NotAfter.UTC().Format(time.RFC3339)),
+		})
+	}
+	return obs
+}
+
+// unprovenPathObservations reports every hop of the discovered path whose issuance
+// this bundle could not prove by signature. It reads the same memoised proof chain
+// assembly and ranking read, so it costs no extra verification: bestParent already
+// asked about every hop it selected.
+func (g *certGraph) unprovenPathObservations(path []int) []Observation {
+	var obs []Observation
+	for i := 1; i < len(path); i++ {
+		child, parent := path[i-1], path[i]
+		if g.proven(child, parent) {
+			continue
+		}
+		obs = append(obs, Observation{
+			Kind: ObsChainEdgeUnprovenIssuer,
+			Detail: fmt.Sprintf(
+				"chain certificate %d, %q, matches the issuer name of %q but no signature here proves it issued that certificate; it was included because nothing in this bundle could be proven to have signed that certificate, so a consumer may be unable to verify the chain",
+				i, boundSubject(g.certs[parent].Subject.String()),
+				boundSubject(g.certs[child].Subject.String())),
 		})
 	}
 	return obs
@@ -1654,7 +1772,7 @@ func dedupeSigners(signers []crypto.Signer) []crypto.Signer {
 	for _, s := range signers {
 		dup := false
 		for _, kept := range out {
-			if matched, supported := publicKeyMatches(kept.Public(), s); supported && matched {
+			if samePublicKey(kept.Public(), s.Public()) {
 				dup = true
 				break
 			}

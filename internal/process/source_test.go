@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/cplieger/atomicfile/v2"
 )
 
 // TestSourcePathVanished_reports_an_unclassifiable_path_as_steady_state pins
@@ -113,10 +115,16 @@ func TestSourceReadBounded(t *testing.T) {
 		}
 	})
 
-	t.Run("rejects oversized file", func(t *testing.T) {
+	// maxFileSize (10 MB) is the documented /input bound, and readBoundedLimit's limit
+	// parameter exists so that boundary is testable without a 10 MB fixture per case.
+	// The bound is INCLUSIVE: a file exactly at the limit must read whole, or a
+	// certificate at the documented maximum becomes a conversion failure that flips
+	// health -- which a fixture well over the limit can never see.
+	t.Run("reads a file exactly at the limit", func(t *testing.T) {
 		t.Parallel()
+		const limit = 1024
 		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "big.pem"), make([]byte, 2048), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "exact.pem"), make([]byte, limit), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		root, err := os.OpenRoot(dir)
@@ -125,8 +133,39 @@ func TestSourceReadBounded(t *testing.T) {
 		}
 		defer root.Close()
 		s := &source{root: root}
-		if _, err := s.readBoundedLimit(t.Context(), "big.pem", 1024); err == nil {
-			t.Error("expected error for oversized file")
+
+		data, err := s.readBoundedLimit(t.Context(), "exact.pem", limit)
+		if err != nil {
+			t.Fatalf("source.readBoundedLimit(file of exactly %d bytes, limit %d) = error %v, want the file read whole: the bound is inclusive",
+				limit, limit, err)
+		}
+		if len(data) != limit {
+			t.Errorf("source.readBoundedLimit(file of exactly %d bytes) read %d bytes, want %d", limit, len(data), limit)
+		}
+	})
+
+	t.Run("refuses a file one byte over the limit", func(t *testing.T) {
+		t.Parallel()
+		const limit = 1024
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "big.pem"), make([]byte, limit+1), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+		s := &source{root: root}
+
+		// errors.Is on atomicfile's sentinel, not a bare non-nil, for the same reason
+		// the missing-file case below argues: a read that failed for any OTHER reason (a
+		// rejected path, a file that vanished, a non-regular file) satisfies non-nil
+		// while proving nothing about the size bound -- and the bound is what stops one
+		// oversized input from spending the scan's only goroutine.
+		if _, err := s.readBoundedLimit(t.Context(), "big.pem", limit); !errors.Is(err, atomicfile.ErrFileTooLarge) {
+			t.Errorf("source.readBoundedLimit(file of %d bytes, limit %d) error = %v, want it to satisfy errors.Is(err, atomicfile.ErrFileTooLarge)",
+				limit+1, limit, err)
 		}
 	})
 

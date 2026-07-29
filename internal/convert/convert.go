@@ -16,6 +16,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/runesafe"
 )
 
@@ -355,20 +356,19 @@ const maxBlockTypeLogLen = 64
 //
 // The marker is appended AFTER the cut, so a truncated result exceeds limit by the
 // marker's own length: the bound exists to stop multi-megabyte lines, not to hit
-// limit exactly.
+// limit exactly. The cut and the marker are logtext.Cap's, shared with
+// internal/process so one condition never grows two vocabularies.
 func boundLogText(s string, limit int) string {
-	s = runesafe.SanitizeSingleLine(s)
-	if len(s) <= limit {
-		return s
-	}
-	return runesafe.CapBytes(s, limit) + truncationMarker
+	return logtext.Cap(runesafe.SanitizeSingleLine(s), limit)
 }
 
-// truncationMarker is appended to text boundLogText had to cut, so a reader can tell
-// a diagnostic that ends mid-subject from one that genuinely ends there. It is
+// truncationMarker names text boundLogText had to cut, so a reader can tell a
+// diagnostic that ends mid-subject from one that genuinely ends there. It is
 // deliberately more explicit than runesafe's own "..." marker, which is why
-// boundLogText composes the library's primitives instead of taking its preset.
-const truncationMarker = "...(truncated)"
+// boundLogText composes the library's primitives instead of taking its preset; the
+// wording itself lives in internal/logtext, and this alias is what the package's own
+// assertions read.
+const truncationMarker = logtext.Marker
 
 // maxSubjectLogLen bounds the certificate-controlled subject interpolated into a
 // diagnostic. The subject is parsed out of a PEM file the app does not control
@@ -499,11 +499,12 @@ func parsePrivateKeys(pemBytes []byte) ([]crypto.Signer, keyDefects, error) {
 			declaredKeyBlocks-scan.decodedBlocks)
 	}
 	return scan.keys, keyDefects{
-		firstUnreadable: scan.unrelated.firstTypeForLog(),
-		unreadable:      scan.unrelated.count,
-		unparseable:     scan.parseFailures,
-		undecoded:       declaredKeyBlocks - scan.decodedBlocks,
-		encrypted:       scan.sawEncrypted,
+		firstUnreadable:   scan.unrelated.firstTypeForLog(),
+		firstParseFailure: parseFailureForLog(scan.firstParseErr),
+		unreadable:        scan.unrelated.count,
+		unparseable:       scan.parseFailures,
+		undecoded:         declaredKeyBlocks - scan.decodedBlocks,
+		encrypted:         scan.sawEncrypted,
 	}, nil
 }
 
@@ -536,6 +537,21 @@ func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped skippedBl
 	return errors.New(msg)
 }
 
+// parseFailureForLog renders the first key-block parse failure for a diagnostic,
+// or "" when every decoded block parsed. It goes through boundLogText for the same
+// reason every other file-derived interpolation in this package does: the text is
+// built from a key file the app does not control, and this is the package's single
+// gate for that. parsePrivateKeyBlock already bounds its own wrapped error, so the
+// gate is idempotent here rather than load-bearing; routing through it keeps the
+// rule "no file-derived text reaches a diagnostic ungated" true by construction
+// rather than by tracing every producer.
+func parseFailureForLog(err error) string {
+	if err == nil {
+		return ""
+	}
+	return boundLogText(err.Error(), maxSubjectLogLen)
+}
+
 // keyDefects counts the key blocks that yielded no usable key even though
 // another block did. parsePrivateKeys itself succeeds in that case, so without
 // carrying this out the evidence is discarded exactly when it is needed: a
@@ -547,6 +563,12 @@ type keyDefects struct {
 	// format this app reads nor a certificate, already sanitized and bounded for a
 	// log by skippedBlocks.firstTypeForLog.
 	firstUnreadable string
+	// firstParseFailure is WHY the first key-labelled block's DER was rejected,
+	// sanitized and bounded like every other file-derived text in this package. The
+	// count alone tells an operator that a block is damaged but not what to do about
+	// it; the reason distinguishes truncated armour from an unsupported key type
+	// from an oversized RSA modulus, which are three different remedies.
+	firstParseFailure string
 	// unreadable is how many such blocks the file holds. Counted apart from
 	// unparseable because encoding/pem decoded them fine and no parser was ever
 	// offered them: only the label rules them out.
@@ -584,7 +606,11 @@ func (d keyDefects) suffix() string {
 func (d keyDefects) details() string {
 	var parts []string
 	if d.unparseable > 0 {
-		parts = append(parts, fmt.Sprintf("%d could not be parsed", d.unparseable))
+		clause := fmt.Sprintf("%d could not be parsed", d.unparseable)
+		if d.firstParseFailure != "" {
+			clause += fmt.Sprintf(" (first: %s)", d.firstParseFailure)
+		}
+		parts = append(parts, clause)
 	}
 	if d.encrypted {
 		parts = append(parts, "at least one is encrypted")
@@ -639,12 +665,12 @@ func isEncryptedPEMBlock(block *pem.Block) bool {
 // above it is already refused a signature check, so accepting a private key above
 // it could only produce a bundle this app would not reason about.
 func oversizedRSAKeyError(block *pem.Block) error {
-	modulusBits, ok := rsaModulusBitsFromKeyDER(block.Bytes, 1)
-	if !ok || modulusBits <= maxVerifiableKeyBits {
+	keyBits, ok := rsaModulusBitsFromKeyDER(block.Bytes, 1)
+	if !ok || keyBits <= maxVerifiableKeyBits {
 		return nil
 	}
-	return fmt.Errorf("private key in a %q block holds a %d-bit RSA modulus, above the %d-bit ceiling this app reads a private key at (parsing it would run RSA precomputation on file-supplied integers and stall the scan)",
-		boundLogText(block.Type, maxBlockTypeLogLen), modulusBits, maxVerifiableKeyBits)
+	return fmt.Errorf("private key in a %q block holds a %d-bit RSA integer (modulus, prime or CRT value), above the %d-bit ceiling this app reads a private key at (parsing it would run RSA precomputation on file-supplied integers and stall the scan)",
+		boundLogText(block.Type, maxBlockTypeLogLen), keyBits, maxVerifiableKeyBits)
 }
 
 // rsaModulusBitsFromKeyDER reports the size of the RSA modulus in private-key
@@ -683,8 +709,15 @@ func rsaModulusBitsFromKeyDER(der []byte, depth int) (int, bool) {
 	}
 	switch {
 	case isASN1(second, asn1.TagInteger):
-		// PKCS#1 RSAPrivateKey: the modulus follows the version.
-		return derIntegerBits(second.Bytes)
+		// PKCS#1 RSAPrivateKey: the modulus follows the version, and the primes
+		// and CRT values follow the modulus. crypto/rsa builds a bigmod modulus
+		// from p and q (Validate -> precompute) before it can reject an
+		// inconsistent key, so the LARGEST integer in the structure decides the
+		// cost, not the modulus. Measuring only the modulus let a 710 KB block
+		// with a 20-bit modulus and 2-Mbit "primes" spend 59.8s inside
+		// x509.ParsePKCS1PrivateKey. OtherPrimeInfos primes are deliberately not
+		// walked: a multi-prime key is refused in ~100us, before any precompute.
+		return maxRSAIntegerBits(second, afterSecond)
 	case isASN1(second, asn1.TagSequence) && depth > 0:
 		// PKCS#8 PrivateKeyInfo: the AlgorithmIdentifier follows the version, and
 		// the privateKey OCTET STRING after it holds the PKCS#1 key.
@@ -695,6 +728,31 @@ func rsaModulusBitsFromKeyDER(der []byte, depth int) (int, bool) {
 		return rsaModulusBitsFromKeyDER(inner.Bytes, depth-1)
 	}
 	return 0, false
+}
+
+// maxRSAIntegerBits reports the bit length of the LARGEST integer in a PKCS#1
+// RSAPrivateKey, given its modulus element and the DER of the elements after
+// it. The modulus decides measurability (it fails open exactly as before when
+// the modulus is absent, zero or negative); each later INTEGER only raises the
+// answer, so a shape this walk cannot read can never LOWER the ceiling check.
+func maxRSAIntegerBits(modulus asn1.RawValue, rest []byte) (int, bool) {
+	maxBits, ok := derIntegerBits(modulus.Bytes)
+	if !ok {
+		return 0, false
+	}
+	for len(rest) > 0 {
+		elem, remaining, elemOK := asn1Element(rest)
+		if !elemOK {
+			break
+		}
+		if isASN1(elem, asn1.TagInteger) {
+			if elemBits, bitsOK := derIntegerBits(elem.Bytes); bitsOK && elemBits > maxBits {
+				maxBits = elemBits
+			}
+		}
+		rest = remaining
+	}
+	return maxBits, true
 }
 
 // asn1Element reads one tag-length-value header off b, returning the element and
@@ -784,7 +842,7 @@ func parsePrivateKeyBlock(block *pem.Block) (crypto.Signer, error) {
 	case pemTypeECPrivateKey:
 		parseErr = sec1Err
 	}
-	return nil, fmt.Errorf("failed to parse private key from %s block (tried PKCS8, PKCS1, SEC1): %w",
+	return nil, fmt.Errorf("failed to parse private key from a %q block (tried PKCS8, PKCS1, SEC1): %w",
 		boundLogText(block.Type, maxBlockTypeLogLen), boundedTextError{parseErr})
 }
 

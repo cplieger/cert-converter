@@ -35,6 +35,14 @@ func newInputSource(t *testing.T, dir string) *source {
 	return &source{root: root}
 }
 
+// newReaper pairs an output store with an input source and a lifecycle mode: the
+// three things reap policy needs, and the only reason these tests construct a store
+// at all. It keeps each case's call to reconcile as short as it was when reconcile
+// took the source and the mode as arguments.
+func newReaper(out *store, src *source, mode outputpolicy.Lifecycle) *reaper {
+	return &reaper{src: src, out: out, mode: mode}
+}
+
 // TestStoreReconcile pins every rail on orphan deletion. Each case is a way the
 // gate must refuse, because getting a deletion wrong destroys private key material
 // and the documented deployment replicates the output tree onward to a second host.
@@ -90,6 +98,16 @@ func TestStoreReconcile(t *testing.T) {
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
+			// The /output-side sibling of the conversion-failure rail above: a bundle whose
+			// mode repair AND repairing rewrite were both refused is one this app wanted to
+			// replace and could not, so deleting OTHER bundles on the strength of that same
+			// volume is what conversionsClean refuses. Unwritable is health-neutral, which
+			// is exactly why nothing else fails when this rail is dropped.
+			name: "sync refuses when a prior bundle could not be rewritten",
+			mode: outputpolicy.LifecycleSync, rc: &reapContext{result: ScanResult{Total: 1, Unwritable: 1}, walkCompleted: true},
+			wantDeleted: 0, wantPresent: true,
+		},
+		{
 			name: "warn, the default, reports but never deletes",
 			mode: outputpolicy.LifecycleWarn, rc: &reapContext{result: ScanResult{Total: 1}, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
@@ -121,7 +139,8 @@ func TestStoreReconcile(t *testing.T) {
 			s := &store{root: root}
 			seen := map[string]struct{}{"live.crt": {}}
 
-			got, err := s.reconcile(context.Background(), tc.mode, newInputSource(t, t.TempDir()), seen, tc.rc)
+			got, err := newReaper(s, newInputSource(t, t.TempDir()), tc.mode).
+				reconcile(context.Background(), seen, tc.rc)
 			if err != nil {
 				t.Errorf("reconcile = error %v, want nil: only a cancelled scan reports one", err)
 			}
@@ -165,9 +184,9 @@ func TestStoreReconcile_warn_mode_reports_report_only_despite_a_conversion_failu
 	logs := captureLogs(t)
 	s := &store{root: root}
 
-	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleWarn,
-		newInputSource(t, t.TempDir()), map[string]struct{}{},
-		&reapContext{result: ScanResult{Total: 1, Failed: 1}, walkCompleted: true})
+	deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleWarn).
+		reconcile(context.Background(), map[string]struct{}{},
+			&reapContext{result: ScanResult{Total: 1, Failed: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Fatalf("reconcile(warn, one failed conversion) = error %v, want nil", reconcileErr)
 	}
@@ -206,9 +225,9 @@ func TestStoreReconcile_unsafe_output_walk_never_advises_deletion(t *testing.T) 
 	logs := captureLogs(t)
 	s := &store{root: root}
 
-	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync,
-		newInputSource(t, t.TempDir()), map[string]struct{}{},
-		&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+	deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
+		reconcile(context.Background(), map[string]struct{}{},
+			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Fatalf("reconcile(unsafe output walk) = error %v, want nil", reconcileErr)
 	}
@@ -248,9 +267,9 @@ func TestStoreReconcile_vanished_input_is_reported_at_debug_not_as_a_mount_warni
 	logs := captureLogs(t)
 	s := &store{root: root}
 
-	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync,
-		newInputSource(t, t.TempDir()), map[string]struct{}{},
-		&reapContext{result: ScanResult{Total: 1, Vanished: 1}, walkCompleted: true})
+	deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
+		reconcile(context.Background(), map[string]struct{}{},
+			&reapContext{result: ScanResult{Total: 1, Vanished: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Fatalf("reconcile(vanished input) = error %v, want nil", reconcileErr)
 	}
@@ -435,9 +454,9 @@ func TestStoreReconcile_oversized_orphan_sample_keeps_the_count(t *testing.T) {
 	logs := captureLogs(t)
 	s := &store{root: root}
 
-	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleWarn,
-		newInputSource(t, t.TempDir()), map[string]struct{}{},
-		&reapContext{result: ScanResult{Total: maxLoggedOrphans}, walkCompleted: true})
+	deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleWarn).
+		reconcile(context.Background(), map[string]struct{}{},
+			&reapContext{result: ScanResult{Total: maxLoggedOrphans}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Fatalf("reconcile(%d oversized orphan names) = error %v, want nil", maxLoggedOrphans, reconcileErr)
 	}
@@ -518,8 +537,8 @@ func TestStoreReconcile_propagates_a_shutdown_from_the_orphan_walk(t *testing.T)
 
 	// sync over a tree with one orphan: the mode that would delete, so nothing about
 	// the arrangement excuses the refusal except the cancellation itself.
-	deleted, err := s.reconcile(ctx, outputpolicy.LifecycleSync, newInputSource(t, t.TempDir()),
-		map[string]struct{}{}, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+	deleted, err := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
+		reconcile(ctx, map[string]struct{}{}, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("reconcile(cancelled ctx) error = %v, want context.Canceled so Run does not report a complete scan", err)
@@ -618,8 +637,8 @@ func TestStoreReconcile_sync_spares_a_nested_live_bundle(t *testing.T) {
 	s := &store{root: root}
 	seen := map[string]struct{}{filepath.Join("acme-v02", "example.com", "live.crt"): {}}
 
-	got, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync, newInputSource(t, t.TempDir()),
-		seen, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+	got, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
+		reconcile(context.Background(), seen, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Errorf("reconcile(nested output tree) = error %v, want nil", reconcileErr)
 	}
@@ -875,6 +894,13 @@ func TestStoreIsCurrent_tightens_a_lax_mode_without_regenerating(t *testing.T) {
 				t.Fatalf("setup: write: %v", err)
 			}
 			path := filepath.Join(dir, "out.pfx")
+			// The output DIRECTORY's mode is fixture noise here, but it is not noise to
+			// isCurrent: reportLaxDir warns when the directory is laxer than pfxDirMode,
+			// and what t.TempDir creates depends on the host (an inherited ACL widens it).
+			// Pinned so the log assertions below observe the FILE's mode only.
+			if err := os.Chmod(dir, pfxDirMode); err != nil {
+				t.Fatalf("setup: Chmod(dir): %v", err)
+			}
 			// Chmod explicitly: a filesystem can widen the mode O_CREATE asks for (an
 			// inherited ACL does), so the fixture cannot get tc.mode from the write.
 			if err := os.Chmod(path, tc.mode); err != nil {
@@ -1630,9 +1656,9 @@ func TestStoreReconcile_spares_an_orphan_whose_certificate_returns_during_the_re
 	})
 	logs := captureLogs(t)
 
-	deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync,
-		newInputSource(t, in), map[string]struct{}{},
-		&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+	deleted, reconcileErr := newReaper(s, newInputSource(t, in), outputpolicy.LifecycleSync).
+		reconcile(context.Background(), map[string]struct{}{},
+			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 
 	if reconcileErr != nil {
 		t.Fatalf("reconcile(certificate returned during the re-check) = error %v, want nil:"+
@@ -1695,9 +1721,9 @@ func TestStoreReconcile_shutdown_during_the_recheck_abandons_the_reap(t *testing
 	})
 	logs := captureLogs(t)
 
-	deleted, reconcileErr := s.reconcile(ctx, outputpolicy.LifecycleSync,
-		newInputSource(t, t.TempDir()), map[string]struct{}{},
-		&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+	deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
+		reconcile(ctx, map[string]struct{}{},
+			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 
 	if !errors.Is(reconcileErr, context.Canceled) {
 		t.Errorf("reconcile(shutdown inside the re-check window) error = %v, want context.Canceled"+
@@ -1753,9 +1779,9 @@ func TestStoreReconcile_defers_once_per_batch(t *testing.T) {
 				return nil
 			})
 
-			deleted, reconcileErr := s.reconcile(context.Background(), outputpolicy.LifecycleSync,
-				newInputSource(t, t.TempDir()), map[string]struct{}{},
-				&reapContext{result: ScanResult{Total: tc.total}, walkCompleted: true})
+			deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
+				reconcile(context.Background(), map[string]struct{}{},
+					&reapContext{result: ScanResult{Total: tc.total}, walkCompleted: true})
 
 			if reconcileErr != nil {
 				t.Fatalf("reconcile = error %v, want nil", reconcileErr)
@@ -1767,5 +1793,127 @@ func TestStoreReconcile_defers_once_per_batch(t *testing.T) {
 				t.Errorf("reconcile(%d candidates) deleted = %d, want %d", len(names), deleted, tc.wantDeleted)
 			}
 		})
+	}
+}
+
+// TestScannerRun_reports_a_shutdown_that_arrives_during_reconciliation pins the one
+// place Scanner.Run turns a reconciliation error into the scan's own outcome. The input
+// walk completed cleanly, so walkErr is nil and nothing else in Run can notice that the
+// scan stopped halfway through the OUTPUT tree: without the fold, Run returns nil, logs
+// "scan complete" at Info -- the record the README's stall alert keys on -- and
+// main.healthyAfterScan leaves the health marker set for a scan that was cancelled
+// mid-reap under OUTPUT_LIFECYCLE=sync. Serial: it swaps waitBeforeReap and
+// slog.Default.
+func TestScannerRun_reports_a_shutdown_that_arrives_during_reconciliation(t *testing.T) {
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "live.example.com", "ecdsa")
+	if err := os.WriteFile(filepath.Join(certsRoot, "live.crt"), certPEM, 0o644); err != nil {
+		t.Fatalf("setup: write crt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(certsRoot, "live.key"), keyPEM, 0o600); err != nil {
+		t.Fatalf("setup: write key: %v", err)
+	}
+	// One orphan bundle, so reconciliation has something to confirm and the deferral is
+	// entered at all.
+	orphan := filepath.Join(outRoot, "gone.pfx")
+	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: write orphan: %v", err)
+	}
+	scanner := New(&Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+		Lifecycle: outputpolicy.LifecycleSync,
+	})
+	// Live for the whole walk and cancelled inside the confirmation window: the only
+	// arrangement in which the walk succeeds and reconciliation does not.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	stubReapWait(t, func(ctx context.Context) error {
+		cancel()
+		return ctx.Err()
+	})
+	logs := captureLogs(t)
+
+	res, err := scanner.Run(ctx)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Run(shutdown during reconciliation) error = %v, want context.Canceled: a scan that stopped partway through the output tree is not complete", err)
+	}
+	if res.Removed != 0 {
+		t.Errorf("Run(shutdown during reconciliation) Removed = %d, want 0", res.Removed)
+	}
+	if got := logs.CountExact("scan complete"); got != 0 {
+		t.Errorf("Run(shutdown during reconciliation) logged %q, want no scan-complete record: it would leave the health marker set and satisfy the stall alert", logs.Messages())
+	}
+	if got := logs.CountLevel(slog.LevelDebug, "scan cancelled during shutdown"); got != 1 {
+		t.Errorf("Run(shutdown during reconciliation) logged %q, want the shutdown summary once at Debug", logs.Messages())
+	}
+	if _, statErr := os.Stat(orphan); statErr != nil {
+		t.Errorf("os.Stat(%q) = %v, want the orphan left in place: nothing may be deleted once the process is stopping", orphan, statErr)
+	}
+}
+
+// TestScannerRun_reports_the_reap_count pins Scanner.Run's one assignment of the reap
+// count into its own result. Every existing reap test asserts Removed == 0 on a scan
+// that must NOT delete, so a Run that dropped the assignment would report removed=0 for
+// the life of the deployment -- in the ScanResult the composition root logs and in the
+// summary attribute the README documents -- while bundles really were being deleted.
+func TestScannerRun_reports_the_reap_count(t *testing.T) {
+	t.Parallel()
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "live.example.com", "ecdsa")
+	if err := os.WriteFile(filepath.Join(certsRoot, "live.crt"), certPEM, 0o644); err != nil {
+		t.Fatalf("setup: write crt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(certsRoot, "live.key"), keyPEM, 0o600); err != nil {
+		t.Fatalf("setup: write key: %v", err)
+	}
+	orphan := filepath.Join(outRoot, "gone.pfx")
+	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: write orphan: %v", err)
+	}
+	scanner := New(&Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+		Lifecycle: outputpolicy.LifecycleSync,
+	})
+
+	res, err := scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run(one orphan, sync) = error %v, want nil", err)
+	}
+	if res.Removed != 1 {
+		t.Errorf("Run(one orphan, sync) Removed = %d, want 1: the count the operator sees must be the count that was deleted", res.Removed)
+	}
+	if _, statErr := os.Stat(orphan); statErr == nil {
+		t.Errorf("os.Stat(%q) = nil, want the orphan deleted: the case must exercise a real reap", orphan)
+	}
+}
+
+// TestLogScanOutcome_names_the_output_side_counts pins the two /output-side counts in
+// the end-of-scan summary, the pair no other test asserts (unresolved and vanished each
+// have their own). Both are operator signals: removed is how many bundles this scan
+// deleted under OUTPUT_LIFECYCLE=sync, and unwritable is the health-neutral count of
+// bundles whose mode repair the volume refused, deliberately kept out of failed= and
+// unreadable= so each documented alert keeps its own diagnosis. Dropping either
+// attribute leaves a scan that deleted key material, or that left a world-readable
+// private key in place, indistinguishable from a clean one. Serial: it swaps
+// slog.Default.
+func TestLogScanOutcome_names_the_output_side_counts(t *testing.T) {
+	logs := captureLogs(t)
+
+	logScanOutcome(t.Context(), &ScanResult{Total: 2, Converted: 1, Removed: 3, Unwritable: 2}, nil)
+
+	for key, want := range map[string]string{"removed": "3", "unwritable": "2"} {
+		if !logs.HasAttr("scan complete", key, want) {
+			got, _ := logs.AttrValue("scan complete", key)
+			t.Errorf("logScanOutcome logged %s=%q, want %q", key, got, want)
+		}
 	}
 }

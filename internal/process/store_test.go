@@ -11,6 +11,20 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 )
 
+// newOutputStore opens dir as a confined output root and returns the store under test,
+// closing the root when the test ends. The mirror of newInputSource: the four-line
+// open/check/close/construct preamble is otherwise spelled once per test, in two
+// different shapes.
+func newOutputStore(t *testing.T, dir string) *store {
+	t.Helper()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot(%s): %v", dir, err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	return &store{root: root}
+}
+
 // TestStoreReconcile_reports_an_output_tree_it_cannot_enumerate pins the arm that
 // fires when the ORPHAN WALK cannot enumerate /output at its ROOT, as opposed to
 // under it: the walk error must reach the operator at WARN with the /output
@@ -44,13 +58,16 @@ func TestStoreReconcile_reports_an_output_tree_it_cannot_enumerate(t *testing.T)
 	if err := root.Close(); err != nil {
 		t.Fatalf("setup: root.Close: %v", err)
 	}
+	// Deliberately NOT newOutputStore: the closed root IS this test's failure
+	// injection, so the store must outlive its root handle here.
 	s := &store{root: root}
 	logs := captureLogs(t)
 
 	// sync over a tree holding one orphan: the mode that would delete, so nothing
 	// about the arrangement excuses the refusal except the unwalkable tree.
-	deleted, err := s.reconcile(t.Context(), outputpolicy.LifecycleSync, newInputSource(t, t.TempDir()),
-		map[string]struct{}{"a.crt": {}}, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+	deleted, err := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
+		reconcile(t.Context(), map[string]struct{}{"a.crt": {}},
+			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 	if err != nil {
 		t.Fatalf("reconcile(unwalkable output tree) = error %v, want nil: an unreadable /output is an"+
 			" operator condition a restart cannot fix, so it must not fail the scan", err)
@@ -75,24 +92,33 @@ func TestStoreReconcile_reports_an_output_tree_it_cannot_enumerate(t *testing.T)
 }
 
 // TestStoreOrphanReportRemediation_advice_matches_the_mode pins that the orphan
-// report never advises a setting that is already in effect. In sync mode the report
-// branch is only reachable with a conversion failure (reconcile returns early unless
-// the input enumeration is complete, so !reapable there means Failed > 0), which is
-// why the sync advice names that failure instead of the mode.
+// report never advises a setting that is already in effect, and that it names the
+// condition actually holding the reap back. In sync mode the report branch is
+// reachable two ways (reconcile returns early unless the input enumeration is
+// complete, so !reapable there means conversionsClean() is false): a failed
+// conversion, or a refused permission repair, which logs no conversion failure at all
+// and is cleared by chowning /output.
 func TestStoreOrphanReportRemediation_advice_matches_the_mode(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name      string
-		mode      outputpolicy.Lifecycle
-		walkSafe  bool
-		wantHas   string
-		wantLacks string
+		name        string
+		mode        outputpolicy.Lifecycle
+		walkSafe    bool
+		refusalOnly bool
+		wantHas     string
+		wantLacks   string
 	}{
 		{
 			name: "sync names the conversion failure, not the mode it is already in",
 			mode: outputpolicy.LifecycleSync, walkSafe: true,
 			wantHas:   "fix the conversion failure reported above",
 			wantLacks: "OUTPUT_LIFECYCLE=sync",
+		},
+		{
+			name: "sync names the refused permission repair, not a conversion failure",
+			mode: outputpolicy.LifecycleSync, walkSafe: true, refusalOnly: true,
+			wantHas:   "no refused permission repair",
+			wantLacks: "fix the conversion failure reported above",
 		},
 		{
 			name: "warn offers sync",
@@ -107,7 +133,7 @@ func TestStoreOrphanReportRemediation_advice_matches_the_mode(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := orphanReportRemediation(tc.mode, tc.walkSafe)
+			got := orphanReportRemediation(tc.mode, tc.walkSafe, tc.refusalOnly)
 			if !strings.Contains(got, tc.wantHas) {
 				t.Errorf("orphanReportRemediation(%v, %v) = %q, want it to contain %q",
 					tc.mode, tc.walkSafe, got, tc.wantHas)
@@ -126,12 +152,7 @@ func TestStoreOrphanReportRemediation_advice_matches_the_mode(t *testing.T) {
 func TestStoreWrite_creates_the_parent_directory(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 
 	if err := s.write(t.Context(), filepath.Join("example.com", "cert.pfx"), []byte("pfx")); err != nil {
 		t.Fatalf("store.write(nested path) = error %v, want nil", err)
@@ -171,14 +192,9 @@ func TestStoreWrite_reports_a_parent_it_cannot_create(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "blocked"), []byte("not a directory"), 0o600); err != nil {
 		t.Fatalf("setup: WriteFile: %v", err)
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 
-	err = s.write(t.Context(), filepath.Join("blocked", "cert.pfx"), []byte("pfx"))
+	err := s.write(t.Context(), filepath.Join("blocked", "cert.pfx"), []byte("pfx"))
 	if err == nil {
 		t.Fatal("store.write(into a path blocked by a regular file) = nil error, want a failure")
 	}
@@ -203,12 +219,7 @@ func TestStoreLstat_does_not_follow_a_symlink(t *testing.T) {
 	if err := os.Symlink(target, filepath.Join(dir, "link.pfx")); err != nil {
 		t.Fatalf("setup: Symlink: %v", err)
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 
 	fi, err := s.lstat("link.pfx")
 	if err != nil {
@@ -241,14 +252,9 @@ func TestStoreWrite_wraps_an_atomic_write_failure(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "occupied"), 0o750); err != nil {
 		t.Fatalf("setup: Mkdir: %v", err)
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 
-	err = s.write(t.Context(), "occupied", []byte("pfx"))
+	err := s.write(t.Context(), "occupied", []byte("pfx"))
 	if err == nil {
 		t.Fatal("store.write(onto an existing directory) = nil error, want a failure")
 	}
@@ -270,17 +276,12 @@ func TestStoreWrite_wraps_an_atomic_write_failure(t *testing.T) {
 func TestStoreWrite_refuses_a_bundle_larger_than_the_read_bound(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 	if err := s.write(t.Context(), "out.pfx", []byte("prior bundle")); err != nil {
 		t.Fatalf("setup: write: %v", err)
 	}
 
-	err = s.write(t.Context(), "out.pfx", make([]byte, maxPFXSize+1))
+	err := s.write(t.Context(), "out.pfx", make([]byte, maxPFXSize+1))
 	if err == nil {
 		t.Fatal("store.write(over maxPFXSize) = nil error, want a refusal: a bundle this app writes above the cap is one its own currency check would call unreadable")
 	}
@@ -335,12 +336,7 @@ func TestStoreIsCurrent_names_a_non_regular_prior_output(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			tc.plant(t, dir)
-			root, err := os.OpenRoot(dir)
-			if err != nil {
-				t.Fatalf("setup: os.OpenRoot: %v", err)
-			}
-			defer root.Close()
-			s := &store{root: root}
+			s := newOutputStore(t, dir)
 			logs := captureLogs(t)
 
 			// want is never dereferenced on this arm: the verdict is reached from the
@@ -387,12 +383,7 @@ func TestStoreIsCurrent_names_a_non_regular_prior_output(t *testing.T) {
 // directory. Runs serially: it swaps slog.Default() and the chmod seam.
 func TestStoreIsCurrent_reports_a_bundle_that_vanishes_mid_inspection(t *testing.T) {
 	dir := t.TempDir()
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 	if err := s.write(t.Context(), "out.pfx", []byte("prior bundle")); err != nil {
 		t.Fatalf("setup: write: %v", err)
 	}
@@ -447,4 +438,121 @@ func TestStoreIsCurrent_reports_a_bundle_that_vanishes_mid_inspection(t *testing
 	if _, ok := logs.AttrValue(unreadableMsg, "remediation"); !ok {
 		t.Errorf("isCurrent(bundle removed mid-inspection) logged %q without a remediation hint: %q", unreadableMsg, logs.Messages())
 	}
+}
+
+// TestStoreIsCurrent_reports_a_lax_output_directory pins the /output DIRECTORY
+// permission report, the precondition every other output touch is confined against.
+//
+// The app creates the directory at pfxDirMode once, through
+// atomicfile.WithMkdirMode, and MkdirAll is a no-op on a directory that already
+// exists — so a directory an operator (or the README's own `mkdir -p`, which yields
+// 0755 under the default umask and 0775 under a umask of 0002) left group- or
+// world-accessible is corrected and named nowhere else, while this app polices the
+// private-key bundle's own mode to 0600 on every scan. A group-writable /output is
+// what makes the symlink swap the confined root exists to survive reachable at all.
+//
+// Asserted on the three properties the report has to hold: it fires for a mode
+// carrying a bit pfxDirMode does not, it stays silent on a mode at or stricter than
+// policy (a deliberately tighter 0700 must not be nagged about), and it is emitted
+// ONCE per directory per scan — isCurrent runs for every .crt, so a flat /output
+// holding twenty bundles must not produce twenty identical records on every tick.
+// It is report-only by design: tightening a directory the operator may have widened
+// deliberately is their call, so the mode on disk must be left exactly as found.
+// Runs serially: it swaps slog.Default().
+func TestStoreIsCurrent_reports_a_lax_output_directory(t *testing.T) {
+	// Spelled out rather than imported from the production const: an operator's log
+	// query keys on these words, so a silent rewording must fail here.
+	const wantMsg = "the /output directory holding a pfx is more permissive than policy"
+
+	for _, tc := range []struct {
+		name     string
+		mode     os.FileMode
+		wantWarn bool
+	}{
+		{"the policy mode is not reported", pfxDirMode, false},
+		{"an owner-only directory is not reported", 0o700, false},
+		{"a group-writable directory is reported", 0o770, true},
+		{"a world-traversable directory is reported", 0o755, true},
+		{"a world-writable directory is reported", 0o777, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			// Chmod explicitly: what t.TempDir creates depends on the host (an inherited
+			// ACL widens it), so the fixture cannot inherit tc.mode.
+			if err := os.Chmod(dir, tc.mode); err != nil {
+				t.Fatalf("setup: Chmod(dir): %v", err)
+			}
+			s := newOutputStore(t, dir)
+			logs := captureLogs(t)
+
+			// No bundle is planted: the report is asked before the bundle's own lstat, so
+			// the absent-bundle arm must carry it too — a lax directory is lax whether or
+			// not a prior bundle sits in it. want is never dereferenced on that arm.
+			current, _, err := s.isCurrent(t.Context(), "out.pfx", nil, convert.EncNameModern2023, "pw")
+			if err != nil || current {
+				t.Fatalf("isCurrent(no prior bundle) = %v, %v, want false, nil", current, err)
+			}
+
+			want := 0
+			if tc.wantWarn {
+				want = 1
+			}
+			if got := logs.CountLevel(slog.LevelWarn, wantMsg); got != want {
+				t.Errorf("isCurrent(directory mode %o) logged %q at WARN %d times, want %d: %q",
+					tc.mode, wantMsg, got, want, logs.Messages())
+			}
+			if fi, statErr := os.Stat(dir); statErr != nil {
+				t.Fatalf("Stat(dir): %v", statErr)
+			} else if got := fi.Mode().Perm(); got != tc.mode {
+				t.Errorf("isCurrent(directory mode %o) changed the directory mode to %o; the report is"+
+					" advisory, and tightening a directory an operator widened on purpose is their call",
+					tc.mode, got)
+			}
+			if !tc.wantWarn {
+				return
+			}
+			for _, key := range []string{"path", "mode", "want", "remediation"} {
+				if _, ok := logs.AttrValue(wantMsg, key); !ok {
+					t.Errorf("isCurrent(directory mode %o) logged %q without a %s attribute, want the"+
+						" directory, the mode found, the mode wanted and what to do: %q",
+						tc.mode, wantMsg, key, logs.Messages())
+				}
+			}
+			if !logs.HasAttr(wantMsg, "mode", tc.mode.String()) {
+				t.Errorf("isCurrent(directory mode %o) logged %q without the mode it found, want %s: %q",
+					tc.mode, wantMsg, tc.mode.String(), logs.Messages())
+			}
+		})
+	}
+
+	t.Run("one record per directory per scan, not one per bundle", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, "nested"), 0o755); err != nil {
+			t.Fatalf("setup: Mkdir: %v", err)
+		}
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatalf("setup: Chmod(dir): %v", err)
+		}
+		s := newOutputStore(t, dir)
+		logs := captureLogs(t)
+
+		// Three bundles in the flat root plus one in a nested directory: the flat ones
+		// share a directory and must report once between them, while the nested one is a
+		// different directory and reports on its own.
+		for _, rel := range []string{"a.pfx", "b.pfx", "c.pfx", "nested/d.pfx"} {
+			if _, _, err := s.isCurrent(t.Context(), rel, nil, convert.EncNameModern2023, "pw"); err != nil {
+				t.Fatalf("isCurrent(%s) = error %v, want nil", rel, err)
+			}
+		}
+
+		if got := logs.CountLevel(slog.LevelWarn, wantMsg); got != 2 {
+			t.Errorf("isCurrent over three bundles in one lax directory plus one in a second logged %q %d"+
+				" times, want exactly 2: the fact is a property of the DIRECTORY, and a per-bundle record"+
+				" would repeat on every scan for as long as the mode stands: %q", wantMsg, got, logs.Messages())
+		}
+		if !logs.HasAttr(wantMsg, "path", "nested") {
+			t.Errorf("isCurrent(nested/d.pfx) logged %q without path=nested, want each directory named"+
+				" separately: %q", wantMsg, logs.Messages())
+		}
+	})
 }

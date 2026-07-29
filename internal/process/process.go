@@ -54,6 +54,32 @@ type ScanResult struct {
 	Unwritable int
 }
 
+// summaryAttrs is the ONE list of the scan-summary attributes, in the order
+// logScanOutcome emits them; the README's alerting section keys Loki rules on these
+// names, so both the names and the order are the operator-visible contract. It sits
+// beside ScanResult because it IS the reporting half of that struct: a counter added
+// above without a row here never reaches the only operator-visible summary, and the
+// omission is not a compile error.
+//
+// Field order is pointer-region packing (govet fieldalignment), not narrative order:
+// the func pointer leads so the string's pointer+len sit behind it. Each row is
+// written keyed so the operator-visible name still reads first.
+var summaryAttrs = []struct {
+	of   func(*ScanResult) int
+	name string
+}{
+	{name: "total", of: func(r *ScanResult) int { return r.Total }},
+	{name: "converted", of: func(r *ScanResult) int { return r.Converted }},
+	{name: "unchanged", of: func(r *ScanResult) int { return r.Unchanged }},
+	{name: "orphan", of: func(r *ScanResult) int { return r.Orphan }},
+	{name: "unreadable", of: func(r *ScanResult) int { return r.Unreadable }},
+	{name: "unresolved", of: func(r *ScanResult) int { return r.Unresolved }},
+	{name: "vanished", of: func(r *ScanResult) int { return r.Vanished }},
+	{name: "unwritable", of: func(r *ScanResult) int { return r.Unwritable }},
+	{name: "removed", of: func(r *ScanResult) int { return r.Removed }},
+	{name: "failed", of: func(r *ScanResult) int { return r.Failed }},
+}
+
 // conversionsClean reports whether nothing this scan did leaves the output tree in a
 // state this app is still trying to repair. It is the ONE spelling of the reap veto
 // that is about the OUTPUT rather than the input enumeration: Failed is the obvious
@@ -173,7 +199,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		return sw.visit(ctx, rel, d, err)
 	})
 
-	result := countResults(sw.results, sw.unreadable, sw.unresolved)
+	result := countResults(sw.results, sw.unreadable, sw.unresolved, sw.vanished)
 	rc := reapContext{
 		// The scan's counts are carried whole rather than copied field-by-field:
 		// result.Unreadable (not sw.unreadable) is what the veto needs, because it also
@@ -199,7 +225,8 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	if rc.enumerationClean() {
 		s.observations.forget(sw.seen)
 	}
-	removed, reconcileErr := out.reconcile(ctx, s.opts.Lifecycle, sw.src, sw.seen, &rc)
+	rp := &reaper{src: sw.src, out: out, mode: s.opts.Lifecycle}
+	removed, reconcileErr := rp.reconcile(ctx, sw.seen, &rc)
 	result.Removed = removed
 	// A shutdown that arrives after the input walk completed cancels reconciliation
 	// instead, and that scan is NOT complete: without folding the error in, the
@@ -216,7 +243,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 // scanWalk carries the read-only conversion parameters and the mutable
 // accounting for one Scanner.Run tree walk: the per-pair results, the count of
 // unreadable sub-paths, and the set of cert paths seen (the input enumeration
-// store.reconcile checks the output tree against). The one exception is
+// reaper.reconcile checks the output tree against). The one exception is
 // observations, which is process-lifetime state owned by the Scanner and shared
 // with the walk, not per-run accounting: it survives across scans by design.
 // Hoisting the WalkDir callback onto this struct keeps Scanner.Run flat.
@@ -229,12 +256,13 @@ type scanWalk struct {
 	password     string
 	results      []conversionStatus
 	unreadable   int
+	// vanished counts paths the walk enumerated and then could not find: the
+	// directory half of the renewal race whose file half readPair classifies as
+	// statusVanished. countResults folds it into ScanResult.Vanished.
+	vanished int
 	// unresolved counts input symlinks the confined root could not resolve. Each
 	// one may hide certificates, so `seen` is NOT a complete enumeration of the
-	// input tree afterwards. countResults folds it into ScanResult.Unresolved, a
-	// field deliberately separate from `Unreadable`, which feeds the README's alert
-	// attributes: conflating them would change an operator-visible signal to fix an
-	// internal precondition.
+	// input tree afterwards. countResults folds it into ScanResult.Unresolved.
 	unresolved int
 }
 
@@ -255,14 +283,28 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		if rel == "." {
 			return err
 		}
+		// An ENOENT below the root is the WALK's half of the renewal race the read
+		// side already classifies as statusVanished. fs.WalkDir only ReadDirs real
+		// directories -- it never descends a symlink -- so the only way a path it
+		// just enumerated answers ENOENT is that it was removed under the walk;
+		// there is no surviving-symlink reading to rule out here, which is why this
+		// arm needs no src.pathVanished second observation. Counting it as
+		// unreadable raised the documented `unreadable=` alert, whose remediation
+		// points at /input permissions, for a directory that is merely being
+		// replaced. Health-neutral and reap-vetoing either way.
+		if errors.Is(err, fs.ErrNotExist) {
+			slog.Debug("skipping path that vanished during the scan", "path", rel, "error", err)
+			sw.vanished++
+			return nil
+		}
 		// Debug, not Warn: this is the per-path half of a two-level contract shared
 		// with the /output sweep. An unreadable sub-path is a steady-state
 		// permissions/UID misconfiguration the app deliberately tolerates, and it
 		// recurs on EVERY scan (each debounced fsnotify event and each fallback
 		// tick) — so naming every one at the default level put N lines plus an
 		// aggregate into the log forever for a condition the operator already knows
-		// about. The aggregate Warn in scanAndSetHealth carries the signal and the
-		// remediation hint; LOG_LEVEL=debug names the individual paths.
+		// about. The aggregate Warn in logInputCoverageWarnings carries the signal and
+		// the remediation hint; LOG_LEVEL=debug names the individual paths.
 		slog.Debug("skipping unreadable path", "path", rel, "error", err)
 		sw.unreadable++
 		return nil
@@ -278,8 +320,8 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		// Debug for the reason the unreadable-sub-path arm above states in full: this
 		// is the same shape of steady-state layout mistake, recurring on EVERY scan
 		// until an operator moves the directory, and the unreadable count incremented
-		// here is what raises the aggregate Warn in scanAndSetHealth on this same
-		// scan. Naming the path at the default level too would emit both halves of
+		// here is what raises the aggregate Warn in logInputCoverageWarnings on this
+		// same scan. Naming the path at the default level too would emit both halves of
 		// that two-level contract as Warn for one condition.
 		if layout.IsCert(rel) {
 			slog.Debug("skipping cert: certificate path is a directory",
@@ -367,9 +409,9 @@ func failScan(ctx context.Context, err error) error {
 // a walk aborted by shutdown (context cancellation or deadline) logs at Debug;
 // any other abort logs at Warn so an operator sees the partial scan and its
 // error. The count attributes are identical in all three cases (the README's Loki
-// alert matches on them), so they are built once. Unresolved is a separate
-// ScanResult field, never folded into the documented Unreadable field, because the
-// README's alert attributes key on `unreadable=`.
+// alert matches on them), so they are built once. Every count is named here,
+// including the ones deliberately kept out of Unreadable; ScanResult's field
+// comments carry why each is separate.
 func logScanOutcome(ctx context.Context, result *ScanResult, walkErr error) {
 	level, msg := slog.LevelInfo, "scan complete"
 	if walkErr != nil {
@@ -378,37 +420,13 @@ func logScanOutcome(ctx context.Context, result *ScanResult, walkErr error) {
 			level, msg = slog.LevelDebug, "scan cancelled during shutdown"
 		}
 	}
-	attrs := make([]any, 0, 24)
+	attrs := make([]any, 0, 2+2*len(summaryAttrs))
 	if walkErr != nil {
 		attrs = append(attrs, "error", walkErr)
 	}
-	attrs = append(attrs,
-		"total", result.Total,
-		"converted", result.Converted,
-		"unchanged", result.Unchanged,
-		"orphan", result.Orphan,
-		"unreadable", result.Unreadable,
-		// unresolved is deliberately a SEPARATE ScanResult field, never folded into
-		// the documented Unreadable field (that would change an operator-visible
-		// alert attribute), so without naming it here the summary reports a clean,
-		// empty scan while an unresolvable input symlink hid an entire certificate
-		// subtree.
-		"unresolved", result.Unresolved,
-		// vanished is the transient renewal race, kept out of Unreadable so the
-		// documented unreadable-path alert stays specific to a steady-state
-		// permissions or layout problem; naming it here is what keeps a scan whose
-		// certs were being replaced mid-walk distinguishable from a clean one.
-		"vanished", result.Vanished,
-		// unwritable is the /output-side health-neutral count, kept out of both failed
-		// and unreadable: folding it into failed would restart-loop the container on a
-		// condition a restart cannot clear (it is what the documented
-		// `(failed|unreadable)=[1-9]` alert matches), and folding it into unreadable
-		// would report an /input remediation for an /output ownership problem. Named
-		// here so a scan that left a foreign-owned bundle in place is distinguishable
-		// from a clean one in the summary as well as in its own per-bundle WARN.
-		"unwritable", result.Unwritable,
-		"removed", result.Removed,
-		"failed", result.Failed)
+	for _, a := range summaryAttrs {
+		attrs = append(attrs, a.name, a.of(result))
+	}
 	slog.Log(ctx, level, msg, attrs...)
 	logInputCoverageWarnings(result, walkErr)
 }
@@ -560,17 +578,27 @@ func pairFingerprint(certPEM, keyPEM []byte) [sha256.Size]byte {
 //
 // The map is plain, so it inherits Scanner's single-goroutine Run contract.
 //
-// Its map carries a SECOND, structural fact that readPair's missing-key classifier
-// depends on: an entry exists for a path only if this process read that pair WHOLE —
-// cert and sibling key both — because note and record are reached only past readPair's
-// success. That PRESENCE is the one piece of in-process evidence that a key which is
-// missing now was there before (completedPair).
+// It carries a SECOND, structural fact that readPair's missing-key classifier
+// depends on, in its own `whole` set: a path is in that set only if this process read
+// that pair WHOLE — cert and sibling key both — because note and record are reached only
+// past readPair's success. That MEMBERSHIP is the one piece of in-process evidence that a
+// key which is missing now was there before (completedPair). It is a separate field
+// precisely because it is spent on a different schedule than the signature: forgetPair
+// spends the wholeness, never the de-duplication.
 type observationLog struct {
 	seen map[string][sha256.Size]byte
+	// whole holds the paths this process has read as a COMPLETE pair. It is the
+	// structural half of the log, kept separate from `seen` because the two are spent
+	// differently: forgetPair spends one scan of missing-key grace, which must not
+	// also reset the WARN de-duplication for input bytes that never changed.
+	whole map[string]struct{}
 }
 
 func newObservationLog() *observationLog {
-	return &observationLog{seen: make(map[string][sha256.Size]byte)}
+	return &observationLog{
+		seen:  make(map[string][sha256.Size]byte),
+		whole: make(map[string]struct{}),
+	}
 }
 
 // observationSignature identifies both the input bytes and the observations
@@ -603,6 +631,7 @@ func (o *observationLog) note(rel string, fp [sha256.Size]byte, obs []convert.Ob
 	current := observationSignature(fp, obs)
 	previous, ok := o.seen[rel]
 	o.seen[rel] = current
+	o.whole[rel] = struct{}{}
 	if !ok || previous != current {
 		logConversionObservations(rel, obs)
 	}
@@ -612,6 +641,7 @@ func (o *observationLog) note(rel string, fp [sha256.Size]byte, obs []convert.Ob
 // already logged the observations unconditionally.
 func (o *observationLog) record(rel string, fp [sha256.Size]byte, obs []convert.Observation) {
 	o.seen[rel] = observationSignature(fp, obs)
+	o.whole[rel] = struct{}{}
 }
 
 // completedPair reports whether this process has already read rel's pair whole, which
@@ -623,17 +653,20 @@ func (o *observationLog) record(rel string, fp [sha256.Size]byte, obs []convert.
 // keep the default-level missing-key diagnostic they have today, because no memory
 // exists to suppress it.
 func (o *observationLog) completedPair(rel string) bool {
-	_, remembered := o.seen[rel]
+	_, remembered := o.whole[rel]
 	return remembered
 }
 
-// forgetPair drops one pair's memory, spending the single scan of grace completedPair
-// grants: the scan that reports a vanished key forgets the pair, so a key that is STILL
-// missing on the next scan — one fsnotify event or one fallback tick later — has no
-// memory behind it and is reported as the genuine orphan it is. It is the per-path
-// sibling of forget, which prunes every path a COMPLETE walk did not see.
+// forgetPair spends the wholeness evidence for one pair, spending the single scan of
+// grace completedPair grants: the scan that reports a vanished key forgets that the pair
+// was ever read whole, so a key that is STILL missing on the next scan — one fsnotify
+// event or one fallback tick later — has no memory behind it and is reported as the
+// genuine orphan it is. The observation signature in `seen` deliberately SURVIVES: the
+// input bytes did not change, so a re-read of the same pair must not re-emit its
+// observation WARN. It is the per-path sibling of forget, which prunes every path a
+// COMPLETE walk did not see.
 func (o *observationLog) forgetPair(rel string) {
-	delete(o.seen, rel)
+	delete(o.whole, rel)
 }
 
 // forget drops entries for paths a COMPLETE walk did not see, so a pair that
@@ -645,6 +678,7 @@ func (o *observationLog) forget(seen map[string]struct{}) {
 	for rel := range o.seen {
 		if _, ok := seen[rel]; !ok {
 			delete(o.seen, rel)
+			delete(o.whole, rel)
 		}
 	}
 }
@@ -868,7 +902,19 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		return failEntry(rel, "conversion failed", err)
 	}
 	if err := sw.out.write(ctx, pfxRel, pfxData); err != nil {
-		return sw.noteWriteFailure(rel, pfxRel, cause, err)
+		outcome := sw.noteWriteFailure(rel, pfxRel, cause, err)
+		if outcome == statusUnwritable {
+			// The bundle on disk already holds the bytes these inputs produce and the
+			// refusal is steady state (no restart grants the UID ownership), so the
+			// observations above describe an input that will be re-analysed on every
+			// scan for as long as the operator leaves /output as it is. Commit the
+			// signature so they are named once, exactly as the unchanged path does:
+			// re-emitting per attempt is reserved for statusFailed, where the bundle
+			// those inputs produce is genuinely not on disk. unwritableBundleMsg remains
+			// the standing per-scan diagnostic for the condition itself.
+			sw.observations.record(rel, fingerprint, observations)
+		}
+		return outcome
 	}
 	sw.observations.record(rel, fingerprint, observations)
 
@@ -893,8 +939,10 @@ const unwritableBundleMsg = "prior pfx is more permissive than policy and neithe
 // goes unhealthy — which is right, because the bundle those inputs produce is not on
 // disk. The single exception is the one condition where nothing is missing: the rewrite
 // was scheduled ONLY to repair a mode a refused chmod could not
-// (staleModeRepairRefused), and the write was refused for a permission reason too. The
-// bundle on disk still holds exactly the bytes these inputs produce, so the operator's
+// (staleModeRepairRefused, which store.isCurrent reports only after the content
+// comparison confirmed the bytes on disk already match), and the write was refused
+// for a permission reason too. The bundle on disk still holds exactly the bytes these
+// inputs produce, so the operator's
 // PFX is neither stale nor absent; what is wrong is ownership of /output, which no
 // restart can change. Counting that in Failed made the container restart-loop on a
 // condition a restart cannot clear — the same mistake statusUnreadable exists to avoid
@@ -953,39 +1001,22 @@ func logConversionObservations(rel string, observations []convert.Observation) {
 // purpose: both mean "an /input path this app could not read", both carry the same
 // operator remediation, both are health-neutral, and both must block orphan reaping.
 //
-// statusVanished is NOT folded in with them: it is the transient renewal race, so it
-// gets its own count and stays out of the documented unreadable alert. statusUnwritable
-// is not folded in either, in the other direction: it is an /output condition, so
-// naming it under a count whose remediation points at /input would misdiagnose it.
-func countResults(results []conversionStatus, walkUnreadable, walkUnresolved int) ScanResult {
-	var converted, unchanged, orphan, failed, unreadable, vanished, unwritable int
+// statusVanished and statusUnwritable each keep their own count instead; see
+// ScanResult's field comments for why.
+func countResults(results []conversionStatus, walkUnreadable, walkUnresolved, walkVanished int) ScanResult {
+	var counts [statusCount]int
 	for _, r := range results {
-		switch r {
-		case statusConverted:
-			converted++
-		case statusUnchanged:
-			unchanged++
-		case statusOrphan:
-			orphan++
-		case statusFailed:
-			failed++
-		case statusUnreadable:
-			unreadable++
-		case statusVanished:
-			vanished++
-		case statusUnwritable:
-			unwritable++
-		}
+		counts[r]++ // every outcome, including a future one, lands somewhere
 	}
 	return ScanResult{
 		Total:      len(results),
-		Converted:  converted,
-		Unchanged:  unchanged,
-		Orphan:     orphan,
-		Failed:     failed,
-		Unreadable: walkUnreadable + unreadable,
+		Converted:  counts[statusConverted],
+		Unchanged:  counts[statusUnchanged],
+		Orphan:     counts[statusOrphan],
+		Failed:     counts[statusFailed],
+		Unreadable: walkUnreadable + counts[statusUnreadable],
 		Unresolved: walkUnresolved,
-		Vanished:   vanished,
-		Unwritable: unwritable,
+		Vanished:   walkVanished + counts[statusVanished],
+		Unwritable: counts[statusUnwritable],
 	}
 }

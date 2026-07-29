@@ -15,6 +15,8 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/cplieger/cert-converter/internal/testcerts"
 )
 
 // TestVerifiableKey_bounds_rsa_only pins the cost guard the graph runs every signature
@@ -67,29 +69,18 @@ func TestVerifiableKey_bounds_rsa_only(t *testing.T) {
 // window. Validity is the only property that varies here, so the template
 // carries nothing else: no basic constraints (the shape `openssl req -x509`
 // produces without CA flags) and no extensions Analyse consults.
+//
+// Only the template shape is local; the minting itself is internal/testcerts's
+// Mint, so how this app signs and PEM-encodes a test certificate has one home.
 func testSelfSignedPEM(t *testing.T, key *ecdsa.PrivateKey, cn string, serial int64, notBefore, notAfter time.Time) []byte {
 	t.Helper()
-	tmpl := &x509.Certificate{
+	_, certPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(serial),
 		Subject:      pkix.Name{CommonName: cn},
 		NotBefore:    notBefore,
 		NotAfter:     notAfter,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatalf("setup: CreateCertificate: %v", err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-}
-
-// testKeyPEM PEM-encodes key as PKCS#8, the form parsePrivateKeys reads first.
-func testKeyPEM(t *testing.T, key *ecdsa.PrivateKey) []byte {
-	t.Helper()
-	der, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		t.Fatalf("setup: MarshalPKCS8PrivateKey: %v", err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	}, &key.PublicKey, nil, key)
+	return certPEM
 }
 
 // testValidityKinds reports the identity-validity observations in a, dropping the
@@ -134,8 +125,8 @@ func TestAnalyseAt_reports_every_input_defect_in_discovery_order(t *testing.T) {
 		certPEM, certPEM,
 	)
 	keyFile := slices.Concat(
-		testKeyPEM(t, key),
-		testKeyPEM(t, other),
+		testcerts.KeyPEM(t, key),
+		testcerts.KeyPEM(t, other),
 		[]byte("-----BEGIN PRIVATE KEY-----\nZm9v\n"),
 	)
 
@@ -176,7 +167,7 @@ func TestAnalyseAt_validity_window_is_inclusive_at_both_edges(t *testing.T) {
 	notBefore := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 	notAfter := notBefore.Add(24 * time.Hour)
 	certPEM := testSelfSignedPEM(t, key, "boundary.example.com", 1, notBefore, notAfter)
-	keyPEM := testKeyPEM(t, key)
+	keyPEM := testcerts.KeyPEM(t, key)
 
 	tests := map[string]struct {
 		now  time.Time
@@ -259,7 +250,7 @@ func TestAnalyseAt_renewed_cert_tie_turns_on_validity_at_the_instant(t *testing.
 		testSelfSignedPEM(t, key, "renewed.example.com", 1, current.Add(-24*time.Hour), current.Add(24*time.Hour)),
 		testSelfSignedPEM(t, key, "renewed.example.com", 2, renewalStart, renewalStart.Add(24*time.Hour)),
 	)
-	keyPEM := testKeyPEM(t, key)
+	keyPEM := testcerts.KeyPEM(t, key)
 
 	tests := map[string]struct {
 		now           time.Time
@@ -290,22 +281,16 @@ func TestAnalyseAt_renewed_cert_tie_turns_on_validity_at_the_instant(t *testing.
 // The internal tests need names the pkix.Name template cannot express -- an explicit
 // RDN order, a chosen DirectoryString tag -- so the template carries RawSubject
 // directly and the parent is passed as a view whose RawSubject is the issuer name to
-// embed.
+// embed. That convention is the only thing local: the signing and parsing are
+// internal/testcerts's Mint, so how this app mints a test certificate has one home.
 func testEvidenceCert(t *testing.T, tmpl *x509.Certificate, key *ecdsa.PrivateKey,
 	parent *x509.Certificate, parentKey *ecdsa.PrivateKey,
 ) *x509.Certificate {
 	t.Helper()
 	if parent == nil {
-		parent, parentKey = tmpl, key
+		parentKey = key // self-signed: Mint takes the template as its own issuer
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &key.PublicKey, parentKey)
-	if err != nil {
-		t.Fatalf("setup: CreateCertificate: %v", err)
-	}
-	got, err := x509.ParseCertificate(der)
-	if err != nil {
-		t.Fatalf("setup: ParseCertificate: %v", err)
-	}
+	_, _, got := testcerts.Mint(t, tmpl, &key.PublicKey, parent, parentKey)
 	return got
 }
 
@@ -520,5 +505,52 @@ func TestCertGraph_never_verifies_a_signature_for_an_unlinked_pair(t *testing.T)
 	}
 	if got := g.proofChecks; got != 0 {
 		t.Errorf("asking about an unlinked pair paid for %d signature verification(s), want 0", got)
+	}
+}
+
+// TestNameLink_refuses_a_name_it_cannot_decode pins the guard nameLink documents:
+// "a name that cannot be decoded matches nothing". Two undecodable names both decode
+// to a nil RDNSequence and reflect.DeepEqual(nil, nil) is true, so a decode whose
+// failure is not honoured turns EVERY pair of unreadable names into a SEMANTIC name
+// match: two unrelated certificates become linked, the pair earns a candidate parent
+// edge plus a signature verification, and a stranger can be ranked into the emitted
+// chain. Nothing else in the suite reaches decodedName's failure return, and no
+// mutation of the condition survives it either (flipping the whole condition breaks
+// the decodable names every other test uses), so this direction is only reachable by
+// asserting it directly.
+func TestNameLink_refuses_a_name_it_cannot_decode(t *testing.T) {
+	t.Parallel()
+	decodable := testRawDN(t, asn1.TagPrintableString, testRDN{testOIDCN, "Decodable CA"})
+	// Both halves of the decode guard: an ASN.1 NULL, which is no RDNSequence at all,
+	// and a well-formed RDNSequence carrying one trailing byte.
+	notASequence := []byte{0x05, 0x00}
+	trailingByte := append(slices.Clone(decodable), 0x00)
+
+	for _, tc := range []struct {
+		name          string
+		childIssuer   []byte
+		parentSubject []byte
+		want          nameLinkage
+	}{
+		{"neither name decodes", notASequence, trailingByte, nameLinkNone},
+		{"the child's issuer name does not decode", notASequence, decodable, nameLinkNone},
+		{"the parent's subject name does not decode", decodable, trailingByte, nameLinkNone},
+		{"undecodable but byte-identical names still match exactly", notASequence, notASequence, nameLinkExact},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := &certGraph{
+				certs: []*x509.Certificate{
+					{RawIssuer: tc.childIssuer},
+					{RawSubject: tc.parentSubject},
+				},
+				decodedSubjects: make([]decodedDN, 2),
+				decodedIssuers:  make([]decodedDN, 2),
+			}
+			if got := g.nameLink(0, 1); got != tc.want {
+				t.Errorf("nameLink(child issuer %x, parent subject %x) = %d, want %d",
+					tc.childIssuer, tc.parentSubject, got, tc.want)
+			}
+		})
 	}
 }

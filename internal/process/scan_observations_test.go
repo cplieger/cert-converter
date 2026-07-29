@@ -248,3 +248,57 @@ func TestObservationLog_reports_a_new_time_derived_observation_without_input_cha
 		t.Fatalf("same input with a newly derived expiry observation logged %d times, want exactly 1", got)
 	}
 }
+
+// TestObservationLog_forgetPair_spends_wholeness_without_resetting_deduplication pins
+// the reason `seen` and `whole` are two fields rather than one map: the two facts the
+// log carries are spent on different schedules.
+//
+// forgetPair exists for the structural half only — it spends the single scan of grace
+// completedPair grants a vanished key, so a key that stays gone is reported as the
+// genuine orphan. When both facts lived in one map, that delete also destroyed the
+// observation signature, so a producer replacing /input with BYTE-IDENTICAL content by
+// unlink-then-write (rsync --delete-before, `docker cp` of a whole tree) made every
+// affected pair re-emit its input WARN on the next scan even though neither the bytes
+// nor the derived observations had changed — precisely the repeat this log exists to
+// suppress.
+//
+// Serial, not parallel: captureLogs swaps the process-global slog.Default().
+func TestObservationLog_forgetPair_spends_wholeness_without_resetting_deduplication(t *testing.T) {
+	logs := captureLogs(t)
+	o := newObservationLog()
+	fp := pairFingerprint([]byte("cert"), []byte("key"))
+	obs := []convert.Observation{{
+		Kind:   convert.ObsLeafNotFirst,
+		Detail: "selected leaf is not the first block",
+	}}
+
+	o.note("tls.crt", fp, obs)
+	if !o.completedPair("tls.crt") {
+		t.Fatal("completedPair after note = false, want true: note is reached only past readPair's success")
+	}
+
+	// The vanished-key scan: the grace is spent, so the NEXT missing key is an orphan.
+	o.forgetPair("tls.crt")
+	if o.completedPair("tls.crt") {
+		t.Error("completedPair after forgetPair = true, want false: the grace must be spent, or a key deleted for good stays quiet forever")
+	}
+
+	// Same bytes, same observations, one scan later. The de-duplication must hold.
+	o.note("tls.crt", fp, obs)
+	if got := countObservation(logs, convert.ObsLeafNotFirst); got != 1 {
+		t.Errorf("unchanged input re-read after forgetPair logged %d leaf-not-first observations, want exactly 1: spending the vanish grace must not reset the WARN de-duplication",
+			got)
+	}
+
+	// A COMPLETE walk that no longer sees the path prunes both halves, so a pair that
+	// comes back is reported once again.
+	o.forget(map[string]struct{}{})
+	o.note("tls.crt", fp, obs)
+	if got := countObservation(logs, convert.ObsLeafNotFirst); got != 2 {
+		t.Errorf("input re-read after forget logged %d leaf-not-first observations in total, want 2: forget prunes the signature as well as the wholeness",
+			got)
+	}
+	if !o.completedPair("tls.crt") {
+		t.Error("completedPair after the pair was re-noted = false, want true")
+	}
+}

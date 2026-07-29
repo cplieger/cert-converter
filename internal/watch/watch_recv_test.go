@@ -3,6 +3,7 @@ package watch
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -129,7 +130,14 @@ func TestHandleFallbackTick_resyncs_the_watch_set_before_scanning(t *testing.T) 
 		t.Fatal(err)
 	}
 	scans := 0
-	w := New(root, func(context.Context) { scans++ }, WithFallback(time.Hour))
+	// The watch set AS THE SCAN SEES IT: the re-sync must precede the scan, or a
+	// renewal landing during a long scan produces no event and waits for the next
+	// tick. Asserting the watch list after the tick cannot tell the two orders apart.
+	var watchedAtScan []string
+	w := New(root, func(context.Context) {
+		scans++
+		watchedAtScan = watcher.WatchList()
+	}, WithFallback(time.Hour))
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
@@ -138,8 +146,8 @@ func TestHandleFallbackTick_resyncs_the_watch_set_before_scanning(t *testing.T) 
 	if scans != 1 {
 		t.Errorf("handleFallbackTick scans = %d, want 1 (the safety-net rescan must still fire)", scans)
 	}
-	if watched := watcher.WatchList(); !slices.Contains(watched, nested) {
-		t.Errorf("handleFallbackTick did not re-sync the watch set; %q missing from %v", nested, watched)
+	if !slices.Contains(watchedAtScan, nested) {
+		t.Errorf("watch set at scan time = %v, want %q already re-attached: the re-sync must run BEFORE the scan so a change landing during the scan still arrives as an event", watchedAtScan, nested)
 	}
 }
 
@@ -321,5 +329,86 @@ func TestHandleFallbackTick_runs_the_scan_when_resync_fails(t *testing.T) {
 
 	if scans != 1 {
 		t.Errorf("handleFallbackTick(resync failing) ran %d scans, want 1: a failed watch-set repair must not disable the polling safety net", scans)
+	}
+}
+
+// TestHandleWatcherError_warns_with_the_operator_diagnostics pins the two WARN
+// records the fsnotify error arm emits. Neither is pinned today: the receive
+// tests assert only whether a rescan was armed, so both records could drop to
+// Debug, lose their attributes, or change class without any test failing.
+//
+// The overflow record is the operator's ONLY statement that events were dropped
+// (a renewal may have been missed and is covered only by the rescan this arm
+// schedules), and the benign record is the only statement that a watcher error
+// occurred at all -- so it owes the same triple every other degraded-path site
+// in this package owes: which root, whether anything will revisit it
+// (fallback_scan; "disabled" means nothing does for the life of the process),
+// and the error.
+// Not parallel: it swaps the process-global slog default.
+func TestHandleWatcherError_warns_with_the_operator_diagnostics(t *testing.T) {
+	benign := errors.New("transient watcher failure")
+
+	for _, tc := range []struct {
+		name      string
+		err       error
+		fallback  time.Duration
+		msg       string
+		wantAttrs map[string]string
+	}{
+		{
+			name:      "an event-queue overflow is announced at WARN with its error",
+			err:       fsnotify.ErrEventOverflow,
+			fallback:  6 * time.Hour,
+			msg:       "fsnotify event queue overflowed",
+			wantAttrs: map[string]string{"error": fsnotify.ErrEventOverflow.Error()},
+		},
+		{
+			name:     "a benign watcher error names the root and the rescan cadence",
+			err:      benign,
+			fallback: 6 * time.Hour,
+			msg:      "watcher error",
+			wantAttrs: map[string]string{
+				"fallback_scan": "6h0m0s",
+				"error":         benign.Error(),
+			},
+		},
+		{
+			name:     "a benign watcher error reports a disabled rescan as disabled",
+			err:      benign,
+			fallback: 0,
+			msg:      "watcher error",
+			wantAttrs: map[string]string{
+				"fallback_scan": "disabled",
+				"error":         benign.Error(),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := capture.Default(t)
+			root := t.TempDir()
+			st := newWatchState(New(root, func(context.Context) {}, WithFallback(tc.fallback)))
+			t.Cleanup(st.stop)
+
+			st.handleWatcherError(tc.err)
+
+			if n := logs.CountLevel(slog.LevelWarn, tc.msg); n != 1 {
+				t.Fatalf("WARN %q logged %d times, want exactly 1; log = %v", tc.msg, n, logs.Messages())
+			}
+			for key, want := range tc.wantAttrs {
+				got, ok := logs.AttrValue(tc.msg, key)
+				if !ok {
+					t.Errorf("WARN %q carries no %q attribute; an operator cannot act on the error without it", tc.msg, key)
+					continue
+				}
+				if got != want {
+					t.Errorf("WARN %q %s = %q, want %q", tc.msg, key, got, want)
+				}
+			}
+			if tc.msg == "watcher error" {
+				if got, _ := logs.AttrValue(tc.msg, "root"); got != root {
+					t.Errorf("WARN %q root = %q, want %q so the operator knows which tree lost an event", tc.msg, got, root)
+				}
+			}
+		})
 	}
 }

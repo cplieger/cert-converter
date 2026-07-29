@@ -7,14 +7,12 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"strings"
+	"path"
 	"time"
 
 	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
-	"github.com/cplieger/cert-converter/internal/outputpolicy"
-	"github.com/cplieger/runesafe"
 )
 
 // Output file and directory modes. A PFX carries a private key, so it is
@@ -42,6 +40,50 @@ const outputPermRemediation = "check /output ownership and permissions for the U
 // A store does not close its root; the Scanner that opened it does.
 type store struct {
 	root *os.Root
+	// laxDirsReported dedupes the lax-output-directory WARN to once per directory
+	// per scan. The check is asked per bundle (isCurrent runs for every .crt), but
+	// the fact it reports is a property of the DIRECTORY, so a flat /output holding
+	// twenty certificates must not emit twenty identical records every scan. The
+	// store is constructed per Scanner.Run, so this lasts exactly one scan.
+	laxDirsReported map[string]struct{}
+}
+
+// laxDirMsg is the standing WARN for an /output directory more permissive than
+// pfxDirMode. It is the precondition every other output touch is confined against:
+// a group- or world-WRITABLE directory lets any other process on the shared mount
+// unlink a bundle or replace it with a symlink, and a world-TRAVERSABLE one exposes
+// the bundle names. This app creates the directory at pfxDirMode
+// (atomicfile.WithMkdirMode) and never revisits it, so a directory an operator or an
+// earlier deployment left lax is corrected and reported nowhere else — while the
+// README's own setup step (`mkdir -p ... && chown ...`) produces 0755 under the
+// default umask, and 0775 under a umask of 0002.
+const laxDirMsg = "the /output directory holding a pfx is more permissive than policy"
+
+// reportLaxDir warns when rel's parent directory carries a permission bit
+// pfxDirMode does not. Report-only on purpose: tightening a directory an operator
+// may have widened deliberately is a behaviour change, while naming it costs the
+// operator nothing and is the only signal that the confinement guarding a
+// private-key bundle rests on a directory anyone can write.
+func (s *store) reportLaxDir(rel string) {
+	dir := path.Dir(rel)
+	if _, done := s.laxDirsReported[dir]; done {
+		return
+	}
+	fi, err := s.lstat(dir)
+	if err != nil || !fi.IsDir() {
+		// A directory that cannot be stat-ed or is not a directory is reported by the
+		// write path itself; this check adds nothing there.
+		return
+	}
+	if s.laxDirsReported == nil {
+		s.laxDirsReported = make(map[string]struct{})
+	}
+	s.laxDirsReported[dir] = struct{}{}
+	if perm := fi.Mode().Perm(); perm&^pfxDirMode != 0 {
+		slog.Warn(laxDirMsg,
+			"path", dir, "mode", perm.String(), "want", os.FileMode(pfxDirMode).String(),
+			"remediation", outputPermRemediation)
+	}
 }
 
 // writeFileInRoot is store.write's confined atomic write, indirected through a
@@ -97,25 +139,6 @@ func (s *store) lstat(rel string) (os.FileInfo, error) {
 // staleTempAge is the age past which an atomicfile temp is considered orphaned by
 // an interrupted write rather than staged by one still in flight.
 const staleTempAge = time.Hour
-
-// maxLoggedOrphans caps how many orphan paths one report names. The count is the
-// actionable number; the paths are a sample, and an unbounded list on a per-scan
-// WARN is a permanent multi-kilobyte log line.
-const maxLoggedOrphans = 20
-
-// maxLoggedOrphanBytes caps the rendered orphan sample by BYTES, which the item cap
-// above does not do: a root-relative path is itself long enough (nested directories,
-// long domain names) that maxLoggedOrphans of them can still be tens of kilobytes on
-// a WARN that repeats for as long as the orphan exists. The budget is generous enough
-// to name a realistic sample in full — 20 typical bundle paths are a few hundred bytes
-// — so it only ever engages on the pathological tree.
-const maxLoggedOrphanBytes = 4096
-
-// truncationMarker is appended to a sample maxLoggedOrphanBytes had to cut, so a
-// reader can tell a path list that ends mid-name from one that genuinely ends there.
-// Same wording as internal/convert's marker, deliberately louder than runesafe's own
-// "...", which is why the cap composes runesafe.CapBytes instead of taking a preset.
-const truncationMarker = "...(truncated)"
 
 // sweepStaleTemps removes PFX temp files orphaned by an interrupted atomic write
 // (a crash between temp-write and rename), then narrates the outcome.
@@ -248,6 +271,9 @@ const (
 func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysis,
 	wantEncoder convert.EncoderType, password string,
 ) (bool, staleCause, error) {
+	// Asked before the bundle's own lstat so it covers the absent-bundle arm too: the
+	// directory is lax whether or not a prior bundle sits in it.
+	s.reportLaxDir(rel)
 	fi, err := s.lstat(rel)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -292,37 +318,44 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 	// return below so a bundle this app keeps and one it is about to replace are
 	// treated alike, and so a rewrite that then fails does not leave a private key
 	// readable by the world with nothing logged.
-	if s.tightenMode(rel, fi.Mode().Perm()) == tightenRefused {
-		// The one mode outcome that IS a verdict. A refused chmod means this process
-		// does not own the bundle (the documented case: a root-owned .pfx left behind
-		// by an earlier deployment before the user: mapping changed), so no number of
-		// scans will ever tighten it — while the bundle holds a private key at, say,
-		// 0644 on a volume the documented downstream rsync replicates onward. A rewrite
-		// DOES converge here, because atomicfile's temp+rename needs write permission
-		// on the output directory rather than on the foreign-owned file, and the
-		// replacement is written WithMode(pfxFileMode). Returning stale hands that to
-		// the ordinary currency path instead of adding a second write path.
-		//
-		// Deliberately narrower than "any chmod error": a chmod the filesystem accepts
-		// without storing (mount-forced modes) or one that fails for any other reason
-		// (EROFS, EINVAL) is NOT evidence that a rewrite would land, and rewriting
-		// there would replace one WARN per scan with a failed encode+write per scan
-		// forever. Those stay tightenIneffective — warned, still current.
-		//
-		// The verdict is tagged staleModeRepairRefused because the rewrite it schedules
-		// can itself be refused — the same UID that does not own the bundle plausibly
-		// does not own the DIRECTORY either, which is the "operator changed PUID and
-		// left root-owned output behind" shape this arm exists for. That outcome is
-		// NOT a conversion failure: the bundle on disk still holds the right bytes, and
-		// no restart can grant a permission the UID does not have, so counting it in
-		// ScanResult.Failed would restart-loop the container over a condition it cannot
-		// clear — the mistake ScanResult.Unreadable already exists to avoid on the
-		// /input side. scanWalk.noteWriteFailure owns that split: a permission refusal
-		// on THIS cause is the health-neutral ScanResult.Unwritable plus a standing
-		// WARN, while any other write failure stays a conversion failure and flips
-		// health exactly as before.
-		return false, staleModeRepairRefused, nil
-	}
+	// The refusal is REMEMBERED rather than returned: staleModeRepairRefused promises
+	// the caller (scanWalk.noteWriteFailure) that the bundle's CONTENT was never in
+	// question, and returning here made that promise without ever reading the bundle.
+	modeRepairRefused := s.tightenMode(rel, fi.Mode().Perm()) == tightenRefused
+
+	// The one mode outcome that IS a verdict. A refused chmod means this process
+	// does not own the bundle (the documented case: a root-owned .pfx left behind
+	// by an earlier deployment before the user: mapping changed), so no number of
+	// scans will ever tighten it — while the bundle holds a private key at, say,
+	// 0644 on a volume the documented downstream rsync replicates onward. A rewrite
+	// DOES converge here, because atomicfile's temp+rename needs write permission
+	// on the output directory rather than on the foreign-owned file, and the
+	// replacement is written WithMode(pfxFileMode). Returning stale hands that to
+	// the ordinary currency path instead of adding a second write path.
+	//
+	// Deliberately narrower than "any chmod error": a chmod the filesystem accepts
+	// without storing (mount-forced modes) or one that fails for any other reason
+	// (EROFS, EINVAL) is NOT evidence that a rewrite would land, and rewriting
+	// there would replace one WARN per scan with a failed encode+write per scan
+	// forever. Those stay tightenIneffective — warned, still current.
+	//
+	// The verdict is tagged staleModeRepairRefused because the rewrite it schedules
+	// can itself be refused — the same UID that does not own the bundle plausibly
+	// does not own the DIRECTORY either, which is the "operator changed PUID and
+	// left root-owned output behind" shape this arm exists for. That outcome is
+	// NOT a conversion failure: the bundle on disk still holds the right bytes, and
+	// no restart can grant a permission the UID does not have, so counting it in
+	// ScanResult.Failed would restart-loop the container over a condition it cannot
+	// clear — the mistake ScanResult.Unreadable already exists to avoid on the
+	// /input side. scanWalk.noteWriteFailure owns that split: a permission refusal
+	// on THIS cause is the health-neutral ScanResult.Unwritable plus a standing
+	// WARN, while any other write failure stays a conversion failure and flips
+	// health exactly as before.
+	//
+	// The verdict itself is deferred to the tail of this function: it is reported
+	// ONLY when the content comparison below says the bytes on disk already are the
+	// bundle these inputs produce. A bundle that is stale for any other reason keeps
+	// staleOrdinary, so a refused rewrite of it stays a conversion failure.
 
 	if fi.Size() > maxPFXSize {
 		slog.Warn("prior pfx exceeds the readable bound; regenerating",
@@ -362,6 +395,15 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 	// internal/convert profile.go maxKDFIterations.
 	res := convert.CheckCurrency(prior, password, want, wantEncoder)
 	current, err := currentFromCurrency(ctx, rel, res, wantEncoder)
+	if err == nil && current && modeRepairRefused {
+		// Stale for the MODE alone: the bundle already holds the bytes these inputs
+		// produce, so the rewrite is a permission repair and a refusal of it is the
+		// health-neutral condition noteWriteFailure reports. A bundle that is stale for
+		// any OTHER reason keeps staleOrdinary, so a refused rewrite of it stays a
+		// conversion failure — the README's /output contract conditions the exception on
+		// exactly this ("except where the bundle already on disk holds the right bytes").
+		return false, staleModeRepairRefused, nil
+	}
 	return current, staleOrdinary, err
 }
 
@@ -542,6 +584,15 @@ func (s *store) tightenMode(rel string, perm os.FileMode) tightenResult {
 	}
 	got, err := s.chmodAndObserve(rel, want)
 	switch {
+	case errors.Is(err, errModeUnobserved):
+		// The chmod was accepted; only the confirming re-stat failed. That says nothing
+		// about ownership, so it must not schedule the rewrite tightenRefused asks for —
+		// the bits may well be correct now, and rewriting would churn the bundle with
+		// fresh KDF salts and a fresh mtime for nothing.
+		slog.Warn(modeNotTightenedMsg,
+			"path", rel, "mode", perm.String(), "want", want.String(),
+			"error", err, "remediation", outputModeRemediation)
+		return tightenIneffective
 	case err != nil && isPermissionRefusal(err):
 		// Not ours to chmod, but ours to replace: the caller reads this outcome as
 		// stale, and the ordinary write path converges it. Named with the ownership
@@ -574,6 +625,12 @@ func (s *store) tightenMode(rel string, perm os.FileMode) tightenResult {
 	}
 }
 
+// errModeUnobserved marks a repair whose CHMOD was ACCEPTED and whose confirming
+// re-stat then failed. It exists so tightenMode cannot read a refused re-stat as a
+// refused chmod: only the chmod being refused is evidence this process does not own
+// the bundle, and only that justifies the rewrite tightenRefused schedules.
+var errModeUnobserved = errors.New("mode not observed after chmod")
+
 // chmodAndObserve tightens rel to want inside the output tree and reports the mode
 // the filesystem actually stored.
 //
@@ -587,7 +644,7 @@ func (s *store) chmodAndObserve(rel string, want os.FileMode) (os.FileMode, erro
 	}
 	fi, err := s.lstat(rel)
 	if err != nil {
-		return 0, fmt.Errorf("re-stat after chmod: %w", err)
+		return 0, fmt.Errorf("re-stat after chmod: %w", errors.Join(errModeUnobserved, err))
 	}
 	return fi.Mode().Perm(), nil
 }
@@ -605,14 +662,13 @@ func (s *store) readBoundedPFX(ctx context.Context, rel string) ([]byte, error) 
 	return atomicfile.ReadBoundedInRoot(ctx, s.root, rel, maxPFXSize)
 }
 
-// --- Output lifecycle ---
+// --- Output lifecycle: the /output half ---
 //
-// The OUTPUT_LIFECYCLE value domain itself (the Lifecycle type, its three modes
-// and their parse) lives in internal/outputpolicy, which this package consumes:
-// the operator's raw value is read and normalised by internal/config, and keeping
-// the enum here put that configuration layer above the orchestrator. What follows
-// is this package's own half — acting on an already-parsed mode over the output
-// tree.
+// The reap POLICY — the vetoes, the confirmation delay, the mode ranking and the
+// operator narration — lives in reap.go on *reaper, which depends on this store and
+// on the input source because the claim behind a deletion spans both trees. What
+// stays here is what that policy asks OF the output tree: enumerating the bundles
+// whose input is absent, and removing a confirmed one.
 
 // orphans lists outputs under the store whose input pair is absent, as
 // root-relative paths in walk order.
@@ -692,259 +748,6 @@ func (s *store) logOrphanWalkOutcome(unreadable, symlinked int) {
 	}
 }
 
-// reapContext is everything the gate needs to decide whether `seen` can be
-// trusted as a COMPLETE enumeration of the input tree. It is a struct rather than
-// positional parameters because every field is a veto and a caller must not
-// be able to transpose two of them silently.
-type reapContext struct {
-	// result is the scan's own outcome counts, carried whole rather than copied
-	// field-by-field: several same-typed ints copied by hand is the transposition this
-	// struct exists to prevent, and it is where a new coverage dimension would go
-	// missing. The veto set itself is spelled once on ScanResult
-	// (inputFullyEnumerated / durablyEnumerated), so the predicates below and
-	// logInputCoverageWarnings cannot drift apart.
-	result        ScanResult
-	walkCompleted bool
-	// shutdown is true when the walk ended because the process is stopping, which
-	// is not an operator-actionable incomplete enumeration.
-	shutdown bool
-}
-
-// enumerationClean reports whether nothing PREVENTED the walk from enumerating the
-// whole input tree. It is the shared half of two decisions that differ by one term:
-// enumeratedInput adds result.Total > 0 (an empty tree is clean but gives the output
-// nothing to be compared against), while Scanner.Run's observation-state prune does
-// not. The veto set is ScanResult.inputFullyEnumerated, the same one
-// logInputCoverageWarnings asks, so a new veto dimension cannot be added to one
-// caller and missed in the other.
-func (r *reapContext) enumerationClean() bool {
-	return r.walkCompleted && r.result.inputFullyEnumerated()
-}
-
-// vanishedOnly reports whether a mid-scan replacement is the ONLY thing that left the
-// enumeration incomplete. It exists to split the diagnostic, not the gate: reaping is
-// blocked either way, but this shape is an ordinary renewal that the next scan
-// resolves by itself, so it must not raise the WARN whose remediation tells the
-// operator to check the /input mount. It differs from enumerationClean only in its
-// Vanished term, and both compose ScanResult.durablyEnumerated so that shared half is
-// spelled once.
-func (r *reapContext) vanishedOnly() bool {
-	return r.walkCompleted && r.result.durablyEnumerated() && r.result.Vanished > 0
-}
-
-// enumeratedInput reports whether `seen` can be trusted as a COMPLETE enumeration
-// of the input tree. It is the precondition for calling an output an orphan AT ALL,
-// not just for deleting one: without it every bundle whose cert the scan never
-// reached reads as an orphan.
-func (r *reapContext) enumeratedInput() bool {
-	return r.enumerationClean() && r.result.Total > 0
-}
-
-// safeToReap reports whether the input enumeration is complete enough, and this
-// scan's own output work clean enough, to justify deleting anything.
-func (r *reapContext) safeToReap() bool {
-	return r.enumeratedInput() && r.result.conversionsClean()
-}
-
-// logIncompleteInputEnumeration reports why orphan reconciliation is skipped when
-// the input enumeration is incomplete. Without a complete enumeration, "this output
-// has no matching input" is not a claim the scan can make: a bundle whose cert the
-// walk never reached is indistinguishable from one whose cert was deleted.
-func logIncompleteInputEnumeration(rc *reapContext) {
-	switch {
-	case rc.shutdown:
-		slog.Debug("skipping orphan reconciliation; scan cancelled during shutdown")
-	case rc.vanishedOnly():
-		// A renewal replaced a cert between readdir and the read. The enumeration is
-		// incomplete, so nothing may be reaped, but the condition is transient and
-		// needs no operator action: the WARN below points at the /input mount, which
-		// would be the wrong diagnosis for the activity this daemon exists to process.
-		slog.Debug("skipping orphan reconciliation; input files were replaced during the scan",
-			"vanished", rc.result.Vanished)
-	case rc.enumerationClean():
-		// A complete walk that found no pair at all: the enumeration did not fail, there
-		// is simply nothing to compare the output tree against. logInputCoverageWarnings
-		// already names this at WARN with the /input-mount remediation, and the operator
-		// alert on "orphan removal is disabled for this scan" points at /output, so
-		// repeating it here would fire that alert with the wrong diagnosis on every scan
-		// of a deployment whose first certificate has not been issued yet.
-		slog.Debug("skipping orphan reconciliation; the scan found no certificate pairs to compare the output tree against")
-	default:
-		slog.Warn("orphan removal is disabled for this scan: the scan did not fully enumerate the input tree, so no output can be proven orphaned",
-			"walk_completed", rc.walkCompleted, "unreadable", rc.result.Unreadable,
-			"unresolved", rc.result.Unresolved, "vanished", rc.result.Vanished,
-			"total", rc.result.Total,
-			"remediation", "check the /input mount and the unreadable-path warnings above")
-	}
-}
-
-// reconcile compares the output tree against the input enumeration and, in sync
-// mode, deletes the bundles that no longer have an input. It returns how many were
-// removed plus a cancellation error when the process is shutting down: the walk
-// caller folds that error into the scan's outcome, so a scan interrupted after the
-// input walk finished is not reported as a clean, complete scan.
-//
-// A deletion is never made on the strength of this scan's snapshot alone. Once the
-// vetoes are passed, confirmOrphans defers the batch by reapDeferral and re-checks
-// each candidate's certificate through src, so an input observed mid-replacement
-// keeps its bundle. src is the input side of the same scan `seen` came from.
-func (s *store) reconcile(ctx context.Context, mode outputpolicy.Lifecycle, src *source,
-	seen map[string]struct{}, rc *reapContext,
-) (int, error) {
-	if mode == outputpolicy.LifecycleKeep {
-		return 0, nil
-	}
-	if !rc.enumeratedInput() {
-		logIncompleteInputEnumeration(rc)
-		return 0, nil
-	}
-	orphaned, walkSafe, err := s.orphans(ctx, seen)
-	if err != nil {
-		if IsShutdown(err) {
-			// Shutdown, not a broken output tree. The input walk usually reports the
-			// cancellation itself, but not when it finished cleanly before the signal
-			// arrived, so the error is returned here too rather than only logged.
-			slog.Debug("orphan enumeration cancelled during shutdown", "error", err)
-			return 0, err
-		}
-		slog.Warn("could not enumerate output orphans; orphan removal is disabled for this scan",
-			"error", err, "dir", s.root.Name(),
-			"remediation", outputPermRemediation)
-		return 0, nil
-	}
-	if len(orphaned) == 0 {
-		return 0, nil
-	}
-
-	reapable := rc.safeToReap() && walkSafe
-	if mode != outputpolicy.LifecycleSync || !reapable {
-		slog.Warn("output bundles have no matching input",
-			"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),
-			"action", lifecycleInaction(mode, reapable, walkSafe),
-			"remediation", orphanReportRemediation(mode, walkSafe))
-		return 0, nil
-	}
-
-	return s.reapConfirmed(ctx, src, orphaned)
-}
-
-// reapConfirmed is the deletion half of reconcile: confirm the batch after the
-// deferral, then remove what is still orphaned. Split out so reconcile's gate reads
-// as a sequence of refusals with one tail call, rather than carrying the delay's own
-// three outcomes inline.
-func (s *store) reapConfirmed(ctx context.Context, src *source, orphaned []string) (int, error) {
-	confirmed, err := s.confirmOrphans(ctx, src, orphaned)
-	if err != nil {
-		return 0, err
-	}
-	if len(confirmed) == 0 {
-		return 0, nil
-	}
-	return s.removeOrphans(ctx, confirmed)
-}
-
-// reapDeferral is how long reconcile waits, ONCE per scan, between identifying
-// orphan candidates and deleting them.
-//
-// It exists because none of the reap vetoes asks whether an input's absence is
-// DURABLE, and the scan most likely to observe /input mid-transition is the one a
-// deletion itself scheduled: internal/watch requests a rescan on any Remove and the
-// debounce is 2s, so a producer that replaces a certificate by unlink-then-write (or
-// an rsync --delete-before) can be observed between the two steps. The bundle would
-// then be deleted and regenerated with fresh KDF salts and a fresh mtime, which is
-// the downstream re-replication output-derived currency exists to prevent.
-//
-// The value balances two costs that are not symmetric. Waiting LONGER covers a slower
-// producer transaction: a local unlink-then-write closes in milliseconds, but a
-// network-mounted /input, an rsync that deletes before it transfers, or a `docker cp`
-// of a whole tree can take seconds. Waiting longer costs only latency on work nobody
-// is waiting for — the reap runs after this scan's conversions, so the delay defers
-// deletions, plus at most one window of the NEXT scan on a daemon whose certificates
-// renew every few weeks. Thirty seconds sits well past the realistic producer window
-// and far below anything an operator would read as a stall: deliberately not minutes,
-// because the wait blocks the scan's only goroutine, and deliberately not a couple of
-// seconds, because that is the same order as the watcher's own 2s debounce and would
-// cover little more than a local rewrite.
-//
-// Nothing here is a guarantee: a producer whose transaction outlasts the window is
-// still observed mid-replacement. The window narrows the race; the vetoes above, the
-// audit line on every deletion, and OUTPUT_LIFECYCLE=warn are what bound the
-// consequence.
-const reapDeferral = 30 * time.Second
-
-// waitBeforeReap is reapDeferral's wait, indirected through a package var for the
-// same reason chmodInRoot is: the behaviour that matters cannot be produced in a test
-// otherwise. Here it is the delay itself — a suite that really waited reapDeferral per
-// case would cost minutes — plus the two edges the wait owns (a shutdown arriving
-// inside the window, and the batch waiting once rather than once per orphan).
-//
-// It returns the context's error when cancellation wins, so the caller abandons the
-// reap instead of running it to completion on the way out.
-var waitBeforeReap = waitForReapDeferral
-
-// waitForReapDeferral waits d, or returns early with the context's error when the
-// process starts shutting down inside the window. It is a named function so the
-// contract stays testable even where waitBeforeReap has been swapped.
-func waitForReapDeferral(ctx context.Context, d time.Duration) error {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
-
-// reapRecheckMsg is the line that announces the deferral. It is a const because it is
-// the one message an operator correlates with a pause in the log and with every
-// deletion that follows it, so the two call sites that matter — the emit and the test
-// that pins the wording — cannot drift.
-const reapRecheckMsg = "possible orphaned output bundles; re-checking their certificates before deleting anything"
-
-// confirmOrphans waits reapDeferral once for the whole batch, then re-checks each
-// candidate's INPUT path and returns only the candidates whose certificate is STILL
-// absent.
-//
-// One wait for the batch, not one per candidate: the window is about wall-clock time
-// passing, not about the individual path, so waiting per orphan would make a tree
-// with twenty of them cost two hundred seconds on the scan's only goroutine.
-//
-// The re-check goes through the same confined input root the scan itself reads
-// through, so a symlink planted under /input cannot make an unrelated path answer for
-// a candidate.
-//
-// A certificate that came back cancels that one deletion and nothing else: it is the
-// ordinary producer transaction this delay exists for, not an error, so it does not
-// fail the scan, does not affect health, and leaves every other candidate reapable. A
-// cancellation during the wait abandons the whole reap and is returned to the caller,
-// which is what keeps an interrupted scan from being reported as complete.
-func (s *store) confirmOrphans(ctx context.Context, src *source, orphaned []string) ([]string, error) {
-	slog.Info(reapRecheckMsg,
-		"count", len(orphaned), "recheck_in", reapDeferral.String())
-	if err := waitBeforeReap(ctx, reapDeferral); err != nil {
-		// Shutdown inside the window: delete nothing further. Debug like the other
-		// interrupted paths here, because the error itself is returned and the caller
-		// reports the cancellation.
-		slog.Debug("orphan removal abandoned during shutdown before the confirming re-check",
-			"candidates", len(orphaned), "error", err)
-		return nil, err
-	}
-	confirmed := make([]string, 0, len(orphaned))
-	for _, rel := range orphaned {
-		cert := layout.CertForOutput(rel)
-		if !src.pathAbsent(cert) {
-			// Named at the default level: this is the deletion this app decided NOT to
-			// make, and it is the only trace that the delay did its job.
-			slog.Info("keeping an output bundle whose certificate came back during the confirmation delay",
-				"path", rel, "input", cert)
-			continue
-		}
-		confirmed = append(confirmed, rel)
-	}
-	return confirmed, nil
-}
-
 // removeOrphans deletes each named output bundle, stopping early on shutdown and
 // skipping (never aborting on) an individual removal failure. Returns how many
 // were actually deleted, plus the context's cancellation error when shutdown cut
@@ -957,6 +760,27 @@ func (s *store) removeOrphans(ctx context.Context, orphaned []string) (int, erro
 				"removed", deleted, "remaining", len(orphaned)-deleted)
 			return deleted, err
 		}
+		// The walk classified this entry up to reapDeferral ago, and only a REGULAR
+		// file is a bundle this app wrote. Re-check through the root right before the
+		// unlink: it is the same durability question confirmOrphans asks of the input
+		// side, and it is what makes the README's promise ("sync only ever removes
+		// files matching this app's own output shape") true of a non-regular occupant
+		// and of one swapped in after the walk.
+		fi, statErr := s.lstat(rel)
+		switch {
+		case errors.Is(statErr, fs.ErrNotExist):
+			slog.Debug("orphaned output vanished before removal", "path", rel)
+			continue
+		case statErr != nil:
+			slog.Warn("could not re-check an orphaned output before removing it; leaving it in place",
+				"path", rel, "error", statErr, "remediation", outputPermRemediation)
+			continue
+		case !fi.Mode().IsRegular():
+			slog.Warn("orphaned output path is not a regular file; leaving it in place",
+				"path", rel, "mode", fi.Mode().String(),
+				"remediation", "remove whatever occupies the output path by hand; this app deletes only the regular files it writes")
+			continue
+		}
 		if err := s.root.Remove(rel); err != nil {
 			slog.Warn("could not remove orphaned output", "path", rel, "error", err,
 				"remediation", outputPermRemediation)
@@ -968,88 +792,4 @@ func (s *store) removeOrphans(ctx context.Context, orphaned []string) (int, erro
 		deleted++
 	}
 	return deleted, nil
-}
-
-// sampleOrphanPaths renders at most maxLoggedOrphans paths within
-// maxLoggedOrphanBytes, naming how many were elided so the log line stays bounded
-// without hiding the scale.
-//
-// The two caps compose because they bound different things and neither implies the
-// other: the ITEM cap keeps the sample readable, and the BYTE cap keeps the record
-// small. An item cap alone is not a size bound, because one root-relative path is
-// itself only bounded by the filesystem's own limits, so 20 deeply nested names can
-// still be tens of kilobytes on a WARN that repeats every scan for as long as the
-// orphan exists.
-//
-// The byte cut runs on the JOINED sample (that is what the budget is about) through
-// runesafe.CapBytes, which backs the cut off to a rune start so a multi-byte name is
-// never cut into a partial rune. Paths are NOT sanitized: /input is a read-only mount
-// of the operator's own tree, and these attributes are the operator's query key for
-// which bundles were reported (the settled path-attribute-runesafe-adoption
-// decision).
-//
-// Both suffixes are appended AFTER the cut, so a truncated sample exceeds the budget
-// by their own length: the bound exists to stop a multi-kilobyte record, not to hit
-// the budget exactly. The elision notice keeps its place at the very end, and the
-// count of orphans is a separate attribute on the same record, so the scale survives
-// either cut.
-func sampleOrphanPaths(paths []string) string {
-	sample, elided := paths, ""
-	if len(paths) > maxLoggedOrphans {
-		sample = paths[:maxLoggedOrphans]
-		elided = fmt.Sprintf(" (+%d more)", len(paths)-maxLoggedOrphans)
-	}
-	rendered := strings.Join(sample, ",")
-	if len(rendered) > maxLoggedOrphanBytes {
-		rendered = runesafe.CapBytes(rendered, maxLoggedOrphanBytes) + truncationMarker
-	}
-	return rendered + elided
-}
-
-// lifecycleInaction explains why an orphan was reported rather than removed. Three
-// independent reasons can apply and the mode alone does not pick between them, so
-// each is named separately and the strongest wins, in this order:
-//
-// An OUTPUT walk that could not enumerate the tree makes the LIST itself
-// untrustworthy (orphanReportRemediation withholds the delete advice for exactly
-// this case, so the two attributes must agree on it).
-//
-// A non-sync mode is report-only, so it outranks the conversion-failure veto: the
-// veto's wording promises removal on the next clean scan, which a mode that never
-// removes anything cannot deliver — and the operator would wait for a recovery that
-// cannot happen while a stale bundle stays served.
-//
-// The conversion-failure arm also covers the health-neutral refused-permission repair
-// (ScanResult.Unwritable, via conversionsClean): its wording holds for that shape too —
-// nothing is removed until a scan with no failures — and the standing WARN that names
-// the ownership problem is emitted per bundle, so this attribute does not need to
-// re-diagnose it.
-//
-// Otherwise the list is trustworthy — the input enumeration was complete, or
-// reconcile would have returned earlier — and sync mode is only withholding this
-// app's own deletion until a scan with no conversion failures.
-func lifecycleInaction(mode outputpolicy.Lifecycle, reapable, walkSafe bool) string {
-	switch {
-	case !walkSafe:
-		return "kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle"
-	case mode == outputpolicy.LifecycleSync && !reapable:
-		return "kept: a conversion failed on this scan, so nothing is removed until a scan with no failures"
-	}
-	return "reported only (OUTPUT_LIFECYCLE=" + string(mode) + ")"
-}
-
-// orphanReportRemediation is the orphan report's operator advice. It must not tell
-// an operator to delete anything on a scan whose OUTPUT walk could not enumerate
-// the tree: the candidate list then holds live bundles — a bundle written through a
-// symlinked output directory is enumerated under its physical path, whose derived
-// input name is absent from `seen`, so it reads as an orphan on the very scan that
-// created it — and every entry in the list carries a private key.
-func orphanReportRemediation(mode outputpolicy.Lifecycle, walkSafe bool) string {
-	if !walkSafe {
-		return "do not remove anything from this list yet: fix the /output warnings above, then re-check it on a scan that reports no disabled orphan removal"
-	}
-	if mode == outputpolicy.LifecycleSync {
-		return "this app removes them itself on the next scan with no conversion failures: fix the conversion failure reported above, or remove them from the output volume by hand"
-	}
-	return "remove them from the output volume, or set OUTPUT_LIFECYCLE=sync to have this app do it"
 }

@@ -1,6 +1,7 @@
 package convert
 
 import (
+	"bytes"
 	"encoding/asn1"
 	"errors"
 	"slices"
@@ -96,7 +97,7 @@ func TestInspect_rejects_an_oversized_identifier(t *testing.T) {
 				AuthSafe: contentInfo{ContentType: rawOID(t, oidDataContentType)},
 				MacData: macData{
 					Mac:        digestInfo{Algorithm: algorithmIdentifier{Algorithm: oversizedOID()}, Digest: []byte{0x01}},
-					MacSalt:    []byte{0x01, 0x02},
+					MacSalt:    bytes.Repeat([]byte{0x01}, minPBKDF2SaltBytes),
 					Iterations: 2048,
 				},
 			},
@@ -108,7 +109,7 @@ func TestInspect_rejects_an_oversized_identifier(t *testing.T) {
 				AuthSafe: contentInfo{ContentType: oversizedOID()},
 				MacData: macData{
 					Mac:        digestInfo{Algorithm: algorithmIdentifier{Algorithm: rawOID(t, oidSHA256)}, Digest: []byte{0x01}},
-					MacSalt:    []byte{0x01, 0x02},
+					MacSalt:    bytes.Repeat([]byte{0x01}, minPBKDF2SaltBytes),
 					Iterations: 2048,
 				},
 			},
@@ -770,6 +771,67 @@ func TestInspect_rejects_a_weaker_nested_modern_algorithm(t *testing.T) {
 				setTestPBKDF2KeyLength(t, &p.MacData.Mac.Algorithm, 20)
 			},
 		},
+		{
+			// A zero-length salt makes the derived key a pure function of the
+			// password and the iteration count, so one precomputation covers every
+			// bundle protected by the same PFX_PASSWORD. The decoder imposes no
+			// minimum (crypto.go:253 hands Salt.Bytes to pbkdf2.Key whatever its
+			// length), so without the floor this reads as modern2023 and is kept.
+			name:        "certificate safe deriving with an empty salt",
+			enc:         EncNameModern2023,
+			wantErrText: "pbes2 PBKDF2 salt is 0 octet(s), want at least 16",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
+					setTestPBKDF2Params(t, alg, func(kdf *pbkdf2Params) {
+						kdf.Salt = asn1.RawValue{FullBytes: testASN1Marshal(t, []byte{})}
+					})
+				})
+			},
+		},
+		{
+			name:        "shrouded key bag deriving with a short salt",
+			enc:         EncNameModern2023,
+			wantErrText: "pbes2 PBKDF2 salt is 4 octet(s), want at least 16",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestShroudedKeyBag(t, p, func(alg *algorithmIdentifier) {
+					setTestPBKDF2Params(t, alg, func(kdf *pbkdf2Params) {
+						kdf.Salt = asn1.RawValue{FullBytes: testASN1Marshal(t, []byte("salt"))}
+					})
+				})
+			},
+		},
+		{
+			name:        "PBMAC1 deriving with a short salt",
+			enc:         EncNameModern2026,
+			wantErrText: "pbmac1 PBKDF2 salt is 8 octet(s), want at least 16",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				setTestPBKDF2Params(t, &p.MacData.Mac.Algorithm, func(kdf *pbkdf2Params) {
+					kdf.Salt = asn1.RawValue{FullBytes: testASN1Marshal(t, []byte("saltsalt"))}
+				})
+			},
+		},
+		{
+			// The SHA-256 MAC keeps its salt in macData itself, which no other check
+			// read at all: Inspect passed only MacData.Iterations on.
+			name:        "SHA-256 MAC with a short macData salt",
+			enc:         EncNameModern2023,
+			wantErrText: "mac salt is 2 octet(s), want at least 16",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				p.MacData.MacSalt = []byte{0x01, 0x02}
+			},
+		},
+		{
+			// The legacy profiles carry pkcs-12PbeParams directly, so their salt is
+			// nowhere near a PBKDF2 block and needs its own (8-octet) floor.
+			name:        "legacy certificate safe with a short pbe salt",
+			enc:         EncNameLegacyDES,
+			wantErrText: "pbe salt is 2 octet(s), want at least 8",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
+					setTestLegacyPBESalt(t, alg, []byte{0x01, 0x02})
+				})
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -838,6 +900,16 @@ func setTestPBKDF2Params(t *testing.T, alg *algorithmIdentifier, mutate func(*pb
 	testASN1Unmarshal(t, params.KeyDerivationFunc.Parameters.FullBytes, &kdf)
 	mutate(&kdf)
 	params.KeyDerivationFunc.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, kdf)}
+	alg.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, params)}
+}
+
+// setTestLegacyPBESalt rewrites the salt of a pkcs-12PbeParams block, the parameter
+// shape the two SHA-1 profiles carry directly on the content-encryption algorithm.
+func setTestLegacyPBESalt(t *testing.T, alg *algorithmIdentifier, salt []byte) {
+	t.Helper()
+	var params legacyPBEParams
+	testASN1Unmarshal(t, alg.Parameters.FullBytes, &params)
+	params.Salt = salt
 	alg.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, params)}
 }
 
@@ -1039,7 +1111,7 @@ func TestBundleAlgorithms_rejects_wrong_auth_safe_type(t *testing.T) {
 func testProfilePBKDF2(t *testing.T) algorithmIdentifier {
 	t.Helper()
 	params := pbkdf2Params{
-		Salt:       asn1.RawValue{FullBytes: testASN1Marshal(t, []byte("salt"))},
+		Salt:       asn1.RawValue{FullBytes: testASN1Marshal(t, bytes.Repeat([]byte("salt"), minPBKDF2SaltBytes/4))},
 		Iterations: 2048,
 		PRF:        algorithmIdentifier{Algorithm: rawOID(t, oidHMACWithSHA256)},
 	}
@@ -1250,6 +1322,290 @@ func TestInspect_rejects_malformed_sequence_framing(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.wantErrText) {
 				t.Errorf("Inspect(%s) = %v, want the refusal to name %q", tc.name, err, tc.wantErrText)
+			}
+		})
+	}
+}
+
+// testTruncatedTailSequence frames elements as a DER SEQUENCE whose body ends in
+// a TRUNCATED element: a SEQUENCE header claiming five content bytes with one
+// present. The outer length covers those partial bytes, so the enclosing
+// unmarshal succeeds and the only thing that can refuse the bundle is the
+// per-element walk.
+func testTruncatedTailSequence(t *testing.T, elements ...[]byte) []byte {
+	t.Helper()
+	body := slices.Concat(elements...)
+	body = append(body, 0x30, 0x05, 0x02)
+	return testASN1Marshal(t, asn1.RawValue{
+		Class:      asn1.ClassUniversal,
+		Tag:        asn1.TagSequence,
+		IsCompound: true,
+		Bytes:      body,
+	})
+}
+
+// TestInspect_rejects_a_malformed_element_in_a_bounded_sequence pins
+// sequenceElements' per-element parse refusal at BOTH of its call sites: the
+// authenticated-safe list and a plaintext safe's bag list.
+//
+// Nothing else reaches it. Every bundle this app writes is well framed at both
+// levels, the four trailing-byte guards the package already pins sit OUTSIDE
+// these OCTET STRING payloads, and FuzzInspect_boundedProfile cannot construct a
+// valid bag list with a truncated tail from arbitrary bytes.
+//
+// The bag-list case is a parse differential rather than a cosmetic check: a
+// plaintext safe may carry up to maxSafeBags bags, so swallowing the per-element
+// error (a break where the return is) leaves the real key bag resolved and the
+// bundle identified as modern2023 from a PREFIX of a list whose remaining bytes
+// the preflight never reads, while the decoder acts on the whole file.
+//
+// The refusal message is asserted because these two errors wrap the asn1 syntax
+// error and NOT ErrProfileUnknown, so a sentinel-only assertion would pass for
+// the wrong reason (a later arm refusing a missing bag).
+func TestInspect_rejects_a_malformed_element_in_a_bounded_sequence(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name        string
+		wantErrText string
+		mutate      func(*testing.T, *pfxPreamble)
+	}{
+		{
+			name:        "a truncated element in the authenticated safe list",
+			wantErrText: "parse authenticated safe element",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				safes := testAuthenticatedSafes(t, p)
+				plaintext := testASN1Marshal(t, safes[plaintextTestSafeIndex(t, safes)])
+				setTestAuthenticatedSafeDER(t, p, testTruncatedTailSequence(t, plaintext))
+			},
+		},
+		{
+			name:        "a truncated bag in a plaintext safe's bag list",
+			wantErrText: "parse plaintext safe bags element",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestAuthenticatedSafe(t, p, oidDataContentType, func(safe *contentInfo) {
+					var inner []byte
+					testASN1Unmarshal(t, safe.Content.Bytes, &inner)
+					var bags []safeBag
+					testASN1Unmarshal(t, inner, &bags)
+					keyBag := testASN1Marshal(t, bags[testShroudedKeyBagIndex(t, bags)])
+					safe.Content.Bytes = testASN1Marshal(t, testTruncatedTailSequence(t, keyBag))
+					safe.Content.FullBytes = nil
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var preamble pfxPreamble
+			testASN1Unmarshal(t, pfx, &preamble)
+			tc.mutate(t, &preamble)
+			got, err := Inspect(testASN1Marshal(t, preamble))
+			if err == nil {
+				t.Fatalf("Inspect(%s) = (%+v, nil), want a refusal", tc.name, got)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrText) {
+				t.Errorf("Inspect(%s) = %v, want the refusal to come from the per-element walk naming %q",
+					tc.name, err, tc.wantErrText)
+			}
+		})
+	}
+}
+
+// testWithoutMACData re-frames a bundle's outer SEQUENCE keeping only its first
+// two elements, which is how a file spells an ABSENT MacData. Re-encoding a
+// pfxPreamble cannot express that shape: asn1.Marshal emits every struct field
+// whatever the optional tag says.
+func testWithoutMACData(t *testing.T, pfx []byte) []byte {
+	t.Helper()
+	var outer asn1.RawValue
+	testASN1Unmarshal(t, pfx, &outer)
+	elements, err := sequenceElements(outer.FullBytes, "pfx", 3)
+	if err != nil {
+		t.Fatalf("setup: split the pfx SEQUENCE: %v", err)
+	}
+	if len(elements) != 3 {
+		t.Fatalf("setup: pfx has %d elements, want 3 (version, authSafe, macData)", len(elements))
+	}
+	return testASN1Marshal(t, asn1.RawValue{
+		Class:      asn1.ClassUniversal,
+		Tag:        asn1.TagSequence,
+		IsCompound: true,
+		Bytes:      slices.Concat(elements[0], elements[1]),
+	})
+}
+
+// TestInspect_rejects_an_unusable_MAC_identifier pins the two shape guards that
+// stand in front of the FIRST identifier the preflight decodes: a bundle that
+// carries no MacData at all, and one whose MAC algorithm field is not an OBJECT
+// IDENTIFIER.
+//
+// Neither is otherwise reached. Every bundle this app writes sets a MAC and
+// spells it as a primitive OID, and arbitrary fuzz bytes are refused by the
+// preamble parse long before they form a v3 PFX with a well-framed authSafe and
+// a wrongly-typed MAC identifier — so both guards can be deleted with the whole
+// package green.
+//
+// The first is the only check that says an UNAUTHENTICATED bundle is not one of
+// ours; the second is what keeps every identifier field in this parser going
+// through the bounded decoder, which is the allocation guard the oversized-OID
+// tests rest on. Each case asserts the guard's own wording, because
+// ErrProfileUnknown alone cannot say which arm refused.
+func TestInspect_rejects_an_unusable_MAC_identifier(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name        string
+		wantErrText string
+		build       func(*testing.T, []byte) []byte
+	}{
+		{
+			name:        "no MacData at all",
+			wantErrText: "no MAC present",
+			build:       testWithoutMACData,
+		},
+		{
+			name:        "a MAC algorithm field that is not an OBJECT IDENTIFIER",
+			wantErrText: "identifier field is not a primitive OBJECT IDENTIFIER",
+			build: func(t *testing.T, pfx []byte) []byte {
+				var preamble pfxPreamble
+				testASN1Unmarshal(t, pfx, &preamble)
+				preamble.MacData.Mac.Algorithm.Algorithm = asn1.RawValue{
+					FullBytes: testASN1Marshal(t, "not-an-object-identifier"),
+				}
+				return testASN1Marshal(t, preamble)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := Inspect(tc.build(t, pfx))
+			if !errors.Is(err, ErrProfileUnknown) {
+				t.Fatalf("Inspect(%s) = (%+v, %v), want ErrProfileUnknown", tc.name, got, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrText) {
+				t.Errorf("Inspect(%s) = %v, want the refusal to name %q", tc.name, err, tc.wantErrText)
+			}
+		})
+	}
+}
+
+// TestInspect_rejects_below_floor_iterations_in_every_derivation_location is the
+// lower half of the same bound, at the same six locations.
+//
+// The ceiling stops a file from dictating CPU cost; the floor is profile identity.
+// go-pkcs12 v0.7.3 derives with 2048 iterations at every location all four profiles
+// encrypt at, and the decoder honours whatever count the file stores, so a bundle
+// wrapping the certificates and the key with AES-256-CBC over a ONE-iteration
+// PBKDF2 satisfied the OID triple, the PRF check and the cipher check, decoded,
+// matched the analysis, and was reported CurrencyMatch — leaving a derivation ~2048x
+// weaker than the configured profile on disk for as long as the inputs are
+// unchanged, because nothing ever rewrites a bundle the preflight called ours.
+//
+// The legacy profiles' SHA-1 macData is deliberately absent from this table: it is
+// the one location go-pkcs12 emits 1 at, so its floor is 1 (checkMACIterations).
+func TestInspect_rejects_below_floor_iterations_in_every_derivation_location(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+
+	const belowFloor = 1
+
+	for _, tc := range []struct {
+		name   string
+		enc    EncoderType
+		mutate func(*testing.T, *pfxPreamble)
+	}{
+		{
+			name: "modern2023 MAC",
+			enc:  EncNameModern2023,
+			mutate: func(_ *testing.T, p *pfxPreamble) {
+				p.MacData.Iterations = belowFloor
+			},
+		},
+		{
+			name: "modern2026 PBMAC1",
+			enc:  EncNameModern2026,
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				setTestPBKDF2Iterations(t, &p.MacData.Mac.Algorithm, belowFloor)
+			},
+		},
+		{
+			name: "modern encrypted certificate safe",
+			enc:  EncNameModern2023,
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
+					setTestPBKDF2Iterations(t, alg, belowFloor)
+				})
+			},
+		},
+		{
+			name: "modern shrouded key bag",
+			enc:  EncNameModern2023,
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestShroudedKeyBag(t, p, func(alg *algorithmIdentifier) {
+					setTestPBKDF2Iterations(t, alg, belowFloor)
+				})
+			},
+		},
+		{
+			name: "legacy encrypted certificate safe",
+			enc:  EncNameLegacyDES,
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
+					setTestLegacyIterations(t, alg, belowFloor)
+				})
+			},
+		},
+		{
+			name: "legacy shrouded key bag",
+			enc:  EncNameLegacyDES,
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestShroudedKeyBag(t, p, func(alg *algorithmIdentifier) {
+					setTestLegacyIterations(t, alg, belowFloor)
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pfx, err := Encode(&analysis, tc.enc, "pw")
+			if err != nil {
+				t.Fatalf("setup: Encode(%s): %v", tc.enc, err)
+			}
+			if _, err := Inspect(pfx); err != nil {
+				t.Fatalf("setup: Inspect(unmodified %s bundle): %v", tc.enc, err)
+			}
+
+			var preamble pfxPreamble
+			testASN1Unmarshal(t, pfx, &preamble)
+			tc.mutate(t, &preamble)
+			mutated := testASN1Marshal(t, preamble)
+
+			if _, err := Inspect(mutated); !errors.Is(err, ErrProfileUnknown) {
+				t.Errorf("Inspect(%s bundle with a %d-iteration derivation) error = %v, want ErrProfileUnknown",
+					tc.enc, belowFloor, err)
 			}
 		})
 	}

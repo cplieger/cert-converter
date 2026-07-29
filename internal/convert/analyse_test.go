@@ -363,15 +363,15 @@ func TestAnalyse_reports_an_out_of_window_identity_without_refusing_it(t *testin
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			key := newKey(t)
-			certPEM, _ := mint(t, &x509.Certificate{
+			key := testcerts.NewECDSAKey(t)
+			_, certPEM, _ := testcerts.Mint(t, &x509.Certificate{
 				SerialNumber: big.NewInt(120),
 				Subject:      pkix.Name{CommonName: "window.example.com"},
 				NotBefore:    tc.notBefore,
 				NotAfter:     tc.notAfter,
 			}, &key.PublicKey, nil, key)
 
-			got, err := convert.Analyse(certPEM, keyPEMOf(t, key))
+			got, err := convert.Analyse(certPEM, testcerts.KeyPEM(t, key))
 			if err != nil {
 				t.Fatalf("Analyse(%s) = error %v, want nil: validity is never a gate", tc.name, err)
 			}
@@ -391,15 +391,15 @@ func TestAnalyse_reports_an_out_of_window_identity_without_refusing_it(t *testin
 func TestAnalyse_reports_no_validity_observation_for_a_current_identity(t *testing.T) {
 	t.Parallel()
 	now := time.Now()
-	key := newKey(t)
-	certPEM, _ := mint(t, &x509.Certificate{
+	key := testcerts.NewECDSAKey(t)
+	_, certPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(121),
 		Subject:      pkix.Name{CommonName: "current.example.com"},
 		NotBefore:    now.Add(-time.Hour),
 		NotAfter:     now.Add(time.Hour),
 	}, &key.PublicKey, nil, key)
 
-	got, err := convert.Analyse(certPEM, keyPEMOf(t, key))
+	got, err := convert.Analyse(certPEM, testcerts.KeyPEM(t, key))
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}
@@ -420,8 +420,8 @@ func TestAnalyse_reports_an_out_of_window_chain_certificate(t *testing.T) {
 	t.Parallel()
 	now := time.Now()
 
-	caKey := newKey(t)
-	caPEM, caCert := mint(t, &x509.Certificate{
+	caKey := testcerts.NewECDSAKey(t)
+	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(140),
 		Subject:               pkix.Name{CommonName: "Expired Intermediate"},
 		NotBefore:             now.Add(-72 * time.Hour),
@@ -431,15 +431,15 @@ func TestAnalyse_reports_an_out_of_window_chain_certificate(t *testing.T) {
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &caKey.PublicKey, nil, caKey)
 
-	leafKey := newKey(t)
-	leafPEM, _ := mint(t, &x509.Certificate{
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(141),
 		Subject:      pkix.Name{CommonName: "valid-leaf.example.com"},
 		NotBefore:    now.Add(-time.Hour),
 		NotAfter:     now.Add(time.Hour),
 	}, &leafKey.PublicKey, caCert, caKey)
 
-	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), keyPEMOf(t, leafKey))
+	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(valid leaf + expired issuer) = error %v, want nil: validity is never a gate", err)
 	}

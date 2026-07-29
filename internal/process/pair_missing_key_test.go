@@ -120,6 +120,13 @@ func TestReadPair_separates_a_key_that_vanished_from_a_key_that_was_never_there(
 func TestScannerRun_reports_a_key_replaced_mid_scan_as_transient_then_names_a_key_that_stays_gone(t *testing.T) {
 	certsRoot := t.TempDir()
 	outRoot := t.TempDir()
+	// The output DIRECTORY's mode is fixture noise for this test but not for isCurrent:
+	// reportLaxDir warns when it is laxer than pfxDirMode, and what t.TempDir creates
+	// depends on the host (an inherited ACL widens it). Pinned so the "no WARN at all"
+	// assertion below observes the scan's own conclusions only.
+	if err := os.Chmod(outRoot, pfxDirMode); err != nil {
+		t.Fatalf("setup: Chmod(outRoot): %v", err)
+	}
 	for _, name := range []string{"renewing", "stable"} {
 		certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, name+".example.com", "ecdsa")
 		if err := os.WriteFile(filepath.Join(certsRoot, name+".crt"), certPEM, 0o644); err != nil {
