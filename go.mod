@@ -4,10 +4,11 @@ go 1.26.5
 
 require (
 	github.com/cplieger/atomicfile/v2 v2.4.0
-	github.com/cplieger/envx v1.4.0
+	github.com/cplieger/envx v1.5.0
 	github.com/cplieger/health v1.4.0
+	github.com/cplieger/pathinside v1.0.0
 	github.com/cplieger/runesafe v1.2.1
-	github.com/cplieger/slogx v1.4.0
+	github.com/cplieger/slogx v1.5.0
 	github.com/fsnotify/fsnotify v1.10.1
 	pgregory.net/rapid v1.3.0
 	software.sslmate.com/src/go-pkcs12 v0.7.3
@@ -25,3 +26,11 @@ require (
 replace github.com/cplieger/runesafe => ../runesafe
 
 replace github.com/cplieger/atomicfile/v2 => ../atomicfile
+
+// LOCAL WIRING ONLY - MUST NOT BE MERGED.
+// pathinside is a NEW library extracted in the same review (the lexical
+// path-containment predicate internal/watch used to hand-roll); it has no
+// release yet, so the require above carries a placeholder version. Drop this
+// line and pin the real first release before this change goes anywhere near
+// main.
+replace github.com/cplieger/pathinside => ../pathinside
