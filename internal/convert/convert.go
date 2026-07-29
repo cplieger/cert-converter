@@ -1324,19 +1324,28 @@ func largestOIDBytes(der []byte, depth int, budget *int) int {
 		if !ok {
 			return largest
 		}
-		switch {
-		case isASN1(elem, asn1.TagOID) && !elem.IsCompound:
-			if len(elem.Bytes) > largest {
-				largest = len(elem.Bytes)
-			}
-		case elem.IsCompound || isASN1(elem, asn1.TagOctetString):
-			if inner := largestOIDBytes(elem.Bytes, depth-1, budget); inner > largest {
-				largest = inner
-			}
+		if n := oidBytesIn(elem, depth, budget); n > largest {
+			largest = n
 		}
 		der = rest
 	}
 	return largest
+}
+
+// oidBytesIn reports the largest OBJECT IDENTIFIER content length elem contributes:
+// its own, when elem IS a primitive OID, or the largest one below it, when elem is a
+// constructed element or an OCTET STRING wrapping more DER. Anything else contributes
+// nothing. Split out of largestOIDBytes so each half stays readable; the walk's
+// fail-open contract and the shared budget are unchanged.
+func oidBytesIn(elem asn1.RawValue, depth int, budget *int) int {
+	switch {
+	case isASN1(elem, asn1.TagOID) && !elem.IsCompound:
+		return len(elem.Bytes)
+	case elem.IsCompound || isASN1(elem, asn1.TagOctetString):
+		return largestOIDBytes(elem.Bytes, depth-1, budget)
+	default:
+		return 0
+	}
 }
 
 // PasswordEncodingIssues reports the ways a PFX password cannot survive the

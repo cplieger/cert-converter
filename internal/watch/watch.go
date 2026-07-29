@@ -549,8 +549,8 @@ func (w *Watcher) addWatchDirs(ctx context.Context, watcher *fsnotify.Watcher, r
 // once-per-walk guard for the budget WARN, whose remainder is unbounded and whose
 // operator action is the same for all of it.
 type watchSetBudget struct {
-	max     int
 	root    string
+	max     int
 	visited int
 	warned  bool
 }

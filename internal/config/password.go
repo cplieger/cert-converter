@@ -18,7 +18,7 @@ import (
 // meaningful protection for the embedded private key: nobody can reproduce it from
 // the secret's visible contents.
 var ErrEmptyPassword = errors.New(
-	"the resolved PFX password is empty or blank (whitespace-only, or invisible characters only, such as a byte-order mark or a variation selector); " +
+	"the resolved PFX password is empty or blank (whitespace-only, or invisible formatting characters only); " +
 		"set PFX_PASSWORD, write a non-blank secret " +
 		"to the file named by PFX_PASSWORD_FILE, or set PFX_ALLOW_EMPTY_PASSWORD=true")
 
@@ -170,10 +170,7 @@ func warnUnrecognizedAllowEmptyPassword(raw string, recognized bool) {
 // escapes today (Primary returns exactly the four Explain covers).
 func checkPasswordEncodable(password string) error {
 	if why := convert.InspectPasswordEncoding(password).Primary().Explain(); why != "" {
-		// Explain returns a verb phrase whose subject the caller supplies (convert's
-		// own guard prefixes "pfx password"), so name one here or the refusal reads
-		// as a dangling clause after the sentinel's colon.
-		return fmt.Errorf("%w: it %s", ErrUnencodablePassword, why)
+		return fmt.Errorf("%w: %s", ErrUnencodablePassword, why)
 	}
 	return nil
 }
@@ -263,17 +260,16 @@ func passwordChannel(source envx.SecretSource) string {
 // the same edit.
 //
 // channel names the variable that delivered the secret (passwordChannel's single
-// rendering), because PasswordInvisibleOnly is reachable through BOTH channels — a
-// BOM-only mounted secret is not blank to envx (it judges blankness on the
-// whitespace-trimmed content, and a BOM is not whitespace), so it arrives here as a
-// non-blank file with an invisible-only value.
+// rendering), because PasswordInvisibleOnly is reachable through BOTH channels —
+// envx trims whitespace, so a BOM-only mounted secret arrives here as a non-blank
+// file with an invisible-only value.
 //
 // blankFileReported suppresses the duplicate generic guidance because
 // logPasswordDelivery already emitted channel-specific remediation for a blank
 // PFX_PASSWORD_FILE — the generic line's "point PFX_PASSWORD_FILE at a mounted
 // secret" names a step the operator has already taken. Only PasswordEmpty can be
-// reached that way: envx rejects a whitespace-only file as ErrBlankSecretFile, which
-// this package routes to an empty password.
+// reached that way: envx trims a file secret, so a whitespace-only file arrives as
+// ErrBlankSecretFile with an empty password.
 func warnPasswordStrength(status PasswordStatus, channel string, blankFileReported bool) {
 	switch status {
 	case PasswordEmpty:
@@ -290,7 +286,7 @@ func warnPasswordStrength(status PasswordStatus, channel string, blankFileReport
 		// logPasswordDelivery's per-shape rune WARNs are not reached and this line
 		// carries their remediation. Only emitted when PFX_ALLOW_EMPTY_PASSWORD let
 		// the value through — without the opt-out the guard refuses to start.
-		slog.Warn("the PFX password consists only of invisible Unicode formatting characters (byte-order mark, zero-width space, soft hyphen, or variation selector); generated PFX files are protected by a password nobody can reproduce from the secret's visible contents",
+		slog.Warn("the PFX password consists only of invisible Unicode formatting characters (byte-order mark, zero-width space, or soft hyphen); generated PFX files are protected by a password nobody can reproduce from the secret's visible contents",
 			"source", channel,
 			"remediation", "rewrite the secret without the invisible characters (an editor saving the secret file as \"UTF-8 with BOM\" is the usual cause; printf %s writes the value verbatim)")
 	case PasswordConfigured:
@@ -329,19 +325,18 @@ func logPasswordDelivery(source envx.SecretSource, password string, status Passw
 				"remediation", "write the secret into the mounted file so generated PFX files protect the private key")
 		case blank:
 			// A mounted secret envx did not consider blank but this package does —
-			// today only an invisible-only value (envx judges blankness on the
-			// whitespace-trimmed content, and an invisible formatting rune is not
-			// whitespace). Reporting it as configured is the defect the single
-			// classification closes; warnPasswordStrength emits the actionable
-			// record for the shape.
+			// today only an invisible-only value (envx trims whitespace). Reporting
+			// it as configured is the defect the single classification closes;
+			// warnPasswordStrength emits the actionable record for the shape.
 		default:
 			slog.Info("PFX password configured", "source", passwordChannel(source))
 		}
 	}
-	if !blank && password != strings.TrimSpace(password) {
-		slog.Warn("the PFX password has leading or trailing whitespace, which is part of the password embedded in every PFX file",
+	if source == envx.SourceEnv && !blank &&
+		password != strings.TrimSpace(password) {
+		slog.Warn("PFX_PASSWORD has leading or trailing whitespace, which is part of the password embedded in every PFX file",
 			"source", passwordChannel(source),
-			"remediation", "remove the surrounding whitespace, or keep it deliberately: it is part of the secret on BOTH channels, so the same bytes delivered through the environment and through a mounted file now yield the same password")
+			"remediation", "remove the surrounding whitespace, or note that PFX_PASSWORD_FILE trims it, so the same value delivered as a mounted secret yields a different password")
 	}
 	// A blank value is skipped: warnPasswordStrength already reports it, with the
 	// remediation that helps (set a real password, or rewrite the secret without the
@@ -358,11 +353,10 @@ func logPasswordDelivery(source envx.SecretSource, password string, status Passw
 // password carrying several shapes receives one actionable record per shape.
 func warnPasswordCharacters(source envx.SecretSource, password string) {
 	channel := passwordChannel(source)
-	// An INTERIOR control character survives both guards: envx removes at most one
-	// trailing line ending from a file secret and nothing from the environment,
-	// and PKCS#12 encodes a newline or tab verbatim, so checkPasswordEncodable
-	// accepts it. The bundle is written, health stays green, and the password
-	// cannot be typed into the consumers that need it.
+	// An INTERIOR control character survives both guards: envx trims only
+	// surrounding whitespace, and PKCS#12 encodes a newline or tab verbatim, so
+	// checkPasswordEncodable accepts it. The bundle is written, health stays
+	// green, and the password cannot be typed into the consumers that need it.
 	if strings.ContainsFunc(password, unicode.IsControl) {
 		slog.Warn("the PFX password contains a control character (newline, carriage return, or tab), which is embedded verbatim in every PFX file and cannot be typed into most PKCS#12 consumers",
 			"source", channel,

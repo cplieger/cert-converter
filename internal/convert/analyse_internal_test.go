@@ -428,10 +428,7 @@ func testRawDN(t *testing.T, tag int, rdns ...testRDN) []byte {
 // testNameLinkGraph builds a graph over certs at a fixed instant.
 func testNameLinkGraph(t *testing.T, certs ...*x509.Certificate) *certGraph {
 	t.Helper()
-	g, err := newCertGraph(certs, time.Now())
-	if err != nil {
-		t.Fatalf("setup: newCertGraph: %v", err)
-	}
+	g := newCertGraph(certs, time.Now())
 	return g
 }
 

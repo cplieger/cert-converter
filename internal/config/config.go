@@ -101,10 +101,7 @@ type Config struct {
 	MaxScanEntries int
 }
 
-// Load is the config entry point; the PFX-password classification and its
-// diagnostics live in password.go. (FallbackInterval, LogLevel and
-// WarnInvalidLogLevel are the deliberate exceptions that read the environment
-// outside Load, for the health subcommand and early logger setup.)
+// Load is the only entry point that reads the environment; the PFX-password classification and its diagnostics live in password.go.
 //
 // Load reads environment variables and returns a populated Config. The PFX
 // password follows the Docker-secrets convention: when PFX_PASSWORD_FILE is
@@ -163,13 +160,14 @@ func Load() (Config, error) {
 	rawAllowEmpty := os.Getenv("PFX_ALLOW_EMPTY_PASSWORD")
 	allowEmpty, allowEmptyRecognized := allowEmptyPassword(rawAllowEmpty)
 	warnUnrecognizedAllowEmptyPassword(rawAllowEmpty, allowEmptyRecognized)
-	// Checked BEFORE the blank guard: the invisible-rune predicate the guard's
-	// classification uses includes the supplementary variation selectors
-	// (U+E0100-U+E01EF), which are non-BMP and therefore unencodable by PKCS#12. A
-	// password made only of those is both blank and unencodable, and the unencodable
-	// refusal is the one that must win: it has no opt-out, so reporting the blank
-	// error instead would advertise a PFX_ALLOW_EMPTY_PASSWORD remediation that only
-	// reaches this refusal on the next start.
+	// Encodability is asked BEFORE the blank guard, because the two overlap: the
+	// invisible-rune class includes the supplementary variation selectors
+	// (U+E0100-U+E01EF), which are non-BMP and so unencodable by PKCS#12. A
+	// password made only of those is both blank and unencodable, and only one of
+	// the two refusals carries an achievable remediation — PFX_ALLOW_EMPTY_PASSWORD
+	// cannot rescue it, since opting out just reaches this error on the next start.
+	// Encodable blank values (a BOM, a zero-width space) still fall through to the
+	// opt-out below.
 	if err := checkPasswordEncodable(password); err != nil {
 		return Config{}, fmt.Errorf("%w (supplied via %s)", err, passwordChannel(source))
 	}
@@ -430,12 +428,11 @@ func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
 }
 
 // warnFallbackDisabled warns when periodic recovery and the health-marker
-// freshness deadline are both gone or unreachable, because nothing else in the
-// process ever reports it: either the explicit 0/false opt-out removed them, or the
-// configured cadence sits at maxFallbackHours, where the rescan that refreshes the
-// marker is 10 years away and the 3x deadline is 30 — decades, not minutes, so on any
-// real deployment horizon the two are the same state and both earn the same tradeoff
-// record.
+// freshness deadline are both gone, because nothing else in the process ever
+// reports it: either the explicit 0/false opt-out removed them, or the configured
+// cadence sits at maxFallbackHours, where the rescan that refreshes the marker
+// never arrives and the 3x deadline can never expire. The two are operationally
+// the same state, so both earn the same tradeoff record.
 //
 // Three things go away together: the periodic re-scan that would convert a renewal
 // whose fsnotify event never arrived; the marker's freshness deadline (main hands the
@@ -456,13 +453,11 @@ func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
 // remain enabled and silent here (warnFallbackRepaired reports those).
 func warnFallbackDisabled(interval time.Duration) {
 	if interval >= maxFallbackHours*time.Hour {
-		// The ceiling is documented as far beyond any real cadence: the rescan is
-		// 10 years out and the marker's 3x freshness deadline 30, so both the
-		// periodic recovery and the deadline are inert for any horizon an operator
-		// runs this container over — the same outcome as the 0/false opt-out,
-		// reached by arithmetic rather than by switching them off.
-		slog.Warn("FALLBACK_SCAN_HOURS is at the "+strconv.Itoa(maxFallbackHours)+"h ceiling, so the next periodic re-scan is 10 years away and the health-marker freshness deadline (3x the interval) is 30; "+
-			"a wedged watch loop keeps reporting healthy for decades while converting nothing",
+		// The ceiling is documented as far beyond any real cadence, so a rescan
+		// at it never arrives: the periodic recovery and the marker's 3x
+		// freshness deadline are both inert, exactly as with the 0/false opt-out.
+		slog.Warn("FALLBACK_SCAN_HOURS is at the "+strconv.Itoa(maxFallbackHours)+"h ceiling, so no periodic re-scan will run and the health-marker freshness deadline (3x the interval) can never expire; "+
+			"a wedged watch loop keeps reporting healthy while converting nothing",
 			"hours", maxFallbackHours,
 			"remediation", "set FALLBACK_SCAN_HOURS to a real cadence (unset it for the 6h default) so a missed fsnotify event is recovered and a wedged loop is reported unhealthy")
 		return

@@ -327,10 +327,7 @@ func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 	}
 	certs, obs := in.certs, in.observations
 
-	g, err := newCertGraph(certs, now)
-	if err != nil {
-		return Analysis{}, err
-	}
+	g := newCertGraph(certs, now)
 
 	identity, tieObs, err := g.selectIdentity(in.signers, in.keyIssues, in.certIssues)
 	if err != nil {
@@ -726,8 +723,7 @@ func rsaModulusBits(pub crypto.PublicKey) int {
 }
 
 // newCertGraph derives the evidence for every pair and the candidate edge set that
-// follows from it, or refuses the bundle outright when a candidate issuer's key is
-// one no signature can be checked against.
+// follows from it.
 //
 // Two passes, in this order for a cost reason. The first fills issuanceEvidence for
 // every ordered pair from byte, OID and decoded-name comparisons alone — no
@@ -744,16 +740,12 @@ func rsaModulusBits(pub crypto.PublicKey) int {
 // periods, path length, name constraints, EKU nesting, unhandled critical extensions
 // or revocation; identity role is enforced separately by Analyse's own issuer check.
 //
-// The refusal runs after the candidate edges are built and before either distance
-// walk, and it is the other place during construction that reaches past the cheap
-// facts: deciding whether chain selection actually DEPENDS on an unverifiable edge
-// asks whether each linked child is proven self-signed or has a parent some signature
-// proves (unresolvedOversizedIssuer). Those verifications are memoised in g.proof and
-// g.selfSigned and are the same ones computeDistances would pay for a bundle that is
-// not refused, so a refused bundle is the only one that pays for proof it never
-// uses — and only when it carries an over-ceiling certificate something here names as
-// an issuer.
-func newCertGraph(certs []*x509.Certificate, now time.Time) (*certGraph, error) {
+// Construction does NOT refuse a bundle. An over-ceiling issuer key — one no
+// signature can be checked against — is refused later, by oversizedIssuerError over
+// the hops of the path chain selection actually chose, because a bundle whose selected
+// path spends only proven edges does not depend on the unverifiable one and was being
+// refused for a key it never reads.
+func newCertGraph(certs []*x509.Certificate, now time.Time) *certGraph {
 	g := &certGraph{
 		now:              now,
 		certs:            certs,
@@ -776,7 +768,7 @@ func newCertGraph(certs []*x509.Certificate, now time.Time) (*certGraph, error) 
 		}
 	}
 	g.computeDistances()
-	return g, nil
+	return g
 }
 
 // fillEvidence computes the cheap facts for every ordered pair. Issuer eligibility is
