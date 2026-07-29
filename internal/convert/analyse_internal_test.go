@@ -227,6 +227,35 @@ func TestNoMatchError_names_a_public_key_type_that_cannot_be_compared(t *testing
 	}
 }
 
+// TestNoMatchError_carries_the_input_defect_clauses_on_the_uncomparable_arm pins
+// what the specialized diagnosis used to drop. The all-uncomparable arm returned
+// immediately, so a bundle holding one DSA certificate plus a matching certificate
+// relabelled "TRUSTED CERTIFICATE" told the operator to re-issue the DSA
+// certificate while never naming the skipped block that actually holds the
+// supplied key's certificate; a damaged key block keyDefects had already recorded
+// went unmentioned too. The uncomparable count only covers PARSED certificate
+// blocks, so it cannot rule either out.
+func TestNoMatchError_carries_the_input_defect_clauses_on_the_uncomparable_arm(t *testing.T) {
+	t.Parallel()
+	g := &certGraph{certs: []*x509.Certificate{{
+		Subject:   pkix.Name{CommonName: "legacy-dsa.example.com"},
+		PublicKey: testUncomparablePublicKey{},
+	}}}
+
+	err := g.noMatchError(1, 0,
+		keyDefects{unparseable: 1, firstParseFailure: "truncated armour"},
+		skippedBlocks{firstType: "TRUSTED CERTIFICATE", count: 1})
+	if err == nil {
+		t.Fatal("noMatchError(1, 0, keyDefects{unparseable: 1}, skippedBlocks{count: 1}) = nil, want the unverifiable-key-type diagnosis")
+	}
+	want := `certificate "CN=legacy-dsa.example.com" has a public key of type convert.testUncomparablePublicKey that cannot be verified against the private key` +
+		`; the key file also holds block(s) that yielded no key: 1 could not be parsed (first: truncated armour)` +
+		`; the certificate file also holds 1 block(s) that are neither a certificate nor a private key and were left out of the bundle (first "TRUSTED CERTIFICATE")`
+	if got := err.Error(); got != want {
+		t.Errorf("noMatchError = %q, want %q", got, want)
+	}
+}
+
 // TestNoMatchError_keeps_the_mismatch_sentence_when_any_certificate_was_comparable
 // pins the gate the uncomparable-certificate diagnosis sits behind: with even one
 // comparable certificate in the bundle the real cause is a plain mismatch, so the

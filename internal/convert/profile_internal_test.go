@@ -771,67 +771,6 @@ func TestInspect_rejects_a_weaker_nested_modern_algorithm(t *testing.T) {
 				setTestPBKDF2KeyLength(t, &p.MacData.Mac.Algorithm, 20)
 			},
 		},
-		{
-			// A zero-length salt makes the derived key a pure function of the
-			// password and the iteration count, so one precomputation covers every
-			// bundle protected by the same PFX_PASSWORD. The decoder imposes no
-			// minimum (crypto.go:253 hands Salt.Bytes to pbkdf2.Key whatever its
-			// length), so without the floor this reads as modern2023 and is kept.
-			name:        "certificate safe deriving with an empty salt",
-			enc:         EncNameModern2023,
-			wantErrText: "pbes2 PBKDF2 salt is 0 octet(s), want at least 16",
-			mutate: func(t *testing.T, p *pfxPreamble) {
-				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
-					setTestPBKDF2Params(t, alg, func(kdf *pbkdf2Params) {
-						kdf.Salt = asn1.RawValue{FullBytes: testASN1Marshal(t, []byte{})}
-					})
-				})
-			},
-		},
-		{
-			name:        "shrouded key bag deriving with a short salt",
-			enc:         EncNameModern2023,
-			wantErrText: "pbes2 PBKDF2 salt is 4 octet(s), want at least 16",
-			mutate: func(t *testing.T, p *pfxPreamble) {
-				mutateTestShroudedKeyBag(t, p, func(alg *algorithmIdentifier) {
-					setTestPBKDF2Params(t, alg, func(kdf *pbkdf2Params) {
-						kdf.Salt = asn1.RawValue{FullBytes: testASN1Marshal(t, []byte("salt"))}
-					})
-				})
-			},
-		},
-		{
-			name:        "PBMAC1 deriving with a short salt",
-			enc:         EncNameModern2026,
-			wantErrText: "pbmac1 PBKDF2 salt is 8 octet(s), want at least 16",
-			mutate: func(t *testing.T, p *pfxPreamble) {
-				setTestPBKDF2Params(t, &p.MacData.Mac.Algorithm, func(kdf *pbkdf2Params) {
-					kdf.Salt = asn1.RawValue{FullBytes: testASN1Marshal(t, []byte("saltsalt"))}
-				})
-			},
-		},
-		{
-			// The SHA-256 MAC keeps its salt in macData itself, which no other check
-			// read at all: Inspect passed only MacData.Iterations on.
-			name:        "SHA-256 MAC with a short macData salt",
-			enc:         EncNameModern2023,
-			wantErrText: "mac salt is 2 octet(s), want at least 16",
-			mutate: func(t *testing.T, p *pfxPreamble) {
-				p.MacData.MacSalt = []byte{0x01, 0x02}
-			},
-		},
-		{
-			// The legacy profiles carry pkcs-12PbeParams directly, so their salt is
-			// nowhere near a PBKDF2 block and needs its own (8-octet) floor.
-			name:        "legacy certificate safe with a short pbe salt",
-			enc:         EncNameLegacyDES,
-			wantErrText: "pbe salt is 2 octet(s), want at least 8",
-			mutate: func(t *testing.T, p *pfxPreamble) {
-				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
-					setTestLegacyPBESalt(t, alg, []byte{0x01, 0x02})
-				})
-			},
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -853,6 +792,130 @@ func TestInspect_rejects_a_weaker_nested_modern_algorithm(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.wantErrText) {
 				t.Errorf("Inspect(%s) = %v, want the refusal to come from the guard naming %q",
 					tc.name, err, tc.wantErrText)
+			}
+		})
+	}
+}
+
+// TestInspect_rejects_salts_one_byte_below_profile_floor pins the salt floors as
+// the BOUNDARIES they are documented to be: 16 octets at every PBKDF2 and macData
+// site, 8 at the legacy pkcs-12PbeParams sites.
+//
+// A short salt makes the derived key a function of the password and the iteration
+// count over a search space the file chooses, so one precomputation covers every
+// bundle protected by the same PFX_PASSWORD; the decoder imposes no minimum of its
+// own (crypto.go:253 hands Salt.Bytes to pbkdf2.Key whatever its length), so the
+// floor is the only thing refusing it. The rows this replaced used obviously short
+// values (0, 4, 8 and 2 octets), which a regression lowering the modern floor to 9
+// or the legacy floor to 3 still refuses -- so they never pinned 16 and 8 at all,
+// and neither the legacy MAC nor the legacy shrouded key bag had a case.
+func TestInspect_rejects_salts_one_byte_below_profile_floor(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+
+	shortModernSalt := bytes.Repeat([]byte{0x01}, 15)
+	shortLegacySalt := bytes.Repeat([]byte{0x01}, 7)
+
+	for _, tc := range []struct {
+		name        string
+		enc         EncoderType
+		wantErrText string
+		mutate      func(*testing.T, *pfxPreamble)
+	}{
+		{
+			name:        "modern certificate safe with a 15-byte salt",
+			enc:         EncNameModern2023,
+			wantErrText: "pbes2 PBKDF2 salt is 15 octet(s), want at least 16",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
+					setTestPBKDF2Params(t, alg, func(kdf *pbkdf2Params) {
+						kdf.Salt = asn1.RawValue{FullBytes: testASN1Marshal(t, shortModernSalt)}
+					})
+				})
+			},
+		},
+		{
+			name:        "modern shrouded key bag with a 15-byte salt",
+			enc:         EncNameModern2023,
+			wantErrText: "pbes2 PBKDF2 salt is 15 octet(s), want at least 16",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestShroudedKeyBag(t, p, func(alg *algorithmIdentifier) {
+					setTestPBKDF2Params(t, alg, func(kdf *pbkdf2Params) {
+						kdf.Salt = asn1.RawValue{FullBytes: testASN1Marshal(t, shortModernSalt)}
+					})
+				})
+			},
+		},
+		{
+			name:        "PBMAC1 with a 15-byte salt",
+			enc:         EncNameModern2026,
+			wantErrText: "pbmac1 PBKDF2 salt is 15 octet(s), want at least 16",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				setTestPBKDF2Params(t, &p.MacData.Mac.Algorithm, func(kdf *pbkdf2Params) {
+					kdf.Salt = asn1.RawValue{FullBytes: testASN1Marshal(t, shortModernSalt)}
+				})
+			},
+		},
+		{
+			name:        "SHA-256 MAC with a 15-byte salt",
+			enc:         EncNameModern2023,
+			wantErrText: "mac salt is 15 octet(s), want at least 16",
+			mutate: func(_ *testing.T, p *pfxPreamble) {
+				p.MacData.MacSalt = shortModernSalt
+			},
+		},
+		{
+			name:        "legacy certificate safe with a 7-byte salt",
+			enc:         EncNameLegacyDES,
+			wantErrText: "pbe salt is 7 octet(s), want at least 8",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
+					setTestLegacyPBESalt(t, alg, shortLegacySalt)
+				})
+			},
+		},
+		{
+			name:        "legacy shrouded key bag with a 7-byte salt",
+			enc:         EncNameLegacyDES,
+			wantErrText: "pbe salt is 7 octet(s), want at least 8",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestShroudedKeyBag(t, p, func(alg *algorithmIdentifier) {
+					setTestLegacyPBESalt(t, alg, shortLegacySalt)
+				})
+			},
+		},
+		{
+			name:        "legacy MAC with a 7-byte salt",
+			enc:         EncNameLegacyDES,
+			wantErrText: "mac salt is 7 octet(s), want at least 8",
+			mutate: func(_ *testing.T, p *pfxPreamble) {
+				p.MacData.MacSalt = shortLegacySalt
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pfx, err := Encode(&analysis, tc.enc, "pw")
+			if err != nil {
+				t.Fatalf("setup: Encode(%s): %v", tc.enc, err)
+			}
+			if _, err := Inspect(pfx); err != nil {
+				t.Fatalf("setup: Inspect(unmodified %s bundle): %v", tc.enc, err)
+			}
+			var preamble pfxPreamble
+			testASN1Unmarshal(t, pfx, &preamble)
+			tc.mutate(t, &preamble)
+
+			_, err = Inspect(testASN1Marshal(t, preamble))
+			if !errors.Is(err, ErrProfileUnknown) {
+				t.Fatalf("Inspect(%s) = %v, want ErrProfileUnknown", tc.name, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrText) {
+				t.Errorf("Inspect(%s) = %v, want the refusal to name %q", tc.name, err, tc.wantErrText)
 			}
 		})
 	}
@@ -1508,21 +1571,26 @@ func TestInspect_rejects_an_unusable_MAC_identifier(t *testing.T) {
 	}
 }
 
-// TestInspect_rejects_below_floor_iterations_in_every_derivation_location is the
-// lower half of the same bound, at the same six locations.
+// TestInspect_rejects_iterations_one_below_profile_floor is the lower half of the
+// same bound, at all seven locations, and it asserts the BOUNDARY rather than an
+// obviously weak value.
 //
 // The ceiling stops a file from dictating CPU cost; the floor is profile identity.
 // go-pkcs12 v0.7.3 derives with 2048 iterations at every location all four profiles
 // encrypt at, and the decoder honours whatever count the file stores, so a bundle
 // wrapping the certificates and the key with AES-256-CBC over a ONE-iteration
 // PBKDF2 satisfied the OID triple, the PRF check and the cipher check, decoded,
-// matched the analysis, and was reported CurrencyMatch — leaving a derivation ~2048x
+// matched the analysis, and was reported CurrencyMatch -- leaving a derivation ~2048x
 // weaker than the configured profile on disk for as long as the inputs are
 // unchanged, because nothing ever rewrites a bundle the preflight called ours.
 //
-// The legacy profiles' SHA-1 macData is deliberately absent from this table: it is
-// the one location go-pkcs12 emits 1 at, so its floor is 1 (checkMACIterations).
-func TestInspect_rejects_below_floor_iterations_in_every_derivation_location(t *testing.T) {
+// Every 2048-iteration site is mutated to 2047 and the legacy SHA-1 macData (the one
+// location go-pkcs12 emits 1 at, so its floor is 1 -- checkMACIterations) to zero,
+// one below its own floor. A one-iteration table pinned nothing: lowering
+// minKDFIterations to any value from 2 to 2047 kept it green while the decoder
+// accepted materially weaker bundles, and the legacy MAC floor had no below-floor
+// case at all.
+func TestInspect_rejects_iterations_one_below_profile_floor(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
 	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
@@ -1530,61 +1598,81 @@ func TestInspect_rejects_below_floor_iterations_in_every_derivation_location(t *
 		t.Fatalf("setup: Analyse: %v", err)
 	}
 
-	const belowFloor = 1
+	// One below the 2048-iteration floor every profile's PBKDF2 and PBMAC1 sites
+	// derive at, and one below the legacy SHA-1 MAC's own floor of 1.
+	const (
+		belowKDFFloor       = 2047
+		belowLegacyMACFloor = 0
+	)
 
 	for _, tc := range []struct {
-		name   string
-		enc    EncoderType
-		mutate func(*testing.T, *pfxPreamble)
+		name       string
+		enc        EncoderType
+		iterations int
+		mutate     func(*testing.T, *pfxPreamble)
 	}{
 		{
-			name: "modern2023 MAC",
-			enc:  EncNameModern2023,
+			name:       "modern2023 MAC",
+			enc:        EncNameModern2023,
+			iterations: belowKDFFloor,
 			mutate: func(_ *testing.T, p *pfxPreamble) {
-				p.MacData.Iterations = belowFloor
+				p.MacData.Iterations = belowKDFFloor
 			},
 		},
 		{
-			name: "modern2026 PBMAC1",
-			enc:  EncNameModern2026,
+			name:       "modern2026 PBMAC1",
+			enc:        EncNameModern2026,
+			iterations: belowKDFFloor,
 			mutate: func(t *testing.T, p *pfxPreamble) {
-				setTestPBKDF2Iterations(t, &p.MacData.Mac.Algorithm, belowFloor)
+				setTestPBKDF2Iterations(t, &p.MacData.Mac.Algorithm, belowKDFFloor)
 			},
 		},
 		{
-			name: "modern encrypted certificate safe",
-			enc:  EncNameModern2023,
-			mutate: func(t *testing.T, p *pfxPreamble) {
-				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
-					setTestPBKDF2Iterations(t, alg, belowFloor)
-				})
-			},
-		},
-		{
-			name: "modern shrouded key bag",
-			enc:  EncNameModern2023,
-			mutate: func(t *testing.T, p *pfxPreamble) {
-				mutateTestShroudedKeyBag(t, p, func(alg *algorithmIdentifier) {
-					setTestPBKDF2Iterations(t, alg, belowFloor)
-				})
-			},
-		},
-		{
-			name: "legacy encrypted certificate safe",
-			enc:  EncNameLegacyDES,
+			name:       "modern encrypted certificate safe",
+			enc:        EncNameModern2023,
+			iterations: belowKDFFloor,
 			mutate: func(t *testing.T, p *pfxPreamble) {
 				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
-					setTestLegacyIterations(t, alg, belowFloor)
+					setTestPBKDF2Iterations(t, alg, belowKDFFloor)
 				})
 			},
 		},
 		{
-			name: "legacy shrouded key bag",
-			enc:  EncNameLegacyDES,
+			name:       "modern shrouded key bag",
+			enc:        EncNameModern2023,
+			iterations: belowKDFFloor,
 			mutate: func(t *testing.T, p *pfxPreamble) {
 				mutateTestShroudedKeyBag(t, p, func(alg *algorithmIdentifier) {
-					setTestLegacyIterations(t, alg, belowFloor)
+					setTestPBKDF2Iterations(t, alg, belowKDFFloor)
 				})
+			},
+		},
+		{
+			name:       "legacy encrypted certificate safe",
+			enc:        EncNameLegacyDES,
+			iterations: belowKDFFloor,
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
+					setTestLegacyIterations(t, alg, belowKDFFloor)
+				})
+			},
+		},
+		{
+			name:       "legacy shrouded key bag",
+			enc:        EncNameLegacyDES,
+			iterations: belowKDFFloor,
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestShroudedKeyBag(t, p, func(alg *algorithmIdentifier) {
+					setTestLegacyIterations(t, alg, belowKDFFloor)
+				})
+			},
+		},
+		{
+			name:       "legacy MAC",
+			enc:        EncNameLegacyDES,
+			iterations: belowLegacyMACFloor,
+			mutate: func(_ *testing.T, p *pfxPreamble) {
+				p.MacData.Iterations = belowLegacyMACFloor
 			},
 		},
 	} {
@@ -1605,7 +1693,7 @@ func TestInspect_rejects_below_floor_iterations_in_every_derivation_location(t *
 
 			if _, err := Inspect(mutated); !errors.Is(err, ErrProfileUnknown) {
 				t.Errorf("Inspect(%s bundle with a %d-iteration derivation) error = %v, want ErrProfileUnknown",
-					tc.enc, belowFloor, err)
+					tc.enc, tc.iterations, err)
 			}
 		})
 	}

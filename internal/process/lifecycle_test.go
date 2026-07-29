@@ -653,47 +653,122 @@ func TestStoreReconcile_sync_spares_a_nested_live_bundle(t *testing.T) {
 	}
 }
 
-// TestStoreRemoveOrphans_skips_an_undeletable_orphan_and_continues pins the
-// "skipping (never aborting on) an individual removal failure" half of removeOrphans'
-// contract. Aborting instead would let one stuck path permanently stop the reap of
-// every later bundle under OUTPUT_LIFECYCLE=sync, and the two behaviours are
-// indistinguishable from the logs: both WARN about the offending path, the scan still
-// completes and health stays green.
-func TestStoreRemoveOrphans_skips_an_undeletable_orphan_and_continues(t *testing.T) {
-	t.Parallel()
+// TestStoreReconcile_spares_a_live_bundle_when_an_ancestor_is_swapped_for_a_symlink is
+// h-f8's regression: the orphan walk vetoes every symlink it SEES, but that snapshot is
+// taken before reapConfirmed waits reapDeferral, and os.Root deliberately follows a
+// symlink component that stays inside the root. Swapping an approved candidate's PARENT
+// directory for a symlink to a live directory therefore used to redirect both the
+// pre-unlink lstat and the unlink itself at a live bundle whose certificate still
+// exists, while the input confirmation had been asked about the approved path. The
+// pinned parent root is what refuses it. Serial: it swaps waitBeforeReap and
+// slog.Default.
+func TestStoreReconcile_spares_a_live_bundle_when_an_ancestor_is_swapped_for_a_symlink(t *testing.T) {
+	outDir, inDir := t.TempDir(), t.TempDir()
+	for _, sub := range []string{"live", "old"} {
+		if err := os.Mkdir(filepath.Join(outDir, sub), 0o750); err != nil {
+			t.Fatalf("setup: Mkdir(%s): %v", sub, err)
+		}
+		if err := os.WriteFile(filepath.Join(outDir, sub, "x.pfx"), []byte("pfx"), 0o600); err != nil {
+			t.Fatalf("setup: WriteFile(%s/x.pfx): %v", sub, err)
+		}
+	}
+	// live/x.crt exists, so live/x.pfx is not a candidate; old/x.crt does not, so
+	// old/x.pfx is the one candidate the reap approves.
+	if err := os.Mkdir(filepath.Join(inDir, "live"), 0o750); err != nil {
+		t.Fatalf("setup: Mkdir(input live): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(inDir, "live", "x.crt"), []byte("crt"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile(input live/x.crt): %v", err)
+	}
+	// The namespace swap lands inside the confirmation window, which is the whole
+	// point: everything the walk observed was symlink-free.
+	stubReapWait(t, func(context.Context) error {
+		if err := os.Remove(filepath.Join(outDir, "old", "x.pfx")); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(outDir, "old")); err != nil {
+			return err
+		}
+		return os.Symlink("live", filepath.Join(outDir, "old"))
+	})
+	logs := captureLogs(t)
+	s := newOutputStore(t, outDir)
+
+	deleted, err := newReaper(s, newInputSource(t, inDir), outputpolicy.LifecycleSync).
+		reconcile(t.Context(), map[string]struct{}{"live/x.crt": {}},
+			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+	if err != nil {
+		t.Fatalf("reconcile(ancestor swapped for a symlink) = %v, want nil", err)
+	}
+	if deleted != 0 {
+		t.Errorf("reconcile(ancestor swapped for a symlink) deleted = %d, want 0", deleted)
+	}
+	if _, statErr := os.Stat(filepath.Join(outDir, "live", "x.pfx")); statErr != nil {
+		t.Fatalf("the live bundle was deleted through the swapped ancestor: %v", statErr)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, pinRedirectedMsg); got != 1 {
+		t.Errorf("reconcile(ancestor swapped for a symlink) logged %q at WARN %d times, want exactly 1: %q",
+			pinRedirectedMsg, got, logs.Messages())
+	}
+	if !logs.HasAttr(pinRedirectedMsg, "path", "old/x.pfx") {
+		t.Errorf("reconcile(ancestor swapped for a symlink) logged %q without path=old/x.pfx: %q",
+			pinRedirectedMsg, logs.Messages())
+	}
+}
+
+// TestStoreRemoveOrphans_spares_non_regular_candidate_and_continues pins the
+// pre-unlink type re-check: a path that changed from the regular file found during
+// the orphan walk into a directory must be left in place, while a later regular
+// orphan is still removed. Serial: captureLogs swaps the process-global slog.Default.
+//
+// It replaces a case that claimed to pin the "skipping (never aborting on) an
+// individual removal FAILURE" arm with a non-empty directory: that fixture never
+// reaches Root.Remove any more, because the non-regular guard now returns first, and
+// the deleted count plus the filesystem state are identical either way. The log
+// assertion is what makes the test fail if the guard is removed.
+func TestStoreRemoveOrphans_spares_non_regular_candidate_and_continues(t *testing.T) {
+	const wantMsg = "orphaned output path is not a regular file; leaving it in place"
+
 	dir := t.TempDir()
-	// A NON-EMPTY directory wearing an output name: Remove refuses it with ENOTEMPTY
-	// whatever uid the test runs as, so the case does not silently pass as root.
 	stuck := filepath.Join(dir, "stuck.pfx")
 	if err := os.Mkdir(stuck, 0o750); err != nil {
-		t.Fatal(err)
+		t.Fatalf("setup: Mkdir: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(stuck, "occupant"), []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
+		t.Fatalf("setup: WriteFile occupant: %v", err)
 	}
 	reapable := filepath.Join(dir, "reapable.pfx")
 	if err := os.WriteFile(reapable, []byte("pfx"), 0o600); err != nil {
-		t.Fatal(err)
+		t.Fatalf("setup: WriteFile reapable.pfx: %v", err)
 	}
 	root, err := os.OpenRoot(dir)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("setup: os.OpenRoot: %v", err)
 	}
 	t.Cleanup(func() { _ = root.Close() })
+	logs := captureLogs(t)
 	s := &store{root: root}
 
 	deleted, err := s.removeOrphans(t.Context(), []string{"stuck.pfx", "reapable.pfx"})
 	if err != nil {
-		t.Fatalf("removeOrphans = %v, want nil: one refused removal is not a scan error", err)
+		t.Fatalf("removeOrphans(non-regular candidate) = %v, want nil", err)
 	}
 	if deleted != 1 {
-		t.Errorf("removeOrphans deleted = %d, want 1: the orphan after the refused one must still go", deleted)
+		t.Errorf("removeOrphans(non-regular candidate) deleted = %d, want 1: the later regular orphan must still go", deleted)
 	}
 	if _, statErr := os.Stat(reapable); !errors.Is(statErr, fs.ErrNotExist) {
-		t.Errorf("os.Stat(reapable.pfx) = %v, want fs.ErrNotExist: a later orphan must not be blocked by an earlier failure", statErr)
+		t.Errorf("os.Stat(reapable.pfx) = %v, want fs.ErrNotExist", statErr)
 	}
-	if _, statErr := os.Stat(stuck); statErr != nil {
-		t.Errorf("the undeletable path vanished (%v); only what Remove accepted may disappear", statErr)
+	if fi, statErr := os.Stat(stuck); statErr != nil {
+		t.Errorf("the non-regular candidate vanished: %v", statErr)
+	} else if !fi.IsDir() {
+		t.Errorf("stuck.pfx mode = %v, want a directory left in place", fi.Mode())
+	}
+	if got := logs.CountLevel(slog.LevelWarn, wantMsg); got != 1 {
+		t.Fatalf("removeOrphans(non-regular candidate) logged %q at WARN %d times, want exactly 1: %q", wantMsg, got, logs.Messages())
+	}
+	if !logs.HasAttr(wantMsg, "path", "stuck.pfx") {
+		t.Errorf("removeOrphans(non-regular candidate) logged %q without path=stuck.pfx: %q", wantMsg, logs.Messages())
 	}
 }
 
@@ -2014,5 +2089,159 @@ func TestLogScanOutcome_names_the_output_side_counts(t *testing.T) {
 			got, _ := logs.AttrValue("scan complete", key)
 			t.Errorf("logScanOutcome logged %s=%q, want %q", key, got, want)
 		}
+	}
+}
+
+// TestScannerRun_refuses_a_tree_over_the_entry_budget pins maxScanEntries, the bound on
+// how much of an untrusted /input one scan takes on, and — the load-bearing half — what
+// the abort must NOT do: reap.
+//
+// /input is a mounted tree this app does not own, and before the budget nothing capped
+// how many entries the walk accepted: every one costs cumulative memory (a `seen` key, a
+// result, an observation entry), so a large planted inventory drove the daemon into an
+// OOM kill and stopped conversion for every certificate. Aborting mid-tree makes `seen`
+// a PARTIAL enumeration, which must never authorise a deletion: without the veto, sync
+// mode would read every bundle whose certificate the walk never reached as an orphan and
+// delete live key material. Serial: it swaps maxScanEntries and slog.Default.
+func TestScannerRun_refuses_a_tree_over_the_entry_budget(t *testing.T) {
+	inDir, outDir := t.TempDir(), t.TempDir()
+	for _, name := range []string{"a.crt", "b.crt", "c.crt"} {
+		if err := os.WriteFile(filepath.Join(inDir, name), []byte("not a pem"), 0o600); err != nil {
+			t.Fatalf("setup: WriteFile(%s): %v", name, err)
+		}
+	}
+	// A bundle with no input at all: the candidate sync mode would delete if a truncated
+	// enumeration were allowed to stand in for a complete one.
+	orphan := filepath.Join(outDir, "gone.pfx")
+	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile(gone.pfx): %v", err)
+	}
+	prev := maxScanEntries
+	// Two: the walk root itself plus one entry, so the third hand-off trips the budget.
+	maxScanEntries = 2
+	t.Cleanup(func() { maxScanEntries = prev })
+	logs := captureLogs(t)
+
+	result, err := New(&Options{
+		CertsRoot: inDir, OutRoot: outDir,
+		Encoder:  convert.EncNameModern2023,
+		Password: "pw", Lifecycle: outputpolicy.LifecycleSync,
+	}).Run(t.Context())
+
+	if !errors.Is(err, errScanBudgetExceeded) {
+		t.Fatalf("Run(tree over the entry budget) = %v, want errScanBudgetExceeded", err)
+	}
+	if result.Removed != 0 {
+		t.Errorf("Run(tree over the entry budget) removed = %d, want 0", result.Removed)
+	}
+	if _, statErr := os.Stat(orphan); statErr != nil {
+		t.Errorf("the orphan candidate was deleted on a truncated enumeration: %v", statErr)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, scanBudgetMsg); got != 1 {
+		t.Errorf("Run(tree over the entry budget) logged %q at WARN %d times, want exactly 1: %q",
+			scanBudgetMsg, got, logs.Messages())
+	}
+}
+
+// TestObservationLog_is_bounded_across_path_churn pins the other half of the same bound.
+// forget only prunes on a walk that PROVED the enumeration complete, so a deployment
+// whose scans keep ending incomplete never reclaims the entries of paths that are gone,
+// and /input path churn then grows process-lifetime state without a ceiling. Eviction
+// spends diagnostic memory only — a re-emitted WARN, a completedPair answer that falls
+// back to its documented safe direction — and no currency decision reads this log at all.
+func TestObservationLog_is_bounded_across_path_churn(t *testing.T) {
+	prev := maxScanEntries
+	maxScanEntries = 2
+	t.Cleanup(func() { maxScanEntries = prev })
+
+	log := newObservationLog()
+	for _, rel := range []string{"a.crt", "b.crt", "c.crt", "d.crt", "e.crt"} {
+		log.note(rel, pairFingerprint([]byte(rel), []byte("key")), nil)
+	}
+
+	if got := len(log.seen); got > maxObservedPairs() {
+		t.Errorf("observationLog holds %d signatures after churn across 5 paths, want at most %d",
+			got, maxObservedPairs())
+	}
+	if got := len(log.whole); got > maxObservedPairs() {
+		t.Errorf("observationLog holds %d wholeness entries after churn across 5 paths, want at most %d:"+
+			" an eviction must not leave the two halves out of step", got, maxObservedPairs())
+	}
+	// The path recorded last is the one an operator is most likely to ask about next, and
+	// re-noting a remembered path must never evict anything.
+	if !log.completedPair("e.crt") {
+		t.Errorf("observationLog forgot the most recently recorded pair; eviction must make room, not drop the new entry")
+	}
+}
+
+// TestStoreReconcile_rechecks_each_candidate_immediately_before_its_own_deletion is
+// h-f7's regression: the absence observation that authorizes deleting a bundle has to be
+// adjacent to that deletion.
+//
+// A batch confirmation pass — re-check every candidate, THEN unlink every survivor —
+// makes each candidate's authorizing observation older by however long the rest of the
+// batch takes to check, and a producer that restores a certificate inside that stretch
+// loses its live bundle anyway. The sequence must stay one shared wait followed by, per
+// candidate, `input re-check -> output lstat -> unlink`.
+//
+// The log ORDER is what pins it, because each half is already named at the default
+// level: the audit line for a deletion and the keep line for a cancelled one. Under the
+// batch shape every keep precedes every removal; interleaved, `early.pfx` is gone before
+// `later.pfx` is ever looked at. Serial: it swaps waitBeforeReap and slog.Default.
+func TestStoreReconcile_rechecks_each_candidate_immediately_before_its_own_deletion(t *testing.T) {
+	out := t.TempDir()
+	// Walk order is lexical, so early.pfx is the candidate processed first.
+	for _, name := range []string{"early.pfx", "later.pfx"} {
+		if err := os.WriteFile(filepath.Join(out, name), []byte("pfx"), 0o600); err != nil {
+			t.Fatalf("setup: WriteFile(%s): %v", name, err)
+		}
+	}
+	outRoot, err := os.OpenRoot(out)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	t.Cleanup(func() { _ = outRoot.Close() })
+	in := t.TempDir()
+	s := &store{root: outRoot}
+	stubReapWait(t, func(context.Context) error {
+		return os.WriteFile(filepath.Join(in, "later.crt"), []byte("cert"), 0o600)
+	})
+	logs := captureLogs(t)
+
+	deleted, reconcileErr := newReaper(s, newInputSource(t, in), outputpolicy.LifecycleSync).
+		reconcile(context.Background(), map[string]struct{}{},
+			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+
+	if reconcileErr != nil {
+		t.Fatalf("reconcile(interleaved re-check) = error %v, want nil", reconcileErr)
+	}
+	if deleted != 1 {
+		t.Errorf("reconcile(interleaved re-check) deleted = %d, want 1", deleted)
+	}
+	const (
+		removedMsg = "removed orphaned output whose input is gone"
+		keptMsg    = "keeping an output bundle whose certificate came back during the confirmation delay"
+	)
+	removedAt, keptAt := -1, -1
+	for i, msg := range logs.Messages() {
+		switch msg {
+		case removedMsg:
+			removedAt = i
+		case keptMsg:
+			keptAt = i
+		}
+	}
+	if removedAt < 0 || keptAt < 0 {
+		t.Fatalf("reconcile logged %q, want both the deletion audit line and the cancelled deletion", logs.Messages())
+	}
+	if removedAt > keptAt {
+		t.Errorf("reconcile logged %q: later.pfx was re-checked before early.pfx was unlinked, so the whole batch is authorized by observations taken before any deletion — every candidate must be re-checked immediately before its own unlink",
+			logs.Messages())
+	}
+	if _, statErr := os.Stat(filepath.Join(out, "early.pfx")); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("os.Stat(early.pfx) = %v, want fs.ErrNotExist: its certificate stayed gone", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(out, "later.pfx")); statErr != nil {
+		t.Errorf("the bundle whose certificate came back was deleted: %v", statErr)
 	}
 }

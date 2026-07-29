@@ -216,28 +216,47 @@ var ecPublicKeyOID = asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}
 // { OBJECT IDENTIFIER algorithm, ... }, OCTET STRING privateKey }. It shares
 // maxRSAIntegerBitsFromKeyDER's asn1.RawValue walk, so nothing is decoded beyond the
 // tag-length headers and the OID itself, and anything it cannot read is false.
+//
+// The identifier is decoded through decodeOID, so the package's untrusted-OID bound
+// (maxOIDBytes) applies here too: encoding/asn1 allocates one int per encoded byte
+// when it decodes into an asn1.ObjectIdentifier, so a near-limit PEM devoting its
+// DER to one syntactically valid identifier could otherwise spend tens of megabytes
+// of heap merely to answer "no" — on the scan's only goroutine, for a CERTIFICATE
+// file's companion-block question. An oversized identifier answers false, which is
+// the same safe direction as every other shape this walk cannot read: the block is
+// reported rather than silently treated as the EC key's companion.
 func pkcs8HoldsECKey(der []byte) bool {
+	oid, ok := pkcs8AlgorithmOID(der)
+	if !ok {
+		return false
+	}
+	parsed, err := decodeOID(oid)
+	return err == nil && parsed.Equal(ecPublicKeyOID)
+}
+
+// pkcs8AlgorithmOID returns the retained (undecoded) algorithm OID element of
+// PKCS#8 PrivateKeyInfo DER, and false for anything that is not that shape. It is
+// the one reader of that field: both callers need the identifier's LENGTH before
+// anything decodes it, so the element is handed back as an asn1.RawValue for the
+// same reason profile.go retains every untrusted identifier as one.
+func pkcs8AlgorithmOID(der []byte) (asn1.RawValue, bool) {
 	outer, _, ok := asn1Element(der)
 	if !ok || !isASN1(outer, asn1.TagSequence) {
-		return false
+		return asn1.RawValue{}, false
 	}
 	version, afterVersion, ok := asn1Element(outer.Bytes)
 	if !ok || !isASN1(version, asn1.TagInteger) {
-		return false
+		return asn1.RawValue{}, false
 	}
 	algorithm, _, ok := asn1Element(afterVersion)
 	if !ok || !isASN1(algorithm, asn1.TagSequence) {
-		return false
+		return asn1.RawValue{}, false
 	}
 	oid, _, ok := asn1Element(algorithm.Bytes)
 	if !ok || !isASN1(oid, asn1.TagOID) {
-		return false
+		return asn1.RawValue{}, false
 	}
-	var parsed asn1.ObjectIdentifier
-	if rest, err := asn1.Unmarshal(oid.FullBytes, &parsed); err != nil || len(rest) != 0 {
-		return false
-	}
-	return parsed.Equal(ecPublicKeyOID)
+	return oid, true
 }
 
 // isExpectedKeyFilePassenger reports whether a non-key PEM label in the KEY file is
@@ -665,16 +684,58 @@ func isEncryptedPEMBlock(block *pem.Block) bool {
 // above it is already refused a signature check, so accepting a private key above
 // it could only produce a bundle this app would not reason about.
 func oversizedRSAKeyError(block *pem.Block) error {
-	keyBits, ok := maxRSAIntegerBitsFromKeyDER(block.Bytes, 1)
-	if !ok || keyBits <= maxVerifiableKeyBits {
+	scan := maxRSAIntegerBitsFromKeyDER(block.Bytes, 1)
+	if !scan.measured {
+		return nil
+	}
+	if scan.factors > maxRSAPrimeFactors {
+		return fmt.Errorf("private key in a %q block declares %d RSA prime factors, above the %d-factor ceiling this app reads a private key at (parsing it would run one modular inverse per additional prime against a growing product and stall the scan)",
+			boundLogText(block.Type, maxBlockTypeLogLen), scan.factors, maxRSAPrimeFactors)
+	}
+	if scan.maxBits <= maxVerifiableKeyBits {
 		return nil
 	}
 	return fmt.Errorf("private key in a %q block holds a %d-bit RSA integer (modulus, prime or CRT value), above the %d-bit ceiling this app reads a private key at (parsing it would run RSA precomputation on file-supplied integers and stall the scan)",
-		boundLogText(block.Type, maxBlockTypeLogLen), keyBits, maxVerifiableKeyBits)
+		boundLogText(block.Type, maxBlockTypeLogLen), scan.maxBits, maxVerifiableKeyBits)
 }
 
-// maxRSAIntegerBitsFromKeyDER reports the size of the LARGEST top-level INTEGER in
-// private-key DER — the modulus, a prime, or a CRT value — reading ONLY each
+// maxRSAPrimeFactors caps how many prime factors a private key may declare before
+// the pre-scan refuses it, and it is a SECOND bound with its own reason: the
+// per-integer ceiling above bounds one oversized value, while this bounds MANY
+// small ones. crypto/x509 decodes PKCS#1's optional OtherPrimeInfos into a slice
+// and crypto/rsa's precomputeLegacy then runs one ModInverse per additional prime
+// against a product that grows with each, so cost climbs superlinearly in the
+// element COUNT at a constant few bytes per element. Measured on go1.26.5 with
+// 1024-bit factors: 1,000 entries (12 KB DER) cost 3.0ms and 2.6 MB, 5,000 (61 KB)
+// cost 52ms and 70 MB, 10,000 (127 KB) cost 160ms and 292 MB — all far inside the
+// reader's 10 MB cap, on the scan's only goroutine, with no cancellation path.
+//
+// 64 is far above any real key: multi-prime RSA is rare and practical keys use
+// three or four factors, so this refuses an amplification shape rather than a
+// configuration.
+const maxRSAPrimeFactors = 64
+
+// rsaKeyPreScan is what the DER-only pre-scan learned about a private-key block.
+// It is a typed result rather than a bare size because the two refusals it feeds
+// are distinct — one integer too wide, or too many prime factors — and an
+// unmeasurable block must be told apart from a measured one either way.
+type rsaKeyPreScan struct {
+	// maxBits is the bit length of the largest RSA integer the structure holds —
+	// the modulus, a prime, a CRT value, or any integer inside OtherPrimeInfos.
+	maxBits int
+	// factors is how many prime factors the structure declares: two, plus one per
+	// OtherPrimeInfos entry. Meaningless unless measured.
+	factors int
+	// measured reports that the block was read as an RSA private key whose
+	// integers could be sized. False is the FAIL-OPEN answer (a non-RSA key, a
+	// malformed block, a zero or negative modulus) and means the pre-scan decides
+	// nothing: the block goes to the existing parsers with their existing errors.
+	measured bool
+}
+
+// maxRSAIntegerBitsFromKeyDER reports the size of the LARGEST INTEGER in private-key
+// DER — the modulus, a prime, a CRT value, or any integer inside OtherPrimeInfos —
+// together with how many prime factors the key declares, reading ONLY each
 // INTEGER's own length: it walks tag-length headers with encoding/asn1's RawValue
 // (which slices the content rather than decoding it) and never converts a
 // file-supplied integer to a big.Int, so it costs sub-microseconds on a 32 KB block
@@ -687,82 +748,153 @@ func oversizedRSAKeyError(block *pem.Block) error {
 // values after it), and a PKCS#8 PrivateKeyInfo, whose privateKey OCTET STRING
 // (after the version INTEGER and the AlgorithmIdentifier SEQUENCE) wraps that same
 // PKCS#1 structure — hence depth, which admits exactly one level of unwrapping and
-// stops a crafted file from nesting containers indefinitely. Nested OtherPrimeInfos
-// primes are intentionally NOT walked; the PKCS#1 arm below states why.
+// stops a crafted file from nesting containers indefinitely.
 //
-// It FAILS OPEN by design: false for anything it cannot measure, which covers a
-// non-RSA key (a SEC1 EC key's second element is an OCTET STRING, a PKCS#8 EC or
-// Ed25519 key's inner OCTET STRING is not a PKCS#1 SEQUENCE, and none of them is
-// expensive to parse), a truncated or malformed block, and a zero or negative
+// It FAILS OPEN by design: an unmeasured result for anything it cannot size, which
+// covers a non-RSA key (a SEC1 EC key's second element is an OCTET STRING, a PKCS#8
+// EC or Ed25519 key's inner OCTET STRING is not a PKCS#1 SEQUENCE, and none of them
+// is expensive to parse), a truncated or malformed block, and a zero or negative
 // modulus. The guard's job is to refuse OVERSIZED keys, not to become a second
 // parser: everything else is left to the existing parsers and their existing
 // errors.
-func maxRSAIntegerBitsFromKeyDER(der []byte, depth int) (int, bool) {
+func maxRSAIntegerBitsFromKeyDER(der []byte, depth int) rsaKeyPreScan {
 	outer, _, ok := asn1Element(der)
 	if !ok || !isASN1(outer, asn1.TagSequence) {
-		return 0, false
+		return rsaKeyPreScan{}
 	}
 	version, afterVersion, ok := asn1Element(outer.Bytes)
 	if !ok || !isASN1(version, asn1.TagInteger) {
-		return 0, false
+		return rsaKeyPreScan{}
 	}
 	second, afterSecond, ok := asn1Element(afterVersion)
 	if !ok {
-		return 0, false
+		return rsaKeyPreScan{}
 	}
 	switch {
 	case isASN1(second, asn1.TagInteger):
-		// PKCS#1 RSAPrivateKey: the modulus follows the version, and the primes
-		// and CRT values follow the modulus. crypto/rsa builds a bigmod modulus
-		// from p and q (Validate -> precompute) before it can reject an
-		// inconsistent key, so the LARGEST integer in the structure decides the
-		// cost, not the modulus. Measuring only the modulus let a 710 KB block
-		// with a 20-bit modulus and 2-Mbit "primes" spend 59.8s inside
-		// x509.ParsePKCS1PrivateKey. OtherPrimeInfos primes are deliberately not
-		// walked, but NOT because they are cheap to reject: crypto/rsa accepts a
-		// multi-prime key and precomputeLegacy runs ModInverse per additional prime.
-		// They are excluded because that cost is LINEAR in the block's size, not
-		// superlinear like precompute on an oversized p and q: measured on go1.26.5,
-		// a 2048-bit modulus beside one 4-Mbit additional prime (525 KB DER) parses in
-		// 21ms, so the reader's 10 MB cap bounds this near 400ms -- the same order as
-		// the 369ms oversizedRSAKeyError's own doc already accepts. Re-measure before
-		// trusting this exclusion if crypto/rsa's multi-prime path changes.
+		// PKCS#1 RSAPrivateKey: the modulus follows the version, and the primes,
+		// CRT values and the optional OtherPrimeInfos collection follow the
+		// modulus. crypto/rsa builds a bigmod modulus from p and q (Validate ->
+		// precompute) before it can reject an inconsistent key, so the LARGEST
+		// integer in the structure decides the cost, not the modulus. Measuring
+		// only the modulus let a 710 KB block with a 20-bit modulus and 2-Mbit
+		// "primes" spend 59.8s inside x509.ParsePKCS1PrivateKey.
 		return maxRSAIntegerBits(second, afterSecond)
-	case isASN1(second, asn1.TagSequence) && depth > 0:
-		// PKCS#8 PrivateKeyInfo: the AlgorithmIdentifier follows the version, and
-		// the privateKey OCTET STRING after it holds the PKCS#1 key.
-		inner, _, ok := asn1Element(afterSecond)
-		if !ok || !isASN1(inner, asn1.TagOctetString) {
-			return 0, false
-		}
-		return maxRSAIntegerBitsFromKeyDER(inner.Bytes, depth-1)
+	case isASN1(second, asn1.TagSequence):
+		return maxRSAIntegerBitsFromPKCS8(afterSecond, depth)
 	}
-	return 0, false
+	return rsaKeyPreScan{}
 }
 
-// maxRSAIntegerBits reports the bit length of the LARGEST integer in a PKCS#1
-// RSAPrivateKey, given its modulus element and the DER of the elements after
-// it. The modulus decides measurability (it fails open exactly as before when
-// the modulus is absent, zero or negative); each later INTEGER only raises the
-// answer, so a shape this walk cannot read can never LOWER the ceiling check.
-func maxRSAIntegerBits(modulus asn1.RawValue, rest []byte) (int, bool) {
+// maxRSAIntegerBitsFromPKCS8 measures the PKCS#1 key inside a PKCS#8
+// PrivateKeyInfo, given the DER after its AlgorithmIdentifier: the privateKey
+// OCTET STRING that follows holds the PKCS#1 structure.
+//
+// depth is the unwrap allowance, and it is a security rule rather than a style
+// one: an exhausted allowance fails open here exactly as it did inline, so a
+// crafted file cannot nest containers indefinitely and make the walk recurse. It
+// fails open on anything else it cannot read, for the reason
+// maxRSAIntegerBitsFromKeyDER documents.
+func maxRSAIntegerBitsFromPKCS8(afterAlgorithm []byte, depth int) rsaKeyPreScan {
+	if depth <= 0 {
+		return rsaKeyPreScan{}
+	}
+	inner, _, ok := asn1Element(afterAlgorithm)
+	if !ok || !isASN1(inner, asn1.TagOctetString) {
+		return rsaKeyPreScan{}
+	}
+	return maxRSAIntegerBitsFromKeyDER(inner.Bytes, depth-1)
+}
+
+// maxRSAIntegerBits reports the largest integer in a PKCS#1 RSAPrivateKey and how
+// many prime factors it declares, given its modulus element and the DER of the
+// elements after it. The modulus decides measurability (it fails open exactly as
+// before when the modulus is absent, zero or negative); each later INTEGER only
+// raises the size, so a shape this walk cannot read can never LOWER the ceiling
+// check.
+//
+// The trailing SEQUENCE, when present, is PKCS#1's optional OtherPrimeInfos: its
+// integers count towards the size and its element count towards the factor total,
+// because that collection is the amplification shape maxRSAPrimeFactors bounds.
+func maxRSAIntegerBits(modulus asn1.RawValue, rest []byte) rsaKeyPreScan {
 	maxBits, ok := derIntegerBits(modulus.Bytes)
 	if !ok {
-		return 0, false
+		return rsaKeyPreScan{}
 	}
+	scan := rsaKeyPreScan{maxBits: maxBits, factors: 2, measured: true}
 	for len(rest) > 0 {
 		elem, remaining, elemOK := asn1Element(rest)
 		if !elemOK {
 			break
 		}
-		if isASN1(elem, asn1.TagInteger) {
-			if elemBits, bitsOK := derIntegerBits(elem.Bytes); bitsOK && elemBits > maxBits {
-				maxBits = elemBits
-			}
-		}
+		scan.fold(elem)
 		rest = remaining
 	}
-	return maxBits, true
+	return scan
+}
+
+// fold folds one post-modulus PKCS#1 element into the scan: an INTEGER can only
+// raise the measured size, and the OtherPrimeInfos SEQUENCE contributes both its
+// integers' sizes and its element count. Any other element is not part of the
+// structure's cost and is skipped.
+func (s *rsaKeyPreScan) fold(elem asn1.RawValue) {
+	switch {
+	case isASN1(elem, asn1.TagInteger):
+		if elemBits, ok := derIntegerBits(elem.Bytes); ok && elemBits > s.maxBits {
+			s.maxBits = elemBits
+		}
+	case isASN1(elem, asn1.TagSequence):
+		additional, additionalBits := rsaOtherPrimeInfos(elem.Bytes)
+		s.factors += additional
+		if additionalBits > s.maxBits {
+			s.maxBits = additionalBits
+		}
+	}
+}
+
+// rsaOtherPrimeInfos walks PKCS#1's OtherPrimeInfos (a SEQUENCE OF
+// OtherPrimeInfo, each SEQUENCE { INTEGER prime, INTEGER exponent, INTEGER
+// coefficient }), reporting how many additional primes it declares and the widest
+// integer inside it. Nothing is decoded here either: each element is measured
+// from its own tag-length header.
+//
+// It counts an entry it cannot fully read, and stops at the first element that is
+// not an OtherPrimeInfo, which is the FAIL-CLOSED direction on purpose — the count
+// feeds a refusal, so undercounting a malformed collection is the only mistake
+// with a cost. Undercounting cannot happen from a short read: the walk stops, and
+// the caller refuses on what it already counted.
+func rsaOtherPrimeInfos(body []byte) (additional, maxBits int) {
+	for len(body) > 0 {
+		info, remaining, ok := asn1Element(body)
+		if !ok || !isASN1(info, asn1.TagSequence) {
+			break
+		}
+		additional++
+		if infoBits := otherPrimeInfoBits(info); infoBits > maxBits {
+			maxBits = infoBits
+		}
+		body = remaining
+	}
+	return additional, maxBits
+}
+
+// otherPrimeInfoBits reports the widest of one OtherPrimeInfo's three INTEGERs
+// (prime, exponent, coefficient), and zero for a shape it cannot read — which only
+// ever LOWERS the measured size, never the factor count the refusal turns on.
+func otherPrimeInfoBits(info asn1.RawValue) int {
+	var maxBits int
+	fields := info.Bytes
+	for range 3 {
+		field, afterField, ok := asn1Element(fields)
+		if !ok || !isASN1(field, asn1.TagInteger) {
+			break
+		}
+		if fieldBits, bitsOK := derIntegerBits(field.Bytes); bitsOK && fieldBits > maxBits {
+			maxBits = fieldBits
+		}
+		fields = afterField
+	}
+	return maxBits
 }
 
 // asn1Element reads one tag-length-value header off b, returning the element and
@@ -815,7 +947,7 @@ func derIntegerBits(content []byte) (int, bool) {
 // The return type is crypto.Signer: every accepted type implements it, so the
 // caller never has to consider a key whose public half cannot be read.
 func parsePrivateKeyBlock(block *pem.Block) (crypto.Signer, error) {
-	if err := oversizedRSAKeyError(block); err != nil {
+	if err := prohibitiveKeyError(block); err != nil {
 		return nil, err
 	}
 
@@ -854,6 +986,42 @@ func parsePrivateKeyBlock(block *pem.Block) (crypto.Signer, error) {
 	}
 	return nil, fmt.Errorf("failed to parse private key from a %q block (tried PKCS8, PKCS1, SEC1): %w",
 		boundLogText(block.Type, maxBlockTypeLogLen), boundedTextError{parseErr})
+}
+
+// prohibitiveKeyError is every refusal a private-key block earns from its DER
+// alone, before any parser sees it: an RSA integer or prime count whose
+// precomputation would stall the scan, and an algorithm identifier whose decode
+// would allocate megabytes to reject a key. They share a home because they share a
+// reason — each cost is paid INSIDE crypto/x509, where nothing can interrupt it —
+// and because the order they are asked in is not a decision a caller should have to
+// make.
+func prohibitiveKeyError(block *pem.Block) error {
+	if err := oversizedRSAKeyError(block); err != nil {
+		return err
+	}
+	return oversizedKeyAlgorithmOIDError(block)
+}
+
+// oversizedKeyAlgorithmOIDError refuses a PKCS#8 private-key block whose algorithm
+// identifier is larger than maxOIDBytes, and reports nil for every block that is
+// not that shape.
+//
+// It is the same allocation bound profile.go's decodeOID applies to bundle bytes,
+// applied here because x509.ParsePKCS8PrivateKey decodes that identifier into an
+// asn1.ObjectIdentifier before it can reject an unsupported key: encoding/asn1
+// allocates one int per encoded byte, roughly eight bytes of heap per input byte, so
+// a file inside the reader's 10 MB cap can spend most of its DER on one
+// syntactically valid identifier and drive tens of megabytes of transient
+// allocation merely to be refused — on the scan's only goroutine, with no
+// cancellation path. The refusal is bounded and names the size, like every other
+// pre-parse guard here; every identifier a real key names is 9 bytes or fewer.
+func oversizedKeyAlgorithmOIDError(block *pem.Block) error {
+	oid, ok := pkcs8AlgorithmOID(block.Bytes)
+	if !ok || len(oid.Bytes) <= maxOIDBytes {
+		return nil
+	}
+	return fmt.Errorf("private key in a %q block names a %d-byte algorithm identifier, above the %d-byte ceiling this app decodes an identifier at (decoding it would allocate one int per encoded byte before the key could be rejected)",
+		boundLogText(block.Type, maxBlockTypeLogLen), len(oid.Bytes), maxOIDBytes)
 }
 
 // PasswordEncodingIssues reports the ways a PFX password cannot survive the

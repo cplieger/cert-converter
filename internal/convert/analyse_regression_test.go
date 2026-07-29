@@ -1023,6 +1023,77 @@ func TestAnalyse_refuses_an_over_ceiling_rsa_issuer(t *testing.T) {
 	}
 }
 
+// TestAnalyse_converts_when_a_proven_parent_outranks_an_over_ceiling_namesake pins
+// the OTHER edge of that refusal: it fires on a guess, not on the mere presence of
+// an unverifiable key.
+//
+// Shape: a leaf, the ordinary CA that really signed it, and a same-subject
+// over-ceiling decoy. The decoy carries the leaf's issuer name, so it is a linked
+// candidate parent — but the real CA's signature over the leaf verifies, so nothing
+// about this chain has to be guessed and the decoy can only be excluded. Refusing
+// here (which keying the refusal on "is anything named as its issuer" did) failed a
+// bundle the app resolves correctly, withholding the health marker over an input
+// whose every emitted hop is proven.
+func TestAnalyse_converts_when_a_proven_parent_outranks_an_over_ceiling_namesake(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	const (
+		contestedCN   = "Resolvable Issuer CA"
+		oversizedBits = convert.MaxVerifiableKeyBits + 1
+	)
+
+	// The CA that really signs the leaf, self-signed so it is a root in its own
+	// right and needs no parent of its own.
+	caKey := testcerts.NewECDSAKey(t)
+	_, caPEM, caCert := testcerts.Mint(t,
+		unverifiableCA(230, contestedCN, notBefore, notBefore.Add(240*time.Hour)),
+		&caKey.PublicKey, nil, caKey)
+
+	// The same-subject over-ceiling decoy. Its signature is from a throwaway key
+	// because nothing reads it: the ceiling is decided on the modulus in the
+	// SubjectPublicKeyInfo, and minting a real 16k-bit RSA key costs minutes.
+	throwawayKey := testcerts.NewECDSAKey(t)
+	_, oversizedPEM, oversizedCert := testcerts.Mint(t,
+		unverifiableCA(231, contestedCN, notBefore, notBefore.Add(480*time.Hour)),
+		oversizedRSAPublicKey(oversizedBits), nil, throwawayKey)
+	if k, ok := oversizedCert.PublicKey.(*rsa.PublicKey); !ok || k.N.BitLen() != oversizedBits {
+		t.Fatalf("setup: minted certificate carries a %T, want a %d-bit RSA modulus", oversizedCert.PublicKey, oversizedBits)
+	}
+
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(232),
+		Subject:      pkix.Name{CommonName: "resolvable-issuer-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, caCert, caKey)
+
+	for _, order := range []struct {
+		name  string
+		certs [][]byte
+	}{
+		{"oversized first", [][]byte{leafPEM, oversizedPEM, caPEM}},
+		{"proven CA first", [][]byte{leafPEM, caPEM, oversizedPEM}},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
+			if err != nil {
+				t.Fatalf("Analyse(leaf + its proven CA + a same-subject %d-bit decoy) = error %v, want the bundle converted: the proven edge leaves nothing to guess",
+					oversizedBits, err)
+			}
+			if serials := strings.Join(chainSerials(got.Chain()), ","); serials != "230" {
+				t.Fatalf("chain serials = %s, want 230: the CA whose signature verifies is the only emitted hop", serials)
+			}
+			for _, c := range got.Chain() {
+				if c.SerialNumber.Cmp(big.NewInt(231)) == 0 {
+					t.Errorf("chain holds the over-ceiling decoy (serial 231), want it excluded: no signature can be checked against it")
+				}
+			}
+		})
+	}
+}
+
 // TestAnalyse_converts_beside_an_over_ceiling_certificate_that_issues_nothing keeps
 // the refusal narrow, the way the self-signed carve-out keeps the additive fallback
 // narrow. A certificate this bundle names as nobody's issuer is never a parent in a
@@ -1448,105 +1519,57 @@ func utf8SubjectView(c *x509.Certificate, cn string) *x509.Certificate {
 	return &view
 }
 
-// TestAnalyse_keeps_the_upper_chain_when_a_middle_issuer_cannot_be_established
-// pins what a permitted name-encoding difference in the MIDDLE of a bundle costs
-// now: nothing.
-//
-// Shape: leaf -> lower CA -> upper CA -> root, where the lower CA's issuer name is a
-// permitted but byte-distinct encoding of the upper CA's subject and no
-// key-identifier edge exists. Two earlier defects lived here. The first EXCLUDED the
-// upper CA and the root as unrelated, because a `len(chain) == 0` gate never fired
-// for a path that had found one hop — the silent chain shrink, one link up. The
-// second kept them, but only through the additive fallback: the edge was not in the
-// graph, so the certificates arrived as an input-ordered tail with
-// ObsChainUnverified beside them, even though the upper CA's signature over the
-// lower one verifies and the app was able to prove exactly that when it picked the
-// identity.
-//
-// Both are gone because semantic name equality is now a candidate-edge signal in the
-// one evidence graph, so this bundle's every hop is PROVEN: the emitted order is
-// ancestry order because the path walk produced it, and a bundle whose chain is
-// provable says nothing at all. What still uses the fallback is a bundle where no
-// signature can be checked (TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established
-// pins that half).
-func TestAnalyse_keeps_the_upper_chain_when_a_middle_issuer_cannot_be_established(t *testing.T) {
+// TestAnalyse_reports_an_unproven_edge_linked_only_by_key_identifier pins the
+// key-identifier arm of the unproven-edge diagnostic. The emitted chain here is
+// linked to its issuer by AKI/SKI alone -- the names differ -- so a regression that
+// collapsed the two arms would tell the operator the issuer name matches when it
+// does not, pointing them at a field they can check and find wrong. Every other
+// unproven-edge test covers the name-linked arm, so that collapse passes the suite.
+func TestAnalyse_reports_an_unproven_edge_linked_only_by_key_identifier(t *testing.T) {
 	t.Parallel()
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	keyID := []byte{0x01, 0x23, 0x45, 0x67}
 
-	rootKey := testcerts.NewECDSAKey(t)
-	_, rootPEM, rootCert := testcerts.Mint(t, &x509.Certificate{
-		SerialNumber:          big.NewInt(500),
-		Subject:               pkix.Name{CommonName: "Encoding Root CA"},
-		NotBefore:             notBefore,
-		NotAfter:              notBefore.Add(96 * time.Hour),
-		IsCA:                  true,
-		BasicConstraintsValid: true,
-		KeyUsage:              x509.KeyUsageCertSign,
-	}, &rootKey.PublicKey, nil, rootKey)
+	absentKey := testcerts.NewECDSAKey(t)
+	absentTemplate := unverifiableCA(870, "Absent AKI Signer", notBefore, notBefore.Add(48*time.Hour))
+	absentTemplate.SubjectKeyId = keyID
+	_, _, absentCert := testcerts.Mint(t, absentTemplate, &absentKey.PublicKey, nil, absentKey)
 
-	upperKey := testcerts.NewECDSAKey(t)
-	_, upperPEM, upperCert := testcerts.Mint(t, &x509.Certificate{
-		SerialNumber:          big.NewInt(501),
-		Subject:               pkix.Name{CommonName: "Encoding Upper CA"},
-		NotBefore:             notBefore,
-		NotAfter:              notBefore.Add(72 * time.Hour),
-		IsCA:                  true,
-		BasicConstraintsValid: true,
-		KeyUsage:              x509.KeyUsageCertSign,
-	}, &upperKey.PublicKey, rootCert, rootKey)
-
-	// Signed by the upper CA, but naming it through the other permitted encoding.
-	lowerKey := testcerts.NewECDSAKey(t)
-	_, lowerPEM, lowerCert := testcerts.Mint(t, &x509.Certificate{
-		SerialNumber:          big.NewInt(502),
-		Subject:               pkix.Name{CommonName: "Encoding Lower CA"},
-		NotBefore:             notBefore,
-		NotAfter:              notBefore.Add(48 * time.Hour),
-		IsCA:                  true,
-		BasicConstraintsValid: true,
-		KeyUsage:              x509.KeyUsageCertSign,
-	}, &lowerKey.PublicKey, utf8SubjectView(upperCert, "Encoding Upper CA"), upperKey)
-
-	if bytes.Equal(lowerCert.RawIssuer, upperCert.RawSubject) {
-		t.Fatal("setup: the lower CA's issuer name matches the upper CA's subject byte for byte, so this bundle does not reproduce the encoding difference")
-	}
-	if len(lowerCert.AuthorityKeyId) > 0 {
-		t.Fatal("setup: the lower CA carries an authority key identifier, so the key-identifier edge signal would find the upper CA anyway")
-	}
+	decoyKey := testcerts.NewECDSAKey(t)
+	decoyTemplate := unverifiableCA(871, "Different Subject CA", notBefore, notBefore.Add(48*time.Hour))
+	decoyTemplate.SubjectKeyId = keyID
+	_, decoyPEM, decoyCert := testcerts.Mint(t, decoyTemplate, &decoyKey.PublicKey, nil, decoyKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
-		SerialNumber: big.NewInt(503),
-		Subject:      pkix.Name{CommonName: "middle-gap-leaf.example.com"},
-		NotBefore:    notBefore,
-		NotAfter:     notBefore.Add(24 * time.Hour),
-	}, &leafKey.PublicKey, lowerCert, lowerKey)
+	leafTemplate := unverifiableCA(872, "aki-only-leaf.example.com", notBefore, notBefore.Add(24*time.Hour))
+	leafTemplate.IsCA = false
+	leafTemplate.BasicConstraintsValid = false
+	leafTemplate.KeyUsage = 0
+	_, leafPEM, leafCert := testcerts.Mint(t, leafTemplate, &leafKey.PublicKey, absentCert, absentKey)
 
-	got, err := convert.Analyse(concatPEM(leafPEM, lowerPEM, upperPEM, rootPEM), testcerts.KeyPEM(t, leafKey))
+	if bytes.Equal(leafCert.RawIssuer, decoyCert.RawSubject) {
+		t.Fatal("setup: issuer and subject names match, so the key-identifier-only branch is not reached")
+	}
+	if !bytes.Equal(leafCert.AuthorityKeyId, decoyCert.SubjectKeyId) {
+		t.Fatal("setup: authority and subject key identifiers differ, so no candidate edge exists")
+	}
+
+	got, err := convert.Analyse(concatPEM(leafPEM, decoyPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
-		t.Fatalf("Analyse(chain with an unestablishable middle edge) = error %v, want nil", err)
+		t.Fatalf("Analyse = error %v, want nil", err)
 	}
-	if len(got.Chain()) != 3 {
-		t.Fatalf("chain = %v, want all 3 CA certificates kept: an unprovable middle edge must not truncate the chain",
-			chainSerials(got.Chain()))
+	if serials := strings.Join(chainSerials(got.Chain()), ","); serials != "871" {
+		t.Fatalf("chain serials = %s, want 871: the AKI/SKI-linked decoy is the emitted unproven edge", serials)
 	}
-	// The emitted ORDER is the PKCS#12 contract: go-pkcs12's decoder reads the bag
-	// SEQUENCE positionally, so nearest-parent-first is what a consumer needs. It is
-	// now produced by the path walk rather than by an input-ordered fallback tail, so
-	// a bundle listing its CAs in any order emits them in ancestry order.
-	if serials := strings.Join(chainSerials(got.Chain()), ","); serials != "502,501,500" {
-		t.Errorf("chain serials = %s, want 502,501,500 (nearest parent first, by ancestry)", serials)
+	detail, ok := observationDetail(got.Observations(), convert.ObsChainEdgeUnprovenIssuer)
+	if !ok {
+		t.Fatalf("observations = %v, want %q", got.Observations(), convert.ObsChainEdgeUnprovenIssuer)
 	}
-	if len(got.Extra()) != 0 {
-		t.Errorf("Extra holds %d certificate(s), want 0: neither the upper CA nor the root was shown to be off the chain",
-			len(got.Extra()))
+	if !strings.Contains(detail, "carries the subject key identifier named as the authority key identifier of") {
+		t.Errorf("observation detail = %q, want the AKI/SKI evidence named", detail)
 	}
-	// Every hop is proven, so nothing here is unestablished and nothing is excluded:
-	// the contradictory pair of signals this bundle used to emit — an issuer named as
-	// verified for role selection, and "no issuer could be established" for the chain
-	// — cannot occur once one graph answers both questions.
-	if len(got.Observations()) != 0 {
-		t.Errorf("observations = %v, want none: every edge in this bundle is proven by signature", got.Observations())
+	if strings.Contains(detail, "matches the issuer name of") {
+		t.Errorf("observation detail = %q, want no issuer-name claim for an edge whose names differ", detail)
 	}
 }
 
@@ -2155,7 +2178,6 @@ func TestAnalyse_reports_an_unproven_emitted_chain_edge(t *testing.T) {
 	}
 }
 
-
 // TestAnalyse_treats_a_reencoded_self_issued_certificate_as_its_own_root pins the
 // positive direction of the decoded self-issuance rule (checkSelfSigned): a
 // certificate whose own subject and issuer differ only in a permitted
@@ -2197,6 +2219,110 @@ func TestAnalyse_treats_a_reencoded_self_issued_certificate_as_its_own_root(t *t
 	}
 	if hasObservation(got.Observations(), convert.ObsChainUnverified) {
 		t.Errorf("observations = %v, want no %q: the identity is proven self-signed, so the additive fallback must not fire",
+			got.Observations(), convert.ObsChainUnverified)
+	}
+}
+
+// TestAnalyse_reports_an_unfinished_chain_with_nothing_left_over pins the fact
+// ObsChainUnverified was gated on: a CA-signed leaf ALONE has an unfinished chain
+// and no leftover certificate to append, so the fallback's diagnostic branch was
+// skipped and the app's only input-diagnostic channel said nothing about the
+// missing issuer. Conversion still succeeds with an empty chain - a PFX holding
+// just the identity is a legitimate output - but it must not be silent.
+func TestAnalyse_reports_an_unfinished_chain_with_nothing_left_over(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	caKey := testcerts.NewECDSAKey(t)
+	_, _, caCert := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(870),
+		Subject:               pkix.Name{CommonName: "Absent Issuing CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(72 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &caKey.PublicKey, nil, caKey)
+
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(871),
+		Subject:      pkix.Name{CommonName: "lonely-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, caCert, caKey)
+
+	got, err := convert.Analyse(leafPEM, testcerts.KeyPEM(t, leafKey))
+	if err != nil {
+		t.Fatalf("Analyse(a CA-signed leaf alone) = error %v, want nil", err)
+	}
+	if len(got.Chain()) != 0 {
+		t.Errorf("chain = %v, want empty: the issuer is not in the bundle", chainSerials(got.Chain()))
+	}
+	if len(got.Extra()) != 0 {
+		t.Errorf("Extra = %v, want empty: there is nothing besides the identity", chainSerials(got.Extra()))
+	}
+	if !hasObservation(got.Observations(), convert.ObsChainUnverified) {
+		t.Errorf("observations = %v, want %q: the leaf is not self-signed and its issuer could not be established",
+			got.Observations(), convert.ObsChainUnverified)
+	}
+	if hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
+		t.Errorf("observations = %v, want no %q: no certificate was held back",
+			got.Observations(), convert.ObsExtraCertsExcluded)
+	}
+}
+
+// TestAnalyse_reports_an_unfinished_chain_when_only_the_root_is_absent is the same
+// gap one link further up: the leaf-to-intermediate hop is PROVEN, so the path walk
+// consumes every parsed certificate and leaves nothing over, and the terminus is
+// still not self-signed. The intermediate must stay in the chain and the missing
+// root must be named.
+func TestAnalyse_reports_an_unfinished_chain_when_only_the_root_is_absent(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	rootKey := testcerts.NewECDSAKey(t)
+	_, _, rootCert := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(872),
+		Subject:               pkix.Name{CommonName: "Absent Root CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(96 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &rootKey.PublicKey, nil, rootKey)
+
+	interKey := testcerts.NewECDSAKey(t)
+	_, interPEM, interCert := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(873),
+		Subject:               pkix.Name{CommonName: "Present Intermediate CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(72 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &interKey.PublicKey, rootCert, rootKey)
+
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(874),
+		Subject:      pkix.Name{CommonName: "rootless-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, interCert, interKey)
+
+	got, err := convert.Analyse(concatPEM(leafPEM, interPEM), testcerts.KeyPEM(t, leafKey))
+	if err != nil {
+		t.Fatalf("Analyse(a proven leaf/intermediate pair without its root) = error %v, want nil", err)
+	}
+	if len(got.Chain()) != 1 || got.Chain()[0].SerialNumber.Cmp(big.NewInt(873)) != 0 {
+		t.Fatalf("chain = %v, want the intermediate alone", chainSerials(got.Chain()))
+	}
+	if len(got.Extra()) != 0 {
+		t.Errorf("Extra = %v, want empty: every parsed certificate is on the path", chainSerials(got.Extra()))
+	}
+	if !hasObservation(got.Observations(), convert.ObsChainUnverified) {
+		t.Errorf("observations = %v, want %q: the intermediate's own issuer is absent",
 			got.Observations(), convert.ObsChainUnverified)
 	}
 }

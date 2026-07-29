@@ -1,6 +1,7 @@
 package process
 
 import (
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -441,39 +442,46 @@ func TestStoreIsCurrent_reports_a_bundle_that_vanishes_mid_inspection(t *testing
 }
 
 // TestStoreIsCurrent_reports_a_lax_output_directory pins the /output DIRECTORY
-// permission report, the precondition every other output touch is confined against.
+// permission verdict, the precondition every other output touch is confined against —
+// and the SPLIT in that verdict, which is the whole point of the check.
 //
 // The app creates the directory at pfxDirMode once, through
 // atomicfile.WithMkdirMode, and MkdirAll is a no-op on a directory that already
 // exists — so a directory an operator (or the README's own `mkdir -p`, which yields
 // 0755 under the default umask and 0775 under a umask of 0002) left group- or
 // world-accessible is corrected and named nowhere else, while this app polices the
-// private-key bundle's own mode to 0600 on every scan. A group-writable /output is
-// what makes the symlink swap the confined root exists to survive reachable at all.
+// private-key bundle's own mode to 0600 on every scan.
 //
-// Asserted on the three properties the report has to hold: it fires for a mode
-// carrying a bit pfxDirMode does not, it stays silent on a mode at or stricter than
-// policy (a deliberately tighter 0700 must not be nagged about), and it is emitted
-// ONCE per directory per scan — isCurrent runs for every .crt, so a flat /output
-// holding twenty bundles must not produce twenty identical records on every tick.
-// It is report-only by design: tightening a directory the operator may have widened
-// deliberately is their call, so the mode on disk must be left exactly as found.
+// The split, by consequence: a group- or world-WRITE bit grants unlink and rename
+// authority over a published owner-only bundle, so it is REPAIRED with a confined
+// chmod (0770 -> 0750, 0775 -> 0755, 0777 -> 0755) and, when the repair cannot be
+// made, refuses the write outright. Every other extra bit exposes names and traversal
+// only (0755), so it stays report-only: tightening a directory the operator may have
+// widened deliberately is their call, and the mode on disk must be left exactly as
+// found. A mode at or stricter than policy (a deliberately tighter 0700) is neither
+// touched nor nagged about, and every record is emitted ONCE per directory per scan —
+// isCurrent runs for every .crt, so a flat /output holding twenty bundles must not
+// produce twenty identical records on every tick.
 // Runs serially: it swaps slog.Default().
 func TestStoreIsCurrent_reports_a_lax_output_directory(t *testing.T) {
 	// Spelled out rather than imported from the production const: an operator's log
 	// query keys on these words, so a silent rewording must fail here.
 	const wantMsg = "the /output directory holding a pfx is more permissive than policy"
+	const tightenedMsg = "tightened a group- or world-writable /output directory"
 
 	for _, tc := range []struct {
-		name     string
-		mode     os.FileMode
-		wantWarn bool
+		name          string
+		mode          os.FileMode
+		wantMode      os.FileMode
+		wantWarn      bool
+		wantTightened bool
 	}{
-		{"the policy mode is not reported", pfxDirMode, false},
-		{"an owner-only directory is not reported", 0o700, false},
-		{"a group-writable directory is reported", 0o770, true},
-		{"a world-traversable directory is reported", 0o755, true},
-		{"a world-writable directory is reported", 0o777, true},
+		{name: "the policy mode is not reported", mode: pfxDirMode, wantMode: pfxDirMode},
+		{name: "an owner-only directory is not reported", mode: 0o700, wantMode: 0o700},
+		{name: "a world-traversable directory is reported and left alone", mode: 0o755, wantMode: 0o755, wantWarn: true},
+		{name: "a group-writable directory is tightened", mode: 0o770, wantMode: 0o750, wantTightened: true},
+		{name: "a group-writable world-traversable directory is tightened", mode: 0o775, wantMode: 0o755, wantTightened: true},
+		{name: "a world-writable directory is tightened", mode: 0o777, wantMode: 0o755, wantTightened: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -485,7 +493,7 @@ func TestStoreIsCurrent_reports_a_lax_output_directory(t *testing.T) {
 			s := newOutputStore(t, dir)
 			logs := captureLogs(t)
 
-			// No bundle is planted: the report is asked before the bundle's own lstat, so
+			// No bundle is planted: the check is asked before the bundle's own lstat, so
 			// the absent-bundle arm must carry it too — a lax directory is lax whether or
 			// not a prior bundle sits in it. want is never dereferenced on that arm.
 			current, _, err := s.isCurrent(t.Context(), "out.pfx", nil, convert.EncNameModern2023, "pw")
@@ -501,12 +509,21 @@ func TestStoreIsCurrent_reports_a_lax_output_directory(t *testing.T) {
 				t.Errorf("isCurrent(directory mode %o) logged %q at WARN %d times, want %d: %q",
 					tc.mode, wantMsg, got, want, logs.Messages())
 			}
+			wantTightenRecords := 0
+			if tc.wantTightened {
+				wantTightenRecords = 1
+			}
+			if got := logs.CountLevel(slog.LevelInfo, tightenedMsg); got != wantTightenRecords {
+				t.Errorf("isCurrent(directory mode %o) logged %q at INFO %d times, want %d: a repair this app"+
+					" makes to the operator's volume must be named, and only a real repair may be: %q",
+					tc.mode, tightenedMsg, got, wantTightenRecords, logs.Messages())
+			}
 			if fi, statErr := os.Stat(dir); statErr != nil {
 				t.Fatalf("Stat(dir): %v", statErr)
-			} else if got := fi.Mode().Perm(); got != tc.mode {
-				t.Errorf("isCurrent(directory mode %o) changed the directory mode to %o; the report is"+
-					" advisory, and tightening a directory an operator widened on purpose is their call",
-					tc.mode, got)
+			} else if got := fi.Mode().Perm(); got != tc.wantMode {
+				t.Errorf("isCurrent(directory mode %o) left the directory at %o, want %o: the group/other WRITE"+
+					" bits are repaired because they let another UID replace a published bundle, and every"+
+					" other bit is the operator's call", tc.mode, got, tc.wantMode)
 			}
 			if !tc.wantWarn {
 				return
@@ -525,10 +542,74 @@ func TestStoreIsCurrent_reports_a_lax_output_directory(t *testing.T) {
 		})
 	}
 
+	// The two ways the repair does not happen, neither of which this suite can produce
+	// for real: it runs as uid 0, so no chmod is refused, and no mount-forced-mode
+	// filesystem is available. Both must refuse the write rather than warn and continue,
+	// because a bundle published into a directory another UID can rewrite can be
+	// replaced with attacker-chosen key material after this app publishes it.
+	for _, tc := range []struct {
+		name  string
+		chmod func(*os.Root, string, os.FileMode) error
+	}{
+		{
+			name:  "a refused repair refuses the write",
+			chmod: func(*os.Root, string, os.FileMode) error { return fs.ErrPermission },
+		},
+		{
+			// Accepted and stored nowhere: CIFS/vfat with mount-forced modes, some NFS
+			// squash configs. The chmod reports success and the write bit is still there.
+			name:  "a chmod the filesystem does not store refuses the write",
+			chmod: func(*os.Root, string, os.FileMode) error { return nil },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const refusedMsg = "the /output directory holding a pfx is group- or world-writable and could not be tightened; refusing to write there"
+
+			dir := t.TempDir()
+			if err := os.Chmod(dir, 0o775); err != nil {
+				t.Fatalf("setup: Chmod(dir): %v", err)
+			}
+			prev := chmodInRoot
+			chmodInRoot = tc.chmod
+			t.Cleanup(func() { chmodInRoot = prev })
+			s := newOutputStore(t, dir)
+			logs := captureLogs(t)
+
+			current, _, err := s.isCurrent(t.Context(), "out.pfx", nil, convert.EncNameModern2023, "pw")
+			if err == nil {
+				t.Fatalf("isCurrent(unrepairable writable directory) = %v, nil, want an error: no private key may"+
+					" be published into a namespace another UID can rewrite", current)
+			}
+			if got := logs.CountLevel(slog.LevelWarn, refusedMsg); got != 1 {
+				t.Errorf("isCurrent(unrepairable writable directory) logged %q at WARN %d times, want exactly 1: %q",
+					refusedMsg, got, logs.Messages())
+			}
+			if writeErr := s.write(t.Context(), "out.pfx", []byte("pfx")); writeErr == nil {
+				t.Errorf("write(unrepairable writable directory) = nil, want an error")
+			} else if _, statErr := os.Stat(filepath.Join(dir, "out.pfx")); statErr == nil {
+				t.Errorf("write(unrepairable writable directory) published the bundle anyway")
+			}
+			// The same failure must also stop the reap: a candidate under a directory
+			// another process can write can be swapped between the walk and the unlink.
+			if _, safe, listErr := s.listOutputs(t.Context()); listErr != nil {
+				t.Fatalf("listOutputs = error %v, want nil", listErr)
+			} else if safe {
+				t.Errorf("listOutputs reported the walk safe after an unrepairable writable directory, want unsafe")
+			}
+		})
+	}
+
 	t.Run("one record per directory per scan, not one per bundle", func(t *testing.T) {
 		dir := t.TempDir()
 		if err := os.Mkdir(filepath.Join(dir, "nested"), 0o755); err != nil {
 			t.Fatalf("setup: Mkdir: %v", err)
+		}
+		// Both directories are chmod-ed explicitly: what the host creates depends on it
+		// (an inherited ACL widens a fresh directory), and the fixture needs the
+		// report-only class — a bit beyond policy that grants no write authority — not
+		// the repaired one.
+		if err := os.Chmod(filepath.Join(dir, "nested"), 0o755); err != nil {
+			t.Fatalf("setup: Chmod(nested): %v", err)
 		}
 		if err := os.Chmod(dir, 0o755); err != nil {
 			t.Fatalf("setup: Chmod(dir): %v", err)
@@ -555,4 +636,45 @@ func TestStoreIsCurrent_reports_a_lax_output_directory(t *testing.T) {
 				" separately: %q", wantMsg, logs.Messages())
 		}
 	})
+}
+
+// TestStoreRemoveOrphans_reports_vanished_candidate_and_continues pins removeOrphans'
+// dedicated pre-unlink RACE arm: a candidate that no longer exists when the unlink is
+// attempted is a transient producer transaction, not an operator-facing permission
+// problem, so it is DEBUG and must not raise the re-check WARN — and it must not stop
+// the loop. Deleting the errors.Is(statErr, fs.ErrNotExist) arm routes the vanished
+// candidate through the generic WARN, which is what these two log assertions catch;
+// the deletion count alone would still pass. Serial: captureLogs swaps the
+// process-global slog.Default.
+func TestStoreRemoveOrphans_reports_vanished_candidate_and_continues(t *testing.T) {
+	const vanishedMsg = "orphaned output vanished before removal"
+	const recheckWarn = "could not re-check an orphaned output before removing it; leaving it in place"
+
+	dir := t.TempDir()
+	reapable := filepath.Join(dir, "reapable.pfx")
+	if err := os.WriteFile(reapable, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	s := newOutputStore(t, dir)
+	logs := captureLogs(t)
+
+	deleted, err := s.removeOrphans(t.Context(), []string{"vanished.pfx", "reapable.pfx"})
+	if err != nil {
+		t.Fatalf("removeOrphans(missing candidate followed by regular file) = %v, want nil", err)
+	}
+	if deleted != 1 {
+		t.Errorf("removeOrphans(missing candidate followed by regular file) deleted = %d, want 1", deleted)
+	}
+	if _, statErr := os.Stat(reapable); !os.IsNotExist(statErr) {
+		t.Errorf("os.Stat(reapable.pfx) = %v, want a not-exist error: the vanished first candidate must not stop the loop", statErr)
+	}
+	if got := logs.CountLevel(slog.LevelDebug, vanishedMsg); got != 1 {
+		t.Errorf("removeOrphans(missing candidate) logged %q at DEBUG %d times, want exactly 1: %q", vanishedMsg, got, logs.Messages())
+	}
+	if !logs.HasAttr(vanishedMsg, "path", "vanished.pfx") {
+		t.Errorf("removeOrphans(missing candidate) logged %q without path=vanished.pfx: %q", vanishedMsg, logs.Messages())
+	}
+	if got := logs.CountLevel(slog.LevelWarn, recheckWarn); got != 0 {
+		t.Errorf("removeOrphans(missing candidate) logged %q at WARN %d times, want 0: disappearance is a transient race, not an operator permission problem: %q", recheckWarn, got, logs.Messages())
+	}
 }

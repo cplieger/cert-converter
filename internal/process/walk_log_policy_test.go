@@ -101,9 +101,9 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 
 		logs := captureLogs(t)
 		s := &store{root: root}
-		_, safe, err := s.orphans(t.Context(), map[string]struct{}{})
+		_, safe, err := s.listOutputs(t.Context())
 		if err != nil {
-			t.Fatalf("orphans = %v, want nil: one unreadable sub-path must not abort the walk", err)
+			t.Fatalf("listOutputs = %v, want nil: one unreadable sub-path must not abort the walk", err)
 		}
 		if safe {
 			t.Error("safe = true, want false: an incomplete output enumeration must not authorise deletions")
@@ -126,9 +126,9 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 
 		logs := captureLogs(t)
 		s := &store{root: root}
-		_, safe, err := s.orphans(t.Context(), map[string]struct{}{})
+		_, safe, err := s.listOutputs(t.Context())
 		if err != nil {
-			t.Fatalf("orphans = %v, want nil", err)
+			t.Fatalf("listOutputs = %v, want nil", err)
 		}
 		if safe {
 			t.Error("safe = true, want false: writes and this walk resolve a symlink differently")
@@ -262,11 +262,11 @@ func TestWalkLogPolicy_quiet_when_nothing_is_wrong(t *testing.T) {
 
 	logs := captureLogs(t)
 	s := &store{root: root}
-	if _, safe, orphanErr := s.orphans(t.Context(), map[string]struct{}{}); orphanErr != nil || !safe {
-		t.Fatalf("orphans(clean tree) = safe %v, err %v; want true, nil", safe, orphanErr)
+	if _, safe, orphanErr := s.listOutputs(t.Context()); orphanErr != nil || !safe {
+		t.Fatalf("listOutputs(clean tree) = safe %v, err %v; want true, nil", safe, orphanErr)
 	}
 	if logs.Len() != 0 {
-		t.Errorf("orphans(clean tree) logged %q, want no output at all", logs.Messages())
+		t.Errorf("listOutputs(clean tree) logged %q, want no output at all", logs.Messages())
 	}
 }
 

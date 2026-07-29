@@ -114,6 +114,39 @@ func (r *ScanResult) inputFullyEnumerated() bool {
 	return r.durablyEnumerated() && r.Vanished == 0
 }
 
+// maxScanEntries bounds how many /input entries ONE scan will enumerate before it
+// gives up on the tree.
+//
+// The per-file and per-PEM-block caps bound what one certificate costs; nothing
+// bounded how MANY the walk would take on. /input is a mounted tree this app does not
+// own, and every entry the walk accepts costs cumulative memory that outlives the
+// entry: a `seen` key per certificate, a conversionStatus per result, and an
+// observation-log entry per pair. A producer (or anything else with write access to the
+// host side of that mount) that plants a very large inventory therefore drives the
+// daemon into an OOM kill, which stops conversion for every certificate — a denial of
+// the app's only job, from the one boundary it deliberately does not trust.
+//
+// The budget is a constant rather than an operator setting: it is not a tuning knob but
+// an "this is not a certificate directory" tripwire, and it sits orders of magnitude
+// above any real /input (a Caddy certificates tree holds a handful of files per domain)
+// while far below what exhausts a container's memory. It is a var only so the suite can
+// drive the abort with a handful of files instead of two hundred thousand; nothing in
+// production assigns to it.
+//
+// Exceeding it ABORTS the scan rather than processing a prefix of the tree: a partial
+// enumeration must not be mistaken for a complete one, and aborting is what keeps
+// orphan reaping vetoed (the walk did not complete) so no bundle is deleted on the
+// strength of a truncated input listing. The scan error reaches the operator and the
+// health marker, which is the honest signal for a mount that needs looking at.
+var maxScanEntries = 200_000
+
+// errScanBudgetExceeded marks the abort above. It is its own sentinel so a caller (and
+// a test) can tell a refused-because-too-large tree from an unreadable one.
+var errScanBudgetExceeded = errors.New("input tree exceeds the per-scan entry budget")
+
+// scanBudgetMsg is the operator-facing half of that abort.
+const scanBudgetMsg = "the /input tree holds more entries than one scan will enumerate; stopping this scan without converting or removing anything further"
+
 // Options carries the process-lifetime scan configuration the composition root
 // chooses once at startup: the confined input and output roots, the password
 // embedded in generated PFX files, and the PKCS#12 encoder profile. The encoder
@@ -264,6 +297,11 @@ type scanWalk struct {
 	// one may hide certificates, so `seen` is NOT a complete enumeration of the
 	// input tree afterwards. countResults folds it into ScanResult.Unresolved.
 	unresolved int
+	// entries counts every path this walk has been handed, including directories and
+	// entries it could not read. It is the accounting behind maxScanEntries: the cap is
+	// about how much of an untrusted tree one scan takes on, so it counts what the walk
+	// TOUCHED rather than what it converted.
+	entries int
 }
 
 // visit is the WalkDir callback. The context is checked before and after each
@@ -278,6 +316,16 @@ type scanWalk struct {
 func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+	// Counted before anything is read or remembered, so the budget bounds the walk's
+	// own state rather than trailing it. Returning an error aborts fs.WalkDir, which is
+	// what keeps `seen` from being read as a complete enumeration downstream.
+	sw.entries++
+	if sw.entries > maxScanEntries {
+		slog.Warn(scanBudgetMsg,
+			"path", rel, "entries", sw.entries, "limit", maxScanEntries,
+			"remediation", "check that /input is mounted at the certificate directory and holds nothing else")
+		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.entries, rel)
 	}
 	if err != nil {
 		if rel == "." {
@@ -580,8 +628,8 @@ func pairFingerprint(certPEM, keyPEM []byte) [sha256.Size]byte {
 //
 // It carries a SECOND, structural fact that readPair's missing-key classifier
 // depends on, in its own `whole` set: a path is in that set only if this process read
-// that pair WHOLE — cert and sibling key both — because note and record are reached only
-// past readPair's success. That MEMBERSHIP is the one piece of in-process evidence that a
+// that pair WHOLE — cert and sibling key both — because markWhole is called immediately
+// after readPair succeeds. That MEMBERSHIP is the one piece of in-process evidence that a
 // key which is missing now was there before (completedPair). It is a separate field
 // precisely because it is spent on a different schedule than the signature: forgetPair
 // spends the wholeness, never the de-duplication.
@@ -599,6 +647,13 @@ func newObservationLog() *observationLog {
 		seen:  make(map[string][sha256.Size]byte),
 		whole: make(map[string]struct{}),
 	}
+}
+
+// markWhole records the structural fact that this process read both inputs for rel.
+// It is called at the readPair success boundary, independently of analysis, currency,
+// encoding, and output-write outcomes.
+func (o *observationLog) markWhole(rel string) {
+	o.whole[rel] = struct{}{}
 }
 
 // observationSignature identifies both the input bytes and the observations
@@ -628,10 +683,11 @@ func observationSignature(input [sha256.Size]byte, observations []convert.Observ
 // signature reports each one on the scan that introduced it, which is what
 // unconditional logging would turn into noise.
 func (o *observationLog) note(rel string, fp [sha256.Size]byte, obs []convert.Observation) {
+	o.reserve(rel)
 	current := observationSignature(fp, obs)
 	previous, ok := o.seen[rel]
 	o.seen[rel] = current
-	o.whole[rel] = struct{}{}
+	o.markWhole(rel)
 	if !ok || previous != current {
 		logConversionObservations(rel, obs)
 	}
@@ -640,8 +696,43 @@ func (o *observationLog) note(rel string, fp [sha256.Size]byte, obs []convert.Ob
 // record commits the signature without re-emitting: the conversion path has
 // already logged the observations unconditionally.
 func (o *observationLog) record(rel string, fp [sha256.Size]byte, obs []convert.Observation) {
+	o.reserve(rel)
 	o.seen[rel] = observationSignature(fp, obs)
-	o.whole[rel] = struct{}{}
+	o.markWhole(rel)
+}
+
+// maxObservedPairs bounds this log's process-lifetime size.
+//
+// forget only prunes when a walk PROVED the enumeration complete, so a deployment whose
+// scans keep ending incomplete — an unreadable sub-path, an unresolved symlink, a
+// certificate replaced mid-scan — never reclaims the entries of paths that are gone.
+// Under path churn from a tree this app does not own, that grows process-lifetime state
+// with nothing to stop it. The bound IS the scan entry budget: a scan cannot
+// legitimately observe more pairs than it is allowed to enumerate in the first place,
+// and deriving it rather than repeating the number keeps the two from drifting.
+func maxObservedPairs() int { return maxScanEntries }
+
+// reserve makes room for a path this log has not seen before, evicting one remembered
+// pair when it is full.
+//
+// Eviction spends DIAGNOSTIC memory only, which is why it is safe at all: the signature
+// it drops means the evicted pair re-emits its observation WARN once, and the wholeness
+// evidence it drops makes completedPair answer false, its documented safe direction. No
+// currency decision reads this log — store.isCurrent derives currency from the bundle on
+// disk — so an eviction can never delete a bundle or accept a stale one.
+//
+// The victim is arbitrary (map iteration order) rather than least-recently-used: every
+// entry is worth exactly one deduplicated WARN, so ordering machinery would buy nothing
+// at a bound this size.
+func (o *observationLog) reserve(rel string) {
+	if _, known := o.seen[rel]; known || len(o.seen) < maxObservedPairs() {
+		return
+	}
+	for victim := range o.seen {
+		delete(o.seen, victim)
+		delete(o.whole, victim)
+		break
+	}
 }
 
 // completedPair reports whether this process has already read rel's pair whole, which
@@ -678,6 +769,10 @@ func (o *observationLog) forget(seen map[string]struct{}) {
 	for rel := range o.seen {
 		if _, ok := seen[rel]; !ok {
 			delete(o.seen, rel)
+		}
+	}
+	for rel := range o.whole {
+		if _, ok := seen[rel]; !ok {
 			delete(o.whole, rel)
 		}
 	}
@@ -863,6 +958,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		return outcome
 	}
 	certPEM, keyPEM := inputs.certPEM, inputs.keyPEM
+	sw.observations.markWhole(rel)
 	fingerprint := pairFingerprint(certPEM, keyPEM)
 
 	pfxRel := layout.OutputFor(rel)

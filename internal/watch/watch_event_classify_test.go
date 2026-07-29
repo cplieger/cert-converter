@@ -194,6 +194,47 @@ func TestHandleFsEvent_does_not_watch_through_a_symlinked_directory(t *testing.T
 	}
 }
 
+// TestHandleFsEvent_refuses_to_extend_the_watch_set_outside_root pins the
+// containment guard the symlink test above cannot reach: a REAL directory whose
+// event-derived name is lexically outside the watched root. fsnotify hands back
+// the path a watch was registered with, so a registration that once escaped the
+// root would otherwise keep walking and registering further outside it, one
+// event at a time. The event must still request the conservative in-root rescan
+// (content inside the root is unaffected by the refusal) and must say so at WARN
+// with the path, the root and whether anything will revisit what stays
+// unwatched.
+// Not parallel: it swaps the process-global slog default.
+func TestHandleFsEvent_refuses_to_extend_the_watch_set_outside_root(t *testing.T) {
+	logs := capture.Default(t)
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "escaped")
+	if err := os.MkdirAll(outside, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	w := New(root, func(context.Context) {})
+
+	if got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: outside, Op: fsnotify.Create}); !got {
+		t.Error("handleFsEvent(Create dir outside root) = false, want true: the in-root rescan must still cover content after refusing the watch extension")
+	}
+	if watched := watcher.WatchList(); slices.Contains(watched, outside) {
+		t.Errorf("watch list after an outside-root event = %v, want %q refused", watched, outside)
+	}
+	const msg = "refusing to extend the watch set outside the watched root"
+	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
+		t.Fatalf("WARN %q logged %d times, want exactly 1; log = %v", msg, n, logs.Messages())
+	}
+	if got, ok := logs.AttrValue(msg, "path"); !ok || got != outside {
+		t.Errorf("WARN %q path = %q (present %v), want %q", msg, got, ok, outside)
+	}
+	if got, ok := logs.AttrValue(msg, "root"); !ok || got != root {
+		t.Errorf("WARN %q root = %q (present %v), want %q", msg, got, ok, root)
+	}
+	if got, ok := logs.AttrValue(msg, "fallback_scan"); !ok || got != "disabled" {
+		t.Errorf("WARN %q fallback_scan = %q (present %v), want disabled", msg, got, ok)
+	}
+}
+
 // TestHandleRootWatchLoss_reattaches_the_watch_set_when_the_fallback_is_enabled
 // pins the recoverable half of the root-watch-loss contract. The terminal half is
 // pinned by TestWatchLoop_reports_lost_change_detection_when_the_root_watch_

@@ -562,21 +562,33 @@ func logPasswordDelivery(source envx.SecretSource, password string, blankSecretF
 			slog.Info("PFX password configured", "source", passwordChannel(source))
 		}
 	}
-	if source == envx.SourceEnv && !isBlank(password) &&
+	blank := isBlank(password)
+	if source == envx.SourceEnv && !blank &&
 		password != strings.TrimSpace(password) {
 		slog.Warn("PFX_PASSWORD has leading or trailing whitespace, which is part of the password embedded in every PFX file",
 			"source", passwordChannel(source),
 			"remediation", "remove the surrounding whitespace, or note that PFX_PASSWORD_FILE trims it, so the same value delivered as a mounted secret yields a different password")
 	}
+	// A blank value is skipped: warnPasswordStrength already reports it, with the
+	// remediation that helps (set a real password) rather than a rune-shape one.
+	if blank {
+		return
+	}
+	warnPasswordCharacters(source, password)
+}
+
+// warnPasswordCharacters reports the hard-to-enter runes that survive every
+// validation guard. The three predicates cover disjoint Unicode categories, so a
+// password carrying several shapes receives one actionable record per shape.
+func warnPasswordCharacters(source envx.SecretSource, password string) {
+	channel := passwordChannel(source)
 	// An INTERIOR control character survives both guards: envx trims only
 	// surrounding whitespace, and PKCS#12 encodes a newline or tab verbatim, so
 	// checkPasswordEncodable accepts it. The bundle is written, health stays
 	// green, and the password cannot be typed into the consumers that need it.
-	// A blank value is skipped: warnPasswordStrength already reports it, with the
-	// remediation that helps (set a real password) rather than this one's.
-	if !isBlank(password) && strings.ContainsFunc(password, unicode.IsControl) {
+	if strings.ContainsFunc(password, unicode.IsControl) {
 		slog.Warn("the PFX password contains a control character (newline, carriage return, or tab), which is embedded verbatim in every PFX file and cannot be typed into most PKCS#12 consumers",
-			"source", passwordChannel(source),
+			"source", channel,
 			"remediation", "supply the secret on a single line (openssl rand -base64 wraps at 64 columns; add -A) so whatever opens the .pfx can reproduce the password")
 	}
 	// An invisible FORMAT character survives every guard above: it is valid UTF-8,
@@ -586,18 +598,18 @@ func logPasswordDelivery(source envx.SecretSource, password string, blankSecretF
 	// zero-width space pasted from a web page, therefore becomes part of the
 	// password with nothing to show for it: the bundle is written, health stays
 	// green, and the .pfx cannot be opened with the secret's visible contents.
-	if !isBlank(password) && strings.ContainsFunc(password, isFormatRune) {
+	if strings.ContainsFunc(password, isFormatRune) {
 		slog.Warn("the PFX password contains an invisible Unicode formatting character (byte-order mark, zero-width space, or soft hyphen), which is embedded verbatim in every PFX file and cannot be reproduced from the secret's visible contents",
-			"source", passwordChannel(source),
+			"source", channel,
 			"remediation", "rewrite the secret without the invisible character (an editor saving the secret file as \"UTF-8 with BOM\" is the usual cause; printf %s writes the value verbatim)")
 	}
 	// A non-ASCII SPACE survives every guard above: U+00A0, U+2007 and U+3000 are
 	// Zs, U+2028/U+2029 are Zl/Zp, none of them is Cc or Cf, and TrimSpace only
 	// reaches the ends, so an interior one is embedded verbatim while rendering
 	// exactly like the ASCII space a consumer retypes.
-	if !isBlank(password) && strings.ContainsFunc(password, isAmbiguousSpaceRune) {
+	if strings.ContainsFunc(password, isAmbiguousSpaceRune) {
 		slog.Warn("the PFX password contains a non-ASCII space character (no-break space, ideographic space, or line separator), which is embedded verbatim in every PFX file and is indistinguishable from the ordinary space a consumer would type",
-			"source", passwordChannel(source),
+			"source", channel,
 			"remediation", "retype the secret using ordinary ASCII spaces (a value pasted from a rendered document, a PDF, or a word processor is the usual cause)")
 	}
 }

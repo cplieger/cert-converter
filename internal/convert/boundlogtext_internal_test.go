@@ -160,11 +160,15 @@ func TestBoundedTextError_keeps_the_wrapped_error_reachable(t *testing.T) {
 }
 
 // TestParsePrivateKey_bounds_an_oversized_pkcs8_algorithm_oid pins the key-side
-// half of the bounded-text rule. x509's PKCS#8 fallback ends in "unknown
-// algorithm: <OID>", interpolating an OBJECT IDENTIFIER decoded straight out of
-// the key file, and asn1 allocates one component per content byte -- so a key
-// inside the 10 MB input read bound renders a multi-megabyte ERROR line, re-emitted
-// on every scan because a failed pair is never cached.
+// half of the bounded-text rule, now enforced BEFORE x509 sees the block. x509's
+// PKCS#8 fallback ends in "unknown algorithm: <OID>", interpolating an OBJECT
+// IDENTIFIER decoded straight out of the key file, and asn1 allocates one component
+// per content byte -- so a key inside the 10 MB input read bound rendered a
+// multi-megabyte ERROR line, re-emitted on every scan because a failed pair is
+// never cached, after paying that allocation to produce it.
+// oversizedKeyAlgorithmOIDError now refuses the block on the identifier's LENGTH
+// instead, so neither the allocation nor the unbounded text is paid at all: the
+// diagnostic is a size and a ceiling, and the identifier's own bytes never reach it.
 func TestParsePrivateKey_bounds_an_oversized_pkcs8_algorithm_oid(t *testing.T) {
 	t.Parallel()
 	oid := testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagOID, Bytes: bytes.Repeat([]byte{0x01}, 64<<10)})
@@ -177,15 +181,19 @@ func TestParsePrivateKey_bounds_an_oversized_pkcs8_algorithm_oid(t *testing.T) {
 
 	_, err := ParsePrivateKey(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
 	if err == nil {
-		t.Fatal("ParsePrivateKey(PKCS#8 with a 64 KB algorithm OID) = nil error, want a parse failure")
+		t.Fatal("ParsePrivateKey(PKCS#8 with a 64 KB algorithm OID) = nil error, want a refusal")
 	}
-	// The static prefix names the block type and the parsers tried; everything
-	// input-derived past it is what the bound has to cover.
-	const staticPrefix = len("failed to parse private key from a \"PRIVATE KEY\" block (tried PKCS8, PKCS1, SEC1): ")
-	if want := staticPrefix + maxSubjectLogLen + len(truncationMarker); len(err.Error()) > want {
+	// The refusal carries no input-derived text at all, so the same ceiling the
+	// truncating path had to respect bounds it with room to spare.
+	if want := maxSubjectLogLen + len(truncationMarker) + 256; len(err.Error()) > want {
 		t.Errorf("error is %d bytes, want at most %d: the OID reaches the log unbounded", len(err.Error()), want)
 	}
-	if !strings.HasSuffix(err.Error(), truncationMarker) {
-		t.Errorf("error = %q, want the truncation marked", err.Error())
+	if strings.Contains(err.Error(), strings.Repeat("\x01", 8)) {
+		t.Errorf("error = %q, want the identifier's own bytes absent from the diagnostic", err.Error())
+	}
+	for _, want := range []string{"algorithm identifier", "32-byte ceiling"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to name %q: the operator has to know which bound refused the key", err.Error(), want)
+		}
 	}
 }

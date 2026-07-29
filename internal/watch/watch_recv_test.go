@@ -412,3 +412,104 @@ func TestHandleWatcherError_warns_with_the_operator_diagnostics(t *testing.T) {
 		})
 	}
 }
+
+// TestHandleEventRecv_reattaches_a_recreated_directory pins the half of the
+// membership guard that a per-event WatchList scan used to get for free: the
+// guard now answers from this package's own mirror of the registration set, so a
+// directory whose watch the kernel discarded with the directory itself must be
+// forgotten, or its recreation looks "already watched" and is never walked
+// again -- every renewal underneath it then waits for the periodic re-sync, and
+// never arrives with the fallback disabled.
+//
+// The oracle is the CHILD of the recreated directory: it was never registered
+// before, so it can only appear in the watch list if the Create event actually
+// re-walked the subtree, and unlike the parent it cannot be confused with a
+// registration the kernel is still dropping asynchronously.
+func TestHandleEventRecv_reattaches_a_recreated_directory(t *testing.T) {
+	t.Parallel()
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	dir := filepath.Join(root, "example.com")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	w := New(root, func(context.Context) {})
+	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
+		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
+	}
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+
+	if lost := w.handleEventRecv(t.Context(), watcher, st, fsnotify.Event{Name: dir, Op: fsnotify.Remove}, true); lost != nil {
+		t.Fatalf("handleEventRecv(Remove %q) = %v, want nil (an ordinary directory removal is not lost change detection)", dir, lost)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(dir, "nested")
+	if err := os.MkdirAll(child, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if lost := w.handleEventRecv(t.Context(), watcher, st, fsnotify.Event{Name: dir, Op: fsnotify.Create}, true); lost != nil {
+		t.Fatalf("handleEventRecv(Create %q) = %v, want nil", dir, lost)
+	}
+
+	if watched := watcher.WatchList(); !slices.Contains(watched, child) {
+		t.Errorf("watch list after %q was removed and recreated = %v, want %q re-attached: the removed path must be forgotten so its recreation is walked again",
+			dir, watched, child)
+	}
+}
+
+// TestRecvHelpers_do_no_work_after_cancellation pins the cancellation precedence
+// both receive arms owe the rest of the loop: watchLoop's select picks a ready
+// case at random, so a queued event or watcher error can still be delivered after
+// ctx.Done is ready. The loop exits on its next selection, so a re-attach or a
+// scheduled scan can no longer accomplish anything -- but the WARN it logs on the
+// way sends an operator to troubleshoot watch degradation in a container that is
+// only stopping. Every timer, attach, and channel-loss arm already suppresses
+// equivalent work after cancellation; these two must match, so the assertion is
+// that NOTHING is logged and no scan is armed.
+// Not parallel: it swaps the process-global slog default.
+func TestRecvHelpers_do_no_work_after_cancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(ctx context.Context, w *Watcher, watcher *fsnotify.Watcher, st *watchState) *LostError
+	}{
+		{
+			// With the fallback enabled a live context would WARN that the root
+			// watch was lost and re-attach the whole watch set.
+			name: "a queued root removal is neither announced nor re-attached",
+			call: func(ctx context.Context, w *Watcher, watcher *fsnotify.Watcher, st *watchState) *LostError {
+				return w.handleEventRecv(ctx, watcher, st, fsnotify.Event{Name: w.root, Op: fsnotify.Remove}, true)
+			},
+		},
+		{
+			// A live context would WARN "watcher error" with the rescan cadence.
+			name: "a queued watcher error is not announced",
+			call: func(ctx context.Context, w *Watcher, watcher *fsnotify.Watcher, st *watchState) *LostError {
+				return w.handleErrorRecv(ctx, watcher, st, errors.New("transient watcher failure"), true)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := capture.Default(t)
+			watcher := newTestWatcher(t)
+			w := New(t.TempDir(), func(context.Context) {}, WithFallback(6*time.Hour))
+			st := newWatchState(w)
+			t.Cleanup(st.stop)
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+
+			if lost := tc.call(ctx, w, watcher, st); lost != nil {
+				t.Errorf("receive on a cancelled context = %v, want nil: a shutdown race is a clean stop, not lost change detection", lost)
+			}
+			if st.pending {
+				t.Error("receive on a cancelled context armed the debounce; the loop is exiting and no scan can run")
+			}
+			if n := logs.Len(); n != 0 {
+				t.Errorf("receive on a cancelled context logged %d record(s) (%v), want none: a shutdown must not look like watch degradation", n, logs.Messages())
+			}
+		})
+	}
+}

@@ -250,6 +250,125 @@ func TestParsePrivateKeyBlock_refuses_an_oversized_rsa_key(t *testing.T) {
 	}
 }
 
+// TestParsePrivateKeyBlock_refuses_an_oversized_final_RSA_integer pins the walk's
+// ENDPOINT. The rows above put the oversized value in the modulus or in p and q,
+// all of which are reached early; nothing placed it in Qinv, the LAST top-level
+// INTEGER, so a walk that stopped one element short still passed the whole suite
+// while the pre-scan silently stopped enforcing its "modulus, prime or CRT value"
+// contract and handed the key to crypto/x509 instead.
+func TestParsePrivateKeyBlock_refuses_an_oversized_final_RSA_integer(t *testing.T) {
+	t.Parallel()
+	one := big.NewInt(1)
+	hugeQinv := new(big.Int).Lsh(one, 131071)
+	hugeQinv.SetBit(hugeQinv, 0, 1)
+	der, err := asn1.Marshal(pkcs1KeyDER{
+		N: big.NewInt(196611), E: big.NewInt(65537), D: one, P: one, Q: one,
+		Dp: one, Dq: one, Qinv: hugeQinv,
+	})
+	if err != nil {
+		t.Fatalf("setup: marshal huge-Qinv PKCS#1 key: %v", err)
+	}
+
+	_, err = parsePrivateKeyBlock(&pem.Block{Type: pemTypeRSAPrivateKey, Bytes: der})
+	if err == nil {
+		t.Fatal("parsePrivateKeyBlock(a key with a 131072-bit final CRT integer) = nil error, want a pre-scan refusal")
+	}
+	for _, want := range []string{"131072-bit RSA integer", "16384-bit ceiling", pemTypeRSAPrivateKey} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
+// otherPrimeInfoDER mirrors PKCS#1's OtherPrimeInfo (RFC 8017 A.1.2), so a test can
+// build the multi-prime collection the factor ceiling bounds. Field ORDER is the
+// DER contract.
+type otherPrimeInfoDER struct {
+	Prime, Exponent, Coefficient *big.Int
+}
+
+// multiPrimeKeyDER is pkcs1KeyDER with the optional OtherPrimeInfos collection
+// present, which is where a file hides MANY small primes rather than one large one.
+type multiPrimeKeyDER struct {
+	Version         int
+	N, E, D, P, Q   *big.Int
+	Dp, Dq, Qinv    *big.Int
+	OtherPrimeInfos []otherPrimeInfoDER
+}
+
+// TestParsePrivateKeyBlock_refuses_too_many_RSA_prime_factors pins the SECOND
+// pre-scan bound, which no size check can express. Every integer here is tiny, so
+// the per-integer ceiling passes the block through; the cost is in the COUNT,
+// because crypto/x509 decodes the collection into a slice and crypto/rsa's
+// precomputeLegacy then runs one ModInverse per additional prime against a growing
+// product. Measured on go1.26.5: 10,000 entries in a 127 KB block (far inside the
+// reader's 10 MB cap) cost 160ms and 292 MB on the scan's only goroutine.
+func TestParsePrivateKeyBlock_refuses_too_many_RSA_prime_factors(t *testing.T) {
+	t.Parallel()
+	one := big.NewInt(1)
+	extras := make([]otherPrimeInfoDER, maxRSAPrimeFactors)
+	for i := range extras {
+		extras[i] = otherPrimeInfoDER{Prime: big.NewInt(3), Exponent: one, Coefficient: one}
+	}
+	der, err := asn1.Marshal(multiPrimeKeyDER{
+		Version: 1,
+		N:       big.NewInt(196611), E: big.NewInt(65537), D: one, P: one, Q: one,
+		Dp: one, Dq: one, Qinv: one,
+		OtherPrimeInfos: extras,
+	})
+	if err != nil {
+		t.Fatalf("setup: marshal multi-prime PKCS#1 key: %v", err)
+	}
+	// The whole block stays small: the amplification is the element count, which is
+	// exactly why a size bound cannot catch it.
+	if len(der) > 1<<12 {
+		t.Fatalf("setup: multi-prime fixture is %d bytes, want a small block: the point is that size does not bound this shape", len(der))
+	}
+
+	for name, block := range map[string]*pem.Block{
+		"pkcs1": {Type: pemTypeRSAPrivateKey, Bytes: der},
+		"pkcs8": {Type: pemTypePrivateKey, Bytes: wrapPKCS8(t, der)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := parsePrivateKeyBlock(block)
+			if err == nil {
+				t.Fatalf("parsePrivateKeyBlock(a key declaring %d prime factors) = nil error, want a pre-scan refusal",
+					maxRSAPrimeFactors+2)
+			}
+			for _, want := range []string{"66 RSA prime factors", "64-factor ceiling", block.Type} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want it to contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestParsePrivateKeyBlock_accepts_a_realistic_multi_prime_key keeps that ceiling
+// from becoming a refusal of legitimate keys: a three-prime key is inside the
+// bound, so the pre-scan must measure it and decide nothing. The parser's own
+// verdict on the (deliberately inconsistent) fixture is irrelevant here; what
+// matters is that the refusal above is not what stops it.
+func TestParsePrivateKeyBlock_accepts_a_realistic_multi_prime_key(t *testing.T) {
+	t.Parallel()
+	one := big.NewInt(1)
+	der, err := asn1.Marshal(multiPrimeKeyDER{
+		Version: 1,
+		N:       big.NewInt(196611), E: big.NewInt(65537), D: one, P: one, Q: one,
+		Dp: one, Dq: one, Qinv: one,
+		OtherPrimeInfos: []otherPrimeInfoDER{{Prime: big.NewInt(3), Exponent: one, Coefficient: one}},
+	})
+	if err != nil {
+		t.Fatalf("setup: marshal three-prime PKCS#1 key: %v", err)
+	}
+
+	_, err = parsePrivateKeyBlock(&pem.Block{Type: pemTypeRSAPrivateKey, Bytes: der})
+	if err != nil && strings.Contains(err.Error(), "RSA prime factors") {
+		t.Errorf("parsePrivateKeyBlock(a three-prime key) = %v, want the factor ceiling to stay out of it: multi-prime RSA is legal and rare, not an amplification shape", err)
+	}
+}
+
 // TestRSAModulusBitsFromKeyDER_measures_or_fails_open pins both halves of the
 // pre-scan's contract. The sizes it must measure are what makes the refusal
 // possible; the shapes it must NOT measure are what keeps the guard from becoming
@@ -305,12 +424,12 @@ func TestRSAModulusBitsFromKeyDER_measures_or_fails_open(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			gotBits, gotOK := maxRSAIntegerBitsFromKeyDER(tc.der, 1)
-			if gotOK != tc.wantOK {
-				t.Fatalf("maxRSAIntegerBitsFromKeyDER(%s) measured = %v, want %v", name, gotOK, tc.wantOK)
+			scan := maxRSAIntegerBitsFromKeyDER(tc.der, 1)
+			if scan.measured != tc.wantOK {
+				t.Fatalf("maxRSAIntegerBitsFromKeyDER(%s) measured = %v, want %v", name, scan.measured, tc.wantOK)
 			}
-			if gotOK && gotBits != tc.wantBits {
-				t.Errorf("maxRSAIntegerBitsFromKeyDER(%s) = %d bits, want %d", name, gotBits, tc.wantBits)
+			if scan.measured && scan.maxBits != tc.wantBits {
+				t.Errorf("maxRSAIntegerBitsFromKeyDER(%s) = %d bits, want %d", name, scan.maxBits, tc.wantBits)
 			}
 		})
 	}
@@ -345,9 +464,9 @@ func TestRSAModulusBitsFromKeyDER_fails_open_on_shapes_it_cannot_measure(t *test
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			gotBits, gotOK := maxRSAIntegerBitsFromKeyDER(der, 1)
-			if gotOK {
-				t.Errorf("maxRSAIntegerBitsFromKeyDER(%s) measured %d bits, want it to fail open", name, gotBits)
+			scan := maxRSAIntegerBitsFromKeyDER(der, 1)
+			if scan.measured {
+				t.Errorf("maxRSAIntegerBitsFromKeyDER(%s) measured %d bits, want it to fail open", name, scan.maxBits)
 			}
 		})
 	}

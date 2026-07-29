@@ -28,41 +28,16 @@ const (
 const watchDebounce = 2 * time.Second
 
 // healthyAfterScan reports whether a completed scan should keep the container
-// healthy. Health answers one operational question — "should an orchestrator
-// restart this container?" — so it is driven solely by conversion failures,
-// the only outcome a restart could plausibly clear (a transient mount glitch,
-// a half-written renewal). Unreadable /input sub-paths are deliberately NOT a
-// health input: they are a steady-state permissions/UID misconfiguration or a
-// layout mistake that a restart cannot fix, so internal/process surfaces them
-// as a once-per-scan WARN (logInputCoverageWarnings, which owns every
-// default-level /input-coverage diagnostic) rather than flapping the container
-// unhealthy in a restart loop. The same
-// reasoning covers ScanResult.Unwritable, the /output-side member of that
-// family: a prior bundle whose mode repair AND whose repairing rewrite were
-// both refused for a permission reason already holds the right bytes, and no
-// restart grants the UID ownership of the volume, so it carries its own
-// standing WARN and leaves health alone — while every other failed PFX write is
-// still a conversion failure that clears the marker. It is the
-// single source of truth for the health boundary so the gate can be
-// unit-tested without reimplementing it. The pointer parameter is gocritic's
-// hugeParam threshold, not a mutation: the result is read, never modified.
+// healthy. Only conversion failures clear health; input coverage gaps and
+// refused mode-only output repairs are permissions/layout conditions a restart
+// cannot fix. The pointer avoids copying ScanResult and is never mutated.
 func healthyAfterScan(r *process.ScanResult) bool {
 	return r.Failed == 0
 }
 
-// scanAndSetHealth runs one scan with the scanner's configured input and output
-// roots and flips the health marker via healthyAfterScan (zero conversion
-// failures). A shutdown cancellation leaves the marker untouched; any other
-// scan error clears it. It renders no /input-coverage diagnostic of its own:
-// internal/process owns that whole taxonomy and every default-level warning derived
-// from it (including the unreadable-paths aggregate). What it does own is the
-// scan-level outcome at the composition root — one Info naming a shutdown, one ERROR
-// for a scan that failed for any other reason — because only main knows the failure is
-// also a health transition, and internal/process reports the same event at Warn
-// ("scan aborted before completion", the message the README's CertConverterScanAborted
-// rule matches) without knowing that. Add no further records here: the
-// one-record-per-event discipline reportWatchExit documents holds for this boundary
-// too.
+// scanAndSetHealth runs one scan and updates the marker. Shutdown cancellation
+// leaves the prior marker untouched; any other scan error clears it. Scanner
+// owns input-coverage diagnostics; this composition root logs terminal errors.
 func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *health.Marker) {
 	result, err := scanner.Run(ctx)
 	if err != nil {
@@ -84,42 +59,15 @@ type volumeDir struct {
 	role, path string
 }
 
-// volumesReady reports whether every required volume is already mounted as a
-// directory the running UID can open, logging EVERY offender at ERROR with its
-// role, path and remediation: an operator who omitted the volumes block
-// entirely has both mounts missing, and naming only the first costs a restart
-// per mount to discover the next one.
-//
-// Both volumes must already exist; nothing in this app creates them. Refusing
-// once at startup with a named path is the actionable form of a missing mount:
-// a restart cannot create a directory, so the health marker — reserved for
-// failures a restart could clear — must never carry this one.
-// A mount that exists but cannot be OPENED by the running UID is the same fact
-// one step later: the scanner opens both roots on every scan and a refusal
-// there is a hard scan error, so leaving it to the scan reproduces exactly the
-// restart loop this function exists to prevent for a condition (host-side
-// ownership, mode 0700 — the README's own named first-run mistake) that no
-// restart can clear either. Openability, not writability: an /output that opens
-// but refuses a write is the deliberately health-neutral case
-// warnOutputNotWritable reports and process.ScanResult.Unwritable carries, and
-// refusing to start on it would contradict that design.
-//
-// Deliberately NOT MkdirAll: silently creating a missing mount point would put
-// certificates in the container's ephemeral layer, where they vanish on the
-// next restart, which is worse than refusing to start. A path that exists but
-// is not a directory (a file bind-mounted over /input, a stray touch) is the
-// same fact and is refused the same way.
+// volumesReady verifies every required mount already exists as a directory and
+// can be opened by the running UID. It reports every offender in one startup
+// attempt and never creates a missing mount in the container's ephemeral layer.
+// Output write access is checked separately by warnOutputNotWritable.
 func volumesReady(dirs []volumeDir) bool {
 	ready := true
 	for _, dir := range dirs {
 		fi, statErr := os.Stat(dir.path)
 		if statErr == nil && fi.IsDir() {
-			// The scanner opens BOTH roots with os.OpenRoot on every scan and treats a
-			// failure as a hard scan error, so a mount the running UID cannot open
-			// otherwise surfaces only as an unhealthy container on every tick — the
-			// restart loop this preflight exists to prevent, for a condition no
-			// restart can clear. Probing with the same call the scanner uses is what
-			// keeps the two verdicts from disagreeing.
 			root, openErr := os.OpenRoot(dir.path)
 			if openErr == nil {
 				_ = root.Close()
@@ -146,28 +94,13 @@ func volumesReady(dirs []volumeDir) bool {
 	return ready
 }
 
-// outputWriteProbePattern reuses atomicfile's own temp-name shape
-// (".atomicfile-<digits>.tmp", which os.CreateTemp produces from this pattern) so a
-// probe leaked by a crash in the create/remove window is reclaimed by the per-scan
-// stale-temp sweep instead of sitting in the operator's output tree forever (the
-// orphan reaper only ever matches this app's .pfx output shape).
+// outputWriteProbePattern matches atomicfile's temp-name convention so a probe
+// orphaned by a crash is eligible for the normal stale-temp sweep.
 const outputWriteProbePattern = ".atomicfile-*.tmp"
 
-// warnOutputNotWritable probes /output for write access under the running UID and
-// warns once at startup when it is refused. volumesReady proves only that the mount
-// is a directory: a directory this UID can read but not write in (a host path still
-// owned by root, a user: changed to a different PUID after the first run, an
-// accidental :ro on the output mount) passes that check, and a scan whose bundles are
-// all current writes nothing, so the deployment reports HEALTHY and the
-// misconfiguration surfaces only at the next renewal — weeks away for the
-// set-and-forget deployment this app is built for, and exactly when a fresh bundle is
-// needed.
-//
-// Deliberately a WARN, not a refusal: /output ownership can be repaired on the host
-// while the container runs and the next scan picks it up with no restart, so refusing
-// to start would remove that recovery. It is also why the probe does not touch health:
-// a write refusal a restart cannot clear is health-neutral here for the same reason
-// ScanResult.Unwritable is.
+// warnOutputNotWritable probes output write access under the running UID. It
+// warns rather than refusing startup because host ownership can be repaired
+// while the process runs; later scans retain their normal health semantics.
 func warnOutputNotWritable(dir string) {
 	f, err := os.CreateTemp(dir, outputWriteProbePattern)
 	if err != nil {

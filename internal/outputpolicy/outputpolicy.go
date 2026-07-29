@@ -16,7 +16,10 @@
 // library, so the knob's normalisation is testable on its own.
 package outputpolicy
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // Lifecycle decides what happens to an output whose input pair has disappeared.
 type Lifecycle string
@@ -27,31 +30,36 @@ const (
 	// deletion is opt-in, so an upgrade cannot remove files on its own.
 	LifecycleWarn Lifecycle = "warn"
 	// LifecycleSync makes the output tree mirror the input tree, deleting a bundle
-	// whose source is gone. The homelab deployment opts into this explicitly.
+	// whose source is gone.
 	LifecycleSync Lifecycle = "sync"
 	// LifecycleKeep leaves orphans in place silently.
 	LifecycleKeep Lifecycle = "keep"
 )
 
+// lifecycleModes is the accepted value domain, stated ONCE: ParseLifecycle
+// accepts exactly these and LifecycleModes advertises exactly these, so a mode
+// cannot be added, renamed or removed on one side only — accepted but absent
+// from the operator warning, or advertised but still rejected.
+var lifecycleModes = [...]Lifecycle{LifecycleWarn, LifecycleSync, LifecycleKeep}
+
 // ParseLifecycle normalises a raw OUTPUT_LIFECYCLE value. An unrecognised value
 // falls back to the default with known false, so the caller that read the
 // environment is the one that names it in a warning.
 func ParseLifecycle(raw string) (mode Lifecycle, known bool) {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case string(LifecycleSync):
-		return LifecycleSync, true
-	case string(LifecycleKeep):
-		return LifecycleKeep, true
-	case "", string(LifecycleWarn):
-		return LifecycleWarn, true
-	default:
-		return LifecycleWarn, false
+	normalized := Lifecycle(strings.ToLower(strings.TrimSpace(raw)))
+	if normalized == "" {
+		normalized = LifecycleWarn // unset means the default, not an unrecognised value
 	}
+	if slices.Contains(lifecycleModes[:], normalized) {
+		return normalized, true
+	}
+	return LifecycleWarn, false
 }
 
 // LifecycleModes returns the accepted OUTPUT_LIFECYCLE values, so the caller that
 // read the environment variable can name them in its warning without re-listing
-// the domain ParseLifecycle owns.
+// the domain ParseLifecycle owns. The clone keeps a caller from mutating the
+// package's own inventory.
 func LifecycleModes() []Lifecycle {
-	return []Lifecycle{LifecycleWarn, LifecycleSync, LifecycleKeep}
+	return slices.Clone(lifecycleModes[:])
 }

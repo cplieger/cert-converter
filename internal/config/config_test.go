@@ -933,6 +933,16 @@ func TestLoad_unknown_encoder_warns_and_falls_back_to_modern2023(t *testing.T) {
 			if tc.wantWarn && !logs.AttrContains("unknown PFX_ENCODER", "value", tc.raw) {
 				t.Errorf("Load() with PFX_ENCODER=%q logged %v, want the rejected value named so an operator can spot the typo", tc.raw, logs.Messages())
 			}
+			// The message says only "using the default profile", so these two attrs
+			// are the record's only statement of WHICH profile is in effect and which
+			// spellings are accepted. Dropping either, or wiring a stale list, leaves
+			// every assertion above green while the operator loses the answer.
+			if tc.wantWarn && !logs.HasAttr("unknown PFX_ENCODER", "using", string(tc.wantName)) {
+				t.Errorf("Load() with PFX_ENCODER=%q WARN does not name the effective profile %q (logs %v)", tc.raw, tc.wantName, logs.Messages())
+			}
+			if tc.wantWarn && !logs.HasAttr("unknown PFX_ENCODER", "expected", "[modern2023 modern2026 legacydes legacyrc2]") {
+				t.Errorf("Load() with PFX_ENCODER=%q WARN does not list every canonical profile (logs %v)", tc.raw, logs.Messages())
+			}
 		})
 	}
 }
@@ -1418,6 +1428,16 @@ func TestLoad_wires_output_lifecycle(t *testing.T) {
 			}
 			if tc.wantWarn && !logs.AttrContains("unknown OUTPUT_LIFECYCLE", "value", tc.raw) {
 				t.Errorf("Load() with OUTPUT_LIFECYCLE=%q logged %v, want the rejected value named so an operator can spot the typo", tc.raw, logs.Messages())
+			}
+			// The message says only "using the default", so these two attrs are the
+			// record's only statement of the effective mode and the accepted set.
+			// Removing either, or sourcing a stale list, keeps every assertion above
+			// green while the operator loses the actionable half.
+			if tc.wantWarn && !logs.HasAttr("unknown OUTPUT_LIFECYCLE", "using", string(tc.want)) {
+				t.Errorf("Load() with OUTPUT_LIFECYCLE=%q WARN does not name the effective mode %q (logs %v)", tc.raw, tc.want, logs.Messages())
+			}
+			if tc.wantWarn && !logs.HasAttr("unknown OUTPUT_LIFECYCLE", "expected", "[warn sync keep]") {
+				t.Errorf("Load() with OUTPUT_LIFECYCLE=%q WARN does not list every accepted mode (logs %v)", tc.raw, logs.Messages())
 			}
 		})
 	}

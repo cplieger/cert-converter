@@ -821,10 +821,13 @@ func (g *certGraph) oversizedIssuerError() error {
 		// A certificate nothing here names as its issuer — by name at either fidelity,
 		// nor by authority key identifier — is never a parent in a signature check, so
 		// its size decides nothing: it can only be excluded, or kept by the additive
-		// fallback, and both say so out loud. The question is what the bundle NAMES,
-		// not what survived candidate construction: see namedAsIssuer.
+		// fallback, and both say so out loud. Nor does it decide anything when every
+		// child that names it has a parent a signature PROVES instead: that child's
+		// place is not a guess, so the bundle resolves without the unverifiable edge.
+		// The question is what chain selection DEPENDS on, not what survived candidate
+		// construction: see unresolvedOversizedIssuer.
 		reason := unverifiableKeyReason(c.PublicKey)
-		if reason == "" || !g.namedAsIssuer(i) {
+		if reason == "" || !g.unresolvedOversizedIssuer(i) {
 			continue
 		}
 		return fmt.Errorf(
@@ -834,20 +837,52 @@ func (g *certGraph) oversizedIssuerError() error {
 	return nil
 }
 
-// namedAsIssuer reports whether any other certificate in this bundle names
-// certs[parent] as its issuer — by name at either fidelity, or by authority key
-// identifier — whether or not that pair survived candidate construction.
+// unresolvedOversizedIssuer reports whether chain selection actually DEPENDS on an
+// unverifiable edge into certs[parent]: some other certificate here names it as its
+// issuer — by name at either fidelity, or by authority key identifier — and has no
+// candidate parent that a signature PROVES instead.
 //
-// The candidate set is the wrong question for the oversized refusal. A certificate
-// whose own extensions disqualify it from issuing enters candidateParents ONLY when
-// a signature proves the edge (candidateEdge), and an over-ceiling key can never be
-// verified, so keying the refusal on children[] let through exactly the decoy
-// substitution it exists to refuse: leaf, its real over-ceiling issuer carrying
-// CA:false or no basicConstraints, and a same-subject certificate with an ordinary
-// key that then wins the chain unverified.
-func (g *certGraph) namedAsIssuer(parent int) bool {
+// Both halves are load-bearing. Asking only whether the pair survived candidate
+// construction is the wrong question, because a certificate whose own extensions
+// disqualify it from issuing enters candidateParents ONLY when a signature proves
+// the edge (candidateEdge) and an over-ceiling key can never be verified; keying the
+// refusal on children[] therefore let through exactly the decoy substitution it
+// exists to refuse: leaf, its real over-ceiling issuer carrying CA:false or no
+// basicConstraints, and a same-subject certificate with an ordinary key that then
+// won the chain unverified.
+//
+// Asking only what the bundle NAMES is too coarse in the other direction: a bundle
+// whose every child linked to the oversized certificate is resolved WITHOUT that
+// edge — it has a candidate parent proven by signature, or it is a proven
+// self-signed root and needs no parent at all — resolves entirely without the
+// unverifiable edge, so bestParent never has to guess and refusing would fail a
+// conversion the app can do correctly. The self-signed clause is not an
+// afterthought: a same-subject decoy makes every same-subject root a nominal CHILD
+// of itself's twin, so without it any bundle carrying a proven root beside an
+// over-ceiling namesake would still be refused. Only a child with neither a proven
+// parent nor a proven self-signature leaves the oversized certificate competing on
+// unverified evidence, which is the state the refusal exists for.
+func (g *certGraph) unresolvedOversizedIssuer(parent int) bool {
 	for child := range g.certs {
-		if child != parent && g.edge(child, parent).linked() {
+		if child == parent || !g.edge(child, parent).linked() {
+			continue
+		}
+		if !g.resolvedWithoutParent(child, parent) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolvedWithoutParent reports whether certs[child]'s place in the chain is
+// established without the edge into certs[except]: a signature from some other
+// candidate parent proves it, or it is a proven self-signed root.
+func (g *certGraph) resolvedWithoutParent(child, except int) bool {
+	if g.isSelfSigned(child) {
+		return true
+	}
+	for _, candidate := range g.candidateParents[child] {
+		if candidate != except && g.proven(child, candidate) {
 			return true
 		}
 	}
@@ -1297,19 +1332,30 @@ func (g *certGraph) noMatchError(keyCount, firstUnverifiable int, keyIssues keyD
 	// block keyDefects had already recorded.
 	if firstUnverifiable >= 0 && uncomparable == len(g.certs) {
 		c := g.certs[firstUnverifiable]
+		var msg string
 		if c.PublicKey == nil {
 			// crypto/x509 parses a certificate whose SubjectPublicKeyInfo algorithm OID it
 			// does not recognise and leaves PublicKey nil (parser.go's
 			// UnknownPublicKeyAlgorithm branch), so %T would render "<nil>" here - the one
 			// case where naming the algorithm matters most is the one where there is no
 			// type to name. Say what happened instead.
-			return fmt.Errorf(
+			msg = fmt.Sprintf(
 				"certificate %q uses a public key algorithm crypto/x509 does not recognise, so it cannot be verified against the private key; re-issue it with an RSA, ECDSA or Ed25519 key",
 				boundSubject(c.Subject.String()))
+		} else {
+			msg = fmt.Sprintf(
+				"certificate %q has a public key of type %T that cannot be verified against the private key",
+				boundSubject(c.Subject.String()), c.PublicKey)
 		}
-		return fmt.Errorf(
-			"certificate %q has a public key of type %T that cannot be verified against the private key",
-			boundSubject(c.Subject.String()), c.PublicKey)
+		// The uncomparable count only covers PARSED certificate blocks, so "the
+		// unsupported key is the only explanation left" does not rule out a
+		// certificate-shaped block that was skipped (a link relabelled TRUSTED
+		// CERTIFICATE) or a damaged key block keyDefects already recorded. Both
+		// suffixes carry here for the same reason they carry on a plain mismatch:
+		// returning without them sent the operator to re-issue the certificate this
+		// sentence names while the block holding the supplied key's own certificate
+		// went unmentioned.
+		return errors.New(appendCertIssues(msg+keyIssues.suffix(), certIssues))
 	}
 	msg := fmt.Sprintf(
 		"none of the %d private key block(s) matches any of the %d certificate(s) in the chain%s",
@@ -1328,11 +1374,20 @@ func (g *certGraph) noMatchError(keyCount, firstUnverifiable int, keyIssues keyD
 				boundSubject(c.Subject.String()), c.PublicKey)
 		}
 	}
-	if certIssues.count > 0 {
-		msg += fmt.Sprintf("; the certificate file also holds %d block(s) that are neither a certificate nor a private key and were left out of the bundle (first %q)",
-			certIssues.count, certIssues.firstTypeForLog())
+	return errors.New(appendCertIssues(msg, certIssues))
+}
+
+// appendCertIssues attaches the certificate-file blocks that were neither a
+// certificate nor a private key to a refusal sentence, and is shared by every arm
+// of noMatchError so no diagnosis can drop the clause: the observation that
+// otherwise reports those blocks (ObsUnrelatedBlocksSkipped) is only reachable when
+// the analysis SUCCEEDS.
+func appendCertIssues(msg string, certIssues skippedBlocks) string {
+	if certIssues.count == 0 {
+		return msg
 	}
-	return errors.New(msg)
+	return msg + fmt.Sprintf("; the certificate file also holds %d block(s) that are neither a certificate nor a private key and were left out of the bundle (first %q)",
+		certIssues.count, certIssues.firstTypeForLog())
 }
 
 // resolveAmbiguousMatches rules on more than one (key, certificate) match.
@@ -1609,13 +1664,22 @@ func (g *certGraph) assembleChain(identityCert int) (chain, extra []*x509.Certif
 	// them, so this fallback is not reached for them at all.
 	obs = append(obs, g.unprovenPathObservations(path)...)
 
+	// Whether the terminus is proven self-signed and whether any certificate is left
+	// over are independent facts, so the diagnostic is NOT gated on leftovers: a lone
+	// CA-signed leaf, or a proven leaf/intermediate pair whose root is absent, has an
+	// unfinished chain with nothing to append, and gating ObsChainUnverified on
+	// len(extra) made exactly that case silent. The leftovers only decide what the
+	// observation says happened to them.
 	terminal := path[len(path)-1]
-	if len(extra) > 0 && !g.isSelfSigned(terminal) {
+	if !g.isSelfSigned(terminal) {
 		kept, disqualified := partitionIssuerEligible(extra)
 		chain = append(chain, kept...)
-		disposition := fmt.Sprintf("the remaining %d certificate(s) were kept rather than dropped", len(kept))
-		if len(kept) == 0 {
-			disposition = "none of the remaining certificate(s) could be kept as chain material"
+		disposition := "no remaining certificates were available to keep as chain material"
+		if len(extra) > 0 {
+			disposition = fmt.Sprintf("the remaining %d certificate(s) were kept rather than dropped", len(kept))
+			if len(kept) == 0 {
+				disposition = "none of the remaining certificate(s) could be kept as chain material"
+			}
 		}
 		fallbackObs := []Observation{{
 			Kind: ObsChainUnverified,

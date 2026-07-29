@@ -307,7 +307,6 @@ func TestObservationLog_forgetPair_spends_wholeness_without_resetting_deduplicat
 	}
 }
 
-
 // TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unwritable
 // pins the once-per-change rule on the OTHER steady-state arm: a bundle whose bytes
 // are already correct, whose mode repair was refused, and whose repairing rewrite the

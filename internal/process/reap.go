@@ -12,25 +12,8 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 )
 
-// reaper owns OUTPUT_LIFECYCLE reconciliation: deciding whether an output bundle
-// whose input is gone may be deleted, and deleting it.
-//
-// It depends on BOTH boundary owners rather than living inside either, the way
-// scanWalk already does. The claim behind every deletion spans the two trees ("this
-// /output bundle has no /input certificate"), so it belongs to neither the input
-// reader nor the output store: keeping it here leaves store owning exactly what it
-// advertises — every touch of the output tree — while the /output primitives the reap
-// needs (orphans, removeOrphans) stay on the store as the output-tree operations
-// they are, called through rp.out.
-//
-// The OUTPUT_LIFECYCLE value domain itself (the Lifecycle type, its three modes and
-// their parse) lives in internal/outputpolicy, which this package consumes: the
-// operator's raw value is read and normalised by internal/config, and keeping the
-// enum here put that configuration layer above the orchestrator. What follows is
-// this package's own half — acting on an already-parsed mode across both trees.
-//
-// Scanner.Run constructs it, beside the scanWalk that already holds both roots and
-// the injected Options. A reaper lasts one scan and closes neither root.
+// reaper reconciles output bundles with one scan's input enumeration. It borrows
+// both confined roots for the scan and closes neither.
 type reaper struct {
 	src  *source
 	out  *store
@@ -140,7 +123,7 @@ func logIncompleteInputEnumeration(rc *reapContext) {
 // input walk finished is not reported as a clean, complete scan.
 //
 // A deletion is never made on the strength of this scan's snapshot alone. Once the
-// vetoes are passed, confirmOrphans defers the batch by reapDeferral and re-checks
+// vetoes are passed, reapConfirmed defers the batch by reapDeferral and re-checks
 // each candidate's certificate through rp.src, so an input observed mid-replacement
 // keeps its bundle. rp.src is the input side of the same scan `seen` came from.
 func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *reapContext) (int, error) {
@@ -153,7 +136,7 @@ func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *r
 		logIncompleteInputEnumeration(rc)
 		return 0, nil
 	}
-	orphaned, walkSafe, err := rp.out.orphans(ctx, seen)
+	outputs, walkSafe, err := rp.out.listOutputs(ctx)
 	if err != nil {
 		if IsShutdown(err) {
 			// Shutdown, not a broken output tree. The input walk usually reports the
@@ -167,6 +150,7 @@ func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *r
 			"remediation", outputPermRemediation)
 		return 0, nil
 	}
+	orphaned := orphansOf(outputs, seen)
 	if len(orphaned) == 0 {
 		return 0, nil
 	}
@@ -184,19 +168,87 @@ func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *r
 	return rp.reapConfirmed(ctx, orphaned)
 }
 
-// reapConfirmed is the deletion half of reconcile: confirm the batch after the
-// deferral, then remove what is still orphaned. Split out so reconcile's gate reads
-// as a sequence of refusals with one tail call, rather than carrying the delay's own
-// three outcomes inline.
+// orphansOf selects, from the output tree's own enumeration, the bundles whose input
+// certificate the scan did not see — in walk order.
+//
+// It lives here rather than on the store because the claim it makes spans BOTH trees
+// ("this /output bundle has no /input certificate"), which is the whole reason this
+// type exists: the store enumerates the output tree, and every cross-tree admission
+// decision is made in one place. seen is the set of input .crt paths a COMPLETE walk
+// found; reconcile has already refused to get this far without one. layout owns both
+// directions of the naming contract, so the reverse derivation cannot drift from the
+// forward one used at write time.
+func orphansOf(outputs []string, seen map[string]struct{}) []string {
+	var orphaned []string
+	for _, rel := range outputs {
+		if _, ok := seen[layout.CertForOutput(rel)]; !ok {
+			orphaned = append(orphaned, rel)
+		}
+	}
+	return orphaned
+}
+
+// reapConfirmed is the deletion half of reconcile: wait reapDeferral ONCE for the whole
+// batch, then, per candidate, re-check its INPUT path immediately before deleting that
+// candidate's output. Split out so reconcile's gate reads as a sequence of refusals with
+// one tail call, rather than carrying the delay's own three outcomes inline.
+//
+// One wait for the batch, not one per candidate: the window is about wall-clock time
+// passing, not about the individual path, so waiting per orphan would make a tree with
+// twenty of them cost two hundred seconds on the scan's only goroutine.
+//
+// The re-check is INTERLEAVED with the deletions rather than run as a batch pass ahead
+// of them, and that ordering is the safety property: the absence observation that
+// authorizes a destructive action must be immediately coupled to that action. A batch
+// confirmation pass would let a later candidate's check widen the first candidate's
+// stale-observation window, so a certificate restored after its own check but before the
+// unlink would lose its live bundle.
+//
+// The re-check goes through the same confined input root the scan itself reads through,
+// so a symlink planted under /input cannot make an unrelated path answer for a
+// candidate.
+//
+// A certificate that came back cancels that one deletion and nothing else: it is the
+// ordinary producer transaction this delay exists for, not an error, so it does not fail
+// the scan, does not affect health, and leaves every other candidate reapable. A
+// cancellation during the wait, or between candidates, abandons the rest of the reap and
+// is returned to the caller, which is what keeps an interrupted scan from being reported
+// as complete.
 func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, error) {
-	confirmed, err := rp.confirmOrphans(ctx, orphaned)
-	if err != nil {
+	slog.Info(reapRecheckMsg,
+		"count", len(orphaned), "recheck_in", reapDeferral.String())
+	if err := waitBeforeReap(ctx, reapDeferral); err != nil {
+		// Shutdown inside the window: delete nothing further. Debug like the other
+		// interrupted paths here, because the error itself is returned and the caller
+		// reports the cancellation.
+		slog.Debug("orphan removal abandoned during shutdown before the confirming re-check",
+			"candidates", len(orphaned), "error", err)
 		return 0, err
 	}
-	if len(confirmed) == 0 {
-		return 0, nil
+
+	var deleted int
+	for _, rel := range orphaned {
+		cert := layout.CertForOutput(rel)
+		absent := rp.src.pathAbsent(cert)
+		if err := ctx.Err(); err != nil {
+			slog.Debug("orphan removal interrupted by shutdown during the confirming re-check",
+				"removed", deleted, "remaining", len(orphaned)-deleted, "error", err)
+			return deleted, err
+		}
+		if !absent {
+			// Named at the default level: this is the deletion this app decided NOT to
+			// make, and it is the only trace that the delay did its job.
+			slog.Info("keeping an output bundle whose certificate came back during the confirmation delay",
+				"path", rel, "input", cert)
+			continue
+		}
+		n, err := rp.out.removeOrphans(ctx, []string{rel})
+		deleted += n
+		if err != nil {
+			return deleted, err
+		}
 	}
-	return rp.out.removeOrphans(ctx, confirmed)
+	return deleted, nil
 }
 
 // reapDeferral is how long reconcile waits, ONCE per scan, between identifying
@@ -257,49 +309,6 @@ func waitForReapDeferral(ctx context.Context, d time.Duration) error {
 // deletion that follows it, so the two call sites that matter — the emit and the test
 // that pins the wording — cannot drift.
 const reapRecheckMsg = "possible orphaned output bundles; re-checking their certificates before deleting anything"
-
-// confirmOrphans waits reapDeferral once for the whole batch, then re-checks each
-// candidate's INPUT path and returns only the candidates whose certificate is STILL
-// absent.
-//
-// One wait for the batch, not one per candidate: the window is about wall-clock time
-// passing, not about the individual path, so waiting per orphan would make a tree
-// with twenty of them cost two hundred seconds on the scan's only goroutine.
-//
-// The re-check goes through the same confined input root the scan itself reads
-// through, so a symlink planted under /input cannot make an unrelated path answer for
-// a candidate.
-//
-// A certificate that came back cancels that one deletion and nothing else: it is the
-// ordinary producer transaction this delay exists for, not an error, so it does not
-// fail the scan, does not affect health, and leaves every other candidate reapable. A
-// cancellation during the wait abandons the whole reap and is returned to the caller,
-// which is what keeps an interrupted scan from being reported as complete.
-func (rp *reaper) confirmOrphans(ctx context.Context, orphaned []string) ([]string, error) {
-	slog.Info(reapRecheckMsg,
-		"count", len(orphaned), "recheck_in", reapDeferral.String())
-	if err := waitBeforeReap(ctx, reapDeferral); err != nil {
-		// Shutdown inside the window: delete nothing further. Debug like the other
-		// interrupted paths here, because the error itself is returned and the caller
-		// reports the cancellation.
-		slog.Debug("orphan removal abandoned during shutdown before the confirming re-check",
-			"candidates", len(orphaned), "error", err)
-		return nil, err
-	}
-	confirmed := make([]string, 0, len(orphaned))
-	for _, rel := range orphaned {
-		cert := layout.CertForOutput(rel)
-		if !rp.src.pathAbsent(cert) {
-			// Named at the default level: this is the deletion this app decided NOT to
-			// make, and it is the only trace that the delay did its job.
-			slog.Info("keeping an output bundle whose certificate came back during the confirmation delay",
-				"path", rel, "input", cert)
-			continue
-		}
-		confirmed = append(confirmed, rel)
-	}
-	return confirmed, nil
-}
 
 // maxLoggedOrphans caps how many orphan paths one report names. The count is the
 // actionable number; the paths are a sample, and an unbounded list on a per-scan

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/cplieger/atomicfile/v2"
@@ -40,71 +41,163 @@ const outputPermRemediation = "check /output ownership and permissions for the U
 // A store does not close its root; the Scanner that opened it does.
 type store struct {
 	root *os.Root
-	// laxDirsReported dedupes the lax-output-directory WARN to once per directory
-	// per scan. The check is asked per bundle (isCurrent runs for every .crt), but
-	// the fact it reports is a property of the DIRECTORY, so a flat /output holding
-	// twenty certificates must not emit twenty identical records every scan. The
-	// store is constructed per Scanner.Run, so this lasts exactly one scan.
+	// laxDirsReported dedupes the per-directory output-permission records to once per
+	// directory per scan. The check is asked per bundle (isCurrent runs for every
+	// .crt), but the fact it reports is a property of the DIRECTORY, so a flat /output
+	// holding twenty certificates must not emit twenty identical records every scan.
+	// The store is constructed per Scanner.Run, so this lasts exactly one scan.
 	laxDirsReported map[string]struct{}
+	// dirRepairFailed records that some ancestor of some bundle is group- or
+	// world-writable and this app could not take that bit off it. It disables orphan
+	// reaping for the whole scan: a candidate under a directory another process can
+	// write can be renamed or replaced between the orphan walk and the unlink, so no
+	// deletion made from that walk is provable. Per-scan, like laxDirsReported.
+	dirRepairFailed bool
 }
 
 // laxDirMsg is the standing WARN for an /output directory more permissive than
-// pfxDirMode. It is the precondition every other output touch is confined against:
-// a group- or world-WRITABLE directory lets any other process on the shared mount
-// unlink a bundle or replace it with a symlink, and a world-TRAVERSABLE one exposes
-// the bundle names. This app creates the directory at pfxDirMode
+// pfxDirMode in a way that exposes NAMES rather than write authority: a 0755 root
+// lets any process on the shared mount list the bundle names and traverse to them,
+// which is worth naming and is not this app's call to change — an operator may have
+// widened it deliberately. This app creates the directory at pfxDirMode
 // (atomicfile.WithMkdirMode) and never revisits it, so a directory an operator or an
-// earlier deployment left lax is corrected and reported nowhere else — while the
-// README's own setup step (`mkdir -p ... && chown ...`) produces 0755 under the
-// default umask, and 0775 under a umask of 0002.
+// earlier deployment left lax is reported nowhere else — while the README's own setup
+// step (`mkdir -p ... && chown ...`) produces 0755 under the default umask.
+//
+// A group- or world-WRITE bit is a different fact with a different consequence and is
+// NOT reported here; see dirWriteBits and dirWriteRefusedMsg.
 const laxDirMsg = "the /output directory holding a pfx is more permissive than policy"
 
-// reportLaxDir warns when rel's parent directory carries a permission bit
-// pfxDirMode does not. Report-only on purpose: tightening a directory an operator
-// may have widened deliberately is a behaviour change, while naming it costs the
-// operator nothing and is the only signal that the confinement guarding a
-// private-key bundle rests on a directory anyone can write.
-func (s *store) reportLaxDir(rel string) {
+// dirWriteBits are the group and other WRITE bits on an output directory. They are
+// split out of "any bit beyond pfxDirMode" because they are the only ones that carry
+// write AUTHORITY: directory permissions govern unlink and rename, so a process
+// sharing the mount that holds one of these bits can replace a published, owner-only
+// PFX with key material of its own — pfxFileMode cannot defend a directory entry whose
+// parent is writable, and confinement inside os.Root does not preserve integrity
+// inside that root either. Every other extra bit exposes names or traversal only.
+const dirWriteBits = 0o022
+
+// dirWriteRefusedMsg is the WARN for a group/world-writable output directory this app
+// could not tighten: the chmod was refused (another UID owns the directory) or the
+// filesystem stored nothing (mount-forced modes). It is separate from laxDirMsg
+// because the consequence is different — a bundle published there can be replaced by
+// whoever holds that write bit — and so is what happens next: this app refuses to
+// publish into it rather than reporting a condition nothing acts on.
+const dirWriteRefusedMsg = "the /output directory holding a pfx is group- or world-writable and could not be tightened; refusing to write there"
+
+// dirWriteTightenedMsg is the record for the repair that DID take. Named at the
+// default level like every other output-tree mutation this app makes (a write, a
+// reaped temp, a removed orphan, a tightened bundle mode).
+const dirWriteTightenedMsg = "tightened a group- or world-writable /output directory"
+
+// errDirWriteUnstored marks a directory chmod the filesystem ACCEPTED and did not
+// store (mount-forced modes). Distinct from a refusal only in the diagnostic: neither
+// leaves a namespace this app is willing to publish a private key into.
+var errDirWriteUnstored = errors.New("the filesystem did not store the tightened directory mode")
+
+// enforceDirPerms inspects every ancestor directory of rel and splits the verdict by
+// CONSEQUENCE.
+//
+// A group- or world-WRITE bit (dirWriteBits) is repaired with a confined chmod and
+// verified by re-stat. When the repair is refused or does not take, this returns an
+// error: publishing a private-key bundle into a directory another UID can rewrite
+// would let that UID replace the bundle a downstream consumer then trusts, and no
+// rewrite of ours changes that, so the honest outcome is to refuse the write and say
+// so. The same failure also disables orphan reaping for the scan (dirRepairFailed),
+// because a candidate under such a directory can be swapped between the walk and the
+// unlink.
+//
+// Every other bit beyond pfxDirMode stays REPORT-ONLY (laxDirMsg): a 0755 root exposes
+// names and traversal, which is worth naming, but tightening a directory an operator
+// may have widened deliberately is their call and costs them a working deployment if
+// this app is wrong about it.
+func (s *store) enforceDirPerms(rel string) error {
 	// Every ancestor up to the mount root, not just the immediate parent: the leaf
 	// directory is app-created at pfxDirMode, so in the canonical nested layout
 	// (the output tree mirrors Caddy's certificates/<ca>/<domain>/ shape) the
-	// operator-created /output root - the README's `mkdir -p` case this WARN
+	// operator-created /output root - the README's `mkdir -p` case this check
 	// exists for - is reached only by walking up. path.Dir converges to "." on a
 	// root-relative slash path, so the loop always terminates.
 	for dir := path.Dir(rel); ; dir = path.Dir(dir) {
-		s.reportLaxDirAt(dir)
+		if err := s.enforceDirPermsAt(dir); err != nil {
+			return err
+		}
 		if dir == "." {
-			return
+			return nil
 		}
 	}
 }
 
-// reportLaxDirAt is reportLaxDir's per-directory half: one lstat, one verdict,
-// once per directory per scan.
-func (s *store) reportLaxDirAt(dir string) {
-	if _, done := s.laxDirsReported[dir]; done {
-		return
-	}
+// enforceDirPermsAt is enforceDirPerms' per-directory half: one lstat, one verdict.
+// The VERDICT is recomputed for every bundle — a repair this app could not make has to
+// refuse every write under that directory, not just the first — while the RECORD is
+// emitted once per directory per scan.
+func (s *store) enforceDirPermsAt(dir string) error {
 	fi, err := s.lstat(dir)
 	if err != nil || !fi.IsDir() {
 		// A directory that cannot be stat-ed or is not a directory is reported by the
 		// write path itself; this check adds nothing there.
+		return nil
+	}
+	perm := fi.Mode().Perm()
+	if perm&dirWriteBits == 0 {
+		s.reportLaxDirAt(dir, perm)
+		return nil
+	}
+	want := perm &^ dirWriteBits
+	// Same observe-after-chmod discipline as tightenMode: a chmod's return value says
+	// the request was accepted, not that the bits were kept.
+	got, chmodErr := s.chmodAndObserve(dir, want)
+	if chmodErr == nil && got&dirWriteBits == 0 {
+		if s.firstRecordFor(dir) {
+			slog.Info(dirWriteTightenedMsg,
+				"path", dir, "dir", s.root.Name(),
+				"from", perm.String(), "to", got.String())
+		}
+		return nil
+	}
+	cause := chmodErr
+	if cause == nil {
+		cause = fmt.Errorf("%w: mode is %s after chmod", errDirWriteUnstored, got.String())
+	}
+	s.dirRepairFailed = true
+	if s.firstRecordFor(dir) {
+		slog.Warn(dirWriteRefusedMsg,
+			"path", dir, "dir", s.root.Name(),
+			"mode", perm.String(), "want", want.String(),
+			"error", cause, "remediation", outputPermRemediation)
+	}
+	return fmt.Errorf("output directory %q is group- or world-writable: %w", dir, cause)
+}
+
+// reportLaxDirAt is the report-only half: a directory whose extra bits expose names or
+// traversal but grant no write authority, named once per directory per scan.
+func (s *store) reportLaxDirAt(dir string, perm os.FileMode) {
+	if perm&^pfxDirMode == 0 || !s.firstRecordFor(dir) {
 		return
+	}
+	// dir is root-relative, so it is "." for the flat /output the README's own setup step
+	// produces — the shape this WARN exists for. The root is named alongside it, as
+	// logOrphanWalkOutcome does for its directory-level records, so the operator is told
+	// which directory to chmod rather than being handed a bare dot.
+	slog.Warn(laxDirMsg,
+		"path", dir, "dir", s.root.Name(),
+		"mode", perm.String(), "want", os.FileMode(pfxDirMode).String(),
+		"remediation", outputPermRemediation)
+}
+
+// firstRecordFor reports whether dir has not been recorded yet on this scan, marking
+// it recorded. isCurrent runs for every .crt, so a flat /output holding twenty
+// certificates must not emit twenty identical directory records every scan.
+func (s *store) firstRecordFor(dir string) bool {
+	if _, done := s.laxDirsReported[dir]; done {
+		return false
 	}
 	if s.laxDirsReported == nil {
 		s.laxDirsReported = make(map[string]struct{})
 	}
 	s.laxDirsReported[dir] = struct{}{}
-	if perm := fi.Mode().Perm(); perm&^pfxDirMode != 0 {
-		// dir is root-relative, so it is "." for the flat /output the README's own setup step
-		// produces — the shape this WARN exists for. The root is named alongside it, as
-		// logOrphanWalkOutcome does for its directory-level records, so the operator is told
-		// which directory to chmod rather than being handed a bare dot.
-		slog.Warn(laxDirMsg,
-			"path", dir, "dir", s.root.Name(),
-			"mode", perm.String(), "want", os.FileMode(pfxDirMode).String(),
-			"remediation", outputPermRemediation)
-	}
+	return true
 }
 
 // writeFileInRoot is store.write's confined atomic write, indirected through a
@@ -125,6 +218,13 @@ var writeFileInRoot = atomicfile.WriteFileInRoot
 // by a hand-rolled MkdirAll here. WithMkdirMode creates the parent inside the
 // same confined root as the write, so mode and confinement cannot drift.
 func (s *store) write(ctx context.Context, rel string, pfx []byte) error {
+	// Re-asked here rather than trusted from isCurrent: this is the call that publishes
+	// the private key, and it is the one that must not land in a directory another UID
+	// can rewrite. It is cheap (one lstat per ancestor, records deduped per scan) and
+	// idempotent, and a repair that succeeded on the currency pass leaves nothing to do.
+	if err := s.enforceDirPerms(rel); err != nil {
+		return err
+	}
 	if _, err := writeFileInRoot(ctx, s.root, rel, pfx,
 		atomicfile.WithMode(pfxFileMode),
 		atomicfile.WithMkdirMode(pfxDirMode),
@@ -258,14 +358,9 @@ const (
 // isCurrent reports whether the output at rel is already the bundle want would
 // produce, by READING it rather than by remembering what was written.
 //
-// This replaces the in-memory fingerprint cache. The cache answered a narrower
-// question — "have these input bytes been converted during this process's
-// lifetime?" — which produced three defects at once: every restart reconverted
-// the whole tree with fresh KDF salts (churning mtimes and re-replicating every
-// bundle downstream), a PFX replaced or truncated out of band was never noticed,
-// and rotating PFX_PASSWORD changed nothing because the inputs had not changed.
-// Deriving currency from the output answers all three, and needs no persistent
-// state to survive a restart.
+// Reading the output keeps currency stable across process restarts and detects
+// out-of-band replacement, password rotation, and encoder-profile changes without
+// persisted state.
 //
 // Every "I cannot tell what is on disk" outcome resolves to stale: rewrite. That
 // covers a decode failure (Debug: a rotated password, a truncated or foreign file)
@@ -297,8 +392,14 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 	wantEncoder convert.EncoderType, password string,
 ) (bool, staleCause, error) {
 	// Asked before the bundle's own lstat so it covers the absent-bundle arm too: the
-	// directory is lax whether or not a prior bundle sits in it.
-	s.reportLaxDir(rel)
+	// directory is lax whether or not a prior bundle sits in it. A group- or
+	// world-writable ancestor this app could not tighten is returned as an error
+	// rather than reported, because the currency answer would be moot: whatever this
+	// scan decides about the bundle, publishing one into that namespace lets another
+	// UID replace it.
+	if err := s.enforceDirPerms(rel); err != nil {
+		return false, staleOrdinary, err
+	}
 	fi, err := s.lstat(rel)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -689,69 +790,90 @@ func (s *store) readBoundedPFX(ctx context.Context, rel string) ([]byte, error) 
 
 // --- Output lifecycle: the /output half ---
 //
-// The reap POLICY — the vetoes, the confirmation delay, the mode ranking and the
-// operator narration — lives in reap.go on *reaper, which depends on this store and
-// on the input source because the claim behind a deletion spans both trees. What
-// stays here is what that policy asks OF the output tree: enumerating the bundles
-// whose input is absent, and removing a confirmed one.
+// The reap POLICY — the vetoes, the confirmation delay, the mode ranking, which
+// enumerated output counts as an orphan, and the operator narration — lives in reap.go
+// on *reaper, which depends on this store and on the input source because the claim
+// behind a deletion spans both trees. What stays here is what that policy asks OF the
+// output tree: enumerating the bundles this app owns, and removing a confirmed one.
 
-// orphans lists outputs under the store whose input pair is absent, as
-// root-relative paths in walk order.
+// listOutputs lists every path under the store matching the app's OWN output shape, as
+// root-relative paths in walk order, plus whether this walk saw the tree completely
+// enough for a deletion decision to rest on it.
 //
-// seen is the set of input .crt paths a COMPLETE walk found. Only paths matching
-// the app's own output shape are considered, so a file the app would never have
-// written is never a deletion candidate.
-func (s *store) orphans(ctx context.Context, seen map[string]struct{}) (found []string, safe bool, err error) {
-	safe = true
-	var unreadable, symlinked int
-	walkErr := fs.WalkDir(s.root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
-		// Same per-entry cancellation contract the input walk and the stale-temp
-		// sweep already honour: this walk runs on the shutdown path, because the
-		// scan is driven synchronously from the watcher's onChange callback.
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		if err != nil {
-			if rel == "." {
-				return err
-			}
-			// Debug per path, one aggregate Warn below: the same two-level contract
-			// the input walk and the stale-temp sweep use. This recurs on every scan
-			// for a persistent misconfiguration, so naming each path at the default
-			// level is a permanent log stream for a condition already reported.
-			slog.Debug("skipping unreadable output path while looking for orphans", "path", rel, "error", err)
-			unreadable++
-			safe = false
-			return nil
-		}
-		// A symlink anywhere in the output tree makes this walk and the WRITE path
-		// disagree about where a bundle lives: writes resolve through *os.Root,
-		// which follows a symlink that stays inside the root, while fs.WalkDir does
-		// not follow symlinks at all. So a bundle written through a symlinked
-		// directory is enumerated here under its PHYSICAL path, whose derived input
-		// name is not in `seen`, and it reads as an orphan the same scan that
-		// created it. Refuse to reap rather than try to reconcile two namespaces.
-		if d.Type()&fs.ModeSymlink != 0 {
-			slog.Debug("output tree contains a symlink; orphan removal is disabled for this scan", "path", rel)
-			symlinked++
-			safe = false
-			return nil
-		}
-		if d.IsDir() || !layout.IsOutput(rel) {
-			return nil
-		}
-		// layout owns both directions of the naming contract, so the reverse
-		// derivation cannot drift from the forward one used at write time.
-		if _, ok := seen[layout.CertForOutput(rel)]; !ok {
-			found = append(found, rel)
-		}
-		return nil
-	})
-	if walkErr != nil {
-		return nil, false, fmt.Errorf("walk output tree: %w", walkErr)
+// Restricting the list to layout.IsOutput paths is the output-tree half of the
+// deletion rule and belongs here: a file this app would never have written is never a
+// candidate. WHICH of these outputs has no input is not this function's call — that
+// comparison spans both trees, so it stays with the rest of the deletion-admission
+// rule in reap.go.
+func (s *store) listOutputs(ctx context.Context) (found []string, safe bool, err error) {
+	walk := outputWalk{ctx: ctx, safe: true}
+	if err := fs.WalkDir(s.root.FS(), ".", walk.visit); err != nil {
+		return nil, false, fmt.Errorf("walk output tree: %w", err)
 	}
-	s.logOrphanWalkOutcome(unreadable, symlinked)
-	return found, safe, nil
+	if s.dirRepairFailed {
+		// An output directory another process can write makes every candidate under it
+		// replaceable between this walk and the unlink, so nothing found here is
+		// provably orphaned. dirWriteRefusedMsg already named the directory.
+		walk.safe = false
+	}
+	s.logOrphanWalkOutcome(walk.unreadable, walk.symlinked)
+	return walk.found, walk.safe, nil
+}
+
+// outputWalk is listOutputs' visitor state: the candidate list plus the two
+// deletion-safety counters and the verdict they feed. It exists so the walk body is a
+// named method with explicit state rather than a closure mutating five captured
+// variables — the traversal control, the safety accounting, the diagnostics and the
+// candidate collection are the same branches either way, but the state a deletion
+// decision rests on is now spelled out as fields.
+type outputWalk struct {
+	ctx        context.Context
+	found      []string
+	unreadable int
+	symlinked  int
+	safe       bool
+}
+
+// visit is listOutputs' WalkDir callback: one entry, one verdict.
+func (w *outputWalk) visit(rel string, d fs.DirEntry, err error) error {
+	// Same per-entry cancellation contract the input walk and the stale-temp
+	// sweep already honour: this walk runs on the shutdown path, because the
+	// scan is driven synchronously from the watcher's onChange callback.
+	if ctxErr := w.ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if err != nil {
+		if rel == "." {
+			return err
+		}
+		// Debug per path, one aggregate Warn from logOrphanWalkOutcome: the same
+		// two-level contract the input walk and the stale-temp sweep use. This recurs
+		// on every scan for a persistent misconfiguration, so naming each path at the
+		// default level is a permanent log stream for a condition already reported.
+		slog.Debug("skipping unreadable output path while looking for orphans", "path", rel, "error", err)
+		w.unreadable++
+		w.safe = false
+		return nil
+	}
+	// A symlink anywhere in the output tree makes this walk and the WRITE path
+	// disagree about where a bundle lives: writes resolve through *os.Root,
+	// which follows a symlink that stays inside the root, while fs.WalkDir does
+	// not follow symlinks at all. So a bundle written through a symlinked
+	// directory is enumerated here under its PHYSICAL path, whose derived input
+	// name is not in the scan's enumeration, and it reads as an orphan the same
+	// scan that created it. Refuse to reap rather than try to reconcile two
+	// namespaces.
+	if d.Type()&fs.ModeSymlink != 0 {
+		slog.Debug("output tree contains a symlink; orphan removal is disabled for this scan", "path", rel)
+		w.symlinked++
+		w.safe = false
+		return nil
+	}
+	if d.IsDir() || !layout.IsOutput(rel) {
+		return nil
+	}
+	w.found = append(w.found, rel)
+	return nil
 }
 
 // logOrphanWalkOutcome emits the orphan walk's single aggregate Warn.
@@ -785,36 +907,125 @@ func (s *store) removeOrphans(ctx context.Context, orphaned []string) (int, erro
 				"removed", deleted, "remaining", len(orphaned)-deleted)
 			return deleted, err
 		}
-		// The walk classified this entry up to reapDeferral ago, and only a REGULAR
-		// file is a bundle this app wrote. Re-check through the root right before the
-		// unlink: it is the same durability question confirmOrphans asks of the input
-		// side, and it is what makes the README's promise ("sync only ever removes
-		// files matching this app's own output shape") true of a non-regular occupant
-		// and of one swapped in after the walk.
-		fi, statErr := s.lstat(rel)
-		switch {
-		case errors.Is(statErr, fs.ErrNotExist):
-			slog.Debug("orphaned output vanished before removal", "path", rel)
-			continue
-		case statErr != nil:
-			slog.Warn("could not re-check an orphaned output before removing it; leaving it in place",
-				"path", rel, "error", statErr, "remediation", outputPermRemediation)
-			continue
-		case !fi.Mode().IsRegular():
-			slog.Warn("orphaned output path is not a regular file; leaving it in place",
-				"path", rel, "mode", fi.Mode().String(),
-				"remediation", "remove whatever occupies the output path by hand; this app deletes only the regular files it writes")
-			continue
+		if s.removeOrphan(rel) {
+			deleted++
 		}
-		if err := s.root.Remove(rel); err != nil {
-			slog.Warn("could not remove orphaned output", "path", rel, "error", err,
-				"remediation", outputPermRemediation)
-			continue
-		}
-		// Every deletion is named. Removing key material without an audit line is
-		// not acceptable even when it is correct.
-		slog.Info("removed orphaned output whose input is gone", "path", rel)
-		deleted++
 	}
 	return deleted, nil
+}
+
+// pinRedirectedMsg is the WARN for a candidate whose own output directory could not be
+// pinned to the physical directory the orphan walk classified: a component that is a
+// symlink or not a directory at all, or one that changed identity while it was being
+// opened. The walk already vetoes reaping on any symlink it SEES, but that snapshot is
+// taken before the confirmation delay, so this is the same rule applied at unlink time.
+const pinRedirectedMsg = "could not pin the output directory of an orphaned bundle; leaving it in place"
+
+// removeOrphan re-checks one confirmed orphan and unlinks it through a PINNED parent
+// root, reporting whether it was deleted.
+//
+// The parent root is what makes the unlink safe. os.Root deliberately follows a
+// symlink component that stays inside the root, so a path string re-checked with
+// Lstat and then removed with Remove can address two different files if an ANCESTOR
+// is swapped in between — and reapDeferral leaves a 30-second window for exactly that:
+// replacing an approved candidate's parent directory with a symlink to a live
+// directory would make this code stat and unlink a live bundle while the input
+// confirmation was asked about the approved path. Descending component by component
+// (pinnedParent) and then naming only the BASENAME removes every ancestor from the
+// remove path, so no in-root symlink can redirect it, while the open root keeps the
+// directory pinned even if it is renamed afterwards.
+func (s *store) removeOrphan(rel string) bool {
+	parent, closeParent, err := s.pinnedParent(rel)
+	if err != nil {
+		slog.Warn(pinRedirectedMsg, "path", rel, "error", err,
+			"remediation", "mount the real output directory instead of linking to it, and check /output for paths replaced while the scan was running")
+		return false
+	}
+	defer closeParent()
+	// The walk classified this entry up to reapDeferral ago, and only a REGULAR
+	// file is a bundle this app wrote. Re-check through the pinned parent right
+	// before the unlink: it is the same durability question reapConfirmed asks of
+	// the input side, and it is what makes the README's promise ("sync only ever
+	// removes files matching this app's own output shape") true of a non-regular
+	// occupant and of one swapped in after the walk.
+	base := path.Base(rel)
+	fi, statErr := parent.Lstat(base)
+	switch {
+	case errors.Is(statErr, fs.ErrNotExist):
+		slog.Debug("orphaned output vanished before removal", "path", rel)
+		return false
+	case statErr != nil:
+		slog.Warn("could not re-check an orphaned output before removing it; leaving it in place",
+			"path", rel, "error", statErr, "remediation", outputPermRemediation)
+		return false
+	case !fi.Mode().IsRegular():
+		slog.Warn("orphaned output path is not a regular file; leaving it in place",
+			"path", rel, "mode", fi.Mode().String(),
+			"remediation", "remove whatever occupies the output path by hand; this app deletes only the regular files it writes")
+		return false
+	}
+	if err := parent.Remove(base); err != nil {
+		slog.Warn("could not remove orphaned output", "path", rel, "error", err,
+			"remediation", outputPermRemediation)
+		return false
+	}
+	// Every deletion is named. Removing key material without an audit line is
+	// not acceptable even when it is correct.
+	slog.Info("removed orphaned output whose input is gone", "path", rel)
+	return true
+}
+
+// pinnedParent opens rel's parent directory as an *os.Root whose physical identity
+// has been checked component by component: every component must be a real DIRECTORY
+// (Lstat, so a symlink is refused rather than followed), and the root opened for it
+// must still address the directory that was inspected (os.SameFile against the opened
+// root's own ".").
+//
+// The returned close is the caller's to call, and is a no-op for a bundle sitting
+// directly under the output root (the flat /output layout), where the store's own root
+// already IS the pinned parent.
+func (s *store) pinnedParent(rel string) (*os.Root, func(), error) {
+	current, closeCurrent := s.root, func() {}
+	dir := path.Dir(rel)
+	if dir == "." {
+		return current, closeCurrent, nil
+	}
+	for name := range strings.SplitSeq(dir, "/") {
+		next, err := pinChild(current, name)
+		closeCurrent()
+		if err != nil {
+			return nil, nil, err
+		}
+		current, closeCurrent = next, func() { _ = next.Close() }
+	}
+	return current, closeCurrent, nil
+}
+
+// pinChild opens one directory component of parent as its own root, refusing anything
+// that is not a real directory and anything whose identity changed between the Lstat
+// and the open. Split out of pinnedParent so the descent reads as one step per
+// component rather than carrying four failure arms inline.
+func pinChild(parent *os.Root, name string) (*os.Root, error) {
+	fi, err := parent.Lstat(name)
+	if err != nil {
+		return nil, fmt.Errorf("inspect output directory %q: %w", name, err)
+	}
+	if !fi.IsDir() {
+		// A symlink lands here too, which is the point: os.Root would follow it.
+		return nil, fmt.Errorf("output path component %q is not a directory (mode %s)", name, fi.Mode().String())
+	}
+	next, err := parent.OpenRoot(name)
+	if err != nil {
+		return nil, fmt.Errorf("open output directory %q: %w", name, err)
+	}
+	opened, err := next.Stat(".")
+	if err != nil {
+		_ = next.Close()
+		return nil, fmt.Errorf("confirm output directory %q: %w", name, err)
+	}
+	if !os.SameFile(fi, opened) {
+		_ = next.Close()
+		return nil, fmt.Errorf("output directory %q changed while it was being opened", name)
+	}
+	return next, nil
 }

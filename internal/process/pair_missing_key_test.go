@@ -200,3 +200,95 @@ func TestScannerRun_reports_a_key_replaced_mid_scan_as_transient_then_names_a_ke
 			bundle, statErr)
 	}
 }
+
+// TestScannerRun_grants_the_vanished_key_grace_after_a_failed_write is h-f5's
+// regression: the wholeness evidence completedPair reads must be committed by the READ,
+// not by whatever the output side does afterwards.
+//
+// The pair here reads whole — certificate and sibling key both, through the confined
+// input root — and then fails on an ordinary output write (a directory occupies its
+// bundle path, so the atomic rename cannot land). Nothing about that failure says the
+// key was absent, so when the key disappears on the next scan the operator must see the
+// same one-scan transient grace every other previously-whole pair gets: Vanished, at
+// Debug, with no key-renaming aggregate. Committing the fact from the diagnostic-
+// signature writers instead made this pair read as a never-paired Orphan, which reports
+// a renaming problem for a key that was demonstrably there.
+//
+// The scan after that must still name the genuine orphan, so the grace stays one scan
+// wide. OUTPUT_LIFECYCLE=keep: this is about the input-side taxonomy, and reaping has
+// its own tests. Runs serially: it swaps slog.Default().
+func TestScannerRun_grants_the_vanished_key_grace_after_a_failed_write(t *testing.T) {
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+	// Pinned for the same reason the test above pins it: reportLaxDir's WARN is fixture
+	// noise that depends on the host's inherited ACLs.
+	if err := os.Chmod(outRoot, pfxDirMode); err != nil {
+		t.Fatalf("setup: Chmod(outRoot): %v", err)
+	}
+	for _, name := range []string{"blocked", "stable"} {
+		certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, name+".example.com", "ecdsa")
+		if err := os.WriteFile(filepath.Join(certsRoot, name+".crt"), certPEM, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(certsRoot, name+".key"), keyPEM, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A DIRECTORY at the bundle path: the pair is read, analysed and encoded, and only
+	// then does the write fail. An ordinary conversion failure with nothing wrong on the
+	// /input side, which is the whole point — the read succeeded.
+	if err := os.Mkdir(filepath.Join(outRoot, "blocked.pfx"), pfxDirMode); err != nil {
+		t.Fatalf("setup: Mkdir(blocked.pfx): %v", err)
+	}
+	scanner := New(&Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+		Lifecycle: outputpolicy.LifecycleKeep,
+	})
+
+	res1, err := scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("initial Run = %v, want nil", err)
+	}
+	if res1.Failed != 1 || res1.Orphan != 0 {
+		t.Fatalf("initial Run = %+v, want Failed 1 Orphan 0: the fixture must fail on the WRITE while both inputs read cleanly", res1)
+	}
+
+	// The renewal window, on the pair whose write failed.
+	if err := os.Remove(filepath.Join(certsRoot, "blocked.key")); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := captureLogs(t)
+	res2, err := scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run(key gone after a failed write) = %v, want nil", err)
+	}
+	if res2.Vanished != 1 || res2.Orphan != 0 {
+		t.Errorf("Run(key gone after a failed write) = %+v, want Vanished 1 Orphan 0: this process read the pair whole, so the key's disappearance is the transient race no matter what the write did",
+			res2)
+	}
+	if got := logs.CountLevel(slog.LevelDebug, vanishedKeyMsg); got != 1 {
+		t.Errorf("Run(key gone after a failed write) logged %q, want %q once at DEBUG", logs.Messages(), vanishedKeyMsg)
+	}
+	if logs.Contains(missingKeyAggregate) {
+		t.Errorf("Run(key gone after a failed write) logged %q, want no missing-key aggregate: its remediation tells the operator to rename a key that was demonstrably there",
+			logs.Messages())
+	}
+
+	// One scan later the key is still gone: the grace is spent and this is a genuine
+	// missing key again.
+	logs = captureLogs(t)
+	res3, err := scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run(key still gone) = %v, want nil", err)
+	}
+	if res3.Orphan != 1 || res3.Vanished != 0 {
+		t.Errorf("Run(key still gone) = %+v, want Orphan 1 Vanished 0: the grace is one scan wide, not permanent", res3)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, missingKeyAggregate); got != 1 {
+		t.Errorf("Run(key still gone) logged %q, want %q once at WARN", logs.Messages(), missingKeyAggregate)
+	}
+}

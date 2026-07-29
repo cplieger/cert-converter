@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/layout"
@@ -99,11 +100,25 @@ var (
 var newFSWatcher = fsnotify.NewWatcher
 
 // Watcher monitors a directory tree for cert/key changes and invokes a callback.
+//
+// Field order is govet fieldalignment's: the pointer-bearing fields lead so the
+// GC scans 24 bytes rather than the whole struct.
 type Watcher struct {
 	onChange func(ctx context.Context)
+
+	// watched mirrors the fsnotify registration set, so membership is a map
+	// lookup rather than a scan of fsnotify's own list (see watchSetHas). It is
+	// mutated only from the goroutine running Run, but a test may drive the
+	// event helpers directly while a loop runs, so watchedMu (below) keeps that
+	// honest.
+	watched map[string]struct{}
+
 	root     string
 	debounce time.Duration
 	fallback time.Duration
+
+	// watchedMu guards watched.
+	watchedMu sync.Mutex
 }
 
 // Option configures a Watcher.
@@ -275,6 +290,9 @@ func (w *Watcher) tryAttachWatchSet(ctx context.Context) (*fsnotify.Watcher, att
 		}
 		return nil, stageConstruct, err
 	}
+	// The new watcher's registration set is empty, so the mirror the per-event
+	// membership guard reads must start empty with it.
+	w.resetWatchSet()
 	if addErr := w.addWatchDirs(ctx, fw, w.root); addErr != nil {
 		fw.Close() // release fd + readEvents goroutine before long-lived fallback
 		if ctx.Err() != nil {
@@ -391,26 +409,34 @@ func (w *Watcher) visitWatchPath(
 		return nil
 	}
 	if !d.IsDir() {
-		if path == root {
-			// A non-directory ROOT is fatal, not a skip: filepath.WalkDir Lstats
-			// its root and does not follow it, so a bind-mounted file or a
-			// symlinked /input walks exactly one non-directory entry, registers no
-			// watches, and would otherwise return nil - leaving Run to log
-			// "fsnotify active" with an empty watch set and park in a loop no event
-			// can reach, while the scan (os.OpenRoot DOES follow a symlinked root)
-			// keeps the health marker green. Reporting it lets Run degrade to
-			// polling, or return ErrWatchLost when the fallback is disabled too.
-			if d.Type()&fs.ModeSymlink != 0 {
-				return fmt.Errorf("watch root %q is a symlink; the watch-set walk Lstats the root and does not descend it, so no directory under the target would be watched - bind-mount the target directory at %s instead", path, path)
-			}
-			return fmt.Errorf("watch root %q is not a directory", path)
-		}
-		return nil
+		return validateWatchRootEntry(root, path, d)
 	}
 	if addErr := watcher.Add(path); addErr != nil {
 		return w.handleWatchAddError(root, path, addErr)
 	}
+	w.recordWatch(path)
 	return nil
+}
+
+// validateWatchRootEntry applies the non-directory policy: a regular file below
+// the root is simply not registered (it is watched through its parent), but a
+// non-directory ROOT is fatal, not a skip.
+//
+// filepath.WalkDir Lstats its root and does not follow it, so a bind-mounted file
+// or a symlinked /input walks exactly one non-directory entry, registers no
+// watches, and would otherwise return nil - leaving Run to log "fsnotify active"
+// with an empty watch set and park in a loop no event can reach, while the scan
+// (os.OpenRoot DOES follow a symlinked root) keeps the health marker green.
+// Reporting it lets Run degrade to polling, or return ErrWatchLost when the
+// fallback is disabled too.
+func validateWatchRootEntry(root, path string, d fs.DirEntry) error {
+	if path != root {
+		return nil
+	}
+	if d.Type()&fs.ModeSymlink != 0 {
+		return fmt.Errorf("watch root %q is a symlink; the watch-set walk Lstats the root and does not descend it, so no directory under the target would be watched - bind-mount the target directory at %s instead", path, path)
+	}
+	return fmt.Errorf("watch root %q is not a directory", path)
 }
 
 // handleWatchAddError applies addWatchDirs' walk-error policy to a failed watch
@@ -450,14 +476,52 @@ func (w *Watcher) insideRoot(path string) bool {
 // restores the rest (never, with the fallback disabled: a descendant whose Add
 // failed and which gets no event of its own then stays outside the watch set for
 // the life of the process).
-func watchSetHas(watcher *fsnotify.Watcher, path string) bool {
-	clean := filepath.Clean(path)
-	for _, watched := range watcher.WatchList() {
-		if filepath.Clean(watched) == clean {
-			return true
-		}
+//
+// The answer comes from this package's own mirror of the registration set, not
+// from fsnotify.Watcher.WatchList: WatchList locks the watcher and materializes
+// every registered pathname on every call, so answering a per-event membership
+// question with it makes a burst of N sibling directory creations cost O(N^2)
+// path comparisons and allocation in the same synchronous path that drains the
+// event channel. A writer to the watched tree controls N, so the guard against
+// unbounded walk work must not itself scale with the set it guards.
+func (w *Watcher) watchSetHas(path string) bool {
+	w.watchedMu.Lock()
+	defer w.watchedMu.Unlock()
+	_, ok := w.watched[filepath.Clean(path)]
+	return ok
+}
+
+// recordWatch notes a registration this package made, so watchSetHas can answer
+// from the mirror. Only a SUCCESSFUL watcher.Add records: a directory whose Add
+// failed is not watched, and recording it would suppress the re-attach the
+// permission-repair (Chmod) and re-sync paths exist to perform.
+func (w *Watcher) recordWatch(path string) {
+	w.watchedMu.Lock()
+	defer w.watchedMu.Unlock()
+	if w.watched == nil {
+		w.watched = make(map[string]struct{})
 	}
-	return false
+	w.watched[filepath.Clean(path)] = struct{}{}
+}
+
+// forgetWatch drops a path whose watch is gone. The kernel discards the watch
+// with the directory itself, so a Remove/Rename that is not forgotten would make
+// a recreated directory look watched and never be re-attached, silently missing
+// every renewal underneath it.
+func (w *Watcher) forgetWatch(path string) {
+	w.watchedMu.Lock()
+	defer w.watchedMu.Unlock()
+	delete(w.watched, filepath.Clean(path))
+}
+
+// resetWatchSet empties the mirror for a fresh fsnotify watcher. Every attach
+// constructs a NEW watcher whose registration set starts empty (Run's initial
+// attach and pollTick's upgrade both do), so a path recorded for the previous,
+// now-closed watcher must not be reported as watched under the new one.
+func (w *Watcher) resetWatchSet() {
+	w.watchedMu.Lock()
+	defer w.watchedMu.Unlock()
+	w.watched = make(map[string]struct{})
 }
 
 // --- Event classification ---
@@ -540,7 +604,7 @@ func (w *Watcher) handlePathEvent(
 			"path", event.Name, "root", w.root, "fallback_scan", w.fallbackStatus())
 		return true
 	}
-	if watchSetHas(watcher, event.Name) {
+	if w.watchSetHas(event.Name) {
 		return true // already watched: nothing to re-attach, the debounced rescan covers content
 	}
 	if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
@@ -688,6 +752,24 @@ func (w *Watcher) handleEventRecv(
 	if !ok {
 		return errEventsChannelClosed
 	}
+	// Cancellation outranks an ordinary event, exactly as it does in every timer,
+	// attach, and channel-loss arm of this loop: watchLoop's select picks a ready
+	// case at random, so a queued Remove/Rename or Create can still land here after
+	// ctx.Done is ready. The loop exits on its next selection, so the only thing a
+	// re-attach or a scheduled scan could produce is a watch-degradation WARN
+	// announcing recovery that is not going to happen. The closed-channel taxonomy
+	// above stays ahead of it: that is a fact about the watcher, not work to skip.
+	if ctx.Err() != nil {
+		return nil
+	}
+	// Forget before the root-loss handler runs: the kernel drops the watch along
+	// with the directory, so an unforgotten path would look watched and never be
+	// re-attached if it comes back. Doing it here rather than in handleFsEvent's
+	// Remove/Rename arm is what lets a successful root re-attach below record the
+	// root (and its subtree) again in the same event.
+	if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
+		w.forgetWatch(event.Name)
+	}
 	if !w.handleRootWatchLoss(ctx, watcher, event) {
 		return errRootWatchRemoved
 	}
@@ -708,6 +790,12 @@ func (w *Watcher) handleErrorRecv(
 ) *LostError {
 	if !ok {
 		return errErrorsChannelClosed
+	}
+	// Same cancellation precedence as handleEventRecv: a queued watcher error
+	// selected against a ready ctx.Done would otherwise log a degradation WARN and
+	// schedule a re-sync for a loop that is already exiting.
+	if ctx.Err() != nil {
+		return nil
 	}
 	if st.handleWatcherError(err) {
 		// The dropped events may have included the Create of a new directory, which

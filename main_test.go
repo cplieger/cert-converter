@@ -883,3 +883,37 @@ func TestRun_refuses_to_start_when_a_required_volume_is_missing(t *testing.T) {
 		}
 	}
 }
+
+// TestWarnOutputNotWritable_reports_failed_probe pins the startup probe's only
+// output: volumesReady proves /output is a directory this UID can OPEN, so this
+// WARN is the sole immediate signal that it cannot be WRITTEN. A scan whose
+// bundles are all current writes nothing and still reports healthy, so without
+// this record the misconfiguration surfaces only at the next renewal.
+//
+// The probe is failed with a regular file rather than a mode-0500 directory
+// because the tests can run as uid 0, which bypasses EACCES; a non-directory
+// makes os.CreateTemp fail for everyone. Not parallel: it swaps the
+// process-global slog default.
+func TestWarnOutputNotWritable_reports_failed_probe(t *testing.T) {
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocked, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := capture.Default(t)
+
+	warnOutputNotWritable(blocked)
+
+	const msg = "the output volume is not writable by the running UID"
+	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
+		t.Fatalf("warnOutputNotWritable(%q) logged %d WARN records matching %q, want 1 (logs %v)",
+			blocked, n, msg, logs.Messages())
+	}
+	if !logs.HasAttr(msg, "path", blocked) {
+		t.Errorf("warnOutputNotWritable(%q) did not identify the unusable output path (logs %v)",
+			blocked, logs.Messages())
+	}
+	if !logs.AttrContains(msg, "remediation", "chown the host directory") {
+		t.Errorf("warnOutputNotWritable(%q) gave no ownership remediation (logs %v)",
+			blocked, logs.Messages())
+	}
+}
