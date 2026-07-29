@@ -1,11 +1,15 @@
 package process
 
 import (
+	"context"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
+	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/slogx/capture"
@@ -300,5 +304,101 @@ func TestObservationLog_forgetPair_spends_wholeness_without_resetting_deduplicat
 	}
 	if !o.completedPair("tls.crt") {
 		t.Error("completedPair after the pair was re-noted = false, want true")
+	}
+}
+
+
+// TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unwritable
+// pins the once-per-change rule on the OTHER steady-state arm: a bundle whose bytes
+// are already correct, whose mode repair was refused, and whose repairing rewrite the
+// output directory refused too (statusUnwritable). That condition recurs on every scan
+// for as long as the operator leaves /output as it is, so emitting the pair's input
+// observations before the write outcome is known re-named the same malformed input on
+// every fsnotify event and every fallback tick. The standing condition itself keeps its
+// own per-scan WARN (unwritableBundleMsg): the operator must keep being told /output is
+// foreign-owned, without the input diagnostic riding along.
+//
+// Serial: it swaps slog.Default(), the chmod seam and the write seam.
+func TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unwritable(t *testing.T) {
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+
+	leafPEM, keyPEM, caPEM, chainPEM := testcerts.GenerateCertChain(t)
+	crtPath := filepath.Join(certsRoot, "chain.crt")
+	if err := os.WriteFile(crtPath, chainPEM, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(certsRoot, "chain.key"), keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanner := New(&Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+	})
+	if res, err := scanner.Run(t.Context()); err != nil || res.Converted != 1 {
+		t.Fatalf("setup: initial Run = %+v, %v, want Converted 1 and nil", res, err)
+	}
+
+	// Root-first, same certificates: the bundle on disk stays the right bundle (so the
+	// mode is the only reason to rewrite), while the input now carries a WARN-level
+	// observation this scan has never reported.
+	rootFirst := make([]byte, 0, len(caPEM)+len(leafPEM))
+	rootFirst = append(rootFirst, caPEM...)
+	rootFirst = append(rootFirst, leafPEM...)
+	if err := os.WriteFile(crtPath, rootFirst, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pfxPath := filepath.Join(outRoot, "chain.pfx")
+	if err := os.Chmod(pfxPath, 0o644); err != nil {
+		t.Fatalf("setup: Chmod: %v", err)
+	}
+	prevChmod := chmodInRoot
+	chmodInRoot = func(_ *os.Root, name string, _ os.FileMode) error {
+		return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EPERM}
+	}
+	t.Cleanup(func() { chmodInRoot = prevChmod })
+	prevWrite := writeFileInRoot
+	writeFileInRoot = func(context.Context, *os.Root, string, []byte,
+		...atomicfile.Option,
+	) (atomicfile.Result, error) {
+		return atomicfile.Result{}, &fs.PathError{Op: "openat", Path: "chain.pfx", Err: syscall.EACCES}
+	}
+	t.Cleanup(func() { writeFileInRoot = prevWrite })
+
+	logs := captureLogs(t)
+	res, err := scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run(unwritable output) = error %v, want nil", err)
+	}
+	if res.Unwritable != 1 || res.Failed != 0 {
+		t.Fatalf("Run(unwritable output) = %+v, want Unwritable 1 Failed 0: the bundle's bytes are correct,"+
+			" so this is the health-neutral arm", res)
+	}
+	if got := countObservation(logs, convert.ObsLeafNotFirst); got != 1 {
+		t.Errorf("Run(unwritable output) logged %d leaf-not-first observations, want exactly 1: a new input"+
+			" condition is named once", got)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, unwritableBundleMsg); got != 1 {
+		t.Errorf("Run(unwritable output) logged %q at WARN %d times, want 1", unwritableBundleMsg, got)
+	}
+
+	// Steady state: same inputs, same refusal. The condition repeats, the input
+	// diagnostic does not.
+	res, err = scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run(second unwritable scan) = error %v, want nil", err)
+	}
+	if res.Unwritable != 1 {
+		t.Errorf("Run(second unwritable scan) = %+v, want Unwritable 1 unchanged", res)
+	}
+	if got := countObservation(logs, convert.ObsLeafNotFirst); got != 1 {
+		t.Errorf("two unwritable scans logged %d leaf-not-first observations in total, want 1: an"+
+			" already-reported input condition must not re-emit while the output stays foreign-owned", got)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, unwritableBundleMsg); got != 2 {
+		t.Errorf("two unwritable scans logged %q at WARN %d times, want 2 (one per scan): the standing"+
+			" condition keeps its own diagnostic", unwritableBundleMsg, got)
 	}
 }

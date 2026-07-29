@@ -2154,3 +2154,49 @@ func TestAnalyse_reports_an_unproven_emitted_chain_edge(t *testing.T) {
 			got.Observations(), convert.ObsChainEdgeUnprovenIssuer)
 	}
 }
+
+
+// TestAnalyse_treats_a_reencoded_self_issued_certificate_as_its_own_root pins the
+// positive direction of the decoded self-issuance rule (checkSelfSigned): a
+// certificate whose own subject and issuer differ only in a permitted
+// DirectoryString encoding is self-signed, so the additive fallback stays quiet
+// and an unrelated eligible bystander is EXCLUDED rather than kept. Under the
+// byte-only rule this bundle read as rootless: ObsChainUnverified fired and the
+// bystander was appended to the chain.
+func TestAnalyse_treats_a_reencoded_self_issued_certificate_as_its_own_root(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	key := testcerts.NewECDSAKey(t)
+	tmpl := unverifiableCA(860, "Self Encoding Root CA", notBefore, notBefore.Add(48*time.Hour))
+	// Sign against a view of the SAME template whose subject is the UTF8String
+	// encoding, so RawIssuer is a permitted re-encoding of RawSubject.
+	_, selfPEM, selfCert := testcerts.Mint(t, tmpl, &key.PublicKey,
+		utf8SubjectView(tmpl, "Self Encoding Root CA"), key)
+	if bytes.Equal(selfCert.RawSubject, selfCert.RawIssuer) {
+		t.Fatal("setup: subject and issuer encode identically, so the branch under test is not reached")
+	}
+
+	strangerKey := testcerts.NewECDSAKey(t)
+	_, strangerPEM, _ := testcerts.Mint(t, unverifiableCA(861, "Unrelated Bystander CA", notBefore, notBefore.Add(48*time.Hour)),
+		&strangerKey.PublicKey, nil, strangerKey)
+
+	got, err := convert.Analyse(concatPEM(selfPEM, strangerPEM), testcerts.KeyPEM(t, key))
+	if err != nil {
+		t.Fatalf("Analyse = error %v, want nil", err)
+	}
+	if len(got.Chain()) != 0 {
+		t.Errorf("chain = %v, want empty: a self-issued certificate is its own root", chainSerials(got.Chain()))
+	}
+	if len(got.Extra()) != 1 || got.Extra()[0].SerialNumber.Cmp(big.NewInt(861)) != 0 {
+		t.Fatalf("Extra = %v, want the bystander alone", chainSerials(got.Extra()))
+	}
+	if !hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
+		t.Errorf("observations = %v, want %q: the bystander's exclusion is never silent",
+			got.Observations(), convert.ObsExtraCertsExcluded)
+	}
+	if hasObservation(got.Observations(), convert.ObsChainUnverified) {
+		t.Errorf("observations = %v, want no %q: the identity is proven self-signed, so the additive fallback must not fire",
+			got.Observations(), convert.ObsChainUnverified)
+	}
+}

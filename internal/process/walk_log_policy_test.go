@@ -46,14 +46,14 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 
 		assertDebugOnly(t, logs, "skipping unreadable path", "locked")
 		if sw.unreadable != 1 {
-			t.Errorf("unreadable = %d, want 1 so the aggregate in scanAndSetHealth fires", sw.unreadable)
+			t.Errorf("unreadable = %d, want 1 so the aggregate in logInputCoverageWarnings fires", sw.unreadable)
 		}
 	})
 
 	// A DIRECTORY occupying a <name>.crt path is the same shape of steady-state layout
 	// mistake as the arm above — it recurs on every scan until an operator moves it —
 	// and it feeds the SAME unreadable counter, so the aggregate WARN in
-	// scanAndSetHealth already fires on this scan. Naming the path at the default level
+	// logInputCoverageWarnings already fires on this scan. Naming the path at the default level
 	// as well made one condition produce two WARN records per scan, which is the exact
 	// double-report this policy exists to prevent.
 	//
@@ -71,7 +71,7 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 
 		assertDebugOnly(t, logs, "skipping cert: certificate path is a directory", "blocked.crt")
 		if sw.unreadable != 1 {
-			t.Errorf("unreadable = %d, want 1 so the aggregate in scanAndSetHealth fires and reaping stays vetoed", sw.unreadable)
+			t.Errorf("unreadable = %d, want 1 so the aggregate in logInputCoverageWarnings fires and reaping stays vetoed", sw.unreadable)
 		}
 		if len(sw.seen) != 0 || len(sw.results) != 0 {
 			t.Errorf("seen/results = %d/%d, want 0/0: an unreadable cert path is not a pair outcome",

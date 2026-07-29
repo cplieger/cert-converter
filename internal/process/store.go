@@ -65,7 +65,23 @@ const laxDirMsg = "the /output directory holding a pfx is more permissive than p
 // operator nothing and is the only signal that the confinement guarding a
 // private-key bundle rests on a directory anyone can write.
 func (s *store) reportLaxDir(rel string) {
-	dir := path.Dir(rel)
+	// Every ancestor up to the mount root, not just the immediate parent: the leaf
+	// directory is app-created at pfxDirMode, so in the canonical nested layout
+	// (the output tree mirrors Caddy's certificates/<ca>/<domain>/ shape) the
+	// operator-created /output root - the README's `mkdir -p` case this WARN
+	// exists for - is reached only by walking up. path.Dir converges to "." on a
+	// root-relative slash path, so the loop always terminates.
+	for dir := path.Dir(rel); ; dir = path.Dir(dir) {
+		s.reportLaxDirAt(dir)
+		if dir == "." {
+			return
+		}
+	}
+}
+
+// reportLaxDirAt is reportLaxDir's per-directory half: one lstat, one verdict,
+// once per directory per scan.
+func (s *store) reportLaxDirAt(dir string) {
 	if _, done := s.laxDirsReported[dir]; done {
 		return
 	}
@@ -80,8 +96,13 @@ func (s *store) reportLaxDir(rel string) {
 	}
 	s.laxDirsReported[dir] = struct{}{}
 	if perm := fi.Mode().Perm(); perm&^pfxDirMode != 0 {
+		// dir is root-relative, so it is "." for the flat /output the README's own setup step
+		// produces — the shape this WARN exists for. The root is named alongside it, as
+		// logOrphanWalkOutcome does for its directory-level records, so the operator is told
+		// which directory to chmod rather than being handed a bare dot.
 		slog.Warn(laxDirMsg,
-			"path", dir, "mode", perm.String(), "want", os.FileMode(pfxDirMode).String(),
+			"path", dir, "dir", s.root.Name(),
+			"mode", perm.String(), "want", os.FileMode(pfxDirMode).String(),
 			"remediation", outputPermRemediation)
 	}
 }
@@ -267,7 +288,11 @@ const (
 // file it replaces — so that case resolves to stale like every other "this app can
 // fix it itself" outcome. It is reported as staleModeRepairRefused rather than as a
 // plain stale verdict, because it is the one stale reason whose FAILED rewrite is not
-// a conversion failure.
+// a conversion failure — and ONLY when the content comparison below has already said the
+// bytes on disk are the bundle these inputs produce. That is what makes the cause's promise
+// to scanWalk.noteWriteFailure ("the bundle's CONTENT was never in question") true. A bundle
+// that is stale for any other reason, or whose content this app could not read at all, keeps
+// staleOrdinary, so a refused rewrite of it stays a conversion failure.
 func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysis,
 	wantEncoder convert.EncoderType, password string,
 ) (bool, staleCause, error) {

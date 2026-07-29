@@ -305,7 +305,14 @@ func run() int {
 	if !volumesReady(requiredVolumes) {
 		return 1
 	}
-	warnOutputNotWritable(outputDir)
+	// Same seam as the guard above, deliberately not the outputDir const: a test that
+	// substitutes requiredVolumes and lets the guard pass must not have the write probe
+	// fall through to the real /output.
+	for _, dir := range requiredVolumes {
+		if dir.role == "output" {
+			warnOutputNotWritable(dir.path)
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

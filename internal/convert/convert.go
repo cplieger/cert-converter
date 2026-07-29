@@ -214,7 +214,7 @@ var ecPublicKeyOID = asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}
 // pkcs8HoldsECKey reports whether PKCS#8 PrivateKeyInfo DER declares an EC key,
 // reading only the AlgorithmIdentifier's OID: SEQUENCE { INTEGER version, SEQUENCE
 // { OBJECT IDENTIFIER algorithm, ... }, OCTET STRING privateKey }. It shares
-// rsaModulusBitsFromKeyDER's asn1.RawValue walk, so nothing is decoded beyond the
+// maxRSAIntegerBitsFromKeyDER's asn1.RawValue walk, so nothing is decoded beyond the
 // tag-length headers and the OID itself, and anything it cannot read is false.
 func pkcs8HoldsECKey(der []byte) bool {
 	outer, _, ok := asn1Element(der)
@@ -646,7 +646,7 @@ func isEncryptedPEMBlock(block *pem.Block) bool {
 	return false
 }
 
-// oversizedRSAKeyError refuses a private-key block whose RSA modulus is larger
+// oversizedRSAKeyError refuses a private-key block holding an RSA integer larger
 // than maxVerifiableKeyBits, or reports nil for every block it cannot measure.
 //
 // It exists because the cost is INSIDE the parser: x509.ParsePKCS8PrivateKey and
@@ -665,7 +665,7 @@ func isEncryptedPEMBlock(block *pem.Block) bool {
 // above it is already refused a signature check, so accepting a private key above
 // it could only produce a bundle this app would not reason about.
 func oversizedRSAKeyError(block *pem.Block) error {
-	keyBits, ok := rsaModulusBitsFromKeyDER(block.Bytes, 1)
+	keyBits, ok := maxRSAIntegerBitsFromKeyDER(block.Bytes, 1)
 	if !ok || keyBits <= maxVerifiableKeyBits {
 		return nil
 	}
@@ -673,19 +673,22 @@ func oversizedRSAKeyError(block *pem.Block) error {
 		boundLogText(block.Type, maxBlockTypeLogLen), keyBits, maxVerifiableKeyBits)
 }
 
-// rsaModulusBitsFromKeyDER reports the size of the RSA modulus in private-key
-// DER, reading ONLY the modulus INTEGER's own length: it walks tag-length headers
-// with encoding/asn1's RawValue (which slices the content rather than decoding it)
-// and never converts a file-supplied integer to a big.Int, so it costs
-// sub-microseconds on a 32 KB block where the parser costs hundreds of
-// milliseconds.
+// maxRSAIntegerBitsFromKeyDER reports the size of the LARGEST top-level INTEGER in
+// private-key DER — the modulus, a prime, or a CRT value — reading ONLY each
+// INTEGER's own length: it walks tag-length headers with encoding/asn1's RawValue
+// (which slices the content rather than decoding it) and never converts a
+// file-supplied integer to a big.Int, so it costs sub-microseconds on a 32 KB block
+// where the parser costs hundreds of milliseconds. Measuring the modulus alone let a
+// block with a tiny modulus beside 2-Mbit "primes" through, because crypto/rsa
+// precomputes from p and q before it can reject an inconsistent key.
 //
-// Two shapes carry an RSA modulus, and both are handled: a PKCS#1 RSAPrivateKey,
-// whose modulus is the INTEGER after the version INTEGER, and a PKCS#8
-// PrivateKeyInfo, whose privateKey OCTET STRING (after the version INTEGER and the
-// AlgorithmIdentifier SEQUENCE) wraps that same PKCS#1 structure — hence depth,
-// which admits exactly one level of unwrapping and stops a crafted file from
-// nesting containers indefinitely.
+// Two shapes carry those integers, and both are handled: a PKCS#1 RSAPrivateKey,
+// whose modulus is the INTEGER after the version INTEGER (with the primes and CRT
+// values after it), and a PKCS#8 PrivateKeyInfo, whose privateKey OCTET STRING
+// (after the version INTEGER and the AlgorithmIdentifier SEQUENCE) wraps that same
+// PKCS#1 structure — hence depth, which admits exactly one level of unwrapping and
+// stops a crafted file from nesting containers indefinitely. Nested OtherPrimeInfos
+// primes are intentionally NOT walked; the PKCS#1 arm below states why.
 //
 // It FAILS OPEN by design: false for anything it cannot measure, which covers a
 // non-RSA key (a SEC1 EC key's second element is an OCTET STRING, a PKCS#8 EC or
@@ -694,7 +697,7 @@ func oversizedRSAKeyError(block *pem.Block) error {
 // modulus. The guard's job is to refuse OVERSIZED keys, not to become a second
 // parser: everything else is left to the existing parsers and their existing
 // errors.
-func rsaModulusBitsFromKeyDER(der []byte, depth int) (int, bool) {
+func maxRSAIntegerBitsFromKeyDER(der []byte, depth int) (int, bool) {
 	outer, _, ok := asn1Element(der)
 	if !ok || !isASN1(outer, asn1.TagSequence) {
 		return 0, false
@@ -716,7 +719,14 @@ func rsaModulusBitsFromKeyDER(der []byte, depth int) (int, bool) {
 		// cost, not the modulus. Measuring only the modulus let a 710 KB block
 		// with a 20-bit modulus and 2-Mbit "primes" spend 59.8s inside
 		// x509.ParsePKCS1PrivateKey. OtherPrimeInfos primes are deliberately not
-		// walked: a multi-prime key is refused in ~100us, before any precompute.
+		// walked, but NOT because they are cheap to reject: crypto/rsa accepts a
+		// multi-prime key and precomputeLegacy runs ModInverse per additional prime.
+		// They are excluded because that cost is LINEAR in the block's size, not
+		// superlinear like precompute on an oversized p and q: measured on go1.26.5,
+		// a 2048-bit modulus beside one 4-Mbit additional prime (525 KB DER) parses in
+		// 21ms, so the reader's 10 MB cap bounds this near 400ms -- the same order as
+		// the 369ms oversizedRSAKeyError's own doc already accepts. Re-measure before
+		// trusting this exclusion if crypto/rsa's multi-prime path changes.
 		return maxRSAIntegerBits(second, afterSecond)
 	case isASN1(second, asn1.TagSequence) && depth > 0:
 		// PKCS#8 PrivateKeyInfo: the AlgorithmIdentifier follows the version, and
@@ -725,7 +735,7 @@ func rsaModulusBitsFromKeyDER(der []byte, depth int) (int, bool) {
 		if !ok || !isASN1(inner, asn1.TagOctetString) {
 			return 0, false
 		}
-		return rsaModulusBitsFromKeyDER(inner.Bytes, depth-1)
+		return maxRSAIntegerBitsFromKeyDER(inner.Bytes, depth-1)
 	}
 	return 0, false
 }

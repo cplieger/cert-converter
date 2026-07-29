@@ -495,8 +495,8 @@ func warnBlankPasswordFilePointer() {
 //
 // It is also the single rendering of the "source" log attribute, so every
 // operator-facing password record — the both-channels WARN, the blank-file WARN, the
-// configured INFO, the surrounding-whitespace WARN, and the control-character and
-// invisible-formatting WARNs — carries
+// configured INFO, the surrounding-whitespace WARN, the control-character and
+// invisible-formatting WARNs, and the ambiguous-space WARN — carries
 // ONE vocabulary in that key: the variable name. Rendering envx's internal
 // SourceEnv/SourceFile enum instead would make a Loki matcher or a saved query
 // selecting the mounted-secret channel (source="PFX_PASSWORD_FILE") silently miss the

@@ -227,6 +227,35 @@ func TestNoMatchError_names_a_public_key_type_that_cannot_be_compared(t *testing
 	}
 }
 
+// TestNoMatchError_keeps_the_mismatch_sentence_when_any_certificate_was_comparable
+// pins the gate the uncomparable-certificate diagnosis sits behind: with even one
+// comparable certificate in the bundle the real cause is a plain mismatch, so the
+// base sentence leads and the unreadable key is carried as a trailing clause
+// rather than replacing it (and dropping the keyIssues/certIssues clauses with it).
+// The clause names the key's TYPE, because a key of an unsupported type was parsed
+// fine and is merely not comparable; only a nil PublicKey is a key crypto/x509
+// could not read.
+func TestNoMatchError_keeps_the_mismatch_sentence_when_any_certificate_was_comparable(t *testing.T) {
+	t.Parallel()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("setup: GenerateKey: %v", err)
+	}
+	g := &certGraph{certs: []*x509.Certificate{
+		{Subject: pkix.Name{CommonName: "comparable.example.com"}, PublicKey: &key.PublicKey},
+		{Subject: pkix.Name{CommonName: "legacy-dsa.example.com"}, PublicKey: testUncomparablePublicKey{}},
+	}}
+
+	got := g.noMatchError(1, 1, keyDefects{}, skippedBlocks{})
+	if got == nil {
+		t.Fatal("noMatchError(1, 1, keyDefects{}, skippedBlocks{}) = nil, want the mismatch diagnosis")
+	}
+	want := `none of the 1 private key block(s) matches any of the 2 certificate(s) in the chain; certificate "CN=legacy-dsa.example.com" has a public key of type convert.testUncomparablePublicKey that cannot be compared against the supplied private key, so it was compared against no key`
+	if got.Error() != want {
+		t.Errorf("noMatchError = %q, want %q", got.Error(), want)
+	}
+}
+
 // TestAnalyseAt_renewed_cert_tie_turns_on_validity_at_the_instant pins the tie
 // transition betterIdentity's first key exists for: one key matching two
 // certificates picks the one usable AT THE SCAN INSTANT, not the newest. Both

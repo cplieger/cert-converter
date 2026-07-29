@@ -996,16 +996,16 @@ func TestInspect_rejects_more_safe_bags_than_it_admits(t *testing.T) {
 	}
 }
 
-// TestInspect_rejects_a_non_positive_iteration_count pins the LOWER half of
-// checkIterations' range, which its own comment calls deliberate: a count of zero
-// or below is not a value any profile emits, so a file that spells one out is a
-// file whose framing this app does not understand and must be regenerated rather
-// than trusted.
+// TestInspect_rejects_a_non_positive_iteration_count pins the WORDING of the
+// floor refusal for a count a file spelled out as zero or negative: the message
+// must name the offending count rather than silently reading it as "cheap".
 //
-// Only the upper half is otherwise pinned (the excessive-iteration table), so
-// narrowing the guard to n < 0, or dropping the non-positive half entirely, leaves
-// every test in this package green while Inspect starts reporting such a bundle as
-// one of this app's own profiles.
+// The refusal ITSELF is pinned by
+// TestInspect_rejects_below_floor_iterations_in_every_derivation_location, whose
+// modern2023-MAC case travels the same `n < minIterations` branch
+// (checkIterationsRange): since minKDFIterations is 2048 there is no separable
+// non-positive half of the guard left to delete. What survives here is the
+// diagnostic contract, which a sentinel-only assertion cannot express.
 func TestInspect_rejects_a_non_positive_iteration_count(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)

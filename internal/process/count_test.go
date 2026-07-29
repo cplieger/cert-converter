@@ -2,6 +2,7 @@ package process
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -130,6 +131,14 @@ func TestSummaryAttrs_names_every_scan_result_counter(t *testing.T) {
 		}
 		if len(reporting) != 1 {
 			t.Errorf("ScanResult.%s is reported by summaryAttrs rows %v, want exactly one", name, reporting)
+			continue
+		}
+		// The attribute NAME is the operator-visible half of the contract: the
+		// README's Loki rules match on `orphan=`, `unreadable=` and the rest, so a
+		// row whose func reads the wrong counter must fail here even though the
+		// bijection above still holds.
+		if want := strings.ToLower(name); reporting[0] != want {
+			t.Errorf("ScanResult.%s is reported as %q, want %q", name, reporting[0], want)
 		}
 	}
 }

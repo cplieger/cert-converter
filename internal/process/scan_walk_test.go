@@ -51,6 +51,21 @@ func TestScanWalkVisit_classifies_walk_errors(t *testing.T) {
 		}
 	})
 
+	t.Run("an ENOENT below the root is the renewal race, not an unreadable path", func(t *testing.T) {
+		t.Parallel()
+		sw := &scanWalk{seen: make(map[string]struct{})}
+		if got := sw.visit(t.Context(), "renewing", nil, fs.ErrNotExist); got != nil {
+			t.Errorf("visit(sub-path, ENOENT) = %v, want nil so the walk continues", got)
+		}
+		if sw.vanished != 1 {
+			t.Errorf("visit(sub-path, ENOENT) vanished = %d, want 1", sw.vanished)
+		}
+		if sw.unreadable != 0 {
+			t.Errorf("visit(sub-path, ENOENT) unreadable = %d, want 0: a directory removed under the walk must not raise the documented unreadable= alert, whose remediation points at /input permissions",
+				sw.unreadable)
+		}
+	})
+
 	t.Run("a cancelled context aborts the walk", func(t *testing.T) {
 		t.Parallel()
 		ctx, cancel := context.WithCancel(t.Context())

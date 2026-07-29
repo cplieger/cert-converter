@@ -895,10 +895,10 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		return statusUnchanged
 	}
 
-	logConversionObservations(rel, observations)
 	slog.Debug("converting cert pair", "path", rel)
 	pfxData, err := convert.Encode(&analysis, sw.enc, sw.password)
 	if err != nil {
+		logConversionObservations(rel, observations)
 		return failEntry(rel, "conversion failed", err)
 	}
 	if err := sw.out.write(ctx, pfxRel, pfxData); err != nil {
@@ -906,16 +906,23 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		if outcome == statusUnwritable {
 			// The bundle on disk already holds the bytes these inputs produce and the
 			// refusal is steady state (no restart grants the UID ownership), so the
-			// observations above describe an input that will be re-analysed on every
-			// scan for as long as the operator leaves /output as it is. Commit the
-			// signature so they are named once, exactly as the unchanged path does:
+			// observations describe an input that will be re-analysed on every scan for
+			// as long as the operator leaves /output as it is. note emits them once per
+			// CHANGE and commits the signature, exactly as the unchanged path does:
 			// re-emitting per attempt is reserved for statusFailed, where the bundle
-			// those inputs produce is genuinely not on disk. unwritableBundleMsg remains
-			// the standing per-scan diagnostic for the condition itself.
-			sw.observations.record(rel, fingerprint, observations)
+			// those inputs produce is genuinely not on disk. That is why the emission
+			// waits for the write outcome instead of running before it — a persistently
+			// foreign-owned bundle is non-current on every scan, so an unconditional
+			// emission there repeated the input WARN on every scan forever.
+			// unwritableBundleMsg remains the standing per-scan diagnostic for the
+			// condition itself.
+			sw.observations.note(rel, fingerprint, observations)
+			return outcome
 		}
+		logConversionObservations(rel, observations)
 		return outcome
 	}
+	logConversionObservations(rel, observations)
 	sw.observations.record(rel, fingerprint, observations)
 
 	slog.Info("wrote pfx", "path", pfxRel)

@@ -354,10 +354,11 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 // ambient: a Create event can Lstat and WalkDir beneath event.Name, so a raced
 // ancestor can extend registrations into the replacement target and consume
 // watch descriptors, but it still cannot make the app read or convert content
-// outside the root. That residual is bounded to the single raced registration:
-// handlePathEvent's insideRoot check refuses to extend the watch set from an
-// event path that lies outside the root, so a registration that once escaped
-// cannot compound through the events fsnotify then delivers under it.
+// outside the root. handlePathEvent's insideRoot check bounds only the NAME an
+// event may extend the watch set from, so a registration whose PATH already lies
+// outside the root cannot compound; a registration that escaped through a swapped
+// ancestor still carries an in-root name, so this residual (watch descriptors,
+// never content) stands as described above.
 //
 // The traversal is cancellable: it checks ctx before each entry and returns
 // ctx.Err() as soon as the process is shutting down, so a shutdown arriving
@@ -446,7 +447,9 @@ func (w *Watcher) insideRoot(path string) bool {
 // scans rather than watch-set maintenance. A directory already in the watch set
 // has nothing to re-attach - it was walked when it was added, anything that
 // failed underneath it arrives as its own event, and the periodic re-sync
-// restores the rest.
+// restores the rest (never, with the fallback disabled: a descendant whose Add
+// failed and which gets no event of its own then stays outside the watch set for
+// the life of the process).
 func watchSetHas(watcher *fsnotify.Watcher, path string) bool {
 	clean := filepath.Clean(path)
 	for _, watched := range watcher.WatchList() {

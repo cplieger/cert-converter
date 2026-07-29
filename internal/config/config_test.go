@@ -1636,6 +1636,52 @@ func TestLoad_warns_when_the_password_contains_an_invisible_formatting_character
 	}
 }
 
+// TestLoad_warns_when_the_password_contains_a_non_ascii_space pins the third shape
+// guard beside its Cc and Cf siblings: U+00A0, U+3000 and U+2028 are Zs/Zl, so they
+// are neither control characters nor Cf, TrimSpace does not reach an interior one,
+// and each renders as (or invisibly as) the ordinary space a consumer retypes --
+// this WARN is the operator's only signal that the bundle's password is not what
+// the secret appears to say. The ASCII-space case keeps it from firing on every
+// password with a space in it; the Cc-only and Cf-only cases pin the disjointness
+// isAmbiguousSpaceRune's comment claims, so widening any one predicate to "not
+// printable" cannot silently produce two records about one rune. Serial: it swaps
+// slog.Default().
+func TestLoad_warns_when_the_password_contains_a_non_ascii_space(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		password string
+		wantWarn bool
+	}{
+		{"an interior no-break space warns", "pw\u00a0secret", true},
+		{"an interior ideographic space warns", "pw\u3000secret", true},
+		{"an interior line separator warns", "pw\u2028secret", true},
+		{"an ordinary ASCII space is silent", "pw secret", false},
+		{"a clean password is silent", "hunter2", false},
+		{"a control character alone is silent", "line1\nline2", false},
+		{"a byte-order mark alone is silent", "\ufeffhunter2", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", tc.password)
+			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
+
+			logs := capture.Default(t)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() = %v, want nil: a non-ASCII space is a WARN, not a startup refusal", err)
+			}
+			const msg = "non-ASCII space character"
+			warned := logs.CountLevel(slog.LevelWarn, msg) > 0
+			if warned != tc.wantWarn {
+				t.Errorf("Load(%s) non-ASCII-space WARN = %v, want %v (logs %v)", tc.name, warned, tc.wantWarn, logs.Messages())
+			}
+			if tc.wantWarn && !logs.HasAttr(msg, "source", "PFX_PASSWORD") {
+				t.Errorf("non-ASCII-space WARN does not name the delivery channel as the env-var name an operator filters on (logs %v)", logs.Messages())
+			}
+		})
+	}
+}
+
 // TestLoad_warns_when_a_mounted_secret_contains_a_format_character is the
 // file-channel half: the invisible-formatting guard is channel-agnostic today, and
 // the mounted file is where the failure mode actually originates (an editor saving

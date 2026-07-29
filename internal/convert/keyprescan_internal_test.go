@@ -223,10 +223,16 @@ func TestParsePrivateKeyBlock_refuses_an_oversized_rsa_key(t *testing.T) {
 	t.Parallel()
 	const oversizedBits = 131072
 	pkcs1 := oversizedRSAKeyDER(t, oversizedBits)
+	// The huge-PRIME shape is the bypass this guard was re-keyed for: its modulus is
+	// 18 bits, so measuring only the modulus waved it through and crypto/rsa spent
+	// ~60s on the file's primes. Both arrival shapes carry it.
+	hugePrime := hugePrimeRSAKeyDER(t, oversizedBits)
 
 	for name, block := range map[string]*pem.Block{
-		"pkcs1": {Type: pemTypeRSAPrivateKey, Bytes: pkcs1},
-		"pkcs8": {Type: pemTypePrivateKey, Bytes: wrapPKCS8(t, pkcs1)},
+		"pkcs1":                  {Type: pemTypeRSAPrivateKey, Bytes: pkcs1},
+		"pkcs8":                  {Type: pemTypePrivateKey, Bytes: wrapPKCS8(t, pkcs1)},
+		"pkcs1 with huge primes": {Type: pemTypeRSAPrivateKey, Bytes: hugePrime},
+		"pkcs8 with huge primes": {Type: pemTypePrivateKey, Bytes: wrapPKCS8(t, hugePrime)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -282,6 +288,9 @@ func TestRSAModulusBitsFromKeyDER_measures_or_fails_open(t *testing.T) {
 		"pkcs1 small modulus, oversized primes": {
 			der: hugePrimeRSAKeyDER(t, 131072), wantBits: 131072, wantOK: true,
 		},
+		"pkcs8 small modulus, oversized primes": {
+			der: wrapPKCS8(t, hugePrimeRSAKeyDER(t, 131072)), wantBits: 131072, wantOK: true,
+		},
 		"pkcs8 oversized":           {der: wrapPKCS8(t, oversizedRSAKeyDER(t, 131072)), wantBits: 131072, wantOK: true},
 		"sec1 ec":                   {der: mustMarshalEC(t)},
 		"pkcs8 ecdsa":               {der: mustMarshalPKCS8EC(t)},
@@ -296,12 +305,12 @@ func TestRSAModulusBitsFromKeyDER_measures_or_fails_open(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			gotBits, gotOK := rsaModulusBitsFromKeyDER(tc.der, 1)
+			gotBits, gotOK := maxRSAIntegerBitsFromKeyDER(tc.der, 1)
 			if gotOK != tc.wantOK {
-				t.Fatalf("rsaModulusBitsFromKeyDER(%s) measured = %v, want %v", name, gotOK, tc.wantOK)
+				t.Fatalf("maxRSAIntegerBitsFromKeyDER(%s) measured = %v, want %v", name, gotOK, tc.wantOK)
 			}
 			if gotOK && gotBits != tc.wantBits {
-				t.Errorf("rsaModulusBitsFromKeyDER(%s) = %d bits, want %d", name, gotBits, tc.wantBits)
+				t.Errorf("maxRSAIntegerBitsFromKeyDER(%s) = %d bits, want %d", name, gotBits, tc.wantBits)
 			}
 		})
 	}
@@ -320,13 +329,6 @@ func TestRSAModulusBitsFromKeyDER_measures_or_fails_open(t *testing.T) {
 func TestRSAModulusBitsFromKeyDER_fails_open_on_shapes_it_cannot_measure(t *testing.T) {
 	t.Parallel()
 
-	derSeq := func(elements ...[]byte) []byte {
-		var body []byte
-		for _, e := range elements {
-			body = append(body, e...)
-		}
-		return testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagSequence, IsCompound: true, Bytes: body})
-	}
 	version := testASN1Marshal(t, 0)
 	rsaOID := testASN1Marshal(t, oidRSAEncryption)
 	one := big.NewInt(1)
@@ -335,17 +337,17 @@ func TestRSAModulusBitsFromKeyDER_fails_open_on_shapes_it_cannot_measure(t *test
 	})
 
 	for name, der := range map[string][]byte{
-		"a first element that is not the version":        derSeq(derSeq(rsaOID), version),
-		"nothing after the version":                      derSeq(version),
-		"a pkcs8 shape whose key is not an octet string": derSeq(version, derSeq(rsaOID), testASN1Marshal(t, 5)),
-		"a pkcs8 shape with nothing after the algorithm": derSeq(version, derSeq(rsaOID)),
+		"a first element that is not the version":        derTestSequence(t, derTestSequence(t, rsaOID), version),
+		"nothing after the version":                      derTestSequence(t, version),
+		"a pkcs8 shape whose key is not an octet string": derTestSequence(t, version, derTestSequence(t, rsaOID), testASN1Marshal(t, 5)),
+		"a pkcs8 shape with nothing after the algorithm": derTestSequence(t, version, derTestSequence(t, rsaOID)),
 		"a zero modulus is no modulus":                   zeroModulus,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			gotBits, gotOK := rsaModulusBitsFromKeyDER(der, 1)
+			gotBits, gotOK := maxRSAIntegerBitsFromKeyDER(der, 1)
 			if gotOK {
-				t.Errorf("rsaModulusBitsFromKeyDER(%s) measured %d bits, want it to fail open", name, gotBits)
+				t.Errorf("maxRSAIntegerBitsFromKeyDER(%s) measured %d bits, want it to fail open", name, gotBits)
 			}
 		})
 	}

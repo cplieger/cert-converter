@@ -1400,6 +1400,105 @@ func TestScannerRun_when_the_repairing_rewrite_is_also_refused(t *testing.T) {
 	}
 }
 
+// TestScannerRun_a_stale_bundle_whose_mode_repair_was_refused_is_a_conversion_failure pins the
+// half of the staleModeRepairRefused contract that store.isCurrent's tail gate establishes:
+// health-neutrality is granted ONLY to a bundle whose CONTENT was compared and matched. A
+// bundle that is a renewal behind is stale for an ordinary reason, so a refused rewrite of it
+// counts in ScanResult.Failed and flips health -- otherwise the operator's PFX holds the
+// previous certificate with a green marker and no alert, which is the condition this gate
+// exists to prevent. The sibling test above stages the opposite (correct bytes, wrong mode)
+// and must keep reporting Unwritable; both are needed or either arm can be deleted silently.
+//
+// Failed rather than main.healthyAfterScan is asserted because that predicate lives in
+// package main and reads exactly this field (`return r.Failed == 0`), pinned there by
+// TestHealthyAfterScan.
+// Runs serially: it swaps slog.Default(), the chmod seam and the write seam.
+func TestScannerRun_a_stale_bundle_whose_mode_repair_was_refused_is_a_conversion_failure(t *testing.T) {
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
+	crtPath := filepath.Join(certsRoot, "chain.crt")
+	keyPath := filepath.Join(certsRoot, "chain.key")
+	if err := os.WriteFile(crtPath, chainPEM, 0o644); err != nil {
+		t.Fatalf("setup: write crt: %v", err)
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		t.Fatalf("setup: write key: %v", err)
+	}
+	scanner := New(&Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+	})
+	// The first scan runs with both seams live, so the bundle under test is a real one
+	// this app wrote -- for the PREVIOUS certificate.
+	if res, err := scanner.Run(t.Context()); err != nil || res.Converted != 1 {
+		t.Fatalf("setup: initial Run = %+v, %v, want Converted 1 and nil", res, err)
+	}
+	pfxPath := filepath.Join(outRoot, "chain.pfx")
+	before, _ := readBundle(t, pfxPath)
+
+	// The renewal: a different cert/key pair at the same input names, so the bundle on
+	// disk is stale for an ORDINARY reason (wrong bytes) and not merely for its mode.
+	_, renewedKeyPEM, _, renewedChainPEM := testcerts.GenerateCertChain(t)
+	if err := os.WriteFile(crtPath, renewedChainPEM, 0o644); err != nil {
+		t.Fatalf("setup: rewrite crt: %v", err)
+	}
+	if err := os.WriteFile(keyPath, renewedKeyPEM, 0o600); err != nil {
+		t.Fatalf("setup: rewrite key: %v", err)
+	}
+	// Laxer than pfxFileMode, so tightenMode runs and its refusal is remembered.
+	if err := os.Chmod(pfxPath, 0o644); err != nil {
+		t.Fatalf("setup: Chmod: %v", err)
+	}
+	prevChmod := chmodInRoot
+	chmodInRoot = func(_ *os.Root, name string, _ os.FileMode) error {
+		return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EPERM}
+	}
+	t.Cleanup(func() { chmodInRoot = prevChmod })
+	prevWrite := writeFileInRoot
+	writeFileInRoot = func(context.Context, *os.Root, string, []byte,
+		...atomicfile.Option,
+	) (atomicfile.Result, error) {
+		return atomicfile.Result{}, &fs.PathError{Op: "openat", Path: "chain.pfx", Err: syscall.EACCES}
+	}
+	t.Cleanup(func() { writeFileInRoot = prevWrite })
+
+	logs := captureLogs(t)
+	res, err := scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run(stale bundle, refused repair, refused rewrite) = error %v, want nil: this is a"+
+			" pair-level failure, not a scan-level one", err)
+	}
+	if res.Failed != 1 || res.Unwritable != 0 || res.Converted != 0 {
+		t.Errorf("Run(stale bundle, refused repair, refused rewrite) = %+v, want Failed 1 Unwritable 0"+
+			" Converted 0: only a content-matched bundle earns the health-neutral arm", res)
+	}
+	// The chmod refusal is still announced: tightenMode runs before the content read, so
+	// its absence would mean this test never reached the arm under test.
+	if got := logs.CountLevel(slog.LevelWarn, modeRepairRefusedMsg); got != 1 {
+		t.Errorf("logged %q at WARN %d times, want exactly 1: %q", modeRepairRefusedMsg, got, logs.Messages())
+	}
+	if got := logs.CountLevel(slog.LevelError, "conversion failed"); got != 1 {
+		t.Errorf("logged %q at ERROR %d times, want exactly 1: an unwritten renewal is a conversion"+
+			" failure: %q", "conversion failed", got, logs.Messages())
+	}
+	if got := logs.CountLevel(slog.LevelWarn, unwritableBundleMsg); got != 0 {
+		t.Errorf("logged %q at WARN %d times, want 0: the standing health-neutral WARN belongs only to a"+
+			" bundle whose bytes were compared and matched: %q", unwritableBundleMsg, got, logs.Messages())
+	}
+	// Nothing deleted, nothing truncated: the refused write must leave the stale bundle
+	// exactly as it was, so the next scan can try again.
+	after, afterInfo := readBundle(t, pfxPath)
+	if !bytes.Equal(after, before) {
+		t.Error("Run(stale bundle, refused rewrite) changed the bundle's bytes, want them untouched")
+	}
+	if got := afterInfo.Mode().Perm(); got != 0o644 {
+		t.Errorf("Run(stale bundle, refused rewrite) left mode %o, want 0644 untouched", got)
+	}
+}
+
 // readBundle returns a bundle's bytes and its FileInfo, so a caller can prove a
 // later call left both the contents and the mtime alone.
 func readBundle(t *testing.T, path string) ([]byte, os.FileInfo) {

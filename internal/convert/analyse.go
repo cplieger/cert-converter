@@ -1315,8 +1315,18 @@ func (g *certGraph) noMatchError(keyCount, firstUnverifiable int, keyIssues keyD
 		"none of the %d private key block(s) matches any of the %d certificate(s) in the chain%s",
 		keyCount, len(g.certs), keyIssues.suffix())
 	if firstUnverifiable >= 0 {
-		msg += fmt.Sprintf("; certificate %q holds a public key crypto/x509 could not read, so it was compared against no key",
-			boundSubject(g.certs[firstUnverifiable].Subject.String()))
+		// Same split as the all-uncomparable branch above, for the same reason: a nil
+		// PublicKey is a key crypto/x509 could not READ, while a parsed key of an
+		// unsupported type (a *dsa.PublicKey) was read fine and is merely not
+		// comparable. Telling an operator the parser failed when it did not sends them
+		// to re-issue a certificate whose encoding is intact.
+		if c := g.certs[firstUnverifiable]; c.PublicKey == nil {
+			msg += fmt.Sprintf("; certificate %q holds a public key crypto/x509 could not read, so it was compared against no key",
+				boundSubject(c.Subject.String()))
+		} else {
+			msg += fmt.Sprintf("; certificate %q has a public key of type %T that cannot be compared against the supplied private key, so it was compared against no key",
+				boundSubject(c.Subject.String()), c.PublicKey)
+		}
 	}
 	if certIssues.count > 0 {
 		msg += fmt.Sprintf("; the certificate file also holds %d block(s) that are neither a certificate nor a private key and were left out of the bundle (first %q)",
@@ -1694,11 +1704,19 @@ func (g *certGraph) unprovenPathObservations(path []int) []Observation {
 		if g.proven(child, parent) {
 			continue
 		}
+		// Say which evidence put the hop there. A path edge needs only
+		// issuanceEvidence.linked(), and keyIDLink is computed independently of any
+		// name comparison, so a hop can rest on the authority key identifier alone -
+		// naming the issuer name there sends the operator to the wrong field.
+		linkage := "matches the issuer name of"
+		if g.edge(child, parent).name == nameLinkNone {
+			linkage = "carries the subject key identifier named as the authority key identifier of"
+		}
 		obs = append(obs, Observation{
 			Kind: ObsChainEdgeUnprovenIssuer,
 			Detail: fmt.Sprintf(
-				"chain certificate %d, %q, matches the issuer name of %q but no signature here proves it issued that certificate; it was included because nothing in this bundle could be proven to have signed that certificate, so a consumer may be unable to verify the chain",
-				i, boundSubject(g.certs[parent].Subject.String()),
+				"chain certificate %d, %q, %s %q but no signature here proves it issued that certificate; it was included because nothing in this bundle could be proven to have signed that certificate, so a consumer may be unable to verify the chain",
+				i, boundSubject(g.certs[parent].Subject.String()), linkage,
 				boundSubject(g.certs[child].Subject.String())),
 		})
 	}
