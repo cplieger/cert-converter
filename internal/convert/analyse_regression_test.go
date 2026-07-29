@@ -1189,6 +1189,92 @@ func TestAnalyse_converts_when_a_proven_parent_outranks_an_over_ceiling_namesake
 	}
 }
 
+// TestAnalyse_converts_when_the_path_enters_a_signed_cycle_at_its_proven_hop pins the
+// OTHER entry order into a mutually-signed pair, the one a graph-wide reachability
+// question refused.
+//
+// Shape: leaf -> C proven, C -> P proven, P -> C proven, plus an over-ceiling
+// same-subject namesake of P. pathFrom enters at C, so C's own hop spends the proven
+// C -> P edge and P's only candidate parent (C) is already onPath, which ends the
+// walk. Every emitted hop is proven and the namesake competes for nothing, so the
+// bundle must convert.
+//
+// TestAnalyse_refuses_an_over_ceiling_issuer_whose_alternative_is_cycle_excluded is
+// the mirror: the same cycle entered at P, where C's proven parent IS consumed before
+// C is reached and the guessed hop is real. The two differ only in where the path
+// enters, which is why the question is asked of the selected path's hops rather than
+// of the graph — reachability holds in both orders and cannot tell them apart.
+func TestAnalyse_converts_when_the_path_enters_a_signed_cycle_at_its_proven_hop(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	const (
+		cycleCCN      = "Entered Cycle CA C"
+		cyclePCN      = "Entered Cycle CA P"
+		oversizedBits = convert.MaxVerifiableKeyBits + 17
+	)
+
+	keyC := testcerts.NewECDSAKey(t)
+	keyP := testcerts.NewECDSAKey(t)
+
+	// A scaffold for P, used only as the issuer template C is minted against: it
+	// carries P's subject and P's key, so C's signature verifies under the P that
+	// ships in the bundle.
+	_, _, scaffoldP := testcerts.Mint(t,
+		unverifiableCA(250, cyclePCN, notBefore, notBefore.Add(480*time.Hour)),
+		&keyP.PublicKey, nil, keyP)
+
+	_, cyclePEMC, certC := testcerts.Mint(t,
+		unverifiableCA(251, cycleCCN, notBefore, notBefore.Add(240*time.Hour)),
+		&keyC.PublicKey, scaffoldP, keyP)
+	// P is signed by C, closing the cycle.
+	_, cyclePEMP, _ := testcerts.Mint(t,
+		unverifiableCA(252, cyclePCN, notBefore, notBefore.Add(480*time.Hour)),
+		&keyP.PublicKey, certC, keyC)
+
+	// The over-ceiling namesake of P: a linked candidate parent of C, and no
+	// signature may ever be checked against it.
+	throwawayKey := testcerts.NewECDSAKey(t)
+	_, oversizedPEM, oversizedCert := testcerts.Mint(t,
+		unverifiableCA(253, cyclePCN, notBefore, notBefore.Add(720*time.Hour)),
+		oversizedRSAPublicKey(oversizedBits), nil, throwawayKey)
+	if k, ok := oversizedCert.PublicKey.(*rsa.PublicKey); !ok || k.N.BitLen() != oversizedBits {
+		t.Fatalf("setup: minted certificate carries a %T, want a %d-bit RSA modulus", oversizedCert.PublicKey, oversizedBits)
+	}
+
+	// The leaf is signed by C, so the path ENTERS the cycle at C.
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(254),
+		Subject:      pkix.Name{CommonName: "entered-cycle-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, certC, keyC)
+
+	for _, order := range []struct {
+		name  string
+		certs [][]byte
+	}{
+		{"oversized last", [][]byte{leafPEM, cyclePEMC, cyclePEMP, oversizedPEM}},
+		{"oversized first", [][]byte{leafPEM, oversizedPEM, cyclePEMC, cyclePEMP}},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
+			if err != nil {
+				t.Fatalf("Analyse(a mutually-signed pair entered at its proven hop + a same-subject %d-bit namesake) = error %v, want the bundle converted: every hop the path selects is proven, so nothing is guessed",
+					oversizedBits, err)
+			}
+			if serials := chainSerials(got.Chain()); len(serials) < 2 || serials[0] != "251" || serials[1] != "252" {
+				t.Errorf("chain serials = %v, want it to BEGIN 251,252: the path enters at C and spends the proven C -> P edge", serials)
+			}
+			// The namesake may still be APPENDED by the additive fallback (it is
+			// issuer-eligible and unplaceable, which assembleChain reports as its own
+			// observation). What must not happen is it winning a HOP: it is not part
+			// of the proven prefix above.
+		})
+	}
+}
+
 // TestAnalyse_converts_beside_an_over_ceiling_certificate_that_issues_nothing keeps
 // the refusal narrow, the way the self-signed carve-out keeps the additive fallback
 // narrow. A certificate this bundle names as nobody's issuer is never a parent in a

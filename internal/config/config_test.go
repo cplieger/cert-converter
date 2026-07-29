@@ -257,6 +257,17 @@ func TestLoad_warns_when_the_fallback_value_is_repaired(t *testing.T) {
 				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN %q = %q, want %q=%q (logs %v)",
 					tc.raw, tc.attrKey, mustAttr(t, logs, tc.message, tc.attrKey), tc.attrKey, tc.attrWant, logs.Messages())
 			}
+			// An unparseable value has two plausible intents (a cadence typo, or an
+			// attempt to disable with "off"/"no"), and both land in this arm: the
+			// "expected" text is the only place the accepted vocabulary — including
+			// the 0/false disable spelling — is stated.
+			if strings.HasPrefix(tc.message, "invalid FALLBACK_SCAN_HOURS") {
+				const wantExpected = "a whole number of hours, or 0/false to disable the periodic rescan"
+				if !logs.HasAttr(tc.message, "expected", wantExpected) {
+					t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN expected = %q, want %q (logs %v)",
+						tc.raw, mustAttr(t, logs, tc.message, "expected"), wantExpected, logs.Messages())
+				}
+			}
 		})
 	}
 }
@@ -562,6 +573,65 @@ func TestLoad_warns_when_the_fallback_rescan_is_disabled(t *testing.T) {
 	}
 }
 
+// TestLoad_warns_when_the_fallback_cadence_sits_at_the_ceiling pins the SECOND arm of
+// warnFallbackDisabled: a cadence at maxFallbackHours is operationally the 0/false
+// opt-out (the rescan that refreshes the health marker is 10 years out and the 3x
+// freshness deadline 30), so the state earns the same tradeoff record — whether the
+// operator typed the ceiling or a larger value that clamped to it.
+//
+// A separate test rather than a row in the opt-out table above, because that table's
+// matcher is the 0/false text, which this arm deliberately does not share.
+// Serial: it mutates env and slog.Default.
+func TestLoad_warns_when_the_fallback_cadence_sits_at_the_ceiling(t *testing.T) {
+	const ceilingWarn = "FALLBACK_SCAN_HOURS is at the 87600h ceiling"
+
+	for _, tc := range []struct {
+		name     string
+		raw      string
+		wantWarn bool
+	}{
+		{"exactly at the ceiling warns", "87600", true},
+		{"clamped to the ceiling warns", "999999", true},
+		{"a real cadence is silent", "12", false},
+		{"the default is silent", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", "pw")
+			t.Setenv("FALLBACK_SCAN_HOURS", tc.raw)
+
+			logs := capture.Default(t)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() = %v, want nil", err)
+			}
+			n := logs.CountLevel(slog.LevelWarn, ceilingWarn)
+			if (n > 0) != tc.wantWarn {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q logged %d WARN records matching %q, want warn = %v (interval %v, logs %v)",
+					tc.raw, n, ceilingWarn, tc.wantWarn, cfg.FallbackInterval, logs.Messages())
+			}
+			if !tc.wantWarn {
+				return
+			}
+			// It keys on the parsed INTERVAL, not the raw value, which is what makes
+			// a clamped value reach the same record.
+			if cfg.FallbackInterval != maxFallbackHours*time.Hour {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q FallbackInterval = %v, want %v",
+					tc.raw, cfg.FallbackInterval, maxFallbackHours*time.Hour)
+			}
+			if n != 1 {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q logged %d ceiling WARN records, want exactly 1 (logs %v)",
+					tc.raw, n, logs.Messages())
+			}
+			if !logs.AttrContains(ceilingWarn, "remediation", "FALLBACK_SCAN_HOURS") {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q ceiling WARN carries no remediation naming the variable (logs %v)",
+					tc.raw, logs.Messages())
+			}
+		})
+	}
+}
+
 func TestLoad_password_file_takes_precedence_over_env(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pfx-password")
 	if err := os.WriteFile(path, []byte("  from-file\n"), 0o600); err != nil {
@@ -700,6 +770,14 @@ func TestClassifyPassword(t *testing.T) {
 		{"a zero-width space alone is invisible-only", "\u200b", PasswordInvisibleOnly},
 		{"a soft hyphen alone is invisible-only", "\u00ad", PasswordInvisibleOnly},
 		{"several format runes are invisible-only", "\ufeff\u200b\u00ad", PasswordInvisibleOnly},
+		// Default-ignorable but not Cf: a variation selector and a combining
+		// grapheme joiner render as nothing while being category Mn, which is the
+		// shape a Cf-only predicate classified as a configured password.
+		{"a variation selector alone is invisible-only", "\ufe0f", PasswordInvisibleOnly},
+		{"a combining grapheme joiner alone is invisible-only", "\u034f", PasswordInvisibleOnly},
+		// A real combining accent is Mn but NOT default-ignorable, so it stays a
+		// visible part of a password: the widened predicate must not swallow it.
+		{"a combining accent is configured", "e\u0301", PasswordConfigured},
 		// Whitespace mixed with a format rune is not whitespace-only (TrimSpace
 		// leaves the BOM behind), so it lands in the invisible-only class rather
 		// than being read as a configured password.
@@ -1845,6 +1923,10 @@ func TestLoad_refuses_an_invisible_only_password_on_both_channels(t *testing.T) 
 		{"a zero-width space", "\u200b"},
 		{"a soft hyphen", "\u00ad"},
 		{"a byte-order mark beside whitespace", "\ufeff \t"},
+		// Default-ignorable but NOT category Cf (both are Mn): the shapes a
+		// Cf-only predicate delivered as if they were real passwords.
+		{"a variation selector", "\ufe0f"},
+		{"a combining grapheme joiner", "\u034f"},
 	} {
 		for _, ch := range []struct {
 			channel  string
@@ -1868,6 +1950,16 @@ func TestLoad_refuses_an_invisible_only_password_on_both_channels(t *testing.T) 
 					if !errors.Is(err, ErrEmptyPassword) {
 						t.Fatalf("Load(%s=%q) = %v, want ErrEmptyPassword: an invisible-only password is blank, so the opt-out must govern it",
 							ch.channel, tc.password, err)
+					}
+					// An invisible-only MOUNTED secret reaches the guard with no envx
+					// error to carry the channel, so the refusal must name it here:
+					// the container does not start, and this text is the only thing
+					// the operator gets. The env channel stays bare, so the clause is
+					// never printed for a value nobody supplied.
+					named := strings.Contains(err.Error(), "supplied via PFX_PASSWORD_FILE")
+					if want := ch.channel == "PFX_PASSWORD_FILE"; named != want {
+						t.Errorf("Load(%s=%q) = %v: names PFX_PASSWORD_FILE = %v, want %v (a file-channel refusal must send the operator to the variable file-wins actually reads)",
+							ch.channel, tc.password, err, named, want)
 					}
 					return
 				}
@@ -1913,6 +2005,41 @@ func TestLoad_refuses_an_invisible_only_password_on_both_channels(t *testing.T) 
 				if logs.Contains("PFX password configured") {
 					t.Errorf("Load(%s=%q, opt-out) logged the configured-secret INFO for a blank value (logs %v)",
 						ch.channel, tc.password, logs.Messages())
+				}
+			})
+		}
+	}
+}
+
+// TestLoad_refuses_a_supplementary_invisible_password_as_unencodable pins the
+// PRECEDENCE between the two password refusals for the shape that satisfies both.
+//
+// The invisible-rune predicate covers the whole Variation_Selector table, which
+// includes the supplementary selectors U+E0100-U+E01EF. Those are above U+FFFF, so
+// PKCS#12's BMPString cannot carry them: such a password is blank AND unencodable.
+// ErrUnencodablePassword has to win, because it has no opt-out — reporting
+// ErrEmptyPassword instead advertises a PFX_ALLOW_EMPTY_PASSWORD remediation that
+// only reaches the unencodable refusal on the next start, which is a loop the
+// operator cannot exit by following the message.
+// Serial: it mutates env and slog.Default.
+func TestLoad_refuses_a_supplementary_invisible_password_as_unencodable(t *testing.T) {
+	for _, channel := range []string{"PFX_PASSWORD", "PFX_PASSWORD_FILE"} {
+		for _, optout := range []string{"", "true"} {
+			t.Run(channel+" opt-out="+optout, func(t *testing.T) {
+				const password = "\U000E0100"
+				setPasswordChannel(t, channel, password)
+				t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", optout)
+
+				capture.Default(t)
+
+				_, err := Load()
+				if !errors.Is(err, ErrUnencodablePassword) {
+					t.Fatalf("Load(%s=U+E0100, opt-out=%q) = %v, want ErrUnencodablePassword: a non-BMP rune cannot be carried by PKCS#12 whatever the empty-password opt-out says",
+						channel, optout, err)
+				}
+				if errors.Is(err, ErrEmptyPassword) {
+					t.Errorf("Load(%s=U+E0100, opt-out=%q) = %v, want no ErrEmptyPassword: the blank refusal advertises an opt-out that cannot resolve this value",
+						channel, optout, err)
 				}
 			})
 		}

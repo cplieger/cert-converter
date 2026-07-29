@@ -736,7 +736,7 @@ func TestRun_startup_failure_diagnoses_the_configuration_and_exits_nonzero(t *te
 }
 
 // TestRun_refuses_to_start_when_a_required_volume_is_missing pins the branch that
-// ACTS on volumesReady's verdict: run() must return 1 before it builds a scanner
+// ACTS on process.OpenMounts' verdict: run() must return 1 before it builds a scanner
 // or a watcher, because starting anyway converts nothing and restart-loops
 // forever on a condition a restart cannot clear. It also pins the startup INFO
 // line, the operator's only statement of the effective configuration.

@@ -714,8 +714,9 @@ func TestStoreReconcile_spares_a_live_bundle_when_an_ancestor_is_swapped_for_a_s
 // the orphan walk into a directory must be left in place, while a later regular
 // orphan is still removed. Serial: captureLogs swaps the process-global slog.Default.
 //
-// The log assertion is load-bearing: the guard returns before Root.Remove, so the
-// WARN is the only place the refusal is observable beyond the count.
+// The directory is left EMPTY on purpose: Root.Remove would succeed on it, so if the
+// non-regular guard were removed the count, the surviving-directory stat and the WARN
+// all fail rather than only the log assertion.
 func TestStoreRemoveOrphans_spares_non_regular_candidate_and_continues(t *testing.T) {
 	const wantMsg = "orphaned output path is not a regular file; leaving it in place"
 
@@ -1011,11 +1012,14 @@ func TestStoreIsCurrent_tightens_a_lax_mode_without_regenerating(t *testing.T) {
 // the bundle stays CURRENT and the whole cost is one WARN per scan naming the mode
 // found and the mode wanted, which a second scan repeats rather than compounding.
 //
-// The one failure that IS convergeable — a REFUSED chmod, i.e. a bundle owned by
-// another UID — deliberately does not appear in this table; it belongs to
+// The one failure that IS convergeable — a chmod refused on a bundle owned by ANOTHER
+// UID — deliberately does not appear in this table; it belongs to
 // TestScannerRun_regenerates_a_bundle_whose_mode_repair_was_refused, which pins the
 // opposite verdict. Keeping the two in separate tests is what stops a future
-// simplification from collapsing them back into one non-action.
+// simplification from collapsing them back into one non-action. A refusal on a bundle
+// this process OWNS is NOT that case and does belong here: a UID that owns a file may
+// always chmod it, so what was refused is the requested BITS, and the replacement a
+// rewrite would write lands with the same forced mode.
 //
 // The chmod is stubbed because none of these failures is reproducible in a temp
 // directory: no local filesystem ignores permission bits or refuses a chmod to the
@@ -1050,6 +1054,20 @@ func TestStoreIsCurrent_keeps_a_bundle_whose_mode_cannot_be_tightened(t *testing
 			"a chmod the filesystem rejects as invalid",
 			func(_ *os.Root, name string, _ os.FileMode) error {
 				return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EINVAL}
+			},
+		},
+		{
+			// A mode-forcing mount that REFUSES rather than silently ignoring the
+			// chmod (fat_setattr returns EPERM for any mode outside the mount's
+			// fmask). The bundle is this process's own, so the refusal is about the
+			// BITS and not about ownership, and the replacement a rewrite would
+			// publish lands with the same forced mode — the one arm where a refusal
+			// must NOT schedule one. Deliberately no fileOwnedByProcess override:
+			// the fixture is owned by the test process, which is the premise, so the
+			// production discriminator is what routes this case.
+			"a chmod a mode-forcing filesystem refuses on a bundle this process owns",
+			func(_ *os.Root, name string, _ os.FileMode) error {
+				return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EPERM}
 			},
 		},
 	} {
@@ -2071,6 +2089,109 @@ func TestScanWalk_streams_directories_larger_than_one_read_batch(t *testing.T) {
 	}
 }
 
+// TestScanWalk_charges_an_unreadable_directory_once pins the entry accounting: the
+// budget counts ENUMERATED paths, so a directory the walk cannot open is charged when
+// its parent enumerates it and NOT again when the streaming read reports the open
+// failure through visit for that same path.
+//
+// Charging both made the operator's MAX_SCAN_ENTRIES bite below its configured value on
+// any tree with unreadable directories, and made the `entries=` figure in the abort WARN
+// overstate what the scan visited — sending the operator to raise a limit that was never
+// reached. Skipped as root, which no directory mode refuses.
+func TestScanWalk_charges_an_unreadable_directory_once(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: a 0o000 directory is still readable")
+	}
+	dir := t.TempDir()
+	blocked := filepath.Join(dir, "blocked")
+	if err := os.Mkdir(blocked, 0o000); err != nil {
+		t.Fatalf("setup: Mkdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o750) })
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	sw := &scanWalk{src: &source{root: root}, seen: make(map[string]struct{}), observations: newObservationLog(0)}
+
+	if walkErr := walkRoot(root, func(rel string, d fs.DirEntry, err error) error {
+		return sw.visit(t.Context(), rel, d, err)
+	}); walkErr != nil {
+		t.Fatalf("walkRoot(tree with one unreadable directory) = %v, want nil: an unreadable"+
+			" sub-path must not abort the walk", walkErr)
+	}
+	// The root and the blocked directory: two enumerated paths, two charges. The open
+	// failure visit for "blocked" must add nothing.
+	if want := 2; sw.entries != want {
+		t.Errorf("walkRoot charged %d entries, want %d: a directory the walk cannot open is"+
+			" reported through visit for a path its parent already charged, so charging there"+
+			" enforces MAX_SCAN_ENTRIES below its configured value", sw.entries, want)
+	}
+	if sw.unreadable != 1 {
+		t.Errorf("walkRoot reported unreadable=%d, want 1", sw.unreadable)
+	}
+}
+
+// TestWalkRoot_refuses_a_fifo_in_a_directory_position pins the directory half of the
+// guarantee source_test.go pins for files: a reader-less FIFO must be REFUSED, never
+// waited on.
+//
+// The walk queues a subdirectory on the readdir dirent type, so a hostile occupant only
+// has to be swapped in between that readdir and the open — a TOCTOU window available to
+// anything with write access to the host side of /input. os.Root.Open is a plain
+// O_RDONLY openat and open(2) on a reader-less FIFO blocks forever, which wedges the
+// scan's ONLY goroutine: no further certificate converted, no summary logged, the health
+// marker never refreshed, and recovery only at the healthcheck's 18h max-age deadline.
+// O_DIRECTORY makes the kernel answer ENOTDIR first, so the path is reported as one
+// unreadable sub-path like any other the walk cannot enter.
+func TestWalkRoot_refuses_a_fifo_in_a_directory_position(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if err := syscall.Mkfifo(filepath.Join(dir, "pipe"), 0o600); err != nil {
+		t.Fatalf("setup: Mkfifo: %v", err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+
+	// The FIFO is not a directory, so the walk would normally never queue it. Drive
+	// streamRootDir directly with its path, which is exactly the state the TOCTOU race
+	// produces: a path an earlier readdir classified as a directory.
+	type outcome struct {
+		visited []string
+		err     error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		var visited []string
+		_, streamErr := streamRootDir(root, "pipe", func(rel string, _ fs.DirEntry, err error) error {
+			visited = append(visited, rel)
+			if err == nil {
+				t.Errorf("streamRootDir(FIFO) reported %q with no error, want the open to be refused", rel)
+			}
+			return nil
+		})
+		done <- outcome{visited, streamErr}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("streamRootDir(FIFO) = %v, want nil: a refused sub-path is health-neutral", got.err)
+		}
+		if len(got.visited) != 1 || got.visited[0] != "pipe" {
+			t.Errorf("streamRootDir(FIFO) reported %v, want exactly [\"pipe\"] as one unreadable sub-path", got.visited)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("streamRootDir blocked on a reader-less FIFO: the O_DIRECTORY open regressed and a" +
+			" planted pipe wedges the scan's only goroutine until the healthcheck's max-age deadline")
+	}
+}
+
 // TestScannerRun_refuses_a_tree_over_the_entry_budget pins the entry budget, the bound on
 // how much of an untrusted /input one scan takes on, and — the load-bearing half — what
 // the abort must NOT do: reap, or flip health.
@@ -2137,11 +2258,14 @@ func TestScannerRun_refuses_a_tree_over_the_entry_budget(t *testing.T) {
 	assertRemediationMentions(t, logs, scanBudgetMsg, "MAX_SCAN_ENTRIES")
 }
 
-// TestScannerRun_takes_the_injected_entry_budget pins that the ceiling is INJECTED rather
-// than compiled in: internal/config owns MAX_SCAN_ENTRIES (its default, its ceiling and
-// every diagnostic for a repaired value) and hands the number to this package, which must
-// not read the environment itself. The same tree that trips a budget of 2 must scan
-// cleanly under a budget that fits it.
+// TestScannerRun_takes_the_injected_entry_budget is the negative half of the injected
+// ceiling: internal/config owns MAX_SCAN_ENTRIES (its default, its ceiling and every
+// diagnostic for a repaired value) and hands the number to this package, which must not
+// read the environment itself. Together with the budget of 2 above — the case that proves
+// the injected number is the one enforced — this pins the BOUNDARY: the budget is a
+// maximum, so a tree of exactly as many entries as the budget allows must scan cleanly.
+// Walking the root plus three certificates is four entries against a budget of four, so a
+// bound that refused AT the limit instead of past it would report here.
 func TestScannerRun_takes_the_injected_entry_budget(t *testing.T) {
 	inDir, outDir := t.TempDir(), t.TempDir()
 	for _, name := range []string{"a.crt", "b.crt", "c.crt"} {
@@ -2155,13 +2279,14 @@ func TestScannerRun_takes_the_injected_entry_budget(t *testing.T) {
 		CertsRoot: inDir, OutRoot: outDir,
 		Encoder:  convert.EncNameModern2023,
 		Password: "pw", Lifecycle: outputpolicy.LifecycleSync,
-		MaxScanEntries: 64,
+		// Exactly the tree's size: the root plus a.crt, b.crt and c.crt.
+		MaxScanEntries: 4,
 	}).Run(t.Context()); err != nil {
 		t.Fatalf("Run(tree inside the injected budget) = %v, want nil", err)
 	}
 
 	if got := logs.CountLevel(slog.LevelWarn, scanBudgetMsg); got != 0 {
-		t.Errorf("a tree of 4 entries tripped a budget of 64 (%d %q records): the budget must be the injected one: %q",
+		t.Errorf("a tree of 4 entries tripped a budget of 4 (%d %q records): the budget is a maximum, not a limit the walk stops short of: %q",
 			got, scanBudgetMsg, logs.Messages())
 	}
 }
@@ -2271,11 +2396,15 @@ func TestObservationLog_keeps_reporting_a_lone_key_once_the_dedup_set_is_full(t 
 	}
 }
 
-func TestObservationLog_eviction_never_drops_the_path_it_is_reserving_for(t *testing.T) {
+func TestObservationLog_wholeness_eviction_makes_room_without_touching_the_reserved_path(t *testing.T) {
 	log := newObservationLog(1)
 	// The reachable shape: a.crt is remembered by the SIGNATURE half (note ran for it)
-	// while its wholeness entry is gone, and the wholeness half is already full. reserve
-	// then evicts on behalf of a path the first loop can actually encounter.
+	// while its wholeness entry is gone, and the wholeness half is already full.
+	// reserve routes this through evictWholeness, which must evict the OTHER pair,
+	// keep the reserved path's signature entry, hold the half at its ceiling, and
+	// count the drop as this scan's reap veto. (The `victim == keep` guards themselves
+	// are unreachable from reserve, whose preconditions exclude the reserved path from
+	// the half being evicted; they are defensive only.)
 	log.seen["a.crt"] = pairFingerprint([]byte("a"), []byte("k"))
 	log.whole["b.crt"] = struct{}{}
 
@@ -2356,6 +2485,57 @@ func TestScannerRun_fails_closed_when_the_observation_log_evicts_wholeness_evide
 			evictedEvidenceMsg, got, logs.Messages())
 	}
 	assertRemediationMentions(t, logs, evictedEvidenceMsg, "MAX_SCAN_ENTRIES")
+}
+
+// TestScannerRun_prunes_the_observation_log_despite_an_eviction pins the RECOVERY half
+// of the evicted-evidence gate: the scan that lost wholeness evidence refuses to reap,
+// but it must still PRUNE, so the next scan is clean.
+//
+// Gating the prune on the full enumerationClean (which includes evidenceComplete) made
+// eviction pressure disable the only mechanism that relieves it: the log stays pinned
+// at its ceiling, the next scan evicts again, and orphan reaping is off until a process
+// restart. The prune is therefore gated on walkEnumerationComplete alone, and forget()
+// deletes from both halves directly rather than through dropWholeness, so pruning
+// cannot manufacture the next scan's veto.
+// Serial: it swaps waitBeforeReap and slog.Default.
+func TestScannerRun_prunes_the_observation_log_despite_an_eviction(t *testing.T) {
+	certsRoot, outRoot := t.TempDir(), t.TempDir()
+	writeSelfSignedPair(t, certsRoot, "live")
+	scanner := New(&Options{
+		CertsRoot: certsRoot, OutRoot: outRoot,
+		Password: "pw", Encoder: convert.EncNameModern2023,
+		Lifecycle:      outputpolicy.LifecycleSync,
+		MaxScanEntries: 4,
+	})
+	// Four remembered pairs, none of which exists under /input, so the log is at its
+	// ceiling and reserving room for live.crt has to evict one.
+	for _, rel := range []string{"a.crt", "b.crt", "c.crt", "d.crt"} {
+		scanner.observations.markWhole(rel)
+	}
+	if got := scanner.observations.takeEvictedWholeness(); got != 0 {
+		t.Fatalf("setup evicted %d entries, want 0", got)
+	}
+	stubReapWait(t, func(context.Context) error { return nil })
+	captureLogs(t)
+
+	if _, err := scanner.Run(t.Context()); err != nil {
+		t.Fatalf("Run(log at its ceiling) = %v, want nil", err)
+	}
+	// The gone pairs are reclaimed even though this scan evicted: only live.crt, the
+	// one path the walk saw, may remain.
+	for _, rel := range []string{"a.crt", "b.crt", "c.crt", "d.crt"} {
+		if _, held := scanner.observations.whole[rel]; held {
+			t.Errorf("observation log still holds wholeness for %q, which is absent from /input:"+
+				" gating the prune on the evidence half leaves the log pinned at its ceiling and"+
+				" orphan reaping off until a restart", rel)
+		}
+	}
+	// The prune must not itself count as an evidence loss, or the NEXT scan inherits
+	// this scan's veto and the state is self-sustaining after all.
+	if got := scanner.observations.takeEvictedWholeness(); got != 0 {
+		t.Errorf("after Run the pending evicted-wholeness count is %d, want 0: forget() must"+
+			" delete evidence for gone paths without charging it as a loss", got)
+	}
 }
 
 // assertRemediationMentions requires msg's record to carry a remediation naming want.

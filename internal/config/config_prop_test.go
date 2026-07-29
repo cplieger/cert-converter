@@ -129,7 +129,10 @@ func TestParseFallbackInterval_clamps_every_value_above_the_ceiling(t *testing.T
 // almost never produces a value made ONLY of invisible runes, which is the class
 // that used to be reported as configured.
 func TestClassifyPassword_blankness_matches_the_visible_content(t *testing.T) {
-	invisible := []rune{' ', '\t', '\n', '\r', '\u00a0', '\u3000', '\u2028', '\ufeff', '\u200b', '\u00ad', '\u2060'}
+	// U+FE0F and U+034F are default-ignorable but NOT category Cf (both are Mn), so
+	// they are the runes a Cf-only predicate reported as a real password: keeping
+	// them in the pool is what makes a narrowed isInvisibleRune fail here.
+	invisible := []rune{' ', '\t', '\n', '\r', '\u00a0', '\u3000', '\u2028', '\ufeff', '\u200b', '\u00ad', '\u2060', '\ufe0f', '\u034f'}
 	visible := []rune{'a', 'Z', '9', '!', 'é', '日', '\x00', '\ufffd'}
 	rapid.Check(t, func(t *rapid.T) {
 		runes := rapid.SliceOf(rapid.OneOf(

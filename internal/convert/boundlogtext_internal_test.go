@@ -348,3 +348,63 @@ func TestParsePrivateKey_bounds_an_oversized_sec1_curve_oid(t *testing.T) {
 		}
 	}
 }
+
+// TestParsePrivateKey_bounds_an_oversized_sec1_curve_oid_inside_pkcs8 pins the FOURTH
+// door, the one the finding behind the PKCS#8 retry was actually about: x509 reaches
+// the same SEC1 parser through a PKCS#8 EC container, so for an id-ecPublicKey key
+// ParsePKCS8PrivateKey hands the privateKey OCTET STRING to parseECPrivateKey, which
+// decodes the INNER explicit [0] named-curve identifier into an asn1.ObjectIdentifier
+// and then discards it. Neither the RSA pre-scan (this structure's second element is
+// an OCTET STRING) nor the AlgorithmIdentifier bound (whose own identifiers here are
+// the ordinary 7 and 8 bytes) sees the inner identifier, so only the PKCS#8 unwrap in
+// oversizedSEC1CurveOIDError refuses this shape.
+func TestParsePrivateKey_bounds_an_oversized_sec1_curve_oid_inside_pkcs8(t *testing.T) {
+	t.Parallel()
+	algorithm := asn1.RawValue{Tag: asn1.TagSequence, IsCompound: true, Bytes: append(
+		testASN1Marshal(t, ecPublicKeyOID),
+		testASN1Marshal(t, asn1.ObjectIdentifier{1, 2, 840, 10045, 3, 1, 7})...)}
+	pkcs8WrappingSEC1 := func(t *testing.T, curveOIDBytes int) []byte {
+		t.Helper()
+		curve := testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagOID, Bytes: bytes.Repeat([]byte{0x01}, curveOIDBytes)})
+		sec1 := testASN1Marshal(t, struct {
+			Version    int
+			PrivateKey []byte
+			Parameters asn1.RawValue
+		}{
+			Version:    1,
+			PrivateKey: bytes.Repeat([]byte{0x02}, 32),
+			Parameters: asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: 0, IsCompound: true, Bytes: curve},
+		})
+		return testASN1Marshal(t, struct {
+			Version    int
+			Algo       asn1.RawValue
+			PrivateKey []byte
+		}{Version: 0, Algo: algorithm, PrivateKey: sec1})
+	}
+
+	_, err := ParsePrivateKey(pem.EncodeToMemory(&pem.Block{
+		Type:  "PRIVATE KEY",
+		Bytes: pkcs8WrappingSEC1(t, 64<<10),
+	}))
+	if err == nil {
+		t.Fatal("ParsePrivateKey(PKCS#8 wrapping a SEC1 key with a 64 KB curve OID) = nil error, want a refusal")
+	}
+	for _, want := range []string{"curve identifier", "32-byte ceiling"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to name %q", err.Error(), want)
+		}
+	}
+	if strings.Contains(err.Error(), strings.Repeat("\x01", 8)) {
+		t.Errorf("error = %q, want the identifier's own bytes absent from the diagnostic", err.Error())
+	}
+
+	// The fail-open half: a NORMAL inner curve identifier must reach the parser, so
+	// whatever verdict comes back is x509's own and not this guard's.
+	_, smallErr := ParsePrivateKey(pem.EncodeToMemory(&pem.Block{
+		Type:  "PRIVATE KEY",
+		Bytes: pkcs8WrappingSEC1(t, 8),
+	}))
+	if smallErr != nil && strings.Contains(smallErr.Error(), "curve identifier") {
+		t.Errorf("ParsePrivateKey(PKCS#8 wrapping a SEC1 key with an 8-byte curve OID) = %v, want no curve-identifier refusal: an ordinary identifier must be left to the parser", smallErr)
+	}
+}

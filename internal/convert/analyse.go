@@ -54,6 +54,13 @@ const (
 	//
 	// The leftover-free case is ObsChainTrustAnchorAbsent, a different fact at a
 	// different level; the two are mutually exclusive by construction.
+	//
+	// It is the last of three mutually exclusive terminus kinds, decided in this
+	// order by terminusObservation: a terminus that names ITSELF as its own issuer
+	// is ObsChainAnchorUnverifiable whatever the leftovers (the anchor is present,
+	// only its self-signature is unproven); otherwise a leftover-free bundle is
+	// ObsChainTrustAnchorAbsent; otherwise this kind. So leftovers separate this
+	// kind from ObsChainTrustAnchorAbsent only once the self-issued case is out.
 	ObsChainUnverified ObservationKind = "chain-unverified"
 	// ObsChainTrustAnchorAbsent reports that the chain terminates at a certificate
 	// whose own issuer is not in the bundle, with nothing left over: every parsed
@@ -156,7 +163,8 @@ const (
 	// certificate parses that way, so proven is false for every hop touching it), or
 	// a bundle carrying a same-named certificate while the real signer is absent —
 	// and nothing said so whenever the path still ended at a self-signed certificate:
-	// the terminus kinds (ObsChainUnverified, ObsChainTrustAnchorAbsent) fire only for
+	// the terminus kinds (ObsChainUnverified, ObsChainTrustAnchorAbsent,
+	// ObsChainAnchorUnverifiable) fire only for
 	// a terminus that is not proven self-signed, which a path ending at a root never
 	// is, and they describe the certificate ABOVE the chain rather than an edge in it.
 	// The bundle still converts (this package holds no trust store), but a PKCS#12 CA bag
@@ -329,6 +337,12 @@ func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 		return Analysis{}, err
 	}
 	obs = append(obs, tieObs...)
+
+	// Asked once the identity is known, because whether an unverifiable issuer is
+	// load-bearing is a property of the SELECTED path's hops, not of the graph.
+	if err := g.oversizedIssuerError(identity.cert); err != nil {
+		return Analysis{}, err
+	}
 
 	leaf := certs[identity.cert]
 
@@ -761,9 +775,6 @@ func newCertGraph(certs []*x509.Certificate, now time.Time) (*certGraph, error) 
 			g.children[parent] = append(g.children[parent], child)
 		}
 	}
-	if err := g.oversizedIssuerError(); err != nil {
-		return nil, err
-	}
 	g.computeDistances()
 	return g, nil
 }
@@ -883,9 +894,9 @@ func (g *certGraph) candidateEdge(child, parent int) bool {
 	return e.eligible || g.proven(child, parent)
 }
 
-// oversizedIssuerError refuses a bundle in which a certificate named as the
-// issuer of another one here holds a key no signature can be checked against —
-// which is an RSA modulus above maxVerifiableKeyBits, or a public exponent above
+// oversizedIssuerError refuses a bundle whose SELECTED chain has to GUESS a hop while
+// a certificate named as that hop's issuer holds a key no signature can be checked
+// against — an RSA modulus above maxVerifiableKeyBits, or a public exponent above
 // maxVerifiablePublicExponent — naming which limit was crossed.
 // It reports nil for every other bundle, and reads unverifiableKeyReason (the
 // predicate verifiableKey answers) rather than re-deriving either ceiling, so the
@@ -901,23 +912,60 @@ func (g *certGraph) candidateEdge(child, parent int) bool {
 // DER tie-break settles the rest). The bundle would convert to a PFX whose chain
 // no consumer can verify.
 //
-// Refusing costs nothing real: no CA issues RSA above 16384 bits, so an
-// over-ceiling issuer standing beside a same-subject decoy is an attack shape
-// rather than a configuration. No verification is attempted either way, which is
-// the point of the ceiling; only the outcome changes, from a silent wrong chain to
-// a named refusal.
-func (g *certGraph) oversizedIssuerError() error {
-	for i, c := range g.certs {
-		// A certificate nothing here names as its issuer — by name at either fidelity,
-		// nor by authority key identifier — is never a parent in a signature check, so
-		// its size decides nothing: it can only be excluded, or kept by the additive
-		// fallback, and both say so out loud. Nor does it decide anything when every
-		// child that names it has a parent a signature PROVES instead: that child's
-		// place is not a guess, so the bundle resolves without the unverifiable edge.
-		// The question is what chain selection DEPENDS on, not what survived candidate
-		// construction: see unresolvedOversizedIssuer.
+// It is asked of the identity's OWN path rather than of the graph, and that scoping is
+// the whole correctness argument. Whether an unverifiable edge is load-bearing depends
+// on where the selected path ENTERS a set of mutually-linked certificates, which only
+// the walk knows: in a bundle of leaf -> C proven, C -> P proven and P -> C proven, a
+// path entering at C spends the proven C -> P edge and never needs a guess, while a
+// path entering at P finds C's only proven parent already onPath and does have to
+// guess. A global reachability question cannot separate those two orders, and asking
+// it refused the first — a conversion this app performs correctly, with every emitted
+// hop proven. So the question is asked of pathFrom's actual hops, which are the hops
+// assembleChain emits.
+//
+// A hop a signature PROVES is skipped whatever else the bundle carries, and a linked
+// certificate is only named when the hop it competes for was guessed. Refusing then
+// costs nothing real: no CA issues RSA above 16384 bits, so an over-ceiling issuer
+// standing beside a same-subject decoy is an attack shape rather than a
+// configuration. No verification is attempted either way, which is the point of the
+// ceiling; only the outcome changes, from a silent wrong chain to a named refusal.
+func (g *certGraph) oversizedIssuerError(identity int) error {
+	path := g.pathFrom(identity)
+	for hop := 0; hop+1 < len(path); hop++ {
+		child, selected := path[hop], path[hop+1]
+		// The hop is established, so nothing competed for it: an unverifiable
+		// namesake standing beside a proven parent can only be excluded, which
+		// assembleChain's own observations report.
+		if g.proven(child, selected) {
+			continue
+		}
+		if err := g.unverifiableIssuerRival(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// unverifiableIssuerRival names the first certificate this bundle links as
+// certs[child]'s issuer whose key no signature can be checked against, or nil when
+// there is none.
+//
+// It keys on the NAMING relation (edge().linked(): name at either fidelity, or
+// authority key identifier) rather than on candidateParents, because eligibility and
+// verifiability interact: a certificate whose own extensions disqualify it from
+// issuing enters candidateParents ONLY when a signature proves the edge
+// (candidateEdge), and an over-ceiling key can never be proven. So the decoy
+// substitution this refusal exists for — a leaf, its real over-ceiling issuer
+// carrying CA:false or no basicConstraints, and a same-subject certificate with an
+// ordinary key that then wins the guessed hop — leaves the oversized certificate with
+// no candidate entry at all. Keying on candidate survival skipped exactly that case.
+func (g *certGraph) unverifiableIssuerRival(child int) error {
+	for rival, c := range g.certs {
+		if rival == child || !g.edge(child, rival).linked() {
+			continue
+		}
 		reason := unverifiableKeyReason(c.PublicKey)
-		if reason == "" || !g.unresolvedOversizedIssuer(i) {
+		if reason == "" {
 			continue
 		}
 		return fmt.Errorf(
@@ -925,94 +973,6 @@ func (g *certGraph) oversizedIssuerError() error {
 			boundSubject(c.Subject.String()), reason)
 	}
 	return nil
-}
-
-// unresolvedOversizedIssuer reports whether chain selection actually DEPENDS on an
-// unverifiable edge into certs[parent]: some other certificate here names it as its
-// issuer — by name at either fidelity, or by authority key identifier — and has no
-// candidate parent that a signature PROVES instead.
-//
-// Both halves are load-bearing. Asking only whether the pair survived candidate
-// construction is the wrong question, because a certificate whose own extensions
-// disqualify it from issuing enters candidateParents ONLY when a signature proves
-// the edge (candidateEdge) and an over-ceiling key can never be verified; keying the
-// refusal on children[] therefore let through exactly the decoy substitution it
-// exists to refuse: leaf, its real over-ceiling issuer carrying CA:false or no
-// basicConstraints, and a same-subject certificate with an ordinary key that then
-// won the chain unverified.
-//
-// Asking only what the bundle NAMES is too coarse in the other direction: a bundle
-// whose every child linked to the oversized certificate is resolved WITHOUT that
-// edge — it has a candidate parent proven by signature, or it is a proven
-// self-signed root and needs no parent at all — resolves entirely without the
-// unverifiable edge, so bestParent never has to guess and refusing would fail a
-// conversion the app can do correctly. The self-signed clause is not an
-// afterthought: a same-subject decoy makes every same-subject root a nominal CHILD
-// of itself's twin, so without it any bundle carrying a proven root beside an
-// over-ceiling namesake would still be refused. Only a child with neither a proven
-// parent nor a proven self-signature leaves the oversized certificate competing on
-// unverified evidence, which is the state the refusal exists for.
-func (g *certGraph) unresolvedOversizedIssuer(parent int) bool {
-	for child := range g.certs {
-		if child == parent || !g.edge(child, parent).linked() {
-			continue
-		}
-		if !g.resolvedWithoutParent(child, parent) {
-			return true
-		}
-	}
-	return false
-}
-
-// resolvedWithoutParent reports whether certs[child]'s place in the chain is
-// established without the edge into certs[except]: a signature from some other
-// candidate parent proves it, or it is a proven self-signed root.
-//
-// A proven candidate only counts when it is still USABLE at selection time. pathFrom
-// walks with an onPath set and bestParent skips every candidate already on it, so a
-// candidate that can reach child again through candidate edges — a cycle among
-// same-subject certificates — is exactly the candidate the walk will have consumed
-// before it reaches child, leaving the unverifiable edge to win the hop. Counting it
-// as a resolution witness would exempt the bundle from the refusal on evidence
-// selection cannot use.
-func (g *certGraph) resolvedWithoutParent(child, except int) bool {
-	if g.isSelfSigned(child) {
-		return true
-	}
-	for _, candidate := range g.candidateParents[child] {
-		if candidate != except && g.proven(child, candidate) && !g.candidatePathReaches(candidate, child) {
-			return true
-		}
-	}
-	return false
-}
-
-// candidatePathReaches reports whether the candidate edges lead from certs[from]
-// back to certs[to]. It is the cycle question pathFrom's onPath set answers
-// positionally, asked ahead of time: a `to` reachable from `from` can be on the walk's
-// path when `to`'s own hop is chosen, and bestParent then skips `from` entirely.
-//
-// It reads candidateParents only — no signature is verified, nothing is decoded — so
-// it costs one graph traversal bounded by maxChainCerts, and the visited set makes a
-// cyclic bundle terminate.
-func (g *certGraph) candidatePathReaches(from, to int) bool {
-	visited := make([]bool, len(g.certs))
-	visited[from] = true
-	stack := []int{from}
-	for len(stack) > 0 {
-		cur := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		for _, parent := range g.candidateParents[cur] {
-			if parent == to {
-				return true
-			}
-			if !visited[parent] {
-				visited[parent] = true
-				stack = append(stack, parent)
-			}
-		}
-	}
-	return false
 }
 
 // proven reports whether certs[parent]'s public key produced certs[child]'s

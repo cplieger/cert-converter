@@ -152,10 +152,16 @@ func logIncompleteInputEnumeration(rc *reapContext) {
 	case !rc.evidenceComplete():
 		// The walk may have enumerated the tree perfectly; what this scan lost is the
 		// in-process memory that separates a key being REPLACED right now from a key
-		// that was never there. Its own arm, ahead of the two Debug arms above, because
-		// it is neither transient nor about the mount: it recurs on every scan for as
-		// long as the tree holds more pairs than the log may remember, and the operator
-		// action is the budget, not the /input layout.
+		// that was never there. Its own arm rather than a fold into the Debug arms,
+		// because it is neither transient nor about the mount: it recurs on every scan
+		// for as long as the tree holds more pairs than the log may remember, and the
+		// operator action is the budget, not the /input layout.
+		//
+		// It is placed BELOW vanishedOnly and still wins over it, because vanishedOnly
+		// composes evidenceComplete: a scan that saw a renewal AND lost evidence is not
+		// "only a renewal", so it self-vetoes out of that arm and falls through here.
+		// Dropping that term (or reordering these cases) would report this condition as
+		// the transient Debug line and lose the only remediation an operator gets.
 		slog.Warn(evictedEvidenceMsg,
 			"evidence_evicted", rc.evidenceEvicted,
 			"remediation", "raise MAX_SCAN_ENTRIES to at least the number of certificate pairs under /input, or reduce what /input holds")

@@ -29,11 +29,15 @@ func TestParseLifecycle(t *testing.T) {
 }
 
 // TestLifecycleModes_advertises_exactly_what_the_parser_accepts pins the "stated
-// once" contract from both ends: the modes the caller advertises in its warning are
-// exactly the ones ParseLifecycle recognises. A mode added to the constants but not
-// to the inventory is advertised and then rejected, and one added to the inventory
-// alone is accepted while the warning never names it — both leave an operator
-// setting OUTPUT_LIFECYCLE to a value the log told them was valid.
+// once" contract in the direction a test can actually observe: LifecycleModes must
+// return the current canonical three-value inventory IN ORDER, and every advertised
+// value must round-trip through ParseLifecycle. A mode added to the inventory alone
+// is accepted here and rejected by the parser, which is the drift this catches —
+// along with a removal, a reordering and a broken clone.
+//
+// It cannot catch the mirror case (a new Lifecycle constant that is never added to
+// the inventory): Go constants are not enumerable at runtime, and the want slice
+// below would have to be edited by the same hand that forgot the inventory.
 func TestLifecycleModes_advertises_exactly_what_the_parser_accepts(t *testing.T) {
 	t.Parallel()
 

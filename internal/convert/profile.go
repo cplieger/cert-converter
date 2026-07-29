@@ -154,11 +154,17 @@ type macData struct {
 	Iterations int `asn1:"optional,default:1"`
 }
 
-// The digest itself is deliberately NOT modelled: the preflight never reads it,
-// encoding/asn1 tolerates the trailing element, and a []byte field would copy up
-// to maxPFXSize bytes of unauthenticated input before anything is authenticated.
+// The digest itself is retained but never read: the preflight only needs to know it
+// is THERE and well-shaped. It is modelled as an asn1.RawValue rather than a []byte
+// because encoding/asn1 copies a []byte field, which would duplicate up to
+// maxPFXSize bytes of unauthenticated input on the scan's only goroutine — while
+// DROPPING the field entirely would silently widen the accepted set, since asn1
+// tolerates the trailing element and a required OCTET STRING would become optional
+// to this parser. octetStringBytes re-imposes the shape asn1 enforced for a []byte
+// field, without the copy.
 type digestInfo struct {
 	Algorithm algorithmIdentifier
+	Digest    asn1.RawValue
 }
 
 type algorithmIdentifier struct {
@@ -174,8 +180,12 @@ func (a *algorithmIdentifier) algorithmOID() (asn1.ObjectIdentifier, error) {
 
 // MaxBundleBytes is the largest PKCS#12 bundle this codec will inspect. Every bound
 // below (maxOIDBytes, maxAuthenticatedSafes, maxSafeBags) is sized against it, so the
-// limit belongs here rather than in whichever caller happens to read the file.
-const MaxBundleBytes = 2*10<<20 + 64<<10
+// limit belongs here rather than in whichever caller happens to read the file. It is
+// two of this package's own input files plus PKCS#12 framing, derived from
+// MaxInputBytes rather than restated, so raising the input cap raises this with it
+// instead of silently invalidating the allocation analysis these bounds were sized
+// against.
+const MaxBundleBytes = 2*MaxInputBytes + 64<<10
 
 // maxOIDBytes caps the content length of an object identifier the preflight is
 // willing to decode. Every identifier the four profiles emit is 9 bytes or fewer,
@@ -318,13 +328,16 @@ type safeBag struct {
 }
 
 // encryptedPrivateKeyInfo is the pkcs8ShroudedKeyBag payload (RFC 5208 §6).
+//
+// The encrypted key is retained but never read, for the reason recorded on
+// digestInfo: only Algorithm is inspected, the ciphertext is the largest single field
+// an untrusted bundle controls (so it must not be copied), and dropping the field
+// would make a required OCTET STRING optional to this parser and widen the accepted
+// set the []byte field defined.
 type encryptedPrivateKeyInfo struct {
-	Algorithm algorithmIdentifier
+	Algorithm     algorithmIdentifier
+	EncryptedData asn1.RawValue
 }
-
-// The encrypted key itself is deliberately NOT modelled, for the reason recorded
-// on digestInfo: only Algorithm is read here, and the ciphertext is the largest
-// single field an untrusted bundle controls.
 
 // legacyPBEParams is the pkcs-12PbeParams of the SHA1-based profiles.
 type legacyPBEParams struct {
@@ -440,6 +453,15 @@ func inspect(pfx []byte) (inspection, error) {
 	// encrypted safe's outer algorithm plus the plaintext safe's shrouded key bag,
 	// not just the ones that identify the profile. Re-checking them here would be
 	// dead.
+	//
+	// The digest is measured, never copied, and it is checked last so a bundle with a
+	// more specific defect still reports that one: RFC 7292 requires the field, so an
+	// absent or mistyped digest is not a bundle this app wrote. Retaining it as a
+	// RawValue keeps the accepted set the former []byte field defined, without its
+	// copy of unauthenticated input.
+	if _, digestErr := octetStringBytes(preamble.MacData.Mac.Digest, "mac digest"); digestErr != nil {
+		return inspection{}, digestErr
+	}
 	return inspection{Profile: profileName}, nil
 }
 
@@ -664,6 +686,11 @@ func boundedKeyBagEncryption(bag *safeBag) (asn1.ObjectIdentifier, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Measured, never copied: the ciphertext is required by RFC 5208, so a bundle
+	// whose key bag omits it or mistypes it is not one this app wrote.
+	if _, dataErr := octetStringBytes(info.EncryptedData, "shrouded key bag ciphertext"); dataErr != nil {
+		return nil, dataErr
+	}
 	if iterErr := checkEncryptionIterations(keyOID, info.Algorithm.Parameters); iterErr != nil {
 		return nil, iterErr
 	}
@@ -708,6 +735,15 @@ func profileFor(macAlg, certAlg, keyAlg asn1.ObjectIdentifier) (EncoderType, err
 // sharing the password. PBMAC1 carries its salt inside the nested PBKDF2 block, so
 // that arm is floored by decodeProfilePBKDF2 instead.
 func checkMACIterations(macOID asn1.ObjectIdentifier, params, macSalt asn1.RawValue, macDataIterations int) error {
+	// The salt's SHAPE is checked for every MAC algorithm, including PBMAC1, even
+	// though only the sized arms below read its length. The field was a []byte before
+	// the RawValue change, so asn1 refused a non-OCTET-STRING there for every
+	// algorithm; returning for PBMAC1 without this check would quietly widen the
+	// accepted set to bundles this app never writes.
+	salt, saltErr := octetStringBytes(macSalt, "mac salt")
+	if saltErr != nil {
+		return saltErr
+	}
 	if macOID.Equal(oidPBMAC1) {
 		return checkPBMAC1Parameters(params)
 	}
@@ -719,10 +755,6 @@ func checkMACIterations(macOID asn1.ObjectIdentifier, params, macSalt asn1.RawVa
 	if macOID.Equal(oidSHA256) {
 		minIterations = minKDFIterations
 		minSalt = minPBKDF2SaltBytes
-	}
-	salt, saltErr := octetStringBytes(macSalt, "mac salt")
-	if saltErr != nil {
-		return saltErr
 	}
 	if len(salt) < minSalt {
 		return fmt.Errorf("%w: mac salt is %d octet(s), want at least %d",

@@ -153,7 +153,7 @@ func (s *certScan) visit(block *pem.Block) error {
 		return nil
 	}
 	if err := oversizedCertificateOIDError(block); err != nil {
-		return err
+		return fmt.Errorf("certificate PEM block %d: %w", len(s.certs)+1, err)
 	}
 	c, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
@@ -773,10 +773,15 @@ const maxRSAPrimeFactors = 64
 // same DER in 60 us; at a full 10 MB DER, 855 ms and 267 MB.
 //
 // Stopping cannot let an expensive shape through: a body with more top-level
-// elements than PKCS#1 declares does not match crypto/x509's pkcs1PrivateKey
-// struct, so encoding/asn1 refuses it before any precomputation runs. It is the
-// same ceiling profile.go's sequenceElements applies to every SEQUENCE OF the
-// preflight walks.
+// elements than PKCS#1 declares cannot hide an expensive one past the budget.
+// encoding/asn1 maps a SEQUENCE onto crypto/x509's pkcs1PrivateKey POSITIONALLY, so
+// every integer whose size drives precomputation (N, E, D, P, Q and the three CRT
+// values) is among the eight elements after the modulus, and asn1 TOLERATES extra
+// bytes at the end of a SEQUENCE (measured on go1.26.5: a real key padded with 12
+// trailing INTEGERs still parses) — which means an otherPrimeInfos collection padded
+// past this budget is not matched by the optional field either, and is skipped
+// without cost. It is the same ceiling profile.go's sequenceElements applies to every
+// SEQUENCE OF the preflight walks.
 const maxRSAKeyElements = 16
 
 // rsaKeyPreScan is what the DER-only envelope scan learned about a private-key
@@ -1247,12 +1252,29 @@ func pkcs8PrivateKeyDER(der []byte) []byte {
 }
 
 // maxCertificateOIDDepth bounds how deep the pre-parse walk descends into a
-// certificate's DER. Every identifier x509 decodes sits at most six constructed
-// elements down (Certificate > TBSCertificate > extensions [3] > SEQUENCE OF >
-// Extension > OID, and the same depth for a subject RDN's attribute type), so this
-// is headroom rather than a policy, and it is what stops a crafted file from making
-// the walk recurse.
-const maxCertificateOIDDepth = 8
+// certificate's DER. The deepest identifier x509 decodes is a CertificatePolicies
+// policyIdentifier at NINE constructed elements down (Certificate > TBSCertificate >
+// extensions [3] > SEQUENCE OF > Extension > extnValue OCTET STRING >
+// CertificatePolicies SEQUENCE > PolicyInformation SEQUENCE > OID); a subject RDN's
+// attribute type and a bare extnID sit shallower. So 10 is one level of headroom
+// rather than a policy, and it is what stops a crafted file from making the walk
+// recurse without bound.
+const maxCertificateOIDDepth = 10
+
+// maxCertificateOIDElements bounds how many DER elements the pre-parse walk reads in
+// TOTAL, and it is the certificate-side twin of maxRSAKeyElements: the subject is the
+// WALK rather than the certificate. Every element costs one asn1.Unmarshal into an
+// asn1.RawValue, so a block packed with three-byte INTEGERs makes the guard the
+// expensive operation — measured on go1.26.5, a 7.4 MB block of 2,586,487 such
+// elements cost the walk 243 ms and 197 MB while x509.ParseCertificate refused the
+// same DER in 3 us. The budget is TOTAL rather than per level, because the walk
+// admits maxCertificateOIDDepth levels and a per-level cap would multiply.
+//
+// Exhaustion FAILS OPEN, like every other verdict this walk cannot reach: what it
+// already measured still stands, and a block that needs more than this many elements
+// to describe a real certificate's identifiers is left to the parser. A real
+// certificate's walk visits under 200.
+const maxCertificateOIDElements = 4096
 
 // oversizedCertificateOIDError refuses a CERTIFICATE block carrying an OBJECT
 // IDENTIFIER larger than maxOIDBytes, and reports nil for every block whose DER this
@@ -1267,26 +1289,37 @@ const maxCertificateOIDDepth = 8
 // retained with the parsed chain — on the scan's only goroutine, with no
 // cancellation path. Every identifier a real certificate names is 9 bytes or fewer.
 func oversizedCertificateOIDError(block *pem.Block) error {
-	if largest := largestOIDBytes(block.Bytes, maxCertificateOIDDepth); largest > maxOIDBytes {
-		return fmt.Errorf("certificate in a %q block names a %d-byte object identifier, above the %d-byte ceiling this app decodes an identifier at (decoding it would allocate one int per encoded byte inside the certificate parser)",
-			boundLogText(block.Type, maxBlockTypeLogLen), largest, maxOIDBytes)
+	budget := maxCertificateOIDElements
+	if largest := largestOIDBytes(block.Bytes, maxCertificateOIDDepth, &budget); largest > maxOIDBytes {
+		return fmt.Errorf("certificate names a %d-byte object identifier, above the %d-byte ceiling this app decodes an identifier at (decoding it would allocate one int per encoded byte inside the certificate parser)",
+			largest, maxOIDBytes)
 	}
 	return nil
 }
 
 // largestOIDBytes reports the content length of the largest primitive OBJECT
 // IDENTIFIER in der, descending into constructed elements (and into an OCTET STRING,
-// which is how an extension wraps the identifiers inside its own value) up to depth.
+// which is how an extension wraps the identifiers inside its own value) up to depth,
+// and reading at most *budget elements in total across the whole walk.
 // It reads only each element's tag-length header through asn1Element, decodes
-// nothing, and FAILS OPEN on anything it cannot read, exactly like
+// nothing, and FAILS OPEN on anything it cannot read — an unreadable element, an
+// exhausted depth, or an exhausted element budget — exactly like
 // scanRSAKeyEnvelope: the guard's job is to refuse an oversized identifier, not to
 // become a second certificate parser.
-func largestOIDBytes(der []byte, depth int) int {
+//
+// budget is the shared element allowance, decremented across the whole walk (see
+// maxCertificateOIDElements): without it the guard is itself the amplification it
+// exists to prevent.
+func largestOIDBytes(der []byte, depth int, budget *int) int {
 	if depth <= 0 {
 		return 0
 	}
 	var largest int
 	for len(der) > 0 {
+		if *budget <= 0 {
+			return largest
+		}
+		*budget--
 		elem, rest, ok := asn1Element(der)
 		if !ok {
 			return largest
@@ -1297,7 +1330,7 @@ func largestOIDBytes(der []byte, depth int) int {
 				largest = len(elem.Bytes)
 			}
 		case elem.IsCompound || isASN1(elem, asn1.TagOctetString):
-			if inner := largestOIDBytes(elem.Bytes, depth-1); inner > largest {
+			if inner := largestOIDBytes(elem.Bytes, depth-1, budget); inner > largest {
 				largest = inner
 			}
 		}

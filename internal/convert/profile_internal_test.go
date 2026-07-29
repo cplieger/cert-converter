@@ -299,12 +299,20 @@ func mutateTestEncryptedSafe(t *testing.T, p *pfxPreamble, mutate func(*algorith
 // shrouded private-key bag, which every profile puts in the PLAINTEXT safe.
 func mutateTestShroudedKeyBag(t *testing.T, p *pfxPreamble, mutate func(*algorithmIdentifier)) {
 	t.Helper()
+	mutateTestShroudedKeyBagInfo(t, p, func(info *encryptedPrivateKeyInfo) { mutate(&info.Algorithm) })
+}
+
+// mutateTestShroudedKeyBagInfo rewrites the whole EncryptedPrivateKeyInfo of the
+// shrouded private-key bag, so a case can reach the ciphertext field as well as the
+// algorithm.
+func mutateTestShroudedKeyBagInfo(t *testing.T, p *pfxPreamble, mutate func(*encryptedPrivateKeyInfo)) {
+	t.Helper()
 	mutateTestAuthenticatedSafe(t, p, oidDataContentType, func(safe *contentInfo) {
 		mutateTestSafeBags(t, safe, func(bags []safeBag) []safeBag {
 			bag := &bags[testShroudedKeyBagIndex(t, bags)]
 			var info encryptedPrivateKeyInfo
 			testASN1Unmarshal(t, bag.Value.Bytes, &info)
-			mutate(&info.Algorithm)
+			mutate(&info)
 			bag.Value.Bytes = testASN1Marshal(t, info)
 			bag.Value.FullBytes = nil
 			return bags
@@ -903,6 +911,46 @@ func TestInspect_rejects_salts_one_byte_below_profile_floor(t *testing.T) {
 			wantErrText: "mac salt is 7 octet(s), want at least 8",
 			mutate: func(t *testing.T, p *pfxPreamble) {
 				p.MacData.MacSalt = testOctetString(t, shortLegacySalt)
+			},
+		},
+		// The mistyped-shape half of the same three fields. Each was a []byte before
+		// the preflight retained them as RawValues, so encoding/asn1 refused a
+		// non-OCTET-STRING there; the shape checks are what keep the accepted set
+		// unchanged now that the copy is gone.
+		{
+			name:        "SHA-256 MAC with an INTEGER where the salt belongs",
+			enc:         EncNameModern2023,
+			wantErrText: "mac salt is not a primitive OCTET STRING",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				p.MacData.MacSalt = asn1.RawValue{FullBytes: testASN1Marshal(t, 1)}
+			},
+		},
+		{
+			// PBMAC1 carries its salt in the nested PBKDF2 block and returns before
+			// the length floors, so only the shape check reaches this field.
+			name:        "PBMAC1 with an INTEGER where the salt belongs",
+			enc:         EncNameModern2026,
+			wantErrText: "mac salt is not a primitive OCTET STRING",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				p.MacData.MacSalt = asn1.RawValue{FullBytes: testASN1Marshal(t, 1)}
+			},
+		},
+		{
+			name:        "an INTEGER where the mac digest belongs",
+			enc:         EncNameModern2023,
+			wantErrText: "mac digest is not a primitive OCTET STRING",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				p.MacData.Mac.Digest = asn1.RawValue{FullBytes: testASN1Marshal(t, 1)}
+			},
+		},
+		{
+			name:        "an INTEGER where the shrouded key's ciphertext belongs",
+			enc:         EncNameModern2023,
+			wantErrText: "shrouded key bag ciphertext is not a primitive OCTET STRING",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestShroudedKeyBagInfo(t, p, func(info *encryptedPrivateKeyInfo) {
+					info.EncryptedData = asn1.RawValue{FullBytes: testASN1Marshal(t, 1)}
+				})
 			},
 		},
 	} {
@@ -1705,5 +1753,53 @@ func TestInspect_rejects_iterations_one_below_profile_floor(t *testing.T) {
 					tc.enc, tc.iterations, err)
 			}
 		})
+	}
+}
+
+// TestOctetStringBytes_refuses_every_non_primitive_shape pins the guard that replaced
+// the preflight's copying []byte fields. encoding/asn1 required ClassUniversal,
+// TagOctetString and !IsCompound for a []byte field, so all three clauses must hold
+// here or the preflight admits a shape go-pkcs12 then rejects — and gives up the
+// copy-avoidance for nothing.
+func TestOctetStringBytes_refuses_every_non_primitive_shape(t *testing.T) {
+	t.Parallel()
+	for name, raw := range map[string]asn1.RawValue{
+		"context-specific tag 4": {Class: asn1.ClassContextSpecific, Tag: asn1.TagOctetString},
+		"universal INTEGER":      {Class: asn1.ClassUniversal, Tag: asn1.TagInteger},
+		"constructed OCTET STRING": {
+			Class: asn1.ClassUniversal, Tag: asn1.TagOctetString, IsCompound: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := octetStringBytes(raw, "mac salt"); !errors.Is(err, ErrProfileUnknown) {
+				t.Fatalf("octetStringBytes(%s) = %v, want ErrProfileUnknown", name, err)
+			}
+		})
+	}
+	want := []byte{0x01, 0x02}
+	got, err := octetStringBytes(asn1.RawValue{
+		Class: asn1.ClassUniversal, Tag: asn1.TagOctetString, Bytes: want,
+	}, "mac salt")
+	if err != nil {
+		t.Fatalf("octetStringBytes(primitive OCTET STRING) = %v, want no error", err)
+	}
+	if &got[0] != &want[0] {
+		t.Error("octetStringBytes copied its input; the point of the helper is that it aliases")
+	}
+}
+
+// TestInspect_refuses_a_bundle_over_MaxBundleBytes pins the codec's own input bound.
+// The store checks the size first today, so this arm exists precisely so a SECOND
+// caller cannot hand the preflight an unbounded buffer: every allocation bound below
+// it (maxOIDBytes, maxAuthenticatedSafes, maxSafeBags) is sized against this limit.
+func TestInspect_refuses_a_bundle_over_MaxBundleBytes(t *testing.T) {
+	t.Parallel()
+	_, err := Inspect(make([]byte, MaxBundleBytes+1))
+	if !errors.Is(err, ErrProfileUnknown) {
+		t.Fatalf("Inspect(MaxBundleBytes+1 bytes) = %v, want ErrProfileUnknown", err)
+	}
+	if want := "over the"; !strings.Contains(err.Error(), want) {
+		t.Errorf("Inspect(oversized) = %v, want the refusal to name %q", err, want)
 	}
 }

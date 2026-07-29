@@ -785,3 +785,40 @@ func TestStoreListOutputs_enumerates_a_nested_tree(t *testing.T) {
 			" candidate, and a file this app would never have written is never one", got, want)
 	}
 }
+
+// TestOwnedByThisProcess_answers_the_chmod_authorization_question pins the
+// discriminator the untightenable-mode arms branch on, which every chmod-refusal test
+// reaches through the fileOwnedByProcess seam and therefore never executes.
+//
+// Both halves matter. A file this process just created is OWNED, which is what routes
+// a mode-forcing filesystem's EPERM onto the WARN-only arm instead of scheduling a
+// rewrite that would land with the same forced mode. And a FileInfo carrying no
+// *syscall.Stat_t answers false, which keeps the documented deployment shape (a
+// root-owned bundle left by an earlier PUID mapping) on the arm that repairs it —
+// failing OPEN toward repair rather than assuming ownership it could not read.
+func TestOwnedByThisProcess_answers_the_chmod_authorization_question(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "owned")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("setup: Lstat: %v", err)
+	}
+	if !ownedByThisProcess(fi) {
+		t.Errorf("ownedByThisProcess(a file this process created) = false, want true: the euid that"+
+			" owns a file may always chmod it, which is the premise the WARN-only refusal arm rests on"+
+			" (file uid vs euid %d)", os.Geteuid())
+	}
+	if ownedByThisProcess(statlessFileInfo{fi}) {
+		t.Error("ownedByThisProcess(a FileInfo with no *syscall.Stat_t) = true, want false: an" +
+			" unreadable ownership must route the refusal to the arm that regenerates")
+	}
+}
+
+// statlessFileInfo is an os.FileInfo whose Sys() carries no *syscall.Stat_t, the
+// shape a non-POSIX or synthetic filesystem hands back.
+type statlessFileInfo struct{ os.FileInfo }
+
+func (statlessFileInfo) Sys() any { return nil }

@@ -240,12 +240,12 @@ func TestStoreLogOrphanWalkOutcome_reports_each_disabling_condition(t *testing.T
 
 // TestOutputWalkVisit_an_unreadable_path_vetoes_the_reap pins the orphan walk's
 // deletion-safety accounting on the arm no uid can be relied on to reach: an
-// /output sub-path fs.WalkDir hands back with an error must veto reaping for the
+// /output sub-path walkRoot hands back with an error must veto reaping for the
 // whole scan (safe = false), must feed the aggregate counter, and must not abort
 // the walk.
 //
 // Called directly on the visitor, exactly as the input walk's subtests above call
-// sw.visit, because the only way to make WalkDir produce that error for real is a
+// sw.visit, because the only way to make the walk produce that error for real is a
 // chmod, which does nothing under uid 0 -- so the walk-level subtest skips there
 // and the veto goes unasserted on every root run of the suite. The veto is what
 // stops the reap deleting private-key bundles it could not prove orphaned, so it

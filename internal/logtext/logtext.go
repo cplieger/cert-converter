@@ -1,6 +1,7 @@
-// Package logtext holds the app-wide bounding of untrusted text headed for a
-// diagnostic: one truncation marker, deliberately louder than runesafe's own "...",
-// so an operator can tell a cut record from one that ends there.
+// Package logtext holds the app-wide truncation marker for text headed for a
+// diagnostic, deliberately louder than runesafe's own "...", so an operator can tell
+// a cut record from one that ends there, plus the one byte-bounding helper that does
+// NOT sanitize.
 //
 // It exists for the marker and for the ONE consumer whose text must be bounded
 // without being sanitized: internal/process's orphan path sample. Those paths come

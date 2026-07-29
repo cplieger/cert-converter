@@ -544,6 +544,12 @@ var fileOwnedByProcess = ownedByThisProcess
 // It is the discriminator the refused-chmod arm's premise rests on: only a bundle
 // this process does NOT own is one a temp+rename rewrite can converge.
 //
+// Geteuid, not Getuid: the kernel checks a chmod against the EFFECTIVE (fs) uid
+// (inode_owner_or_capable -> current_fsuid), which is the authorization this
+// discriminator models. Where the two differ, the real uid would answer "owned" for a
+// bundle this process may not chmod (routing a genuinely unconvergeable refusal onto
+// the WARN-only arm) or the reverse.
+//
 // A missing *syscall.Stat_t answers false, which keeps the documented deployment
 // shape (a root-owned bundle left behind by an earlier PUID mapping) on the arm
 // that repairs it.
@@ -552,7 +558,7 @@ func ownedByThisProcess(fi os.FileInfo) bool {
 	if !ok {
 		return false
 	}
-	return int(st.Uid) == os.Getuid()
+	return int(st.Uid) == os.Geteuid()
 }
 
 // tightenMode chmods a prior bundle whose mode is laxer than pfxFileMode back to
@@ -741,7 +747,7 @@ type outputWalk struct {
 	safe       bool
 }
 
-// visit is listOutputs' WalkDir callback: one entry, one verdict.
+// visit is listOutputs' walkRoot callback: one entry, one verdict.
 func (w *outputWalk) visit(rel string, d fs.DirEntry, err error) error {
 	// Same per-entry cancellation contract the input walk and the stale-temp
 	// sweep already honour: this walk runs on the shutdown path, because the
@@ -764,8 +770,10 @@ func (w *outputWalk) visit(rel string, d fs.DirEntry, err error) error {
 	}
 	// A symlink anywhere in the output tree makes this walk and the WRITE path
 	// disagree about where a bundle lives: writes resolve through *os.Root,
-	// which follows a symlink that stays inside the root, while fs.WalkDir does
-	// not follow symlinks at all. So a bundle written through a symlinked
+	// which follows a symlink that stays inside the root, while walkRoot does
+	// not follow symlinks at all (its entries come from ReadDir, so a symlink
+	// reports fs.ModeSymlink and is never descended into). So a bundle written
+	// through a symlinked
 	// directory is enumerated here under its PHYSICAL path, whose derived input
 	// name is not in the scan's enumeration, and it reads as an orphan the same
 	// scan that created it. Refuse to reap rather than try to reconcile two

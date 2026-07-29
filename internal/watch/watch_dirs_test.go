@@ -177,7 +177,7 @@ func TestVisitWatchPath_applies_the_walk_error_policy(t *testing.T) {
 			}
 			w := New(root, func(context.Context) {}, WithFallback(tc.fallback))
 
-			err := w.visitWatchPath(t.Context(), nil, root, path, nil, walkErr)
+			err := w.visitWatchPath(t.Context(), nil, &watchSetBudget{max: fallbackWatchEntries, root: root}, path, nil, walkErr)
 
 			if tc.wantFatal {
 				if !errors.Is(err, walkErr) {
@@ -209,7 +209,7 @@ func TestVisitWatchPath_reports_shutdown_ahead_of_a_walk_error(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := w.visitWatchPath(ctx, nil, root, filepath.Join(root, "example.com"), nil, errors.New("permission denied"))
+	err := w.visitWatchPath(ctx, nil, &watchSetBudget{max: fallbackWatchEntries, root: root}, filepath.Join(root, "example.com"), nil, errors.New("permission denied"))
 
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("visitWatchPath(cancelled ctx, walkErr) = %v, want context.Canceled: shutdown outranks the walk error so Run treats it as a clean stop", err)
@@ -296,6 +296,93 @@ func TestResyncWatchSet_stays_silent_when_shutdown_cut_the_walk_short(t *testing
 	if n := logs.CountLevel(slog.LevelWarn, "failed to re-sync the watch set"); n != 0 {
 		t.Errorf("resyncWatchSet(cancelled ctx) logged %d WARNs %v, want 0: a walk cut short by shutdown is a clean stop, not a watch degradation",
 			n, logs.Messages())
+	}
+}
+
+// TestAddWatchDirs_stops_at_the_entry_budget pins the watch-set walk's entry
+// ceiling, the one behaviour this cycle ADDED to addWatchDirs and the only
+// uncovered non-defensive pair of statements left in the package. Three separate
+// contracts ride on it and none was pinned: the walk STOPS at the budget rather
+// than failing (fs.SkipAll makes WalkDir return nil, which is what keeps Run in
+// watch mode instead of degrading it to polling), the entries up to the budget stay
+// registered (the root above all, or nothing is watched at all), and the refusal is
+// ONE record per walk rather than one per skipped directory, carrying the phrase the
+// CertConverterInputTreeTooLarge alert rule matches (README.md). Deleting the
+// ceiling, inverting the comparison, or returning the error instead of fs.SkipAll all
+// left the suite green.
+//
+// Budget 2 is the whole tree minus one: the root is charged first, then
+// a.example.com (WalkDir enumerates lexically), so b.example.com is the entry past
+// the ceiling.
+// Not parallel: it swaps the process-global slog default.
+func TestAddWatchDirs_stops_at_the_entry_budget(t *testing.T) {
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	watched := filepath.Join(root, "a.example.com")
+	refused := filepath.Join(root, "b.example.com")
+	for _, dir := range []string{watched, refused} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logs := capture.Default(t)
+	w := New(root, func(context.Context) {}, WithMaxEntries(2))
+
+	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
+		t.Fatalf("addWatchDirs over a tree past the budget = %v, want nil: a too-large tree degrades to a PARTIAL watch set, and reporting it as a root failure would drop the process into poll mode", err)
+	}
+
+	list := watcher.WatchList()
+	for _, want := range []string{root, watched} {
+		if !slices.Contains(list, want) {
+			t.Errorf("watch list = %v, want %q registered: the entries up to the budget must still be watched", list, want)
+		}
+	}
+	if slices.Contains(list, refused) {
+		t.Errorf("watch list = %v, want %q refused: the walk must stop at max_entries", list, refused)
+	}
+	if n := logs.CountLevel(slog.LevelWarn, watchBudgetMsg); n != 1 {
+		t.Errorf("budget WARN logged %d times, want exactly 1 per walk (the remainder is unbounded and the operator action is the same for all of it); log = %v",
+			n, logs.Messages())
+	}
+}
+
+// TestAddWatchDirs_bounds_the_live_watch_set_across_calls pins the OTHER half of the
+// same ceiling, and the half the per-walk count cannot express: addWatchDirs runs
+// again for every directory Create/Chmod, each time with a fresh per-walk budget, so
+// a writer creating directories one at a time under an already-watched parent would
+// otherwise add a registration per event forever until the per-UID inotify quota is
+// exhausted — taking unrelated same-UID consumers down with it.
+//
+// Each call here walks a tree that FITS the per-walk budget, so only the live-set
+// bound can refuse anything. Re-walking an already-registered path must stay
+// idempotent (the kernel charges no new slot), or a rebuild would refuse itself.
+// Not parallel: it swaps the process-global slog default.
+func TestAddWatchDirs_bounds_the_live_watch_set_across_calls(t *testing.T) {
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	const budget = 3
+	capture.Default(t)
+	w := New(root, func(context.Context) {}, WithMaxEntries(budget))
+
+	for i := range 6 {
+		dir := filepath.Join(root, "batch-"+string(rune('a'+i)))
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		// One directory per call, exactly as handlePathEvent drives it on a Create.
+		if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
+			t.Fatalf("addWatchDirs(call %d) = %v, want nil", i, err)
+		}
+		if n := len(watcher.WatchList()); n > budget {
+			t.Fatalf("after %d calls the live watch set holds %d registrations, want at most %d: each call takes a fresh per-walk budget, so only a bound on the SET can stop unbounded growth",
+				i+1, n, budget)
+		}
+	}
+	// The root must be among the survivors: refusing new paths may not cost the
+	// registration everything else is watched through.
+	if !slices.Contains(watcher.WatchList(), root) {
+		t.Errorf("watch list = %v, want the root still registered", watcher.WatchList())
 	}
 }
 

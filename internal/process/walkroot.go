@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"slices"
+	"strings"
 	"syscall"
 )
 
@@ -14,6 +15,22 @@ import (
 // implement: the /input scan's per-entry visit and the /output store's listing
 // visit. Naming it is what lets one walker serve both.
 type walkFunc func(rel string, d fs.DirEntry, err error) error
+
+// scanReadDirBatch is how many directory entries one ReadDir call takes at a time.
+// It is the whole point of this streaming walk: fs.WalkDir reads and SORTS a
+// directory's complete inventory before it calls back even once, so a hostile flat
+// /input forces that inventory into memory before the entry budget
+// (scanWalk.entryBudget, from Options.MaxScanEntries) can refuse it — the one-scan
+// exhaustion that budget exists to stop. A fixed batch bounds the per-directory
+// allocation to this many entries whatever the directory holds, and the budget is
+// then checked between batches, on the entries actually taken.
+const scanReadDirBatch = 256
+
+// cmpDirEntryName orders two directory entries by name, the comparison
+// slices.SortFunc needs for streamRootDir's per-batch sort.
+func cmpDirEntryName(a, b fs.DirEntry) int {
+	return strings.Compare(a.Name(), b.Name())
+}
 
 // walkRoot enumerates a confined root's tree and hands every entry to visit,
 // root-relative, in the same shape fs.WalkDir did: the root first, then each entry
@@ -32,9 +49,14 @@ type walkFunc func(rel string, d fs.DirEntry, err error) error
 //
 // Two deliberate differences from fs.WalkDir. Entries arrive in directory order
 // (sorted only within a batch) rather than globally sorted, because a global sort IS
-// the materialization this walk avoids; nothing downstream depends on the order
-// (`seen` is a set, the output listing is a membership filter, and the per-path
-// diagnostics stand alone). And a directory's own entries are all visited before the
+// the materialization this walk avoids. No DECISION depends on the order: `seen` is a
+// set, the output listing is compared as a membership filter, and the per-path
+// diagnostics stand alone. The one thing that does read it is diagnostic —
+// store.listOutputs returns its candidates in walk order and sampleOrphanPaths shows
+// the first few of them — so WHICH orphan paths an operator is shown changed with this
+// walk, and would change again under a re-batching. Nothing alerts on that sample (the
+// README's rules match the message, not the paths).
+// And a directory's own entries are all visited before the
 // walk descends into its subdirectories, which is what lets it keep exactly ONE
 // directory handle open at a time: a queue of pending directory NAMES cannot exhaust
 // the process's descriptors on a deep tree, and on the /input side its own size is

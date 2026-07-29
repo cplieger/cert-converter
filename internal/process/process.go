@@ -9,7 +9,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"strings"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
@@ -378,21 +377,6 @@ func (sw *scanWalk) entryBudget() int {
 		return sw.maxEntries
 	}
 	return fallbackScanEntries
-}
-
-// scanReadDirBatch is how many directory entries one ReadDir call takes at a time.
-// It is the whole point of the streaming walk: fs.WalkDir reads and SORTS a
-// directory's complete inventory before it calls back even once, so a hostile flat
-// /input forces that inventory into memory before the entry budget can refuse it —
-// the one-scan exhaustion maxScanEntries exists to stop. A fixed batch bounds the
-// per-directory allocation to this many entries whatever the directory holds, and the
-// budget is then checked between batches, on the entries actually taken.
-const scanReadDirBatch = 256
-
-// cmpDirEntryName orders two directory entries by name, the comparison
-// slices.SortFunc needs for the per-batch sort above.
-func cmpDirEntryName(a, b fs.DirEntry) int {
-	return strings.Compare(a.Name(), b.Name())
 }
 
 // visit is the walk's per-entry callback (walkRoot -> streamRootDir ->
@@ -940,10 +924,15 @@ func (o *observationLog) reserve(rel string) {
 }
 
 // evictOne drops one remembered pair from BOTH halves, never the path being reserved,
-// so an eviction can never leave the two halves out of step. It prefers a victim the
-// signature half knows (the common case, where both halves hold the pair) and falls back
-// to a wholeness-only entry, which is what a pair that read whole and then failed
-// analysis, encoding, or its write leaves behind.
+// so an eviction can never leave the two halves out of step. It is reserve's SIGNATURE
+// arm, so it takes its victim from `seen`.
+//
+// The wholeness-only loop below is unreachable from that call site and is kept as a
+// guard, not as a path: reserve calls this only when len(seen) >= maxObservedPairs()
+// (never 0, since the fallback is fallbackScanEntries) and only for a `keep` that is
+// absent from `seen`, so the first loop always finds a victim. A wholeness-only entry —
+// what a pair that read whole and then failed analysis, encoding or its write leaves
+// behind — is evicted by evictWholeness, which reserve's own second arm calls.
 func (o *observationLog) evictOne(keep string) {
 	for victim := range o.seen {
 		if victim == keep {

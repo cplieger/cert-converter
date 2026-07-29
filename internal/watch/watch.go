@@ -512,30 +512,65 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 // ancestor still carries an in-root name, so this residual (watch descriptors,
 // never content) stands as described above.
 //
+// The entry ceiling is TWO bounds, not one. Every walk is capped at maxEntries
+// entries, which bounds one traversal's cost; and the LIVE registration set is capped
+// at the same number across calls, which is the host-resource bound the per-walk cap
+// alone does not give. addWatchDirs runs again for every directory Create/Chmod
+// (handlePathEvent), so a writer creating directories one at a time under an
+// already-watched parent hands each call a fresh per-walk budget it never exhausts,
+// and the registration set would grow until the per-UID
+// fs.inotify.max_user_instances/max_user_watches quota is spent — taking unrelated
+// same-UID consumers down with it. Re-registering a path already in the set is
+// idempotent in the kernel and costs no new slot, so a rebuild is never refused by
+// its own existing registrations.
+//
 // The traversal is cancellable: it checks ctx before each entry and returns
 // ctx.Err() as soon as the process is shutting down, so a shutdown arriving
 // mid-walk over a large input tree is not delayed by the remaining
 // registrations. Callers must treat a ctx error as shutdown rather than a watch
 // failure (no WARN, no fallback to polling, no follow-up scan).
 func (w *Watcher) addWatchDirs(ctx context.Context, watcher *fsnotify.Watcher, root string) error {
-	budget := w.maxEntries
-	if budget <= 0 {
-		budget = fallbackWatchEntries
+	budget := &watchSetBudget{max: w.maxEntries, root: root}
+	if budget.max <= 0 {
+		budget.max = fallbackWatchEntries
 	}
-	visited := 0
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		visited++
-		if visited > budget {
-			// One record per walk, not one per skipped directory: the remainder is
-			// unbounded, and the operator action is the same for all of it.
-			slog.Warn(watchBudgetMsg,
-				"root", root, "max_entries", budget,
-				"fallback_scan", w.fallbackStatus(),
-				"remediation", watchBudgetRemediation)
+		if !budget.spendEntry() {
+			w.warnWatchBudget(budget)
 			return fs.SkipAll
 		}
-		return w.visitWatchPath(ctx, watcher, root, path, d, walkErr)
+		return w.visitWatchPath(ctx, watcher, budget, path, d, walkErr)
 	})
+}
+
+// watchSetBudget is one walk's share of the two entry ceilings addWatchDirs applies:
+// how many paths this traversal may visit, and — read through the Watcher's own
+// registration mirror — how large the live watch set may grow. It also carries the
+// once-per-walk guard for the budget WARN, whose remainder is unbounded and whose
+// operator action is the same for all of it.
+type watchSetBudget struct {
+	max     int
+	root    string
+	visited int
+	warned  bool
+}
+
+// spendEntry charges one enumerated path and reports whether it is within budget.
+func (b *watchSetBudget) spendEntry() bool {
+	b.visited++
+	return b.visited <= b.max
+}
+
+// warnWatchBudget emits the budget WARN at most once per walk.
+func (w *Watcher) warnWatchBudget(budget *watchSetBudget) {
+	if budget.warned {
+		return
+	}
+	budget.warned = true
+	slog.Warn(watchBudgetMsg,
+		"root", budget.root, "max_entries", budget.max,
+		"fallback_scan", w.fallbackStatus(),
+		"remediation", watchBudgetRemediation)
 }
 
 // visitWatchPath handles one entry of addWatchDirs' traversal: it honours
@@ -543,9 +578,14 @@ func (w *Watcher) addWatchDirs(ctx context.Context, watcher *fsnotify.Watcher, r
 // warn-and-skip below it), and registers a watch for every directory. Only
 // directories are registered; a regular file is watched through its parent
 // directory.
+//
+// A NEW registration is refused once the live watch set is at the budget (see
+// addWatchDirs): that is the bound the per-walk count cannot express, because each
+// event-driven call starts a fresh count.
 func (w *Watcher) visitWatchPath(
-	ctx context.Context, watcher *fsnotify.Watcher, root, path string, d fs.DirEntry, walkErr error,
+	ctx context.Context, watcher *fsnotify.Watcher, budget *watchSetBudget, path string, d fs.DirEntry, walkErr error,
 ) error {
+	root := budget.root
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}
@@ -559,6 +599,12 @@ func (w *Watcher) visitWatchPath(
 	}
 	if !d.IsDir() {
 		return validateWatchRootEntry(root, path, d)
+	}
+	// Already registered: re-adding is idempotent in the kernel and consumes no
+	// further slot, so a rebuild never refuses itself.
+	if !w.watchSetHas(path) && w.watchSetSize() >= budget.max {
+		w.warnWatchBudget(budget)
+		return fs.SkipAll
 	}
 	if addErr := watcher.Add(path); addErr != nil {
 		return w.handleWatchAddError(root, path, addErr)
@@ -640,6 +686,15 @@ func (w *Watcher) watchSetHas(path string) bool {
 	defer w.watchedMu.Unlock()
 	_, ok := w.watched[filepath.Clean(path)]
 	return ok
+}
+
+// watchSetSize reports how many registrations the mirror holds, which is the live
+// watch set addWatchDirs bounds across calls. Read under the same lock as
+// watchSetHas, because a Remove/Rename handler can forget a path concurrently.
+func (w *Watcher) watchSetSize() int {
+	w.watchedMu.Lock()
+	defer w.watchedMu.Unlock()
+	return len(w.watched)
 }
 
 // recordWatch notes a registration this package made, so watchSetHas can answer
