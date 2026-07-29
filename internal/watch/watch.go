@@ -453,11 +453,13 @@ func (w *Watcher) handleWatchAddError(root, path string, addErr error) error {
 // insideRoot reports whether an event-derived path still denotes a name inside
 // the watched root. Watch-set maintenance is the one place this package can
 // EXTEND its ambient reach: fsnotify hands back the path a watch was registered
-// with, so a registration that once escaped the root (the swapped-ancestor race
-// addWatchDirs documents) would otherwise keep walking and registering further
-// outside it, one event at a time. The check is lexical because it bounds the
-// NAME, not the resolution: a symlink is already refused by handlePathEvent's
-// Lstat and by WalkDir, which does not descend one.
+// with, so a registration carrying an out-of-root NAME would otherwise keep
+// walking and registering further outside it, one event at a time. The check is
+// lexical because it bounds the NAME, not the resolution: a symlink is already
+// refused by handlePathEvent's Lstat and by WalkDir, which does not descend one.
+// It therefore does NOT bound the swapped-ancestor race addWatchDirs documents:
+// a registration that escaped that way still carries an in-root name, so that
+// residual (watch descriptors, never content) stands as addWatchDirs describes.
 func (w *Watcher) insideRoot(path string) bool {
 	rel, err := filepath.Rel(filepath.Clean(w.root), filepath.Clean(path))
 	if err != nil {
@@ -676,7 +678,7 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) erro
 			}
 
 		case <-st.debounceTimer.C:
-			st.runDebouncedScan(ctx)
+			st.runDebouncedScan(ctx, watcher)
 
 		case <-st.fallbackChan():
 			w.handleFallbackTick(ctx, watcher, st)
@@ -904,11 +906,28 @@ func (st *watchState) scheduleScan() {
 
 // runDebouncedScan fires the debounced rescan and re-arms the fallback timer so
 // the safety-net interval is measured from the last real scan.
-func (st *watchState) runDebouncedScan(ctx context.Context) {
+//
+// The watch set is re-asserted first, exactly as the fallback tick does, and for a
+// reason the event-driven recovery cannot cover: the watched mirror only forgets a
+// path when fsnotify DELIVERS a Remove/Rename for it, and the Linux backend consumes
+// IN_UNMOUNT and IN_IGNORED without emitting an event at all. A registration dropped
+// that way leaves the mirror claiming the directory is watched, so handlePathEvent's
+// membership guard skips the subtree re-walk and its descendants stay unwatched for
+// the process's life — with the periodic rescan disabled, later renewals under them
+// are never detected. Re-asserting once per debounced SCAN (not once per event) keeps
+// that walk off the per-event path, which is what the membership guard bought.
+func (st *watchState) runDebouncedScan(ctx context.Context, watcher *fsnotify.Watcher) {
 	st.pending = false
 	// A stop request must prevent new work on every arm: watchLoop's select has
 	// no ctx precedence (Go picks a ready case at random), so a debounce deadline
 	// reached in the same instant as cancellation can win over ctx.Done.
+	if ctx.Err() != nil {
+		return
+	}
+	st.w.resyncWatchSet(ctx, watcher,
+		"failed to re-assert the watch set before a debounced scan; a registration the kernel dropped without an event stays unwatched until the next scan")
+	// The re-sync can be cut short by cancellation, and the scan below would then be
+	// spurious work for a loop that is already returning.
 	if ctx.Err() != nil {
 		return
 	}

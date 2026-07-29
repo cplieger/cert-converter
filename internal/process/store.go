@@ -806,14 +806,18 @@ func (s *store) readBoundedPFX(ctx context.Context, rel string) ([]byte, error) 
 // comparison spans both trees, so it stays with the rest of the deletion-admission
 // rule in reap.go.
 func (s *store) listOutputs(ctx context.Context) (found []string, safe bool, err error) {
-	walk := outputWalk{ctx: ctx, safe: true}
+	walk := outputWalk{ctx: ctx, store: s, safe: true}
 	if err := fs.WalkDir(s.root.FS(), ".", walk.visit); err != nil {
 		return nil, false, fmt.Errorf("walk output tree: %w", err)
 	}
 	if s.dirRepairFailed {
-		// An output directory another process can write makes every candidate under it
-		// replaceable between this walk and the unlink, so nothing found here is
-		// provably orphaned. dirWriteRefusedMsg already named the directory.
+		// Scan-wide backstop for a repair refusal recorded ELSEWHERE — the write path's
+		// own enforceDirPerms, on an ancestor of a live bundle. The per-directory
+		// verdict this walk applies covers the directories it enumerates, including an
+		// orphan-only subtree no input-driven call ever inspects; this catches the rest.
+		// Either way a directory another process can write makes every candidate under
+		// it replaceable between this walk and the unlink, so nothing found here is
+		// provably orphaned, and dirWriteRefusedMsg already named the directory.
 		walk.safe = false
 	}
 	s.logOrphanWalkOutcome(walk.unreadable, walk.symlinked)
@@ -827,7 +831,13 @@ func (s *store) listOutputs(ctx context.Context) (found []string, safe bool, err
 // candidate collection are the same branches either way, but the state a deletion
 // decision rests on is now spelled out as fields.
 type outputWalk struct {
-	ctx        context.Context
+	ctx context.Context
+	// store is the tree being walked, so the walk can apply the same per-directory
+	// write-permission verdict the write path applies. It has to be asked HERE for a
+	// directory holding nothing but orphans: enforceDirPerms is only ever reached from
+	// isCurrent and write, both driven by an INPUT pair, so a nested directory whose
+	// bundles are all orphaned is otherwise never inspected at all.
+	store      *store
 	found      []string
 	unreadable int
 	symlinked  int
@@ -869,7 +879,16 @@ func (w *outputWalk) visit(rel string, d fs.DirEntry, err error) error {
 		w.safe = false
 		return nil
 	}
-	if d.IsDir() || !layout.IsOutput(rel) {
+	if d.IsDir() {
+		// The write path's verdict, applied to every directory this walk enumerates: a
+		// directory another process can write and this app cannot repair makes every
+		// candidate beneath it replaceable between this walk and the unlink.
+		if err := w.store.enforceDirPermsAt(rel); err != nil {
+			w.safe = false
+		}
+		return nil
+	}
+	if !layout.IsOutput(rel) {
 		return nil
 	}
 	w.found = append(w.found, rel)
@@ -937,6 +956,16 @@ const pinRedirectedMsg = "could not pin the output directory of an orphaned bund
 func (s *store) removeOrphan(rel string) bool {
 	parent, closeParent, err := s.pinnedParent(rel)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// An ancestor vanished with its bundle during the deferral: the same
+			// transient race as the basename arm below, not a redirection. pinChild
+			// wraps its Lstat error, so this is the nested layout's spelling of the
+			// disappearance the flat layout reports from Lstat directly — and the
+			// symlink remediation on the WARN below would send an operator looking for
+			// a misconfiguration that is not there.
+			slog.Debug("orphaned output vanished before removal", "path", rel)
+			return false
+		}
 		slog.Warn(pinRedirectedMsg, "path", rel, "error", err,
 			"remediation", "mount the real output directory instead of linking to it, and check /output for paths replaced while the scan was running")
 		return false

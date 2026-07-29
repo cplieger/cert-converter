@@ -197,3 +197,74 @@ func TestParsePrivateKey_bounds_an_oversized_pkcs8_algorithm_oid(t *testing.T) {
 		}
 	}
 }
+
+// TestParsePrivateKey_bounds_an_oversized_pkcs8_parameters_oid pins the SIBLING
+// identifier of the one above. The AlgorithmIdentifier's parameters field is decoded
+// by the very same x509 call: with algorithm = id-ecPublicKey (7 bytes, so the
+// identifier bound passes it) x509 unmarshals parameters into an
+// asn1.ObjectIdentifier -- the named curve -- one int per encoded byte, before it can
+// reject an unsupported curve. The refusal has to name the parameter identifier and
+// carry none of its bytes, exactly like the identifier's own bound.
+func TestParsePrivateKey_bounds_an_oversized_pkcs8_parameters_oid(t *testing.T) {
+	t.Parallel()
+	algorithm := asn1.RawValue{Tag: asn1.TagSequence, IsCompound: true, Bytes: append(
+		testASN1Marshal(t, ecPublicKeyOID),
+		testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagOID, Bytes: bytes.Repeat([]byte{0x01}, 64<<10)})...)}
+	der := testASN1Marshal(t, struct {
+		Version    int
+		Algo       asn1.RawValue
+		PrivateKey []byte
+	}{Version: 0, Algo: algorithm, PrivateKey: []byte{}})
+
+	_, err := ParsePrivateKey(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
+	if err == nil {
+		t.Fatal("ParsePrivateKey(PKCS#8 with a 64 KB parameters OID) = nil error, want a refusal")
+	}
+	if want := maxSubjectLogLen + len(truncationMarker) + 256; len(err.Error()) > want {
+		t.Errorf("error is %d bytes, want at most %d: the parameter OID reaches the log unbounded", len(err.Error()), want)
+	}
+	if strings.Contains(err.Error(), strings.Repeat("\x01", 8)) {
+		t.Errorf("error = %q, want the identifier's own bytes absent from the diagnostic", err.Error())
+	}
+	for _, want := range []string{"algorithm parameter identifier", "32-byte ceiling"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to name %q", err.Error(), want)
+		}
+	}
+}
+
+// TestParsePrivateKey_bounds_an_oversized_sec1_curve_oid pins the third door on the
+// same call chain: parsePrivateKeyBlock tries x509.ParseECPrivateKey on every block
+// that fails PKCS#8 and PKCS#1, and that parser decodes the explicit [0] named-curve
+// identifier into an asn1.ObjectIdentifier before it can reject an unknown curve.
+// Neither the RSA pre-scan (this shape's second element is an OCTET STRING) nor the
+// PKCS#8 identifier bound (not this shape) intercepts the block.
+func TestParsePrivateKey_bounds_an_oversized_sec1_curve_oid(t *testing.T) {
+	t.Parallel()
+	curve := testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagOID, Bytes: bytes.Repeat([]byte{0x01}, 64<<10)})
+	der := testASN1Marshal(t, struct {
+		Version    int
+		PrivateKey []byte
+		Parameters asn1.RawValue
+	}{
+		Version:    1,
+		PrivateKey: bytes.Repeat([]byte{0x02}, 32),
+		Parameters: asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: 0, IsCompound: true, Bytes: curve},
+	})
+
+	_, err := ParsePrivateKey(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}))
+	if err == nil {
+		t.Fatal("ParsePrivateKey(SEC1 with a 64 KB curve OID) = nil error, want a refusal")
+	}
+	if want := maxSubjectLogLen + len(truncationMarker) + 256; len(err.Error()) > want {
+		t.Errorf("error is %d bytes, want at most %d: the curve OID reaches the log unbounded", len(err.Error()), want)
+	}
+	if strings.Contains(err.Error(), strings.Repeat("\x01", 8)) {
+		t.Errorf("error = %q, want the identifier's own bytes absent from the diagnostic", err.Error())
+	}
+	for _, want := range []string{"curve identifier", "32-byte ceiling"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to name %q", err.Error(), want)
+		}
+	}
+}

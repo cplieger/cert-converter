@@ -2092,6 +2092,57 @@ func TestLogScanOutcome_names_the_output_side_counts(t *testing.T) {
 	}
 }
 
+// TestScanWalk_streams_directories_larger_than_one_read_batch pins the streaming
+// enumeration itself.
+//
+// The walk reads each directory in fixed-size batches through the confined root
+// instead of handing the whole thing to fs.WalkDir, which reads AND sorts a
+// directory's complete inventory before the entry budget gets to see a single path —
+// so a hostile flat /input could force that inventory into memory before it could be
+// refused. Batching only helps if the loop actually spans batches and still reaches
+// every entry, at every depth, which is what this pins: a directory holding more than
+// one batch, plus a nested one, must be enumerated completely and exactly once.
+func TestScanWalk_streams_directories_larger_than_one_read_batch(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	const flat = scanReadDirBatch + 37
+	for i := range flat {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("entry-%04d.txt", i)), []byte("x"), 0o600); err != nil {
+			t.Fatalf("setup: WriteFile: %v", err)
+		}
+	}
+	nested := filepath.Join(dir, "nested")
+	if err := os.Mkdir(nested, 0o750); err != nil {
+		t.Fatalf("setup: Mkdir: %v", err)
+	}
+	const deep = 5
+	for i := range deep {
+		if err := os.WriteFile(filepath.Join(nested, fmt.Sprintf("deep-%d.txt", i)), []byte("x"), 0o600); err != nil {
+			t.Fatalf("setup: WriteFile: %v", err)
+		}
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	sw := &scanWalk{src: &source{root: root}, seen: make(map[string]struct{}), observations: newObservationLog()}
+
+	if walkErr := sw.walkInput(t.Context(), root); walkErr != nil {
+		t.Fatalf("walkInput(a tree spanning several read batches) = %v, want nil", walkErr)
+	}
+	// The root, every flat entry, the nested directory, and everything inside it.
+	if want := 1 + flat + 1 + deep; sw.entries != want {
+		t.Errorf("walkInput visited %d entries, want %d: a batched read must reach every entry of every directory exactly once",
+			sw.entries, want)
+	}
+	if sw.unreadable != 0 || sw.unresolved != 0 || sw.vanished != 0 {
+		t.Errorf("walkInput reported unreadable=%d unresolved=%d vanished=%d on a clean tree, want zeros",
+			sw.unreadable, sw.unresolved, sw.vanished)
+	}
+}
+
 // TestScannerRun_refuses_a_tree_over_the_entry_budget pins maxScanEntries, the bound on
 // how much of an untrusted /input one scan takes on, and — the load-bearing half — what
 // the abort must NOT do: reap.
@@ -2171,6 +2222,21 @@ func TestObservationLog_is_bounded_across_path_churn(t *testing.T) {
 	// re-noting a remembered path must never evict anything.
 	if !log.completedPair("e.crt") {
 		t.Errorf("observationLog forgot the most recently recorded pair; eviction must make room, not drop the new entry")
+	}
+
+	// The readPair boundary records wholeness for pairs that never reach note or record
+	// (an Analyse failure, an Encode failure, a failed write), so the structural half has
+	// to be bounded at its OWN entry point, not only through the signature writers.
+	structural := newObservationLog()
+	for _, rel := range []string{"f.crt", "g.crt", "h.crt", "i.crt", "j.crt"} {
+		structural.markWhole(rel)
+	}
+	if got := len(structural.whole); got > maxObservedPairs() {
+		t.Errorf("markWhole alone left %d wholeness entries after churn across 5 paths, want at most %d",
+			got, maxObservedPairs())
+	}
+	if !structural.completedPair("j.crt") {
+		t.Errorf("markWhole evicted the pair it was reserving room for; eviction must pick another victim")
 	}
 }
 

@@ -226,7 +226,7 @@ var ecPublicKeyOID = asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}
 // the same safe direction as every other shape this walk cannot read: the block is
 // reported rather than silently treated as the EC key's companion.
 func pkcs8HoldsECKey(der []byte) bool {
-	oid, ok := pkcs8AlgorithmOID(der)
+	oid, _, ok := pkcs8AlgorithmOID(der)
 	if !ok {
 		return false
 	}
@@ -235,28 +235,29 @@ func pkcs8HoldsECKey(der []byte) bool {
 }
 
 // pkcs8AlgorithmOID returns the retained (undecoded) algorithm OID element of
-// PKCS#8 PrivateKeyInfo DER, and false for anything that is not that shape. It is
-// the one reader of that field: both callers need the identifier's LENGTH before
-// anything decodes it, so the element is handed back as an asn1.RawValue for the
-// same reason profile.go retains every untrusted identifier as one.
-func pkcs8AlgorithmOID(der []byte) (asn1.RawValue, bool) {
+// PKCS#8 PrivateKeyInfo DER, together with the DER that follows it INSIDE the same
+// AlgorithmIdentifier (its optional parameters field), and false for anything that is
+// not that shape. It is the one reader of that field: every caller needs a length
+// before anything decodes it, so each element is handed back undecoded for the same
+// reason profile.go retains every untrusted identifier as an asn1.RawValue.
+func pkcs8AlgorithmOID(der []byte) (oid asn1.RawValue, parameters []byte, ok bool) {
 	outer, _, ok := asn1Element(der)
 	if !ok || !isASN1(outer, asn1.TagSequence) {
-		return asn1.RawValue{}, false
+		return asn1.RawValue{}, nil, false
 	}
 	version, afterVersion, ok := asn1Element(outer.Bytes)
 	if !ok || !isASN1(version, asn1.TagInteger) {
-		return asn1.RawValue{}, false
+		return asn1.RawValue{}, nil, false
 	}
 	algorithm, _, ok := asn1Element(afterVersion)
 	if !ok || !isASN1(algorithm, asn1.TagSequence) {
-		return asn1.RawValue{}, false
+		return asn1.RawValue{}, nil, false
 	}
-	oid, _, ok := asn1Element(algorithm.Bytes)
+	oid, parameters, ok = asn1Element(algorithm.Bytes)
 	if !ok || !isASN1(oid, asn1.TagOID) {
-		return asn1.RawValue{}, false
+		return asn1.RawValue{}, nil, false
 	}
-	return oid, true
+	return oid, parameters, true
 }
 
 // isExpectedKeyFilePassenger reports whether a non-key PEM label in the KEY file is
@@ -666,7 +667,8 @@ func isEncryptedPEMBlock(block *pem.Block) bool {
 }
 
 // oversizedRSAKeyError refuses a private-key block holding an RSA integer larger
-// than maxVerifiableKeyBits, or reports nil for every block it cannot measure.
+// than maxVerifiableKeyBits or declaring more than maxRSAPrimeFactors prime factors,
+// or reports nil for every block it cannot measure.
 //
 // It exists because the cost is INSIDE the parser: x509.ParsePKCS8PrivateKey and
 // x509.ParsePKCS1PrivateKey run RSA CRT precomputation and consistency validation
@@ -689,8 +691,8 @@ func oversizedRSAKeyError(block *pem.Block) error {
 		return nil
 	}
 	if scan.factors > maxRSAPrimeFactors {
-		return fmt.Errorf("private key in a %q block declares %d RSA prime factors, above the %d-factor ceiling this app reads a private key at (parsing it would run one modular inverse per additional prime against a growing product and stall the scan)",
-			boundLogText(block.Type, maxBlockTypeLogLen), scan.factors, maxRSAPrimeFactors)
+		return fmt.Errorf("private key in a %q block declares more than %d RSA prime factors, above the %d-factor ceiling this app reads a private key at (parsing it would run one modular inverse per additional prime against a growing product and stall the scan)",
+			boundLogText(block.Type, maxBlockTypeLogLen), maxRSAPrimeFactors, maxRSAPrimeFactors)
 	}
 	if scan.maxBits <= maxVerifiableKeyBits {
 		return nil
@@ -724,7 +726,9 @@ type rsaKeyPreScan struct {
 	// the modulus, a prime, a CRT value, or any integer inside OtherPrimeInfos.
 	maxBits int
 	// factors is how many prime factors the structure declares: two, plus one per
-	// OtherPrimeInfos entry. Meaningless unless measured.
+	// OtherPrimeInfos entry, SATURATED at maxRSAPrimeFactors+1 — past the ceiling the
+	// exact count buys nothing and the counting itself is attacker-controlled work.
+	// Meaningless unless measured.
 	factors int
 	// measured reports that the block was read as an RSA private key whose
 	// integers could be sized. False is the FAIL-OPEN answer (a non-RSA key, a
@@ -828,6 +832,14 @@ func maxRSAIntegerBits(modulus asn1.RawValue, rest []byte) rsaKeyPreScan {
 			break
 		}
 		scan.fold(elem)
+		// The factor count SATURATES: once it is one past the ceiling the refusal is
+		// already proven, and every further element measured is attacker-controlled
+		// work bought for a number no caller reads. The size ceiling can only be
+		// raised by an element this loop would keep walking, and a block that already
+		// earns the factor refusal is never reported for its size.
+		if scan.factors > maxRSAPrimeFactors {
+			break
+		}
 		rest = remaining
 	}
 	return scan
@@ -835,8 +847,8 @@ func maxRSAIntegerBits(modulus asn1.RawValue, rest []byte) rsaKeyPreScan {
 
 // fold folds one post-modulus PKCS#1 element into the scan: an INTEGER can only
 // raise the measured size, and the OtherPrimeInfos SEQUENCE contributes both its
-// integers' sizes and its element count. Any other element is not part of the
-// structure's cost and is skipped.
+// integers' sizes and its element count, counted only as far as the ceiling the
+// count feeds.
 func (s *rsaKeyPreScan) fold(elem asn1.RawValue) {
 	switch {
 	case isASN1(elem, asn1.TagInteger):
@@ -844,7 +856,7 @@ func (s *rsaKeyPreScan) fold(elem asn1.RawValue) {
 			s.maxBits = elemBits
 		}
 	case isASN1(elem, asn1.TagSequence):
-		additional, additionalBits := rsaOtherPrimeInfos(elem.Bytes)
+		additional, additionalBits := rsaOtherPrimeInfos(elem.Bytes, maxRSAPrimeFactors-s.factors+1)
 		s.factors += additional
 		if additionalBits > s.maxBits {
 			s.maxBits = additionalBits
@@ -858,13 +870,18 @@ func (s *rsaKeyPreScan) fold(elem asn1.RawValue) {
 // integer inside it. Nothing is decoded here either: each element is measured
 // from its own tag-length header.
 //
+// limit is how many entries are still worth counting — one more than the caller
+// needs to prove its refusal — so the walk stops as soon as the ceiling is exceeded
+// instead of measuring an attacker-sized collection to the end for an exact count
+// nothing reads. A non-positive limit stops immediately.
+//
 // It counts an entry it cannot fully read, and stops at the first element that is
 // not an OtherPrimeInfo, which is the FAIL-CLOSED direction on purpose — the count
 // feeds a refusal, so undercounting a malformed collection is the only mistake
 // with a cost. Undercounting cannot happen from a short read: the walk stops, and
 // the caller refuses on what it already counted.
-func rsaOtherPrimeInfos(body []byte) (additional, maxBits int) {
-	for len(body) > 0 {
+func rsaOtherPrimeInfos(body []byte, limit int) (additional, maxBits int) {
+	for len(body) > 0 && additional < limit {
 		info, remaining, ok := asn1Element(body)
 		if !ok || !isASN1(info, asn1.TagSequence) {
 			break
@@ -940,9 +957,10 @@ func derIntegerBits(content []byte) (int, bool) {
 // container holding a key type cert-converter does not support is rejected with
 // a distinct error rather than reported as unparseable.
 //
-// An oversized RSA modulus is refused BEFORE any parser sees the block, because
-// the cost of an oversized key is paid inside the parser itself; see
-// oversizedRSAKeyError.
+// Every refusal a private-key block earns from its DER alone is applied BEFORE any
+// parser sees the block, because the cost is paid inside the parser itself: an
+// oversized RSA integer, too many RSA prime factors, and an oversized algorithm,
+// parameter or curve identifier; see prohibitiveKeyError.
 //
 // The return type is crypto.Signer: every accepted type implements it, so the
 // caller never has to consider a key whose public half cannot be read.
@@ -999,12 +1017,16 @@ func prohibitiveKeyError(block *pem.Block) error {
 	if err := oversizedRSAKeyError(block); err != nil {
 		return err
 	}
-	return oversizedKeyAlgorithmOIDError(block)
+	if err := oversizedKeyAlgorithmOIDError(block); err != nil {
+		return err
+	}
+	return oversizedSEC1CurveOIDError(block)
 }
 
 // oversizedKeyAlgorithmOIDError refuses a PKCS#8 private-key block whose algorithm
-// identifier is larger than maxOIDBytes, and reports nil for every block that is
-// not that shape.
+// identifier — or the parameters identifier beside it in the same
+// AlgorithmIdentifier — is larger than maxOIDBytes, and reports nil for every block
+// that is not that shape.
 //
 // It is the same allocation bound profile.go's decodeOID applies to bundle bytes,
 // applied here because x509.ParsePKCS8PrivateKey decodes that identifier into an
@@ -1016,11 +1038,60 @@ func prohibitiveKeyError(block *pem.Block) error {
 // cancellation path. The refusal is bounded and names the size, like every other
 // pre-parse guard here; every identifier a real key names is 9 bytes or fewer.
 func oversizedKeyAlgorithmOIDError(block *pem.Block) error {
-	oid, ok := pkcs8AlgorithmOID(block.Bytes)
-	if !ok || len(oid.Bytes) <= maxOIDBytes {
+	oid, parameters, ok := pkcs8AlgorithmOID(block.Bytes)
+	if !ok {
 		return nil
 	}
-	return fmt.Errorf("private key in a %q block names a %d-byte algorithm identifier, above the %d-byte ceiling this app decodes an identifier at (decoding it would allocate one int per encoded byte before the key could be rejected)",
+	if len(oid.Bytes) > maxOIDBytes {
+		return fmt.Errorf("private key in a %q block names a %d-byte algorithm identifier, above the %d-byte ceiling this app decodes an identifier at (decoding it would allocate one int per encoded byte before the key could be rejected)",
+			boundLogText(block.Type, maxBlockTypeLogLen), len(oid.Bytes), maxOIDBytes)
+	}
+	// The AlgorithmIdentifier's parameters field is decoded the same way and by the
+	// same call: for an EC key x509 unmarshals it into an asn1.ObjectIdentifier (the
+	// named curve) before it can reject an unknown curve. Only a PRIMITIVE OBJECT
+	// IDENTIFIER reaches that allocation; a compound tag or a SEQUENCE (explicit EC
+	// parameters, RSASSA-PSS parameters) is refused by encoding/asn1 without
+	// allocating, so it is left alone.
+	if params, _, paramsOK := asn1Element(parameters); paramsOK && isASN1(params, asn1.TagOID) &&
+		!params.IsCompound && len(params.Bytes) > maxOIDBytes {
+		return fmt.Errorf("private key in a %q block names a %d-byte algorithm parameter identifier, above the %d-byte ceiling this app decodes an identifier at (decoding it would allocate one int per encoded byte before the key could be rejected)",
+			boundLogText(block.Type, maxBlockTypeLogLen), len(params.Bytes), maxOIDBytes)
+	}
+	return nil
+}
+
+// oversizedSEC1CurveOIDError refuses a SEC1 ECPrivateKey block whose explicit [0]
+// named-curve identifier is larger than maxOIDBytes, and reports nil for every block
+// that is not that shape.
+//
+// It is the third door on the same call chain as oversizedKeyAlgorithmOIDError:
+// x509.ParseECPrivateKey decodes that identifier into an asn1.ObjectIdentifier (one
+// int per encoded byte) before it can reject an unknown curve, and
+// parsePrivateKeyBlock tries that parser on EVERY block that fails PKCS#8 and PKCS#1,
+// whatever its label. Every curve a real key names is 9 bytes or fewer, so nothing
+// legitimate is newly refused; only the refusal point and its text move.
+func oversizedSEC1CurveOIDError(block *pem.Block) error {
+	outer, _, ok := asn1Element(block.Bytes)
+	if !ok || !isASN1(outer, asn1.TagSequence) {
+		return nil
+	}
+	version, afterVersion, ok := asn1Element(outer.Bytes)
+	if !ok || !isASN1(version, asn1.TagInteger) {
+		return nil
+	}
+	priv, afterPriv, ok := asn1Element(afterVersion)
+	if !ok || !isASN1(priv, asn1.TagOctetString) {
+		return nil
+	}
+	params, _, ok := asn1Element(afterPriv)
+	if !ok || params.Class != asn1.ClassContextSpecific || params.Tag != 0 || !params.IsCompound {
+		return nil
+	}
+	oid, _, oidOK := asn1Element(params.Bytes)
+	if !oidOK || !isASN1(oid, asn1.TagOID) || len(oid.Bytes) <= maxOIDBytes {
+		return nil
+	}
+	return fmt.Errorf("private key in a %q block names a %d-byte curve identifier, above the %d-byte ceiling this app decodes an identifier at (decoding it would allocate one int per encoded byte before the key could be rejected)",
 		boundLogText(block.Type, maxBlockTypeLogLen), len(oid.Bytes), maxOIDBytes)
 }
 

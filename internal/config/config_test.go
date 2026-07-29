@@ -469,6 +469,11 @@ func TestLoad_blank_password_reports_only_the_strength_warning(t *testing.T) {
 			for _, unwanted := range []string{
 				"PFX_PASSWORD has leading or trailing whitespace",
 				"contains a control character",
+				// U+00A0 in the table above is both blank and Zs, so this is the
+				// record that the one blank guard in logPasswordDelivery suppresses;
+				// an invisible-formatting entry would be vacuous (no blank input
+				// carries a Cf rune).
+				"contains a non-ASCII space character",
 			} {
 				if n := logs.Count(unwanted); n != 0 {
 					t.Errorf("Load(PFX_PASSWORD=%q) logged %d records matching %q, want none: the blank password is already reported, and this line's remediation sends the operator to fix the wrong thing (logs %v)",

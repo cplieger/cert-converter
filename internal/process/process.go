@@ -6,9 +6,12 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
+	"path"
+	"slices"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
@@ -228,9 +231,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	// /output stale-temp sweep does: every step is an openat-relative
 	// syscall and every path handed downstream is root-relative, so no
 	// ambient absolute path exists for a later read to reach for.
-	walkErr := fs.WalkDir(inHandle.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
-		return sw.visit(ctx, rel, d, err)
-	})
+	walkErr := sw.walkInput(ctx, inHandle)
 
 	result := countResults(sw.results, sw.unreadable, sw.unresolved, sw.vanished)
 	rc := reapContext{
@@ -302,6 +303,123 @@ type scanWalk struct {
 	// about how much of an untrusted tree one scan takes on, so it counts what the walk
 	// TOUCHED rather than what it converted.
 	entries int
+}
+
+// scanReadDirBatch is how many directory entries one ReadDir call takes at a time.
+// It is the whole point of the streaming walk: fs.WalkDir reads and SORTS a
+// directory's complete inventory before it calls back even once, so a hostile flat
+// /input forces that inventory into memory before the entry budget can refuse it —
+// the one-scan exhaustion maxScanEntries exists to stop. A fixed batch bounds the
+// per-directory allocation to this many entries whatever the directory holds, and the
+// budget is then checked between batches, on the entries actually taken.
+const scanReadDirBatch = 256
+
+// walkInput enumerates the input tree through the confined root and hands every
+// entry to visit, root-relative, in the same shape fs.WalkDir did: the root first,
+// then each entry pre-order, with a read failure reported through visit for the path
+// it belongs to (fatal at the root, one unreadable sub-path below it) and a visit
+// error — a cancellation or the entry-budget abort — stopping the walk at once.
+//
+// Two deliberate differences from fs.WalkDir. Entries arrive in directory order
+// (sorted only within a batch) rather than globally sorted, because a global sort IS
+// the materialization this walk avoids; nothing downstream depends on the order
+// (`seen` is a set, and the per-path diagnostics stand alone). And a directory's own
+// entries are all visited before the walk descends into its subdirectories, which is
+// what lets it keep exactly ONE directory handle open at a time: a queue of pending
+// directory NAMES cannot exhaust the process's descriptors on a deep tree, and its
+// own size is bounded by the entry budget because every queued directory was counted
+// as an entry when it was visited.
+func (sw *scanWalk) walkInput(ctx context.Context, root *os.Root) error {
+	fi, err := root.Stat(".")
+	if err != nil {
+		return sw.visit(ctx, ".", nil, err)
+	}
+	if visitErr := sw.visit(ctx, ".", fs.FileInfoToDirEntry(fi), nil); visitErr != nil {
+		return visitErr
+	}
+	pending := []string{"."}
+	for len(pending) > 0 {
+		dir := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		subdirs, streamErr := sw.streamDir(ctx, root, dir)
+		if streamErr != nil {
+			return streamErr
+		}
+		// Reversed, so the stack pops the subdirectories in the order they were read.
+		slices.Reverse(subdirs)
+		pending = append(pending, subdirs...)
+	}
+	return nil
+}
+
+// streamDir visits one directory's entries in fixed-size batches and reports the
+// subdirectories found under it, for the caller to stream in turn. The handle is
+// closed before any of them is opened.
+//
+// A directory that cannot be opened or read is reported through visit for its OWN
+// path, which is where fs.WalkDir reported it too: at the root that aborts the scan,
+// below the root it counts one unreadable sub-path (or one vanished path) and the
+// walk goes on with the rest of the tree.
+func (sw *scanWalk) streamDir(ctx context.Context, root *os.Root, dir string) ([]string, error) {
+	handle, err := root.Open(dir)
+	if err != nil {
+		return nil, sw.visit(ctx, dir, nil, err)
+	}
+	defer func() { _ = handle.Close() }()
+
+	var subdirs []string
+	for {
+		entries, readErr := handle.ReadDir(scanReadDirBatch)
+		// Sorted within the batch only: it costs nothing at this size and keeps a
+		// single directory's diagnostics stable from scan to scan.
+		slices.SortFunc(entries, cmpDirEntryName)
+		batchSubdirs, visitErr := sw.visitBatch(ctx, dir, entries)
+		subdirs = append(subdirs, batchSubdirs...)
+		if visitErr != nil {
+			return nil, visitErr
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return subdirs, nil
+			}
+			// The entries already read are kept: they were visited, and the failure
+			// costs the REST of this directory, not what the walk has seen of it.
+			return subdirs, sw.visit(ctx, dir, nil, readErr)
+		}
+	}
+}
+
+// visitBatch hands one batch of directory entries to visit, root-relative, and reports
+// the subdirectories among them for the caller to stream once this directory's handle
+// is closed. A visit error (a cancellation, or the entry-budget abort) stops the batch
+// and is returned with whatever the batch had already found.
+func (sw *scanWalk) visitBatch(ctx context.Context, dir string, entries []fs.DirEntry) ([]string, error) {
+	var subdirs []string
+	for _, entry := range entries {
+		rel := entry.Name()
+		if dir != "." {
+			rel = path.Join(dir, entry.Name())
+		}
+		if visitErr := sw.visit(ctx, rel, entry, nil); visitErr != nil {
+			return subdirs, visitErr
+		}
+		if entry.IsDir() {
+			subdirs = append(subdirs, rel)
+		}
+	}
+	return subdirs, nil
+}
+
+// cmpDirEntryName orders two directory entries by name, the comparison
+// slices.SortFunc needs for the per-batch sort above.
+func cmpDirEntryName(a, b fs.DirEntry) int {
+	switch {
+	case a.Name() < b.Name():
+		return -1
+	case a.Name() > b.Name():
+		return 1
+	}
+	return 0
 }
 
 // visit is the WalkDir callback. The context is checked before and after each
@@ -651,8 +769,12 @@ func newObservationLog() *observationLog {
 
 // markWhole records the structural fact that this process read both inputs for rel.
 // It is called at the readPair success boundary, independently of analysis, currency,
-// encoding, and output-write outcomes.
+// encoding, and output-write outcomes — so it is reached for pairs that never get as
+// far as note or record (an analysis failure, an encode failure, a failed write), and
+// it therefore has to reserve against the same ceiling they do rather than trusting
+// their reservations to bound it.
 func (o *observationLog) markWhole(rel string) {
+	o.reserve(rel)
 	o.whole[rel] = struct{}{}
 }
 
@@ -725,13 +847,38 @@ func maxObservedPairs() int { return maxScanEntries }
 // entry is worth exactly one deduplicated WARN, so ordering machinery would buy nothing
 // at a bound this size.
 func (o *observationLog) reserve(rel string) {
-	if _, known := o.seen[rel]; known || len(o.seen) < maxObservedPairs() {
-		return
+	// BOTH halves are checked because they are WRITTEN independently: markWhole is
+	// reached at the readPair success boundary, on pairs that never get as far as note
+	// or record, so a `seen`-only ceiling would leave the structural half growing for
+	// the process lifetime.
+	if _, known := o.seen[rel]; !known && len(o.seen) >= maxObservedPairs() {
+		o.evictOne(rel)
 	}
+	if _, known := o.whole[rel]; !known && len(o.whole) >= maxObservedPairs() {
+		o.evictOne(rel)
+	}
+}
+
+// evictOne drops one remembered pair from BOTH halves, never the path being reserved,
+// so an eviction can never leave the two halves out of step. It prefers a victim the
+// signature half knows (the common case, where both halves hold the pair) and falls back
+// to a wholeness-only entry, which is what a pair that read whole and then failed
+// analysis, encoding, or its write leaves behind.
+func (o *observationLog) evictOne(keep string) {
 	for victim := range o.seen {
+		if victim == keep {
+			continue
+		}
 		delete(o.seen, victim)
 		delete(o.whole, victim)
-		break
+		return
+	}
+	for victim := range o.whole {
+		if victim == keep {
+			continue
+		}
+		delete(o.whole, victim)
+		return
 	}
 }
 

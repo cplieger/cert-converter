@@ -254,7 +254,15 @@ func TestStoreLogOrphanWalkOutcome_reports_each_disabling_condition(t *testing.T
 // zero would put a "count=0" warning with a remediation hint into the log on every
 // scan of a perfectly healthy /output.
 func TestWalkLogPolicy_quiet_when_nothing_is_wrong(t *testing.T) {
-	root, err := os.OpenRoot(t.TempDir())
+	dir := t.TempDir()
+	// listOutputs applies the write-permission verdict to every directory it
+	// enumerates, so "nothing is wrong" has to include the root's own mode: a
+	// group-writable /output is a condition the walk is REQUIRED to report, and some
+	// hosts hand t.TempDir a group-writable directory (an inherited default ACL).
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
 	if err != nil {
 		t.Fatal(err)
 	}

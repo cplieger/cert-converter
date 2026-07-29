@@ -287,6 +287,13 @@ func TestWatchMode_states_the_post_watch_set_sequence_once(t *testing.T) {
 				t.Fatal("watch mode scanned twice; the attach-then-scan must be stated exactly once")
 			case <-time.After(300 * time.Millisecond):
 			}
+			// Counted HERE, before the cert write below: the attach-then-scan sequence is
+			// stated exactly once. Every debounced scan afterwards re-asserts the watch
+			// set (recovering a registration the kernel dropped without an event) and
+			// refreshes this dump with it, which is a different statement.
+			if n := logs.Count("fsnotify watch set"); n != 1 {
+				t.Errorf("watch set dumped %d times during acquisition, want exactly 1; log = %v", n, logs.Messages())
+			}
 
 			// The watch loop is live: a cert write is detected as an event, not by the
 			// (one-hour) safety-net rescan.
@@ -311,8 +318,8 @@ func TestWatchMode_states_the_post_watch_set_sequence_once(t *testing.T) {
 				t.Fatal("watchMode did not return after ctx cancellation")
 			}
 
-			if n := logs.Count("fsnotify watch set"); n != 1 {
-				t.Errorf("watch set dumped %d times, want exactly 1; log = %v", n, logs.Messages())
+			if n := logs.Count("fsnotify watch set"); n < 1 {
+				t.Errorf("watch set never dumped; log = %v", logs.Messages())
 			}
 			// Close is the one resource release watch mode owns on every exit path.
 			// An Add on a live watcher would succeed (and be idempotent).

@@ -45,8 +45,10 @@ const (
 	// self-signed CA can serve as an identity) but unusual enough to surface.
 	ObsCAAsIdentity ObservationKind = "ca-as-identity"
 	// ObsChainUnverified reports that no issuer of the certificate the discovered
-	// path ended on could be established from the bundle, so the remaining
-	// issuer-eligible certificates were included as-is rather than dropped.
+	// path ended on could be established from the bundle. Any remaining
+	// issuer-eligible certificates were then included as-is rather than dropped; the
+	// observation fires whether or not there were any, because the unfinished chain
+	// is the fact worth reporting and the leftovers only decide what became of them.
 	ObsChainUnverified ObservationKind = "chain-unverified"
 	// ObsIdentityNotYetValid reports a selected identity whose NotBefore is in
 	// the future. Conversion still proceeds; consumers will reject it.
@@ -118,9 +120,9 @@ const (
 	// verification ceilings, a public key crypto/x509 left nil (a legacy DSA
 	// certificate parses that way, so proven is false for every hop touching it), or
 	// a bundle carrying a same-named certificate while the real signer is absent —
-	// and nothing said so whenever the path still ended at a self-signed certificate
-	// or consumed every certificate in the bundle: ObsChainUnverified fires only for
-	// a terminus that is not proven self-signed WITH certificates left over. The
+	// and nothing said so whenever the path still ended at a self-signed certificate:
+	// ObsChainUnverified fires only for a terminus that is not proven self-signed,
+	// which a fully proven path ending at a root never is. The
 	// bundle still converts (this package holds no trust store), but a PKCS#12 CA bag
 	// a consumer imports into a trust store is the wrong place for an unproven link
 	// to be silent.
@@ -634,8 +636,8 @@ func rsaModulusBits(pub crypto.PublicKey) int {
 // Two passes, in this order for a cost reason. The first fills issuanceEvidence for
 // every ordered pair from byte, OID and decoded-name comparisons alone — no
 // signature work, and one name decode per certificate however many pairs read it.
-// The second turns that into candidate edges, and it is the only place the expensive
-// fact is reached for during construction: a pair the evidence links whose parent is
+// The second turns that into candidate edges, reaching for the expensive fact only
+// where the cheap one would be wrong: a pair the evidence links whose parent is
 // NOT RFC-eligible is admitted only when it demonstrably signed the child, which is
 // the one case where the cheap answer would discard a real signer.
 //
@@ -646,9 +648,15 @@ func rsaModulusBits(pub crypto.PublicKey) int {
 // periods, path length, name constraints, EKU nesting, unhandled critical extensions
 // or revocation; identity role is enforced separately by Analyse's own issuer check.
 //
-// The refusal is decided on the candidate edges alone, before either distance walk
-// runs, so a bundle this app will not reason about costs it no signature
-// verifications at all.
+// The refusal runs after the candidate edges are built and before either distance
+// walk, and it is the other place during construction that reaches past the cheap
+// facts: deciding whether chain selection actually DEPENDS on an unverifiable edge
+// asks whether each linked child is proven self-signed or has a parent some signature
+// proves (unresolvedOversizedIssuer). Those verifications are memoised in g.proof and
+// g.selfSigned and are the same ones computeDistances would pay for a bundle that is
+// not refused, so a refused bundle is the only one that pays for proof it never
+// uses — and only when it carries an over-ceiling certificate something here names as
+// an issuer.
 func newCertGraph(certs []*x509.Certificate, now time.Time) (*certGraph, error) {
 	g := &certGraph{
 		now:              now,
@@ -877,13 +885,49 @@ func (g *certGraph) unresolvedOversizedIssuer(parent int) bool {
 // resolvedWithoutParent reports whether certs[child]'s place in the chain is
 // established without the edge into certs[except]: a signature from some other
 // candidate parent proves it, or it is a proven self-signed root.
+//
+// A proven candidate only counts when it is still USABLE at selection time. pathFrom
+// walks with an onPath set and bestParent skips every candidate already on it, so a
+// candidate that can reach child again through candidate edges — a cycle among
+// same-subject certificates — is exactly the candidate the walk will have consumed
+// before it reaches child, leaving the unverifiable edge to win the hop. Counting it
+// as a resolution witness would exempt the bundle from the refusal on evidence
+// selection cannot use.
 func (g *certGraph) resolvedWithoutParent(child, except int) bool {
 	if g.isSelfSigned(child) {
 		return true
 	}
 	for _, candidate := range g.candidateParents[child] {
-		if candidate != except && g.proven(child, candidate) {
+		if candidate != except && g.proven(child, candidate) && !g.candidatePathReaches(candidate, child) {
 			return true
+		}
+	}
+	return false
+}
+
+// candidatePathReaches reports whether the candidate edges lead from certs[from]
+// back to certs[to]. It is the cycle question pathFrom's onPath set answers
+// positionally, asked ahead of time: a `to` reachable from `from` can be on the walk's
+// path when `to`'s own hop is chosen, and bestParent then skips `from` entirely.
+//
+// It reads candidateParents only — no signature is verified, nothing is decoded — so
+// it costs one graph traversal bounded by maxChainCerts, and the visited set makes a
+// cyclic bundle terminate.
+func (g *certGraph) candidatePathReaches(from, to int) bool {
+	visited := make([]bool, len(g.certs))
+	visited[from] = true
+	stack := []int{from}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, parent := range g.candidateParents[cur] {
+			if parent == to {
+				return true
+			}
+			if !visited[parent] {
+				visited[parent] = true
+				stack = append(stack, parent)
+			}
 		}
 	}
 	return false
@@ -909,7 +953,8 @@ func (g *certGraph) resolvedWithoutParent(child, except int) bool {
 // every one of the maxChainCerts^2 pairs. A parent key above either verification
 // ceiling is refused too, which is the cost the ceilings exist to refuse; after
 // newCertGraph's oversizedIssuerError that state is only reachable for a certificate
-// this bundle names as nobody's issuer.
+// this bundle names as nobody's issuer; oversizedIssuerError itself asks the question
+// earlier, and gets the same false for the edge it is refusing.
 func (g *certGraph) proven(child, parent int) bool {
 	key := [2]int{child, parent}
 	if got, ok := g.proof[key]; ok {
@@ -1071,7 +1116,8 @@ func (g *certGraph) issuerName(i int) (pkix.RDNSequence, bool) {
 // A certificate whose own RSA key exceeds either verification ceiling is reported as
 // not self-signed — unverified rather than disproven — for the same cost reason
 // proven applies the ceiling. After newCertGraph's refusal that answer is only
-// reachable for a certificate this bundle names as nobody's issuer, so it decides
+// reachable for a certificate this bundle names as nobody's issuer — which
+// oversizedIssuerError also relies on while deciding that refusal — so it decides
 // only two harmless things: such a stray is no root for the distance walk, and if
 // it is the IDENTITY itself its empty chain counts as a failure to prove rather
 // than proof, so the additive fallback keeps the rest of the bundle and says so.

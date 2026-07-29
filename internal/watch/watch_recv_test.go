@@ -461,6 +461,59 @@ func TestHandleEventRecv_reattaches_a_recreated_directory(t *testing.T) {
 	}
 }
 
+// TestRunDebouncedScan_reasserts_registrations_the_kernel_dropped_silently pins the
+// recovery the event-driven path structurally cannot cover.
+//
+// The membership mirror only forgets a path when fsnotify DELIVERS a Remove or
+// Rename for it, and the Linux backend consumes IN_UNMOUNT and IN_IGNORED without
+// emitting an event at all (a child filesystem unmount, or any implicit kernel
+// removal). The mirror then claims a directory is watched that the kernel has
+// dropped, and handlePathEvent's guard skips the subtree re-walk on the strength of
+// that claim, so the directory and everything under it stay unwatched. Re-asserting
+// the set once per debounced scan recovers them.
+//
+// The Removes below are made straight on the watcher, leaving the mirror untouched,
+// which is exactly the state the filtered kernel events produce.
+func TestRunDebouncedScan_reasserts_registrations_the_kernel_dropped_silently(t *testing.T) {
+	t.Parallel()
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	dir := filepath.Join(root, "example.com")
+	child := filepath.Join(dir, "nested")
+	if err := os.MkdirAll(child, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	w := New(root, func(context.Context) {}, WithDebounce(time.Millisecond))
+	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
+		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
+	}
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+
+	for _, path := range []string{dir, child} {
+		if err := watcher.Remove(path); err != nil {
+			t.Fatalf("setup: watcher.Remove(%q) = %v, want nil", path, err)
+		}
+	}
+	// The mirror still claims both, so the event path skips the re-walk.
+	if !w.watchSetHas(dir) {
+		t.Fatalf("setup: the mirror forgot %q; this test needs the state where the mirror and the kernel disagree", dir)
+	}
+	if w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: dir, Op: fsnotify.Chmod}) {
+		st.scheduleScan()
+	}
+
+	st.runDebouncedScan(t.Context(), watcher)
+
+	watched := watcher.WatchList()
+	for _, want := range []string{dir, child} {
+		if !slices.Contains(watched, want) {
+			t.Errorf("watch list after the debounced scan = %v, want %q re-registered: a registration the kernel dropped without an event is only recovered by re-asserting the set",
+				watched, want)
+		}
+	}
+}
+
 // TestRecvHelpers_do_no_work_after_cancellation pins the cancellation precedence
 // both receive arms owe the rest of the loop: watchLoop's select picks a ready
 // case at random, so a queued event or watcher error can still be delivered after

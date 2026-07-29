@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -676,5 +677,108 @@ func TestStoreRemoveOrphans_reports_vanished_candidate_and_continues(t *testing.
 	}
 	if got := logs.CountLevel(slog.LevelWarn, recheckWarn); got != 0 {
 		t.Errorf("removeOrphans(missing candidate) logged %q at WARN %d times, want 0: disappearance is a transient race, not an operator permission problem: %q", recheckWarn, got, logs.Messages())
+	}
+}
+
+// TestStoreListOutputs_refuses_the_walk_for_a_writable_orphan_only_directory pins the
+// reaping veto for the ONE directory class the write path cannot reach.
+//
+// enforceDirPerms is only ever called from isCurrent and write, both driven by an
+// INPUT pair, so a nested directory whose bundles are all orphaned — the exact tree
+// the reap is about to delete from — is never inspected by them at all: its mode is
+// neither repaired nor recorded, and a scan-wide flag set elsewhere is the only thing
+// that could have vetoed the reap. Here nothing else sets it: the root is tight, and
+// only the orphan-only directory is writable with its repair refused. The walk itself
+// has to notice.
+func TestStoreListOutputs_refuses_the_walk_for_a_writable_orphan_only_directory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatalf("setup: Chmod(root): %v", err)
+	}
+	orphanDir := filepath.Join(dir, "old")
+	if err := os.Mkdir(orphanDir, 0o775); err != nil {
+		t.Fatalf("setup: Mkdir(old): %v", err)
+	}
+	// Explicit, because what a fresh directory gets depends on the host (an inherited
+	// default ACL widens it): the fixture needs the group-WRITE class.
+	if err := os.Chmod(orphanDir, 0o775); err != nil {
+		t.Fatalf("setup: Chmod(old): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(orphanDir, "gone.pfx"), []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+
+	prev := chmodInRoot
+	chmodInRoot = func(r *os.Root, name string, mode os.FileMode) error {
+		if name == "old" {
+			// The uid-0 test process can chmod anything, so the refusal a real
+			// deployment hits (a directory owned by another UID) is injected here.
+			return fs.ErrPermission
+		}
+		return prev(r, name, mode)
+	}
+	t.Cleanup(func() { chmodInRoot = prev })
+
+	s := newOutputStore(t, dir)
+	found, safe, err := s.listOutputs(t.Context())
+	if err != nil {
+		t.Fatalf("listOutputs = error %v, want nil", err)
+	}
+	if safe {
+		t.Errorf("listOutputs(an orphan-only directory this app cannot tighten) reported the walk safe, want unsafe:"+
+			" every candidate under it can be swapped between the walk and the unlink (found %v)", found)
+	}
+	if !slices.Contains(found, "old/gone.pfx") {
+		t.Errorf("listOutputs found %v, want it to enumerate old/gone.pfx: the veto is on the verdict, not on the listing", found)
+	}
+}
+
+// TestStoreRemoveOrphans_reports_a_vanished_nested_candidate_as_a_race pins the same
+// DEBUG-not-WARN contract for the NESTED layout, which reaches the disappearance
+// through a different call.
+//
+// A flat candidate answers ENOENT from removeOrphan's own Lstat, but a nested one is
+// pinned parent-component by parent-component first, so an ancestor removed during the
+// reap deferral fails the PIN instead — and the pin's WARN carries a symlink
+// remediation ("mount the real output directory instead of linking to it") for an
+// ordinary disappearance that is neither a symlink nor an identity swap. Serial:
+// captureLogs swaps the process-global slog.Default.
+func TestStoreRemoveOrphans_reports_a_vanished_nested_candidate_as_a_race(t *testing.T) {
+	const (
+		vanishedMsg = "orphaned output vanished before removal"
+		pinMsg      = pinRedirectedMsg
+	)
+
+	dir := t.TempDir()
+	nested := filepath.Join(dir, "ca1")
+	if err := os.Mkdir(nested, 0o750); err != nil {
+		t.Fatalf("setup: Mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "gone.pfx"), []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	s := newOutputStore(t, dir)
+	// The whole directory goes, exactly as a producer replacing a CA folder mid-scan
+	// would take it: the candidate was enumerated, its ancestor is gone by unlink time.
+	if err := os.RemoveAll(nested); err != nil {
+		t.Fatalf("setup: RemoveAll: %v", err)
+	}
+	logs := captureLogs(t)
+
+	deleted, err := s.removeOrphans(t.Context(), []string{"ca1/gone.pfx"})
+	if err != nil {
+		t.Fatalf("removeOrphans(vanished nested candidate) = %v, want nil", err)
+	}
+	if deleted != 0 {
+		t.Errorf("removeOrphans(vanished nested candidate) deleted = %d, want 0", deleted)
+	}
+	if got := logs.CountLevel(slog.LevelDebug, vanishedMsg); got != 1 {
+		t.Errorf("removeOrphans(vanished nested candidate) logged %q at DEBUG %d times, want exactly 1: %q",
+			vanishedMsg, got, logs.Messages())
+	}
+	if got := logs.CountLevel(slog.LevelWarn, pinMsg); got != 0 {
+		t.Errorf("removeOrphans(vanished nested candidate) logged %q at WARN %d times, want 0: a disappearance is a"+
+			" transient race, and that WARN's remediation points at a symlink misconfiguration that is not there: %q",
+			pinMsg, got, logs.Messages())
 	}
 }

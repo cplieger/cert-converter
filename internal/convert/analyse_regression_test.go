@@ -1023,6 +1023,88 @@ func TestAnalyse_refuses_an_over_ceiling_rsa_issuer(t *testing.T) {
 	}
 }
 
+// TestAnalyse_refuses_an_over_ceiling_issuer_whose_alternative_is_cycle_excluded
+// pins the resolution witness against the walk that actually spends it. A proven
+// alternative parent only exempts the bundle if selection can still USE it:
+// pathFrom carries an onPath set and bestParent skips every candidate already on it,
+// so a proven candidate that leads back to the child through candidate edges is the
+// one the walk has already consumed by the time the child's own hop is chosen — and
+// the unverifiable oversized edge wins that hop unopposed.
+//
+// Shape: leaf -> A proven, A -> C proven, C -> A proven (a mutually-signed pair, both
+// reachable from the leaf), plus an oversized same-subject decoy for A. C's only
+// other proven candidate is A, which is on the path when C is reached, so C is NOT
+// resolved without the oversized edge and the bundle must be refused. Before the
+// cycle check the witness was accepted and Analyse emitted A, C, oversized.
+func TestAnalyse_refuses_an_over_ceiling_issuer_whose_alternative_is_cycle_excluded(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	const (
+		cycleACN      = "Cycle CA A"
+		cycleCCN      = "Cycle CA C"
+		oversizedBits = convert.MaxVerifiableKeyBits + 17
+	)
+
+	keyA := testcerts.NewECDSAKey(t)
+	keyC := testcerts.NewECDSAKey(t)
+
+	// A scaffold for C, used only as the issuer template A is minted against: it
+	// carries C's subject and C's key, so A's signature verifies under the C that
+	// ships in the bundle.
+	_, _, scaffoldC := testcerts.Mint(t,
+		unverifiableCA(240, cycleCCN, notBefore, notBefore.Add(480*time.Hour)),
+		&keyC.PublicKey, nil, keyC)
+
+	_, cyclePEMA, certA := testcerts.Mint(t,
+		unverifiableCA(241, cycleACN, notBefore, notBefore.Add(240*time.Hour)),
+		&keyA.PublicKey, scaffoldC, keyC)
+	// C is signed by A, closing the cycle: A's issuer is C's subject and C's issuer
+	// is A's subject, and both signatures verify.
+	_, cyclePEMC, _ := testcerts.Mint(t,
+		unverifiableCA(242, cycleCCN, notBefore, notBefore.Add(480*time.Hour)),
+		&keyC.PublicKey, certA, keyA)
+
+	// The oversized same-subject decoy for A: a linked candidate parent of the leaf
+	// AND of C, and no signature may ever be checked against it.
+	throwawayKey := testcerts.NewECDSAKey(t)
+	_, oversizedPEM, oversizedCert := testcerts.Mint(t,
+		unverifiableCA(243, cycleACN, notBefore, notBefore.Add(720*time.Hour)),
+		oversizedRSAPublicKey(oversizedBits), nil, throwawayKey)
+	if k, ok := oversizedCert.PublicKey.(*rsa.PublicKey); !ok || k.N.BitLen() != oversizedBits {
+		t.Fatalf("setup: minted certificate carries a %T, want a %d-bit RSA modulus", oversizedCert.PublicKey, oversizedBits)
+	}
+
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(244),
+		Subject:      pkix.Name{CommonName: "cycle-issuer-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, certA, keyA)
+
+	for _, order := range []struct {
+		name  string
+		certs [][]byte
+	}{
+		{"oversized last", [][]byte{leafPEM, cyclePEMA, cyclePEMC, oversizedPEM}},
+		{"oversized first", [][]byte{leafPEM, oversizedPEM, cyclePEMA, cyclePEMC}},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
+			if err == nil {
+				t.Fatalf("Analyse(a mutually-signed pair + a same-subject %d-bit decoy) = nil error and a chain of serial(s) %v, want a refusal: the only proven alternative for the second hop is excluded by cycle avoidance, so the oversized edge is guessed",
+					oversizedBits, chainSerials(got.Chain()))
+			}
+			for _, want := range []string{fmt.Sprintf("%d-bit", oversizedBits), cycleACN} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Analyse error = %q, want it to name %q", err.Error(), want)
+				}
+			}
+		})
+	}
+}
+
 // TestAnalyse_converts_when_a_proven_parent_outranks_an_over_ceiling_namesake pins
 // the OTHER edge of that refusal: it fires on a guess, not on the mere presence of
 // an unverifiable key.

@@ -1,6 +1,7 @@
 package convert
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -336,12 +337,45 @@ func TestParsePrivateKeyBlock_refuses_too_many_RSA_prime_factors(t *testing.T) {
 				t.Fatalf("parsePrivateKeyBlock(a key declaring %d prime factors) = nil error, want a pre-scan refusal",
 					maxRSAPrimeFactors+2)
 			}
-			for _, want := range []string{"66 RSA prime factors", "64-factor ceiling", block.Type} {
+			for _, want := range []string{"more than 64 RSA prime factors", "64-factor ceiling", block.Type} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("error = %q, want it to contain %q", err, want)
 				}
 			}
 		})
+	}
+}
+
+// TestMaxRSAIntegerBitsFromKeyDER_saturates_the_factor_count pins the walk's own
+// bound. The count feeds one refusal and nothing reads the exact number, so once the
+// scan has seen one factor past the ceiling the collection must not be measured any
+// further: continuing costs one RawValue walk per entry of an attacker-sized
+// collection (a 10 MB PEM holds hundreds of thousands of them) to learn a number the
+// refusal does not print.
+func TestMaxRSAIntegerBitsFromKeyDER_saturates_the_factor_count(t *testing.T) {
+	t.Parallel()
+	one := big.NewInt(1)
+	extras := make([]otherPrimeInfoDER, 10_000)
+	for i := range extras {
+		extras[i] = otherPrimeInfoDER{Prime: big.NewInt(3), Exponent: one, Coefficient: one}
+	}
+	der, err := asn1.Marshal(multiPrimeKeyDER{
+		Version: 1,
+		N:       big.NewInt(196611), E: big.NewInt(65537), D: one, P: one, Q: one,
+		Dp: one, Dq: one, Qinv: one,
+		OtherPrimeInfos: extras,
+	})
+	if err != nil {
+		t.Fatalf("setup: marshal multi-prime PKCS#1 key: %v", err)
+	}
+
+	scan := maxRSAIntegerBitsFromKeyDER(der, 1)
+	if !scan.measured {
+		t.Fatalf("maxRSAIntegerBitsFromKeyDER(a 10,000-entry multi-prime key) did not measure the block; the refusal depends on it")
+	}
+	if scan.factors != maxRSAPrimeFactors+1 {
+		t.Errorf("scan.factors = %d, want %d: the walk must stop one factor past the ceiling instead of counting every entry",
+			scan.factors, maxRSAPrimeFactors+1)
 	}
 }
 
@@ -369,13 +403,13 @@ func TestParsePrivateKeyBlock_accepts_a_realistic_multi_prime_key(t *testing.T) 
 	}
 }
 
-// TestRSAModulusBitsFromKeyDER_measures_or_fails_open pins both halves of the
+// TestMaxRSAIntegerBitsFromKeyDER_measures_or_fails_open pins both halves of the
 // pre-scan's contract. The sizes it must measure are what makes the refusal
 // possible; the shapes it must NOT measure are what keeps the guard from becoming
 // a second parser that rejects input the app accepts today. Every not-measured
 // case here reaches the existing parsers unchanged, which is why a malformed RSA
 // block still produces the label-specific parse error pinned in convert_test.go.
-func TestRSAModulusBitsFromKeyDER_measures_or_fails_open(t *testing.T) {
+func TestMaxRSAIntegerBitsFromKeyDER_measures_or_fails_open(t *testing.T) {
 	t.Parallel()
 
 	rsa2048, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -435,8 +469,8 @@ func TestRSAModulusBitsFromKeyDER_measures_or_fails_open(t *testing.T) {
 	}
 }
 
-// TestRSAModulusBitsFromKeyDER_fails_open_on_shapes_it_cannot_measure covers the
-// container shapes TestRSAModulusBitsFromKeyDER_measures_or_fails_open does not
+// TestMaxRSAIntegerBitsFromKeyDER_fails_open_on_shapes_it_cannot_measure covers the
+// container shapes TestMaxRSAIntegerBitsFromKeyDER_measures_or_fails_open does not
 // reach. The pre-scan is the guard that keeps an oversized file-supplied RSA
 // modulus out of crypto/x509's precomputation (a measured 369ms stall on the
 // scan's only goroutine, with no cancellation path), so a misread is
@@ -445,7 +479,7 @@ func TestRSAModulusBitsFromKeyDER_measures_or_fails_open(t *testing.T) {
 // exists to prevent. None of these rows is reachable through the DER already in
 // that table, so today a walk missing one of these header checks passes the suite
 // unchanged.
-func TestRSAModulusBitsFromKeyDER_fails_open_on_shapes_it_cannot_measure(t *testing.T) {
+func TestMaxRSAIntegerBitsFromKeyDER_fails_open_on_shapes_it_cannot_measure(t *testing.T) {
 	t.Parallel()
 
 	version := testASN1Marshal(t, 0)
@@ -530,6 +564,11 @@ func TestPKCS8HoldsECKey_answers_true_only_for_an_ec_algorithm_identifier(t *tes
 		"an algorithm oid whose body cannot decode": {der: derTestSequence(t, version, derTestSequence(t, []byte{0x06, 0x01, 0x80}))},
 		"a truncated pkcs8 rsa container":           {der: pkcs8RSA[:16]},
 		"a pkcs8 container naming rsaEncryption":    {der: derTestSequence(t, version, derTestSequence(t, testASN1Marshal(t, oidRSAEncryption)))},
+		// The identifier is decoded through decodeOID, so maxOIDBytes applies here
+		// too: a syntactically valid but oversized identifier must answer false
+		// rather than spend one int per encoded byte to say so.
+		"an algorithm oid above the maxOIDBytes bound": {der: derTestSequence(t, version, derTestSequence(t,
+			testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagOID, Bytes: bytes.Repeat([]byte{0x01}, maxOIDBytes+1)})))},
 	}
 
 	for name, tc := range cases {

@@ -798,8 +798,9 @@ func TestInspect_rejects_a_weaker_nested_modern_algorithm(t *testing.T) {
 }
 
 // TestInspect_rejects_salts_one_byte_below_profile_floor pins the salt floors as
-// the BOUNDARIES they are documented to be: 16 octets at every PBKDF2 and macData
-// site, 8 at the legacy pkcs-12PbeParams sites.
+// the BOUNDARIES they are documented to be: 16 octets at every PBKDF2 site and
+// the SHA-256 macData salt, 8 at the legacy pkcs-12PbeParams sites and the
+// legacy SHA-1 macData salt.
 //
 // A short salt makes the derived key a function of the password and the iteration
 // count over a search space the file chooses, so one precomputation covers every
@@ -910,9 +911,9 @@ func TestInspect_rejects_salts_one_byte_below_profile_floor(t *testing.T) {
 			testASN1Unmarshal(t, pfx, &preamble)
 			tc.mutate(t, &preamble)
 
-			_, err = Inspect(testASN1Marshal(t, preamble))
+			got, err := Inspect(testASN1Marshal(t, preamble))
 			if !errors.Is(err, ErrProfileUnknown) {
-				t.Fatalf("Inspect(%s) = %v, want ErrProfileUnknown", tc.name, err)
+				t.Fatalf("Inspect(%s) = (%+v, %v), want ErrProfileUnknown", tc.name, got, err)
 			}
 			if !strings.Contains(err.Error(), tc.wantErrText) {
 				t.Errorf("Inspect(%s) = %v, want the refusal to name %q", tc.name, err, tc.wantErrText)
@@ -1064,7 +1065,7 @@ func TestInspect_rejects_more_safe_bags_than_it_admits(t *testing.T) {
 // must name the offending count rather than silently reading it as "cheap".
 //
 // The refusal ITSELF is pinned by
-// TestInspect_rejects_below_floor_iterations_in_every_derivation_location, whose
+// TestInspect_rejects_iterations_one_below_profile_floor, whose
 // modern2023-MAC case travels the same `n < minIterations` branch
 // (checkIterationsRange): since minKDFIterations is 2048 there is no separable
 // non-positive half of the guard left to delete. What survives here is the

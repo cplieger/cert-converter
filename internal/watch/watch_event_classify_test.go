@@ -235,6 +235,37 @@ func TestHandleFsEvent_refuses_to_extend_the_watch_set_outside_root(t *testing.T
 	}
 }
 
+// TestHandleFsEvent_skips_the_rewalk_for_an_already_watched_directory pins the
+// half of the membership guard that bounds per-event work: a Create for a
+// directory already in the watch set must NOT re-walk its subtree. The oracle is
+// a child that appeared without an event of its own — it can only reach the watch
+// list if the guard failed to skip the walk.
+func TestHandleFsEvent_skips_the_rewalk_for_an_already_watched_directory(t *testing.T) {
+	t.Parallel()
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	dir := filepath.Join(root, "example.com")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	w := New(root, func(context.Context) {})
+	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
+		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
+	}
+	child := filepath.Join(dir, "nested")
+	if err := os.MkdirAll(child, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: dir, Op: fsnotify.Create}); !got {
+		t.Error("handleFsEvent(Create of an already-watched dir) = false, want true: the debounced rescan still covers content")
+	}
+	if watched := watcher.WatchList(); slices.Contains(watched, child) {
+		t.Errorf("a Create for the already-watched %q re-walked its subtree and registered %q; the membership guard must skip the walk (watch list = %v)",
+			dir, child, watched)
+	}
+}
+
 // TestHandleRootWatchLoss_reattaches_the_watch_set_when_the_fallback_is_enabled
 // pins the recoverable half of the root-watch-loss contract. The terminal half is
 // pinned by TestWatchLoop_reports_lost_change_detection_when_the_root_watch_

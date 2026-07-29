@@ -7,6 +7,13 @@ import (
 	"time"
 )
 
+// absentWatchRoot is a path that does not exist, so a watch-set walk over it fails at
+// its root before any watcher method is called. The timer tests below use it to drive
+// runDebouncedScan with a nil watcher: they pin the debounce and fallback arithmetic,
+// and a real fsnotify watcher would park a goroutine in an inotify read that a
+// synctest bubble's fake clock cannot advance past.
+const absentWatchRoot = "/nonexistent-cert-converter-watch-root"
+
 // TestNewWatchState_leaves_nothing_armed_when_fallback_disabled pins the
 // disabled-fallback contract: fallbackChan must be nil (a receive on a nil
 // channel blocks forever, which is what keeps watchLoop's fallback case from
@@ -38,9 +45,14 @@ func TestNewWatchState_leaves_nothing_armed_when_fallback_disabled(t *testing.T)
 // by the first event. Re-arming on every event would let a continuous event
 // stream push the scan out indefinitely, so a renewal mid-burst would never be
 // converted.
+//
+// The root is an absent path, so runDebouncedScan's watch-set re-assert fails at the
+// root and returns before it can touch a watcher: this test pins the debounce
+// arithmetic, not the re-sync (watch_recv_test.go owns that), and a real fsnotify
+// watcher inside a synctest bubble would block the fake clock on an inotify read.
 func TestWatchState_scheduleScan_does_not_extend_the_debounce_window(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		st := newWatchState(New("/input", func(context.Context) {}, WithDebounce(2*time.Second)))
+		st := newWatchState(New(absentWatchRoot, func(context.Context) {}, WithDebounce(2*time.Second)))
 		defer st.stop()
 
 		start := time.Now()
@@ -57,7 +69,7 @@ func TestWatchState_scheduleScan_does_not_extend_the_debounce_window(t *testing.
 			t.Errorf("debounce fired %v after the first event, want exactly 2s (a burst must not extend the window)", elapsed)
 		}
 
-		st.runDebouncedScan(t.Context())
+		st.runDebouncedScan(t.Context(), nil)
 		if st.pending {
 			t.Error("runDebouncedScan left the pending flag set; the next event would never re-arm the debounce timer")
 		}
@@ -68,10 +80,12 @@ func TestWatchState_scheduleScan_does_not_extend_the_debounce_window(t *testing.
 // safety-net cadence: both a debounced scan and a fallback scan re-arm the
 // fallback timer, so the periodic rescan interval is measured from the last
 // real scan rather than from process start.
+//
+// Same absent root as above, for the same reason.
 func TestWatchState_scans_re_arm_the_fallback_from_the_last_scan(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		scans := 0
-		st := newWatchState(New("/input",
+		st := newWatchState(New(absentWatchRoot,
 			func(context.Context) { scans++ },
 			WithDebounce(2*time.Second), WithFallback(6*time.Hour)))
 		defer st.stop()
@@ -82,7 +96,7 @@ func TestWatchState_scans_re_arm_the_fallback_from_the_last_scan(t *testing.T) {
 		// after that scan.
 		st.scheduleScan()
 		<-st.debounceTimer.C
-		st.runDebouncedScan(t.Context())
+		st.runDebouncedScan(t.Context(), nil)
 
 		fired := <-st.fallbackChan()
 		if want := start.Add(2*time.Second + 6*time.Hour); !fired.Equal(want) {
@@ -115,7 +129,7 @@ func TestRunDebouncedScan_skips_scan_after_shutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	st.runDebouncedScan(ctx)
+	st.runDebouncedScan(ctx, nil)
 
 	if scans != 0 {
 		t.Errorf("runDebouncedScan(cancelled ctx) ran %d scans, want 0", scans)

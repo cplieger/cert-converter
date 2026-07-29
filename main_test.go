@@ -903,7 +903,9 @@ func TestWarnOutputNotWritable_reports_failed_probe(t *testing.T) {
 
 	warnOutputNotWritable(blocked)
 
-	const msg = "the output volume is not writable by the running UID"
+	const msg = "the output volume is not writable by the running UID, so no PFX can be produced; " +
+		"a scan whose bundles are all current still reports healthy, so this would otherwise " +
+		"surface only at the next renewal"
 	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
 		t.Fatalf("warnOutputNotWritable(%q) logged %d WARN records matching %q, want 1 (logs %v)",
 			blocked, n, msg, logs.Messages())
