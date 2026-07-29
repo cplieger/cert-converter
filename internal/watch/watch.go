@@ -162,6 +162,105 @@ func (w *Watcher) fallbackStatus() string {
 	return FallbackLabel(w.fallback)
 }
 
+// --- The mode record: how change detection reports which mode it is in ---
+
+// detectionMode is the change-detection mode, modelled explicitly because it is
+// an operational STATE and not a one-off startup event: poll mode raises renewal
+// latency from "immediately" to FALLBACK_SCAN_HOURS for as long as it lasts, and
+// health is deliberately blind to it (the marker tracks conversion failures, and
+// a poll scan refreshes it exactly like a watch scan does). A single startup WARN
+// is therefore not enough — a container that has been degraded for a week looks
+// identical to a healthy one — so the mode travels on every record this package
+// emits about it, as a closed-set attribute an alert rule can key on.
+//
+// modeWatch and modePoll are the two modes Run supervises and the only values the
+// mode attribute takes. modeStartup is not a mode: it is the previous_mode value
+// for the process's FIRST mode selection, which has no predecessor.
+type detectionMode string
+
+const (
+	modeWatch   detectionMode = "watch"
+	modePoll    detectionMode = "poll"
+	modeStartup detectionMode = "startup" // previous_mode only, never mode
+)
+
+// level maps a mode to the level its records are emitted at, and is the single
+// home of the rule that gives the degradation a recurring signal at
+// LOG_LEVEL=warn: poll mode is a STANDING degradation, so its records are WARNs,
+// while watch mode is the intended state and reports at Info. Recovery to watch
+// mode is good news and is announced at Info for the same reason.
+//
+// Deriving the level from the mode rather than from the call site is what keeps a
+// new scan or transition site from silently reporting a degraded process at Info.
+func (m detectionMode) level() slog.Level {
+	if m == modePoll {
+		return slog.LevelWarn
+	}
+	return slog.LevelInfo
+}
+
+// The one message string per scan. It is deliberately mode-INDEPENDENT: the mode
+// is an attribute, so a log-based alert keys on one line ("change detection
+// scan") plus mode="poll" rather than on an enumeration of degradation
+// phrasings, and the same query counts scans in either mode. The transition
+// records keep their own site-specific messages, because each names WHY the mode
+// changed.
+const msgScanState = "change detection scan"
+
+// The trigger attribute's closed set: which clock or event caused this scan.
+const (
+	triggerAttach   = "attach"   // watch mode's post-attach scan (scanThenWatch)
+	triggerEvent    = "event"    // a debounced fsnotify event
+	triggerFallback = "fallback" // watch mode's periodic safety-net rescan
+	triggerStartup  = "startup"  // poll mode's initial scan
+	triggerPoll     = "poll"     // a poll-mode tick scan
+)
+
+// The upgrade_stage attribute's closed set, carried by a poll-mode scan record
+// alongside the error: WHY the fsnotify upgrade this tick attempted failed. It
+// preserves the diagnostic the previous per-tick Info records carried, so raising
+// the mode signal to WARN does not cost the reason the process is still degraded.
+const (
+	upgradeStageConstruct = "fsnotify_unavailable"
+	upgradeStageWatchDirs = "watch_set_rebuild_failed"
+)
+
+// logModeEntry emits the transition record: change detection has just ENTERED
+// mode, coming from previous. Level follows the mode (see detectionMode.level),
+// so entering poll mode WARNs and recovering to watch mode reports at Info.
+//
+// msg stays per-site because each entry names its own cause; the attributes are
+// what an alert or a dashboard keys on. extra carries the site's own diagnostics
+// (the attach error, the watched-directory count).
+func (w *Watcher) logModeEntry(ctx context.Context, mode, previous detectionMode, msg string, extra ...any) {
+	attrs := append([]any{
+		"mode", string(mode),
+		"previous_mode", string(previous),
+		"fallback_scan", w.fallbackStatus(),
+	}, extra...)
+	slog.Log(ctx, mode.level(), msg, attrs...)
+}
+
+// logScanState emits the ONE state record every scan carries, naming the mode
+// that is live as the scan runs. Together with the transition records above it is
+// the whole mode signal: the transition says when the state changed, this says
+// the state is still current, once per scan, on the mode's own cadence. That is
+// what makes a permanently degraded container visible at LOG_LEVEL=warn (a poll
+// scan every FALLBACK_SCAN_HOURS is a WARN) while a healthy one adds no warnings
+// at all (its scans report at Info).
+//
+// It replaces this package's previous per-scan announcements rather than joining
+// them: two records per scan would double the log volume of the healthy path and
+// leave the mode discoverable in only one of them.
+func (w *Watcher) logScanState(ctx context.Context, mode detectionMode, trigger string, extra ...any) {
+	attrs := append([]any{
+		"mode", string(mode),
+		"trigger", trigger,
+		"fallback_scan", w.fallbackStatus(),
+	}, extra...)
+	slog.Log(ctx, mode.level(), msgScanState, attrs...)
+}
+
 // New creates a Watcher for the given root directory. Timing policy is chosen by
 // the composition root (main.go) and injected via WithDebounce/WithFallback;
 // config owns the documented FALLBACK_SCAN_HOURS default, so an un-optioned
@@ -230,14 +329,18 @@ func (w *Watcher) Run(ctx context.Context) error {
 }
 
 // attachWatchSet is Run's initial mode selection: it constructs the fsnotify
-// watcher and registers the watch set, announcing an active watch set on
-// success. It reports (watcher, false) for watch mode, (nil, false) when
-// fsnotify is unusable and Run must select poll mode (the reason is WARNed
-// here, because only this attempt is a degradation from the intended mode), and
-// (nil, true) when a shutdown arrived mid-attempt, which is a clean stop rather
-// than a watch failure and must not be reported as one. Poll mode's equivalent
-// retry is pollTick, which logs at Info because staying in poll mode is not a
-// new degradation.
+// watcher and registers the watch set, announcing the mode it entered either
+// way. It reports (watcher, false) for watch mode, (nil, false) when fsnotify is
+// unusable and Run must select poll mode, and (nil, true) when a shutdown
+// arrived mid-attempt, which is a clean stop rather than a watch failure and
+// must not be reported as one.
+//
+// Both records are mode TRANSITIONS (logModeEntry), so the level follows the mode
+// rather than the call site: entering poll mode WARNs, entering watch mode
+// reports at Info. Poll mode's equivalent retry is pollTick, which does not
+// re-announce a transition it did not make — while it stays in poll mode the
+// signal is the per-scan mode record, at WARN for as long as the degradation
+// lasts.
 //
 // The construct-then-register sequence itself lives in tryAttachWatchSet, the
 // single statement of it shared with pollTick; this function is the record half
@@ -248,17 +351,17 @@ func (w *Watcher) attachWatchSet(ctx context.Context) (watcher *fsnotify.Watcher
 	case stageStopped:
 		return nil, true // shutdown arrived mid-attempt; not a watch failure
 	case stageConstruct:
-		slog.Warn("fsnotify unavailable, using polling with periodic upgrade attempts",
-			"fallback_scan", w.fallbackStatus(), "error", err)
+		w.logModeEntry(ctx, modePoll, modeStartup,
+			"fsnotify unavailable, using polling with periodic upgrade attempts", "error", err)
 		return nil, false
 	case stageWatchDirs:
-		slog.Warn("failed to watch directories, using polling with periodic upgrade attempts",
-			"fallback_scan", w.fallbackStatus(), "error", err)
+		w.logModeEntry(ctx, modePoll, modeStartup,
+			"failed to watch directories, using polling with periodic upgrade attempts", "error", err)
 		return nil, false
 	case stageAttached:
 	}
 
-	slog.Info("fsnotify active", "directory_count", len(fw.WatchList()))
+	w.logModeEntry(ctx, modeWatch, modeStartup, "fsnotify active", "directory_count", len(fw.WatchList()))
 	return fw, false
 }
 
@@ -344,6 +447,7 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 	if ctx.Err() != nil {
 		return nil
 	}
+	w.logScanState(ctx, modeWatch, triggerAttach)
 	w.onChange(ctx)
 	return w.watchLoop(ctx, watcher)
 }
@@ -905,7 +1009,10 @@ func (st *watchState) scheduleScan() {
 }
 
 // runDebouncedScan fires the debounced rescan and re-arms the fallback timer so
-// the safety-net interval is measured from the last real scan.
+// the safety-net interval is measured from the last real scan. Its per-scan mode
+// record (logScanState, trigger="event") replaces the previous "cert change
+// detected, processing" line: one record per scan, carrying the mode, rather than
+// an announcement that said nothing about the state the process is in.
 //
 // The watch set is re-asserted first, exactly as the fallback tick does, and for a
 // reason the event-driven recovery cannot cover: the watched mirror only forgets a
@@ -931,7 +1038,7 @@ func (st *watchState) runDebouncedScan(ctx context.Context, watcher *fsnotify.Wa
 	if ctx.Err() != nil {
 		return
 	}
-	slog.Info("cert change detected, processing")
+	st.w.logScanState(ctx, modeWatch, triggerEvent)
 	st.w.onChange(ctx)
 	if st.fallbackTimer != nil {
 		st.fallbackTimer.Reset(st.w.fallback)
@@ -939,9 +1046,12 @@ func (st *watchState) runDebouncedScan(ctx context.Context, watcher *fsnotify.Wa
 }
 
 // runFallbackScan fires the periodic safety-net rescan and re-arms its timer.
-// It is reached only when fallbackTimer is non-nil (see fallbackChan).
+// It is reached only when fallbackTimer is non-nil (see fallbackChan). Its
+// per-scan mode record replaces the previous Debug announcement: this tick is the
+// scan that keeps the mode signal recurring on the fallback cadence, and at Debug
+// it was invisible in every deployment that does not run at debug.
 func (st *watchState) runFallbackScan(ctx context.Context) {
-	slog.Debug("fallback scan triggered", "interval", st.w.fallback)
+	st.w.logScanState(ctx, modeWatch, triggerFallback)
 	st.w.onChange(ctx)
 	st.fallbackTimer.Reset(st.w.fallback)
 }
@@ -988,6 +1098,7 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) (upgraded *fsnotify.W
 	if ctx.Err() != nil {
 		return nil, nil
 	}
+	w.logScanState(ctx, modePoll, triggerStartup)
 	w.onChange(ctx)
 
 	if w.fallback <= 0 {
@@ -1046,11 +1157,16 @@ func (w *Watcher) pollUntilUpgrade(ctx context.Context) *fsnotify.Watcher {
 // it as a degraded upgrade failure. A nil watcher with stopped=false means stay
 // in poll mode.
 //
-// The Info level is deliberate: unlike Run's initial attempt (attachWatchSet,
-// which WARNs), a failed retry is a continuation of an already-reported
-// degradation, not a new one. The construct-then-register sequence itself is
-// tryAttachWatchSet, shared with attachWatchSet; this function owns only the
-// poll-mode record and the polling scan that follows a failed upgrade.
+// The record is the per-scan mode record (logScanState), so a failed retry is
+// reported at WARN with mode="poll": staying in poll mode is not a NEW
+// degradation, but it is a standing one, and the whole point of the mode model is
+// that it stays visible at LOG_LEVEL=warn for as long as it lasts. The
+// upgrade_stage and error attributes carry which half of the upgrade failed. The
+// construct-then-register sequence itself is tryAttachWatchSet, shared with
+// attachWatchSet; this function owns only the poll-mode record and the polling
+// scan that follows a failed upgrade. A tick that UPGRADES logs the transition
+// instead and no scan record, because it runs no scan (watch mode's
+// attach-then-scan does).
 //
 // The cancellation guard is here rather than in the caller's select because this
 // function owns the stopped outcome: a tick that fires in the same instant as a
@@ -1067,18 +1183,18 @@ func (w *Watcher) pollTick(ctx context.Context) (upgraded *fsnotify.Watcher, sto
 	case stageStopped:
 		return nil, true // shutdown interrupted the upgrade attempt; not a poll-mode continuation
 	case stageConstruct:
-		slog.Info("fsnotify still unavailable, staying in poll mode",
-			"mode", "poll", "retry_interval", w.fallback, "error", attachErr)
+		w.logScanState(ctx, modePoll, triggerPoll,
+			"upgrade_stage", upgradeStageConstruct, "error", attachErr)
 		w.onChange(ctx)
 		return nil, false
 	case stageWatchDirs:
-		slog.Info("fsnotify available but the watch set could not be rebuilt, staying in poll mode",
-			"mode", "poll", "retry_interval", w.fallback, "error", attachErr)
+		w.logScanState(ctx, modePoll, triggerPoll,
+			"upgrade_stage", upgradeStageWatchDirs, "error", attachErr)
 		w.onChange(ctx)
 		return nil, false
 	case stageAttached:
 	}
-	slog.Info("fsnotify recovered, upgrading from poll to watch",
+	w.logModeEntry(ctx, modeWatch, modePoll, "fsnotify recovered, upgrading from poll to watch",
 		"directory_count", len(fw.WatchList()))
 	return fw, false
 }

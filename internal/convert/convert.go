@@ -214,7 +214,7 @@ var ecPublicKeyOID = asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}
 // pkcs8HoldsECKey reports whether PKCS#8 PrivateKeyInfo DER declares an EC key,
 // reading only the AlgorithmIdentifier's OID: SEQUENCE { INTEGER version, SEQUENCE
 // { OBJECT IDENTIFIER algorithm, ... }, OCTET STRING privateKey }. It shares
-// maxRSAIntegerBitsFromKeyDER's asn1.RawValue walk, so nothing is decoded beyond the
+// scanRSAKeyEnvelope's asn1.RawValue walk, so nothing is decoded beyond the
 // tag-length headers and the OID itself, and anything it cannot read is false.
 //
 // The identifier is decoded through decodeOID, so the package's untrusted-OID bound
@@ -362,32 +362,43 @@ const maxBlockTypeLogLen = 64
 // that interpolates text taken from a file the app does not control (a certificate
 // subject, a PEM block label) goes through it.
 //
-// Sanitizing is delegated to runesafe.SanitizeSingleLine, the fleet's shared policy
-// for untrusted text bound for a single-line sink, so the text is safe under any
-// slog handler by construction rather than by matching one handler's escaping.
+// The whole composition is runesafe's: SanitizeSingleLineCapped applies the fleet's
+// shared single-line policy (so the text is safe under any slog handler by
+// construction rather than by matching one handler's escaping), caps the SANITIZED
+// form on a rune boundary — the cap must run after sanitizing, which can GROW the
+// text as an invalid byte becomes the three-byte U+FFFD, and a cut inside a rune
+// would mint exactly the raw 0x80-0x9F tail bytes the sanitizer just removed — and
+// names the cut with the marker this app supplies. Nothing is re-implemented here;
+// the app contributes only the marker and the limit.
 //
-// Bounding stays here: the source file is capped only by the caller's input read
+// The bound exists because the source file is capped only by the caller's input read
 // bound (10 MB, internal/process source.go maxFileSize), so an unbounded
 // interpolation would put a multi-megabyte line into the log of every scan that
-// retries the pair. The cap runs AFTER sanitizing, on a rune boundary
-// (runesafe.CapBytes), because sanitizing can GROW the text — an invalid byte
-// becomes the three-byte U+FFFD — and a cut inside a rune would mint exactly the
-// raw 0x80-0x9F tail bytes the sanitizer just removed.
+// retries the pair.
 //
-// The marker is appended AFTER the cut, so a truncated result exceeds limit by the
-// marker's own length: the bound exists to stop multi-megabyte lines, not to hit
-// limit exactly. The cut and the marker are logtext.Cap's, shared with
-// internal/process so one condition never grows two vocabularies.
+// The marker is charged AGAINST limit, so the result never exceeds limit at all —
+// where the app's own composition used to append the marker after the cut and run to
+// limit plus the marker's length. The bound exists to stop multi-megabyte lines, so
+// either placement serves it; taking the library's makes limit mean the total, which
+// is the simpler promise to a caller sizing a diagnostic.
+//
+// The cut FACT is discarded deliberately: no diagnostic in this package reports
+// truncation as a separate attribute, and the marker in the text is what an operator
+// reads. A caller that ever needs the fact takes the pair directly rather than
+// re-deriving it from the marker, which a value legitimately ending in the marker
+// would defeat.
 func boundLogText(s string, limit int) string {
-	return logtext.Cap(runesafe.SanitizeSingleLine(s), limit)
+	text, _ := runesafe.SanitizeSingleLineCapped(s, limit, logtext.Marker)
+	return text
 }
 
 // truncationMarker names text boundLogText had to cut, so a reader can tell a
 // diagnostic that ends mid-subject from one that genuinely ends there. It is
-// deliberately more explicit than runesafe's own "..." marker, which is why
-// boundLogText composes the library's primitives instead of taking its preset; the
-// wording itself lives in internal/logtext, and this alias is what the package's own
-// assertions read.
+// deliberately more explicit than runesafe's own "..." preset marker, which is why
+// boundLogText passes a marker of its own to the library's caller-marker primitive.
+// The wording lives in internal/logtext because internal/process bounds its orphan
+// path sample with the same marker and the two must not drift; this alias is what
+// the package's own assertions read.
 const truncationMarker = logtext.Marker
 
 // maxSubjectLogLen bounds the certificate-controlled subject interpolated into a
@@ -668,7 +679,21 @@ func isEncryptedPEMBlock(block *pem.Block) bool {
 
 // oversizedRSAKeyError refuses a private-key block holding an RSA integer larger
 // than maxVerifiableKeyBits or declaring more than maxRSAPrimeFactors prime factors,
-// or reports nil for every block it cannot measure.
+// and reports nil for every block that is not an RSA private-key envelope at all.
+//
+// The two ceilings are asked of the SAME envelope scan, and independently: the
+// factor ceiling is decided from the envelope's shape alone, so it still refuses a
+// key whose integers could not be SIZED. A block whose modulus is zero or negative
+// is malformed, but it is unambiguously an RSA envelope, and the collection of extra
+// prime factors it declares is read from tag-length headers that do not depend on
+// the modulus being readable. Deciding "unmeasurable, therefore nothing to say" —
+// which is what a size-only pre-scan did — left the amplification shape the factor
+// ceiling exists for reachable behind one malformed integer.
+//
+// A consequence, accepted deliberately: for such a block this app's own bounded
+// refusal is now the error the operator sees, where crypto/x509's malformed-key
+// error used to be. The app refuses the file either way; only the wording changes,
+// and it changes towards the diagnostic that names the ceiling and the remedy.
 //
 // It exists because the cost is INSIDE the parser: x509.ParsePKCS8PrivateKey and
 // x509.ParsePKCS1PrivateKey run RSA CRT precomputation and consistency validation
@@ -686,15 +711,18 @@ func isEncryptedPEMBlock(block *pem.Block) bool {
 // above it is already refused a signature check, so accepting a private key above
 // it could only produce a bundle this app would not reason about.
 func oversizedRSAKeyError(block *pem.Block) error {
-	scan := maxRSAIntegerBitsFromKeyDER(block.Bytes, 1)
-	if !scan.measured {
+	scan := scanRSAKeyEnvelope(block.Bytes, 1)
+	if !scan.isRSA {
 		return nil
 	}
 	if scan.factors > maxRSAPrimeFactors {
 		return fmt.Errorf("private key in a %q block declares more than %d RSA prime factors, above the %d-factor ceiling this app reads a private key at (parsing it would run one modular inverse per additional prime against a growing product and stall the scan)",
 			boundLogText(block.Type, maxBlockTypeLogLen), maxRSAPrimeFactors, maxRSAPrimeFactors)
 	}
-	if scan.maxBits <= maxVerifiableKeyBits {
+	// The size ceiling is the half that CAN be inapplicable: a block none of whose
+	// integers could be sized has no measured size to compare, and the parser's own
+	// error is the right answer for it.
+	if !scan.sized || scan.maxBits <= maxVerifiableKeyBits {
 		return nil
 	}
 	return fmt.Errorf("private key in a %q block holds a %d-bit RSA integer (modulus, prime or CRT value), above the %d-bit ceiling this app reads a private key at (parsing it would run RSA precomputation on file-supplied integers and stall the scan)",
@@ -717,35 +745,46 @@ func oversizedRSAKeyError(block *pem.Block) error {
 // configuration.
 const maxRSAPrimeFactors = 64
 
-// rsaKeyPreScan is what the DER-only pre-scan learned about a private-key block.
-// It is a typed result rather than a bare size because the two refusals it feeds
-// are distinct — one integer too wide, or too many prime factors — and an
-// unmeasurable block must be told apart from a measured one either way.
+// rsaKeyPreScan is what the DER-only envelope scan learned about a private-key
+// block: its SHAPE, the prime-factor count that shape declares, and — optionally —
+// the size of the largest integer in it. All three come back from one walk because
+// the refusals they feed must not depend on each other: a size that could not be
+// measured is a missing MEASUREMENT, not a missing envelope, and it must not silence
+// the factor ceiling.
 type rsaKeyPreScan struct {
 	// maxBits is the bit length of the largest RSA integer the structure holds —
 	// the modulus, a prime, a CRT value, or any integer inside OtherPrimeInfos.
+	// Meaningless unless sized.
 	maxBits int
 	// factors is how many prime factors the structure declares: two, plus one per
 	// OtherPrimeInfos entry, SATURATED at maxRSAPrimeFactors+1 — past the ceiling the
 	// exact count buys nothing and the counting itself is attacker-controlled work.
-	// Meaningless unless measured.
+	// Meaningless unless isRSA.
 	factors int
-	// measured reports that the block was read as an RSA private key whose
-	// integers could be sized. False is the FAIL-OPEN answer (a non-RSA key, a
-	// malformed block, a zero or negative modulus) and means the pre-scan decides
-	// nothing: the block goes to the existing parsers with their existing errors.
-	measured bool
+	// isRSA reports that the block IS an RSA private-key envelope: a PKCS#1
+	// RSAPrivateKey, or a PKCS#8 PrivateKeyInfo wrapping one. False is the FAIL-OPEN
+	// answer for a shape that is not one (a non-RSA key, a truncated or malformed
+	// container) and means the pre-scan decides nothing: the block goes to the
+	// existing parsers with their existing errors.
+	isRSA bool
+	// sized reports that at least one integer in the envelope could be measured, so
+	// maxBits means something. It is INDEPENDENT of isRSA: a malformed envelope
+	// whose every integer is zero, negative or unreadable is still an envelope whose
+	// factor count is known, which is why this is a second flag and not the absence
+	// of the first.
+	sized bool
 }
 
-// maxRSAIntegerBitsFromKeyDER reports the size of the LARGEST INTEGER in private-key
-// DER — the modulus, a prime, a CRT value, or any integer inside OtherPrimeInfos —
-// together with how many prime factors the key declares, reading ONLY each
-// INTEGER's own length: it walks tag-length headers with encoding/asn1's RawValue
-// (which slices the content rather than decoding it) and never converts a
+// scanRSAKeyEnvelope reads a private-key DER envelope, reporting whether it IS an
+// RSA private-key envelope, how many prime factors it declares, and the size of the
+// largest INTEGER in it when any integer could be sized — one walk, three answers,
+// because the two refusals oversizedRSAKeyError applies must be able to fire
+// independently.
+//
+// It reads ONLY each element's own tag-length header, through encoding/asn1's
+// RawValue (which slices the content rather than decoding it), and never converts a
 // file-supplied integer to a big.Int, so it costs sub-microseconds on a 32 KB block
-// where the parser costs hundreds of milliseconds. Measuring the modulus alone let a
-// block with a tiny modulus beside 2-Mbit "primes" through, because crypto/rsa
-// precomputes from p and q before it can reject an inconsistent key.
+// where the parser costs hundreds of milliseconds.
 //
 // Two shapes carry those integers, and both are handled: a PKCS#1 RSAPrivateKey,
 // whose modulus is the INTEGER after the version INTEGER (with the primes and CRT
@@ -754,14 +793,16 @@ type rsaKeyPreScan struct {
 // PKCS#1 structure — hence depth, which admits exactly one level of unwrapping and
 // stops a crafted file from nesting containers indefinitely.
 //
-// It FAILS OPEN by design: an unmeasured result for anything it cannot size, which
-// covers a non-RSA key (a SEC1 EC key's second element is an OCTET STRING, a PKCS#8
-// EC or Ed25519 key's inner OCTET STRING is not a PKCS#1 SEQUENCE, and none of them
-// is expensive to parse), a truncated or malformed block, and a zero or negative
-// modulus. The guard's job is to refuse OVERSIZED keys, not to become a second
-// parser: everything else is left to the existing parsers and their existing
-// errors.
-func maxRSAIntegerBitsFromKeyDER(der []byte, depth int) rsaKeyPreScan {
+// It FAILS OPEN on SHAPE by design: an isRSA-false result for anything that is not
+// one of those two envelopes, which covers a non-RSA key (a SEC1 EC key's second
+// element is an OCTET STRING, a PKCS#8 EC or Ed25519 key's inner OCTET STRING is not
+// a PKCS#1 SEQUENCE, and none of them is expensive to parse) and a container it
+// cannot read at all. Measurability is a SEPARATE answer: inside a recognised
+// envelope, an integer this walk cannot size simply does not contribute a size, and
+// the envelope's factor count still stands. The guard's job is to refuse OVERSIZED
+// and OVER-FACTORED keys, not to become a second parser: every other verdict is left
+// to the existing parsers and their existing errors.
+func scanRSAKeyEnvelope(der []byte, depth int) rsaKeyPreScan {
 	outer, _, ok := asn1Element(der)
 	if !ok || !isASN1(outer, asn1.TagSequence) {
 		return rsaKeyPreScan{}
@@ -783,23 +824,23 @@ func maxRSAIntegerBitsFromKeyDER(der []byte, depth int) rsaKeyPreScan {
 		// integer in the structure decides the cost, not the modulus. Measuring
 		// only the modulus let a 710 KB block with a 20-bit modulus and 2-Mbit
 		// "primes" spend 59.8s inside x509.ParsePKCS1PrivateKey.
-		return maxRSAIntegerBits(second, afterSecond)
+		return scanRSAPKCS1Body(second, afterSecond)
 	case isASN1(second, asn1.TagSequence):
-		return maxRSAIntegerBitsFromPKCS8(afterSecond, depth)
+		return scanRSAKeyEnvelopePKCS8(afterSecond, depth)
 	}
 	return rsaKeyPreScan{}
 }
 
-// maxRSAIntegerBitsFromPKCS8 measures the PKCS#1 key inside a PKCS#8
-// PrivateKeyInfo, given the DER after its AlgorithmIdentifier: the privateKey
-// OCTET STRING that follows holds the PKCS#1 structure.
+// scanRSAKeyEnvelopePKCS8 scans the PKCS#1 key inside a PKCS#8 PrivateKeyInfo,
+// given the DER after its AlgorithmIdentifier: the privateKey OCTET STRING that
+// follows holds the PKCS#1 structure.
 //
 // depth is the unwrap allowance, and it is a security rule rather than a style
 // one: an exhausted allowance fails open here exactly as it did inline, so a
 // crafted file cannot nest containers indefinitely and make the walk recurse. It
-// fails open on anything else it cannot read, for the reason
-// maxRSAIntegerBitsFromKeyDER documents.
-func maxRSAIntegerBitsFromPKCS8(afterAlgorithm []byte, depth int) rsaKeyPreScan {
+// fails open on anything else it cannot read, for the reason scanRSAKeyEnvelope
+// documents.
+func scanRSAKeyEnvelopePKCS8(afterAlgorithm []byte, depth int) rsaKeyPreScan {
 	if depth <= 0 {
 		return rsaKeyPreScan{}
 	}
@@ -807,25 +848,29 @@ func maxRSAIntegerBitsFromPKCS8(afterAlgorithm []byte, depth int) rsaKeyPreScan 
 	if !ok || !isASN1(inner, asn1.TagOctetString) {
 		return rsaKeyPreScan{}
 	}
-	return maxRSAIntegerBitsFromKeyDER(inner.Bytes, depth-1)
+	return scanRSAKeyEnvelope(inner.Bytes, depth-1)
 }
 
-// maxRSAIntegerBits reports the largest integer in a PKCS#1 RSAPrivateKey and how
-// many prime factors it declares, given its modulus element and the DER of the
-// elements after it. The modulus decides measurability (it fails open exactly as
-// before when the modulus is absent, zero or negative); each later INTEGER only
-// raises the size, so a shape this walk cannot read can never LOWER the ceiling
-// check.
+// scanRSAPKCS1Body scans a PKCS#1 RSAPrivateKey body, given its modulus element and
+// the DER of the elements after it. The envelope is RECOGNISED by the time this is
+// called, so isRSA is true and the factor count starts at the two primes PKCS#1
+// always declares; only the size is conditional.
+//
+// The modulus is folded in like any other integer rather than gating the walk. A
+// modulus that is absent, zero or negative used to abandon the whole scan, and with
+// it the factor count — so a malformed key carrying a huge OtherPrimeInfos
+// collection reached crypto/x509 with both ceilings skipped. Every integer here can
+// only RAISE the measured size, so a value this walk cannot read can never lower the
+// ceiling check.
 //
 // The trailing SEQUENCE, when present, is PKCS#1's optional OtherPrimeInfos: its
 // integers count towards the size and its element count towards the factor total,
-// because that collection is the amplification shape maxRSAPrimeFactors bounds.
-func maxRSAIntegerBits(modulus asn1.RawValue, rest []byte) rsaKeyPreScan {
-	maxBits, ok := derIntegerBits(modulus.Bytes)
-	if !ok {
-		return rsaKeyPreScan{}
-	}
-	scan := rsaKeyPreScan{maxBits: maxBits, factors: 2, measured: true}
+// because that collection is the amplification shape maxRSAPrimeFactors bounds. That
+// count is the only superlinear cost in reach, and it saturates; everything else
+// here is one tag-length header per element.
+func scanRSAPKCS1Body(modulus asn1.RawValue, rest []byte) rsaKeyPreScan {
+	scan := rsaKeyPreScan{factors: 2, isRSA: true}
+	scan.fold(modulus)
 	for len(rest) > 0 {
 		elem, remaining, elemOK := asn1Element(rest)
 		if !elemOK {
@@ -845,21 +890,30 @@ func maxRSAIntegerBits(modulus asn1.RawValue, rest []byte) rsaKeyPreScan {
 	return scan
 }
 
-// fold folds one post-modulus PKCS#1 element into the scan: an INTEGER can only
-// raise the measured size, and the OtherPrimeInfos SEQUENCE contributes both its
-// integers' sizes and its element count, counted only as far as the ceiling the
-// count feeds.
+// fold folds one PKCS#1 element into the scan: an INTEGER can only raise the
+// measured size (and prove the envelope sizeable at all), and the OtherPrimeInfos
+// SEQUENCE contributes both its integers' sizes and its element count, counted only
+// as far as the ceiling the count feeds.
 func (s *rsaKeyPreScan) fold(elem asn1.RawValue) {
 	switch {
 	case isASN1(elem, asn1.TagInteger):
-		if elemBits, ok := derIntegerBits(elem.Bytes); ok && elemBits > s.maxBits {
-			s.maxBits = elemBits
+		if elemBits, ok := derIntegerBits(elem.Bytes); ok {
+			s.sized = true
+			if elemBits > s.maxBits {
+				s.maxBits = elemBits
+			}
 		}
 	case isASN1(elem, asn1.TagSequence):
 		additional, additionalBits := rsaOtherPrimeInfos(elem.Bytes, maxRSAPrimeFactors-s.factors+1)
 		s.factors += additional
-		if additionalBits > s.maxBits {
-			s.maxBits = additionalBits
+		// A positive bit length is itself the proof that some integer in the
+		// collection was readable: derIntegerBits reports zero for every value whose
+		// size means nothing.
+		if additionalBits > 0 {
+			s.sized = true
+			if additionalBits > s.maxBits {
+				s.maxBits = additionalBits
+			}
 		}
 	}
 }
@@ -936,8 +990,10 @@ func isASN1(v asn1.RawValue, tag int) bool {
 // derIntegerBits reports the bit length of a DER INTEGER's content bytes, and
 // false when the value is not a positive integer whose size means anything: an
 // empty content, a negative value (the leading byte of a two's-complement DER
-// INTEGER has its high bit set), or zero. Neither is a modulus, and both are left
-// to the parser's own refusal. The sign is read from the FIRST byte, before the
+// INTEGER has its high bit set), or zero. None of those is a size, so such a value
+// contributes nothing to the envelope scan's measurement — the scan still reports
+// the envelope's shape and factor count, and only the SIZE half of the pre-scan
+// stands down. The sign is read from the FIRST byte, before the
 // 0x00 bytes DER prepends to keep a large positive value positive are stripped.
 func derIntegerBits(content []byte) (int, bool) {
 	if len(content) == 0 || content[0] >= 0x80 {

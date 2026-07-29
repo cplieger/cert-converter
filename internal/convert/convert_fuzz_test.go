@@ -9,6 +9,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"math/big"
 	"os"
@@ -115,6 +116,14 @@ func FuzzParsePrivateKey(f *testing.F) {
 	}))
 	f.Add(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: []byte("this is not valid DER")}))
 	f.Add(append(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("this is not valid DER")}), ecPEM...))
+	// The envelope pre-scan's malformed-but-shaped branch: a PKCS#1 key whose modulus
+	// is zero (so nothing in it can be SIZED) declaring a large OtherPrimeInfos
+	// collection. It is the shape that used to skip both pre-scan ceilings and reach
+	// crypto/x509, which decodes the whole collection before it looks at the modulus,
+	// so the walk over the elements AFTER an unreadable modulus is code only this
+	// seed's shape reaches. The weekly corpus is discarded after every run, so the
+	// seed is the durable reach into it.
+	f.Add(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: zeroModulusMultiPrimeDER(f, 200)}))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		key, err := convert.ParsePrivateKey(data)
@@ -166,6 +175,36 @@ func FuzzParsePrivateKey(f *testing.F) {
 			t.Fatal("the private key changed across its own PKCS#8 round trip")
 		}
 	})
+}
+
+// zeroModulusMultiPrimeDER builds PKCS#1 RSAPrivateKey DER whose modulus is zero and
+// which declares extras additional prime factors, mirroring x509's own
+// pkcs1PrivateKey plus RFC 8017's optional OtherPrimeInfos. Field ORDER is the DER
+// contract. It is deliberately not a usable key: it exists as a fuzz seed for the
+// pre-scan's envelope walk, which must read this shape's factor count without the
+// modulus being readable.
+func zeroModulusMultiPrimeDER(f *testing.F, extras int) []byte {
+	f.Helper()
+	one := big.NewInt(1)
+	infos := make([]struct{ Prime, Exponent, Coefficient *big.Int }, extras)
+	for i := range infos {
+		infos[i] = struct{ Prime, Exponent, Coefficient *big.Int }{Prime: big.NewInt(3), Exponent: one, Coefficient: one}
+	}
+	der, err := asn1.Marshal(struct {
+		Version         int
+		N, E, D, P, Q   *big.Int
+		Dp, Dq, Qinv    *big.Int
+		OtherPrimeInfos []struct{ Prime, Exponent, Coefficient *big.Int }
+	}{
+		Version: 1,
+		N:       big.NewInt(0), E: big.NewInt(65537), D: one, P: one, Q: one,
+		Dp: one, Dq: one, Qinv: one,
+		OtherPrimeInfos: infos,
+	})
+	if err != nil {
+		f.Fatalf("setup: marshal zero-modulus multi-prime key: %v", err)
+	}
+	return der
 }
 
 func FuzzToPFXRoundTrip(f *testing.F) {

@@ -31,6 +31,42 @@ const defaultFallbackInterval = 6 * time.Hour
 // clamp WARN, and the two must report the same ceiling.
 const maxFallbackHours = 87600
 
+// defaultMaxScanEntries is the number of /input paths ONE scan will enumerate when
+// MAX_SCAN_ENTRIES is unset, empty, or unusable. A Caddy certificate directory holds
+// a handful of entries per domain, so ten thousand is already orders of magnitude
+// above any real deployment while keeping the walk's worst case small.
+const defaultMaxScanEntries = 10000
+
+// maxScanEntriesCeiling is the largest ceiling MAX_SCAN_ENTRIES may raise the budget
+// to; a higher configured value is clamped to it. It is the historical hardcoded
+// bound, kept as the upper limit so raising the setting cannot restore an
+// effectively unbounded walk.
+//
+// There is deliberately NO disable value (no "0"/"false" spelling, unlike
+// FALLBACK_SCAN_HOURS): disabling the budget would reopen the single-scan
+// memory/CPU exhaustion path the ceiling exists to close, so a zero or negative
+// value is treated as unusable input and falls back to the default.
+const maxScanEntriesCeiling = 200000
+
+// scanEntriesRepair reports whether parsing accepted, defaulted, or clamped the
+// configured MAX_SCAN_ENTRIES. Parsing stays silent because MaxScanEntries is a
+// plain reader; Load owns the one-time diagnostics, exactly as it does for
+// FALLBACK_SCAN_HOURS.
+type scanEntriesRepair int
+
+const (
+	// scanEntriesAccepted means the derived budget is the configured one: an
+	// explicit in-range count, or an unset/blank value taking the documented
+	// default.
+	scanEntriesAccepted scanEntriesRepair = iota
+	// scanEntriesInvalid means the value was unparseable or non-positive and
+	// defaultMaxScanEntries was substituted.
+	scanEntriesInvalid
+	// scanEntriesClamped means the value was above maxScanEntriesCeiling and was
+	// clamped down to it.
+	scanEntriesClamped
+)
+
 // fallbackRepair reports whether parsing accepted, defaulted, or clamped the
 // configured value. Parsing stays silent because FallbackInterval is called by
 // health probes; Load owns the one-time diagnostics.
@@ -62,11 +98,14 @@ type Config struct {
 	FallbackInterval time.Duration
 }
 
-// ErrEmptyPassword indicates the resolved PFX password is empty or entirely
-// Unicode whitespace and the PFX_ALLOW_EMPTY_PASSWORD opt-out is not set. Such
-// a password provides no meaningful protection for the embedded private key.
+// ErrEmptyPassword indicates the resolved PFX password is blank — empty, entirely
+// Unicode whitespace, or entirely invisible formatting runes — and the
+// PFX_ALLOW_EMPTY_PASSWORD opt-out is not set. Such a password provides no
+// meaningful protection for the embedded private key: nobody can reproduce it from
+// the secret's visible contents.
 var ErrEmptyPassword = errors.New(
-	"the resolved PFX password is empty or blank; set PFX_PASSWORD, write a non-blank secret " +
+	"the resolved PFX password is empty or blank (whitespace-only, or invisible formatting characters only); " +
+		"set PFX_PASSWORD, write a non-blank secret " +
 		"to the file named by PFX_PASSWORD_FILE, or set PFX_ALLOW_EMPTY_PASSWORD=true")
 
 // ErrUnencodablePassword indicates the configured password contains invalid UTF-8,
@@ -90,33 +129,65 @@ const (
 	// PasswordWhitespaceOnly means the password consists only of whitespace,
 	// which is effectively no protection.
 	PasswordWhitespaceOnly PasswordStatus = "whitespace-only"
+	// PasswordInvisibleOnly means the password consists only of invisible runes
+	// and at least one of them is a Unicode FORMAT character (Cf): a secret file
+	// holding nothing but a byte-order mark an editor added, or a pasted
+	// zero-width space. It is as unusable as a whitespace-only password — nobody
+	// can retype it from the secret's visible contents — so it is classified as
+	// blank rather than configured.
+	PasswordInvisibleOnly PasswordStatus = "invisible-only"
 	// PasswordConfigured means a real password was supplied.
 	PasswordConfigured PasswordStatus = "configured"
 )
 
-// classifyPassword classifies a PFX password. It is the single home for the
+// classifyPassword classifies a PFX password ONCE, and is the single home for the
 // blank-password predicate: Load's empty-password guard, Load's weak-password
 // WARN, and the Config.PasswordStatus the startup log reports all derive their
 // decision from it, so they cannot drift.
+//
+// The order of the arms is the precedence: a password made only of whitespace stays
+// PasswordWhitespaceOnly (its own WARN names the stray-quote cause), and
+// PasswordInvisibleOnly is reserved for a value that survives TrimSpace yet still
+// carries nothing an operator can see or retype.
 func classifyPassword(password string) PasswordStatus {
 	switch {
 	case password == "":
 		return PasswordEmpty
 	case strings.TrimSpace(password) == "":
 		return PasswordWhitespaceOnly
+	case isInvisibleOnly(password):
+		return PasswordInvisibleOnly
 	default:
 		return PasswordConfigured
 	}
 }
 
-// isBlank reports whether a password is empty or entirely Unicode whitespace, and
-// therefore offers no real protection.
+// isInvisibleOnly reports whether every rune of a non-empty password is invisible:
+// whitespace, or a Unicode FORMAT character (Cf) such as a byte-order mark, a
+// zero-width space or a soft hyphen.
+//
+// This is the shape TrimSpace cannot see. A secret file an editor saved as "UTF-8
+// with BOM" and nothing else, or a value that is one pasted zero-width space, is
+// valid UTF-8, inside the BMP, not a NUL and not whitespace, so every other guard
+// accepts it — and the resulting bundle is protected by a password nobody can
+// reproduce from the file's visible (empty) contents. Invalid UTF-8 decodes as
+// U+FFFD, which is neither space nor Cf, so a binary secret stays configured.
+func isInvisibleOnly(password string) bool {
+	return !strings.ContainsFunc(password, func(r rune) bool {
+		return !unicode.IsSpace(r) && !isFormatRune(r)
+	})
+}
+
+// isBlank reports whether a password offers no real protection: empty, entirely
+// Unicode whitespace, or entirely invisible formatting runes.
 //
 // This is the single blankness rule for BOTH delivery channels, so
 // PFX_ALLOW_EMPTY_PASSWORD means one thing regardless of how the secret arrived.
 // PFX_PASSWORD=" " (a quoting slip in a compose file or .env) is therefore REJECTED:
 // README documents the guard as refusing to start when the password is empty, which an
-// operator reasonably reads as covering a blank value.
+// operator reasonably reads as covering a blank value. A BOM-only secret file is
+// rejected for the same reason — it is blank to every human who reads it, and only
+// the opt-out may start a container with it.
 func isBlank(password string) bool {
 	return classifyPassword(password) != PasswordConfigured
 }
@@ -126,8 +197,9 @@ func isBlank(password string) bool {
 // set the secret is read from that file (bounded, whitespace-trimmed) so it
 // never appears in the process environment; otherwise PFX_PASSWORD is used. It
 // returns ErrEmptyPassword when neither supplies a value, or when the value is
-// blank (empty or whitespace-only) — a whitespace-only PFX_PASSWORD_FILE
-// included, because a blank file routes through the same guard as a blank
+// blank (empty, whitespace-only, or invisible formatting runes only) — a
+// whitespace-only or BOM-only PFX_PASSWORD_FILE included, because a blank file
+// routes through the same guard as a blank
 // PFX_PASSWORD — unless PFX_ALLOW_EMPTY_PASSWORD is set to true; it returns
 // ErrUnencodablePassword when the configured password is a shape PKCS#12 cannot
 // carry (invalid UTF-8, a non-BMP rune, or an embedded NUL); and it fails
@@ -168,8 +240,14 @@ func Load() (Config, error) {
 			return Config{}, secretErr
 		}
 	}
+	// One classification, three consumers: the empty-password guard below, the
+	// weak-password WARN (warnPasswordStrength, emitted last), and the
+	// Config.PasswordStatus the startup line reports. Deriving all three from this
+	// single answer is what keeps a value the guard treats as blank from being
+	// reported as "configured".
+	status := classifyPassword(password)
 	allowEmpty := allowEmptyPassword(os.Getenv("PFX_ALLOW_EMPTY_PASSWORD"))
-	if isBlank(password) && !allowEmpty {
+	if status != PasswordConfigured && !allowEmpty {
 		if blankSecretFile != nil {
 			// A blank secret FILE is not "no password supplied": name the envx error,
 			// which carries the configured path. A startup FAILURE is the deliberate
@@ -178,14 +256,10 @@ func Load() (Config, error) {
 		}
 		return Config{}, ErrEmptyPassword
 	}
-	// Classified next to the guard that consumes it, but warned last (see
-	// warnPasswordStrength), so the weak-password WARN lands after the delivery,
-	// lifecycle, encoder and fallback diagnostics rather than ahead of them.
-	status := classifyPassword(password)
 	if err := checkPasswordEncodable(password); err != nil {
 		return Config{}, fmt.Errorf("%w (supplied via %s)", err, passwordChannel(source))
 	}
-	logPasswordDelivery(source, password, blankSecretFile)
+	logPasswordDelivery(source, password, status, blankSecretFile)
 
 	rawLifecycle := os.Getenv("OUTPUT_LIFECYCLE")
 	lifecycle, lifecycleKnown := outputpolicy.ParseLifecycle(rawLifecycle)
@@ -204,7 +278,12 @@ func Load() (Config, error) {
 	fallbackInterval, rawFallback, repair := fallbackIntervalFromEnv()
 	warnFallbackRepaired(rawFallback, repair)
 	warnFallbackDisabled(fallbackInterval)
-	warnPasswordStrength(status, blankSecretFile != nil)
+	_, rawScanEntries, scanRepair := maxScanEntriesFromEnv()
+	warnMaxScanEntriesRepaired(rawScanEntries, scanRepair)
+	// Warned last (see warnPasswordStrength), so the weak-password WARN lands after
+	// the delivery, lifecycle, encoder, fallback and scan-ceiling diagnostics rather
+	// than ahead of them.
+	warnPasswordStrength(status, passwordChannel(source), blankSecretFile != nil)
 
 	return Config{
 		Password:         password,
@@ -239,6 +318,28 @@ func fallbackIntervalFromEnv() (interval time.Duration, raw string, repair fallb
 	raw = os.Getenv("FALLBACK_SCAN_HOURS")
 	interval, repair = parseFallbackInterval(raw)
 	return interval, raw, repair
+}
+
+// MaxScanEntries returns the effective MAX_SCAN_ENTRIES: the number of /input paths
+// one scan may enumerate before it refuses the tree. Exported separately from Load,
+// like FallbackInterval, so the composition root can hand the budget to the scanner
+// without every caller re-deriving the default and the ceiling.
+//
+// Deliberately SILENT: it emits no log records. Every diagnostic for this setting is
+// emitted once per process start, by Load (warnMaxScanEntriesRepaired).
+func MaxScanEntries() int {
+	limit, _, _ := maxScanEntriesFromEnv()
+	return limit
+}
+
+// maxScanEntriesFromEnv reads MAX_SCAN_ENTRIES and returns the effective budget, the
+// raw configured value (what a diagnostic must quote), and how the parse had to
+// repair it. The single home for the variable's name, shared by the silent
+// MaxScanEntries reader and by Load, which is the only caller that warns.
+func maxScanEntriesFromEnv() (limit int, raw string, repair scanEntriesRepair) {
+	raw = os.Getenv("MAX_SCAN_ENTRIES")
+	limit, repair = parseMaxScanEntries(raw)
+	return limit, raw, repair
 }
 
 // LogLevel returns the effective LOG_LEVEL as a slog level. Exported separately
@@ -356,16 +457,10 @@ func parseFallbackInterval(v string) (time.Duration, fallbackRepair) {
 		return defaultFallbackInterval, fallbackAccepted
 	default:
 		n, err := strconv.ParseInt(trimmed, 10, 64)
-		// A valid decimal too large for int64 is still a positive
-		// above-ceiling value: clamp it like 87601 instead of misreading
-		// overflow as malformed input. strconv reports ErrRange (not
-		// ErrSyntax) for an overflowing digit prefix followed by junk too, so
-		// the digits-only check keeps "1e40x" malformed rather than clamping
-		// it; an optional leading "+" is still a valid decimal.
-		digits := strings.TrimPrefix(trimmed, "+")
-		positiveOverflow := errors.Is(err, strconv.ErrRange) &&
-			digits != "" && strings.Trim(digits, "0123456789") == ""
-		if positiveOverflow || (err == nil && n > maxFallbackHours) {
+		// A valid decimal too large for int64 is still a positive above-ceiling
+		// value: clamp it like 87601 instead of misreading overflow as malformed
+		// input. isPositiveOverflow owns that rule for both numeric parsers.
+		if isPositiveOverflow(trimmed, err) || (err == nil && n > maxFallbackHours) {
 			return time.Duration(maxFallbackHours) * time.Hour, fallbackClamped
 		}
 		if err == nil && n > 0 {
@@ -373,6 +468,54 @@ func parseFallbackInterval(v string) (time.Duration, fallbackRepair) {
 		}
 		return defaultFallbackInterval, fallbackInvalid
 	}
+}
+
+// isPositiveOverflow reports whether a trimmed value is a valid decimal too large
+// for int64, and therefore an above-ceiling number rather than malformed input. The
+// shared rule behind both numeric parsers, so MAX_SCAN_ENTRIES and
+// FALLBACK_SCAN_HOURS cannot disagree about what an overflowing value means.
+//
+// strconv reports ErrRange (not ErrSyntax) for an overflowing digit prefix followed
+// by junk too, so the digits-only check keeps "1e40x" malformed rather than clamping
+// it; an optional leading "+" is still a valid decimal.
+func isPositiveOverflow(trimmed string, err error) bool {
+	digits := strings.TrimPrefix(trimmed, "+")
+	return errors.Is(err, strconv.ErrRange) &&
+		digits != "" && strings.Trim(digits, "0123456789") == ""
+}
+
+// parseMaxScanEntries parses a MAX_SCAN_ENTRIES value into the number of /input
+// paths one scan may enumerate, and reports how the value had to be repaired to get
+// there. Surrounding whitespace is trimmed first, so " 5000 " parses as 5000.
+// An empty or whitespace-only value — or any unparseable, zero, or negative value —
+// yields defaultMaxScanEntries, matching an unset variable, so a misconfigured
+// budget never becomes an unbounded walk. A value above maxScanEntriesCeiling is
+// clamped to it, including a valid decimal too large for int64: a positive
+// out-of-range number counts as above-ceiling, not as malformed input.
+//
+// There is deliberately no disable spelling (see maxScanEntriesCeiling): "0" and
+// "false" are unusable input here, not an opt-out, because a scan with no entry
+// budget is the exhaustion path the ceiling exists to close.
+//
+// A pure parse: it emits no log records, so MaxScanEntries() stays silent for any
+// caller. The repaired-input diagnostics are warnMaxScanEntriesRepaired's, emitted
+// once per process start from Load.
+func parseMaxScanEntries(v string) (int, scanEntriesRepair) {
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" {
+		return defaultMaxScanEntries, scanEntriesAccepted
+	}
+	// Atoi rather than ParseInt: the budget is an int, so parsing at the target
+	// width keeps the clamp from needing a narrowing conversion, and an
+	// int-overflowing value still arrives as ErrRange.
+	n, err := strconv.Atoi(trimmed)
+	if isPositiveOverflow(trimmed, err) || (err == nil && n > maxScanEntriesCeiling) {
+		return maxScanEntriesCeiling, scanEntriesClamped
+	}
+	if err == nil && n > 0 {
+		return n, scanEntriesAccepted
+	}
+	return defaultMaxScanEntries, scanEntriesInvalid
 }
 
 // warnFallbackRepaired emits the operator-facing diagnostic for a
@@ -395,6 +538,30 @@ func warnFallbackRepaired(raw string, repair fallbackRepair) {
 		// The configured cadence was used as-is. The explicit "0"/"false"
 		// opt-out lands here too and is reported by warnFallbackDisabled, which
 		// keys on the interval rather than on the repair.
+	}
+}
+
+// warnMaxScanEntriesRepaired emits the operator-facing diagnostic for a
+// MAX_SCAN_ENTRIES value the parser could not use as configured. Both cases are
+// silently repaired, so the WARN naming the rejected value is the operator's only
+// way to tell an intended budget from a default or a clamp — and a deployment that
+// meant to raise the ceiling would otherwise keep failing its scan at the default
+// with nothing to explain why.
+//
+// Called only from Load, so each line is emitted exactly once per process start and
+// never from the `health` subcommand. raw is the value as configured, untrimmed, so
+// the log shows what the operator actually set.
+func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
+	switch repair {
+	case scanEntriesClamped:
+		slog.Warn("MAX_SCAN_ENTRIES too large, clamping",
+			"value", raw, "max_entries", maxScanEntriesCeiling)
+	case scanEntriesInvalid:
+		slog.Warn("invalid MAX_SCAN_ENTRIES, using default",
+			"value", raw, "default", defaultMaxScanEntries,
+			"expected", "a whole number of entries between 1 and "+strconv.Itoa(maxScanEntriesCeiling)+" (there is no value that disables the budget)")
+	case scanEntriesAccepted:
+		// The configured budget was used as-is; nothing to report.
 	}
 }
 
@@ -513,13 +680,18 @@ func passwordChannel(source envx.SecretSource) string {
 // a new PasswordStatus cannot gain a case without its warning being considered in
 // the same edit.
 //
+// channel names the variable that delivered the secret (passwordChannel's single
+// rendering), because PasswordInvisibleOnly is reachable through BOTH channels —
+// envx trims whitespace, so a BOM-only mounted secret arrives here as a non-blank
+// file with an invisible-only value.
+//
 // blankFileReported suppresses the duplicate generic guidance because
 // logPasswordDelivery already emitted channel-specific remediation for a blank
 // PFX_PASSWORD_FILE — the generic line's "point PFX_PASSWORD_FILE at a mounted
 // secret" names a step the operator has already taken. Only PasswordEmpty can be
 // reached that way: envx trims a file secret, so a whitespace-only file arrives as
 // ErrBlankSecretFile with an empty password.
-func warnPasswordStrength(status PasswordStatus, blankFileReported bool) {
+func warnPasswordStrength(status PasswordStatus, channel string, blankFileReported bool) {
 	switch status {
 	case PasswordEmpty:
 		if blankFileReported {
@@ -530,6 +702,14 @@ func warnPasswordStrength(status PasswordStatus, blankFileReported bool) {
 	case PasswordWhitespaceOnly:
 		slog.Warn("PFX_PASSWORD is whitespace-only; generated PFX files are protected by that whitespace string, which is effectively no protection",
 			"remediation", "set PFX_PASSWORD to a real value (check for stray quotes or spaces in the env file)")
+	case PasswordInvisibleOnly:
+		// The one record for this shape: an invisible-only password is blank, so
+		// logPasswordDelivery's per-shape rune WARNs are not reached and this line
+		// carries their remediation. Only emitted when PFX_ALLOW_EMPTY_PASSWORD let
+		// the value through — without the opt-out the guard refuses to start.
+		slog.Warn("the PFX password consists only of invisible Unicode formatting characters (byte-order mark, zero-width space, or soft hyphen); generated PFX files are protected by a password nobody can reproduce from the secret's visible contents",
+			"source", channel,
+			"remediation", "rewrite the secret without the invisible characters (an editor saving the secret file as \"UTF-8 with BOM\" is the usual cause; printf %s writes the value verbatim)")
 	case PasswordConfigured:
 		// A real password is the healthy case: the value is a secret, so nothing
 		// is logged about it beyond the non-secret status in the startup line.
@@ -552,17 +732,25 @@ func warnPasswordStrength(status PasswordStatus, blankFileReported bool) {
 // omitted from these steady-state lines so a healthy startup does not publish the
 // secret-mount topology to every aggregator; a startup FAILURE is the deliberate
 // exception, because an unusable secret file cannot be diagnosed without it.
-func logPasswordDelivery(source envx.SecretSource, password string, blankSecretFile error) {
+func logPasswordDelivery(source envx.SecretSource, password string, status PasswordStatus, blankSecretFile error) {
+	// Derived from the one classification rather than recomputed, so the INFO can
+	// never report "configured" for a value the guard treats as blank.
+	blank := status != PasswordConfigured
 	if source == envx.SourceFile {
-		if blankSecretFile != nil {
+		switch {
+		case blankSecretFile != nil:
 			slog.Warn("PFX_PASSWORD_FILE is blank; starting with an empty PFX password because PFX_ALLOW_EMPTY_PASSWORD is set",
 				"source", passwordChannel(source),
 				"remediation", "write the secret into the mounted file so generated PFX files protect the private key")
-		} else {
+		case blank:
+			// A mounted secret envx did not consider blank but this package does —
+			// today only an invisible-only value (envx trims whitespace). Reporting
+			// it as configured is the defect the single classification closes;
+			// warnPasswordStrength emits the actionable record for the shape.
+		default:
 			slog.Info("PFX password configured", "source", passwordChannel(source))
 		}
 	}
-	blank := isBlank(password)
 	if source == envx.SourceEnv && !blank &&
 		password != strings.TrimSpace(password) {
 		slog.Warn("PFX_PASSWORD has leading or trailing whitespace, which is part of the password embedded in every PFX file",
@@ -570,7 +758,9 @@ func logPasswordDelivery(source envx.SecretSource, password string, blankSecretF
 			"remediation", "remove the surrounding whitespace, or note that PFX_PASSWORD_FILE trims it, so the same value delivered as a mounted secret yields a different password")
 	}
 	// A blank value is skipped: warnPasswordStrength already reports it, with the
-	// remediation that helps (set a real password) rather than a rune-shape one.
+	// remediation that helps (set a real password, or rewrite the secret without the
+	// invisible runes) rather than one per-rune-shape record about a value that
+	// carries nothing else.
 	if blank {
 		return
 	}

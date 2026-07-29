@@ -18,7 +18,8 @@ converts each one, chain plus private key, into a PKCS#12 (.pfx) file. The
 typical use: Caddy renews PEM certificates, but some of your apps only accept
 PFX (some Synology services, .NET apps, Windows-based tools). Point `/input`
 at Caddy's certificate folder and fresh PFX files appear on every renewal.
-SHA-256 change detection skips unchanged certificates; modern2023,
+Each scan compares the bundle already on disk against the one the current
+inputs produce, so unchanged certificates are skipped; modern2023,
 modern2026, and legacy encoding profiles cover both current and older
 consumers.
 
@@ -26,7 +27,7 @@ consumers.
 
 - **Distroless and rootless**: runs on `gcr.io/distroless/static-debian13:nonroot` with no shell or package manager, minimizing the attack surface.
 - **fsnotify with polling fallback**: reacts to certificate changes in real time, and periodic full scans catch anything fsnotify misses (network mounts, edge cases), so renewals are never skipped.
-- **SHA-256 skip-unchanged**: fingerprints input files to skip pointless PFX regeneration, reducing disk writes and keeping output timestamps meaningful.
+- **Skip-unchanged read from the output itself**: currency is decided by reading the bundle on disk rather than from a state file, so a rotated password or a changed encoder profile is picked up on the next scan while unchanged certificates cause no rewrite, keeping disk writes and output timestamps meaningful.
 - **No HTTP server, no open ports**: the container has zero network listeners; health is a file-based probe, so nothing is exposed to the network.
 
 ## Quick start
@@ -60,34 +61,41 @@ services:
 
 | Variable | Description | Default | Required |
 | --- | --- | --- | --- |
-| `PFX_PASSWORD` | Password embedded in generated PFX files. The container refuses to start when this is empty **or blank** (whitespace-only, e.g. a quoting slip in compose) unless `PFX_ALLOW_EMPTY_PASSWORD=true` is set, and refuses to start when the value cannot survive PKCS#12 encoding: a character outside the Basic Multilingual Plane (every conversion would fail), a byte sequence that is not valid UTF-8, or an embedded NUL (both would silently produce bundles no consumer can open with the configured secret). | - | Yes |
-| `PFX_PASSWORD_FILE` | Path to a file holding the PFX password (Docker/Podman secret). When set it takes precedence over `PFX_PASSWORD`, keeping the secret out of the container environment and out of `docker inspect`; setting both logs a WARN naming which one is ignored. The file is read once, bounded at 1 MB, and trimmed of surrounding whitespace. The path must already be in cleaned form and contain no `..` anywhere in it, so `/run/secrets/../secrets/pfx` is refused even when it is readable, as are a redundant `//`, a `./` prefix, a trailing `/`, and a filename that merely holds two consecutive dots such as `pfx..v2`. An **unusable** file — unreadable, oversized, or a rejected path — is a startup failure that `PFX_ALLOW_EMPTY_PASSWORD=true` does not rescue. A **blank** file (empty or whitespace-only) is treated exactly like a blank `PFX_PASSWORD`: refused unless `PFX_ALLOW_EMPTY_PASSWORD=true`, so the opt-out means one thing however the secret is delivered. A configured file never falls back to `PFX_PASSWORD` in either case. | - | No |
-| `PFX_ALLOW_EMPTY_PASSWORD` | Set to `true` to let the container start with an empty `PFX_PASSWORD`. Generated PFX files then protect the embedded private key with an empty password (effectively no protection); not recommended. | `false` | No |
-| `FALLBACK_SCAN_HOURS` | Hours between full directory re-scans, the fallback for fsnotify events missed on network mounts and similar edge cases. Only an explicit `0` or `false` disables it, and that runs the watcher unsupervised: a missed event stays unrecovered until the next change, the health marker's freshness deadline is off, and an `/input` watch dropped by an unmount or remount cannot be detected at all, so the container keeps reporting healthy while converting nothing. Startup logs a WARN naming those three losses. Leave the fallback enabled unless you accept a watcher nothing supervises. An empty, whitespace, or invalid value uses the 6h default, so a blank never silently disables the safety net; a value above `87600` (10 years) is clamped to that ceiling. An invalid or clamped value is reported by a WARN at startup only — never by the `health` subcommand, which reads the same setting on every healthcheck. | `6` | No |
-| `PFX_ENCODER` | PFX encoding profile: modern2023 (AES-256-CBC + SHA-256, default), modern2026 (AES-256-CBC + PBMAC1, requires OpenSSL 3.4.0+), legacy (3DES + SHA-1 for older devices), or legacyrc2 (RC2-40 + SHA-1, a last-resort interop escape: a 40-bit RC2 key is brute-forceable, so the private key in such a bundle is protected only nominally — use it when a device accepts nothing else, and treat the output as sensitive). `modern` is an alias for `modern2023`, and `legacy` is recorded as `legacydes` in startup logs. See the [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables). | `modern2023` | No |
-| `OUTPUT_LIFECYCLE` | What happens to a `.pfx` whose certificate has been removed from `/input`. `warn` (default) logs the orphan and leaves the file in place; `sync` deletes it so `/output` tracks `/input`, after a short re-check (30 seconds later, once per scan) confirms the certificate is still gone; `keep` is silent and never deletes. `sync` only ever removes files matching this app's own output shape, and it refuses to delete anything at all unless the scan proves it enumerated `/input` completely: at least one certificate found, the walk finished, and no unreadable path, unresolvable symlink, or conversion failure. A scan that cannot make that proof logs `orphan removal is disabled for this scan` and reaps nothing, so a broken or empty mount can never be read as "every certificate was deleted". An unrecognized value logs a WARN and uses `warn`. | `warn` | No |
-| `LOG_LEVEL` | Minimum log level: `debug`, `info`, `warn`, or `error` (case-insensitive; slog offsets such as `info+2` work). `debug` surfaces per-certificate skip reasons (orphan, unchanged, unreadable subdir) and filesystem-event detail. An unrecognized value falls back to `info`. | `info` | No |
+| `PFX_PASSWORD` | Password embedded in generated PFX files. The container refuses to start when this is empty **or blank** unless `PFX_ALLOW_EMPTY_PASSWORD=true` is set. Blank means nothing an operator can read or retype: whitespace-only (a quoting slip in compose), or invisible characters only, such as a byte-order mark or a pasted zero-width space. It also refuses to start when the value cannot survive PKCS#12 encoding: a character outside the Basic Multilingual Plane (every conversion would fail), a byte sequence that is not valid UTF-8, or an embedded NUL (both would silently produce bundles no consumer can open with the configured secret). | - | Yes |
+| `PFX_PASSWORD_FILE` | Path to a file holding the PFX password (Docker/Podman secret). When set it takes precedence over `PFX_PASSWORD`, keeping the secret out of the container environment and out of `docker inspect`; setting both logs a WARN naming which one is ignored. The file is read once, bounded at 1 MB, and trimmed of surrounding whitespace. The path must already be in cleaned form and contain no `..` anywhere in it, so `/run/secrets/../secrets/pfx` is refused even when it is readable, as are a redundant `//`, a `./` prefix, a trailing `/`, and a name such as `pfx..v2`. An **unusable** file (unreadable, oversized, or a rejected path) is a startup failure that `PFX_ALLOW_EMPTY_PASSWORD=true` does not rescue. A **blank** file (empty, whitespace-only, or holding only invisible characters such as a byte-order mark an editor added) is treated exactly like a blank `PFX_PASSWORD`: refused unless `PFX_ALLOW_EMPTY_PASSWORD=true`, so the opt-out means one thing however the secret is delivered. A configured file never falls back to `PFX_PASSWORD` in either case. | - | No |
+| `PFX_ALLOW_EMPTY_PASSWORD` | Set to `true` to let the container start with a blank password, from either delivery channel. Generated PFX files then protect the embedded private key with an empty password (effectively no protection); not recommended. | `false` | No |
+| `FALLBACK_SCAN_HOURS` | Hours between full directory re-scans, the fallback for fsnotify events missed on network mounts and similar edge cases. Only an explicit `0` or `false` disables it, which leaves the watcher unsupervised and the container reporting healthy while converting nothing; startup logs a WARN naming what is lost, and [Healthcheck](#healthcheck) has the detail. An empty, whitespace, or invalid value uses the 6h default, so a blank never silently disables the safety net; a value above `87600` (10 years) is clamped to that ceiling. An invalid or clamped value is reported by a WARN at startup only, never by the `health` subcommand, which reads the same setting on every healthcheck. | `6` | No |
+| `PFX_ENCODER` | PFX encoding profile: modern2023 (AES-256-CBC + SHA-256, default), modern2026 (AES-256-CBC + PBMAC1, requires OpenSSL 3.4.0+), legacy (3DES + SHA-1 for older devices), or legacyrc2 (RC2-40 + SHA-1, a last-resort interop escape: a 40-bit RC2 key is brute-forceable, so the private key in such a bundle is protected only nominally; use it when a device accepts nothing else and treat the output as sensitive). `modern` is an alias for `modern2023`, and `legacy` is recorded as `legacydes` in startup logs. See the [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables). | `modern2023` | No |
+| `OUTPUT_LIFECYCLE` | What happens to a `.pfx` whose certificate **and** private key have both been removed from `/input`. `warn` (default) logs the orphan and leaves the file in place; `sync` deletes it so `/output` tracks `/input`, after a short re-check (30 seconds later, once per scan) confirms both are still gone; `keep` is silent and never deletes. A bundle whose `<name>.key` is still there is kept and reported by its own WARN: a half-written or half-deleted pair is not proof the bundle is orphaned. Finish the change under `/input` (add the matching `<name>.crt`, or remove the leftover `<name>.key`) and the next scan reaps it. `sync` only ever removes files matching this app's own output shape, and it refuses to delete anything at all unless the scan proves it enumerated `/input` completely: at least one certificate found, the walk finished within `MAX_SCAN_ENTRIES`, and no unreadable path, unresolvable symlink, or conversion failure. A scan that cannot make that proof logs `orphan removal is disabled for this scan` and reaps nothing, so a broken or empty mount can never be read as "every certificate was deleted". Every scan that does delete something logs a WARN naming the count and a sample of the paths. An unrecognized value logs a WARN and uses `warn`. | `warn` | No |
+| `MAX_SCAN_ENTRIES` | How many `/input` paths one scan enumerates before it stops without converting or removing anything further. The stop is a WARN naming the path it reached, and it leaves health alone, because no restart shrinks the tree; orphan cleanup is skipped for that scan. Raise it if your certificate tree is legitimately larger than the default. An empty, whitespace, invalid, zero, or negative value uses the `10000` default; a value above `200000` is clamped to that ceiling. Either repair is reported by a WARN at startup naming the value you set. There is deliberately no value that disables the budget. | `10000` | No |
+| `LOG_LEVEL` | Minimum log level: `debug`, `info`, `warn`, or `error` (case-insensitive; slog offsets such as `info+2` work). `debug` surfaces per-certificate skip reasons (orphan, unchanged, unreadable subdir), each orphan deletion's own path, and filesystem-event detail. An unrecognized value falls back to `info`. | `info` | No |
 
 ### Volumes
 
 | Mount | Description |
 | --- | --- |
-| `/input` | PEM certificate directory (read-only). Each certificate must be named `<name>.crt` with its private key as the sibling `<name>.key` in the same directory (Caddy's layout); files with any other extension are ignored, so a certbot-style directory of `fullchain.pem`/`privkey.pem` produces no output and logs `no certificate pairs found under the input root`. Sub-directories are scanned recursively and mirrored under `/output` as `<name>.pfx`. Must be readable by the UID in `user:`; Caddy's certificate directory is often root-owned and mode `0700`, so either `chgrp`/`chmod` it for that UID or run the container as a UID that can read it. |
+| `/input` | PEM certificate directory (read-only). Each certificate must be named `<name>.crt` with its private key as the sibling `<name>.key` in the same directory (Caddy's layout); files with any other extension are ignored, so a certbot-style directory of `fullchain.pem`/`privkey.pem` produces no output and logs `no certificate pairs found under the input root`. Sub-directories are scanned recursively and mirrored under `/output` as `<name>.pfx`. Must be readable by the UID in `user:`; Caddy's certificate directory is often root-owned and mode `0700`, so `chgrp`/`chmod` it for that UID or run the container as a UID that can read it. |
 | `/output` | PFX output directory; must be writable by the UID in `user:` |
 
 Create the host output directory owned by the UID you set in `user:` before
 the first start. Export `PUID` and `PGID` with the same values Compose uses,
 then run `mkdir -p /path/to/pfx/output && chown "${PUID:-1000}:${PGID:-1000}" /path/to/pfx/output`
-(both default to `1000`, matching `compose.yaml`). Unlike anything under `/input` the scan cannot read, which is
-only warned about and skipped, an unwritable `/output` fails every conversion and
-keeps the container unhealthy — except where the bundle already on disk holds the
-right bytes and is only being rewritten to tighten a file mode a refused `chmod`
-could not, in which case a permission-refused write leaves it in place, warns with
-the same ownership remediation and does not flip health, since no restart grants
-the UID ownership of the volume. Generated `.pfx` files are mode `0600` and their
-directories `0750`, both owned by that UID, so whatever consumes them must run
-as the same UID (or as a privileged process); group membership alone is
-insufficient because mode `0600` grants no group read access.
+(both default to `1000`, matching `compose.yaml`). An unwritable `/output` fails
+every conversion and keeps the container unhealthy. The one exception is a bundle
+that already holds the right bytes and is only being rewritten to tighten a file
+mode a refused `chmod` could not: the refused write leaves it in place, warns with
+the same ownership remediation, and leaves health alone, since no restart grants
+the UID ownership of the volume.
+
+Generated `.pfx` files are mode `0600` and the directories this app creates are
+`0750`, both owned by that UID, so whatever consumes them must run as the same
+UID (or as a privileged process); group membership alone is insufficient because
+mode `0600` grants no group read access. An output directory that is already more
+permissive than `0750` is reported by a WARN naming its mode and then left exactly
+as found: the bundle is still published and health is unaffected (a forced-mode
+mount such as CIFS, NFS, or vfat cannot be chmod'ed at all). Tightening it is
+yours to do, and worth doing: a group- or world-writable directory lets any other
+process on that mount replace a bundle.
 
 ## Alerting
 
@@ -97,24 +105,12 @@ this with no configuration) and evaluate these with
 [Loki's ruler](https://grafana.com/docs/loki/latest/alert/); firing alerts
 deliver through your Alertmanager exactly like Prometheus metric alerts.
 
-**Prerequisite: these exact rules require `LOG_LEVEL=info` (the default) or
-`debug`.** The `scan complete` line they key on is logged at INFO even when
-`failed`/`unreadable` are non-zero, so `LOG_LEVEL=warn` or `error` suppresses
-it: `CertConverterConversionFailed` then never fires and
-`CertConverterScanStalled` fires permanently despite healthy fallback scans
-(`error` additionally suppresses the WARN-level `scan aborted before
-completion` line behind `CertConverterScanAborted`). If you run at `warn` or
-`error`, do not deploy the `CertConverterConversionFailed` or
-`CertConverterScanStalled` expressions unchanged. Container health covers
-conversion failures and aborted scans (and, with the fallback rescan enabled, a
-stalled watch loop through the marker's freshness deadline), but it deliberately
-ignores `unreadable>0` — nothing the scan merely could not READ under `/input`
-flips health, because none of it is clearable by a restart — so at `warn` also
-alert on the WARN lines `some /input paths were unreadable and were skipped` and
-`skipping cert: cannot read` to keep that coverage. At `error` that WARN is
-suppressed too, so use a
-lower log level if you need equivalent unreadable-path alerting. Otherwise write
-replacement rules over the messages your level still emits.
+Every rule below keys on a WARN or ERROR record, so they all work at
+`LOG_LEVEL=warn` as well as at the `info` default (`error` suppresses all but
+the two ERROR rules). No rule reports a wedged watch loop, because a healthy
+scan is deliberately silent at `warn`: the container healthcheck covers that
+case through the health marker's freshness deadline (see
+[Healthcheck](#healthcheck)).
 
 ```yaml
 groups:
@@ -123,8 +119,9 @@ groups:
       - alert: CertConverterConversionFailed
         expr: |
           sum by (container) (count_over_time(
-            {container="cert-converter"} |= `scan complete`
-            |~ ` (failed|unreadable)=[1-9]` [15m]
+            {container="cert-converter"}
+            |~ `(conversion failed|failed to inspect existing pfx)`
+            != `(shutdown)` [15m]
           )) > 0
         for: 0m
         labels:
@@ -132,14 +129,13 @@ groups:
         annotations:
           summary: "cert-converter failed to convert a certificate"
           description: >
-            A scan logged failed>0 (PEM parse, cert/key mismatch, or PFX write)
-            or unreadable>0 (an /input path the scan could not read); the
-            affected .pfx is stale or missing. Only the failed>0 half flips
-            container health — an unreadable path is a layout or permissions
-            condition a restart cannot clear — so this rule deliberately covers
-            more than the healthcheck does. Check /input permissions, that each
-            cert and its sibling key are regular files inside the mount rather
-            than symlinks out of it, and the certificate chain.
+            A PEM or key parse error, a cert/key mismatch, or a failed PFX write
+            left the affected .pfx stale or missing, and the container is
+            unhealthy until a scan converts everything cleanly. The
+            `!= (shutdown)` filter drops the same messages when they were caused
+            by the container stopping, which are logged at DEBUG. Check /output
+            ownership and permissions for the UID in `user:`, that no symlink is
+            planted at the output path, and the certificate chain.
       - alert: CertConverterScanAborted
         expr: |
           sum by (container) (count_over_time(
@@ -153,25 +149,47 @@ groups:
           description: >
             The /input root itself could not be walked (unreadable mount, wrong
             permissions, or a mid-scan unmount), so the scan returned early and
-            the container is unhealthy. The conversion-failure rule does not
-            cover this outcome, and the stall rule identifies it only after its
-            eight-hour window. Check the /input mount and its permissions.
-      - alert: CertConverterScanStalled
+            the container is unhealthy. Check the /input mount and its
+            permissions.
+      - alert: CertConverterInputTreeTooLarge
         expr: |
-          absent_over_time({container="cert-converter"} |= `scan complete` [8h])
-        for: 10m
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |= `holds more entries than one scan will enumerate` [15m]
+          )) > 0
+        for: 0m
         labels:
           severity: warning
         annotations:
-          summary: "cert-converter has not completed a scan in 8h"
+          summary: "cert-converter stopped a scan at the /input entry budget"
           description: >
-            cert-converter emits a `scan complete` line at least every
-            FALLBACK_SCAN_HOURS (default 6h). None in 8h while the container is
-            up means either the fsnotify watch and the fallback timer are both
-            wedged, or every scan is aborting early — check for a
-            CertConverterScanAborted alert first, since that one names the
-            /input problem and fires within 15m. If no scan aborted, the loop is
-            wedged: restart the container.
+            The scan reached MAX_SCAN_ENTRIES (default 10000) and stopped, so
+            every certificate past that point is unconverted and orphan cleanup
+            was skipped for that scan. Health is unaffected, because no restart
+            shrinks the tree, which makes this rule the only signal. Check that
+            /input is mounted at the certificate directory and holds nothing
+            else, or raise MAX_SCAN_ENTRIES.
+      - alert: CertConverterChangeDetectionDegraded
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |= `change detection scan` |= `mode=poll` [8h]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter is polling instead of watching for changes"
+          description: >
+            No fsnotify watch could be established, so change detection has
+            fallen back to a full rescan every FALLBACK_SCAN_HOURS (default 6h)
+            and a renewal now waits that long to convert. Every poll-mode scan
+            repeats this record, so the alert stands for as long as the
+            degradation does; recovery is logged as `fsnotify recovered,
+            upgrading from poll to watch`. Health is unaffected: a poll scan
+            refreshes the marker exactly like a watch scan. Exhausted inotify
+            instances on the host are the usual cause. Match the window to your
+            FALLBACK_SCAN_HOURS.
       - alert: CertConverterChangeDetectionDead
         expr: |
           sum by (container) (count_over_time(
@@ -185,30 +203,23 @@ groups:
           summary: "cert-converter lost change detection and is exiting for a restart"
           description: >
             The watch loop ended for a reason other than shutdown, so the process
-            exited non-zero to be restarted. The announcement is emitted once,
-            by the process that exits, and its `error` field names which loss
-            occurred. Three causes: fsnotify's channels closed under a live
-            container, the fsnotify root watch was removed while
-            FALLBACK_SCAN_HOURS is 0/false so nothing can re-attach it, or
-            fsnotify was unavailable AND FALLBACK_SCAN_HOURS is 0/false,
-            leaving no mechanism to notice a renewal at all. Exiting is
-            deliberate — the alternative was a
-            container that sat healthy forever while converting nothing, because
-            the startup scan had already written the health marker and disabling
-            the fallback also disables the marker's freshness deadline. Critical
-            rather than warning: with no restart policy the container stays down
-            and every renewal is silently missed. Ensure the deployment restarts
-            it (`restart: unless-stopped`), and if the record carries a
+            exited non-zero to be restarted, and its `error` field names which
+            loss occurred: fsnotify's channels closed under a live container, or
+            the root watch was removed, or fsnotify was unavailable at all, the
+            last two only while FALLBACK_SCAN_HOURS is 0/false and nothing can
+            re-attach a watch. Critical rather than warning: with no restart
+            policy the container stays down and every renewal is silently
+            missed. Ensure the deployment restarts it
+            (`restart: unless-stopped`), and if the record carries a
             `remediation` field naming FALLBACK_SCAN_HOURS, unset it or set it
-            above 0 so the periodic rescan covers the missing watch or
-            re-attaches the removed one. Exhausted
-            inotify instances on the host are the usual root cause and are often
-            transient.
+            above 0 so the periodic rescan covers or re-attaches the missing
+            watch. Exhausted inotify instances on the host are the usual root
+            cause and are often transient.
       - alert: CertConverterInputPathUnreachable
         expr: |
           sum by (container) (count_over_time(
             {container="cert-converter"}
-            |~ `(skipping symlink that could not be resolved through the input root|skipping cert: cannot stat sibling key)` [15m]
+            |~ `(some /input paths were unreadable and were skipped|skipping symlink that could not be resolved through the input root|skipping cert: cannot stat sibling key|skipping cert: cannot read)` [15m]
           )) > 0
         for: 0m
         labels:
@@ -216,18 +227,12 @@ groups:
         annotations:
           summary: "cert-converter skipped an unreachable /input path"
           description: >
-            An /input path could not be reached, so what it holds was not
-            converted. Either a symlink could not be resolved through the input
-            root, or a certificate's sibling `<name>.key` could not be stat'ed —
-            which covers a path escaping the input root, a permission denial, and
-            any other IO error, not only a symlink. Whatever was skipped — every
-            certificate under a linked directory, or that one certificate — was
-            not converted. This outcome is health-neutral: the scan still
-            logs `scan complete` with failed=0 and unreadable=0, so none of the
-            other rules fire and the affected .pfx stays stale or absent
-            indefinitely. Mount the certificate path directly instead of linking
-            to it, or repair the permissions of the link target and of the
-            sibling key.
+            An /input path could not be read, stat'ed, or resolved, so the
+            certificates it holds were not converted and their .pfx files stay
+            stale or absent. Health is unaffected, because no restart clears a
+            permissions or layout condition, which makes this rule the only
+            signal. Repair the permissions for the UID in `user:`, and mount the
+            certificate directory directly instead of linking to it.
       - alert: CertConverterNoCertificatePairs
         expr: |
           sum by (container) (count_over_time(
@@ -241,18 +246,14 @@ groups:
           summary: "cert-converter found no convertible certificate pairs under /input"
           description: >
             A scan completed without converting a single `<name>.crt` with a
-            sibling `<name>.key` — either it visited no pair at all, or every
-            `.crt` it visited was an orphan with no sibling key — so no PFX is
-            produced at all. This is the signature of a wrong or vanished
-            /input mount, of a certbot-style
-            directory of fullchain.pem/privkey.pem this app does not read, or
-            of a key-naming layout that does not match the `<name>.key`
-            contract. The
-            outcome is health-neutral — the scan still logs `scan complete` with
-            failed=0 and unreadable=0 — so none of the other rules fire. Check
-            the /input mount and the .crt/.key filename contract. A fresh
-            deployment legitimately reports this until the first issuance; raise
-            `for:` if that is noisy.
+            sibling `<name>.key`, so no PFX is produced at all. This is the
+            signature of a wrong or vanished /input mount, of a certbot-style
+            directory of fullchain.pem/privkey.pem this app does not read, or of
+            a key-naming layout that does not match the `<name>.key` contract.
+            Health is unaffected, so this rule is the only signal. Check the
+            /input mount and the .crt/.key filename contract. A fresh deployment
+            legitimately reports this until the first issuance; raise `for:` if
+            that is noisy.
       - alert: CertConverterOutputCleanupDegraded
         expr: |
           sum by (container) (count_over_time(
@@ -266,11 +267,10 @@ groups:
           summary: "cert-converter cannot clean up stale /output temp files"
           description: >
             The stale-temp sweep aborted at the /output root, could not inspect
-            or unlink temp files left
-            behind by an interrupted atomic write, or could not enter an /output
-            sub-path. Conversions may still succeed, so this is health-neutral
-            and no other rule fires, while `.atomicfile-*.tmp` files — each
-            holding a private key — accumulate under /output indefinitely. Check
+            or unlink temp files left behind by an interrupted atomic write, or
+            could not enter an /output sub-path. Conversions may still succeed,
+            so health is unaffected, while `.atomicfile-*.tmp` files, each
+            holding a private key, accumulate under /output indefinitely. Check
             /output ownership and permissions for the UID in `user:`.
       - alert: CertConverterOrphanRemovalDisabled
         expr: |
@@ -284,60 +284,52 @@ groups:
         annotations:
           summary: "cert-converter cannot reap orphaned /output bundles"
           description: >
-            The orphan walk could not enumerate /output completely, so this scan
-            refused to delete anything: either a sub-path could not be read, or
-            the tree contains a symlink (writes resolve through the output root
-            and follow it, while the orphan walk does not, so the two disagree
-            about where a bundle lives and a freshly written one would read as an
-            orphan). Only relevant with `OUTPUT_LIFECYCLE=sync`, where it is the
-            difference between "nothing to reap" and "reaping is off" — the two
-            are otherwise indistinguishable, since refusing to delete is
-            health-neutral and no other rule fires. A `.pfx` whose certificate
-            was removed from /input therefore stays served indefinitely. Check
-            /output ownership and permissions for the UID in `user:`, and mount
-            the real output directory instead of linking to it.
+            This scan could not prove an output bundle is orphaned, so it deleted
+            nothing: /input was not fully enumerated, or an /output sub-path could
+            not be read, or the output tree contains a symlink (writes follow it
+            and the orphan walk does not, so a freshly written bundle would read
+            as an orphan), or the tree holds more certificate pairs than
+            MAX_SCAN_ENTRIES lets the app remember. Only relevant with
+            `OUTPUT_LIFECYCLE=sync`, where it is the difference between "nothing
+            to reap" and "reaping is off", otherwise indistinguishable because
+            health is unaffected: a `.pfx` whose certificate was removed from
+            /input stays served indefinitely. The record's own `remediation`
+            field names the action for the case that fired.
 ```
 
-Thresholds and the `severity` label are starting points; adjust the stall
-window to your `FALLBACK_SCAN_HOURS` and the `container` selector to your
-deployment, and route by whatever labels your Alertmanager uses.
-`CertConverterScanStalled` assumes the fallback rescan is enabled: with
-`FALLBACK_SCAN_HOURS` set to `0`/`false` there is no guaranteed `scan
-complete` cadence at all (a scan then runs only on a filesystem event, and
-certificates renew every few weeks), so that rule fires permanently instead
-of reporting a wedged loop — drop it, exactly as the `health` probe drops its
-staleness deadline in that configuration. Dropping it leaves no rule that can
-report a wedged loop, and the probe has no deadline to fail either, so a
-dropped `/input` watch goes undetected and the container stays healthy while
-converting nothing (see [Healthcheck](#healthcheck)). Keep the fallback enabled
-if you want either signal. The same applies at
-`LOG_LEVEL=warn`/`error`, where the `scan complete` heartbeat is filtered out
-of the logs entirely (see the prerequisite above): both conditions invalidate
-the heartbeat rule. `CertConverterInputPathUnreachable`,
-`CertConverterNoCertificatePairs`, `CertConverterOutputCleanupDegraded`, and
-`CertConverterOrphanRemovalDisabled` are
-the exceptions to the prerequisite: they key on WARN lines, so they work at
-`debug`, `info`, or `warn` and are suppressed only at `error`.
+Thresholds and the `severity` label are starting points; adjust the
+`container` selector to your deployment, match the degradation window to your
+`FALLBACK_SCAN_HOURS`, and route by whatever labels your Alertmanager uses.
+
+Two `OUTPUT_LIFECYCLE=sync` conditions are worth querying without a rule of
+their own: `removed output bundles whose input certificates are gone` audits
+each scan's deletions with a count and a sample of the paths, and `keeping an
+output bundle whose certificate is gone but whose private key is still in
+/input` names a half-deleted pair whose bundle is kept until you finish the
+change. Nothing keys on `cert input observation`: an ACME `fullchain.pem` from
+Caddy or certbot deliberately omits the root certificate, so that normal shape
+is reported at INFO (`kind=chain-trust-anchor-absent`), and only the WARN-level
+observations name input a consumer is likely to reject.
 
 ## Healthcheck
 
-The image bakes in a health probe. After each processing cycle with no conversion failures, the main process writes a marker file at `/tmp/.healthy`. The `health` subcommand (`/cert-watcher health`) exits 0 when the marker exists and, while the fallback rescan is enabled, is fresher than three `FALLBACK_SCAN_HOURS` intervals. A staler marker means the watch loop is wedged, so the probe fails and the container is reported `unhealthy`. Docker Engine does not act on health status by itself: an orchestrator that does (Swarm, Kubernetes) restarts the container, while under plain Docker Compose the `unhealthy` state is a signal to monitor — see the `CertConverterScanStalled` rule under [Alerting](#alerting) — and the restart is yours to perform.
+The image bakes in a health probe. After each processing cycle with no conversion failures, the main process writes a marker file at `/tmp/.healthy`. The `health` subcommand (`/cert-watcher health`) exits 0 when the marker exists and, while the fallback rescan is enabled, is fresher than three `FALLBACK_SCAN_HOURS` intervals. A staler marker means the watch loop is wedged, so the probe fails and the container is reported `unhealthy`. Docker Engine does not act on health status by itself: an orchestrator that does (Swarm, Kubernetes) restarts the container, while under plain Docker Compose the `unhealthy` state is a signal to monitor and the restart is yours to perform.
 
-Setting `FALLBACK_SCAN_HOURS` to `0`/`false` disables both the periodic fallback and this staleness deadline, which leaves the watcher unsupervised. Events on a live fsnotify watch still trigger scans, but no periodic scan remains to recover a missed event or reattach a silently dropped `/input` watch. Unmounting or remounting that directory can make the kernel discard the watch without any filesystem event reaching the process, so the watcher can sit holding no watches while the last clean scan's marker keeps the container healthy indefinitely. It logs nothing in that state, so no alert rule can catch it either. Startup logs a WARN naming that tradeoff. The supervised choice is to leave the fallback enabled; turn it off only if you accept having no signal at all when conversion stops.
+Setting `FALLBACK_SCAN_HOURS` to `0`/`false` disables both the periodic fallback and this staleness deadline, which leaves the watcher unsupervised: events on a live fsnotify watch still trigger scans, but nothing recovers a missed event or reattaches a dropped `/input` watch. Unmounting or remounting that directory can make the kernel discard the watch with no filesystem event reaching the process, so the watcher can sit holding no watches while the last clean scan's marker keeps the container healthy indefinitely, logging nothing an alert rule could catch. Startup logs a WARN naming that tradeoff. Turn the fallback off only if you accept having no signal at all when conversion stops.
 
 Health answers one question: should an orchestrator restart this container? It therefore tracks only failures a restart could plausibly clear. The container becomes **unhealthy** when the `/input` root itself cannot be read or a certificate fails to convert (PEM or key parse error, cert/key mismatch, or PFX write failure). It **auto-recovers** on the next clean cycle (fsnotify event or fallback timer) without a restart.
 
-An unreadable _sub-path_ under `/input` (e.g. one certificate directory with the wrong permissions or owner) is a steady-state misconfiguration a restart would not fix. It is logged as a warning and its certificates are skipped; it does **not** flip the container unhealthy. Fix the directory permissions or run the container as a UID that can read it.
+An unreadable _sub-path_ under `/input` (e.g. one certificate directory with the wrong permissions or owner) is a steady-state misconfiguration a restart would not fix, so it is logged as a warning, its certificates are skipped, and health is left alone. Three other conditions are reported the same way, each with its own remediation in the record: an `/input` tree holding more entries than `MAX_SCAN_ENTRIES` (that scan stops early and skips orphan cleanup), an `/output` directory more permissive than `0750`, and a refused permission repair on a bundle that already holds the right bytes.
 
 ## Security
 
 The attack surface is small: the container reads PEM files from one mounted directory and writes PFX files to another, with no network listener or open port. It runs as a non-root user on a distroless base with no shell or package manager (see [Why this design](#why-this-design)), so there is nothing to expose or firewall; keep the `/input` mount read-only as in the quick start.
 
-File paths are hardcoded (`/input`, `/output`), not configurable via env vars. Input reads are confined to `/input` through an `os.Root`, so a symlink planted in the input tree cannot redirect a read outside it. Reads are TOCTOU-safe (stat and read from the same handle) with a 10 MB cap, and malformed PEM or key input is rejected and logged rather than converted. PFX writes use an atomic temp-file + rename.
+File paths are hardcoded (`/input`, `/output`), not configurable via env vars. Input reads are confined to `/input` through an `os.Root`, so a symlink planted in the input tree cannot redirect a read outside it. Reads are TOCTOU-safe (stat and read from the same handle) with a 10 MB cap, and malformed PEM or key input is rejected and logged rather than converted. A private key is refused before Go's parser sees it when its structure declares more than 64 RSA prime factors or an RSA integer above 16384 bits, so a small crafted file cannot stall the scan on key precomputation. PFX writes use an atomic temp-file + rename.
 
 `PFX_PASSWORD` is the only protection on the private key inside every generated `.pfx`. A literal compose value, `${...}` interpolation, and `env_file:` all become container environment and are visible to anyone who can query the Docker daemon (`docker inspect`). To avoid that exposure, mount a Docker/Podman secret and set `PFX_PASSWORD_FILE` to its in-container path; the file value takes precedence over `PFX_PASSWORD`. If an environment value is acceptable, `PFX_PASSWORD: "${PFX_PASSWORD:?}"` plus a mode-`0600`, gitignored `.env` keeps the value out of the committed compose file, but not out of container inspection.
 
-One accepted scanner finding: semgrep flags the fixed `/tmp/.healthy` health-marker path as a predictable temp file. The path is a deliberate contract between the main process and the `health` probe inside the container's own filesystem, not shared state an attacker can pre-create. Live scan results are on the repository's Security tab.
+One accepted scanner finding: semgrep flags the fixed `/tmp/.healthy` marker path as a predictable temp file, but it is a contract between the main process and the `health` probe inside the container's own filesystem, not shared state an attacker can pre-create. Live scan results are on the repository's Security tab.
 
 ### Hardened deployment
 

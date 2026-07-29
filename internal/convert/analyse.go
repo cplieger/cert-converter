@@ -45,11 +45,36 @@ const (
 	// self-signed CA can serve as an identity) but unusual enough to surface.
 	ObsCAAsIdentity ObservationKind = "ca-as-identity"
 	// ObsChainUnverified reports that no issuer of the certificate the discovered
-	// path ended on could be established from the bundle. Any remaining
-	// issuer-eligible certificates were then included as-is rather than dropped; the
-	// observation fires whether or not there were any, because the unfinished chain
-	// is the fact worth reporting and the leftovers only decide what became of them.
+	// path ended on could be established from the bundle WHILE certificates were
+	// left over that it could not place. Any of those that are issuer-eligible were
+	// then included as-is rather than dropped, so the bundle carries certificates
+	// whose relationship to the identity this app could not establish — the fact
+	// worth an operator's attention, and why the leftovers are what this kind is
+	// gated on.
+	//
+	// The leftover-free case is ObsChainTrustAnchorAbsent, a different fact at a
+	// different level; the two are mutually exclusive by construction.
 	ObsChainUnverified ObservationKind = "chain-unverified"
+	// ObsChainTrustAnchorAbsent reports that the chain terminates at a certificate
+	// whose own issuer is not in the bundle, with nothing left over: every parsed
+	// certificate is on the emitted path and the path simply stops below a trust
+	// anchor.
+	//
+	// This is the NORMAL shape of the input this app exists to convert. A Caddy/ACME
+	// `fullchain.pem` is leaf + intermediate with the root deliberately absent (the
+	// consumer is expected to hold it), so the condition recurs on first sight, after
+	// every renewal and after every restart, and it names nothing the operator can
+	// act on — hence ObservationClassInfo rather than a warning. It is reported at
+	// all because an empty or truncated chain is otherwise indistinguishable from a
+	// complete one in the output, and an operator who DID mean to ship the full chain
+	// has no other signal that the anchor never arrived.
+	//
+	// It is deliberately NOT ObsChainEdgeUnprovenIssuer: that one reports an emitted
+	// chain EDGE resting on unproven linkage (a certificate is in the bundle and this
+	// app could not prove it issued the one below it), which is a fact about
+	// certificates that are present. This one reports a certificate that is ABSENT,
+	// and every edge below it may be fully proven.
+	ObsChainTrustAnchorAbsent ObservationKind = "chain-trust-anchor-absent"
 	// ObsIdentityNotYetValid reports a selected identity whose NotBefore is in
 	// the future. Conversion still proceeds; consumers will reject it.
 	ObsIdentityNotYetValid ObservationKind = "identity-not-yet-valid"
@@ -121,21 +146,67 @@ const (
 	// certificate parses that way, so proven is false for every hop touching it), or
 	// a bundle carrying a same-named certificate while the real signer is absent —
 	// and nothing said so whenever the path still ended at a self-signed certificate:
-	// ObsChainUnverified fires only for a terminus that is not proven self-signed,
-	// which a fully proven path ending at a root never is. The
-	// bundle still converts (this package holds no trust store), but a PKCS#12 CA bag
+	// the terminus kinds (ObsChainUnverified, ObsChainTrustAnchorAbsent) fire only for
+	// a terminus that is not proven self-signed, which a path ending at a root never
+	// is, and they describe the certificate ABOVE the chain rather than an edge in it.
+	// The bundle still converts (this package holds no trust store), but a PKCS#12 CA bag
 	// a consumer imports into a trust store is the wrong place for an unproven link
 	// to be silent.
 	ObsChainEdgeUnprovenIssuer ObservationKind = "chain-edge-unproven-issuer"
 )
 
-// Noise reports whether an observation of this kind is a benign artefact of how the
-// input file was assembled rather than something the operator probably did not intend.
-// It lives beside the constants because the distinction is a property of the KIND, known
-// where the kinds are minted; how loudly a caller reports each class stays the caller's
+// ObservationClass is how loudly an observation of a given kind deserves to be
+// reported. Three values rather than a boolean, because the kinds fall into three
+// genuinely different operator relationships and a two-valued classification forced
+// the third into whichever neighbour was less wrong: a benign assembly artefact, a
+// fact about the input the operator has no action for, and something they probably
+// did not intend.
+//
+// It classifies the KIND, not a log level: this package knows which of the three a
+// kind is (that is a property of the condition, minted where the kinds are minted),
+// and the caller maps a class onto its own severity vocabulary. A string type rather
+// than an integer so the class is legible in a log line or a test failure without a
+// separate formatting method.
+type ObservationClass string
+
+const (
+	// ObservationClassQuiet is a benign artefact of how the input file was assembled,
+	// with no bearing on the bundle produced. Worth recording, not worth surfacing.
+	ObservationClassQuiet ObservationClass = "quiet"
+	// ObservationClassInfo is a true fact about the input the operator has nothing to
+	// act on — the expected shape of a supported input — reported so it is not
+	// invisible, and deliberately not as a problem.
+	ObservationClassInfo ObservationClass = "informational"
+	// ObservationClassWarning names something the operator probably did not intend, or
+	// that a consumer of the bundle will reject. This is the default for a new kind:
+	// an unclassified condition is louder than it should be rather than silent.
+	ObservationClassWarning ObservationClass = "warning"
+)
+
+// Class reports how loudly an observation of this kind deserves to be reported. It
+// lives beside the constants because the distinction is a property of the KIND, known
+// where the kinds are minted; how a caller renders each class stays the caller's
 // choice.
-func (k ObservationKind) Noise() bool {
-	return k == ObsDuplicateCerts
+//
+// Every kind is listed explicitly so that changing one's class is a visible edit to
+// this switch rather than a side effect of adding it to a group. The exhaustiveness
+// test in this package fails if a declared kind is missing here.
+func (k ObservationKind) Class() ObservationClass {
+	switch k {
+	case ObsDuplicateCerts:
+		return ObservationClassQuiet
+	case ObsChainTrustAnchorAbsent:
+		return ObservationClassInfo
+	case ObsLeafNotFirst, ObsMultipleKeys, ObsExtraCertsExcluded, ObsRenewedCertTie,
+		ObsCAAsIdentity, ObsChainUnverified, ObsIdentityNotYetValid, ObsIdentityExpired,
+		ObsChainCertOutOfWindow, ObsChainCertCannotIssue, ObsUnrelatedBlocksSkipped,
+		ObsUnusableKeyBlocksSkipped, ObsIssuerMatchIgnored, ObsKeyReusedAcrossCerts,
+		ObsChainEdgeUnprovenIssuer:
+		return ObservationClassWarning
+	}
+	// Unreachable while the switch above is exhaustive, which the test enforces. A
+	// kind that somehow arrives unclassified is reported loudly, never dropped.
+	return ObservationClassWarning
 }
 
 // Observation is one non-fatal finding about the input. Detail is already bounded
@@ -1713,25 +1784,24 @@ func (g *certGraph) assembleChain(identityCert int) (chain, extra []*x509.Certif
 	// Whether the terminus is proven self-signed and whether any certificate is left
 	// over are independent facts, so the diagnostic is NOT gated on leftovers: a lone
 	// CA-signed leaf, or a proven leaf/intermediate pair whose root is absent, has an
-	// unfinished chain with nothing to append, and gating ObsChainUnverified on
-	// len(extra) made exactly that case silent. The leftovers only decide what the
-	// observation says happened to them.
+	// unfinished chain with nothing to append, and reporting nothing at all made
+	// exactly that case silent. The leftovers decide WHICH fact is reported, because
+	// they are what separates the two:
+	//
+	//   - nothing left over: every parsed certificate is on the emitted path and the
+	//     path stops below a trust anchor the bundle never carried. That is the
+	//     documented shape of a Caddy/ACME fullchain, so it is ObsChainTrustAnchorAbsent
+	//     at the informational class — a fact, not a defect, and one that recurs on
+	//     every renewal.
+	//   - certificates left over: this app could not place them, and included the
+	//     issuer-eligible ones anyway, so the bundle carries certificates whose
+	//     relationship to the identity is unestablished. That is ObsChainUnverified,
+	//     and it stays a warning.
 	terminal := path[len(path)-1]
 	if !g.isSelfSigned(terminal) {
 		kept, disqualified := partitionIssuerEligible(extra)
 		chain = append(chain, kept...)
-		disposition := "no remaining certificates were available to keep as chain material"
-		if len(extra) > 0 {
-			disposition = fmt.Sprintf("the remaining %d certificate(s) were kept rather than dropped", len(kept))
-			if len(kept) == 0 {
-				disposition = "none of the remaining certificate(s) could be kept as chain material"
-			}
-		}
-		fallbackObs := []Observation{{
-			Kind: ObsChainUnverified,
-			Detail: fmt.Sprintf("no issuer of %q could be established from the bundle; %s",
-				boundSubject(g.certs[terminal].Subject.String()), disposition),
-		}}
+		fallbackObs := []Observation{terminusObservation(g.certs[terminal], extra, kept)}
 		if len(disqualified) > 0 {
 			fallbackObs = append(fallbackObs, Observation{
 				Kind: ObsExtraCertsExcluded,
@@ -1750,6 +1820,36 @@ func (g *certGraph) assembleChain(identityCert int) (chain, extra []*x509.Certif
 		})
 	}
 	return chain, extra, obs
+}
+
+// terminusObservation states what became of a chain whose terminus is not proven
+// self-signed. The split it draws is the one the two kinds mean: with nothing left
+// over, the only fact is that the anchor above the terminus is absent
+// (ObsChainTrustAnchorAbsent, informational — the documented fullchain shape); with
+// certificates left over, the fact is that this app could not place them and
+// included the eligible ones regardless (ObsChainUnverified, a warning).
+//
+// It takes the leftovers and the kept subset rather than deriving them, because the
+// caller has already partitioned them to build the chain and re-deriving here would
+// let the sentence and the emitted chain disagree.
+func terminusObservation(terminal *x509.Certificate, extra, kept []*x509.Certificate) Observation {
+	subject := boundSubject(terminal.Subject.String())
+	if len(extra) == 0 {
+		return Observation{
+			Kind: ObsChainTrustAnchorAbsent,
+			Detail: fmt.Sprintf("the chain ends at %q, whose issuer is not in the bundle; every certificate supplied is in the chain, so nothing was left out",
+				subject),
+		}
+	}
+	disposition := fmt.Sprintf("the remaining %d certificate(s) were kept rather than dropped", len(kept))
+	if len(kept) == 0 {
+		disposition = "none of the remaining certificate(s) could be kept as chain material"
+	}
+	return Observation{
+		Kind: ObsChainUnverified,
+		Detail: fmt.Sprintf("no issuer of %q could be established from the bundle; %s",
+			subject, disposition),
+	}
 }
 
 // validAt reports whether c is inside its validity window at now.

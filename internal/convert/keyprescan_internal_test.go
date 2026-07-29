@@ -346,13 +346,13 @@ func TestParsePrivateKeyBlock_refuses_too_many_RSA_prime_factors(t *testing.T) {
 	}
 }
 
-// TestMaxRSAIntegerBitsFromKeyDER_saturates_the_factor_count pins the walk's own
+// TestScanRSAKeyEnvelope_saturates_the_factor_count pins the walk's own
 // bound. The count feeds one refusal and nothing reads the exact number, so once the
 // scan has seen one factor past the ceiling the collection must not be measured any
 // further: continuing costs one RawValue walk per entry of an attacker-sized
 // collection (a 10 MB PEM holds hundreds of thousands of them) to learn a number the
 // refusal does not print.
-func TestMaxRSAIntegerBitsFromKeyDER_saturates_the_factor_count(t *testing.T) {
+func TestScanRSAKeyEnvelope_saturates_the_factor_count(t *testing.T) {
 	t.Parallel()
 	one := big.NewInt(1)
 	extras := make([]otherPrimeInfoDER, 10_000)
@@ -369,13 +369,106 @@ func TestMaxRSAIntegerBitsFromKeyDER_saturates_the_factor_count(t *testing.T) {
 		t.Fatalf("setup: marshal multi-prime PKCS#1 key: %v", err)
 	}
 
-	scan := maxRSAIntegerBitsFromKeyDER(der, 1)
-	if !scan.measured {
-		t.Fatalf("maxRSAIntegerBitsFromKeyDER(a 10,000-entry multi-prime key) did not measure the block; the refusal depends on it")
+	scan := scanRSAKeyEnvelope(der, 1)
+	if !scan.isRSA {
+		t.Fatalf("scanRSAKeyEnvelope(a 10,000-entry multi-prime key) did not recognise the envelope; the refusal depends on it")
 	}
 	if scan.factors != maxRSAPrimeFactors+1 {
 		t.Errorf("scan.factors = %d, want %d: the walk must stop one factor past the ceiling instead of counting every entry",
 			scan.factors, maxRSAPrimeFactors+1)
+	}
+}
+
+// TestParsePrivateKeyBlock_refuses_a_malformed_modulus_declaring_too_many_factors is
+// the end-to-end proof that the envelope scan closed the hole: a key whose modulus is
+// unreadable AND which declares a huge OtherPrimeInfos collection is refused by THIS
+// app, from its DER, before crypto/x509 decodes the collection.
+//
+// Both properties are load-bearing. The modulus is what a size-only pre-scan gave up
+// on (so both ceilings were skipped), and the collection is the cost: x509 decodes
+// every entry into a slice before it ever looks at the modulus, which at the 10 MiB
+// input cap extrapolates to ~950,000 entries, ~152 MB and ~408 ms on the scan's only
+// goroutine with no cancellation path.
+//
+// The error PRECEDENCE is asserted, not just the refusal: the message must be the
+// app's own bounded diagnostic naming the factor ceiling, and must NOT be x509's
+// malformed-key error. That inversion is a deliberate, accepted consequence — the
+// file is refused either way, and this wording is the one that names the ceiling.
+func TestParsePrivateKeyBlock_refuses_a_malformed_modulus_declaring_too_many_factors(t *testing.T) {
+	t.Parallel()
+	one := big.NewInt(1)
+	extras := make([]otherPrimeInfoDER, maxRSAPrimeFactors)
+	for i := range extras {
+		extras[i] = otherPrimeInfoDER{Prime: big.NewInt(3), Exponent: one, Coefficient: one}
+	}
+	der, err := asn1.Marshal(multiPrimeKeyDER{
+		Version: 1,
+		N:       big.NewInt(0), E: big.NewInt(65537), D: one, P: one, Q: one,
+		Dp: one, Dq: one, Qinv: one,
+		OtherPrimeInfos: extras,
+	})
+	if err != nil {
+		t.Fatalf("setup: marshal zero-modulus multi-prime key: %v", err)
+	}
+
+	for name, block := range map[string]*pem.Block{
+		"pkcs1": {Type: pemTypeRSAPrivateKey, Bytes: der},
+		"pkcs8": {Type: pemTypePrivateKey, Bytes: wrapPKCS8(t, der)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := parsePrivateKeyBlock(block)
+			if err == nil {
+				t.Fatalf("parsePrivateKeyBlock(a zero-modulus key declaring %d prime factors) = nil error, want the pre-scan refusal",
+					maxRSAPrimeFactors+2)
+			}
+			got := err.Error()
+			for _, want := range []string{"more than 64 RSA prime factors", "64-factor ceiling", block.Type} {
+				if !strings.Contains(got, want) {
+					t.Errorf("error = %q, want it to contain %q", got, want)
+				}
+			}
+			// The proof that the refusal is the app's and precedes the parser: this
+			// wording exists only in oversizedRSAKeyError, and x509's own complaint
+			// about the modulus is absent.
+			if strings.Contains(got, "x509:") {
+				t.Errorf("error = %q, want the app's own bounded refusal rather than a crypto/x509 error: the guard must run first", got)
+			}
+		})
+	}
+}
+
+// TestParsePrivateKeyBlock_leaves_a_plain_malformed_modulus_to_the_parser pins the
+// OTHER side of that precedence, and it is what keeps the change from becoming "the
+// pre-scan is a second parser". A malformed modulus is not itself a refusal: with a
+// legal factor count and no oversized integer there is nothing for either ceiling to
+// say, so the block still goes to crypto/x509 and the operator still gets the
+// parser's diagnosis of the damage, wrapped in this package's label-naming message.
+func TestParsePrivateKeyBlock_leaves_a_plain_malformed_modulus_to_the_parser(t *testing.T) {
+	t.Parallel()
+	one := big.NewInt(1)
+	der, err := asn1.Marshal(multiPrimeKeyDER{
+		Version: 1,
+		N:       big.NewInt(0), E: big.NewInt(65537), D: one, P: one, Q: one,
+		Dp: one, Dq: one, Qinv: one,
+		OtherPrimeInfos: []otherPrimeInfoDER{{Prime: big.NewInt(3), Exponent: one, Coefficient: one}},
+	})
+	if err != nil {
+		t.Fatalf("setup: marshal zero-modulus three-prime key: %v", err)
+	}
+
+	_, err = parsePrivateKeyBlock(&pem.Block{Type: pemTypeRSAPrivateKey, Bytes: der})
+	if err == nil {
+		t.Fatal("parsePrivateKeyBlock(a zero-modulus key) = nil error, want the parser's own rejection")
+	}
+	got := err.Error()
+	if !strings.Contains(got, "failed to parse private key") {
+		t.Errorf("error = %q, want the parser's own failure: neither ceiling applies to this block", got)
+	}
+	for _, unwanted := range []string{"RSA prime factors", "RSA integer"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("error = %q, want no pre-scan refusal: a malformed modulus is not itself over a ceiling", got)
+		}
 	}
 }
 
@@ -403,13 +496,20 @@ func TestParsePrivateKeyBlock_accepts_a_realistic_multi_prime_key(t *testing.T) 
 	}
 }
 
-// TestMaxRSAIntegerBitsFromKeyDER_measures_or_fails_open pins both halves of the
-// pre-scan's contract. The sizes it must measure are what makes the refusal
-// possible; the shapes it must NOT measure are what keeps the guard from becoming
-// a second parser that rejects input the app accepts today. Every not-measured
-// case here reaches the existing parsers unchanged, which is why a malformed RSA
-// block still produces the label-specific parse error pinned in convert_test.go.
-func TestMaxRSAIntegerBitsFromKeyDER_measures_or_fails_open(t *testing.T) {
+// TestScanRSAKeyEnvelope_reports_shape_and_optional_size pins the envelope scan's
+// three answers at once: whether the block IS an RSA private-key envelope, and — for
+// one that is — the size of its widest integer when any integer could be sized. The
+// sizes it must measure are what makes the size refusal possible; the shapes it must
+// NOT claim are what keeps the guard from becoming a second parser that rejects input
+// the app converts today. Every non-envelope case here reaches the existing parsers
+// unchanged, which is why a malformed non-RSA block still produces the
+// label-specific parse error pinned in convert_test.go.
+//
+// Shape and size are asserted as INDEPENDENT answers because that independence is
+// the contract: the rows whose modulus is unreadable are still envelopes, and the
+// factor ceiling reads their shape (see
+// TestScanRSAKeyEnvelope_counts_factors_through_an_unmeasurable_modulus).
+func TestScanRSAKeyEnvelope_reports_shape_and_optional_size(t *testing.T) {
 	t.Parallel()
 
 	rsa2048, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -430,77 +530,137 @@ func TestMaxRSAIntegerBitsFromKeyDER_measures_or_fails_open(t *testing.T) {
 	}
 
 	cases := map[string]struct {
-		der      []byte
-		wantBits int
-		wantOK   bool
+		der       []byte
+		wantBits  int
+		wantRSA   bool
+		wantSized bool
 	}{
-		"pkcs1 rsa":            {der: x509.MarshalPKCS1PrivateKey(rsa2048), wantBits: 2048, wantOK: true},
-		"pkcs8 rsa":            {der: pkcs8RSA, wantBits: 2048, wantOK: true},
-		"pkcs1 at the ceiling": {der: atCeiling, wantBits: maxVerifiableKeyBits, wantOK: true},
-		"pkcs1 oversized":      {der: oversizedRSAKeyDER(t, 131072), wantBits: 131072, wantOK: true},
+		"pkcs1 rsa":            {der: x509.MarshalPKCS1PrivateKey(rsa2048), wantBits: 2048, wantRSA: true, wantSized: true},
+		"pkcs8 rsa":            {der: pkcs8RSA, wantBits: 2048, wantRSA: true, wantSized: true},
+		"pkcs1 at the ceiling": {der: atCeiling, wantBits: maxVerifiableKeyBits, wantRSA: true, wantSized: true},
+		"pkcs1 oversized":      {der: oversizedRSAKeyDER(t, 131072), wantBits: 131072, wantRSA: true, wantSized: true},
 		"pkcs1 small modulus, oversized primes": {
-			der: hugePrimeRSAKeyDER(t, 131072), wantBits: 131072, wantOK: true,
+			der: hugePrimeRSAKeyDER(t, 131072), wantBits: 131072, wantRSA: true, wantSized: true,
 		},
 		"pkcs8 small modulus, oversized primes": {
-			der: wrapPKCS8(t, hugePrimeRSAKeyDER(t, 131072)), wantBits: 131072, wantOK: true,
+			der: wrapPKCS8(t, hugePrimeRSAKeyDER(t, 131072)), wantBits: 131072, wantRSA: true, wantSized: true,
 		},
-		"pkcs8 oversized":           {der: wrapPKCS8(t, oversizedRSAKeyDER(t, 131072)), wantBits: 131072, wantOK: true},
-		"sec1 ec":                   {der: mustMarshalEC(t)},
-		"pkcs8 ecdsa":               {der: mustMarshalPKCS8EC(t)},
-		"pkcs8 ed25519":             {der: mustMarshalPKCS8Ed25519(t)},
-		"garbage":                   {der: []byte("this is not valid DER")},
-		"empty":                     {der: nil},
-		"truncated pkcs1":           {der: x509.MarshalPKCS1PrivateKey(rsa2048)[:12]},
-		"negative modulus":          {der: negativeModulus},
-		"doubly wrapped past depth": {der: wrapPKCS8(t, wrapPKCS8(t, oversizedRSAKeyDER(t, 131072)))},
+		"pkcs8 oversized": {der: wrapPKCS8(t, oversizedRSAKeyDER(t, 131072)), wantBits: 131072, wantRSA: true, wantSized: true},
+		// An unreadable modulus is a missing MEASUREMENT, not a missing envelope: the
+		// widest integer still readable here is the 17-bit public exponent, which is
+		// what the size half of the pre-scan now compares against its ceiling (and
+		// passes). The block still reaches x509, which rejects it — but as a key with
+		// a legal factor count, not because the scan gave up.
+		"negative modulus is still an envelope": {der: negativeModulus, wantBits: 17, wantRSA: true, wantSized: true},
+		"sec1 ec":                               {der: mustMarshalEC(t)},
+		"pkcs8 ecdsa":                           {der: mustMarshalPKCS8EC(t)},
+		"pkcs8 ed25519":                         {der: mustMarshalPKCS8Ed25519(t)},
+		"garbage":                               {der: []byte("this is not valid DER")},
+		"empty":                                 {der: nil},
+		"truncated pkcs1":                       {der: x509.MarshalPKCS1PrivateKey(rsa2048)[:12]},
+		"doubly wrapped past depth":             {der: wrapPKCS8(t, wrapPKCS8(t, oversizedRSAKeyDER(t, 131072)))},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			scan := maxRSAIntegerBitsFromKeyDER(tc.der, 1)
-			if scan.measured != tc.wantOK {
-				t.Fatalf("maxRSAIntegerBitsFromKeyDER(%s) measured = %v, want %v", name, scan.measured, tc.wantOK)
+			scan := scanRSAKeyEnvelope(tc.der, 1)
+			if scan.isRSA != tc.wantRSA {
+				t.Fatalf("scanRSAKeyEnvelope(%s) isRSA = %v, want %v", name, scan.isRSA, tc.wantRSA)
 			}
-			if scan.measured && scan.maxBits != tc.wantBits {
-				t.Errorf("maxRSAIntegerBitsFromKeyDER(%s) = %d bits, want %d", name, scan.maxBits, tc.wantBits)
+			if scan.sized != tc.wantSized {
+				t.Fatalf("scanRSAKeyEnvelope(%s) sized = %v, want %v", name, scan.sized, tc.wantSized)
+			}
+			if scan.sized && scan.maxBits != tc.wantBits {
+				t.Errorf("scanRSAKeyEnvelope(%s) = %d bits, want %d", name, scan.maxBits, tc.wantBits)
 			}
 		})
 	}
 }
 
-// TestMaxRSAIntegerBitsFromKeyDER_fails_open_on_shapes_it_cannot_measure covers the
-// container shapes TestMaxRSAIntegerBitsFromKeyDER_measures_or_fails_open does not
-// reach. The pre-scan is the guard that keeps an oversized file-supplied RSA
-// modulus out of crypto/x509's precomputation (a measured 369ms stall on the
-// scan's only goroutine, with no cancellation path), so a misread is
-// operator-visible in both directions: a shape wrongly MEASURED refuses a key the
-// app converts today, and a shape wrongly skipped admits the stall the guard
-// exists to prevent. None of these rows is reachable through the DER already in
-// that table, so today a walk missing one of these header checks passes the suite
-// unchanged.
-func TestMaxRSAIntegerBitsFromKeyDER_fails_open_on_shapes_it_cannot_measure(t *testing.T) {
+// TestScanRSAKeyEnvelope_counts_factors_through_an_unmeasurable_modulus is the
+// REPLACEMENT for the assertion this test file used to make, and it reverses it.
+//
+// The old defence was "a zero modulus is no modulus": the scan abandoned the whole
+// block, reported nothing, and the block went to crypto/x509 with BOTH ceilings
+// skipped. That fail-open was defended as leaving a malformed key to the parser's own
+// error — but the factor ceiling does not need the modulus, and skipping it made one
+// malformed integer a way past the guard: x509 decodes the entire OtherPrimeInfos
+// collection into a slice before it looks at the modulus at all (extrapolated to
+// ~950,000 entries, ~152 MB and ~408 ms at the 10 MiB input cap, on the scan's only
+// goroutine, with no cancellation path).
+//
+// The new defence is that an unreadable modulus costs the SIZE answer only: the
+// envelope is still recognised and its factor count still read, from tag-length
+// headers that never depended on the modulus being a number.
+func TestScanRSAKeyEnvelope_counts_factors_through_an_unmeasurable_modulus(t *testing.T) {
+	t.Parallel()
+	one := big.NewInt(1)
+	extras := make([]otherPrimeInfoDER, maxRSAPrimeFactors)
+	for i := range extras {
+		extras[i] = otherPrimeInfoDER{Prime: big.NewInt(3), Exponent: one, Coefficient: one}
+	}
+
+	for name, modulus := range map[string]*big.Int{
+		"a zero modulus":     big.NewInt(0),
+		"a negative modulus": big.NewInt(-3),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			der, err := asn1.Marshal(multiPrimeKeyDER{
+				Version: 1,
+				N:       modulus, E: big.NewInt(65537), D: one, P: one, Q: one,
+				Dp: one, Dq: one, Qinv: one,
+				OtherPrimeInfos: extras,
+			})
+			if err != nil {
+				t.Fatalf("setup: marshal multi-prime key with %s: %v", name, err)
+			}
+
+			scan := scanRSAKeyEnvelope(der, 1)
+			if !scan.isRSA {
+				t.Fatalf("scanRSAKeyEnvelope(%s) reported no envelope; the factor ceiling then never runs", name)
+			}
+			if scan.factors <= maxRSAPrimeFactors {
+				t.Errorf("scanRSAKeyEnvelope(%s) counted %d factors, want more than the %d-factor ceiling: the count does not depend on the modulus",
+					name, scan.factors, maxRSAPrimeFactors)
+			}
+		})
+	}
+}
+
+// TestScanRSAKeyEnvelope_fails_open_on_shapes_that_are_not_an_envelope covers the
+// container shapes TestScanRSAKeyEnvelope_reports_shape_and_optional_size does not
+// reach. The pre-scan is the guard that keeps an oversized or over-factored
+// file-supplied RSA key out of crypto/x509's precomputation (a measured 369ms stall
+// on the scan's only goroutine, with no cancellation path), so a misread is
+// operator-visible in both directions: a shape wrongly claimed as an RSA envelope
+// refuses a key the app converts today, and a shape wrongly skipped admits the stall
+// the guard exists to prevent. None of these rows is reachable through the DER
+// already in that table, so today a walk missing one of these header checks passes
+// the suite unchanged.
+//
+// The zero-modulus case deliberately does NOT belong here any more: it is an
+// envelope, and it moved to
+// TestScanRSAKeyEnvelope_counts_factors_through_an_unmeasurable_modulus.
+func TestScanRSAKeyEnvelope_fails_open_on_shapes_that_are_not_an_envelope(t *testing.T) {
 	t.Parallel()
 
 	version := testASN1Marshal(t, 0)
 	rsaOID := testASN1Marshal(t, oidRSAEncryption)
-	one := big.NewInt(1)
-	zeroModulus := testASN1Marshal(t, pkcs1KeyDER{
-		N: big.NewInt(0), E: big.NewInt(65537), D: one, P: one, Q: one, Dp: one, Dq: one, Qinv: one,
-	})
 
 	for name, der := range map[string][]byte{
 		"a first element that is not the version":        derTestSequence(t, derTestSequence(t, rsaOID), version),
 		"nothing after the version":                      derTestSequence(t, version),
 		"a pkcs8 shape whose key is not an octet string": derTestSequence(t, version, derTestSequence(t, rsaOID), testASN1Marshal(t, 5)),
 		"a pkcs8 shape with nothing after the algorithm": derTestSequence(t, version, derTestSequence(t, rsaOID)),
-		"a zero modulus is no modulus":                   zeroModulus,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			scan := maxRSAIntegerBitsFromKeyDER(der, 1)
-			if scan.measured {
-				t.Errorf("maxRSAIntegerBitsFromKeyDER(%s) measured %d bits, want it to fail open", name, scan.maxBits)
+			scan := scanRSAKeyEnvelope(der, 1)
+			if scan.isRSA {
+				t.Errorf("scanRSAKeyEnvelope(%s) claimed an RSA envelope (%d bits, %d factors), want it to fail open",
+					name, scan.maxBits, scan.factors)
 			}
 		})
 	}

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/process"
@@ -730,14 +733,35 @@ func TestVolumesReady(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
 
-			if got := volumesReady(tc.dirs); got != tc.want {
+			open, got := volumesReady(tc.dirs)
+			t.Cleanup(func() { closeVolumes(open) })
+			if got != tc.want {
 				t.Errorf("volumesReady(%+v) = %v, want %v", tc.dirs, got, tc.want)
 			}
 			if tc.want {
+				// Every accepted volume comes back with its confined handle open: that
+				// handle is what the /output write probe runs against, so a guard that
+				// returned the verdict alone would send the probe back to re-resolving
+				// the path it just proved openable.
+				if len(open) != len(tc.dirs) {
+					t.Errorf("volumesReady(%+v) returned %d handles, want one per required volume (%d)",
+						tc.dirs, len(open), len(tc.dirs))
+				}
+				for i, vol := range open {
+					if vol.root == nil {
+						t.Errorf("volumesReady(%+v) handle %d (role %q) has a nil root", tc.dirs, i, vol.role)
+					}
+				}
 				if logs.Len() != 0 {
 					t.Errorf("volumesReady(%+v) logged %v, want silence when every volume is mounted", tc.dirs, logs.Messages())
 				}
 				return
+			}
+			// A refusal must hand back nothing: run() returns 1 without looking at the
+			// slice, so any handle opened before the offender has to be closed here or
+			// it is leaked for the life of the process.
+			if open != nil {
+				t.Errorf("volumesReady(%+v) returned %d handles on the refusal path, want none", tc.dirs, len(open))
 			}
 			const msg = "required volume is missing or not a directory"
 			if n := logs.CountLevel(slog.LevelError, msg); n != 1 {
@@ -771,7 +795,7 @@ func TestVolumesReady_names_every_missing_volume(t *testing.T) {
 
 	logs := capture.Default(t)
 
-	if volumesReady([]volumeDir{{"input", absentInput}, {"output", absentOutput}}) {
+	if _, ready := volumesReady([]volumeDir{{"input", absentInput}, {"output", absentOutput}}); ready {
 		t.Fatal("volumesReady(both absent) = true, want false")
 	}
 	const msg = "required volume is missing or not a directory"
@@ -890,18 +914,30 @@ func TestRun_refuses_to_start_when_a_required_volume_is_missing(t *testing.T) {
 // bundles are all current writes nothing and still reports healthy, so without
 // this record the misconfiguration surfaces only at the next renewal.
 //
-// The probe is failed with a regular file rather than a mode-0500 directory
-// because the tests can run as uid 0, which bypasses EACCES; a non-directory
-// makes os.CreateTemp fail for everyone. Not parallel: it swaps the
-// process-global slog default.
+// This case runs the REAL library probe, so the app's mapping is pinned against
+// atomicfile's actual outcome and not only against the stub below. The probe is
+// failed by opening the confined handle and then deleting the directory under it:
+// the handle stays valid and every create through it fails ENOENT, which no UID
+// bypasses. (That replaces the previous regular-file construction for the same
+// reason it replaced a chmod-0500 directory — the suite can run as uid 0 — and a
+// regular file is no longer usable at all, since an *os.Root can only be opened
+// on a directory.) Not parallel: it swaps the process-global slog default.
 func TestWarnOutputNotWritable_reports_failed_probe(t *testing.T) {
-	blocked := filepath.Join(t.TempDir(), "not-a-directory")
-	if err := os.WriteFile(blocked, nil, 0o600); err != nil {
+	blocked := filepath.Join(t.TempDir(), "output-gone")
+	if err := os.Mkdir(blocked, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(blocked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	if err := os.Remove(blocked); err != nil {
 		t.Fatal(err)
 	}
 	logs := capture.Default(t)
 
-	warnOutputNotWritable(blocked)
+	warnOutputNotWritable(root)
 
 	const msg = "the output volume is not writable by the running UID, so no PFX can be produced; " +
 		"a scan whose bundles are all current still reports healthy, so this would otherwise " +
@@ -917,5 +953,240 @@ func TestWarnOutputNotWritable_reports_failed_probe(t *testing.T) {
 	if !logs.AttrContains(msg, "remediation", "chown the host directory") {
 		t.Errorf("warnOutputNotWritable(%q) gave no ownership remediation (logs %v)",
 			blocked, logs.Messages())
+	}
+	// The stage is what tells an operator WHICH refusal they are looking at, now
+	// that the probe walks the whole create/write/flush/close/unlink ladder instead
+	// of the create alone.
+	if !logs.HasAttr(msg, "stage", atomicfile.ProbeStageCreate.String()) {
+		t.Errorf("warnOutputNotWritable(%q) does not name the failing probe stage (logs %v)",
+			blocked, logs.Messages())
+	}
+}
+
+// wantOutputNotWritableMsg is the operator-visible refusal message. It is spelled
+// out again rather than imported from main.go for the same reason the case above
+// keeps its own copy: the wording is the contract an operator (and the README's
+// alerting section) reads, so the tests assert the literal text.
+const wantOutputNotWritableMsg = "the output volume is not writable by the running UID, so no PFX can be produced; " +
+	"a scan whose bundles are all current still reports healthy, so this would otherwise " +
+	"surface only at the next renewal"
+
+// stubOutputProbe substitutes the probe seam for one test and restores it. The
+// stub is how the stages a temp directory cannot produce — a volume that accepts
+// and flushes the bytes and then refuses the unlink, a deferred write error that
+// surfaces only at close — get exercised at all; they are precisely the
+// misconfigurations this WARN set exists for.
+func stubOutputProbe(t *testing.T, res atomicfile.ProbeResult, err error) {
+	t.Helper()
+	prev := probeOutputWritable
+	probeOutputWritable = func(context.Context, *os.Root, string, ...atomicfile.Option) (atomicfile.ProbeResult, error) {
+		return res, err
+	}
+	t.Cleanup(func() { probeOutputWritable = prev })
+}
+
+// TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning pins the
+// whole outcome ladder onto the operator's warnings, and the two properties that
+// make the probe warn-and-continue:
+//
+//   - No probe outcome fails startup. warnOutputNotWritable returns nothing (a
+//     compile-time property of its call site in run()), and no leg emits an ERROR
+//     record, the level this app reserves for the conditions it refuses to start on.
+//   - The refusal and the two teardown failures stay THREE distinguishable
+//     records. Folding the close and remove outcomes into the create warning hides
+//     a volume that writes bundles fine and only denies cleanup; the stage-to-
+//     message mapping below is what such a regression would break.
+//
+// Serial (no t.Parallel): it swaps the process-global slog default and the seam.
+func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+
+	const leakedName = ".atomicfile-1234567890.tmp"
+	leakedPath := filepath.Join(dir, leakedName)
+
+	for _, tc := range []struct {
+		probeErr    error
+		wantAttrs   map[string]string
+		name        string
+		wantMsg     string
+		wantAbsent  string
+		res         atomicfile.ProbeResult
+		wantWarns   int
+		wantRecords int
+	}{
+		{
+			name: "every stage passed is silent",
+			res:  atomicfile.ProbeResult{Dir: dir, Name: leakedName},
+		},
+		{
+			name: "a refused create reports the volume as not writable",
+			res: atomicfile.ProbeResult{
+				Dir: dir, Stage: atomicfile.ProbeStageCreate, Err: fs.ErrPermission,
+			},
+			wantMsg:     wantOutputNotWritableMsg,
+			wantWarns:   1,
+			wantRecords: 1,
+			wantAttrs: map[string]string{
+				"role": "output", "path": dir,
+				"stage": atomicfile.ProbeStageCreate.String(),
+			},
+			// Nothing was durably written, so there is no probe file to reclaim and the
+			// sweep sentence would send an operator after a file that does not exist.
+			wantAbsent: "cleanup",
+		},
+		{
+			name: "a refused write that also leaked names the leftover",
+			res: atomicfile.ProbeResult{
+				Dir: dir, Name: leakedName, Stage: atomicfile.ProbeStageWrite,
+				Err: fs.ErrPermission, Leaked: true,
+			},
+			wantMsg:     wantOutputNotWritableMsg,
+			wantWarns:   1,
+			wantRecords: 1,
+			wantAttrs: map[string]string{
+				"stage": atomicfile.ProbeStageWrite.String(), "leaked_probe": leakedPath,
+				"cleanup": staleTempRemediation,
+			},
+		},
+		{
+			name: "a close failure keeps its own message",
+			res: atomicfile.ProbeResult{
+				Dir: dir, Name: leakedName, Stage: atomicfile.ProbeStageClose,
+				Err: errors.New("input/output error"),
+			},
+			wantMsg:     "failed to close the output write probe",
+			wantWarns:   1,
+			wantRecords: 1,
+			wantAttrs: map[string]string{
+				"path": leakedPath, "stage": atomicfile.ProbeStageClose.String(),
+			},
+			// The probe file WAS removed here, so the sweep remediation must not fire:
+			// it is keyed on ProbeResult.Leaked, not on the stage.
+			wantAbsent: "remediation",
+		},
+		{
+			name: "a close failure that leaked keeps the sweep remediation",
+			res: atomicfile.ProbeResult{
+				Dir: dir, Name: leakedName, Stage: atomicfile.ProbeStageClose,
+				Err: errors.New("input/output error"), Leaked: true,
+			},
+			wantMsg:     "failed to close the output write probe",
+			wantWarns:   1,
+			wantRecords: 1,
+			wantAttrs:   map[string]string{"remediation": staleTempRemediation},
+		},
+		{
+			name: "a refused unlink keeps its own message and the sweep remediation",
+			res: atomicfile.ProbeResult{
+				Dir: dir, Name: leakedName, Stage: atomicfile.ProbeStageRemove,
+				Err: fs.ErrPermission, Leaked: true,
+			},
+			wantMsg:     "failed to remove the output write probe",
+			wantWarns:   1,
+			wantRecords: 1,
+			wantAttrs: map[string]string{
+				"path": leakedPath, "remediation": staleTempRemediation,
+			},
+		},
+		{
+			// "The probe was not attempted" says nothing about /output either way, so it
+			// must not print the diagnosis an operator would act on — and must not
+			// vanish either.
+			name:        "a probe that was not attempted is not the not-writable diagnosis",
+			probeErr:    errors.New("atomicfile: context canceled"),
+			wantRecords: 1,
+			wantAttrs:   map[string]string{"path": dir},
+			wantAbsent:  "remediation",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubOutputProbe(t, tc.res, tc.probeErr)
+			logs := capture.Default(t)
+
+			warnOutputNotWritable(root)
+
+			if got := logs.Len(); got != tc.wantRecords {
+				t.Fatalf("warnOutputNotWritable logged %d records, want %d (logs %v)",
+					got, tc.wantRecords, logs.Messages())
+			}
+			if got := logs.CountLevel(slog.LevelWarn, ""); got != tc.wantWarns {
+				t.Errorf("warnOutputNotWritable logged %d WARN records, want %d (logs %v)",
+					got, tc.wantWarns, logs.Messages())
+			}
+			if got := logs.CountLevel(slog.LevelError, ""); got != 0 {
+				t.Errorf("warnOutputNotWritable logged %d ERROR records, want 0: a probe outcome must never read as a refusal to start (logs %v)",
+					got, logs.Messages())
+			}
+			if tc.wantMsg != "" && logs.CountLevel(slog.LevelWarn, tc.wantMsg) != 1 {
+				t.Fatalf("warnOutputNotWritable did not emit the %q WARN (logs %v)", tc.wantMsg, logs.Messages())
+			}
+			for key, want := range tc.wantAttrs {
+				if !logs.HasAttr(tc.wantMsg, key, want) {
+					t.Errorf("warnOutputNotWritable %q record: attr %q = %q, want %q (logs %v)",
+						tc.wantMsg, key, attrOrMissing(logs, tc.wantMsg, key), want, logs.Messages())
+				}
+			}
+			if tc.wantAbsent != "" {
+				if got, ok := logs.AttrValue(tc.wantMsg, tc.wantAbsent); ok {
+					t.Errorf("warnOutputNotWritable %q record carries attr %q = %q, want it absent",
+						tc.wantMsg, tc.wantAbsent, got)
+				}
+			}
+		})
+	}
+}
+
+// attrOrMissing renders an attr for a failure message, or reports it as absent.
+func attrOrMissing(logs *capture.Recorder, msgSub, key string) string {
+	if got, ok := logs.AttrValue(msgSub, key); ok {
+		return got
+	}
+	return "<absent>"
+}
+
+// TestOutputWriteProbe_leaves_a_name_the_stale_temp_sweep_reclaims pins the claim
+// the leaked-probe remediation makes: a probe file left in /output is reclaimable
+// by the app's own stale-temp sweep (process/store.sweepStaleTemps, which runs
+// atomicfile.CleanupStaleTempsInRoot).
+//
+// It replaces the local ".atomicfile-*.tmp" pattern main.go used to carry. That
+// constant matched the sweep only because os.CreateTemp happens to substitute
+// DIGITS for "*", which its documentation promises merely to be "a random string"
+// — an undocumented stdlib detail the app had to rely on to re-derive a
+// library-owned convention. The library now owns the name and exports the
+// predicate, so the agreement is asserted here instead of assumed.
+func TestOutputWriteProbe_leaves_a_name_the_stale_temp_sweep_reclaims(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+
+	// Calls the library directly rather than through the probeOutputWritable seam:
+	// the claim under test is atomicfile's naming contract, and reading a package
+	// var the serial tests above swap would be a data race under t.Parallel.
+	res, err := atomicfile.ProbeWritableInRoot(t.Context(), root, ".")
+	if err != nil {
+		t.Fatalf("the probe could not be attempted on a writable temp dir: %v", err)
+	}
+	if !res.OK() {
+		t.Fatalf("probe on a writable temp dir: stage %v, err %v; want every stage to pass", res.Stage, res.Err)
+	}
+	if !atomicfile.IsPackageTemp(res.Name) {
+		t.Errorf("the probe file was named %q, which the stale-temp sweep does not reclaim, so a leaked probe would be permanent and the remediation this app logs would be false",
+			res.Name)
+	}
+	// A probe that passed every stage removed its own file: a leftover on the happy
+	// path would accumulate one entry per container start.
+	if _, statErr := os.Stat(filepath.Join(dir, res.Name)); statErr == nil {
+		t.Errorf("the probe file %q survived a fully successful probe", res.Name)
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/slogx/capture"
 )
 
 // newInputSource opens a confined source over dir: the INPUT tree the reap's
@@ -38,9 +39,11 @@ func newInputSource(t *testing.T, dir string) *source {
 // newReaper pairs an output store with an input source and a lifecycle mode: the
 // three things reap policy needs, and the only reason these tests construct a store
 // at all. It keeps each case's call to reconcile as short as it was when reconcile
-// took the source and the mode as arguments.
+// took the source and the mode as arguments. The observation log is the reap's
+// lone-key de-duplication state; a fresh one per reaper is the process-start position,
+// where a first lone key is reported.
 func newReaper(out *store, src *source, mode outputpolicy.Lifecycle) *reaper {
-	return &reaper{src: src, out: out, mode: mode}
+	return &reaper{src: src, out: out, mode: mode, observations: newObservationLog(0)}
 }
 
 // TestStoreReconcile pins every rail on orphan deletion. Each case is a way the
@@ -108,6 +111,20 @@ func TestStoreReconcile(t *testing.T) {
 			wantDeleted: 0, wantPresent: true,
 		},
 		{
+			// The MEMORY rail: the walk enumerated the tree perfectly, but the observation
+			// log's ceiling dropped the wholeness evidence noteMissingKey classifies a
+			// missing sibling key against, so a key being replaced right now would have
+			// been recorded as an ordinary orphan — which vetoes nothing. Every other veto
+			// reads clean here, which is exactly why the gate has to fail closed on the
+			// admitted loss rather than on a symptom of it.
+			name: "sync refuses when the observation log evicted wholeness evidence",
+			mode: outputpolicy.LifecycleSync,
+			rc: &reapContext{
+				result: ScanResult{Total: 1}, walkCompleted: true, evidenceEvicted: 1,
+			},
+			wantDeleted: 0, wantPresent: true,
+		},
+		{
 			name: "warn, the default, reports but never deletes",
 			mode: outputpolicy.LifecycleWarn, rc: &reapContext{result: ScanResult{Total: 1}, walkCompleted: true},
 			wantDeleted: 0, wantPresent: true,
@@ -131,12 +148,7 @@ func TestStoreReconcile(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o600); err != nil {
 				t.Fatalf("setup: WriteFile(notes.txt): %v", err)
 			}
-			root, err := os.OpenRoot(dir)
-			if err != nil {
-				t.Fatalf("setup: os.OpenRoot: %v", err)
-			}
-			defer root.Close()
-			s := &store{root: root}
+			s := newOutputStore(t, dir)
 			seen := map[string]struct{}{"live.crt": {}}
 
 			got, err := newReaper(s, newInputSource(t, t.TempDir()), tc.mode).
@@ -176,13 +188,8 @@ func TestStoreReconcile_warn_mode_reports_report_only_despite_a_conversion_failu
 	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
 		t.Fatalf("setup: WriteFile: %v", err)
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
 	logs := captureLogs(t)
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 
 	deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleWarn).
 		reconcile(context.Background(), map[string]struct{}{},
@@ -217,13 +224,8 @@ func TestStoreReconcile_unsafe_output_walk_never_advises_deletion(t *testing.T) 
 	if err := os.Symlink(".", filepath.Join(dir, "linked")); err != nil {
 		t.Fatalf("setup: Symlink: %v", err)
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
 	logs := captureLogs(t)
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 
 	deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
 		reconcile(context.Background(), map[string]struct{}{},
@@ -259,13 +261,8 @@ func TestStoreReconcile_unsafe_output_walk_never_advises_deletion(t *testing.T) 
 // slog.Default.
 func TestStoreReconcile_vanished_input_is_reported_at_debug_not_as_a_mount_warning(t *testing.T) {
 	dir := t.TempDir()
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
 	logs := captureLogs(t)
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 
 	deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
 		reconcile(context.Background(), map[string]struct{}{},
@@ -446,13 +443,8 @@ func TestStoreReconcile_oversized_orphan_sample_keeps_the_count(t *testing.T) {
 			t.Fatalf("setup: WriteFile: %v", err)
 		}
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
 	logs := captureLogs(t)
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 
 	deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleWarn).
 		reconcile(context.Background(), map[string]struct{}{},
@@ -491,12 +483,7 @@ func TestStoreRemoveOrphans_cancelled_context_stops_before_deletion(t *testing.T
 	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
@@ -526,12 +513,7 @@ func TestStoreReconcile_propagates_a_shutdown_from_the_orphan_walk(t *testing.T)
 	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
@@ -567,12 +549,7 @@ func TestStoreIsCurrent_rewrites_on_an_encoder_change(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 
 	written, err := convert.Encode(&analysis, convert.EncNameModern2023, "pw")
 	if err != nil {
@@ -629,12 +606,7 @@ func TestStoreReconcile_sync_spares_a_nested_live_bundle(t *testing.T) {
 			t.Fatalf("setup: WriteFile(%s): %v", name, err)
 		}
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 	seen := map[string]struct{}{filepath.Join("acme-v02", "example.com", "live.crt"): {}}
 
 	got, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
@@ -741,13 +713,8 @@ func TestStoreRemoveOrphans_spares_non_regular_candidate_and_continues(t *testin
 	if err := os.WriteFile(reapable, []byte("pfx"), 0o600); err != nil {
 		t.Fatalf("setup: WriteFile reapable.pfx: %v", err)
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
 	logs := captureLogs(t)
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 
 	deleted, err := s.removeOrphans(t.Context(), []string{"stuck.pfx", "reapable.pfx"})
 	if err != nil {
@@ -785,12 +752,7 @@ func TestStoreIsCurrent_rewrites_after_a_password_rotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	root, err := os.OpenRoot(t.TempDir())
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
-	s := &store{root: root}
+	s := newOutputStore(t, t.TempDir())
 
 	written, err := convert.Encode(&analysis, convert.EncNameModern2023, "old-password")
 	if err != nil {
@@ -834,12 +796,7 @@ func TestStoreIsCurrent_treats_an_undecodable_prior_as_stale(t *testing.T) {
 		t.Fatalf("setup: Encode: %v", err)
 	}
 	dir := t.TempDir()
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 
 	for _, tc := range []struct {
 		name    string
@@ -892,12 +849,7 @@ func TestStoreIsCurrent_regenerates_an_oversized_prior(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("setup: Close: %v", err)
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 
 	logs := captureLogs(t)
 	current, _, err := s.isCurrent(t.Context(), "big.pfx", &convert.Analysis{}, convert.EncNameModern2023, "pw")
@@ -959,12 +911,7 @@ func TestStoreIsCurrent_tightens_a_lax_mode_without_regenerating(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			root, err := os.OpenRoot(dir)
-			if err != nil {
-				t.Fatalf("setup: os.OpenRoot: %v", err)
-			}
-			defer root.Close()
-			s := &store{root: root}
+			s := newOutputStore(t, dir)
 			if err := s.write(t.Context(), "out.pfx", mustEncode(t, &analysis)); err != nil {
 				t.Fatalf("setup: write: %v", err)
 			}
@@ -1093,12 +1040,7 @@ func TestStoreIsCurrent_keeps_a_bundle_whose_mode_cannot_be_tightened(t *testing
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			root, err := os.OpenRoot(dir)
-			if err != nil {
-				t.Fatalf("setup: os.OpenRoot: %v", err)
-			}
-			defer root.Close()
-			s := &store{root: root}
+			s := newOutputStore(t, dir)
 			if err := s.write(t.Context(), "out.pfx", mustEncode(t, &analysis)); err != nil {
 				t.Fatalf("setup: write: %v", err)
 			}
@@ -1603,12 +1545,7 @@ func TestStoreIsCurrent_propagates_a_shutdown_instead_of_reporting_stale(t *test
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	root, err := os.OpenRoot(t.TempDir())
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	defer root.Close()
-	s := &store{root: root}
+	s := newOutputStore(t, t.TempDir())
 	// Written through store.write, so the file on disk is a real bundle and only the
 	// read can answer the question.
 	if err := s.write(t.Context(), "out.pfx", mustEncode(t, &analysis)); err != nil {
@@ -1816,13 +1753,8 @@ func TestStoreReconcile_spares_an_orphan_whose_certificate_returns_during_the_re
 			t.Fatalf("setup: WriteFile(%s): %v", name, err)
 		}
 	}
-	outRoot, err := os.OpenRoot(out)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	t.Cleanup(func() { _ = outRoot.Close() })
 	in := t.TempDir()
-	s := &store{root: outRoot}
+	s := newOutputStore(t, out)
 	// The producer's write lands INSIDE the deferral window, after the candidates were
 	// identified and before they are confirmed.
 	stubReapWait(t, func(context.Context) error {
@@ -1878,12 +1810,7 @@ func TestStoreReconcile_shutdown_during_the_recheck_abandons_the_reap(t *testing
 	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
 		t.Fatalf("setup: WriteFile: %v", err)
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 	// A context that is live when the candidates are identified and cancelled inside
 	// the window, which is the only arrangement the earlier shutdown guards cannot
 	// already catch.
@@ -1941,12 +1868,7 @@ func TestStoreReconcile_defers_once_per_batch(t *testing.T) {
 					t.Fatalf("setup: WriteFile(%s): %v", name, err)
 				}
 			}
-			root, err := os.OpenRoot(dir)
-			if err != nil {
-				t.Fatalf("setup: os.OpenRoot: %v", err)
-			}
-			t.Cleanup(func() { _ = root.Close() })
-			s := &store{root: root}
+			s := newOutputStore(t, dir)
 			waits := 0
 			stubReapWait(t, func(context.Context) error {
 				waits++
@@ -2127,7 +2049,7 @@ func TestScanWalk_streams_directories_larger_than_one_read_batch(t *testing.T) {
 		t.Fatalf("setup: os.OpenRoot: %v", err)
 	}
 	t.Cleanup(func() { _ = root.Close() })
-	sw := &scanWalk{src: &source{root: root}, seen: make(map[string]struct{}), observations: newObservationLog()}
+	sw := &scanWalk{src: &source{root: root}, seen: make(map[string]struct{}), observations: newObservationLog(0)}
 
 	if walkErr := sw.walkInput(t.Context(), root); walkErr != nil {
 		t.Fatalf("walkInput(a tree spanning several read batches) = %v, want nil", walkErr)
@@ -2143,9 +2065,9 @@ func TestScanWalk_streams_directories_larger_than_one_read_batch(t *testing.T) {
 	}
 }
 
-// TestScannerRun_refuses_a_tree_over_the_entry_budget pins maxScanEntries, the bound on
+// TestScannerRun_refuses_a_tree_over_the_entry_budget pins the entry budget, the bound on
 // how much of an untrusted /input one scan takes on, and — the load-bearing half — what
-// the abort must NOT do: reap.
+// the abort must NOT do: reap, or flip health.
 //
 // /input is a mounted tree this app does not own, and before the budget nothing capped
 // how many entries the walk accepted: every one costs cumulative memory (a `seen` key, a
@@ -2153,7 +2075,18 @@ func TestScanWalk_streams_directories_larger_than_one_read_batch(t *testing.T) {
 // OOM kill and stopped conversion for every certificate. Aborting mid-tree makes `seen`
 // a PARTIAL enumeration, which must never authorise a deletion: without the veto, sync
 // mode would read every bundle whose certificate the walk never reached as an orphan and
-// delete live key material. Serial: it swaps maxScanEntries and slog.Default.
+// delete live key material.
+//
+// The OLD defence — Run returns errScanBudgetExceeded to its caller — is void, and
+// deliberately so: main.scanAndSetHealth clears the health marker on any non-shutdown
+// error from Run, so a too-large tree restart-looped the container on a condition no
+// restart can clear. It is now reported (scanBudgetMsg at WARN, with the remediation that
+// names MAX_SCAN_ENTRIES) and health-neutral, the same reading this app already gives
+// every /input path it could not read. What replaces the assertion is its inverse: the
+// error must NOT reach the caller, and the WARN must.
+//
+// The budget is injected (Options.MaxScanEntries) rather than swapped through a package
+// var. Serial: it swaps slog.Default.
 func TestScannerRun_refuses_a_tree_over_the_entry_budget(t *testing.T) {
 	inDir, outDir := t.TempDir(), t.TempDir()
 	for _, name := range []string{"a.crt", "b.crt", "c.crt"} {
@@ -2167,20 +2100,21 @@ func TestScannerRun_refuses_a_tree_over_the_entry_budget(t *testing.T) {
 	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
 		t.Fatalf("setup: WriteFile(gone.pfx): %v", err)
 	}
-	prev := maxScanEntries
-	// Two: the walk root itself plus one entry, so the third hand-off trips the budget.
-	maxScanEntries = 2
-	t.Cleanup(func() { maxScanEntries = prev })
 	logs := captureLogs(t)
 
 	result, err := New(&Options{
 		CertsRoot: inDir, OutRoot: outDir,
 		Encoder:  convert.EncNameModern2023,
 		Password: "pw", Lifecycle: outputpolicy.LifecycleSync,
+		// Two: the walk root itself plus one entry, so the third hand-off trips the budget.
+		MaxScanEntries: 2,
 	}).Run(t.Context())
-
-	if !errors.Is(err, errScanBudgetExceeded) {
-		t.Fatalf("Run(tree over the entry budget) = %v, want errScanBudgetExceeded", err)
+	if err != nil {
+		t.Fatalf("Run(tree over the entry budget) = %v, want nil: a tree bigger than the budget"+
+			" is not restart-clearable, so it must not reach the health marker", err)
+	}
+	if result.Failed != 0 {
+		t.Errorf("Run(tree over the entry budget) failed = %d, want 0: health is driven by Failed alone", result.Failed)
 	}
 	if result.Removed != 0 {
 		t.Errorf("Run(tree over the entry budget) removed = %d, want 0", result.Removed)
@@ -2192,51 +2126,201 @@ func TestScannerRun_refuses_a_tree_over_the_entry_budget(t *testing.T) {
 		t.Errorf("Run(tree over the entry budget) logged %q at WARN %d times, want exactly 1: %q",
 			scanBudgetMsg, got, logs.Messages())
 	}
+	// The remediation is the ONLY operator action for this condition now that no error
+	// propagates, so it has to name the way out of a legitimately large tree.
+	assertRemediationMentions(t, logs, scanBudgetMsg, "MAX_SCAN_ENTRIES")
+}
+
+// TestScannerRun_takes_the_injected_entry_budget pins that the ceiling is INJECTED rather
+// than compiled in: internal/config owns MAX_SCAN_ENTRIES (its default, its ceiling and
+// every diagnostic for a repaired value) and hands the number to this package, which must
+// not read the environment itself. The same tree that trips a budget of 2 must scan
+// cleanly under a budget that fits it.
+func TestScannerRun_takes_the_injected_entry_budget(t *testing.T) {
+	inDir, outDir := t.TempDir(), t.TempDir()
+	for _, name := range []string{"a.crt", "b.crt", "c.crt"} {
+		if err := os.WriteFile(filepath.Join(inDir, name), []byte("not a pem"), 0o600); err != nil {
+			t.Fatalf("setup: WriteFile(%s): %v", name, err)
+		}
+	}
+	logs := captureLogs(t)
+
+	if _, err := New(&Options{
+		CertsRoot: inDir, OutRoot: outDir,
+		Encoder:  convert.EncNameModern2023,
+		Password: "pw", Lifecycle: outputpolicy.LifecycleSync,
+		MaxScanEntries: 64,
+	}).Run(t.Context()); err != nil {
+		t.Fatalf("Run(tree inside the injected budget) = %v, want nil", err)
+	}
+
+	if got := logs.CountLevel(slog.LevelWarn, scanBudgetMsg); got != 0 {
+		t.Errorf("a tree of 4 entries tripped a budget of 64 (%d %q records): the budget must be the injected one: %q",
+			got, scanBudgetMsg, logs.Messages())
+	}
 }
 
 // TestObservationLog_is_bounded_across_path_churn pins the other half of the same bound.
 // forget only prunes on a walk that PROVED the enumeration complete, so a deployment
 // whose scans keep ending incomplete never reclaims the entries of paths that are gone,
-// and /input path churn then grows process-lifetime state without a ceiling. Eviction
-// spends diagnostic memory only — a re-emitted WARN, a completedPair answer that falls
-// back to its documented safe direction — and no currency decision reads this log at all.
+// and /input path churn then grows process-lifetime state without a ceiling.
+//
+// Eviction spends the SIGNATURE freely (a re-emitted WARN, and no currency decision reads
+// this log at all). It does not get to spend the WHOLENESS evidence silently, which is
+// what the second half of this test pins: every wholeness entry dropped is counted, and
+// Scanner.Run turns the count into that scan's reap veto — see
+// TestScannerRun_fails_closed_when_the_observation_log_evicts_wholeness_evidence.
 func TestObservationLog_is_bounded_across_path_churn(t *testing.T) {
-	prev := maxScanEntries
-	maxScanEntries = 2
-	t.Cleanup(func() { maxScanEntries = prev })
-
-	log := newObservationLog()
+	log := newObservationLog(2)
 	for _, rel := range []string{"a.crt", "b.crt", "c.crt", "d.crt", "e.crt"} {
 		log.note(rel, pairFingerprint([]byte(rel), []byte("key")), nil)
 	}
 
-	if got := len(log.seen); got > maxObservedPairs() {
+	if got := len(log.seen); got > log.maxObservedPairs() {
 		t.Errorf("observationLog holds %d signatures after churn across 5 paths, want at most %d",
-			got, maxObservedPairs())
+			got, log.maxObservedPairs())
 	}
-	if got := len(log.whole); got > maxObservedPairs() {
+	if got := len(log.whole); got > log.maxObservedPairs() {
 		t.Errorf("observationLog holds %d wholeness entries after churn across 5 paths, want at most %d:"+
-			" an eviction must not leave the two halves out of step", got, maxObservedPairs())
+			" an eviction must not leave the two halves out of step", got, log.maxObservedPairs())
 	}
 	// The path recorded last is the one an operator is most likely to ask about next, and
 	// re-noting a remembered path must never evict anything.
 	if !log.completedPair("e.crt") {
 		t.Errorf("observationLog forgot the most recently recorded pair; eviction must make room, not drop the new entry")
 	}
+	// Every pair that lost its wholeness evidence has to be reported, because that
+	// evidence is what separates a replaced key from an absent one: three of the five
+	// paths above were evicted from a log that may hold two.
+	if got := log.takeEvictedWholeness(); got != 3 {
+		t.Errorf("takeEvictedWholeness after churn across 5 paths at a ceiling of 2 = %d, want 3:"+
+			" a dropped wholeness entry is a lost reap justification, not free memory", got)
+	}
+	if got := log.takeEvictedWholeness(); got != 0 {
+		t.Errorf("takeEvictedWholeness re-read = %d, want 0: the veto covers the scan that spent the evidence", got)
+	}
 
 	// The readPair boundary records wholeness for pairs that never reach note or record
 	// (an Analyse failure, an Encode failure, a failed write), so the structural half has
 	// to be bounded at its OWN entry point, not only through the signature writers.
-	structural := newObservationLog()
+	structural := newObservationLog(2)
 	for _, rel := range []string{"f.crt", "g.crt", "h.crt", "i.crt", "j.crt"} {
 		structural.markWhole(rel)
 	}
-	if got := len(structural.whole); got > maxObservedPairs() {
+	if got := len(structural.whole); got > structural.maxObservedPairs() {
 		t.Errorf("markWhole alone left %d wholeness entries after churn across 5 paths, want at most %d",
-			got, maxObservedPairs())
+			got, structural.maxObservedPairs())
 	}
 	if !structural.completedPair("j.crt") {
 		t.Errorf("markWhole evicted the pair it was reserving room for; eviction must pick another victim")
+	}
+	if got := structural.takeEvictedWholeness(); got != 3 {
+		t.Errorf("takeEvictedWholeness after markWhole-only churn = %d, want 3: the structural entry"+
+			" point has to report its own evictions", got)
+	}
+}
+
+// TestObservationLog_counts_only_evidence_it_actually_held guards the eviction counter
+// against the opposite error: vetoing a reap for evidence that never existed. A path the
+// signature half knows and the wholeness half does not is the common shape (note is
+// reached for pairs whose key is missing), and evicting it costs a deduplicated WARN and
+// nothing else. Only a dropped WHOLENESS entry is a lost reap justification.
+func TestObservationLog_counts_only_evidence_it_actually_held(t *testing.T) {
+	log := newObservationLog(1)
+	log.seen["a.crt"] = pairFingerprint([]byte("a"), []byte("k"))
+	// b.crt reserves the last slot, so a.crt — signature-only — is the victim.
+	log.note("b.crt", pairFingerprint([]byte("b"), []byte("k")), nil)
+
+	if _, held := log.seen["a.crt"]; held {
+		t.Fatal("setup did not evict the signature-only entry; the rest of this test proves nothing")
+	}
+	if got := log.takeEvictedWholeness(); got != 0 {
+		t.Errorf("takeEvictedWholeness after evicting a signature-only entry = %d, want 0:"+
+			" a scan must not lose orphan removal for evidence the log never held", got)
+	}
+}
+
+// TestScannerRun_fails_closed_when_the_observation_log_evicts_wholeness_evidence is the
+// deletion-side consequence of the bound above, and the one the bounded-log test cannot
+// see: that test drives the log through one entry point and asserts on its SIZE, while
+// the damage is in the scan that spent the evidence.
+//
+// noteMissingKey reads the wholeness evidence as "this certificate HAD its sibling key",
+// and only that reading produces the reap-vetoing statusVanished; without it the same
+// ENOENT is an ordinary statusOrphan, which vetoes nothing. So an eviction silently
+// converted "I cannot tell whether this key is being replaced" into "the enumeration is
+// complete", and unrelated leftover bundles were deleted on the strength of it. The gate
+// now fails closed on the loss: nothing is deleted, and the loss is named at WARN with
+// the budget as the remediation.
+//
+// The log is pre-loaded to its ceiling because that is the state earlier scans leave
+// behind (forget only prunes on a walk that PROVED the enumeration complete, so a
+// deployment whose scans keep ending incomplete accumulates), and driving it from the
+// filesystem would need more /input entries than the same number allows one scan to walk.
+// Serial: it swaps waitBeforeReap and slog.Default.
+func TestScannerRun_fails_closed_when_the_observation_log_evicts_wholeness_evidence(t *testing.T) {
+	certsRoot, outRoot := t.TempDir(), t.TempDir()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "live.example.com", "ecdsa")
+	if err := os.WriteFile(filepath.Join(certsRoot, "live.crt"), certPEM, 0o644); err != nil {
+		t.Fatalf("setup: write crt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(certsRoot, "live.key"), keyPEM, 0o600); err != nil {
+		t.Fatalf("setup: write key: %v", err)
+	}
+	// A bundle with no input: the candidate this scan must NOT delete once it admits it
+	// lost the evidence behind its own missing-key classification.
+	orphan := filepath.Join(outRoot, "gone.pfx")
+	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: write orphan: %v", err)
+	}
+	// Four entries walked (root, live.crt, live.key) sits inside a budget of 4, so the
+	// walk completes and every other veto is clear; the log arrives already holding its
+	// four pairs, so reserving room for live.crt has to evict one.
+	scanner := New(&Options{
+		CertsRoot: certsRoot, OutRoot: outRoot,
+		Password: "pw", Encoder: convert.EncNameModern2023,
+		Lifecycle:      outputpolicy.LifecycleSync,
+		MaxScanEntries: 4,
+	})
+	for _, rel := range []string{"a.crt", "b.crt", "c.crt", "d.crt"} {
+		scanner.observations.markWhole(rel)
+	}
+	if got := scanner.observations.takeEvictedWholeness(); got != 0 {
+		t.Fatalf("setup evicted %d entries while filling the log to its ceiling, want 0:"+
+			" the scan under test has to be the one that evicts", got)
+	}
+	stubReapWait(t, func(context.Context) error { return nil })
+	logs := captureLogs(t)
+
+	result, err := scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run(log at its ceiling) = %v, want nil: losing a diagnostic memory is not a scan failure", err)
+	}
+	if result.Removed != 0 {
+		t.Errorf("Run(log at its ceiling) removed = %d, want 0: the reap gate must fail closed on evicted evidence", result.Removed)
+	}
+	if _, statErr := os.Stat(orphan); statErr != nil {
+		t.Errorf("an orphan was deleted on a scan that lost the evidence separating a replaced key from a missing one: %v", statErr)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, evictedEvidenceMsg); got != 1 {
+		t.Errorf("Run(log at its ceiling) logged %q at WARN %d times, want exactly 1: %q",
+			evictedEvidenceMsg, got, logs.Messages())
+	}
+	assertRemediationMentions(t, logs, evictedEvidenceMsg, "MAX_SCAN_ENTRIES")
+}
+
+// assertRemediationMentions requires msg's record to carry a remediation naming want.
+// These conditions are reported and never fixed by the app, so the remediation IS the
+// operator's only way out and a hint that does not name the setting is not one.
+func assertRemediationMentions(t *testing.T, logs *capture.Recorder, msg, want string) {
+	t.Helper()
+	got, ok := logs.AttrValue(msg, "remediation")
+	if !ok {
+		t.Errorf("record %q carries no remediation: it is the only line the operator sees", msg)
+		return
+	}
+	if !strings.Contains(got, want) {
+		t.Errorf("record %q remediation = %q, want it to name %q", msg, got, want)
 	}
 }
 
@@ -2250,10 +2334,11 @@ func TestObservationLog_is_bounded_across_path_churn(t *testing.T) {
 // loses its live bundle anyway. The sequence must stay one shared wait followed by, per
 // candidate, `input re-check -> output lstat -> unlink`.
 //
-// The log ORDER is what pins it, because each half is already named at the default
-// level: the audit line for a deletion and the keep line for a cancelled one. Under the
-// batch shape every keep precedes every removal; interleaved, `early.pfx` is gone before
-// `later.pfx` is ever looked at. Serial: it swaps waitBeforeReap and slog.Default.
+// The per-path ORDER is what pins it: the per-path deletion line (Debug, the unbounded
+// detail behind the once-per-scan audit record) and the keep line for a cancelled one.
+// Under the batch shape every keep precedes every removal; interleaved, `early.pfx` is
+// gone before `later.pfx` is ever looked at. Serial: it swaps waitBeforeReap and
+// slog.Default.
 func TestStoreReconcile_rechecks_each_candidate_immediately_before_its_own_deletion(t *testing.T) {
 	out := t.TempDir()
 	// Walk order is lexical, so early.pfx is the candidate processed first.
@@ -2262,13 +2347,8 @@ func TestStoreReconcile_rechecks_each_candidate_immediately_before_its_own_delet
 			t.Fatalf("setup: WriteFile(%s): %v", name, err)
 		}
 	}
-	outRoot, err := os.OpenRoot(out)
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	t.Cleanup(func() { _ = outRoot.Close() })
 	in := t.TempDir()
-	s := &store{root: outRoot}
+	s := newOutputStore(t, out)
 	stubReapWait(t, func(context.Context) error {
 		return os.WriteFile(filepath.Join(in, "later.crt"), []byte("cert"), 0o600)
 	})
@@ -2309,5 +2389,255 @@ func TestStoreReconcile_rechecks_each_candidate_immediately_before_its_own_delet
 	}
 	if _, statErr := os.Stat(filepath.Join(out, "later.pfx")); statErr != nil {
 		t.Errorf("the bundle whose certificate came back was deleted: %v", statErr)
+	}
+}
+
+// TestStoreReconcile_keeps_a_bundle_whose_private_key_is_still_present is h-f3's
+// regression, on the only path in this app that deletes private-key material.
+//
+// The confirming re-check asked one question — did the CERTIFICATE come back within
+// reapDeferral — and a producer that writes a pair key-first with more than 30 seconds
+// between the two steps (an rsync of a large tree, a manual install, a slow network
+// mount) presents exactly the observation of a deleted certificate. Its live bundle was
+// removed. The sibling key is the second, independent piece of evidence: a pair whose key
+// is still there is a pair somebody is still keeping.
+//
+// The 30-second confirmation is KEPT, not widened into a one-scan grace: a grace would lag
+// an intentional deletion by up to FALLBACK_SCAN_HOURS, and while it stood an old PFX
+// would coexist with a newly arrived certificate so a consumer could read the stale
+// bundle. Serial: it swaps waitBeforeReap and slog.Default.
+func TestStoreReconcile_keeps_a_bundle_whose_private_key_is_still_present(t *testing.T) {
+	out := t.TempDir()
+	// Walk order is lexical: half.pfx keeps its key, whole.pfx has neither input left.
+	for _, name := range []string{"half.pfx", "whole.pfx"} {
+		if err := os.WriteFile(filepath.Join(out, name), []byte("pfx"), 0o600); err != nil {
+			t.Fatalf("setup: WriteFile(%s): %v", name, err)
+		}
+	}
+	in := t.TempDir()
+	// The key arrived; its certificate has not. Every reap veto is otherwise clear, which
+	// is why nothing but this check stands between the key and its bundle's deletion.
+	if err := os.WriteFile(filepath.Join(in, "half.key"), []byte("key"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile(half.key): %v", err)
+	}
+	s := newOutputStore(t, out)
+	stubReapWait(t, func(context.Context) error { return nil })
+	logs := captureLogs(t)
+
+	deleted, reconcileErr := newReaper(s, newInputSource(t, in), outputpolicy.LifecycleSync).
+		reconcile(context.Background(), map[string]struct{}{},
+			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+
+	if reconcileErr != nil {
+		t.Fatalf("reconcile(lone key) = error %v, want nil: a half-written pair is not a scan failure", reconcileErr)
+	}
+	if deleted != 1 {
+		t.Errorf("reconcile(lone key) deleted = %d, want 1: only the pair that is gone entirely may go", deleted)
+	}
+	if _, statErr := os.Stat(filepath.Join(out, "half.pfx")); statErr != nil {
+		t.Errorf("the bundle of a certificate whose private key is still in /input was deleted: %v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(out, "whole.pfx")); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("os.Stat(whole.pfx) = %v, want fs.ErrNotExist: vetoing on a lone key must not"+
+			" defer a genuine full deletion to a later scan", statErr)
+	}
+	// Nothing in this app reported a lone key at any level before, so the indefinite
+	// retention this veto introduces would otherwise be completely silent.
+	if got := logs.CountLevel(slog.LevelWarn, loneKeyRetainedMsg); got != 1 {
+		t.Errorf("reconcile(lone key) logged %q at WARN %d times, want exactly 1: %q",
+			loneKeyRetainedMsg, got, logs.Messages())
+	}
+	if !logs.HasAttr(loneKeyRetainedMsg, "key", "half.key") {
+		got, _ := logs.AttrValue(loneKeyRetainedMsg, "key")
+		t.Errorf("the lone-key WARN named key=%q, want %q: the operator has to be told which file to finish or remove",
+			got, "half.key")
+	}
+	if !logs.HasAttr(loneKeyRetainedMsg, "path", "half.pfx") {
+		got, _ := logs.AttrValue(loneKeyRetainedMsg, "path")
+		t.Errorf("the lone-key WARN named path=%q, want %q: the retained bundle is the subject of the record", got, "half.pfx")
+	}
+	assertRemediationMentions(t, logs, loneKeyRetainedMsg, ".crt")
+}
+
+// TestStoreReconcile_lone_key_veto_reads_any_occupant_as_a_key pins the deliberate rule
+// for a key path that holds something other than a regular file.
+//
+// The key is asked for with the SAME ENOENT-only semantics as the certificate
+// (source.pathAbsent, one primitive for both questions): only an ENOENT counts as "no
+// key". A directory, a FIFO or a symlink whose target does not resolve therefore vetoes
+// the deletion too, because the alternative is unlinking private-key material on evidence
+// that amounts to "the key path is odd" — and an odd occupant is not the operator
+// removing the key. It never counts silently: the same WARN names the retention, which is
+// what turns a stray directory at a key path from a never-reaped bundle nobody can explain
+// into a named condition. Serial: it swaps waitBeforeReap and slog.Default.
+func TestStoreReconcile_lone_key_veto_reads_any_occupant_as_a_key(t *testing.T) {
+	out := t.TempDir()
+	if err := os.WriteFile(filepath.Join(out, "odd.pfx"), []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile(odd.pfx): %v", err)
+	}
+	in := t.TempDir()
+	// A DIRECTORY at the key path: present, unreadable as a key, and not evidence that
+	// the operator removed anything.
+	if err := os.Mkdir(filepath.Join(in, "odd.key"), 0o750); err != nil {
+		t.Fatalf("setup: Mkdir(odd.key): %v", err)
+	}
+	s := newOutputStore(t, out)
+	stubReapWait(t, func(context.Context) error { return nil })
+	logs := captureLogs(t)
+
+	deleted, reconcileErr := newReaper(s, newInputSource(t, in), outputpolicy.LifecycleSync).
+		reconcile(context.Background(), map[string]struct{}{},
+			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+
+	if reconcileErr != nil {
+		t.Fatalf("reconcile(directory at the key path) = error %v, want nil", reconcileErr)
+	}
+	if deleted != 0 {
+		t.Errorf("reconcile(directory at the key path) deleted = %d, want 0: an occupant that is not"+
+			" a key is still not proof the key was removed", deleted)
+	}
+	if _, statErr := os.Stat(filepath.Join(out, "odd.pfx")); statErr != nil {
+		t.Errorf("the bundle was deleted on the strength of an odd occupant at its key path: %v", statErr)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, loneKeyRetainedMsg); got != 1 {
+		t.Errorf("reconcile(directory at the key path) logged %q at WARN %d times, want exactly 1: %q",
+			loneKeyRetainedMsg, got, logs.Messages())
+	}
+}
+
+// TestStoreReconcile_lone_key_warn_is_deduplicated_per_change pins the report's
+// de-duplication schedule, which is per CHANGE rather than per scan: the retention lasts
+// for as long as the operator leaves the pair half-deleted, and this app rescans on every
+// fsnotify event and every fallback tick, so a per-scan report is a permanent WARN stream
+// for a condition already named. The state is remembered in the observation log — the same
+// machinery that deduplicates the input observations — and retired when the pair reads
+// whole again. Serial: it swaps waitBeforeReap and slog.Default.
+func TestStoreReconcile_lone_key_warn_is_deduplicated_per_change(t *testing.T) {
+	out := t.TempDir()
+	if err := os.WriteFile(filepath.Join(out, "half.pfx"), []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile(half.pfx): %v", err)
+	}
+	in := t.TempDir()
+	if err := os.WriteFile(filepath.Join(in, "half.key"), []byte("key"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile(half.key): %v", err)
+	}
+	s := newOutputStore(t, out)
+	stubReapWait(t, func(context.Context) error { return nil })
+	logs := captureLogs(t)
+	// One reaper across both scans: the observation log is Scanner-lifetime state, which
+	// is what makes "once per change" expressible at all.
+	rp := newReaper(s, newInputSource(t, in), outputpolicy.LifecycleSync)
+	rc := &reapContext{result: ScanResult{Total: 1}, walkCompleted: true}
+
+	for range 3 {
+		if _, err := rp.reconcile(context.Background(), map[string]struct{}{}, rc); err != nil {
+			t.Fatalf("reconcile(lone key) = error %v, want nil", err)
+		}
+	}
+
+	if got := logs.CountLevel(slog.LevelWarn, loneKeyRetainedMsg); got != 1 {
+		t.Errorf("three scans of one unchanged lone key logged %q at WARN %d times, want exactly 1: %q",
+			loneKeyRetainedMsg, got, logs.Messages())
+	}
+
+	// The pair reading whole again is the CHANGE that retires the report, so the next time
+	// it loses its certificate the operator is told again.
+	rp.observations.markWhole("half.crt")
+	if _, err := rp.reconcile(context.Background(), map[string]struct{}{}, rc); err != nil {
+		t.Fatalf("reconcile(lone key after the pair read whole) = error %v, want nil", err)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, loneKeyRetainedMsg); got != 2 {
+		t.Errorf("a lone key that recurred after the pair read whole logged %q at WARN %d times,"+
+			" want 2: the report is deduplicated per change, not for the process lifetime",
+			loneKeyRetainedMsg, got)
+	}
+}
+
+// TestStoreReconcile_audits_deletions_once_per_scan_at_warn pins the deletion audit
+// record, the app's warn-visible contract for the one destructive action it takes.
+//
+// Successful deletions were named per path at INFO, so at LOG_LEVEL=warn — the level an
+// operator runs a quiet daemon at — private-key bundles disappeared silently while only
+// the FAILURES of orphan removal were loud. One structured record per deletion-bearing
+// scan carries the count and the paths, through the SAME bounded sample the orphan report
+// uses (sampleOrphanPaths: at most maxLoggedOrphans paths within maxLoggedOrphanBytes) so
+// a tree that lost many certificates at once cannot turn the audit into a multi-kilobyte
+// line. Serial: it swaps waitBeforeReap and slog.Default.
+func TestStoreReconcile_audits_deletions_once_per_scan_at_warn(t *testing.T) {
+	out := t.TempDir()
+	for _, name := range []string{"one.pfx", "two.pfx"} {
+		if err := os.WriteFile(filepath.Join(out, name), []byte("pfx"), 0o600); err != nil {
+			t.Fatalf("setup: WriteFile(%s): %v", name, err)
+		}
+	}
+	s := newOutputStore(t, out)
+	stubReapWait(t, func(context.Context) error { return nil })
+	logs := captureLogs(t)
+
+	deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
+		reconcile(context.Background(), map[string]struct{}{},
+			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+
+	if reconcileErr != nil {
+		t.Fatalf("reconcile(two orphans) = error %v, want nil", reconcileErr)
+	}
+	if deleted != 2 {
+		t.Fatalf("reconcile(two orphans) deleted = %d, want 2", deleted)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, reapAuditMsg); got != 1 {
+		t.Errorf("a scan that deleted two bundles logged %q at WARN %d times, want exactly 1:"+
+			" one record per deletion-bearing scan, not one per path", reapAuditMsg, got)
+	}
+	if !logs.HasAttr(reapAuditMsg, "count", "2") {
+		got, _ := logs.AttrValue(reapAuditMsg, "count")
+		t.Errorf("the deletion audit record count = %q, want %q", got, "2")
+	}
+	paths, ok := logs.AttrValue(reapAuditMsg, "paths")
+	if !ok {
+		t.Fatalf("the deletion audit record carries no paths attribute: the count alone does not say WHICH key material is gone")
+	}
+	for _, want := range []string{"one.pfx", "two.pfx"} {
+		if !strings.Contains(paths, want) {
+			t.Errorf("the deletion audit record paths = %q, want it to name %q", paths, want)
+		}
+	}
+	// The per-path detail stays available for a reader who asked for it, one level down.
+	if got := logs.CountLevel(slog.LevelDebug, "removed orphaned output whose input is gone"); got != 2 {
+		t.Errorf("the per-path deletion detail logged %d times at DEBUG, want 2: the audit record"+
+			" collapses the default-level report, it does not remove the detail", got)
+	}
+}
+
+// TestStoreReconcile_no_audit_record_when_nothing_was_deleted is the other half of that
+// contract: the audit record is WARN, so a scan that deleted nothing must not emit it. Its
+// absence is what "nothing was deleted" looks like in a quiet log, and a record emitted
+// with count=0 would train an operator to ignore the one line that reports destroyed key
+// material. Serial: it swaps waitBeforeReap and slog.Default.
+func TestStoreReconcile_no_audit_record_when_nothing_was_deleted(t *testing.T) {
+	out := t.TempDir()
+	if err := os.WriteFile(filepath.Join(out, "kept.pfx"), []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile(kept.pfx): %v", err)
+	}
+	in := t.TempDir()
+	// The certificate comes back inside the window, so the one candidate is spared and
+	// the scan deletes nothing.
+	stubReapWait(t, func(context.Context) error {
+		return os.WriteFile(filepath.Join(in, "kept.crt"), []byte("cert"), 0o600)
+	})
+	logs := captureLogs(t)
+
+	deleted, reconcileErr := newReaper(newOutputStore(t, out), newInputSource(t, in), outputpolicy.LifecycleSync).
+		reconcile(context.Background(), map[string]struct{}{},
+			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+
+	if reconcileErr != nil {
+		t.Fatalf("reconcile(candidate spared) = error %v, want nil", reconcileErr)
+	}
+	if deleted != 0 {
+		t.Fatalf("reconcile(candidate spared) deleted = %d, want 0", deleted)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, reapAuditMsg); got != 0 {
+		t.Errorf("a scan that deleted nothing logged %q %d times at WARN, want 0: %q",
+			reapAuditMsg, got, logs.Messages())
 	}
 }

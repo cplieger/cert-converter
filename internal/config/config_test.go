@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -690,6 +691,27 @@ func TestClassifyPassword(t *testing.T) {
 		{"single printable char is configured", "x", PasswordConfigured},
 		// TrimSpace does not trim NUL, so a binary secret is a real password.
 		{"NUL byte is configured", "\x00", PasswordConfigured},
+		// The invisible-only class: every rune survives TrimSpace yet none of them
+		// can be seen or retyped. A secret file an editor saved as "UTF-8 with BOM"
+		// and nothing else is the realistic case, and it used to classify as
+		// "configured" — starting the container without the opt-out and reporting a
+		// password that protects the key against nobody.
+		{"a byte-order mark alone is invisible-only", "\ufeff", PasswordInvisibleOnly},
+		{"a zero-width space alone is invisible-only", "\u200b", PasswordInvisibleOnly},
+		{"a soft hyphen alone is invisible-only", "\u00ad", PasswordInvisibleOnly},
+		{"several format runes are invisible-only", "\ufeff\u200b\u00ad", PasswordInvisibleOnly},
+		// Whitespace mixed with a format rune is not whitespace-only (TrimSpace
+		// leaves the BOM behind), so it lands in the invisible-only class rather
+		// than being read as a configured password.
+		{"a byte-order mark beside whitespace is invisible-only", "\ufeff \t\n", PasswordInvisibleOnly},
+		// One visible rune is a real password: the class is about a value with
+		// nothing an operator can read, not about carrying an invisible rune.
+		{"a byte-order mark beside a real value is configured", "\ufeffhunter2", PasswordConfigured},
+		{"an interior zero-width space is configured", "pw\u200bsecret", PasswordConfigured},
+		// Invalid UTF-8 decodes as U+FFFD, which is neither space nor Cf, so a
+		// binary secret stays a configured password (checkPasswordEncodable owns
+		// refusing it).
+		{"the replacement rune is configured", "\ufffd", PasswordConfigured},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := classifyPassword(tc.password); got != tc.want {
@@ -1754,6 +1776,415 @@ func TestLoad_warns_when_a_mounted_secret_contains_a_format_character(t *testing
 			}
 			if tc.wantWarn && !logs.HasAttr(msg, "source", "PFX_PASSWORD_FILE") {
 				t.Errorf("invisible-formatting WARN does not name the mounted-secret channel an operator filters on (logs %v)", logs.Messages())
+			}
+		})
+	}
+}
+
+// TestLoad_refuses_an_invisible_only_password_on_both_channels pins the guard half
+// of the single password classification: a value made only of invisible formatting
+// runes is BLANK, so the PFX_ALLOW_EMPTY_PASSWORD opt-out governs it exactly as it
+// governs a whitespace-only value — and it does so identically whichever channel
+// delivered it.
+//
+// The file channel is the one that matters in practice and the one that used to
+// escape every guard: envx trims whitespace, so a secret file holding nothing but a
+// BOM an editor added is NOT blank to envx, arrived here as a real password, and
+// started a container whose bundles are protected by a password nobody can retype.
+// Serial: it mutates env and slog.Default.
+func TestLoad_refuses_an_invisible_only_password_on_both_channels(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		password string
+	}{
+		{"a byte-order mark", "\ufeff"},
+		{"a zero-width space", "\u200b"},
+		{"a soft hyphen", "\u00ad"},
+		{"a byte-order mark beside whitespace", "\ufeff \t"},
+	} {
+		for _, ch := range []struct {
+			channel  string
+			optout   string
+			wantErr  bool
+			wantName string
+		}{
+			{"PFX_PASSWORD", "", true, "env without the opt-out is refused"},
+			{"PFX_PASSWORD", "true", false, "env with the opt-out starts"},
+			{"PFX_PASSWORD_FILE", "", true, "file without the opt-out is refused"},
+			{"PFX_PASSWORD_FILE", "true", false, "file with the opt-out starts"},
+		} {
+			t.Run(tc.name+": "+ch.wantName, func(t *testing.T) {
+				setPasswordChannel(t, ch.channel, tc.password)
+				t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", ch.optout)
+
+				logs := capture.Default(t)
+
+				cfg, err := Load()
+				if ch.wantErr {
+					if !errors.Is(err, ErrEmptyPassword) {
+						t.Fatalf("Load(%s=%q) = %v, want ErrEmptyPassword: an invisible-only password is blank, so the opt-out must govern it",
+							ch.channel, tc.password, err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("Load(%s=%q, opt-out) = %v, want nil", ch.channel, tc.password, err)
+				}
+				// The opt-out accepts the value verbatim, exactly as it does a
+				// whitespace-only one: the guard is what the opt-out waives, not
+				// the classification. envx trims a FILE secret, so the delivered
+				// value drops surrounding whitespace on that channel — the
+				// invisible runes themselves are never trimmed, which is why the
+				// value still reaches the encoder unseen.
+				wantPassword := tc.password
+				if ch.channel == "PFX_PASSWORD_FILE" {
+					wantPassword = strings.TrimSpace(tc.password)
+				}
+				if cfg.Password != wantPassword {
+					t.Errorf("Load(%s=%q, opt-out) Password = %q, want %q",
+						ch.channel, tc.password, cfg.Password, wantPassword)
+				}
+				if cfg.PasswordStatus != PasswordInvisibleOnly {
+					t.Errorf("Load(%s=%q, opt-out) status = %q, want %q: the startup line must not report a password nobody can retype as configured",
+						ch.channel, tc.password, cfg.PasswordStatus, PasswordInvisibleOnly)
+				}
+				if n := logs.CountLevel(slog.LevelWarn, invisibleOnlyWarn); n != 1 {
+					t.Errorf("Load(%s=%q, opt-out) logged %d WARN records matching %q, want exactly 1 (logs %v)",
+						ch.channel, tc.password, n, invisibleOnlyWarn, logs.Messages())
+				}
+				if !logs.HasAttr(invisibleOnlyWarn, "source", ch.channel) {
+					t.Errorf("Load(%s=%q, opt-out) invisible-only WARN source = %q, want %q: the record must name the variable an operator edits (logs %v)",
+						ch.channel, tc.password, mustAttr(t, logs, invisibleOnlyWarn, "source"), ch.channel, logs.Messages())
+				}
+				// One record per shape: the per-rune WARN for a password that
+				// CONTAINS an invisible rune must not also fire for a password that
+				// consists of nothing else, or the operator reads two records about
+				// one condition.
+				if n := logs.Count("contains an invisible Unicode formatting character"); n != 0 {
+					t.Errorf("Load(%s=%q, opt-out) logged %d per-rune invisible-formatting records alongside the invisible-only WARN, want 0 (logs %v)",
+						ch.channel, tc.password, n, logs.Messages())
+				}
+				// "PFX password configured" is the INFO that reported the defect:
+				// a mounted secret holding only a BOM is not a configured secret.
+				if logs.Contains("PFX password configured") {
+					t.Errorf("Load(%s=%q, opt-out) logged the configured-secret INFO for a blank value (logs %v)",
+						ch.channel, tc.password, logs.Messages())
+				}
+			})
+		}
+	}
+}
+
+// invisibleOnlyWarn is the message substring of the invisible-only strength WARN.
+// Named once: three tests key on it, and it is the operator-facing text a Loki
+// matcher selects.
+const invisibleOnlyWarn = "consists only of invisible Unicode formatting characters"
+
+// setPasswordChannel configures the PFX password through exactly one delivery
+// channel, so a test can assert that both channels reach the same decision without
+// each case re-deriving the isolation. The file channel writes the value verbatim
+// (no trailing newline), because a trailing newline is whitespace envx trims and
+// would change the classification under test.
+func setPasswordChannel(t *testing.T, channel, password string) {
+	t.Helper()
+	switch channel {
+	case "PFX_PASSWORD":
+		isolatePasswordFile(t)
+		t.Setenv("PFX_PASSWORD", password)
+	case "PFX_PASSWORD_FILE":
+		path := filepath.Join(t.TempDir(), "pfx-password")
+		if err := os.WriteFile(path, []byte(password), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PFX_PASSWORD", "")
+		t.Setenv("PFX_PASSWORD_FILE", path)
+	default:
+		t.Fatalf("unknown password channel %q", channel)
+	}
+}
+
+// TestLoad_derives_status_and_warnings_from_one_classification pins the whole point
+// of the single classification: for every class, on both delivery channels, the
+// status Config reports and the WARN set Load emits describe the SAME answer. A
+// guard, a warning or a status that drifted from the other two is exactly the defect
+// this shape closes, and each of the three is observable here.
+//
+// The absent-message assertions are what make it a derivation test rather than three
+// unrelated checks: a whitespace-only password must not also produce the
+// invisible-only record, an invisible-only one must not produce the whitespace text,
+// and a configured one must produce neither. Serial: it mutates env and slog.Default.
+func TestLoad_derives_status_and_warnings_from_one_classification(t *testing.T) {
+	const (
+		emptyWarn      = "PFX_PASSWORD is empty"
+		whitespaceWarn = "PFX_PASSWORD is whitespace-only"
+		blankFileWarn  = "PFX_PASSWORD_FILE is blank"
+	)
+	// Every operator-facing record this test reasons about. Each case names the
+	// ones that must appear; every other one must not.
+	all := []string{emptyWarn, whitespaceWarn, invisibleOnlyWarn, blankFileWarn}
+
+	for _, tc := range []struct {
+		name       string
+		channel    string
+		password   string
+		wantStatus PasswordStatus
+		wantWarns  []string
+	}{
+		{"env empty", "PFX_PASSWORD", "", PasswordEmpty, []string{emptyWarn}},
+		{"env whitespace-only", "PFX_PASSWORD", " \t", PasswordWhitespaceOnly, []string{whitespaceWarn}},
+		{"env invisible-only", "PFX_PASSWORD", "\ufeff", PasswordInvisibleOnly, []string{invisibleOnlyWarn}},
+		{"env configured", "PFX_PASSWORD", "hunter2", PasswordConfigured, nil},
+		// envx trims a file secret, so an empty and a whitespace-only file are the
+		// same delivery failure and both arrive as ErrBlankSecretFile with an empty
+		// password: the channel-specific record reports it and the generic
+		// empty-password line is deliberately suppressed.
+		{"file empty", "PFX_PASSWORD_FILE", "", PasswordEmpty, []string{blankFileWarn}},
+		{"file whitespace-only", "PFX_PASSWORD_FILE", "  \n", PasswordEmpty, []string{blankFileWarn}},
+		{"file invisible-only", "PFX_PASSWORD_FILE", "\u200b", PasswordInvisibleOnly, []string{invisibleOnlyWarn}},
+		{"file configured", "PFX_PASSWORD_FILE", "hunter2", PasswordConfigured, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setPasswordChannel(t, tc.channel, tc.password)
+			// A blank value of any class only reaches its warning with the opt-out
+			// set; without it Load refuses to start, which the guard tests pin.
+			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "true")
+
+			logs := capture.Default(t)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() = %v, want nil", err)
+			}
+			if cfg.PasswordStatus != tc.wantStatus {
+				t.Errorf("Load(%s=%q) status = %q, want %q", tc.channel, tc.password, cfg.PasswordStatus, tc.wantStatus)
+			}
+			for _, msg := range all {
+				want := 0
+				if slices.Contains(tc.wantWarns, msg) {
+					want = 1
+				}
+				if got := logs.CountLevel(slog.LevelWarn, msg); got != want {
+					t.Errorf("Load(%s=%q, status %q) logged %d WARN records matching %q, want %d: the WARN set must describe the same classification the status reports (logs %v)",
+						tc.channel, tc.password, tc.wantStatus, got, msg, want, logs.Messages())
+				}
+			}
+			// The healthy case is also a derivation: a configured password produces
+			// no quality WARN at all, and the file channel says so at INFO.
+			if tc.wantStatus == PasswordConfigured && tc.channel == "PFX_PASSWORD_FILE" &&
+				logs.CountLevel(slog.LevelInfo, "PFX password configured") != 1 {
+				t.Errorf("Load(%s=%q) did not report the configured mounted secret at INFO (logs %v)",
+					tc.channel, tc.password, logs.Messages())
+			}
+		})
+	}
+}
+
+// TestParseMaxScanEntries pins the derived scan budget for every shape of
+// MAX_SCAN_ENTRIES, and — alongside each value — the repair classification Load
+// turns into a diagnostic. The two travel together so a value can never change
+// class without this table saying so.
+func TestParseMaxScanEntries(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		val        string
+		want       int
+		wantRepair scanEntriesRepair
+	}{
+		{"empty uses default", "", defaultMaxScanEntries, scanEntriesAccepted},
+		{"whitespace uses default", "   ", defaultMaxScanEntries, scanEntriesAccepted},
+		{"valid", "5000", 5000, scanEntriesAccepted},
+		{"padded valid", "  5000  ", 5000, scanEntriesAccepted},
+		// 1 is the smallest usable budget: a tree with a single entry still scans.
+		{"one is usable", "1", 1, scanEntriesAccepted},
+		{"at ceiling unclamped", "200000", maxScanEntriesCeiling, scanEntriesAccepted},
+		{"one above ceiling clamped", "200001", maxScanEntriesCeiling, scanEntriesClamped},
+		{"far above ceiling clamped", "10000000", maxScanEntriesCeiling, scanEntriesClamped},
+		// A valid decimal too large for int is still a positive above-ceiling
+		// value, so it clamps rather than falling through to the default.
+		{"beyond int64 clamped", "999999999999999999999999999999", maxScanEntriesCeiling, scanEntriesClamped},
+		{"signed beyond int64 clamped", "+999999999999999999999999999999", maxScanEntriesCeiling, scanEntriesClamped},
+		// strconv reports ErrRange once the digit prefix overflows even when junk
+		// follows, so a malformed value must stay malformed instead of being
+		// mistaken for an above-ceiling number.
+		{"overflowing prefix with junk", "999999999999999999999999999999x", defaultMaxScanEntries, scanEntriesInvalid},
+		{"non-numeric", "abc", defaultMaxScanEntries, scanEntriesInvalid},
+		// There is deliberately no disable spelling: "0" and "false" are unusable
+		// input, not an opt-out, because a scan with no entry budget is the
+		// exhaustion path the ceiling exists to close.
+		{"zero is not a disable value", "0", defaultMaxScanEntries, scanEntriesInvalid},
+		{"padded zero is not a disable value", " 0 ", defaultMaxScanEntries, scanEntriesInvalid},
+		{"false is not a disable value", "false", defaultMaxScanEntries, scanEntriesInvalid},
+		{"negative uses default", "-1", defaultMaxScanEntries, scanEntriesInvalid},
+		{"beyond negative int64 uses default", "-999999999999999999999999999999", defaultMaxScanEntries, scanEntriesInvalid},
+		{"a decimal fraction is invalid", "1.5", defaultMaxScanEntries, scanEntriesInvalid},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, repair := parseMaxScanEntries(tc.val)
+			if got != tc.want {
+				t.Errorf("parseMaxScanEntries(%q) = %d, want %d", tc.val, got, tc.want)
+			}
+			if repair != tc.wantRepair {
+				t.Errorf("parseMaxScanEntries(%q) repair = %s, want %s",
+					tc.val, scanRepairName(repair), scanRepairName(tc.wantRepair))
+			}
+		})
+	}
+}
+
+// scanRepairName renders a scanEntriesRepair for a test failure message.
+// Test-local for the same reason repairName is: the production diagnostics are
+// message-per-case rather than formatted from the enum.
+func scanRepairName(r scanEntriesRepair) string {
+	switch r {
+	case scanEntriesAccepted:
+		return "scanEntriesAccepted"
+	case scanEntriesInvalid:
+		return "scanEntriesInvalid"
+	case scanEntriesClamped:
+		return "scanEntriesClamped"
+	}
+	return "scanEntriesRepair(" + strconv.Itoa(int(r)) + ")"
+}
+
+// TestMaxScanEntries_is_silent pins the exported reader's contract for every parse
+// class, the same contract FallbackInterval carries: the value is read through a
+// plain accessor, so it must never emit the startup diagnostics Load owns. Without
+// this, moving the WARNs into the parser would print a startup-shaped record from
+// every caller that only wanted the number.
+// slog.Default is process-global, so this test must not run in parallel with
+// anything that logs.
+func TestMaxScanEntries_is_silent(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want int
+	}{
+		{"", defaultMaxScanEntries},
+		{"   ", defaultMaxScanEntries},
+		{"abc", defaultMaxScanEntries},
+		{"0", defaultMaxScanEntries},
+		{"-1", defaultMaxScanEntries},
+		{"5000", 5000},
+		{"200000", maxScanEntriesCeiling},
+		{"200001", maxScanEntriesCeiling},
+		{"999999999999999999999999999999", maxScanEntriesCeiling},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			t.Setenv("MAX_SCAN_ENTRIES", tc.raw)
+
+			logs := capture.Default(t)
+
+			if got := MaxScanEntries(); got != tc.want {
+				t.Errorf("MaxScanEntries() with MAX_SCAN_ENTRIES=%q = %d, want %d", tc.raw, got, tc.want)
+			}
+			if logs.Len() != 0 {
+				t.Errorf("MaxScanEntries() with MAX_SCAN_ENTRIES=%q logged %v, want no records: the accessor is silent and Load owns the diagnostics",
+					tc.raw, logs.Messages())
+			}
+		})
+	}
+}
+
+// TestLoad_warns_when_the_scan_entry_budget_is_repaired pins the two repair
+// diagnostics at their only home. Both values are silently repaired, so the WARN
+// naming the rejected value is the operator's only way to tell an intended budget
+// from a default or a clamp — a deployment that meant to raise the ceiling would
+// otherwise keep failing its scan at the default with nothing to explain why.
+// Message text, level and attribute keys are asserted verbatim: a documented Loki
+// matcher or an operator's grep keys on them. Exactly one record per process start.
+// slog.Default is process-global, so this test must not run in parallel with
+// anything that logs.
+func TestLoad_warns_when_the_scan_entry_budget_is_repaired(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		raw      string
+		message  string
+		attrKey  string
+		attrWant string
+	}{
+		{
+			name: "invalid value uses default", raw: "abc",
+			message: "invalid MAX_SCAN_ENTRIES, using default", attrKey: "default", attrWant: "10000",
+		},
+		{
+			name: "zero is not a disable value", raw: "0",
+			message: "invalid MAX_SCAN_ENTRIES, using default", attrKey: "default", attrWant: "10000",
+		},
+		{
+			name: "excessive value is clamped", raw: "200001",
+			message: "MAX_SCAN_ENTRIES too large, clamping", attrKey: "max_entries", attrWant: "200000",
+		},
+		// Both WARNs quote the value as CONFIGURED, untrimmed: a value that is
+		// unusable only because of a stray space or newline looks correct in the
+		// log once it is trimmed, and nothing else reports the difference.
+		{
+			name: "padded invalid value is quoted untrimmed", raw: " abc\t",
+			message: "invalid MAX_SCAN_ENTRIES, using default", attrKey: "default", attrWant: "10000",
+		},
+		{
+			name: "padded excessive value is quoted untrimmed", raw: " 200001 ",
+			message: "MAX_SCAN_ENTRIES too large, clamping", attrKey: "max_entries", attrWant: "200000",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", "pw")
+			t.Setenv("MAX_SCAN_ENTRIES", tc.raw)
+
+			logs := capture.Default(t)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() = %v, want nil: an unusable MAX_SCAN_ENTRIES is repaired, not a startup refusal", err)
+			}
+			if n := logs.CountLevel(slog.LevelWarn, tc.message); n != 1 {
+				t.Errorf("Load() with MAX_SCAN_ENTRIES=%q logged %d WARN records matching %q, want exactly 1 (logs %v)",
+					tc.raw, n, tc.message, logs.Messages())
+			}
+			if n := logs.CountExact(tc.message); n != 1 {
+				t.Errorf("Load() with MAX_SCAN_ENTRIES=%q logged %d records with the exact message %q, want 1 (logs %v)",
+					tc.raw, n, tc.message, logs.Messages())
+			}
+			if !logs.AttrContains(tc.message, "value", tc.raw) {
+				t.Errorf("Load() with MAX_SCAN_ENTRIES=%q WARN does not name the rejected value (logs %v)",
+					tc.raw, logs.Messages())
+			}
+			if !logs.HasAttr(tc.message, tc.attrKey, tc.attrWant) {
+				t.Errorf("Load() with MAX_SCAN_ENTRIES=%q WARN %q = %q, want %q=%q (logs %v)",
+					tc.raw, tc.attrKey, mustAttr(t, logs, tc.message, tc.attrKey), tc.attrKey, tc.attrWant, logs.Messages())
+			}
+			// The value the scanner will use must agree with the record that
+			// explains the repair, or the log describes a budget nothing enforces.
+			wantLimit, _, _ := maxScanEntriesFromEnv()
+			if got := MaxScanEntries(); got != wantLimit {
+				t.Errorf("MaxScanEntries() = %d, want %d", got, wantLimit)
+			}
+		})
+	}
+}
+
+// TestLoad_does_not_repair_a_usable_scan_entry_budget keeps the invalid-value and
+// clamp diagnostics off accepted values: an operator running the default, or an
+// explicit in-range budget, must see no record about MAX_SCAN_ENTRIES at all.
+func TestLoad_does_not_repair_a_usable_scan_entry_budget(t *testing.T) {
+	for _, raw := range []string{"", "   ", "1", "5000", "  5000 ", "200000"} {
+		t.Run(raw, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", "pw")
+			t.Setenv("MAX_SCAN_ENTRIES", raw)
+
+			logs := capture.Default(t)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() = %v, want nil", err)
+			}
+
+			for _, unwanted := range []string{
+				"invalid MAX_SCAN_ENTRIES, using default",
+				"MAX_SCAN_ENTRIES too large, clamping",
+			} {
+				if n := logs.Count(unwanted); n != 0 {
+					t.Errorf("Load() with MAX_SCAN_ENTRIES=%q logged %d records matching %q, want none (logs %v)",
+						raw, n, unwanted, logs.Messages())
+				}
 			}
 		})
 	}

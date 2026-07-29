@@ -237,7 +237,7 @@ func TestScannerRun_keeps_observation_state_across_an_incomplete_enumeration(t *
 // Serial, not parallel: captureLogs swaps the process-global slog.Default().
 func TestObservationLog_reports_a_new_time_derived_observation_without_input_change(t *testing.T) {
 	logs := captureLogs(t)
-	o := newObservationLog()
+	o := newObservationLog(0)
 	fp := pairFingerprint([]byte("cert"), []byte("key"))
 	o.record("tls.crt", fp, nil)
 
@@ -269,7 +269,7 @@ func TestObservationLog_reports_a_new_time_derived_observation_without_input_cha
 // Serial, not parallel: captureLogs swaps the process-global slog.Default().
 func TestObservationLog_forgetPair_spends_wholeness_without_resetting_deduplication(t *testing.T) {
 	logs := captureLogs(t)
-	o := newObservationLog()
+	o := newObservationLog(0)
 	fp := pairFingerprint([]byte("cert"), []byte("key"))
 	obs := []convert.Observation{{
 		Kind:   convert.ObsLeafNotFirst,

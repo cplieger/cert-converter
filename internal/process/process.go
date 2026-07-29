@@ -117,8 +117,8 @@ func (r *ScanResult) inputFullyEnumerated() bool {
 	return r.durablyEnumerated() && r.Vanished == 0
 }
 
-// maxScanEntries bounds how many /input entries ONE scan will enumerate before it
-// gives up on the tree.
+// fallbackScanEntries bounds how many /input entries ONE scan enumerates when the
+// composition root injected no budget of its own.
 //
 // The per-file and per-PEM-block caps bound what one certificate costs; nothing
 // bounded how MANY the walk would take on. /input is a mounted tree this app does not
@@ -129,26 +129,40 @@ func (r *ScanResult) inputFullyEnumerated() bool {
 // daemon into an OOM kill, which stops conversion for every certificate — a denial of
 // the app's only job, from the one boundary it deliberately does not trust.
 //
-// The budget is a constant rather than an operator setting: it is not a tuning knob but
-// an "this is not a certificate directory" tripwire, and it sits orders of magnitude
-// above any real /input (a Caddy certificates tree holds a handful of files per domain)
-// while far below what exhausts a container's memory. It is a var only so the suite can
-// drive the abort with a handful of files instead of two hundred thousand; nothing in
-// production assigns to it.
+// The operator-facing budget is MAX_SCAN_ENTRIES, and it is INJECTED
+// (Options.MaxScanEntries) rather than read here: internal/config owns the variable's
+// name, its default, its ceiling and every diagnostic for a repaired value, and this
+// package stays a leaf that package configures. Importing internal/config from the
+// scanner would invert that direction and give the silent `health` subcommand a path
+// into the scan machinery.
 //
-// Exceeding it ABORTS the scan rather than processing a prefix of the tree: a partial
-// enumeration must not be mistaken for a complete one, and aborting is what keeps
-// orphan reaping vetoed (the walk did not complete) so no bundle is deleted on the
-// strength of a truncated input listing. The scan error reaches the operator and the
-// health marker, which is the honest signal for a mount that needs looking at.
-var maxScanEntries = 200_000
+// This constant is only the guard for a Scanner constructed without a budget (a
+// caller that never wired one, and the package's own tests): it matches
+// internal/config's default so a never-wired scanner behaves like a default-configured
+// one, which is why the two numbers are allowed to be spelled twice — config's is the
+// operator contract, this one is the floor under a missing wiring.
+const fallbackScanEntries = 10_000
 
-// errScanBudgetExceeded marks the abort above. It is its own sentinel so a caller (and
-// a test) can tell a refused-because-too-large tree from an unreadable one.
+// errScanBudgetExceeded marks the abort above. It is its own sentinel so the walk's
+// own callers (and a test) can tell a refused-because-too-large tree from an
+// unreadable one.
+//
+// It is deliberately NOT returned to Run's caller: see Run, where it is swallowed
+// after the summary is logged. A tree bigger than the budget is not restart-clearable,
+// so it must not flip health — the same reading this app already gives every /input
+// path it could not read.
 var errScanBudgetExceeded = errors.New("input tree exceeds the per-scan entry budget")
 
-// scanBudgetMsg is the operator-facing half of that abort.
-const scanBudgetMsg = "the /input tree holds more entries than one scan will enumerate; stopping this scan without converting or removing anything further"
+// scanBudgetMsg is the operator-facing half of that abort. It names the health
+// consequence for the same reason the unreadable aggregate does: "stopping this scan"
+// otherwise reads as a failure an operator would expect a restart to clear.
+const scanBudgetMsg = "the /input tree holds more entries than one scan will enumerate; stopping this scan without converting or removing anything further, health is unaffected"
+
+// scanBudgetRemediation is that WARN's operator action. It names BOTH ways out,
+// because the budget cannot tell them apart: a mount pointed at the wrong tree (the
+// tripwire this bound exists for) and a legitimately large certificate directory that
+// simply needs a higher ceiling.
+const scanBudgetRemediation = "check that /input is mounted at the certificate directory and holds nothing else, or raise MAX_SCAN_ENTRIES if the tree is legitimately this large"
 
 // Options carries the process-lifetime scan configuration the composition root
 // chooses once at startup: the confined input and output roots, the password
@@ -163,6 +177,13 @@ type Options struct {
 	CertsRoot string
 	OutRoot   string
 	Password  string
+	// MaxScanEntries is how many /input entries one scan may enumerate before it
+	// refuses the tree (fallbackScanEntries when non-positive). It is INJECTED rather
+	// than read from internal/config here: that package owns MAX_SCAN_ENTRIES' name,
+	// default, ceiling and repaired-value diagnostics, and the composition root wires
+	// its config.MaxScanEntries() into this field. It also bounds the observation log,
+	// whose size a scan's enumeration is what drives (observationLog.maxObservedPairs).
+	MaxScanEntries int
 }
 
 // Scanner walks a certificate directory, decides which cert/key pairs are out of
@@ -189,7 +210,7 @@ type Scanner struct {
 func New(opts *Options) *Scanner {
 	return &Scanner{
 		opts:         *opts,
-		observations: newObservationLog(),
+		observations: newObservationLog(opts.MaxScanEntries),
 	}
 }
 
@@ -226,12 +247,22 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		password:     s.opts.Password,
 		enc:          s.opts.Encoder,
 		seen:         make(map[string]struct{}),
+		maxEntries:   s.opts.MaxScanEntries,
 	}
 	// Enumerate the input tree THROUGH the root handle, exactly as the
 	// /output stale-temp sweep does: every step is an openat-relative
 	// syscall and every path handed downstream is root-relative, so no
 	// ambient absolute path exists for a later read to reach for.
 	walkErr := sw.walkInput(ctx, inHandle)
+	// A tree over the entry budget is REPORTED, not failed. It stops the walk (so
+	// `seen` is a prefix of the tree and every whole-tree claim below stays vetoed),
+	// visit has already emitted scanBudgetMsg at WARN with the remediation, and the
+	// summary names the abort — but the error is not carried past this point, because
+	// nothing about a too-large /input is clearable by restarting the container. That
+	// is the same reading this app gives every /input path it could not read
+	// (main.healthyAfterScan asks Failed alone), and it is why the budget's own
+	// diagnostic has to carry the operator action: no other signal follows.
+	budgetExceeded := errors.Is(walkErr, errScanBudgetExceeded)
 
 	result := countResults(sw.results, sw.unreadable, sw.unresolved, sw.vanished)
 	rc := reapContext{
@@ -249,6 +280,15 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		result:        result,
 		walkCompleted: walkErr == nil,
 		shutdown:      walkErr != nil && IsShutdown(walkErr),
+		// The observation log's ceiling can force it to drop the "this pair was once
+		// read whole" evidence noteMissingKey depends on, and the loss is silent at the
+		// point of use: a key that goes missing afterwards is classified as an ordinary
+		// orphan (health-neutral, NOT reap-vetoing) instead of the transient
+		// statusVanished (reap-vetoing), so the scan would go on to delete unrelated
+		// leftover outputs on an input reading it can no longer justify. Taken (and
+		// reset) once per scan so the veto covers exactly the scan whose evidence was
+		// spent; a later scan that re-reads the pair whole re-establishes it.
+		evidenceEvicted: s.observations.takeEvictedWholeness(),
 	}
 	// Prune observation state for pairs that are gone, but ONLY when the walk
 	// proved the enumeration complete: an aborted walk, an unreadable sub-path or
@@ -259,7 +299,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	if rc.enumerationClean() {
 		s.observations.forget(sw.seen)
 	}
-	rp := &reaper{src: sw.src, out: out, mode: s.opts.Lifecycle}
+	rp := &reaper{src: sw.src, out: out, mode: s.opts.Lifecycle, observations: s.observations}
 	removed, reconcileErr := rp.reconcile(ctx, sw.seen, &rc)
 	result.Removed = removed
 	// A shutdown that arrives after the input walk completed cancels reconciliation
@@ -271,6 +311,9 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	}
 
 	logScanOutcome(ctx, &result, walkErr)
+	if budgetExceeded {
+		return result, nil
+	}
 	return result, walkErr
 }
 
@@ -299,10 +342,26 @@ type scanWalk struct {
 	// input tree afterwards. countResults folds it into ScanResult.Unresolved.
 	unresolved int
 	// entries counts every path this walk has been handed, including directories and
-	// entries it could not read. It is the accounting behind maxScanEntries: the cap is
+	// entries it could not read. It is the accounting behind the entry budget: the cap is
 	// about how much of an untrusted tree one scan takes on, so it counts what the walk
 	// TOUCHED rather than what it converted.
 	entries int
+	// maxEntries is this walk's entry budget, injected from Options.MaxScanEntries.
+	// Non-positive means "use fallbackScanEntries" (entryBudget), so a scanWalk
+	// assembled without one — the package's own focused tests do this — is bounded
+	// rather than unbounded.
+	maxEntries int
+}
+
+// entryBudget is the effective ceiling for this walk: the injected budget, or
+// fallbackScanEntries when nothing was injected. The fallback is resolved HERE rather
+// than at construction so every assembler of a scanWalk gets a bound, including the
+// tests that build one field by field.
+func (sw *scanWalk) entryBudget() int {
+	if sw.maxEntries > 0 {
+		return sw.maxEntries
+	}
+	return fallbackScanEntries
 }
 
 // scanReadDirBatch is how many directory entries one ReadDir call takes at a time.
@@ -439,10 +498,10 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 	// own state rather than trailing it. Returning an error aborts fs.WalkDir, which is
 	// what keeps `seen` from being read as a complete enumeration downstream.
 	sw.entries++
-	if sw.entries > maxScanEntries {
+	if budget := sw.entryBudget(); sw.entries > budget {
 		slog.Warn(scanBudgetMsg,
-			"path", rel, "entries", sw.entries, "limit", maxScanEntries,
-			"remediation", "check that /input is mounted at the certificate directory and holds nothing else")
+			"path", rel, "entries", sw.entries, "limit", budget,
+			"remediation", scanBudgetRemediation)
 		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.entries, rel)
 	}
 	if err != nil {
@@ -609,17 +668,29 @@ func logScanOutcome(ctx context.Context, result *ScanResult, walkErr error) {
 // classification here silently changed what that WARN covered, with no compile-time
 // or structural signal. main keeps only healthyAfterScan, the health boundary.
 //
-// The unreadable arm fires ahead of the full-enumeration gate below because it IS the
-// diagnosis for an incomplete enumeration; it needs only a completed walk (walkErr ==
-// nil), the same condition the composition root applied by returning early on a scan
-// error. The three arms after the gate require a completed walk with no unreadable
-// sub-path, no unresolved symlink and nothing that vanished mid-scan. Unreadable == 0
-// is what makes "every certificate" provable, because Run deliberately continues past
-// an unreadable sub-path, so a partial enumeration cannot know what lies beneath it,
-// and the unreadable arm already carries the actionable diagnosis for that shape.
-// Vanished == 0 is the same argument for the transient case: a cert, or the key that
-// pairs with one, replaced during the walk was not observed whole, so "every
-// certificate lacks its key" is not a claim this scan can make, and the next one can.
+// Every message is gated by the evidence THAT message needs, which is the rule this
+// function is organised around rather than a per-arm exception:
+//
+//   - A completed walk (walkErr == nil) is the floor for all of them: an aborted scan
+//     observed an arbitrary prefix of the tree and can claim nothing.
+//   - The unreadable aggregate needs only that floor — it IS the diagnosis for an
+//     incomplete enumeration, so gating it on a complete one would silence it exactly
+//     when it applies. It is also the same condition the composition root applied by
+//     returning early on a scan error.
+//   - The WHOLE-TREE arms ("no certificate pair at all", "every certificate lacks its
+//     key") need a complete enumeration: no unreadable path, no unresolved symlink,
+//     nothing that vanished mid-scan. Run deliberately continues past an unreadable
+//     sub-path, so a partial enumeration cannot know what lies beneath it, and a cert
+//     (or the key pairing with one) replaced during the walk was not observed whole.
+//     Neither "no pair exists" nor "every certificate" is a claim such a scan can make.
+//   - The PER-PATH arm ("some certificates are missing their sibling .key") needs only
+//     its own count, because that count is proven path by path: the sibling is stat-ed
+//     directly through the confined root and only ENOENT becomes statusOrphan. A hole
+//     elsewhere in the tree cannot make an observed missing key unobserved.
+//
+// Orphan REAPING keeps the full whole-tree gate (reapContext.enumerationClean): a
+// deletion rests on the claim that no input for a bundle exists ANYWHERE in the tree,
+// which is a whole-tree claim, unlike naming the orphans this scan actually saw.
 func logInputCoverageWarnings(result *ScanResult, walkErr error) {
 	if walkErr != nil {
 		return
@@ -643,11 +714,14 @@ func logInputCoverageWarnings(result *ScanResult, walkErr error) {
 			// condition.
 			"remediation", inputPermRemediation)
 	}
-	if !result.inputFullyEnumerated() {
-		return
-	}
+	// Each arm is gated by the evidence IT needs, which is the rule here rather than an
+	// exception: a claim about the WHOLE TREE ("no pair at all", "every certificate")
+	// needs a complete enumeration, while a claim about the PATHS THIS SCAN READ needs
+	// only those paths. Folding the second kind behind the whole-tree gate silenced a
+	// proven fact because of an unrelated hole elsewhere in the tree.
+	fullyEnumerated := result.inputFullyEnumerated()
 	switch {
-	case result.Total == 0:
+	case fullyEnumerated && result.Total == 0:
 		// A completed scan that visited no .crt at all is indistinguishable from
 		// a healthy steady state in the summary counts (failed=0 keeps the marker
 		// set, and the README's Loki rules match on failed/unreadable or on the
@@ -655,7 +729,7 @@ func logInputCoverageWarnings(result *ScanResult, walkErr error) {
 		// vanished /input mount: no PFX is produced and nothing fires. Name it.
 		slog.Warn("no certificate pairs found under the input root; no PFX output is being produced",
 			"remediation", "check that the /input mount points at the PEM certificate directory")
-	case result.Orphan == result.Total:
+	case fullyEnumerated && result.Orphan == result.Total:
 		// Every .crt under /input lacks its sibling .key, so the scan
 		// completed with failed=0 and produced nothing at all. The summary counts
 		// carry orphan, but no README Loki rule keys on it and the
@@ -666,13 +740,25 @@ func logInputCoverageWarnings(result *ScanResult, walkErr error) {
 			"orphan", result.Orphan,
 			"remediation", "name each private key <name>.key beside its <name>.crt (Caddy's layout)")
 	case result.Orphan > 0:
-		// Some, not all. The pairs that DO have their key still convert, so the scan
+		// Some, not all — and the ONE arm here that needs no whole-tree proof. Every
+		// counted orphan is proven per path: readPair stats the sibling .key directly
+		// through the confined root and only an ENOENT becomes statusOrphan (a key that
+		// is there and unreadable is statusUnreadable, and a key this process had already
+		// read whole is the transient statusVanished), so "these certificates have no
+		// sibling .key" is a fact about paths this scan read, not an inference from the
+		// tree being complete. An unreadable path, an unresolved symlink or a renewal
+		// elsewhere in the tree cannot make it untrue, and gating it on them silenced it
+		// for as long as any unrelated hole stood.
+		//
+		// It is also the arm that catches the all-orphan shape on an INCOMPLETE
+		// enumeration: "every certificate" is then unprovable, "some" still holds.
+		//
+		// The pairs that DO have their key still convert, so the scan
 		// completes with failed=0 and the summary's orphan count is the only trace at
 		// the default level. An orphaned .crt is also recorded as seen, so its
 		// existing bundle is never reaped either: it keeps being served, indefinitely
-		// stale, with nothing naming it. Same reasoning as the arm above, one blast
-		// radius smaller. The per-cert path stays Debug; this is the once-per-scan
-		// aggregate.
+		// stale, with nothing naming it. The per-cert path stays Debug; this is the
+		// once-per-scan aggregate.
 		slog.Warn("some certificates under the input root are missing their sibling .key; those produce no PFX and any existing bundle for them goes stale",
 			"orphan", result.Orphan, "total", result.Total,
 			"remediation", "name each private key <name>.key beside its <name>.crt (Caddy's layout), or remove the certificate from /input")
@@ -758,12 +844,37 @@ type observationLog struct {
 	// differently: forgetPair spends one scan of missing-key grace, which must not
 	// also reset the WARN de-duplication for input bytes that never changed.
 	whole map[string]struct{}
+	// loneKeys holds the cert paths this log has already reported as retaining an
+	// output because a sibling KEY is still there while the certificate is gone
+	// (reaper.reapConfirmed). A THIRD set for a third spending schedule: it is cleared
+	// when the pair reads whole again (markWhole) or when the bundle is finally deleted
+	// (clearLoneKey), and — unlike `seen` and `whole` — it is deliberately NOT pruned by
+	// forget, whose gate is membership in the scan's cert enumeration. A lone key's
+	// certificate is by definition absent from that enumeration, so pruning it there
+	// would re-report the same unchanged condition on every scan.
+	loneKeys map[string]struct{}
+	// maxPairs is the injected ceiling (Options.MaxScanEntries); non-positive means
+	// fallbackScanEntries. Resolved through maxObservedPairs.
+	maxPairs int
+	// evictedWholeness counts wholeness entries reserve had to drop since the last
+	// take. It is the log's own report that it can no longer answer completedPair for
+	// some pair it once knew — evidence noteMissingKey needs — and Scanner.Run turns it
+	// into a reap veto for that scan (reapContext.evidenceEvicted). Without it the loss
+	// is silent exactly where it matters: a missing key reads as an ordinary orphan,
+	// which does not veto reaping, so the scan deletes other bundles on an input reading
+	// it can no longer defend.
+	evictedWholeness int
 }
 
-func newObservationLog() *observationLog {
+// newObservationLog builds an empty log bounded at maxPairs entries per half. A
+// non-positive maxPairs means fallbackScanEntries: an unbounded log is not an option
+// this constructor offers, because /input path churn is what fills it.
+func newObservationLog(maxPairs int) *observationLog {
 	return &observationLog{
-		seen:  make(map[string][sha256.Size]byte),
-		whole: make(map[string]struct{}),
+		seen:     make(map[string][sha256.Size]byte),
+		whole:    make(map[string]struct{}),
+		loneKeys: make(map[string]struct{}),
+		maxPairs: maxPairs,
 	}
 }
 
@@ -776,6 +887,37 @@ func newObservationLog() *observationLog {
 func (o *observationLog) markWhole(rel string) {
 	o.reserve(rel)
 	o.whole[rel] = struct{}{}
+	// A pair that reads whole is not a lone key any more, so the next time it becomes
+	// one it is reported again. This is the "per change, not per scan" half of the
+	// lone-key report: the state is remembered until the state itself changes.
+	o.clearLoneKey(rel)
+}
+
+// markLoneKey records that rel's bundle is being retained because a sibling key is
+// still present while the certificate is gone, and reports whether that is NEW — i.e.
+// whether the condition has to be logged on this scan. Once reported it stays silent
+// until markWhole sees the pair whole again or clearLoneKey retires it with the bundle.
+//
+// A full log answers true every time rather than remembering: this set is bounded by
+// the same ceiling as the rest of the log, and re-reporting a retained private-key
+// bundle is the loud direction. It does NOT route through reserve, because reserve's
+// eviction spends the wholeness evidence a reap veto now rests on — a diagnostic
+// de-duplication set must not be able to trigger that.
+func (o *observationLog) markLoneKey(rel string) bool {
+	if _, reported := o.loneKeys[rel]; reported {
+		return false
+	}
+	if len(o.loneKeys) >= o.maxObservedPairs() {
+		return true
+	}
+	o.loneKeys[rel] = struct{}{}
+	return true
+}
+
+// clearLoneKey retires the lone-key report for rel: the pair read whole again, or the
+// bundle was finally deleted once the key went too.
+func (o *observationLog) clearLoneKey(rel string) {
+	delete(o.loneKeys, rel)
 }
 
 // observationSignature identifies both the input bytes and the observations
@@ -831,17 +973,27 @@ func (o *observationLog) record(rel string, fp [sha256.Size]byte, obs []convert.
 // Under path churn from a tree this app does not own, that grows process-lifetime state
 // with nothing to stop it. The bound IS the scan entry budget: a scan cannot
 // legitimately observe more pairs than it is allowed to enumerate in the first place,
-// and deriving it rather than repeating the number keeps the two from drifting.
-func maxObservedPairs() int { return maxScanEntries }
+// which is why the budget is injected into this log too rather than derived a second
+// time from anything else.
+func (o *observationLog) maxObservedPairs() int {
+	if o.maxPairs > 0 {
+		return o.maxPairs
+	}
+	return fallbackScanEntries
+}
 
 // reserve makes room for a path this log has not seen before, evicting one remembered
 // pair when it is full.
 //
-// Eviction spends DIAGNOSTIC memory only, which is why it is safe at all: the signature
-// it drops means the evicted pair re-emits its observation WARN once, and the wholeness
-// evidence it drops makes completedPair answer false, its documented safe direction. No
-// currency decision reads this log — store.isCurrent derives currency from the bundle on
-// disk — so an eviction can never delete a bundle or accept a stale one.
+// Eviction spends the signature freely — the evicted pair re-emits its observation WARN
+// once, and no currency decision reads this log at all, since store.isCurrent derives
+// currency from the bundle on disk. What it must NOT spend silently is the WHOLENESS
+// evidence: dropping it makes completedPair answer false, and that answer is what
+// downgrades a later missing key from the reap-vetoing statusVanished to the ordinary
+// statusOrphan, which authorises deleting unrelated leftover bundles on this scan. So
+// every wholeness entry dropped is COUNTED (evictedWholeness) and Scanner.Run turns the
+// count into a reap veto for that scan: the reap gate fails closed on the loss instead
+// of reading it as proof.
 //
 // The victim is arbitrary (map iteration order) rather than least-recently-used: every
 // entry is worth exactly one deduplicated WARN, so ordering machinery would buy nothing
@@ -851,10 +1003,10 @@ func (o *observationLog) reserve(rel string) {
 	// reached at the readPair success boundary, on pairs that never get as far as note
 	// or record, so a `seen`-only ceiling would leave the structural half growing for
 	// the process lifetime.
-	if _, known := o.seen[rel]; !known && len(o.seen) >= maxObservedPairs() {
+	if _, known := o.seen[rel]; !known && len(o.seen) >= o.maxObservedPairs() {
 		o.evictOne(rel)
 	}
-	if _, known := o.whole[rel]; !known && len(o.whole) >= maxObservedPairs() {
+	if _, known := o.whole[rel]; !known && len(o.whole) >= o.maxObservedPairs() {
 		o.evictOne(rel)
 	}
 }
@@ -870,16 +1022,42 @@ func (o *observationLog) evictOne(keep string) {
 			continue
 		}
 		delete(o.seen, victim)
-		delete(o.whole, victim)
+		o.dropWholeness(victim)
 		return
 	}
 	for victim := range o.whole {
 		if victim == keep {
 			continue
 		}
-		delete(o.whole, victim)
+		o.dropWholeness(victim)
 		return
 	}
+}
+
+// dropWholeness removes one path's wholeness evidence and counts the loss when there
+// was any to lose. Counting here rather than at the two call sites above is what makes
+// the accounting exact: the signature half is evicted alongside paths the wholeness half
+// never held, and counting those would veto a reap for evidence that never existed.
+func (o *observationLog) dropWholeness(rel string) {
+	if _, held := o.whole[rel]; !held {
+		return
+	}
+	delete(o.whole, rel)
+	o.evictedWholeness++
+}
+
+// takeEvictedWholeness reports how many pairs have lost their wholeness evidence to
+// the ceiling since the last call, and resets the counter.
+//
+// Read once per scan by Scanner.Run, which turns a non-zero answer into that scan's
+// reap veto. It RESETS because the veto's scope is the scan whose evidence was spent: a
+// later scan that reads the pair whole again re-establishes the evidence through
+// markWhole, and a later scan that finds the key still missing has the same no-memory
+// position as a pair this process never read whole — the documented, loud direction.
+func (o *observationLog) takeEvictedWholeness() int {
+	n := o.evictedWholeness
+	o.evictedWholeness = 0
+	return n
 }
 
 // completedPair reports whether this process has already read rel's pair whole, which
@@ -1122,11 +1300,13 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	observations := analysis.Observations()
 	current, cause, err := sw.out.isCurrent(ctx, pfxRel, &analysis, sw.enc, sw.password)
 	if err != nil {
-		// Only shutdown gets here: isCurrent resolves every unreadable-output case to
-		// "stale" itself and reserves an error for cancellation, which is neither
-		// current nor stale. failEntry logs it at Debug, and visit's post-conversion
-		// context check turns it into the walk-level cancellation the caller reports,
-		// so this entry's statusFailed never reaches the health marker.
+		// A cancellation, and nothing else: isCurrent resolves every "I cannot tell what
+		// is on disk" outcome (an unreadable, oversized, non-regular or undecodable
+		// bundle, a lax directory) to "stale" itself, and its only two error returns are
+		// the prior-bundle read that raced a cancellation and currentFromCurrency's
+		// pre-verdict context check. failEntry logs it at Debug, and visit's
+		// post-conversion context check turns it into the walk-level cancellation the
+		// caller reports, so this entry's statusFailed never reaches the health marker.
 		return failEntry(rel, "failed to inspect existing pfx", err)
 	}
 	if current {
@@ -1221,9 +1401,16 @@ func (sw *scanWalk) noteWriteFailure(logRel, pfxRel string, cause staleCause, er
 
 // logConversionObservations surfaces Analyse's non-fatal findings about a pair's
 // input. Every one of them is a CONVERTIBLE condition, so none flips health:
-// health tracks conversion failures, and these all converted. They are logged at
-// WARN because each names something the operator probably did not intend, except
-// the duplicate-block artefact, which is noise at that level.
+// health tracks conversion failures, and these all converted.
+//
+// The level comes from the kind's own convert.ObservationClass, which is minted where
+// the kinds are minted, mapped here onto this app's log vocabulary: Quiet (a benign
+// assembly artefact) is Debug, Info (a true fact about the input with nothing to act
+// on, such as a chain that stops at an absent trust anchor — the documented Caddy
+// fullchain shape) is Info, and Warning (something the operator probably did not
+// intend, or that a consumer will reject) is Warn. Three levels rather than the old
+// noise/not-noise boolean, which had no room for the middle case and reported it as a
+// problem the operator was expected to fix.
 //
 // Observations are emitted on the conversion path, and on the unchanged path only
 // when the pair's observation signature (input bytes plus the observations derived
@@ -1236,11 +1423,21 @@ func (sw *scanWalk) noteWriteFailure(logRel, pfxRel string, cause staleCause, er
 // Detail is already bounded by convert, so it needs no further truncation here.
 func logConversionObservations(rel string, observations []convert.Observation) {
 	for _, o := range observations {
-		if o.Kind.Noise() {
-			slog.Debug("cert input observation", "path", rel, "kind", string(o.Kind), "detail", o.Detail)
-			continue
+		attrs := []any{"path", rel, "kind", string(o.Kind), "detail", o.Detail}
+		switch o.Kind.Class() {
+		case convert.ObservationClassQuiet:
+			slog.Debug("cert input observation", attrs...)
+		case convert.ObservationClassInfo:
+			slog.Info("cert input observation", attrs...)
+		case convert.ObservationClassWarning:
+			slog.Warn("cert input observation", attrs...)
+		default:
+			// convert.Class never returns anything else (its own exhaustiveness test
+			// enforces that), and a class this app does not know is reported loudly
+			// rather than dropped — the same safe direction convert takes for an
+			// unclassified kind.
+			slog.Warn("cert input observation", attrs...)
 		}
-		slog.Warn("cert input observation", "path", rel, "kind", string(o.Kind), "detail", o.Detail)
 	}
 }
 

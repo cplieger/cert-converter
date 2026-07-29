@@ -23,7 +23,8 @@ scan, then hand off to the watcher. The real work lives under
 
 - `internal/config`: parses `PFX_PASSWORD` (or `PFX_PASSWORD_FILE`, via
   `envx.Secret`), `PFX_ALLOW_EMPTY_PASSWORD`, `PFX_ENCODER`,
-  `FALLBACK_SCAN_HOURS`, and `LOG_LEVEL` (via `config.LogLevel`, exported
+  `FALLBACK_SCAN_HOURS`, `MAX_SCAN_ENTRIES`, and `LOG_LEVEL` (via
+  `config.LogLevel`, exported
   separately from `Load` so `main` can install the logger before the
   config load emits its own WARN lines) from the environment, then
   delegates encoder selection to `convert.EncoderName` (an unknown
@@ -31,8 +32,9 @@ scan, then hand off to the watcher. The real work lives under
   Every configuration WARN except the invalid-`LOG_LEVEL` one is emitted
   during `Load` (directly or through its helpers), once per process start;
   that one belongs to `main`, which must install the logger before `Load`
-  runs. The reusable readers `config.FallbackInterval` and `config.LogLevel`
-  keep their parsing silent because they are called outside `Load` (the former
+  runs. The reusable readers `config.FallbackInterval`, `config.MaxScanEntries`
+  and `config.LogLevel`
+  keep their parsing silent because they are called outside `Load` (the first
   by the `health` subcommand, where a WARN would repeat on every healthcheck).
 - `internal/convert`: PEM parsing (package-internal; reached through
   `PairInRoot`, which is the package's only production conversion edge —
@@ -50,11 +52,13 @@ scan, then hand off to the watcher. The real work lives under
 - `internal/process`: orchestration, plus `types.go` holding the
   package-private `conversionStatus` outcome enum (`ScanResult` is the
   package's only exported outcome surface), and the package-private
-  SHA-256 fingerprint cache for skip-unchanged detection (`cache.go`: a
-  read-only `matches` query plus a `record` commit applied only after a
-  successful conversion). `Scanner.Run` walks `/input`,
-  pairs each `*.crt` with its sibling `*.key`, consults the cache, and
+  observation log that de-duplicates per-input warnings across scans.
+  `Scanner.Run` walks `/input`,
+  pairs each `*.crt` with its sibling `*.key`, asks `store.isCurrent` whether
+  the bundle already on disk is the one those inputs produce, and
   writes PFX files to `/output`, returning a `ScanResult` count summary.
+  `reap.go` owns the `OUTPUT_LIFECYCLE` reconciliation, including the vetoes
+  that must hold before anything is deleted.
 - `internal/watch`: fsnotify watch loop with a debounce window and a
   periodic full-scan fallback. Falls back to polling (with periodic
   upgrade attempts) when fsnotify is unavailable.
@@ -63,7 +67,12 @@ scan, then hand off to the watcher. The real work lives under
 
 Data flow: `watch` detects a change and invokes the `onChange` callback
 wired in `main.go`, which calls `Scanner.Run`. The scan result drives the
-health marker (any failure clears it; a clean cycle sets it).
+health marker through `healthyAfterScan`: a conversion failure, or a scan that
+could not walk `/input` at all, clears it, and a cycle with neither sets it.
+Read-side conditions (an unreadable sub-path, an unresolvable symlink, an
+`/input` tree over `MAX_SCAN_ENTRIES`, a refused output permission repair) are
+warned about and deliberately leave the marker alone, because no restart clears
+them.
 
 ## Conventions and gotchas
 
@@ -77,21 +86,21 @@ health marker (any failure clears it; a clean cycle sets it).
 - **Reads are bounded and confined.** Cert/key reads go through
   `convert.ReadBoundedFromRoot`, which opens each file through the `/input`
   `*os.Root` and reads it under the 10 MB cap (`MaxFileSize`), so a symlink
-  planted in the watched tree cannot redirect the read outside it. The hash
-  cache does no file I/O of its own: the scanner reads each input once and
-  passes the bytes to `process`'s own `pairFingerprint`. PFX writes are atomic
-  (temp + rename) via `cplieger/atomicfile`. Keep new file I/O on these helpers.
-- **Only the fsnotify-unavailable fallback is not unit-tested.** A test cannot
-  make `fsnotify.NewWatcher` itself fail, so the arm of `Run` that degrades to
-  polling on that error is validated by the Docker healthcheck in production.
-  Everything else IS unit-tested here, including the event-driven loops:
-  `Run` end to end (`watch_run_test.go`), `watchLoop`'s `select` over a real
-  cert write and a dead watcher (`watch_loop_test.go`), the poll tick and its
-  upgrade handoff (`watch_poll_test.go`), event classification
+  planted in the watched tree cannot redirect the read outside it. The scanner
+  reads each input once and derives the pair's fingerprint from those bytes
+  (`pairFingerprint`), so nothing re-reads a file just to hash it. PFX writes are
+  atomic (temp + rename) via `cplieger/atomicfile`. Keep new file I/O on these helpers.
+- **The watch loop and its polling fallback are unit-tested.** `newFSWatcher` is
+  the construction seam the tests swap to make fsnotify "unavailable", so the
+  poll mode, its periodic upgrade attempt, and the handback to watch mode are all
+  covered along with `Run` end to end (`watch_run_test.go`), `watchLoop`'s
+  `select` over a real cert write and a dead watcher (`watch_loop_test.go`), the
+  poll tick and its upgrade handoff (`watch_poll_test.go`), event classification
   (`handleFsEvent`), watch-set construction (`addWatchDirs`),
   the per-arm receive helpers (`handleEventRecv`, `handleErrorRecv`,
   `handleFallbackTick`), the channel-closed-vs-shutdown translation
-  (`lostOrShutdown`), and the debounce/fallback timer accounting
+  (`lostOrShutdown`), the mode records (`watch_mode_record_test.go`) and the
+  debounce/fallback timer accounting
   (`watchState`, under `testing/synctest`). New logic in this package follows
   the same shape: put it in a helper the loop calls, and test the helper.
 - **Health is a file marker, not a probe endpoint.** A successful cycle
@@ -121,10 +130,9 @@ golangci-lint fmt
 
 Tests are property-based ([rapid](https://github.com/flyingmutant/rapid))
 plus table-driven, and there are fuzz targets in `internal/convert`
-(`convert_fuzz_test.go`) and in `internal/process`
-(`stale_temp_name_fuzz_test.go`, which drives the `/output` stale-temp
-deletion gate). Run a fuzz target directly when touching a parser or that
-gate:
+(PEM and key parsing, bundle analysis, password-encoding classification, and
+log-text bounding), `internal/config`, and `internal/outputpolicy`. Run a fuzz
+target directly when touching a parser or a value domain:
 
 ```sh
 go test ./internal/convert -run '^$' -fuzz FuzzParseCertChain -fuzztime 30s

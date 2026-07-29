@@ -41,163 +41,58 @@ const outputPermRemediation = "check /output ownership and permissions for the U
 // A store does not close its root; the Scanner that opened it does.
 type store struct {
 	root *os.Root
-	// laxDirsReported dedupes the per-directory output-permission records to once per
-	// directory per scan. The check is asked per bundle (isCurrent runs for every
-	// .crt), but the fact it reports is a property of the DIRECTORY, so a flat /output
-	// holding twenty certificates must not emit twenty identical records every scan.
-	// The store is constructed per Scanner.Run, so this lasts exactly one scan.
+	// laxDirsReported dedupes the lax-output-directory WARN to once per directory
+	// per scan. The check is asked per bundle (isCurrent runs for every .crt), but
+	// the fact it reports is a property of the DIRECTORY, so a flat /output holding
+	// twenty certificates must not emit twenty identical records every scan. The
+	// store is constructed per Scanner.Run, so this lasts exactly one scan.
 	laxDirsReported map[string]struct{}
-	// dirRepairFailed records that some ancestor of some bundle is group- or
-	// world-writable and this app could not take that bit off it. It disables orphan
-	// reaping for the whole scan: a candidate under a directory another process can
-	// write can be renamed or replaced between the orphan walk and the unlink, so no
-	// deletion made from that walk is provable. Per-scan, like laxDirsReported.
-	dirRepairFailed bool
 }
 
 // laxDirMsg is the standing WARN for an /output directory more permissive than
-// pfxDirMode in a way that exposes NAMES rather than write authority: a 0755 root
-// lets any process on the shared mount list the bundle names and traverse to them,
-// which is worth naming and is not this app's call to change — an operator may have
-// widened it deliberately. This app creates the directory at pfxDirMode
+// pfxDirMode: a group- or world-WRITABLE directory lets any other process on the
+// shared mount unlink a bundle or replace it, and a world-TRAVERSABLE one exposes the
+// bundle names. This app creates the directory at pfxDirMode
 // (atomicfile.WithMkdirMode) and never revisits it, so a directory an operator or an
 // earlier deployment left lax is reported nowhere else — while the README's own setup
-// step (`mkdir -p ... && chown ...`) produces 0755 under the default umask.
-//
-// A group- or world-WRITE bit is a different fact with a different consequence and is
-// NOT reported here; see dirWriteBits and dirWriteRefusedMsg.
+// step (`mkdir -p ... && chown ...`) produces 0755 under the default umask, and 0775
+// under a umask of 0002.
 const laxDirMsg = "the /output directory holding a pfx is more permissive than policy"
 
-// dirWriteBits are the group and other WRITE bits on an output directory. They are
-// split out of "any bit beyond pfxDirMode" because they are the only ones that carry
-// write AUTHORITY: directory permissions govern unlink and rename, so a process
-// sharing the mount that holds one of these bits can replace a published, owner-only
-// PFX with key material of its own — pfxFileMode cannot defend a directory entry whose
-// parent is writable, and confinement inside os.Root does not preserve integrity
-// inside that root either. Every other extra bit exposes names or traversal only.
-const dirWriteBits = 0o022
-
-// dirWriteRefusedMsg is the WARN for a group/world-writable output directory this app
-// could not tighten: the chmod was refused (another UID owns the directory) or the
-// filesystem stored nothing (mount-forced modes). It is separate from laxDirMsg
-// because the consequence is different — a bundle published there can be replaced by
-// whoever holds that write bit — and so is what happens next: this app refuses to
-// publish into it rather than reporting a condition nothing acts on.
-const dirWriteRefusedMsg = "the /output directory holding a pfx is group- or world-writable and could not be tightened; refusing to write there"
-
-// dirWriteTightenedMsg is the record for the repair that DID take. Named at the
-// default level like every other output-tree mutation this app makes (a write, a
-// reaped temp, a removed orphan, a tightened bundle mode).
-const dirWriteTightenedMsg = "tightened a group- or world-writable /output directory"
-
-// errDirWriteUnstored marks a directory chmod the filesystem ACCEPTED and did not
-// store (mount-forced modes). Distinct from a refusal only in the diagnostic: neither
-// leaves a namespace this app is willing to publish a private key into.
-var errDirWriteUnstored = errors.New("the filesystem did not store the tightened directory mode")
-
-// enforceDirPerms inspects every ancestor directory of rel and splits the verdict by
-// CONSEQUENCE.
+// reportLaxDir warns when rel's parent directory carries a permission bit pfxDirMode
+// does not.
 //
-// A group- or world-WRITE bit (dirWriteBits) is repaired with a confined chmod and
-// verified by re-stat. When the repair is refused or does not take, this returns an
-// error: publishing a private-key bundle into a directory another UID can rewrite
-// would let that UID replace the bundle a downstream consumer then trusts, and no
-// rewrite of ours changes that, so the honest outcome is to refuse the write and say
-// so. The same failure also disables orphan reaping for the scan (dirRepairFailed),
-// because a candidate under such a directory can be swapped between the walk and the
-// unlink.
+// REPORT-ONLY, and that is a decision rather than an omission. A directory this app
+// can WRITE but cannot chmod is the operator's own choice: it gets one warning and
+// nothing else — the mode on disk is left exactly as found, the bundle is still
+// published, orphan reaping is not vetoed, and health is unaffected. Acting on the
+// mode instead (chmod the ancestors, refuse to publish below a directory whose repair
+// failed, count that refusal as a conversion failure) means publishing NOTHING and
+// restart-looping forever on the mount types this app exists to serve: CIFS, NFS and
+// vfat force directory modes, so the chmod can never succeed there.
 //
-// Every other bit beyond pfxDirMode stays REPORT-ONLY (laxDirMsg): a 0755 root exposes
-// names and traversal, which is worth naming, but tightening a directory an operator
-// may have widened deliberately is their call and costs them a working deployment if
-// this app is wrong about it.
-func (s *store) enforceDirPerms(rel string) error {
-	// Every ancestor up to the mount root, not just the immediate parent: the leaf
-	// directory is app-created at pfxDirMode, so in the canonical nested layout
-	// (the output tree mirrors Caddy's certificates/<ca>/<domain>/ shape) the
-	// operator-created /output root - the README's `mkdir -p` case this check
-	// exists for - is reached only by walking up. path.Dir converges to "." on a
-	// root-relative slash path, so the loop always terminates.
-	for dir := path.Dir(rel); ; dir = path.Dir(dir) {
-		if err := s.enforceDirPermsAt(dir); err != nil {
-			return err
-		}
-		if dir == "." {
-			return nil
-		}
+// Naming it still costs the operator nothing and is the only signal that the
+// confinement guarding a private-key bundle rests on a directory others can write.
+func (s *store) reportLaxDir(rel string) {
+	dir := path.Dir(rel)
+	if _, done := s.laxDirsReported[dir]; done {
+		return
 	}
-}
-
-// enforceDirPermsAt is enforceDirPerms' per-directory half: one lstat, one verdict.
-// The VERDICT is recomputed for every bundle — a repair this app could not make has to
-// refuse every write under that directory, not just the first — while the RECORD is
-// emitted once per directory per scan.
-func (s *store) enforceDirPermsAt(dir string) error {
 	fi, err := s.lstat(dir)
 	if err != nil || !fi.IsDir() {
 		// A directory that cannot be stat-ed or is not a directory is reported by the
 		// write path itself; this check adds nothing there.
-		return nil
-	}
-	perm := fi.Mode().Perm()
-	if perm&dirWriteBits == 0 {
-		s.reportLaxDirAt(dir, perm)
-		return nil
-	}
-	want := perm &^ dirWriteBits
-	// Same observe-after-chmod discipline as tightenMode: a chmod's return value says
-	// the request was accepted, not that the bits were kept.
-	got, chmodErr := s.chmodAndObserve(dir, want)
-	if chmodErr == nil && got&dirWriteBits == 0 {
-		if s.firstRecordFor(dir) {
-			slog.Info(dirWriteTightenedMsg,
-				"path", dir, "dir", s.root.Name(),
-				"from", perm.String(), "to", got.String())
-		}
-		return nil
-	}
-	cause := chmodErr
-	if cause == nil {
-		cause = fmt.Errorf("%w: mode is %s after chmod", errDirWriteUnstored, got.String())
-	}
-	s.dirRepairFailed = true
-	if s.firstRecordFor(dir) {
-		slog.Warn(dirWriteRefusedMsg,
-			"path", dir, "dir", s.root.Name(),
-			"mode", perm.String(), "want", want.String(),
-			"error", cause, "remediation", outputPermRemediation)
-	}
-	return fmt.Errorf("output directory %q is group- or world-writable: %w", dir, cause)
-}
-
-// reportLaxDirAt is the report-only half: a directory whose extra bits expose names or
-// traversal but grant no write authority, named once per directory per scan.
-func (s *store) reportLaxDirAt(dir string, perm os.FileMode) {
-	if perm&^pfxDirMode == 0 || !s.firstRecordFor(dir) {
 		return
-	}
-	// dir is root-relative, so it is "." for the flat /output the README's own setup step
-	// produces — the shape this WARN exists for. The root is named alongside it, as
-	// logOrphanWalkOutcome does for its directory-level records, so the operator is told
-	// which directory to chmod rather than being handed a bare dot.
-	slog.Warn(laxDirMsg,
-		"path", dir, "dir", s.root.Name(),
-		"mode", perm.String(), "want", os.FileMode(pfxDirMode).String(),
-		"remediation", outputPermRemediation)
-}
-
-// firstRecordFor reports whether dir has not been recorded yet on this scan, marking
-// it recorded. isCurrent runs for every .crt, so a flat /output holding twenty
-// certificates must not emit twenty identical directory records every scan.
-func (s *store) firstRecordFor(dir string) bool {
-	if _, done := s.laxDirsReported[dir]; done {
-		return false
 	}
 	if s.laxDirsReported == nil {
 		s.laxDirsReported = make(map[string]struct{})
 	}
 	s.laxDirsReported[dir] = struct{}{}
-	return true
+	if perm := fi.Mode().Perm(); perm&^pfxDirMode != 0 {
+		slog.Warn(laxDirMsg,
+			"path", dir, "mode", perm.String(), "want", os.FileMode(pfxDirMode).String(),
+			"remediation", outputPermRemediation)
+	}
 }
 
 // writeFileInRoot is store.write's confined atomic write, indirected through a
@@ -218,13 +113,6 @@ var writeFileInRoot = atomicfile.WriteFileInRoot
 // by a hand-rolled MkdirAll here. WithMkdirMode creates the parent inside the
 // same confined root as the write, so mode and confinement cannot drift.
 func (s *store) write(ctx context.Context, rel string, pfx []byte) error {
-	// Re-asked here rather than trusted from isCurrent: this is the call that publishes
-	// the private key, and it is the one that must not land in a directory another UID
-	// can rewrite. It is cheap (one lstat per ancestor, records deduped per scan) and
-	// idempotent, and a repair that succeeded on the currency pass leaves nothing to do.
-	if err := s.enforceDirPerms(rel); err != nil {
-		return err
-	}
 	if _, err := writeFileInRoot(ctx, s.root, rel, pfx,
 		atomicfile.WithMode(pfxFileMode),
 		atomicfile.WithMkdirMode(pfxDirMode),
@@ -392,14 +280,10 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 	wantEncoder convert.EncoderType, password string,
 ) (bool, staleCause, error) {
 	// Asked before the bundle's own lstat so it covers the absent-bundle arm too: the
-	// directory is lax whether or not a prior bundle sits in it. A group- or
-	// world-writable ancestor this app could not tighten is returned as an error
-	// rather than reported, because the currency answer would be moot: whatever this
-	// scan decides about the bundle, publishing one into that namespace lets another
-	// UID replace it.
-	if err := s.enforceDirPerms(rel); err != nil {
-		return false, staleOrdinary, err
-	}
+	// directory is lax whether or not a prior bundle sits in it. Report-only, so it
+	// never changes the currency answer, the write, the reap or health — see
+	// reportLaxDir.
+	s.reportLaxDir(rel)
 	fi, err := s.lstat(rel)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -806,19 +690,9 @@ func (s *store) readBoundedPFX(ctx context.Context, rel string) ([]byte, error) 
 // comparison spans both trees, so it stays with the rest of the deletion-admission
 // rule in reap.go.
 func (s *store) listOutputs(ctx context.Context) (found []string, safe bool, err error) {
-	walk := outputWalk{ctx: ctx, store: s, safe: true}
+	walk := outputWalk{ctx: ctx, safe: true}
 	if err := fs.WalkDir(s.root.FS(), ".", walk.visit); err != nil {
 		return nil, false, fmt.Errorf("walk output tree: %w", err)
-	}
-	if s.dirRepairFailed {
-		// Scan-wide backstop for a repair refusal recorded ELSEWHERE — the write path's
-		// own enforceDirPerms, on an ancestor of a live bundle. The per-directory
-		// verdict this walk applies covers the directories it enumerates, including an
-		// orphan-only subtree no input-driven call ever inspects; this catches the rest.
-		// Either way a directory another process can write makes every candidate under
-		// it replaceable between this walk and the unlink, so nothing found here is
-		// provably orphaned, and dirWriteRefusedMsg already named the directory.
-		walk.safe = false
 	}
 	s.logOrphanWalkOutcome(walk.unreadable, walk.symlinked)
 	return walk.found, walk.safe, nil
@@ -831,13 +705,7 @@ func (s *store) listOutputs(ctx context.Context) (found []string, safe bool, err
 // candidate collection are the same branches either way, but the state a deletion
 // decision rests on is now spelled out as fields.
 type outputWalk struct {
-	ctx context.Context
-	// store is the tree being walked, so the walk can apply the same per-directory
-	// write-permission verdict the write path applies. It has to be asked HERE for a
-	// directory holding nothing but orphans: enforceDirPerms is only ever reached from
-	// isCurrent and write, both driven by an INPUT pair, so a nested directory whose
-	// bundles are all orphaned is otherwise never inspected at all.
-	store      *store
+	ctx        context.Context
 	found      []string
 	unreadable int
 	symlinked  int
@@ -880,12 +748,10 @@ func (w *outputWalk) visit(rel string, d fs.DirEntry, err error) error {
 		return nil
 	}
 	if d.IsDir() {
-		// The write path's verdict, applied to every directory this walk enumerates: a
-		// directory another process can write and this app cannot repair makes every
-		// candidate beneath it replaceable between this walk and the unlink.
-		if err := w.store.enforceDirPermsAt(rel); err != nil {
-			w.safe = false
-		}
+		// The directory's own mode is not this walk's business: it is reported once per
+		// scan by reportLaxDir on the write side and acts on nothing (a directory this
+		// app can write but not chmod is the operator's choice), so it can neither veto
+		// a deletion nor be repaired from here.
 		return nil
 	}
 	if !layout.IsOutput(rel) {
@@ -998,9 +864,11 @@ func (s *store) removeOrphan(rel string) bool {
 			"remediation", outputPermRemediation)
 		return false
 	}
-	// Every deletion is named. Removing key material without an audit line is
-	// not acceptable even when it is correct.
-	slog.Info("removed orphaned output whose input is gone", "path", rel)
+	// Every deletion is named. The once-per-scan audit record (reapAuditMsg) is the
+	// warn-visible contract for that; this per-path line is the complete, unbounded
+	// list for a reader who asked for detail, so it sits at Debug rather than repeating
+	// the audit at the default level once per path.
+	slog.Debug("removed orphaned output whose input is gone", "path", rel)
 	return true
 }
 

@@ -57,7 +57,7 @@ func TestReadPair_separates_a_key_that_vanished_from_a_key_that_was_never_there(
 	}
 	t.Cleanup(func() { _ = inHandle.Close() })
 
-	sw := &scanWalk{src: &source{root: inHandle}, observations: newObservationLog()}
+	sw := &scanWalk{src: &source{root: inHandle}, observations: newObservationLog(0)}
 	// "renewed.crt" and "linked.crt" were read whole by an earlier scan of this
 	// process; "fresh.crt" never was. record is the same call convertEntry makes on
 	// its success path, which is what makes the presence of an entry mean "this pair's

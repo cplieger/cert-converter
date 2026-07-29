@@ -652,6 +652,18 @@ func TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established(t *tes
 		t.Errorf("observations = %v, want one of kind %q so the operator knows the chain was not verified",
 			got.Observations(), convert.ObsChainUnverified)
 	}
+	// The split between the two terminus kinds is what leftovers decide: here a
+	// certificate this app could not place was carried into the bundle anyway, which is
+	// the warning's subject. The informational anchor-absent kind is for the bundle
+	// where nothing was left over at all.
+	if hasObservation(got.Observations(), convert.ObsChainTrustAnchorAbsent) {
+		t.Errorf("observations = %v, want no %q: a certificate was kept whose ancestry is unestablished, which is more than an absent anchor",
+			got.Observations(), convert.ObsChainTrustAnchorAbsent)
+	}
+	if got := convert.ObsChainUnverified.Class(); got != convert.ObservationClassWarning {
+		t.Errorf("ObsChainUnverified.Class() = %q, want %q: this signal must not be quietened by the class split",
+			got, convert.ObservationClassWarning)
+	}
 }
 
 // TestAnalyse_still_excludes_an_unrelated_cert_from_a_self_signed_identity keeps
@@ -2305,12 +2317,19 @@ func TestAnalyse_treats_a_reencoded_self_issued_certificate_as_its_own_root(t *t
 	}
 }
 
-// TestAnalyse_reports_an_unfinished_chain_with_nothing_left_over pins the fact
-// ObsChainUnverified was gated on: a CA-signed leaf ALONE has an unfinished chain
-// and no leftover certificate to append, so the fallback's diagnostic branch was
-// skipped and the app's only input-diagnostic channel said nothing about the
-// missing issuer. Conversion still succeeds with an empty chain - a PFX holding
-// just the identity is a legitimate output - but it must not be silent.
+// TestAnalyse_reports_an_unfinished_chain_with_nothing_left_over pins the fact the
+// terminus diagnostic was once gated on leftovers for: a CA-signed leaf ALONE has an
+// unfinished chain and no leftover certificate to append, so the diagnostic branch was
+// skipped and the app's only input-diagnostic channel said nothing about the missing
+// issuer. Conversion still succeeds with an empty chain - a PFX holding just the
+// identity is a legitimate output - but it must not be silent.
+//
+// Which KIND it is not silent with was settled separately: nothing was left over, so
+// there is nothing this app failed to place, and the only fact is that the issuer above
+// the leaf is absent. That is ObsChainTrustAnchorAbsent at the informational class, and
+// ObsChainUnverified (a warning about certificates carried without established
+// ancestry) must NOT fire here - it was reporting a leftover disposition for a bundle
+// with no leftovers.
 func TestAnalyse_reports_an_unfinished_chain_with_nothing_left_over(t *testing.T) {
 	t.Parallel()
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
@@ -2344,9 +2363,17 @@ func TestAnalyse_reports_an_unfinished_chain_with_nothing_left_over(t *testing.T
 	if len(got.Extra()) != 0 {
 		t.Errorf("Extra = %v, want empty: there is nothing besides the identity", chainSerials(got.Extra()))
 	}
-	if !hasObservation(got.Observations(), convert.ObsChainUnverified) {
+	if !hasObservation(got.Observations(), convert.ObsChainTrustAnchorAbsent) {
 		t.Errorf("observations = %v, want %q: the leaf is not self-signed and its issuer could not be established",
+			got.Observations(), convert.ObsChainTrustAnchorAbsent)
+	}
+	if hasObservation(got.Observations(), convert.ObsChainUnverified) {
+		t.Errorf("observations = %v, want no %q: nothing was left over, so nothing was carried without established ancestry",
 			got.Observations(), convert.ObsChainUnverified)
+	}
+	if got := convert.ObsChainTrustAnchorAbsent.Class(); got != convert.ObservationClassInfo {
+		t.Errorf("ObsChainTrustAnchorAbsent.Class() = %q, want %q: an absent anchor is the documented fullchain shape, not a warning",
+			got, convert.ObservationClassInfo)
 	}
 	if hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
 		t.Errorf("observations = %v, want no %q: no certificate was held back",
@@ -2355,10 +2382,16 @@ func TestAnalyse_reports_an_unfinished_chain_with_nothing_left_over(t *testing.T
 }
 
 // TestAnalyse_reports_an_unfinished_chain_when_only_the_root_is_absent is the same
-// gap one link further up: the leaf-to-intermediate hop is PROVEN, so the path walk
-// consumes every parsed certificate and leaves nothing over, and the terminus is
-// still not self-signed. The intermediate must stay in the chain and the missing
-// root must be named.
+// gap one link further up, and it is this app's PRIMARY DOCUMENTED INPUT: a Caddy/ACME
+// fullchain is leaf + intermediate with the root deliberately absent. The
+// leaf-to-intermediate hop is PROVEN, so the path walk consumes every parsed
+// certificate and leaves nothing over, and the terminus is still not self-signed. The
+// intermediate must stay in the chain and the missing root must be named.
+//
+// Named at the INFORMATIONAL class, not as a warning: the operator has nothing to act
+// on (the consumer is expected to hold the root), and the condition recurs on first
+// sight, after every renewal and after every restart, so ObsChainUnverified's warning
+// here was log noise on the app's most ordinary input.
 func TestAnalyse_reports_an_unfinished_chain_when_only_the_root_is_absent(t *testing.T) {
 	t.Parallel()
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
@@ -2403,8 +2436,16 @@ func TestAnalyse_reports_an_unfinished_chain_when_only_the_root_is_absent(t *tes
 	if len(got.Extra()) != 0 {
 		t.Errorf("Extra = %v, want empty: every parsed certificate is on the path", chainSerials(got.Extra()))
 	}
-	if !hasObservation(got.Observations(), convert.ObsChainUnverified) {
+	if !hasObservation(got.Observations(), convert.ObsChainTrustAnchorAbsent) {
 		t.Errorf("observations = %v, want %q: the intermediate's own issuer is absent",
+			got.Observations(), convert.ObsChainTrustAnchorAbsent)
+	}
+	if hasObservation(got.Observations(), convert.ObsChainUnverified) {
+		t.Errorf("observations = %v, want no %q: a fullchain's absent root is not an unplaceable leftover, and warning about it on every renewal is noise",
 			got.Observations(), convert.ObsChainUnverified)
+	}
+	if hasObservation(got.Observations(), convert.ObsChainEdgeUnprovenIssuer) {
+		t.Errorf("observations = %v, want no %q: the one emitted edge is proven by signature",
+			got.Observations(), convert.ObsChainEdgeUnprovenIssuer)
 	}
 }

@@ -93,14 +93,8 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 			t.Skip("root ignores directory permissions")
 		}
 
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = root.Close() })
-
 		logs := captureLogs(t)
-		s := &store{root: root}
+		s := newOutputStore(t, dir)
 		_, safe, err := s.listOutputs(t.Context())
 		if err != nil {
 			t.Fatalf("listOutputs = %v, want nil: one unreadable sub-path must not abort the walk", err)
@@ -118,14 +112,8 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 		if err := os.Symlink(dir, filepath.Join(dir, "loop")); err != nil {
 			t.Skipf("symlink unsupported here: %v", err)
 		}
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = root.Close() })
-
 		logs := captureLogs(t)
-		s := &store{root: root}
+		s := newOutputStore(t, dir)
 		_, safe, err := s.listOutputs(t.Context())
 		if err != nil {
 			t.Fatalf("listOutputs = %v, want nil", err)
@@ -134,6 +122,12 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 			t.Error("safe = true, want false: writes and this walk resolve a symlink differently")
 		}
 
+		// The two symlink lines are one condition at two levels, not a duplicate: the
+		// per-path line ("...contains a symlink", Debug, names the path) is what
+		// LOG_LEVEL=debug gives an operator, and the aggregate ("...contains symlinks",
+		// Warn, carries the count and the remediation) is the once-per-scan default-level
+		// record. Both are correct; only one may be a WARN, which is what the two
+		// assertions below say.
 		assertDebugOnly(t, logs, "output tree contains a symlink", "loop")
 		assertOneAggregateWarn(t, logs, "output tree contains symlinks", "1")
 	})
@@ -219,12 +213,7 @@ func TestStoreLogOrphanWalkOutcome_reports_each_disabling_condition(t *testing.T
 	const unreadableMsg = "some output paths could not be read while looking for orphans; orphan removal is disabled for this scan"
 	const symlinkMsg = "output tree contains symlinks; orphan removal is disabled for this scan because writes and the orphan walk resolve paths differently"
 
-	root, err := os.OpenRoot(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
-	s := &store{root: root}
+	s := newOutputStore(t, t.TempDir())
 
 	t.Run("unreadable output paths are reported with their count", func(t *testing.T) {
 		logs := captureLogs(t)
@@ -253,23 +242,18 @@ func TestStoreLogOrphanWalkOutcome_reports_each_disabling_condition(t *testing.T
 // output tree with no symlinks emits no aggregate at all. A guard that also fired on
 // zero would put a "count=0" warning with a remediation hint into the log on every
 // scan of a perfectly healthy /output.
+//
+// The root's own mode is deliberately left as the host created it (t.TempDir yields
+// 0755 on some hosts, and an inherited default ACL can widen a fresh directory): the
+// orphan walk has no business inspecting directory permissions at all, so a
+// permissiveness record appearing here is a failure. The /output directory mode is
+// reported once per scan from the write side (store.reportLaxDir) and acts on nothing
+// — an earlier cycle asked this walk for that verdict and used it to veto reaping,
+// which the 2026-07 decision removed.
 func TestWalkLogPolicy_quiet_when_nothing_is_wrong(t *testing.T) {
 	dir := t.TempDir()
-	// listOutputs applies the write-permission verdict to every directory it
-	// enumerates, so "nothing is wrong" has to include the root's own mode: a
-	// group-writable /output is a condition the walk is REQUIRED to report, and some
-	// hosts hand t.TempDir a group-writable directory (an inherited default ACL).
-	if err := os.Chmod(dir, 0o750); err != nil {
-		t.Fatal(err)
-	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
-
 	logs := captureLogs(t)
-	s := &store{root: root}
+	s := newOutputStore(t, dir)
 	if _, safe, orphanErr := s.listOutputs(t.Context()); orphanErr != nil || !safe {
 		t.Fatalf("listOutputs(clean tree) = safe %v, err %v; want true, nil", safe, orphanErr)
 	}

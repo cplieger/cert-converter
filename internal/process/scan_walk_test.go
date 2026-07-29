@@ -111,13 +111,7 @@ func TestStoreIsCurrent_degrades_when_the_output_cannot_be_inspected(t *testing.
 	if err := os.Symlink(outside, filepath.Join(outDir, "swapped")); err != nil {
 		t.Fatal(err)
 	}
-	outHandle, err := os.OpenRoot(outDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = outHandle.Close() })
-
-	s := &store{root: outHandle}
+	s := newOutputStore(t, outDir)
 
 	current, _, err := s.isCurrent(t.Context(), "swapped/tls.pfx", &convert.Analysis{}, convert.EncNameModern2023, "pw")
 	if err != nil {
@@ -173,17 +167,11 @@ func TestScanWalkVisit_cancellation_during_conversion_aborts_the_walk(t *testing
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = inHandle.Close() })
-	outHandle, err := os.OpenRoot(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = outHandle.Close() })
-
 	fi, err := os.Lstat(filepath.Join(certsRoot, "late.crt"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	sw := &scanWalk{src: &source{root: inHandle}, out: &store{root: outHandle}, seen: make(map[string]struct{})}
+	sw := &scanWalk{src: &source{root: inHandle}, out: newOutputStore(t, t.TempDir()), seen: make(map[string]struct{})}
 
 	got := sw.visit(&cancelAfterFirstCheck{}, "late.crt", fs.FileInfoToDirEntry(fi), nil)
 

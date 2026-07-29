@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"os"
 	"testing"
 
 	"github.com/cplieger/atomicfile/v2"
@@ -24,12 +23,6 @@ import (
 // package tests the app-specific logs because their remediation names /output
 // and the deployment's user mapping. Runs serially because it swaps slog.Default().
 func TestStoreLogSweepOutcome_operator_signals(t *testing.T) {
-	root, err := os.OpenRoot(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
-
 	tests := []struct {
 		walkErr       error
 		name          string
@@ -80,7 +73,7 @@ func TestStoreLogSweepOutcome_operator_signals(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			s := &store{root: root}
+			s := newOutputStore(t, t.TempDir())
 			s.logSweepOutcome(tt.res, tt.walkErr)
 
 			if !logs.Contains(tt.wantMsg) {
@@ -112,15 +105,9 @@ func TestStoreLogSweepOutcome_operator_signals(t *testing.T) {
 // operator-facing warning with a remediation hint, into the log on every scan of
 // a perfectly healthy /output. Runs serially: it swaps slog.Default().
 func TestStoreLogSweepOutcome_is_silent_for_a_clean_sweep(t *testing.T) {
-	root, err := os.OpenRoot(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
-
 	logs := captureLogs(t)
 
-	s := &store{root: root}
+	s := newOutputStore(t, t.TempDir())
 	s.logSweepOutcome(atomicfile.SweepResult{}, nil)
 
 	if logs.Len() != 0 {

@@ -10,9 +10,14 @@ import (
 	"encoding/asn1"
 	"encoding/pem"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"maps"
 	"math/big"
 	"reflect"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -611,4 +616,122 @@ func TestNameLink_refuses_a_name_it_cannot_decode(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestObservationKind_Class_pins_every_declared_kind is the guard that keeps the
+// classification from going stale. internal/process chooses a log level FROM
+// ObservationKind.Class, so a kind added without a class entry, or an existing kind
+// whose class quietly moves, changes what an operator sees with nothing else in the
+// suite failing: Class's fallback answers "warning" for an unlisted kind, which
+// compiles and looks reasonable.
+//
+// The declared kinds are read out of analyse.go's AST rather than from a list in
+// production, because a production list is the very thing that would go stale (it
+// would have to be maintained beside the constants it claims to enumerate). The table
+// below is the pinned expectation: everything the code treated as noise before the
+// class existed is quiet, everything else is a warning, and the trust-anchor kind is
+// the one deliberate informational level.
+func TestObservationKind_Class_pins_every_declared_kind(t *testing.T) {
+	t.Parallel()
+
+	want := map[ObservationKind]ObservationClass{
+		ObsLeafNotFirst:             ObservationClassWarning,
+		ObsMultipleKeys:             ObservationClassWarning,
+		ObsDuplicateCerts:           ObservationClassQuiet,
+		ObsExtraCertsExcluded:       ObservationClassWarning,
+		ObsRenewedCertTie:           ObservationClassWarning,
+		ObsCAAsIdentity:             ObservationClassWarning,
+		ObsChainUnverified:          ObservationClassWarning,
+		ObsChainTrustAnchorAbsent:   ObservationClassInfo,
+		ObsIdentityNotYetValid:      ObservationClassWarning,
+		ObsIdentityExpired:          ObservationClassWarning,
+		ObsChainCertOutOfWindow:     ObservationClassWarning,
+		ObsChainCertCannotIssue:     ObservationClassWarning,
+		ObsUnrelatedBlocksSkipped:   ObservationClassWarning,
+		ObsUnusableKeyBlocksSkipped: ObservationClassWarning,
+		ObsIssuerMatchIgnored:       ObservationClassWarning,
+		ObsKeyReusedAcrossCerts:     ObservationClassWarning,
+		ObsChainEdgeUnprovenIssuer:  ObservationClassWarning,
+	}
+
+	declared := declaredObservationKinds(t)
+	if len(declared) != len(want) {
+		t.Errorf("analyse.go declares %d observation kind(s), the table pins %d: a kind was added or removed without stating its class",
+			len(declared), len(want))
+	}
+	for name, kind := range declared {
+		wantClass, pinned := want[kind]
+		if !pinned {
+			t.Errorf("%s (%q) has no class pinned in this test: state it here and in ObservationKind.Class, because process picks the log level from it and an unlisted kind silently reaches the operator as a warning",
+				name, kind)
+			continue
+		}
+		if got := kind.Class(); got != wantClass {
+			t.Errorf("%s.Class() = %q, want %q: a class change moves what the operator sees, so it may not happen as a side effect",
+				name, got, wantClass)
+		}
+	}
+	for kind := range want {
+		if !slices.Contains(slices.Collect(maps.Values(declared)), kind) {
+			t.Errorf("this test pins a class for %q, which analyse.go no longer declares: drop the entry", kind)
+		}
+	}
+	// The classes themselves are a closed set; a fourth value would need a decision in
+	// process about how to log it, so it must not appear here by accident.
+	for name, kind := range declared {
+		switch got := kind.Class(); got {
+		case ObservationClassQuiet, ObservationClassInfo, ObservationClassWarning:
+		default:
+			t.Errorf("%s.Class() = %q, which is not one of the three declared classes", name, got)
+		}
+	}
+}
+
+// declaredObservationKinds returns every ObservationKind constant analyse.go
+// declares, by constant name. Reading the source is the point: it is what lets the
+// class table above fail on a kind that was ADDED, which no assertion against the
+// package's own symbols can see.
+func declaredObservationKinds(t *testing.T) map[string]ObservationKind {
+	t.Helper()
+
+	const src = "analyse.go"
+	file, err := parser.ParseFile(token.NewFileSet(), src, nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("setup: parse %s: %v", src, err)
+	}
+
+	kinds := map[string]ObservationKind{}
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			if ident, ok := vs.Type.(*ast.Ident); !ok || ident.Name != "ObservationKind" {
+				continue
+			}
+			for i, name := range vs.Names {
+				if i >= len(vs.Values) {
+					t.Fatalf("setup: %s declares %s with no value; the parse assumes one literal per name", src, name.Name)
+				}
+				lit, ok := vs.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					t.Fatalf("setup: %s declares %s with a non-literal value; this parse cannot evaluate it", src, name.Name)
+				}
+				value, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					t.Fatalf("setup: unquote %s's value %s: %v", name.Name, lit.Value, err)
+				}
+				kinds[name.Name] = ObservationKind(value)
+			}
+		}
+	}
+	if len(kinds) == 0 {
+		t.Fatalf("setup: found no ObservationKind constants in %s; the AST walk is broken, not the table", src)
+	}
+	return kinds
 }

@@ -17,3 +17,11 @@ require (
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 )
+
+// LOCAL WIRING ONLY - MUST NOT BE MERGED.
+// cert-converter adopts primitives added to these libraries in the same review
+// (runesafe cap-and-mark, atomicfile ProbeWritable). Drop both lines and bump
+// the pinned versions once runesafe and atomicfile release.
+replace github.com/cplieger/runesafe => ../runesafe
+
+replace github.com/cplieger/atomicfile/v2 => ../atomicfile

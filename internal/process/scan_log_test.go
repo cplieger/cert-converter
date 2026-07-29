@@ -138,7 +138,7 @@ func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = inHandle.Close() })
-	sw := &scanWalk{src: &source{root: inHandle}, observations: newObservationLog()}
+	sw := &scanWalk{src: &source{root: inHandle}, observations: newObservationLog(0)}
 
 	for _, tt := range []struct {
 		certRel, keyRel, wantMsg string
@@ -223,8 +223,9 @@ func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing
 // exactly that shape and stay quiet otherwise, or it becomes noise on every
 // fsnotify event and every fallback tick. An incomplete enumeration
 // (Unreadable > 0) must stay quiet too: Run continues past an unreadable
-// sub-path, so "every certificate" is unproven and the unreadable-path WARN
-// already carries the actionable diagnosis. Runs serially: it swaps
+// sub-path, so "every certificate" is unproven — the unreadable-path WARN carries the
+// actionable diagnosis, and the per-path "some certificates" notice names the missing
+// keys this scan did observe. Runs serially: it swaps
 // slog.Default().
 func TestLogScanOutcome_flags_an_input_tree_whose_certs_all_lack_a_key(t *testing.T) {
 	const wantMsg = "every certificate under the input root is missing its sibling .key"
@@ -258,19 +259,28 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_all_lack_a_key(t *testin
 	}
 }
 
-// TestLogConversionObservations_levels pins the one observation-reporting split
-// this package makes: a duplicate-block artefact is noise and stays at Debug,
-// while every other observation names something the operator probably did not
-// intend and must reach the default level. Inverting it would either bury a
-// reordered bundle, a multi-key file or an expired identity under
-// LOG_LEVEL=debug, or WARN on every conversion of a bundle whose only oddity is a
-// repeated certificate. Runs serially: it swaps slog.Default().
+// TestLogConversionObservations_levels pins this package's mapping from
+// convert.ObservationClass onto log levels, one case per class: a duplicate-block
+// artefact is Quiet and stays at Debug, a chain that stops at an absent trust anchor
+// is Info (a true fact about the documented Caddy fullchain shape, with nothing for
+// the operator to do) and reaches INFO, and everything the operator probably did not
+// intend is Warning and must reach WARN.
+//
+// The Info case is the one a regression collapses: the old boolean classification had
+// no room for it, so it was reported as a problem — a WARN on every conversion of a
+// perfectly normal fullchain. Inverting the other two would either bury a reordered
+// bundle, a multi-key file or an expired identity under LOG_LEVEL=debug, or WARN on
+// every conversion of a bundle whose only oddity is a repeated certificate. Runs
+// serially: it swaps slog.Default().
 func TestLogConversionObservations_levels(t *testing.T) {
 	for _, tc := range []struct {
 		kind      convert.ObservationKind
 		wantLevel slog.Level
 	}{
 		{convert.ObsDuplicateCerts, slog.LevelDebug},
+		// The expected shape of a Caddy/ACME fullchain: named so it is not invisible,
+		// deliberately not as a problem.
+		{convert.ObsChainTrustAnchorAbsent, slog.LevelInfo},
 		{convert.ObsLeafNotFirst, slog.LevelWarn},
 		{convert.ObsMultipleKeys, slog.LevelWarn},
 		{convert.ObsIdentityExpired, slog.LevelWarn},
@@ -425,25 +435,42 @@ func TestNoteUnreadableInput_levels(t *testing.T) {
 // .crt files lack their .key, the pairs that do have a key still convert, so the
 // scan reports failed=0 and the health marker stays set while those certificates
 // produce no PFX and their existing bundles go stale unreaped. It must fire for
-// exactly that shape, stay quiet when the all-orphan or empty-tree notice owns the
-// case (they are earlier switch arms), and stay quiet on an unproven enumeration.
+// exactly that shape and stay quiet when the all-orphan or empty-tree notice owns the
+// case (they are earlier switch arms).
+//
+// The three enumeration vetoes do NOT silence it, and that is the contract this table
+// pins after the 2026-07 decision: each coverage message is gated by the evidence IT
+// needs. Every counted orphan is proven path by path (readPair stats the sibling
+// through the confined root and only ENOENT becomes statusOrphan), so an unreadable
+// path, an unresolved symlink or a renewal elsewhere in the tree cannot make an
+// observed missing key unobserved. The previous shape required silence on all three
+// and that stated defence is VOID: it suppressed a proven fact because of an unrelated
+// hole, for as long as the hole stood. Only the whole-tree claims (empty tree, EVERY
+// certificate) still need a complete enumeration — which is why the all-orphan shape
+// with a veto present falls through to this notice rather than going silent.
+//
+// An aborted scan stays quiet: a walk that stopped observed an arbitrary prefix.
 // Runs serially: it swaps slog.Default().
 func TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key(t *testing.T) {
 	const wantMsg = "some certificates under the input root are missing their sibling .key"
 	for _, tt := range []struct {
-		walkErr  error
-		name     string
-		result   ScanResult
-		wantWarn bool
+		walkErr   error
+		name      string
+		result    ScanResult
+		wantWarn  bool
+		wantCount string
 	}{
-		{nil, "a partially orphaned tree is named", ScanResult{Total: 2, Converted: 1, Orphan: 1}, true},
-		{nil, "an all-orphan tree stays quiet (the earlier arm owns it)", ScanResult{Total: 2, Orphan: 2}, false},
-		{nil, "an empty tree stays quiet (the Total==0 notice owns it)", ScanResult{}, false},
-		{nil, "a fully converted tree stays quiet", ScanResult{Total: 2, Converted: 2}, false},
-		{nil, "an unreadable sub-path stays quiet", ScanResult{Total: 3, Converted: 1, Orphan: 1, Unreadable: 1}, false},
-		{nil, "an unresolved symlink stays quiet", ScanResult{Total: 2, Converted: 1, Orphan: 1, Unresolved: 1}, false},
-		{nil, "a cert that vanished mid-scan stays quiet", ScanResult{Total: 3, Converted: 1, Orphan: 1, Vanished: 1}, false},
-		{errors.New("permission denied"), "an aborted scan stays quiet", ScanResult{Total: 2, Converted: 1, Orphan: 1}, false},
+		{nil, "a partially orphaned tree is named", ScanResult{Total: 2, Converted: 1, Orphan: 1}, true, "1"},
+		{nil, "an all-orphan tree stays quiet (the earlier arm owns it)", ScanResult{Total: 2, Orphan: 2}, false, ""},
+		{nil, "an empty tree stays quiet (the Total==0 notice owns it)", ScanResult{}, false, ""},
+		{nil, "a fully converted tree stays quiet", ScanResult{Total: 2, Converted: 2}, false, ""},
+		{nil, "an unreadable sub-path does not silence a proven missing key", ScanResult{Total: 3, Converted: 1, Orphan: 1, Unreadable: 1}, true, "1"},
+		{nil, "an unresolved symlink does not silence a proven missing key", ScanResult{Total: 2, Converted: 1, Orphan: 1, Unresolved: 1}, true, "1"},
+		{nil, "a cert that vanished mid-scan does not silence a proven missing key", ScanResult{Total: 3, Converted: 1, Orphan: 1, Vanished: 1}, true, "1"},
+		// "every certificate" is not provable here, but "some" still is, so the
+		// unprovable arm hands the case to this one instead of the scan going silent.
+		{nil, "an all-orphan tree with a veto falls through to the per-path notice", ScanResult{Total: 2, Orphan: 2, Unreadable: 1}, true, "2"},
+		{errors.New("permission denied"), "an aborted scan stays quiet", ScanResult{Total: 2, Converted: 1, Orphan: 1}, false, ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
@@ -460,8 +487,9 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key(t *
 			if logs.CountLevel(slog.LevelWarn, wantMsg) != 1 {
 				t.Errorf("logScanOutcome(%+v, nil) logged %q, want the partial-orphan notice at level WARN", tt.result, logs.Messages())
 			}
-			if !logs.HasAttr(wantMsg, "orphan", "1") {
-				t.Errorf("logScanOutcome(%+v, nil) logged %q, want the orphan count on the notice", tt.result, logs.Messages())
+			if !logs.HasAttr(wantMsg, "orphan", tt.wantCount) {
+				got, _ := logs.AttrValue(wantMsg, "orphan")
+				t.Errorf("logScanOutcome(%+v, nil) logged orphan=%q, want %q on the notice", tt.result, got, tt.wantCount)
 			}
 		})
 	}
