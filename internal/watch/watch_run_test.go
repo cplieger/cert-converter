@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -479,5 +480,68 @@ func TestAttachWatchSet_names_the_rescan_cadence_when_it_degrades_to_polling(t *
 				t.Errorf("WARN %q fallback_scan = %q with WithFallback(%v), want %q", tc.msg, got, tc.fallback, tc.wantFallback)
 			}
 		})
+	}
+}
+
+// TestTryAttachWatchSet_rebuilds_the_membership_mirror_for_a_new_watcher pins
+// the mirror reset every attach performs: each attach constructs a NEW fsnotify
+// watcher whose registration set starts empty, so a path recorded for the
+// previous, now-closed watcher must not be reported as watched under the new
+// one. Without the reset the mirror claims a directory is watched that the new
+// watcher never registered, handlePathEvent's membership guard skips the
+// subtree re-walk on the strength of that claim, and every renewal underneath
+// it is detected only by the periodic rescan -- never, with the fallback
+// disabled.
+//
+// The oracle is a directory that goes away BETWEEN the two attaches, while no
+// watch loop is running: no Remove event is ever delivered, so the event path's
+// forgetWatch cannot cover it and only the reset can.
+func TestTryAttachWatchSet_rebuilds_the_membership_mirror_for_a_new_watcher(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	dir := filepath.Join(root, "example.com")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	w := New(root, func(context.Context) {})
+
+	first, stage, err := w.tryAttachWatchSet(t.Context())
+	if stage != stageAttached || err != nil {
+		t.Fatalf("setup: tryAttachWatchSet = (stage %v, %v), want stageAttached", stage, err)
+	}
+	if !w.watchSetHas(dir) {
+		t.Fatalf("setup: %q is not in the membership mirror after the first attach", dir)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("setup: first.Close() = %v", err)
+	}
+
+	// The directory goes away while no watch loop is running, so no Remove event
+	// is ever delivered and the event path cannot forget it.
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	second, stage, err := w.tryAttachWatchSet(t.Context())
+	if stage != stageAttached || err != nil {
+		t.Fatalf("tryAttachWatchSet (re-attach) = (stage %v, %v), want stageAttached", stage, err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+
+	if w.watchSetHas(dir) {
+		t.Errorf("the membership mirror still claims %q is watched after a re-attach that did not register it", dir)
+	}
+
+	// The consequence: with the stale claim in place, the recreated directory
+	// looks already-watched and its subtree is never walked again.
+	child := filepath.Join(dir, "nested")
+	if err := os.MkdirAll(child, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.handleFsEvent(t.Context(), second, fsnotify.Event{Name: dir, Op: fsnotify.Create}); !got {
+		t.Error("handleFsEvent(Create of the recreated dir) = false, want true")
+	}
+	if watched := second.WatchList(); !slices.Contains(watched, child) {
+		t.Errorf("watch list = %v, want %q attached: a directory the new watcher never registered must be walked again", watched, child)
 	}
 }

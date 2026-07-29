@@ -3,6 +3,7 @@ package process
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -29,6 +30,10 @@ func TestLogScanOutcome_levels(t *testing.T) {
 		{context.Canceled, "cancelled walk logs at debug", "scan cancelled during shutdown", slog.LevelDebug},
 		{context.DeadlineExceeded, "deadline exceeded logs at debug", "scan cancelled during shutdown", slog.LevelDebug},
 		{errors.New("permission denied"), "other abort logs at warn", "scan aborted before completion", slog.LevelWarn},
+		{
+			fmt.Errorf("%w: stopped at 3 entries (a.crt)", errScanBudgetExceeded),
+			"entry-budget abort logs its own summary at warn", scanBudgetSummaryMsg, slog.LevelWarn,
+		},
 	}
 
 	for _, tt := range tests {

@@ -117,6 +117,13 @@ type Watcher struct {
 	debounce time.Duration
 	fallback time.Duration
 
+	// maxEntries is how many paths ONE watch-set walk may enumerate before it
+	// stops registering (fallbackWatchEntries when non-positive). It is INJECTED
+	// exactly as internal/process.Options.MaxScanEntries is: internal/config owns
+	// MAX_SCAN_ENTRIES' name, default, ceiling and repaired-value diagnostics, and
+	// this package stays a leaf that package configures.
+	maxEntries int
+
 	// watchedMu guards watched.
 	watchedMu sync.Mutex
 }
@@ -139,6 +146,29 @@ func WithDebounce(d time.Duration) Option {
 func WithFallback(d time.Duration) Option {
 	return func(w *Watcher) { w.fallback = d }
 }
+
+// WithMaxEntries sets how many paths one watch-set walk may enumerate. Zero or a
+// negative value uses fallbackWatchEntries.
+func WithMaxEntries(n int) Option {
+	return func(w *Watcher) { w.maxEntries = n }
+}
+
+// fallbackWatchEntries guards a Watcher constructed without a budget (a caller
+// that never wired one, and this package's own tests). It matches
+// internal/config's MAX_SCAN_ENTRIES default so an un-wired Watcher walks like a
+// default-configured one.
+const fallbackWatchEntries = 10000
+
+// watchBudgetMsg is the operator-facing half of a watch-set walk that stopped at
+// the budget. It names the health consequence (none) and what is lost (real-time
+// detection under the unwalked remainder) for the same reason the scan's own
+// budget WARN does, and it reuses that WARN's matched phrase so one alert rule
+// covers both walks over the same tree.
+const watchBudgetMsg = "the /input tree holds more entries than one scan will enumerate; stopping the watch-set walk, so directories past the budget are unwatched and renewals under them are covered only by the periodic rescan, health is unaffected"
+
+// watchBudgetRemediation names both ways out, exactly as the scan's does: a mount
+// pointed at the wrong tree, or a legitimately large certificate directory.
+const watchBudgetRemediation = "check that /input is mounted at the certificate directory and holds nothing else, or raise MAX_SCAN_ENTRIES if the tree is legitimately this large"
 
 // FallbackLabel renders a periodic-rescan interval for an operator-facing log
 // record. A non-positive interval is reported as "disabled" rather than as a
@@ -488,7 +518,22 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 // registrations. Callers must treat a ctx error as shutdown rather than a watch
 // failure (no WARN, no fallback to polling, no follow-up scan).
 func (w *Watcher) addWatchDirs(ctx context.Context, watcher *fsnotify.Watcher, root string) error {
+	budget := w.maxEntries
+	if budget <= 0 {
+		budget = fallbackWatchEntries
+	}
+	visited := 0
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		visited++
+		if visited > budget {
+			// One record per walk, not one per skipped directory: the remainder is
+			// unbounded, and the operator action is the same for all of it.
+			slog.Warn(watchBudgetMsg,
+				"root", root, "max_entries", budget,
+				"fallback_scan", w.fallbackStatus(),
+				"remediation", watchBudgetRemediation)
+			return fs.SkipAll
+		}
 		return w.visitWatchPath(ctx, watcher, root, path, d, walkErr)
 	})
 }
@@ -923,6 +968,11 @@ func (w *Watcher) handleErrorRecv(
 // it cut the re-sync short or arrived while the re-sync succeeded: the loop is
 // about to return anyway.
 func (w *Watcher) handleFallbackTick(ctx context.Context, watcher *fsnotify.Watcher, st *watchState) {
+	// The fallback tick re-asserts the whole set too, so it shares the pre-scan
+	// re-assert's clock: a debounced scan landing right behind this tick has nothing
+	// left to recover, and charging both sites to one timestamp is what keeps the
+	// walk on a cadence this process chose (see minPreScanResync).
+	st.lastResync = time.Now()
 	w.resyncWatchSet(ctx, watcher,
 		"failed to re-sync the watch set during the periodic fallback scan; the scan below still runs, so a renewal is not missed")
 	// Same stop-request rule as runDebouncedScan, on the success path too: the
@@ -944,6 +994,15 @@ func (w *Watcher) handleFallbackTick(ctx context.Context, watcher *fsnotify.Watc
 // degradation -- so neither can be changed for one re-sync site and silently left
 // wrong at the others. warning names what stays uncovered until the next re-sync.
 func (w *Watcher) resyncWatchSet(ctx context.Context, watcher *fsnotify.Watcher, warning string) {
+	// Rebuild rather than append: the walk below re-records every directory it registers, so
+	// starting from empty makes the mirror exactly the set this walk established. That prunes a
+	// path the tree no longer has - the mirror otherwise only forgets on a DELIVERED
+	// Remove/Rename, and the queue overflow that drops those deliveries is the same condition
+	// that routes here, so without this the map grows with churn for the process's life. A walk
+	// cut short below leaves the mirror emptier than the kernel's set, which errs toward one
+	// extra subtree walk on a later event (the safe direction this mirror already documents),
+	// never toward claiming an unwatched directory is watched.
+	w.resetWatchSet()
 	if addErr := w.addWatchDirs(ctx, watcher, w.root); addErr != nil {
 		if ctx.Err() == nil {
 			slog.Warn(warning, "root", w.root, "fallback_scan", w.fallbackStatus(), "error", addErr)
@@ -960,10 +1019,20 @@ func (w *Watcher) resyncWatchSet(ctx context.Context, watcher *fsnotify.Watcher,
 // debounce flag and the debounce/fallback timers. Hoisting the per-event work
 // onto its methods keeps watchLoop's select a flat dispatch table rather than a
 // deeply nested switch.
+// minPreScanResync floors how often a debounced scan may re-assert the WHOLE watch set. The
+// re-assert is O(directories under the root) and re-emits one WARN per unwatchable directory,
+// while its trigger costs a writer one create+delete (handleFsEvent's Remove arm always
+// schedules a scan), so without a floor the walk runs on the writer's cadence rather than on
+// a cadence this process chose. A minute still recovers a silently dropped registration long
+// before the fallback tick would, and covers the fallback-disabled case the per-scan re-assert
+// was added for.
+const minPreScanResync = time.Minute
+
 type watchState struct {
 	w             *Watcher
 	debounceTimer *time.Timer
 	fallbackTimer *time.Timer // nil when the periodic fallback rescan is disabled
+	lastResync    time.Time   // when the watch set was last re-asserted; floors the pre-scan re-assert
 	pending       bool
 }
 
@@ -1022,7 +1091,11 @@ func (st *watchState) scheduleScan() {
 // membership guard skips the subtree re-walk and its descendants stay unwatched for
 // the process's life — with the periodic rescan disabled, later renewals under them
 // are never detected. Re-asserting once per debounced SCAN (not once per event) keeps
-// that walk off the per-event path, which is what the membership guard bought.
+// that walk off the per-event path, which is what the membership guard bought — and
+// minPreScanResync additionally floors its cadence, so the walk is bounded by the clock
+// rather than by a writer's event rate (one create+delete per debounce window arms a scan,
+// and the walk carries none of the MAX_SCAN_ENTRIES ceiling the scan it precedes does).
+// The zero lastResync means the first debounced scan of a run always re-asserts.
 func (st *watchState) runDebouncedScan(ctx context.Context, watcher *fsnotify.Watcher) {
 	st.pending = false
 	// A stop request must prevent new work on every arm: watchLoop's select has
@@ -1031,12 +1104,15 @@ func (st *watchState) runDebouncedScan(ctx context.Context, watcher *fsnotify.Wa
 	if ctx.Err() != nil {
 		return
 	}
-	st.w.resyncWatchSet(ctx, watcher,
-		"failed to re-assert the watch set before a debounced scan; a registration the kernel dropped without an event stays unwatched until the next scan")
-	// The re-sync can be cut short by cancellation, and the scan below would then be
-	// spurious work for a loop that is already returning.
-	if ctx.Err() != nil {
-		return
+	if time.Since(st.lastResync) >= minPreScanResync {
+		st.lastResync = time.Now()
+		st.w.resyncWatchSet(ctx, watcher,
+			"failed to re-assert the watch set before a debounced scan; a registration the kernel dropped without an event stays unwatched until the next re-assert")
+		// The re-sync can be cut short by cancellation, and the scan below would then be
+		// spurious work for a loop that is already returning.
+		if ctx.Err() != nil {
+			return
+		}
 	}
 	st.w.logScanState(ctx, modeWatch, triggerEvent)
 	st.w.onChange(ctx)
@@ -1172,12 +1248,12 @@ func (w *Watcher) pollUntilUpgrade(ctx context.Context) *fsnotify.Watcher {
 // function owns the stopped outcome: a tick that fires in the same instant as a
 // shutdown must do no work at all -- no upgrade attempt, no scan driving the health
 // marker -- and every caller already reads stopped=true as "end poll mode". The
-// Debug line follows the guard so a cancelled tick announces no scan it never ran.
+// Debug line follows the guard so a cancelled tick announces no tick it never ran.
 func (w *Watcher) pollTick(ctx context.Context) (upgraded *fsnotify.Watcher, stopped bool) {
 	if ctx.Err() != nil {
 		return nil, true
 	}
-	slog.Debug("poll scan triggered", "interval", w.fallback)
+	slog.Debug("poll tick", "interval", w.fallback)
 	fw, stage, attachErr := w.tryAttachWatchSet(ctx)
 	switch stage {
 	case stageStopped:

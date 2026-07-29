@@ -74,8 +74,16 @@ func EncoderName(raw string) (name EncoderType, known bool) {
 			return p.name, true
 		}
 	}
-	return EncNameModern2023, false
+	return defaultProfile.name, false
 }
+
+// defaultProfile is the row every unrecognized name resolves to, and the one home
+// of that answer: EncoderName's fallback and resolvedProfile's both read it, so
+// "which profile is the default" is one edit in the table rather than three
+// literals to keep aligned. A partial edit is what would make the write side emit
+// one profile while the read side compared against another — the permanent
+// rewrite loop resolvedProfile exists to prevent.
+var defaultProfile = profiles[0]
 
 // EncoderNames returns the canonical PFX_ENCODER spellings in profile-table
 // order. The profiles table stays the single home of the value domain, while the
@@ -103,7 +111,7 @@ func resolvedProfile(name EncoderType) (EncoderType, *pkcs12.Encoder) {
 			return p.name, p.encoder
 		}
 	}
-	return EncNameModern2023, pkcs12.Modern2023
+	return defaultProfile.name, defaultProfile.encoder
 }
 
 // resolvedName reports the profile name an EncoderType actually selects — the same

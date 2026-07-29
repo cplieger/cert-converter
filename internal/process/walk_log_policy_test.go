@@ -238,6 +238,61 @@ func TestStoreLogOrphanWalkOutcome_reports_each_disabling_condition(t *testing.T
 	})
 }
 
+// TestOutputWalkVisit_an_unreadable_path_vetoes_the_reap pins the orphan walk's
+// deletion-safety accounting on the arm no uid can be relied on to reach: an
+// /output sub-path fs.WalkDir hands back with an error must veto reaping for the
+// whole scan (safe = false), must feed the aggregate counter, and must not abort
+// the walk.
+//
+// Called directly on the visitor, exactly as the input walk's subtests above call
+// sw.visit, because the only way to make WalkDir produce that error for real is a
+// chmod, which does nothing under uid 0 -- so the walk-level subtest skips there
+// and the veto goes unasserted on every root run of the suite. The veto is what
+// stops the reap deleting private-key bundles it could not prove orphaned, so it
+// must be pinned uid-independently. The readable bundle in the second half is the
+// other half of the contract: one unreadable path vetoes deletion for the scan but
+// does not stop the enumeration.
+// Runs serially: it swaps slog.Default().
+func TestOutputWalkVisit_an_unreadable_path_vetoes_the_reap(t *testing.T) {
+	// Spelled out rather than imported from the production call site: an operator's
+	// log query keys on these words, so a silent rewording must fail here.
+	const wantMsg = "skipping unreadable output path while looking for orphans"
+
+	dir := t.TempDir()
+	bundle := filepath.Join(dir, "live.pfx")
+	if err := os.WriteFile(bundle, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	logs := captureLogs(t)
+	w := &outputWalk{ctx: t.Context(), safe: true}
+
+	if err := w.visit("locked/tls.pfx", nil, errors.New("permission denied")); err != nil {
+		t.Fatalf("visit(unreadable output sub-path) = %v, want nil so the rest of the tree is still walked", err)
+	}
+	if w.safe {
+		t.Error("safe = true after an unreadable output sub-path, want false: a tree this scan could not" +
+			" fully read cannot prove any bundle orphaned, and the bundles hold private keys")
+	}
+	if w.unreadable != 1 {
+		t.Errorf("unreadable = %d, want 1 so the aggregate in logOrphanWalkOutcome fires", w.unreadable)
+	}
+	if len(w.found) != 0 {
+		t.Errorf("found = %v, want empty: a path the walk could not read is not a deletion candidate", w.found)
+	}
+
+	if err := w.visit("live.pfx", dirEntryOf(t, bundle), nil); err != nil {
+		t.Fatalf("visit(readable bundle) = %v, want nil", err)
+	}
+	if len(w.found) != 1 || w.found[0] != "live.pfx" {
+		t.Errorf("found = %v, want [live.pfx]: the unreadable path vetoes deletion, it does not stop enumeration", w.found)
+	}
+	if w.safe {
+		t.Error("safe = true, want it to stay false: a later readable entry cannot re-authorise deletions")
+	}
+
+	assertDebugOnly(t, logs, wantMsg, "locked/tls.pfx")
+}
+
 // TestWalkLogPolicy_quiet_when_nothing_is_wrong pins the steady state: a readable
 // output tree with no symlinks emits no aggregate at all. A guard that also fired on
 // zero would put a "count=0" warning with a remediation hint into the log on every

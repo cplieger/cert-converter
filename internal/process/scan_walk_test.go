@@ -162,16 +162,11 @@ func TestScanWalkVisit_cancellation_during_conversion_aborts_the_walk(t *testing
 	if err := os.WriteFile(filepath.Join(certsRoot, "late.key"), []byte("not a pem"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	inHandle, err := os.OpenRoot(certsRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = inHandle.Close() })
 	fi, err := os.Lstat(filepath.Join(certsRoot, "late.crt"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	sw := &scanWalk{src: &source{root: inHandle}, out: newOutputStore(t, t.TempDir()), seen: make(map[string]struct{})}
+	sw := &scanWalk{src: newInputSource(t, certsRoot), out: newOutputStore(t, t.TempDir()), seen: make(map[string]struct{})}
 
 	got := sw.visit(&cancelAfterFirstCheck{}, "late.crt", fs.FileInfoToDirEntry(fi), nil)
 
@@ -206,12 +201,7 @@ func TestNoteUnwalkableSymlink_reports_resolution_outcomes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	root, err := os.OpenRoot(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
-	sw := &scanWalk{src: &source{root: root}}
+	sw := &scanWalk{src: newInputSource(t, input)}
 
 	for _, tt := range []struct {
 		name, wantMessage string
@@ -267,12 +257,7 @@ func TestNoteUnwalkableSymlink_stays_silent_where_nothing_is_hidden(t *testing.T
 			t.Fatal(err)
 		}
 	}
-	inHandle, err := os.OpenRoot(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = inHandle.Close() })
-	sw := &scanWalk{src: &source{root: inHandle}}
+	sw := &scanWalk{src: newInputSource(t, input)}
 
 	entry := func(name string) fs.DirEntry {
 		fi, lerr := os.Lstat(filepath.Join(input, name))

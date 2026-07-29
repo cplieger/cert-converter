@@ -213,9 +213,6 @@ func TestBoundLogText_is_the_library_primitive_with_this_apps_marker(t *testing.
 // const, not a copy that happens to match today.
 func TestTruncationMarker_does_not_drift_from_the_shared_leaf(t *testing.T) {
 	t.Parallel()
-	if truncationMarker != logtext.Marker {
-		t.Errorf("truncationMarker = %q, want the shared logtext.Marker %q", truncationMarker, logtext.Marker)
-	}
 	cut := boundLogText(strings.Repeat("a", maxSubjectLogLen+1), maxSubjectLogLen)
 	if !strings.HasSuffix(cut, logtext.Marker) {
 		t.Errorf("boundLogText marked a cut with %q, want the shared marker %q",

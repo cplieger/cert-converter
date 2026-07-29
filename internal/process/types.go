@@ -10,9 +10,9 @@ type conversionStatus int
 // it, so a value propagated by mistake can never read as a successful
 // conversion. It never reaches countResults.
 //
-// statusConverted, statusUnchanged, statusFailed, statusOrphan,
-// statusUnreadable, and statusVanished enumerate the possible outcomes of
-// converting a single cert/key pair.
+// statusConverted, statusUnchanged, statusFailed, statusOrphan, statusUnreadable,
+// statusVanished and statusUnwritable enumerate the possible outcomes of converting
+// a single cert/key pair.
 //
 // statusUnreadable is health-neutral and exists to keep the health marker honest.
 // An /input path the app cannot read — a symlink the confined root refuses because

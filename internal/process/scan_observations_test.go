@@ -358,6 +358,11 @@ func TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unw
 		return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EPERM}
 	}
 	t.Cleanup(func() { chmodInRoot = prevChmod })
+	// The injected refusal MEANS "another UID owns this bundle", so the ownership read
+	// has to agree.
+	prevOwned := fileOwnedByProcess
+	fileOwnedByProcess = func(os.FileInfo) bool { return false }
+	t.Cleanup(func() { fileOwnedByProcess = prevOwned })
 	prevWrite := writeFileInRoot
 	writeFileInRoot = func(context.Context, *os.Root, string, []byte,
 		...atomicfile.Option,

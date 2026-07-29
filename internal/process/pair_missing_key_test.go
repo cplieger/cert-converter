@@ -9,7 +9,6 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
-	"github.com/cplieger/cert-converter/internal/testcerts"
 )
 
 // missingKeyAggregate is logInputCoverageWarnings' partial-orphan line: the
@@ -67,33 +66,37 @@ func TestReadPair_separates_a_key_that_vanished_from_a_key_that_was_never_there(
 	}
 
 	for _, tc := range []struct {
-		certRel, keyRel, wantMsg string
-		wantOutcome              conversionStatus
+		name, certRel, keyRel, wantMsg string
+		wantOutcome                    conversionStatus
 	}{
-		{"fresh.crt", "fresh.key", "skipping cert without matching key", statusOrphan},
-		{"renewed.crt", "renewed.key", vanishedKeyMsg, statusVanished},
-		{"linked.crt", "linked.key", "skipping cert without matching key", statusOrphan},
+		{"a key never observed is an orphan", "fresh.crt", "fresh.key", "skipping cert without matching key", statusOrphan},
+		{"a key this process read whole has vanished", "renewed.crt", "renewed.key", vanishedKeyMsg, statusVanished},
+		{"a surviving symlink at the key path stays an orphan", "linked.crt", "linked.key", "skipping cert without matching key", statusOrphan},
 		// The same pair as the second case, one scan later, with its memory spent.
-		{"renewed.crt", "renewed.key", "skipping cert without matching key", statusOrphan},
+		{"the vanished grace is spent after one scan", "renewed.crt", "renewed.key", "skipping cert without matching key", statusOrphan},
 	} {
-		logs := captureLogs(t)
+		// Sequential on purpose: the last case depends on the second having spent the
+		// pair's memory, and captureLogs swaps the process-global slog.Default.
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLogs(t)
 
-		_, outcome := sw.readPair(t.Context(), tc.certRel, tc.keyRel)
+			_, outcome := sw.readPair(t.Context(), tc.certRel, tc.keyRel)
 
-		if outcome != tc.wantOutcome {
-			t.Errorf("readPair(%q) outcome = %d, want %d", tc.certRel, outcome, tc.wantOutcome)
-		}
-		if outcome == statusFailed || outcome == statusUnreadable {
-			t.Errorf("readPair(%q) outcome = %d: a key that is simply not there is neither a conversion failure nor an unreadable path",
-				tc.certRel, outcome)
-		}
-		if got := logs.CountLevel(slog.LevelDebug, tc.wantMsg); got != 1 {
-			t.Errorf("readPair(%q) logged %q, want %q once at DEBUG", tc.certRel, logs.Messages(), tc.wantMsg)
-		}
-		if got := logs.CountLevel(slog.LevelWarn, ""); got != 0 {
-			t.Errorf("readPair(%q) logged %d WARN records (%q); a missing key is never operator-actionable at the per-path level",
-				tc.certRel, got, logs.Messages())
-		}
+			if outcome != tc.wantOutcome {
+				t.Errorf("readPair(%q) outcome = %d, want %d", tc.certRel, outcome, tc.wantOutcome)
+			}
+			if outcome == statusFailed || outcome == statusUnreadable {
+				t.Errorf("readPair(%q) outcome = %d: a key that is simply not there is neither a conversion failure nor an unreadable path",
+					tc.certRel, outcome)
+			}
+			if got := logs.CountLevel(slog.LevelDebug, tc.wantMsg); got != 1 {
+				t.Errorf("readPair(%q) logged %q, want %q once at DEBUG", tc.certRel, logs.Messages(), tc.wantMsg)
+			}
+			if got := logs.CountLevel(slog.LevelWarn, ""); got != 0 {
+				t.Errorf("readPair(%q) logged %d WARN records (%q); a missing key is never operator-actionable at the per-path level",
+					tc.certRel, got, logs.Messages())
+			}
+		})
 	}
 }
 
@@ -128,13 +131,7 @@ func TestScannerRun_reports_a_key_replaced_mid_scan_as_transient_then_names_a_ke
 		t.Fatalf("setup: Chmod(outRoot): %v", err)
 	}
 	for _, name := range []string{"renewing", "stable"} {
-		certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, name+".example.com", "ecdsa")
-		if err := os.WriteFile(filepath.Join(certsRoot, name+".crt"), certPEM, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(certsRoot, name+".key"), keyPEM, 0o600); err != nil {
-			t.Fatal(err)
-		}
+		writeSelfSignedPair(t, certsRoot, name)
 	}
 	scanner := New(&Options{
 		CertsRoot: certsRoot,
@@ -226,13 +223,7 @@ func TestScannerRun_grants_the_vanished_key_grace_after_a_failed_write(t *testin
 		t.Fatalf("setup: Chmod(outRoot): %v", err)
 	}
 	for _, name := range []string{"blocked", "stable"} {
-		certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, name+".example.com", "ecdsa")
-		if err := os.WriteFile(filepath.Join(certsRoot, name+".crt"), certPEM, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(certsRoot, name+".key"), keyPEM, 0o600); err != nil {
-			t.Fatal(err)
-		}
+		writeSelfSignedPair(t, certsRoot, name)
 	}
 	// A DIRECTORY at the bundle path: the pair is read, analysed and encoded, and only
 	// then does the write fail. An ordinary conversion failure with nothing wrong on the

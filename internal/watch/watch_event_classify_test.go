@@ -379,3 +379,55 @@ func TestHandleRootWatchLoss_stays_live_when_the_reattach_fails(t *testing.T) {
 		}
 	}
 }
+
+// TestHandleFsEvent_refuses_a_directory_whose_name_only_prefixes_the_root pins
+// the containment guard against the prefix-match bypass class. The existing
+// outside-root test uses a path in an unrelated directory, which a naive
+// strings.HasPrefix(path, root) containment check also refuses, so nothing
+// distinguished the lexical Rel-based guard from that bypassable form: a real
+// sibling named "<root>-evil" shares the root's textual prefix while lying
+// outside it, and accepting it lets one event extend inotify registrations into
+// a tree this app must not watch (and, one event at a time, further outside it).
+// The control case keeps the guard honest: a function that refused everything
+// would satisfy the refusal half alone.
+// Not parallel: it swaps the process-global slog default.
+func TestHandleFsEvent_refuses_a_directory_whose_name_only_prefixes_the_root(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "input")
+	inside := filepath.Join(root, "example.com")
+	sibling := root + "-evil" // shares root's textual prefix, is NOT under it
+	for _, dir := range []string{inside, sibling} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logs := capture.Default(t)
+	watcher := newTestWatcher(t)
+	w := New(root, func(context.Context) {})
+	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
+		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
+	}
+
+	const msg = "refusing to extend the watch set outside the watched root"
+	if got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: sibling, Op: fsnotify.Create}); !got {
+		t.Error("handleFsEvent(Create of a prefix-sibling dir) = false, want true: content inside the root is unaffected by the refusal, so the rescan must still run")
+	}
+	if watched := watcher.WatchList(); slices.Contains(watched, sibling) {
+		t.Errorf("watch list = %v, want %q refused: it only shares the root's textual prefix", watched, sibling)
+	}
+	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
+		t.Errorf("WARN %q logged %d times, want exactly 1; log = %v", msg, n, logs.Messages())
+	}
+
+	// Control: a directory genuinely under the root is still accepted.
+	nested := filepath.Join(inside, "nested")
+	if err := os.MkdirAll(nested, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: nested, Op: fsnotify.Create}); !got {
+		t.Error("handleFsEvent(Create of a dir under the root) = false, want true")
+	}
+	if watched := watcher.WatchList(); !slices.Contains(watched, nested) {
+		t.Errorf("watch list = %v, want %q watched: the guard must not refuse a path inside the root", watched, nested)
+	}
+}

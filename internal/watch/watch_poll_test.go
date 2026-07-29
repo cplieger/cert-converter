@@ -125,7 +125,7 @@ func TestPollLoopWithUpgrade_hands_the_upgraded_watcher_back_without_scanning(t 
 	if n := len(scans); n != 0 {
 		t.Errorf("upgrade tick ran %d scans, want 0: the post-attach scan belongs to watch mode", n)
 	}
-	if n := logs.Count("poll scan triggered"); n != 1 {
+	if n := logs.Count("poll tick"); n != 1 {
 		t.Errorf("poll mode logged %d poll ticks, want exactly the one that upgraded; log = %v", n, logs.Messages())
 	}
 }
@@ -313,7 +313,7 @@ func TestPollTick_stays_in_poll_mode_when_fsnotify_remains_unavailable(t *testin
 // the tick runs its cheapest failure path. The composite contract (no scan,
 // stopped=true) is also satisfied by the retry arm's own ctx check, which keeps those
 // assertions green even with the entry guard deleted; the guard's own effect is that a
-// cancelled tick announces no work at all, so the "poll scan triggered" Debug record
+// cancelled tick announces no work at all, so the "poll tick" Debug record
 // is what actually pins it and is asserted here.
 //
 // The mid-attempt arms are pinned separately — the rebuild branch by
@@ -344,9 +344,9 @@ func TestPollTick_does_no_work_when_the_ctx_is_already_cancelled(t *testing.T) {
 	// The entry guard's own effect: a cancelled tick announces no work at all. The
 	// retry arm's ctx check keeps every assertion above green even with the guard
 	// deleted, so this record is what actually pins it.
-	if n := logs.Count("poll scan triggered"); n != 0 {
-		t.Errorf("pollTick(cancelled ctx) logged %d %q records, want 0: the entry guard must return before announcing a scan it never runs; log = %v",
-			n, "poll scan triggered", logs.Messages())
+	if n := logs.Count("poll tick"); n != 0 {
+		t.Errorf("pollTick(cancelled ctx) logged %d %q records, want 0: the entry guard must return before announcing a tick it never runs; log = %v",
+			n, "poll tick", logs.Messages())
 	}
 }
 

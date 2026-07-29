@@ -1,8 +1,11 @@
 package convert_test
 
 import (
-	"crypto"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
 	"testing"
+	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/testcerts"
@@ -27,11 +30,19 @@ func FuzzAnalyse_keeps_the_bundle_internally_consistent(f *testing.F) {
 	m := testcerts.GenerateChainMaterial(f)
 	_, unrelatedKeyPEM := testcerts.GenerateSelfSignedCert(f, "fuzz-unrelated.example.com", "ecdsa")
 	unrelatedCertPEM, _ := testcerts.GenerateSelfSignedCert(f, "fuzz-stranger.example.com", "ecdsa")
+	spareCAPEM := fuzzSpareCA(f)
 
 	// The committed seeds ARE the durable fuzz coverage (the weekly run's generated
 	// corpus is discarded), so they cover every resolvable shape the package
 	// documents: leaf-first, leaf-last, a renewal tie, a stranger to exclude, decoy
 	// keys, a key that matches nothing, and a CA as the identity.
+	//
+	// The last three end on a terminus that is NOT proven self-signed, which is the
+	// app's canonical ACME/Caddy input (the root lives in the consumer's trust store,
+	// never in the file) and the only branch that MOVES a certificate between the
+	// emitted chain and the excluded set. Without them the conservation invariant
+	// below never runs on that branch at all, so a fallback that emitted a kept
+	// certificate twice, or dropped one, satisfied every seed.
 	for _, seed := range []struct{ certPEM, keyPEM []byte }{
 		{concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM},
 		{concatPEM(m.CAPEM, m.LeafPEM), m.LeafKeyPEM},
@@ -40,6 +51,9 @@ func FuzzAnalyse_keeps_the_bundle_internally_consistent(f *testing.F) {
 		{concatPEM(m.LeafPEM, m.CAPEM), concatPEM(unrelatedKeyPEM, m.LeafKeyPEM)},
 		{concatPEM(m.LeafPEM, m.CAPEM), unrelatedKeyPEM},
 		{m.CAPEM, m.CAKeyPEM},
+		{m.LeafPEM, m.LeafKeyPEM},
+		{concatPEM(m.LeafPEM, unrelatedCertPEM), m.LeafKeyPEM},
+		{concatPEM(m.LeafPEM, spareCAPEM), m.LeafKeyPEM},
 	} {
 		f.Add(seed.certPEM, seed.keyPEM)
 	}
@@ -52,17 +66,7 @@ func FuzzAnalyse_keeps_the_bundle_internally_consistent(f *testing.F) {
 			return
 		}
 
-		signer, ok := got.Key().(crypto.Signer)
-		if !ok {
-			t.Fatalf("Analyse returned a key of type %T that is not a crypto.Signer", got.Key())
-		}
-		matcher, ok := got.Leaf().PublicKey.(interface{ Equal(crypto.PublicKey) bool })
-		if !ok {
-			t.Fatalf("selected leaf carries a public key of type %T with no Equal method", got.Leaf().PublicKey)
-		}
-		if !matcher.Equal(signer.Public()) {
-			t.Fatal("Analyse resolved a bundle whose key is not the private half of the selected leaf")
-		}
+		assertKeyMatchesLeaf(t, got)
 
 		inputCerts, parseErr := convert.ParseCertChain(certPEM)
 		if parseErr != nil {
@@ -94,4 +98,25 @@ func FuzzAnalyse_keeps_the_bundle_internally_consistent(f *testing.F) {
 				len(emitted), len(fromInput))
 		}
 	})
+}
+
+// fuzzSpareCA mints a self-signed CA with a subject no other fixture uses. It is
+// what gives the unfinished-chain seed something the additive fallback can KEEP:
+// GenerateSelfSignedCert produces a certificate with no CA extensions (which
+// partitionIssuerEligible disqualifies), and a second GenerateChainMaterial CA
+// shares "Material Test CA" as its subject, so the path walk adopts it as an
+// unproven parent instead of leaving it over.
+func fuzzSpareCA(f *testing.F) []byte {
+	key := testcerts.NewECDSAKey(f)
+	now := time.Now()
+	_, caPEM, _ := testcerts.Mint(f, &x509.Certificate{
+		SerialNumber:          big.NewInt(9001),
+		Subject:               pkix.Name{CommonName: "fuzz-spare-ca.example.com"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &key.PublicKey, nil, key)
+	return caPEM
 }

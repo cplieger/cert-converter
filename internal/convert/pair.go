@@ -13,9 +13,9 @@ import (
 // Encode produces the PKCS#12 bytes for an analysed certificate/key pair.
 //
 // It is pure: bytes in, bytes out, no filesystem and no *os.Root. The confined
-// atomic write that used to be bolted onto the end of this operation belongs to
-// whoever owns the output tree, which is internal/process; this package is a codec
-// and never learns where its input came from or where its output goes.
+// atomic write belongs to whoever owns the output tree, internal/process; this
+// package is a codec and never learns where its input came from or where its
+// output goes.
 //
 // The bag order the encoder produces is the order Analysis defines: the leaf's
 // bag first, then its chain nearest-parent-first. That is a contract rather than an
@@ -65,10 +65,13 @@ func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 // whatever later tries to open it.
 //
 // Recognition is InspectPasswordEncoding's, so the encoder cannot drift from the
-// startup gate that consumes the same query, and which shape is named when a
-// password carries several is PasswordEncodingIssues.Primary's, the single home of
-// that precedence, so this guard and internal/config's checkPasswordEncodable name
-// the same shape for the same password by construction.
+// startup gate that consumes the same query; which shape is named when a password
+// carries several is PasswordEncodingIssues.Primary's, the single home of that
+// precedence; and the sentence describing the shape is
+// PasswordEncodingIssue.Explain's, the single home of that wording. So this guard
+// and internal/config's checkPasswordEncodable name the same shape AND give the
+// same advice for the same password by construction, each contributing only its
+// own framing.
 //
 // Only the SHAPE is named, never the value: these messages reach the container
 // log and the password is a secret. No sentinel wraps them because no caller
@@ -76,28 +79,10 @@ func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 // conversion failure, and config.ErrUnencodablePassword (which cannot be reused
 // here anyway: internal/config imports this package) exists for callers of Load.
 func unencodablePasswordError(password string) error {
-	switch shape := InspectPasswordEncoding(password).Primary(); shape {
-	case PasswordInvalidUTF8:
-		return errors.New("pfx password is not valid UTF-8, so the PKCS#12 UCS-2 password encoding " +
-			"would replace every invalid byte with U+FFFD and protect the bundle with a different, " +
-			"lower-entropy password than the one supplied; " +
-			"supply a text secret (for example base64) instead of raw binary bytes")
-	case PasswordNonBMP:
-		return errors.New("pfx password contains a character outside the Basic Multilingual Plane, " +
-			"which the PKCS#12 UCS-2 password encoding cannot represent; " +
-			"choose a password made of BMP characters (ASCII is safest)")
-	case PasswordEmbeddedNUL:
-		return errors.New("pfx password contains a NUL byte, and PKCS#12 passwords are NUL-terminated, " +
-			"so no consumer that builds the terminated BMPString itself could open the bundle with the " +
-			"password supplied; strip NUL bytes from the secret " +
-			"(a UTF-16 or NUL-padded secret file is the usual cause)")
-	case PasswordEncodesFine:
-		return nil
-	default:
-		return fmt.Errorf("pfx password carries encoding shape %q, which this codec cannot prove "+
-			"the PKCS#12 UCS-2 password encoding carries intact; refusing rather than writing a "+
-			"bundle that may be protected by a different password than the one supplied", shape)
+	if why := InspectPasswordEncoding(password).Primary().Explain(); why != "" {
+		return errors.New("pfx password " + why)
 	}
+	return nil
 }
 
 // --- Read-back: the currency check ---
@@ -178,12 +163,10 @@ func (c Currency) Current() bool { return c.Reason == CurrencyMatch }
 //  4. the comparison against want.
 //
 // That order is a safety invariant of the codec, not a convention for callers to
-// remember. It used to live in the one production consumer while this package
-// exported the three steps separately, so a second consumer reaching for the
-// decode alone would have run an unbounded derivation on counts taken from a file
-// under /output. The steps are unexported now, so the order is unbypassable: this
-// is the only door, and it always walks them in this sequence. It is the same rule
-// the package already applies to parseCertChain, applied to the read-back side.
+// remember: a consumer reaching for the decode alone would run an unbounded
+// derivation on counts taken from a file under /output. The steps are unexported,
+// so the order is unbypassable - this is the only door, and it always walks them in
+// this sequence, the same rule the package already applies to parseCertChain.
 //
 // Nothing here is fatal. Every non-match outcome means "rewrite the file", so a
 // parse or decode failure is reported as a reason rather than as an error return;

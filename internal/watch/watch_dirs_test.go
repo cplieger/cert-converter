@@ -298,3 +298,37 @@ func TestResyncWatchSet_stays_silent_when_shutdown_cut_the_walk_short(t *testing
 			n, logs.Messages())
 	}
 }
+
+// TestResyncWatchSet_prunes_a_directory_the_tree_no_longer_has pins the
+// membership mirror's only full rebuild: resyncWatchSet re-walks the whole root,
+// so the mirror it leaves behind must be exactly the set that walk established.
+// The mirror otherwise shrinks only on a DELIVERED Remove/Rename, and the
+// event-queue overflow that drops those deliveries is one of the conditions that
+// routes here, so an append-only re-sync accumulates one path string per deleted
+// directory for the life of the process.
+// Not parallel: it swaps the process-global slog default via the walk's WARNs.
+func TestResyncWatchSet_prunes_a_directory_the_tree_no_longer_has(t *testing.T) {
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	gone := filepath.Join(root, "example.com")
+	if err := os.MkdirAll(gone, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	w := New(root, func(context.Context) {})
+
+	w.resyncWatchSet(t.Context(), watcher, "failed to re-sync the watch set")
+	if !w.watchSetHas(gone) {
+		t.Fatalf("setup: %q is not in the membership mirror after the first re-sync", gone)
+	}
+
+	if err := os.RemoveAll(gone); err != nil {
+		t.Fatal(err)
+	}
+
+	w.resyncWatchSet(t.Context(), watcher, "failed to re-sync the watch set")
+
+	if w.watchSetHas(gone) {
+		t.Errorf("the membership mirror still claims %q is watched after a re-sync of a tree that no longer has it: the map grows with directory churn otherwise",
+			gone)
+	}
+}

@@ -44,7 +44,10 @@ var lifecycleModes = [...]Lifecycle{LifecycleWarn, LifecycleSync, LifecycleKeep}
 
 // ParseLifecycle normalises a raw OUTPUT_LIFECYCLE value. An unrecognised value
 // falls back to the default with known false, so the caller that read the
-// environment is the one that names it in a warning.
+// environment is the one that names it in a warning. An empty or whitespace-only
+// value is the UNSET case and is recognised: it returns LifecycleWarn with known
+// true, so leaving OUTPUT_LIFECYCLE unset warns about nothing — the same split
+// convert.EncoderName documents for PFX_ENCODER.
 func ParseLifecycle(raw string) (mode Lifecycle, known bool) {
 	normalized := Lifecycle(strings.ToLower(strings.TrimSpace(raw)))
 	if normalized == "" {

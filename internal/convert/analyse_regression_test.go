@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/pem"
 	"fmt"
 	"math/big"
 	"slices"
@@ -2375,6 +2376,14 @@ func TestAnalyse_reports_an_unfinished_chain_with_nothing_left_over(t *testing.T
 		t.Errorf("ObsChainTrustAnchorAbsent.Class() = %q, want %q: an absent anchor is the documented fullchain shape, not a warning",
 			got, convert.ObservationClassInfo)
 	}
+	// The sentence must name THIS bundle: the identity ships alone, so a consumer that
+	// does not already hold the issuer cannot build a path. Saying "every certificate
+	// supplied is in the chain" here claimed the opposite of the operator's situation,
+	// because the emitted chain is empty.
+	if detail, ok := observationDetail(got.Observations(), convert.ObsChainTrustAnchorAbsent); !ok ||
+		!strings.Contains(detail, "no chain certificates at all") {
+		t.Errorf("anchor-absent detail = %q, want it to name that no chain certificate was supplied at all", detail)
+	}
 	if hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
 		t.Errorf("observations = %v, want no %q: no certificate was held back",
 			got.Observations(), convert.ObsExtraCertsExcluded)
@@ -2446,6 +2455,93 @@ func TestAnalyse_reports_an_unfinished_chain_when_only_the_root_is_absent(t *tes
 	}
 	if hasObservation(got.Observations(), convert.ObsChainEdgeUnprovenIssuer) {
 		t.Errorf("observations = %v, want no %q: the one emitted edge is proven by signature",
+			got.Observations(), convert.ObsChainEdgeUnprovenIssuer)
+	}
+	// The fullchain shape carries chain material, so it must NOT get the sentence
+	// written for a bundle holding the identity alone: this operator has nothing to do.
+	if detail, ok := observationDetail(got.Observations(), convert.ObsChainTrustAnchorAbsent); !ok ||
+		strings.Contains(detail, "no chain certificates at all") {
+		t.Errorf("anchor-absent detail = %q, want no claim that chain material is missing: the intermediate is in the bundle", detail)
+	}
+}
+
+// TestAnalyse_reports_a_terminus_whose_self_signature_does_not_verify pins the THIRD
+// terminus fact, the one both absent-anchor kinds mis-stated: the chain ends at a
+// certificate that names ITSELF as its own issuer, so its anchor is PRESENT, but this
+// app could not verify that self-signature (a corrupt or re-signed certificate, an
+// algorithm crypto/x509 refuses such as MD5 or DSA, or a key above the verification
+// ceilings).
+//
+// Before ObsChainAnchorUnverifiable this shape was reported as
+// ObsChainTrustAnchorAbsent - the INFORMATIONAL kind minted for the normal Caddy/ACME
+// fullchain - with a Detail claiming "whose issuer is not in the bundle" about a
+// certificate whose issuer IS in the bundle. A trust anchor whose own signature does
+// not verify was therefore indistinguishable in the log from a healthy fullchain,
+// while a consumer validating the chain will reject it, so it is a warning.
+//
+// The root's signature over the LEAF is left intact, so the leaf->root hop stays
+// proven and ObsChainEdgeUnprovenIssuer does not fire: the only broken thing is the
+// root's signature over itself.
+func TestAnalyse_reports_a_terminus_whose_self_signature_does_not_verify(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	rootKey := testcerts.NewECDSAKey(t)
+	rootDER, _, rootCert := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(875),
+		Subject:               pkix.Name{CommonName: "legacy-root.example.com"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(96 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &rootKey.PublicKey, nil, rootKey)
+
+	leafKey := testcerts.NewECDSAKey(t)
+	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(876),
+		Subject:      pkix.Name{CommonName: "broken-anchor-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, rootCert, rootKey)
+
+	// Flip one bit inside the root's own signature. ParseCertificate never decodes a
+	// signature's contents, so the certificate still parses; only CheckSignature over
+	// its own TBS fails, which is exactly the condition isSelfSigned collapses into
+	// "not self-signed".
+	tampered := bytes.Clone(rootDER)
+	at := bytes.Index(tampered, rootCert.Signature)
+	if at < 0 {
+		t.Fatalf("the root's signature was not found in its own DER, so it cannot be tampered with")
+	}
+	tampered[at] ^= 0x01
+	brokenRootPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tampered})
+
+	got, err := convert.Analyse(concatPEM(leafPEM, brokenRootPEM), testcerts.KeyPEM(t, leafKey))
+	if err != nil {
+		t.Fatalf("Analyse(a leaf under a root whose self-signature is broken) = error %v, want nil", err)
+	}
+	if len(got.Chain()) != 1 || got.Chain()[0].SerialNumber.Cmp(big.NewInt(875)) != 0 {
+		t.Fatalf("chain = %v, want the tampered root alone: it is still the leaf's proven issuer", chainSerials(got.Chain()))
+	}
+	if !hasObservation(got.Observations(), convert.ObsChainAnchorUnverifiable) {
+		t.Errorf("observations = %v, want %q: the anchor is present and its self-signature could not be verified",
+			got.Observations(), convert.ObsChainAnchorUnverifiable)
+	}
+	if got := convert.ObsChainAnchorUnverifiable.Class(); got != convert.ObservationClassWarning {
+		t.Errorf("ObsChainAnchorUnverifiable.Class() = %q, want %q: a consumer validating the chain will reject this anchor",
+			got, convert.ObservationClassWarning)
+	}
+	if hasObservation(got.Observations(), convert.ObsChainTrustAnchorAbsent) {
+		t.Errorf("observations = %v, want no %q: the issuer of the terminus IS in the bundle - it is the terminus itself",
+			got.Observations(), convert.ObsChainTrustAnchorAbsent)
+	}
+	if hasObservation(got.Observations(), convert.ObsChainUnverified) {
+		t.Errorf("observations = %v, want no %q: nothing was left over to carry without established ancestry",
+			got.Observations(), convert.ObsChainUnverified)
+	}
+	if hasObservation(got.Observations(), convert.ObsChainEdgeUnprovenIssuer) {
+		t.Errorf("observations = %v, want no %q: the root's signature over the leaf is intact",
 			got.Observations(), convert.ObsChainEdgeUnprovenIssuer)
 	}
 }

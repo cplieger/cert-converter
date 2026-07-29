@@ -32,12 +32,7 @@ func TestSourcePathVanished_reports_an_unclassifiable_path_as_steady_state(t *te
 	if err := os.WriteFile(filepath.Join(dir, "plain"), []byte("not a directory"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
-	s := &source{root: root}
+	s := newInputSource(t, dir)
 
 	if s.pathVanished("plain/tls.crt") {
 		t.Error("source.pathVanished(path under a non-directory) = true, want false: " +
@@ -65,12 +60,7 @@ func TestSourcePathAbsent(t *testing.T) {
 	if err := os.Symlink("nowhere", filepath.Join(dir, "dangling.crt")); err != nil {
 		t.Fatal(err)
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
-	s := &source{root: root}
+	s := newInputSource(t, dir)
 
 	for _, tc := range []struct {
 		rel  string
@@ -100,12 +90,7 @@ func TestSourceReadBounded(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "in.pem"), []byte("hello"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer root.Close()
-		s := &source{root: root}
+		s := newInputSource(t, dir)
 		data, err := s.readBoundedLimit(t.Context(), "in.pem", 1024)
 		if err != nil {
 			t.Fatalf("source.readBoundedLimit: %v", err)
@@ -127,12 +112,7 @@ func TestSourceReadBounded(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "exact.pem"), make([]byte, limit), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer root.Close()
-		s := &source{root: root}
+		s := newInputSource(t, dir)
 
 		data, err := s.readBoundedLimit(t.Context(), "exact.pem", limit)
 		if err != nil {
@@ -151,12 +131,7 @@ func TestSourceReadBounded(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "big.pem"), make([]byte, limit+1), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer root.Close()
-		s := &source{root: root}
+		s := newInputSource(t, dir)
 
 		// errors.Is on atomicfile's sentinel, not a bare non-nil, for the same reason
 		// the missing-file case below argues: a read that failed for any OTHER reason (a
@@ -172,12 +147,7 @@ func TestSourceReadBounded(t *testing.T) {
 	t.Run("nonexistent file", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer root.Close()
-		s := &source{root: root}
+		s := newInputSource(t, dir)
 		// errors.Is, not merely non-nil: noteUnreadableInput splits the transient
 		// renewal race from a steady-state unreadable input on exactly
 		// errors.Is(err, fs.ErrNotExist) over THIS error. A wrapper anywhere in the
@@ -185,7 +155,7 @@ func TestSourceReadBounded(t *testing.T) {
 		// vanished cert down the Warn arm and back into the alerted unreadable count,
 		// which is the false page the vanished classification exists to prevent -- and
 		// a bare non-nil assertion cannot see it.
-		_, err = s.readBoundedLimit(t.Context(), "missing.pem", 1024)
+		_, err := s.readBoundedLimit(t.Context(), "missing.pem", 1024)
 		if !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("source.readBoundedLimit(nonexistent file) error = %v, want it to satisfy errors.Is(err, fs.ErrNotExist)", err)
 		}
@@ -206,12 +176,7 @@ func TestSourceReadBounded(t *testing.T) {
 		if err := os.Symlink(filepath.Join(outside, "secret"), filepath.Join(dir, "leak.pem")); err != nil {
 			t.Fatal(err)
 		}
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer root.Close()
-		s := &source{root: root}
+		s := newInputSource(t, dir)
 		if _, err := s.readBoundedLimit(t.Context(), "leak.pem", 1024); err == nil {
 			t.Fatal("source.readBoundedLimit followed a symlink escaping the root; want a confinement error")
 		}
@@ -230,12 +195,7 @@ func TestSourceReadBounded(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer root.Close()
-		s := &source{root: root}
+		s := newInputSource(t, dir)
 
 		data, err := s.readBoundedLimit(t.Context(), "../secret.pem", 1024)
 		if err == nil {
@@ -258,12 +218,7 @@ func TestSourceReadBounded(t *testing.T) {
 		if err := syscall.Mkfifo(filepath.Join(dir, "evil.crt"), 0o600); err != nil {
 			t.Fatalf("setup: mkfifo: %v", err)
 		}
-		root, err := os.OpenRoot(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer root.Close()
-		s := &source{root: root}
+		s := newInputSource(t, dir)
 
 		done := make(chan error, 1)
 		go func() {

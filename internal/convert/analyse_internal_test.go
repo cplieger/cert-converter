@@ -284,7 +284,40 @@ func TestNoMatchError_keeps_the_mismatch_sentence_when_any_certificate_was_compa
 	if got == nil {
 		t.Fatal("noMatchError(1, 1, keyDefects{}, skippedBlocks{}) = nil, want the mismatch diagnosis")
 	}
-	want := `none of the 1 private key block(s) matches any of the 2 certificate(s) in the chain; certificate "CN=legacy-dsa.example.com" has a public key of type convert.testUncomparablePublicKey that cannot be compared against the supplied private key, so it was compared against no key`
+	want := `none of the 1 distinct private key(s) in the key file matches any of the 2 certificate(s) in the chain; certificate "CN=legacy-dsa.example.com" has a public key of type convert.testUncomparablePublicKey that cannot be compared against the supplied private key, so it was compared against no key`
+	if got.Error() != want {
+		t.Errorf("noMatchError = %q, want %q", got.Error(), want)
+	}
+}
+
+// TestNoMatchError_says_a_key_x509_could_not_read_was_compared_against_nothing
+// pins the OTHER half of the trailing clause its sibling above covers. The
+// distinction is deliberate in production and it is the whole point of the clause:
+// a certificate whose public key was parsed into a type without Equal was read
+// fine and is merely not comparable, while a nil PublicKey is a key crypto/x509
+// could not read at all (the UnknownPublicKeyAlgorithm branch). Only the typed
+// case is exercised today, so collapsing the nil arm into the %T arm passes the
+// entire suite while telling an operator their certificate "has a public key of
+// type <nil>" and sending them to re-issue a certificate whose encoding is fine.
+func TestNoMatchError_says_a_key_x509_could_not_read_was_compared_against_nothing(t *testing.T) {
+	t.Parallel()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("setup: GenerateKey: %v", err)
+	}
+	// One comparable certificate keeps the diagnosis on the mismatch arm: with every
+	// certificate uncomparable it would take the specialized arm instead, which its
+	// own tests already cover.
+	g := &certGraph{certs: []*x509.Certificate{
+		{Subject: pkix.Name{CommonName: "comparable.example.com"}, PublicKey: &key.PublicKey},
+		{Subject: pkix.Name{CommonName: "unknown-algorithm.example.com"}, PublicKey: nil},
+	}}
+
+	got := g.noMatchError(1, 1, keyDefects{}, skippedBlocks{})
+	if got == nil {
+		t.Fatal("noMatchError(1, 1, keyDefects{}, skippedBlocks{}) = nil, want the mismatch diagnosis")
+	}
+	want := `none of the 1 distinct private key(s) in the key file matches any of the 2 certificate(s) in the chain; certificate "CN=unknown-algorithm.example.com" holds a public key crypto/x509 could not read, so it was compared against no key`
 	if got.Error() != want {
 		t.Errorf("noMatchError = %q, want %q", got.Error(), want)
 	}
@@ -642,6 +675,7 @@ func TestObservationKind_Class_pins_every_declared_kind(t *testing.T) {
 		ObsRenewedCertTie:           ObservationClassWarning,
 		ObsCAAsIdentity:             ObservationClassWarning,
 		ObsChainUnverified:          ObservationClassWarning,
+		ObsChainAnchorUnverifiable:  ObservationClassWarning,
 		ObsChainTrustAnchorAbsent:   ObservationClassInfo,
 		ObsIdentityNotYetValid:      ObservationClassWarning,
 		ObsIdentityExpired:          ObservationClassWarning,

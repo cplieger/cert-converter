@@ -346,6 +346,60 @@ func TestParsePrivateKeyBlock_refuses_too_many_RSA_prime_factors(t *testing.T) {
 	}
 }
 
+// TestParsePrivateKeyBlock_refuses_an_oversized_prime_inside_OtherPrimeInfos pins the
+// SIZE half of the OtherPrimeInfos walk, which no other case in this file reaches:
+// every multi-prime fixture here declares tiny extra primes, so the collection has
+// only ever contributed to the FACTOR count. A key whose factor count is legal but
+// which hides one huge integer inside the collection is the other amplification
+// shape -- crypto/x509 decodes the collection and crypto/rsa runs its precompute on
+// those integers, on the scan's only goroutine, with no cancellation path -- and the
+// only thing that refuses it is the collection's contribution to the measured size.
+func TestParsePrivateKeyBlock_refuses_an_oversized_prime_inside_OtherPrimeInfos(t *testing.T) {
+	t.Parallel()
+	const oversizedBits = 131072
+	one := big.NewInt(1)
+	hugePrime := new(big.Int).Lsh(one, oversizedBits-1)
+	hugePrime.SetBit(hugePrime, 0, 1)
+	der, err := asn1.Marshal(multiPrimeKeyDER{
+		Version: 1,
+		N:       big.NewInt(196611), E: big.NewInt(65537), D: one, P: one, Q: one,
+		Dp: one, Dq: one, Qinv: one,
+		OtherPrimeInfos: []otherPrimeInfoDER{{Prime: hugePrime, Exponent: one, Coefficient: one}},
+	})
+	if err != nil {
+		t.Fatalf("setup: marshal a three-prime key with an oversized extra prime: %v", err)
+	}
+
+	for name, block := range map[string]*pem.Block{
+		"pkcs1": {Type: pemTypeRSAPrivateKey, Bytes: der},
+		"pkcs8": {Type: pemTypePrivateKey, Bytes: wrapPKCS8(t, der)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := parsePrivateKeyBlock(block)
+			if err == nil {
+				t.Fatalf("parsePrivateKeyBlock(a key with a %d-bit prime inside OtherPrimeInfos) = nil error, want the size refusal",
+					oversizedBits)
+			}
+			got := err.Error()
+			for _, want := range []string{"131072-bit RSA integer", "16384-bit ceiling", block.Type} {
+				if !strings.Contains(got, want) {
+					t.Errorf("error = %q, want it to contain %q: an integer inside OtherPrimeInfos must count towards the measured size",
+						got, want)
+				}
+			}
+			// The factor count is legal here (three primes), so the refusal must be the
+			// SIZE one, and it must still precede crypto/x509 rather than follow it.
+			if strings.Contains(got, "RSA prime factors") {
+				t.Errorf("error = %q, want the size refusal: three prime factors are inside the ceiling", got)
+			}
+			if strings.Contains(got, "x509:") {
+				t.Errorf("error = %q, want the app's own bounded refusal before the parser runs", got)
+			}
+		})
+	}
+}
+
 // TestScanRSAKeyEnvelope_saturates_the_factor_count pins the walk's own
 // bound. The count feeds one refusal and nothing reads the exact number, so once the
 // scan has seen one factor past the ceiling the collection must not be measured any
@@ -376,6 +430,51 @@ func TestScanRSAKeyEnvelope_saturates_the_factor_count(t *testing.T) {
 	if scan.factors != maxRSAPrimeFactors+1 {
 		t.Errorf("scan.factors = %d, want %d: the walk must stop one factor past the ceiling instead of counting every entry",
 			scan.factors, maxRSAPrimeFactors+1)
+	}
+}
+
+// TestRSAOtherPrimeInfos_stops_at_the_first_element_that_is_not_an_OtherPrimeInfo pins
+// the walk's stop rule over a MALFORMED collection, which nothing else feeds it: every
+// fixture in this file builds a well-formed OtherPrimeInfos to its end. The count feeds
+// a refusal, so crediting an element the walk could not read would refuse a damaged key
+// with the factor-ceiling diagnostic where the contract is that the parser reports the
+// damage -- the same precedence
+// TestParsePrivateKeyBlock_leaves_a_plain_malformed_modulus_to_the_parser pins for the
+// modulus.
+func TestRSAOtherPrimeInfos_stops_at_the_first_element_that_is_not_an_OtherPrimeInfo(t *testing.T) {
+	t.Parallel()
+	one := big.NewInt(1)
+	info := testASN1Marshal(t, otherPrimeInfoDER{Prime: big.NewInt(3), Exponent: one, Coefficient: one})
+
+	cases := map[string]struct {
+		body           []byte
+		wantAdditional int
+		wantMaxBits    int
+	}{
+		// The entry before the stop still counts, and its widest integer (the 2-bit
+		// prime) is still measured.
+		"one entry then an element that is not a sequence": {
+			body:           append(bytes.Clone(info), testASN1Marshal(t, 5)...),
+			wantAdditional: 1,
+			wantMaxBits:    2,
+		},
+		// Nothing readable at all: the walk credits no prime rather than counting an
+		// element it could not parse.
+		"a body that is not an element at all": {body: []byte("not DER")},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			additional, maxBits := rsaOtherPrimeInfos(tc.body, maxRSAPrimeFactors)
+			if additional != tc.wantAdditional {
+				t.Errorf("rsaOtherPrimeInfos(%s) counted %d additional prime(s), want %d: the walk must stop rather than re-read the same element",
+					name, additional, tc.wantAdditional)
+			}
+			if maxBits != tc.wantMaxBits {
+				t.Errorf("rsaOtherPrimeInfos(%s) = %d bits, want %d", name, maxBits, tc.wantMaxBits)
+			}
+		})
 	}
 }
 
@@ -739,4 +838,121 @@ func TestPKCS8HoldsECKey_answers_true_only_for_an_ec_algorithm_identifier(t *tes
 			}
 		})
 	}
+}
+
+// TestOversizedCertificateOIDError_bounds_an_identifier_the_parser_would_decode pins
+// the certificate side of the package's untrusted-identifier bound, the one input
+// path that had no such guard. x509.ParseCertificate decodes every extension
+// identifier and every subject/issuer attribute type into an asn1.ObjectIdentifier,
+// and encoding/asn1 sizes that slice from the encoded LENGTH (one int per byte), so a
+// file inside the reader's 10 MB cap could spend its DER on one syntactically valid
+// identifier and drive tens of megabytes on the scan's only goroutine.
+//
+// Both halves of the contract are pinned: the oversized identifier is refused from
+// the DER alone, and an ordinary certificate still passes, because every identifier a
+// real certificate names is 9 bytes or fewer.
+func TestOversizedCertificateOIDError_bounds_an_identifier_the_parser_would_decode(t *testing.T) {
+	t.Parallel()
+
+	oversized := testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagOID, Bytes: bytes.Repeat([]byte{0x01}, maxOIDBytes+1)})
+	// Nested where a real certificate keeps an extension identifier: Certificate >
+	// TBSCertificate > extensions, with the identifiers inside an extension's own
+	// value wrapped in an OCTET STRING, so the walk has to descend to find it.
+	nested := derTestSequence(t, derTestSequence(t, testASN1Marshal(t, asn1.RawValue{
+		Tag:   asn1.TagOctetString,
+		Bytes: derTestSequence(t, oversized),
+	})))
+	err := oversizedCertificateOIDError(&pem.Block{Type: pemTypeCertificate, Bytes: nested})
+	if err == nil {
+		t.Fatalf("oversizedCertificateOIDError(a %d-byte identifier) = nil, want a refusal before the parser decodes it",
+			maxOIDBytes+1)
+	}
+	if !strings.Contains(err.Error(), "object identifier") {
+		t.Errorf("error = %q, want it to name the oversized object identifier", err)
+	}
+
+	key, keyErr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if keyErr != nil {
+		t.Fatalf("setup: ecdsa.GenerateKey = error %v, want nil", keyErr)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(4211),
+		Subject:               pkix.Name{CommonName: "ordinary.example.com"},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, certErr := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if certErr != nil {
+		t.Fatalf("setup: x509.CreateCertificate = error %v, want nil", certErr)
+	}
+	if err := oversizedCertificateOIDError(&pem.Block{Type: pemTypeCertificate, Bytes: der}); err != nil {
+		t.Errorf("oversizedCertificateOIDError(an ordinary certificate) = %v, want nil: nothing legitimate may be refused", err)
+	}
+}
+
+// FuzzScanRSAKeyEnvelope_reports_a_bounded_shape fuzzes the DER-only pre-scan every
+// private-key block passes through before crypto/x509 sees it. The bytes are an
+// operator-supplied file's, bounded only by the caller's 10 MB read cap, and the walk
+// is what keeps an oversized or over-factored key out of RSA precomputation, so its
+// structural promises are worth exploring beyond the shapes hand-built above.
+//
+// The invariants are the walk's own contract, not "does not panic": a shape it does not
+// recognise reports the ZERO value (oversizedRSAKeyError returns nil on !isRSA without
+// reading the other fields, so a partly-filled report would be acted on later), the
+// factor count SATURATES one past the ceiling (the bound that stops the walk from
+// measuring an attacker-sized collection to the end), a measured size is a positive one
+// (the ceiling comparison reads maxBits only when sized), and the same bytes always
+// yield the same verdict.
+func FuzzScanRSAKeyEnvelope_reports_a_bounded_shape(f *testing.F) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		f.Fatalf("setup: rsa.GenerateKey: %v", err)
+	}
+	pkcs1 := x509.MarshalPKCS1PrivateKey(key)
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		f.Fatalf("setup: MarshalPKCS8PrivateKey: %v", err)
+	}
+	one := big.NewInt(1)
+	extras := make([]otherPrimeInfoDER, 200)
+	for i := range extras {
+		extras[i] = otherPrimeInfoDER{Prime: big.NewInt(3), Exponent: one, Coefficient: one}
+	}
+	overFactored, err := asn1.Marshal(multiPrimeKeyDER{
+		Version: 1,
+		N:       big.NewInt(196611), E: big.NewInt(65537), D: one, P: one, Q: one,
+		Dp: one, Dq: one, Qinv: one,
+		OtherPrimeInfos: extras,
+	})
+	if err != nil {
+		f.Fatalf("setup: marshal multi-prime key: %v", err)
+	}
+	// The committed seeds ARE the durable coverage: the weekly run's generated corpus is
+	// discarded, so each shape the refusals depend on is pinned here.
+	f.Add(pkcs1)
+	f.Add(pkcs8)
+	f.Add(overFactored)
+	f.Add(pkcs1[:12])
+	f.Add([]byte("this is not valid DER"))
+	f.Add([]byte(nil))
+
+	f.Fuzz(func(t *testing.T, der []byte) {
+		scan := scanRSAKeyEnvelope(der, 1)
+		if !scan.isRSA && scan != (rsaKeyPreScan{}) {
+			t.Fatalf("scanRSAKeyEnvelope(%d bytes) failed open with %+v, want the zero value: a caller reads the other fields only after isRSA",
+				len(der), scan)
+		}
+		if scan.factors > maxRSAPrimeFactors+1 {
+			t.Fatalf("scanRSAKeyEnvelope(%d bytes) counted %d factors, want at most %d: past the ceiling the exact count buys nothing and the counting is attacker-controlled work",
+				len(der), scan.factors, maxRSAPrimeFactors+1)
+		}
+		if scan.sized != (scan.maxBits > 0) {
+			t.Fatalf("scanRSAKeyEnvelope(%d bytes) reported sized = %v with maxBits = %d, want a size exactly when one was measured",
+				len(der), scan.sized, scan.maxBits)
+		}
+		if again := scanRSAKeyEnvelope(der, 1); again != scan {
+			t.Fatalf("scanRSAKeyEnvelope is not deterministic: second call = %+v, first = %+v", again, scan)
+		}
+	})
 }

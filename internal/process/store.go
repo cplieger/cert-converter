@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cplieger/atomicfile/v2"
@@ -74,7 +75,25 @@ const laxDirMsg = "the /output directory holding a pfx is more permissive than p
 // Naming it still costs the operator nothing and is the only signal that the
 // confinement guarding a private-key bundle rests on a directory others can write.
 func (s *store) reportLaxDir(rel string) {
-	dir := path.Dir(rel)
+	// Every ancestor up to the mount root, not just the immediate parent: the leaf
+	// directory is app-created at pfxDirMode, so in the nested layout (the output
+	// tree mirrors /input's sub-directories) the operator-created /output root --
+	// the README's `mkdir -p` case this WARN exists for -- is reached only by
+	// walking up. path.Dir converges to "." on a root-relative path, so the loop
+	// always terminates.
+	for dir := path.Dir(rel); ; dir = path.Dir(dir) {
+		s.reportLaxDirAt(dir)
+		if dir == "." {
+			return
+		}
+	}
+}
+
+// reportLaxDirAt reports one output directory, once per directory per scan.
+// Report-only: the mode on disk is left exactly as found, the bundle is still
+// published, orphan reaping is not vetoed and health is unaffected (the 2026-07
+// output-dir-write-bit-enforcement decision).
+func (s *store) reportLaxDirAt(dir string) {
 	if _, done := s.laxDirsReported[dir]; done {
 		return
 	}
@@ -89,8 +108,12 @@ func (s *store) reportLaxDir(rel string) {
 	}
 	s.laxDirsReported[dir] = struct{}{}
 	if perm := fi.Mode().Perm(); perm&^pfxDirMode != 0 {
+		// dir is root-relative, so it is "." for the flat /output the README's own setup
+		// step produces; the root is named alongside it, as logOrphanWalkOutcome does for
+		// its own directory-level records.
 		slog.Warn(laxDirMsg,
-			"path", dir, "mode", perm.String(), "want", os.FileMode(pfxDirMode).String(),
+			"path", dir, "dir", s.root.Name(),
+			"mode", perm.String(), "want", os.FileMode(pfxDirMode).String(),
 			"remediation", outputPermRemediation)
 	}
 }
@@ -219,7 +242,11 @@ func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
 // It still bounds a hostile file, which is its other purpose: decoding feeds the
 // FILE'S OWN key-derivation iteration counts into PBKDF2, so an unbounded read
 // would let one crafted file spend arbitrary CPU on the scan's only goroutine.
-const maxPFXSize = 2*maxFileSize + 64<<10
+//
+// The value is convert.MaxBundleBytes, the largest bundle the codec will inspect:
+// the party whose parser allocations scale with the input states the limit, so the
+// read cap here and the preflight's own bounds cannot drift apart.
+const maxPFXSize = convert.MaxBundleBytes
 
 // staleCause names WHY a bundle was reported stale, for the ONE consumer that has to
 // tell the difference: convertEntry, which must know whether an /output write the
@@ -331,41 +358,7 @@ func (s *store) isCurrent(ctx context.Context, rel string, want *convert.Analysi
 	// The refusal is REMEMBERED rather than returned: staleModeRepairRefused promises
 	// the caller (scanWalk.noteWriteFailure) that the bundle's CONTENT was never in
 	// question, and returning here made that promise without ever reading the bundle.
-	modeRepairRefused := s.tightenMode(rel, fi.Mode().Perm()) == tightenRefused
-
-	// The one mode outcome that IS a verdict. A refused chmod means this process
-	// does not own the bundle (the documented case: a root-owned .pfx left behind
-	// by an earlier deployment before the user: mapping changed), so no number of
-	// scans will ever tighten it — while the bundle holds a private key at, say,
-	// 0644 on a volume the documented downstream rsync replicates onward. A rewrite
-	// DOES converge here, because atomicfile's temp+rename needs write permission
-	// on the output directory rather than on the foreign-owned file, and the
-	// replacement is written WithMode(pfxFileMode). Returning stale hands that to
-	// the ordinary currency path instead of adding a second write path.
-	//
-	// Deliberately narrower than "any chmod error": a chmod the filesystem accepts
-	// without storing (mount-forced modes) or one that fails for any other reason
-	// (EROFS, EINVAL) is NOT evidence that a rewrite would land, and rewriting
-	// there would replace one WARN per scan with a failed encode+write per scan
-	// forever. Those stay tightenIneffective — warned, still current.
-	//
-	// The verdict is tagged staleModeRepairRefused because the rewrite it schedules
-	// can itself be refused — the same UID that does not own the bundle plausibly
-	// does not own the DIRECTORY either, which is the "operator changed PUID and
-	// left root-owned output behind" shape this arm exists for. That outcome is
-	// NOT a conversion failure: the bundle on disk still holds the right bytes, and
-	// no restart can grant a permission the UID does not have, so counting it in
-	// ScanResult.Failed would restart-loop the container over a condition it cannot
-	// clear — the mistake ScanResult.Unreadable already exists to avoid on the
-	// /input side. scanWalk.noteWriteFailure owns that split: a permission refusal
-	// on THIS cause is the health-neutral ScanResult.Unwritable plus a standing
-	// WARN, while any other write failure stays a conversion failure and flips
-	// health exactly as before.
-	//
-	// The verdict itself is deferred to the tail of this function: it is reported
-	// ONLY when the content comparison below says the bytes on disk already are the
-	// bundle these inputs produce. A bundle that is stale for any other reason keeps
-	// staleOrdinary, so a refused rewrite of it stays a conversion failure.
+	modeRepairRefused := s.tightenMode(rel, fi) == tightenRefused
 
 	if fi.Size() > maxPFXSize {
 		slog.Warn("prior pfx exceeds the readable bound; regenerating",
@@ -540,6 +533,28 @@ func isPermissionRefusal(err error) bool {
 	return errors.Is(err, fs.ErrPermission)
 }
 
+// fileOwnedByProcess is tightenMode's ownership question, indirected through a
+// package var for the same reason chmodInRoot is: a suite cannot stage a
+// foreign-owned bundle in a directory it created itself, and a chmod refusal
+// injected through chmodInRoot means "another UID owns this" only if the ownership
+// read agrees.
+var fileOwnedByProcess = ownedByThisProcess
+
+// ownedByThisProcess reports whether fi is owned by the UID this process runs as.
+// It is the discriminator the refused-chmod arm's premise rests on: only a bundle
+// this process does NOT own is one a temp+rename rewrite can converge.
+//
+// A missing *syscall.Stat_t answers false, which keeps the documented deployment
+// shape (a root-owned bundle left behind by an earlier PUID mapping) on the arm
+// that repairs it.
+func ownedByThisProcess(fi os.FileInfo) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return int(st.Uid) == os.Getuid()
+}
+
 // tightenMode chmods a prior bundle whose mode is laxer than pfxFileMode back to
 // policy and reports, as a tightenResult, whether the tightening took effect — and
 // when it did not, whether a rewrite could still converge it. It moves permission
@@ -571,7 +586,8 @@ func isPermissionRefusal(err error) bool {
 // a swap in the window before this call, but the reach of that race is one permission
 // bit: it never touches content, and anyone able to stage the swap on a co-mounted
 // /output can already replace the bundle itself.
-func (s *store) tightenMode(rel string, perm os.FileMode) tightenResult {
+func (s *store) tightenMode(rel string, fi os.FileInfo) tightenResult {
+	perm := fi.Mode().Perm()
 	if !laxerThanPolicy(perm) {
 		return tightenNotNeeded
 	}
@@ -599,6 +615,19 @@ func (s *store) tightenMode(rel string, perm os.FileMode) tightenResult {
 		// about ownership, so it must not schedule the rewrite tightenRefused asks for —
 		// the bits may well be correct now, and rewriting would churn the bundle with
 		// fresh KDF salts and a fresh mtime for nothing.
+		slog.Warn(modeNotTightenedMsg,
+			"path", rel, "mode", perm.String(), "want", want.String(),
+			"error", err, "remediation", outputModeRemediation)
+		return tightenIneffective
+	case err != nil && isPermissionRefusal(err) && fileOwnedByProcess(fi):
+		// A refusal on a bundle this process OWNS is not evidence about ownership: a
+		// UID that owns a file may always chmod it, so what was refused is the
+		// requested BITS, not our right to set them. That is a filesystem which forces
+		// modes and reports the refusal instead of swallowing it (fat_setattr returns
+		// EPERM for any mode outside the mount's fmask), and a rewrite cannot converge
+		// it either — the replacement lands with the same forced mode — so this must
+		// NOT schedule one. Same outcome as a chmod the filesystem accepts and stores
+		// nothing, which is the identical condition reported through the other channel.
 		slog.Warn(modeNotTightenedMsg,
 			"path", rel, "mode", perm.String(), "want", want.String(),
 			"error", err, "remediation", outputModeRemediation)
@@ -691,7 +720,7 @@ func (s *store) readBoundedPFX(ctx context.Context, rel string) ([]byte, error) 
 // rule in reap.go.
 func (s *store) listOutputs(ctx context.Context) (found []string, safe bool, err error) {
 	walk := outputWalk{ctx: ctx, safe: true}
-	if err := fs.WalkDir(s.root.FS(), ".", walk.visit); err != nil {
+	if err := walkRoot(s.root, walk.visit); err != nil {
 		return nil, false, fmt.Errorf("walk output tree: %w", err)
 	}
 	s.logOrphanWalkOutcome(walk.unreadable, walk.symlinked)
@@ -742,7 +771,7 @@ func (w *outputWalk) visit(rel string, d fs.DirEntry, err error) error {
 	// scan that created it. Refuse to reap rather than try to reconcile two
 	// namespaces.
 	if d.Type()&fs.ModeSymlink != 0 {
-		slog.Debug("output tree contains a symlink; orphan removal is disabled for this scan", "path", rel)
+		slog.Debug("output tree contains a symlink; "+reapDisabledPhrase, "path", rel)
 		w.symlinked++
 		w.safe = false
 		return nil
@@ -769,12 +798,12 @@ func (w *outputWalk) visit(rel string, d fs.DirEntry, err error) error {
 // individual paths stay at Debug.
 func (s *store) logOrphanWalkOutcome(unreadable, symlinked int) {
 	if unreadable > 0 {
-		slog.Warn("some output paths could not be read while looking for orphans; orphan removal is disabled for this scan",
+		slog.Warn("some output paths could not be read while looking for orphans; "+reapDisabledPhrase,
 			"dir", s.root.Name(), "count", unreadable,
 			"remediation", outputPermRemediation)
 	}
 	if symlinked > 0 {
-		slog.Warn("output tree contains symlinks; orphan removal is disabled for this scan because writes and the orphan walk resolve paths differently",
+		slog.Warn("output tree contains symlinks; "+reapDisabledPhrase+" because writes and the orphan walk resolve paths differently",
 			"dir", s.root.Name(), "count", symlinked,
 			"remediation", "mount the real output directory instead of linking to it")
 	}

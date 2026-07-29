@@ -172,7 +172,7 @@ func TestAnalyse_resolves_every_documented_input_shape(t *testing.T) {
 			name:    "no key matches any certificate",
 			certPEM: concatPEM(m.LeafPEM, m.CAPEM),
 			keyPEM:  unrelatedKeyPEM,
-			wantErr: "none of the 1 private key block(s) matches any of the 2 certificate(s)",
+			wantErr: "none of the 1 distinct private key(s) in the key file matches any of the 2 certificate(s)",
 		},
 		{
 			name:    "two distinct identities cannot be one bundle",
@@ -579,7 +579,7 @@ func TestAnalyse_names_the_unusable_key_blocks_when_nothing_matches(t *testing.T
 	// The base sentence stays an exact prefix of the diagnosis (analyse_test.go's
 	// documented-input-shape row and convert_test.go both match on it).
 	for _, want := range []string{
-		"none of the 1 private key block(s) matches any of the 2 certificate(s) in the chain",
+		"none of the 1 distinct private key(s) in the key file matches any of the 2 certificate(s) in the chain",
 		"1 declared block(s) could not be decoded",
 	} {
 		if !strings.Contains(got, want) {
@@ -610,7 +610,7 @@ func TestAnalyse_names_an_unparseable_and_an_encrypted_key_block_when_nothing_ma
 	}
 	got := err.Error()
 	for _, want := range []string{
-		"none of the 1 private key block(s) matches any of the 2 certificate(s) in the chain",
+		"none of the 1 distinct private key(s) in the key file matches any of the 2 certificate(s) in the chain",
 		"1 could not be parsed",
 		"at least one is encrypted",
 	} {
@@ -946,7 +946,7 @@ func TestAnalyse_names_the_skipped_certificate_file_blocks_when_nothing_matches(
 		t.Fatal("Analyse(relabelled CA link + unrelated key) = nil error, want a no-match error")
 	}
 	got := err.Error()
-	const base = "none of the 1 private key block(s) matches any of the 1 certificate(s) in the chain"
+	const base = "none of the 1 distinct private key(s) in the key file matches any of the 1 certificate(s) in the chain"
 	if !strings.HasPrefix(got, base) {
 		t.Errorf("Analyse error = %q, want the base no-match sentence %q as an exact prefix", got, base)
 	}

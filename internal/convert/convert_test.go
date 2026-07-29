@@ -595,7 +595,7 @@ func TestConvertPair_resolves_a_leaf_last_chain_structurally(t *testing.T) {
 			t.Fatal("convertPairInRoot(unrelated key) = nil error, want a no-match error")
 		}
 		got := err.Error()
-		for _, want := range []string{"none of the 1 private key block(s)", "2 certificate(s)"} {
+		for _, want := range []string{"none of the 1 distinct private key(s) in the key file", "2 certificate(s)"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("error = %q, want it to contain %q", got, want)
 			}
@@ -1085,5 +1085,54 @@ func TestConvertPair_bounds_the_certificate_subject_it_names(t *testing.T) {
 				t.Errorf("round-tripped %d CA cert(s), want 0: an unrelated certificate must be excluded, not embedded", len(cas))
 			}
 		})
+	}
+}
+
+// TestPasswordEncodingIssue_Explain_words_every_shape_once pins the wording both
+// refusal channels now share: Encode's codec guard and internal/config's startup
+// gate each contribute only a prefix or a sentinel, so this is the single place the
+// shape's meaning and its remediation are asserted. A shape that encodes faithfully
+// must return "" (the presence check both callers make), and an unrecognised shape
+// must fail CLOSED with a non-empty sentence rather than pass as encodable.
+func TestPasswordEncodingIssue_Explain_words_every_shape_once(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		shape           convert.PasswordEncodingIssue
+		wantShape       string
+		wantRemediation string
+	}{
+		"invalid UTF-8": {
+			shape:           convert.PasswordInvalidUTF8,
+			wantShape:       "not valid UTF-8",
+			wantRemediation: "supply a text secret",
+		},
+		"non-BMP": {
+			shape:           convert.PasswordNonBMP,
+			wantShape:       "outside the Basic Multilingual Plane",
+			wantRemediation: "choose a password made of BMP characters",
+		},
+		"embedded NUL": {
+			shape:           convert.PasswordEmbeddedNUL,
+			wantShape:       "contains a NUL byte",
+			wantRemediation: "strip NUL bytes from the secret",
+		},
+		"unrecognised shape fails closed": {
+			shape:           convert.PasswordEncodingIssue("future-shape"),
+			wantShape:       "future-shape",
+			wantRemediation: "cannot prove",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := tc.shape.Explain()
+			if !strings.Contains(got, tc.wantShape) || !strings.Contains(got, tc.wantRemediation) {
+				t.Errorf("%q.Explain() = %q, want the shape %q and the remediation %q",
+					tc.shape, got, tc.wantShape, tc.wantRemediation)
+			}
+		})
+	}
+
+	if got := convert.PasswordEncodesFine.Explain(); got != "" {
+		t.Errorf("PasswordEncodesFine.Explain() = %q, want \"\": both callers treat a non-empty result as a refusal", got)
 	}
 }

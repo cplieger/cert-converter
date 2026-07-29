@@ -54,3 +54,36 @@ func TestEncoderName(t *testing.T) {
 		})
 	}
 }
+
+// TestEncoderNames_advertises_only_spellings_EncoderName_accepts pins the agreement
+// between the value domain the app ADVERTISES and the one it ACCEPTS. internal/config
+// passes convert.EncoderNames() as the "expected" attribute of its "unknown PFX_ENCODER"
+// WARN, so every name in the list is a value an operator is told to use, while
+// EncoderName matches a lower-cased, trimmed value against each row's name -- a row
+// spelled any other way would be advertised and then silently replaced with the
+// modern2023 default, leaving the operator on the same WARN after a restart. Nothing else
+// pins it: config's own test compares the RENDERED list against a literal, which stays
+// true for a name EncoderName cannot resolve.
+func TestEncoderNames_advertises_only_spellings_EncoderName_accepts(t *testing.T) {
+	t.Parallel()
+	want := []convert.EncoderType{
+		convert.EncNameModern2023,
+		convert.EncNameModern2026,
+		convert.EncNameLegacyDES,
+		convert.EncNameLegacyRC2,
+	}
+	names := convert.EncoderNames()
+	if len(names) != len(want) {
+		t.Fatalf("convert.EncoderNames() = %v, want the %d canonical spellings %v", names, len(want), want)
+	}
+	for i, name := range names {
+		if name != want[i] {
+			t.Errorf("convert.EncoderNames()[%d] = %q, want %q: the list is the profile table's own order", i, name, want[i])
+		}
+		resolved, known := convert.EncoderName(string(name))
+		if !known || resolved != name {
+			t.Errorf("convert.EncoderName(%q) = (%q, %v), want (%q, true): an advertised spelling the app cannot resolve leaves the operator on the default",
+				name, resolved, known, name)
+		}
+	}
+}

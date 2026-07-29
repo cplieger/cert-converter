@@ -514,6 +514,52 @@ func TestRunDebouncedScan_reasserts_registrations_the_kernel_dropped_silently(t 
 	}
 }
 
+// TestRunDebouncedScan_floors_the_reassert_cadence pins minPreScanResync: the
+// whole-tree re-assert above is O(directories under the root), re-emits one WARN per
+// unwatchable directory, and carries none of the MAX_SCAN_ENTRIES ceiling the scan it
+// precedes does, while arming it costs a writer to /input one create+delete per
+// debounce window (handleFsEvent's Remove arm schedules a scan for ANY path). Without
+// the floor that walk runs on the writer's cadence, which is a writer-controlled CPU
+// and log-volume amplifier on the change-detection goroutine.
+//
+// The oracle is a registration dropped straight on the watcher between two scans, the
+// same kernel-silent state the test above recovers: the first scan re-asserts, the
+// second one lands inside the floor and must leave it dropped. The scan itself must
+// still run both times -- the floor bounds the re-assert, never change detection.
+func TestRunDebouncedScan_floors_the_reassert_cadence(t *testing.T) {
+	t.Parallel()
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	dir := filepath.Join(root, "example.com")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	scans := 0
+	w := New(root, func(context.Context) { scans++ }, WithDebounce(time.Millisecond))
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+
+	st.runDebouncedScan(t.Context(), watcher)
+	if !slices.Contains(watcher.WatchList(), dir) {
+		t.Fatalf("watch list after the first debounced scan = %v, want %q: the first scan of a run must re-assert the set",
+			watcher.WatchList(), dir)
+	}
+
+	if err := watcher.Remove(dir); err != nil {
+		t.Fatalf("setup: watcher.Remove(%q) = %v, want nil", dir, err)
+	}
+
+	st.runDebouncedScan(t.Context(), watcher)
+
+	if watched := watcher.WatchList(); slices.Contains(watched, dir) {
+		t.Errorf("watch list after a second debounced scan inside %v = %v, want %q still dropped: the whole-tree re-assert must not run on the writer's event cadence",
+			minPreScanResync, watched, dir)
+	}
+	if scans != 2 {
+		t.Errorf("onChange called %d times across two debounced scans, want 2: the re-assert floor must bound the walk, not the scan", scans)
+	}
+}
+
 // TestRecvHelpers_do_no_work_after_cancellation pins the cancellation precedence
 // both receive arms owe the rest of the loop: watchLoop's select picks a ready
 // case at random, so a queued event or watcher error can still be delivered after
@@ -564,5 +610,54 @@ func TestRecvHelpers_do_no_work_after_cancellation(t *testing.T) {
 				t.Errorf("receive on a cancelled context logged %d record(s) (%v), want none: a shutdown must not look like watch degradation", n, logs.Messages())
 			}
 		})
+	}
+}
+
+// TestHandleEventRecv_reattaches_a_directory_recreated_after_a_rename pins the
+// Rename half of the forget-before-root-loss step. Its Remove twin
+// (TestHandleEventRecv_reattaches_a_recreated_directory) covers only
+// event.Has(fsnotify.Remove), so dropping the Rename half leaves the whole suite
+// green while a directory renamed away (an operator moving example.com aside,
+// or a rotation that renames rather than deletes) stays in the membership
+// mirror: when the name is used again the guard reports it already watched, its
+// subtree is never walked, and renewals under it are detected only by the
+// periodic rescan -- never, with the fallback disabled.
+//
+// The oracle is the CHILD of the recreated directory: it was never registered
+// before, so it can only appear in the watch list if the Create event actually
+// re-walked the subtree.
+func TestHandleEventRecv_reattaches_a_directory_recreated_after_a_rename(t *testing.T) {
+	t.Parallel()
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	dir := filepath.Join(root, "example.com")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	w := New(root, func(context.Context) {})
+	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
+		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
+	}
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+
+	if lost := w.handleEventRecv(t.Context(), watcher, st, fsnotify.Event{Name: dir, Op: fsnotify.Rename}, true); lost != nil {
+		t.Fatalf("handleEventRecv(Rename %q) = %v, want nil (an ordinary rename is not lost change detection)", dir, lost)
+	}
+	if err := os.Rename(dir, filepath.Join(root, "example.com.bak")); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(dir, "nested")
+	if err := os.MkdirAll(child, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if lost := w.handleEventRecv(t.Context(), watcher, st, fsnotify.Event{Name: dir, Op: fsnotify.Create}, true); lost != nil {
+		t.Fatalf("handleEventRecv(Create %q) = %v, want nil", dir, lost)
+	}
+
+	if watched := watcher.WatchList(); !slices.Contains(watched, child) {
+		t.Errorf("watch list after %q was renamed away and recreated = %v, want %q re-attached: a renamed-away path must be forgotten so its recreation is walked again",
+			dir, watched, child)
 	}
 }

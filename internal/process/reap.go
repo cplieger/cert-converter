@@ -64,6 +64,16 @@ func (r *reapContext) evidenceComplete() bool {
 	return r.evidenceEvicted == 0
 }
 
+// walkEnumerationComplete reports whether nothing PREVENTED the walk from observing
+// every /input path: the walk ran to the end and no path was unreadable, unresolved
+// or replaced under it. It is the ONE spelling of the walk-coverage veto, separate
+// from evidenceComplete because the two are about different things — the TREE versus
+// this process's MEMORY — and only the first says anything about whether `seen` is a
+// complete enumeration.
+func (r *reapContext) walkEnumerationComplete() bool {
+	return r.walkCompleted && r.result.inputFullyEnumerated()
+}
+
 // enumerationClean reports whether nothing PREVENTED the walk from enumerating the
 // whole input tree, and nothing spent the in-process evidence this scan's own
 // classifications rest on. It is the shared half of two decisions that differ by one
@@ -73,7 +83,7 @@ func (r *reapContext) evidenceComplete() bool {
 // same one logInputCoverageWarnings asks, so a new veto dimension cannot be added to one
 // caller and missed in the other.
 func (r *reapContext) enumerationClean() bool {
-	return r.walkCompleted && r.result.inputFullyEnumerated() && r.evidenceComplete()
+	return r.walkEnumerationComplete() && r.evidenceComplete()
 }
 
 // vanishedOnly reports whether a mid-scan replacement is the ONLY thing that left the
@@ -112,12 +122,17 @@ func (r *reapContext) permissionRefusalOnly() bool {
 	return r.result.Failed == 0 && r.result.Unwritable > 0
 }
 
+// reapDisabledPhrase is the substring the README's CertConverterCannotReap Loki rule matches.
+// Every record that reports a scan declining to reap composes its message from it, so the
+// alert cannot be dropped by rewording one site.
+const reapDisabledPhrase = "orphan removal is disabled for this scan"
+
 // evictedEvidenceMsg is the report for a scan that disabled orphan removal because the
 // observation log's ceiling dropped the wholeness evidence noteMissingKey classifies a
 // missing sibling key against. It is a const because it is the one line that explains an
 // otherwise inexplicable steady state — sync mode enabled, orphans present, nothing
 // removed — so the emit and the test that pins it cannot drift.
-const evictedEvidenceMsg = "orphan removal is disabled for this scan: the observation log dropped the evidence that separates a replaced private key from a missing one, so an orphan cannot be proven"
+const evictedEvidenceMsg = reapDisabledPhrase + ": the observation log dropped the evidence that separates a replaced private key from a missing one, so an orphan cannot be proven"
 
 // logIncompleteInputEnumeration reports why orphan reconciliation is skipped when
 // the input enumeration is incomplete. Without a complete enumeration, "this output
@@ -153,7 +168,7 @@ func logIncompleteInputEnumeration(rc *reapContext) {
 		// of a deployment whose first certificate has not been issued yet.
 		slog.Debug("skipping orphan reconciliation; the scan found no certificate pairs to compare the output tree against")
 	default:
-		slog.Warn("orphan removal is disabled for this scan: the scan did not fully enumerate the input tree, so no output can be proven orphaned",
+		slog.Warn(reapDisabledPhrase+": the scan did not fully enumerate the input tree, so no output can be proven orphaned",
 			"walk_completed", rc.walkCompleted, "unreadable", rc.result.Unreadable,
 			"unresolved", rc.result.Unresolved, "vanished", rc.result.Vanished,
 			"total", rc.result.Total,
@@ -190,7 +205,7 @@ func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *r
 			slog.Debug("orphan enumeration cancelled during shutdown", "error", err)
 			return 0, err
 		}
-		slog.Warn("could not enumerate output orphans; orphan removal is disabled for this scan",
+		slog.Warn("could not enumerate output orphans; "+reapDisabledPhrase,
 			"error", err, "dir", rp.out.root.Name(),
 			"remediation", outputPermRemediation)
 		return 0, nil
@@ -207,6 +222,7 @@ func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *r
 			"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),
 			"action", d.inaction,
 			"remediation", d.remediation)
+		rp.reportRetainedLoneKeys(orphaned, walkSafe)
 		return 0, nil
 	}
 
@@ -311,6 +327,31 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 		}
 	}
 	return deleted, nil
+}
+
+// reportRetainedLoneKeys names, on a scan that REPORTS orphans instead of deleting
+// them, every candidate the sync path would refuse to delete because the certificate's
+// sibling private key is still under /input.
+//
+// Without it this app's own promise — "a bundle whose <name>.key is still there is kept
+// and reported by its own WARN" (README, OUTPUT_LIFECYCLE) — holds only under
+// OUTPUT_LIFECYCLE=sync, so the DEFAULT warn mode reports the bundle as an ordinary
+// orphan and its remediation offers sync, which would not delete it either. The report
+// is de-duplicated per CHANGE by the same observation-log set the reap path uses, so it
+// does not repeat on every fsnotify event and fallback tick.
+//
+// An OUTPUT walk that could not enumerate the tree is skipped for the same reason
+// orphanReportRemediation withholds its delete advice on it: that candidate list can
+// hold live bundles, so naming one of them as a half-deleted pair would be a wrong
+// diagnosis. On a trustworthy list the input enumeration was proven complete, so every
+// candidate's certificate really is gone and the only open question is the key.
+func (rp *reaper) reportRetainedLoneKeys(orphaned []string, walkSafe bool) {
+	if !walkSafe {
+		return
+	}
+	for _, rel := range orphaned {
+		_ = rp.keyStillPresent(rel, layout.CertForOutput(rel))
+	}
 }
 
 // keyStillPresent vetoes one confirmed candidate's deletion because the sibling PRIVATE

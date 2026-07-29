@@ -36,7 +36,7 @@ const (
 // real chain is a leaf plus a handful of issuers; the bound exists because
 // Analyse's graph work is superlinear in the certificate count (all-pairs
 // candidate edges, and a path walk that verifies up to n^2/2 signatures), so one
-// file inside the reader's 10 MB cap could otherwise hold ~19,000 certificates
+// file inside the reader's MaxInputBytes cap could otherwise hold ~19,000 certificates
 // and spend hours of CPU plus gigabytes of adjacency state on the scan's only
 // goroutine.
 const maxChainCerts = 64
@@ -45,6 +45,15 @@ const maxChainCerts = 64
 // Rotation appends a second key; nothing legitimate appends thousands, and every
 // extra key multiplies identity matching.
 const maxKeyBlocks = 16
+
+// MaxInputBytes is the largest certificate or key file this package's acceptance
+// bounds are calibrated against: maxChainCerts, maxKeyBlocks, maxRSAPrimeFactors
+// and the log-text bounds are each sized from the worst case a file this large can
+// hold, and the measured costs in their comments assume it. The reader enforces it
+// (internal/process reads every input under this cap), so the number lives here
+// where the reasoning that depends on it lives: raising the cap has to be a change
+// to this constant, which lands in the diff beside the bounds it invalidates.
+const MaxInputBytes = 10 << 20
 
 // parseCertChain decodes all CERTIFICATE PEM blocks from pemBytes, returning
 // them in order. Blocks of any other type (the private key of a combined
@@ -142,6 +151,9 @@ func (s *certScan) visit(block *pem.Block) error {
 			s.unrelated.add(block.Type)
 		}
 		return nil
+	}
+	if err := oversizedCertificateOIDError(block); err != nil {
+		return err
 	}
 	c, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
@@ -345,15 +357,15 @@ func (s *skippedBlocks) add(blockType string) {
 }
 
 // firstTypeForLog returns the first skipped label bounded for a log line: the
-// PEM type is operator-supplied text capped only by the 10 MB input read bound
-// internal/process applies (source.go maxFileSize).
+// PEM type is operator-supplied text capped only by the MaxInputBytes input read
+// bound internal/process applies.
 func (s *skippedBlocks) firstTypeForLog() string {
 	return boundLogText(s.firstType, maxBlockTypeLogLen)
 }
 
 // maxBlockTypeLogLen bounds the PEM block label a parse diagnostic names. A PEM
-// type line is arbitrary operator-supplied text bounded only by the caller's 10 MB
-// input read bound (internal/process source.go maxFileSize), so
+// type line is arbitrary operator-supplied text bounded only by the caller's
+// MaxInputBytes input read bound, so
 // it is truncated before it reaches the log.
 const maxBlockTypeLogLen = 64
 
@@ -372,7 +384,7 @@ const maxBlockTypeLogLen = 64
 // the app contributes only the marker and the limit.
 //
 // The bound exists because the source file is capped only by the caller's input read
-// bound (10 MB, internal/process source.go maxFileSize), so an unbounded
+// bound (MaxInputBytes), so an unbounded
 // interpolation would put a multi-megabyte line into the log of every scan that
 // retries the pair.
 //
@@ -420,7 +432,7 @@ func boundSubject(subject string) string {
 // its messages with %q (a SAN URI, a name constraint, an extension OID), and
 // x509's PKCS#8 unknown-algorithm message interpolates an OBJECT IDENTIFIER
 // decoded from the key file. Either file is capped only by the caller's input
-// read bound (10 MB), so the unbounded text would
+// read bound (MaxInputBytes), so the unbounded text would
 // put a multi-megabyte line into the log of every scan that retries the pair.
 // It shares the same bound (maxSubjectLogLen) and the same partial-rune handling
 // as every other certificate-controlled interpolation in this package. Unwrap is
@@ -572,10 +584,12 @@ func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped skippedBl
 // or "" when every decoded block parsed. It goes through boundLogText for the same
 // reason every other file-derived interpolation in this package does: the text is
 // built from a key file the app does not control, and this is the package's single
-// gate for that. parsePrivateKeyBlock already bounds its own wrapped error, so the
-// gate is idempotent here rather than load-bearing; routing through it keeps the
-// rule "no file-derived text reaches a diagnostic ungated" true by construction
-// rather than by tracing every producer.
+// gate for that. parsePrivateKeyBlock bounds the WRAPPED parser error at the same
+// limit, but its own sentence is charged against that budget first, so a maximal
+// inner error loses its tail here — the reason's opening survives, which is the part
+// that names the remedy. Routing through the gate keeps the rule "no file-derived
+// text reaches a diagnostic ungated" true by construction rather than by tracing
+// every producer.
 func parseFailureForLog(err error) string {
 	if err == nil {
 		return ""
@@ -700,7 +714,7 @@ func isEncryptedPEMBlock(block *pem.Block) bool {
 // on the integers the FILE supplies before either can reject the key, and that
 // work has no context or cancellation path. Measured on go1.26.5, a
 // self-consistent key costs 8.8ms to parse at 16384 bits and 369ms at 131072 bits
-// from a 73 KB block, and other shapes inside the reader's 10 MB cap are far
+// from a 73 KB block, and other shapes inside the reader's MaxInputBytes cap are far
 // worse; all of it lands on the scan's only goroutine, before convertEntry can
 // emit its per-path diagnostic, where shutdown cannot interrupt it. So the guard
 // cannot inspect a PARSED key — by then the stall has already happened — and runs
@@ -738,12 +752,32 @@ func oversizedRSAKeyError(block *pem.Block) error {
 // element COUNT at a constant few bytes per element. Measured on go1.26.5 with
 // 1024-bit factors: 1,000 entries (12 KB DER) cost 3.0ms and 2.6 MB, 5,000 (61 KB)
 // cost 52ms and 70 MB, 10,000 (127 KB) cost 160ms and 292 MB — all far inside the
-// reader's 10 MB cap, on the scan's only goroutine, with no cancellation path.
+// reader's MaxInputBytes cap, on the scan's only goroutine, with no cancellation path.
 //
 // 64 is far above any real key: multi-prime RSA is rare and practical keys use
 // three or four factors, so this refuses an amplification shape rather than a
 // configuration.
 const maxRSAPrimeFactors = 64
+
+// maxRSAKeyElements bounds how many top-level elements of a PKCS#1 RSAPrivateKey
+// body the pre-scan walks, and it is a THIRD bound whose subject is the walk
+// itself rather than the key. RFC 8017 A.1.2 declares nine INTEGERs plus the
+// optional otherPrimeInfos SEQUENCE, so eight elements follow the modulus; 16 is
+// generous headroom for a structure some other tool wrote.
+//
+// It exists because the walk is not free: every element costs one asn1.Unmarshal
+// into an asn1.RawValue, so a body of tiny INTEGERs makes the GUARD the expensive
+// operation. Measured on go1.26.5, a 7.86 MB body (the largest DER a 10 MB PEM
+// file yields) holding 2,621,438 three-byte INTEGERs cost the walk 340 ms and
+// 200 MB of transient allocation, while x509.ParsePKCS1PrivateKey rejected the
+// same DER in 60 us; at a full 10 MB DER, 855 ms and 267 MB.
+//
+// Stopping cannot let an expensive shape through: a body with more top-level
+// elements than PKCS#1 declares does not match crypto/x509's pkcs1PrivateKey
+// struct, so encoding/asn1 refuses it before any precomputation runs. It is the
+// same ceiling profile.go's sequenceElements applies to every SEQUENCE OF the
+// preflight walks.
+const maxRSAKeyElements = 16
 
 // rsaKeyPreScan is what the DER-only envelope scan learned about a private-key
 // block: its SHAPE, the prime-factor count that shape declares, and — optionally —
@@ -868,10 +902,21 @@ func scanRSAKeyEnvelopePKCS8(afterAlgorithm []byte, depth int) rsaKeyPreScan {
 // because that collection is the amplification shape maxRSAPrimeFactors bounds. That
 // count is the only superlinear cost in reach, and it saturates; everything else
 // here is one tag-length header per element.
+//
+// The element count is bounded too (maxRSAKeyElements), because the walk's own
+// per-element cost is what a body of millions of tiny INTEGERs attacks; a body
+// longer than PKCS#1 declares is rejected by encoding/asn1's struct decode in
+// microseconds, so the budget forfeits no refusal that could have mattered.
 func scanRSAPKCS1Body(modulus asn1.RawValue, rest []byte) rsaKeyPreScan {
 	scan := rsaKeyPreScan{factors: 2, isRSA: true}
 	scan.fold(modulus)
-	for len(rest) > 0 {
+	// The walk is bounded on BOTH axes: maxRSAKeyElements bounds how many elements
+	// it reads at all (the walk's own cost), maxRSAPrimeFactors below bounds what
+	// they may declare.
+	for range maxRSAKeyElements {
+		if len(rest) == 0 {
+			break
+		}
 		elem, remaining, elemOK := asn1Element(rest)
 		if !elemOK {
 			break
@@ -1088,7 +1133,7 @@ func prohibitiveKeyError(block *pem.Block) error {
 // applied here because x509.ParsePKCS8PrivateKey decodes that identifier into an
 // asn1.ObjectIdentifier before it can reject an unsupported key: encoding/asn1
 // allocates one int per encoded byte, roughly eight bytes of heap per input byte, so
-// a file inside the reader's 10 MB cap can spend most of its DER on one
+// a file inside the reader's MaxInputBytes cap can spend most of its DER on one
 // syntactically valid identifier and drive tens of megabytes of transient
 // allocation merely to be refused — on the scan's only goroutine, with no
 // cancellation path. The refusal is bounded and names the size, like every other
@@ -1127,7 +1172,62 @@ func oversizedKeyAlgorithmOIDError(block *pem.Block) error {
 // whatever its label. Every curve a real key names is 9 bytes or fewer, so nothing
 // legitimate is newly refused; only the refusal point and its text move.
 func oversizedSEC1CurveOIDError(block *pem.Block) error {
-	outer, _, ok := asn1Element(block.Bytes)
+	size, found := sec1CurveOIDBytes(block.Bytes)
+	if !found || size <= maxOIDBytes {
+		// x509 reaches the SAME SEC1 parser through a PKCS#8 EC container: for an
+		// id-ecPublicKey key, ParsePKCS8PrivateKey hands the privateKey OCTET STRING's
+		// content to parseECPrivateKey, whose ecPrivateKey struct decodes the explicit
+		// [0] named-curve identifier into an asn1.ObjectIdentifier exactly as the
+		// top-level SEC1 path does — and then DISCARDS it, because the curve named in
+		// the AlgorithmIdentifier wins. Neither the RSA pre-scan (the inner structure's
+		// second element is an OCTET STRING) nor the PKCS#8 identifier bound (which
+		// reads only the AlgorithmIdentifier, whose own identifiers are the ordinary 7
+		// and 8 bytes) sees it, so the fourth door needs this unwrap.
+		size, found = sec1CurveOIDBytes(pkcs8PrivateKeyDER(block.Bytes))
+	}
+	if !found || size <= maxOIDBytes {
+		return nil
+	}
+	return fmt.Errorf("private key in a %q block names a %d-byte curve identifier, above the %d-byte ceiling this app decodes an identifier at (decoding it would allocate one int per encoded byte before the key could be rejected)",
+		boundLogText(block.Type, maxBlockTypeLogLen), size, maxOIDBytes)
+}
+
+// sec1CurveOIDBytes reports the content length of a SEC1 ECPrivateKey's explicit
+// [0] named-curve identifier — SEQUENCE { INTEGER version, OCTET STRING privateKey,
+// [0] parameters OPTIONAL } — and false for anything that is not that shape. Only
+// the LENGTH comes back, for the reason decodeOID documents: the whole point is to
+// compare it before anything decodes the identifier.
+func sec1CurveOIDBytes(der []byte) (int, bool) {
+	outer, _, ok := asn1Element(der)
+	if !ok || !isASN1(outer, asn1.TagSequence) {
+		return 0, false
+	}
+	version, afterVersion, ok := asn1Element(outer.Bytes)
+	if !ok || !isASN1(version, asn1.TagInteger) {
+		return 0, false
+	}
+	priv, afterPriv, ok := asn1Element(afterVersion)
+	if !ok || !isASN1(priv, asn1.TagOctetString) {
+		return 0, false
+	}
+	params, _, ok := asn1Element(afterPriv)
+	if !ok || params.Class != asn1.ClassContextSpecific || params.Tag != 0 || !params.IsCompound {
+		return 0, false
+	}
+	oid, _, oidOK := asn1Element(params.Bytes)
+	if !oidOK || !isASN1(oid, asn1.TagOID) {
+		return 0, false
+	}
+	return len(oid.Bytes), true
+}
+
+// pkcs8PrivateKeyDER returns the content of a PKCS#8 PrivateKeyInfo's privateKey
+// OCTET STRING — the inner key structure x509 hands to the algorithm's own parser —
+// and nil for anything that is not that shape. It is the sibling of
+// scanRSAKeyEnvelopePKCS8's unwrap and admits exactly one level for the same
+// reason: a crafted file must not be able to make a pre-parse walk recurse.
+func pkcs8PrivateKeyDER(der []byte) []byte {
+	outer, _, ok := asn1Element(der)
 	if !ok || !isASN1(outer, asn1.TagSequence) {
 		return nil
 	}
@@ -1135,20 +1235,75 @@ func oversizedSEC1CurveOIDError(block *pem.Block) error {
 	if !ok || !isASN1(version, asn1.TagInteger) {
 		return nil
 	}
-	priv, afterPriv, ok := asn1Element(afterVersion)
-	if !ok || !isASN1(priv, asn1.TagOctetString) {
+	algorithm, afterAlgorithm, ok := asn1Element(afterVersion)
+	if !ok || !isASN1(algorithm, asn1.TagSequence) {
 		return nil
 	}
-	params, _, ok := asn1Element(afterPriv)
-	if !ok || params.Class != asn1.ClassContextSpecific || params.Tag != 0 || !params.IsCompound {
+	inner, _, ok := asn1Element(afterAlgorithm)
+	if !ok || !isASN1(inner, asn1.TagOctetString) {
 		return nil
 	}
-	oid, _, oidOK := asn1Element(params.Bytes)
-	if !oidOK || !isASN1(oid, asn1.TagOID) || len(oid.Bytes) <= maxOIDBytes {
-		return nil
+	return inner.Bytes
+}
+
+// maxCertificateOIDDepth bounds how deep the pre-parse walk descends into a
+// certificate's DER. Every identifier x509 decodes sits at most six constructed
+// elements down (Certificate > TBSCertificate > extensions [3] > SEQUENCE OF >
+// Extension > OID, and the same depth for a subject RDN's attribute type), so this
+// is headroom rather than a policy, and it is what stops a crafted file from making
+// the walk recurse.
+const maxCertificateOIDDepth = 8
+
+// oversizedCertificateOIDError refuses a CERTIFICATE block carrying an OBJECT
+// IDENTIFIER larger than maxOIDBytes, and reports nil for every block whose DER this
+// walk cannot read.
+//
+// It exists for the reason decodeOID and oversizedKeyAlgorithmOIDError exist, on the
+// one input path that had no such bound: x509.ParseCertificate decodes every
+// extension identifier and every subject/issuer attribute type into an
+// asn1.ObjectIdentifier, and encoding/asn1 sizes that slice from the encoded LENGTH
+// (one int per byte), so a file inside the reader's MaxInputBytes cap can spend its DER on
+// one syntactically valid identifier and drive tens of megabytes — half of it
+// retained with the parsed chain — on the scan's only goroutine, with no
+// cancellation path. Every identifier a real certificate names is 9 bytes or fewer.
+func oversizedCertificateOIDError(block *pem.Block) error {
+	if largest := largestOIDBytes(block.Bytes, maxCertificateOIDDepth); largest > maxOIDBytes {
+		return fmt.Errorf("certificate in a %q block names a %d-byte object identifier, above the %d-byte ceiling this app decodes an identifier at (decoding it would allocate one int per encoded byte inside the certificate parser)",
+			boundLogText(block.Type, maxBlockTypeLogLen), largest, maxOIDBytes)
 	}
-	return fmt.Errorf("private key in a %q block names a %d-byte curve identifier, above the %d-byte ceiling this app decodes an identifier at (decoding it would allocate one int per encoded byte before the key could be rejected)",
-		boundLogText(block.Type, maxBlockTypeLogLen), len(oid.Bytes), maxOIDBytes)
+	return nil
+}
+
+// largestOIDBytes reports the content length of the largest primitive OBJECT
+// IDENTIFIER in der, descending into constructed elements (and into an OCTET STRING,
+// which is how an extension wraps the identifiers inside its own value) up to depth.
+// It reads only each element's tag-length header through asn1Element, decodes
+// nothing, and FAILS OPEN on anything it cannot read, exactly like
+// scanRSAKeyEnvelope: the guard's job is to refuse an oversized identifier, not to
+// become a second certificate parser.
+func largestOIDBytes(der []byte, depth int) int {
+	if depth <= 0 {
+		return 0
+	}
+	var largest int
+	for len(der) > 0 {
+		elem, rest, ok := asn1Element(der)
+		if !ok {
+			return largest
+		}
+		switch {
+		case isASN1(elem, asn1.TagOID) && !elem.IsCompound:
+			if len(elem.Bytes) > largest {
+				largest = len(elem.Bytes)
+			}
+		case elem.IsCompound || isASN1(elem, asn1.TagOctetString):
+			if inner := largestOIDBytes(elem.Bytes, depth-1); inner > largest {
+				largest = inner
+			}
+		}
+		der = rest
+	}
+	return largest
 }
 
 // PasswordEncodingIssues reports the ways a PFX password cannot survive the
@@ -1198,6 +1353,37 @@ func (i PasswordEncodingIssues) Primary() PasswordEncodingIssue {
 		return PasswordEmbeddedNUL
 	}
 	return PasswordEncodesFine
+}
+
+// Explain says why a shape cannot survive the PKCS#12 UCS-2 password encoding and
+// what to do about it, or "" for a password that encodes faithfully. It is the
+// single home of that wording: Encode's codec guard and internal/config's startup
+// gate both refuse on a non-empty result, so neither re-enumerates the shapes and a
+// new shape lands once. Never names the password value; these texts reach the log.
+func (s PasswordEncodingIssue) Explain() string {
+	switch s {
+	case PasswordEncodesFine:
+		return ""
+	case PasswordInvalidUTF8:
+		return "is not valid UTF-8, so the PKCS#12 UCS-2 password encoding would " +
+			"replace every invalid byte with U+FFFD and protect the bundle with a " +
+			"different, lower-entropy password than the one supplied; supply a text " +
+			"secret (for example base64) instead of raw binary bytes"
+	case PasswordNonBMP:
+		return "contains a character outside the Basic Multilingual Plane, which the " +
+			"PKCS#12 UCS-2 password encoding cannot represent, so every encode would " +
+			"fail; choose a password made of BMP characters (ASCII is safest)"
+	case PasswordEmbeddedNUL:
+		return "contains a NUL byte, and PKCS#12 passwords are NUL-terminated, so no " +
+			"consumer that builds the terminated BMPString itself could open the bundle " +
+			"with the password supplied; strip NUL bytes from the secret (a UTF-16 or " +
+			"NUL-padded secret file is the usual cause)"
+	}
+	// Fail CLOSED for a shape this wording does not cover: a non-empty result is a
+	// refusal, so a future recognised shape is refused by both consumers until its
+	// text is added here, instead of being accepted by fallthrough at either.
+	return fmt.Sprintf("carries encoding shape %q, which this app cannot prove the "+
+		"PKCS#12 UCS-2 password encoding carries intact", s)
 }
 
 // InspectPasswordEncoding reports how a PFX password fares under the PKCS#12

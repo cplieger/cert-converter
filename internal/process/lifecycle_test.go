@@ -46,6 +46,27 @@ func newReaper(out *store, src *source, mode outputpolicy.Lifecycle) *reaper {
 	return &reaper{src: src, out: out, mode: mode, observations: newObservationLog(0)}
 }
 
+// writePair writes an already-generated pair into dir under the /input naming rule the
+// scanner pairs on (<stem>.crt beside <stem>.key), with the modes every fixture in this
+// package uses: a world-readable certificate and an owner-only key.
+func writePair(t *testing.T, dir, stem string, certPEM, keyPEM []byte) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, stem+".crt"), certPEM, 0o644); err != nil {
+		t.Fatalf("setup: write %s.crt: %v", stem, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, stem+".key"), keyPEM, 0o600); err != nil {
+		t.Fatalf("setup: write %s.key: %v", stem, err)
+	}
+}
+
+// writeSelfSignedPair generates a fresh ECDSA self-signed pair for <stem>.example.com and
+// writes it as <stem>.crt/<stem>.key: the /input fixture the scan-level cases start from.
+func writeSelfSignedPair(t *testing.T, dir, stem string) {
+	t.Helper()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, stem+".example.com", "ecdsa")
+	writePair(t, dir, stem, certPEM, keyPEM)
+}
+
 // TestStoreReconcile pins every rail on orphan deletion. Each case is a way the
 // gate must refuse, because getting a deletion wrong destroys private key material
 // and the documented deployment replicates the output tree onward to a second host.
@@ -378,9 +399,9 @@ func TestSampleOrphanPaths_bounds_the_sample_by_bytes(t *testing.T) {
 			t.Errorf("sampleOrphanPaths(one %d-byte path) rendered %d bytes without the %q marker: a reader cannot tell the list was cut",
 				len(paths[0]), len(got), truncationMarker)
 		}
-		if max := maxLoggedOrphanBytes + len(truncationMarker); len(got) > max {
+		if maxLen := maxLoggedOrphanBytes + len(truncationMarker); len(got) > maxLen {
 			t.Errorf("sampleOrphanPaths(one %d-byte path) rendered %d bytes, want at most %d",
-				len(paths[0]), len(got), max)
+				len(paths[0]), len(got), maxLen)
 		}
 		if !utf8.ValidString(got) {
 			t.Errorf("sampleOrphanPaths(one %d-byte path) rendered invalid UTF-8: the cut split a rune", len(paths[0]))
@@ -392,9 +413,9 @@ func TestSampleOrphanPaths_bounds_the_sample_by_bytes(t *testing.T) {
 		}
 		// The rune backoff may discard up to utf8.UTFMax-1 bytes below the budget and no
 		// more; a cap that threw away much more would be a silent second truncation.
-		if min := maxLoggedOrphanBytes - (utf8.UTFMax - 1); len(kept) < min {
+		if minKept := maxLoggedOrphanBytes - (utf8.UTFMax - 1); len(kept) < minKept {
 			t.Errorf("sampleOrphanPaths(one %d-byte path) kept only %d bytes, want at least %d: the rune backoff must not discard more than one rune",
-				len(paths[0]), len(kept), min)
+				len(paths[0]), len(kept), minKept)
 		}
 	})
 
@@ -419,8 +440,8 @@ func TestSampleOrphanPaths_bounds_the_sample_by_bytes(t *testing.T) {
 			t.Errorf("sampleOrphanPaths(%d oversized paths) rendered %d bytes without the %q marker: the item cap is not a byte bound",
 				len(paths), len(got), truncationMarker)
 		}
-		if max := maxLoggedOrphanBytes + len(truncationMarker) + len(wantMore); len(got) > max {
-			t.Errorf("sampleOrphanPaths(%d oversized paths) rendered %d bytes, want at most %d", len(paths), len(got), max)
+		if maxLen := maxLoggedOrphanBytes + len(truncationMarker) + len(wantMore); len(got) > maxLen {
+			t.Errorf("sampleOrphanPaths(%d oversized paths) rendered %d bytes, want at most %d", len(paths), len(got), maxLen)
 		}
 	})
 }
@@ -467,8 +488,8 @@ func TestStoreReconcile_oversized_orphan_sample_keeps_the_count(t *testing.T) {
 	if !strings.HasSuffix(paths, truncationMarker) {
 		t.Errorf("orphan report logged a %d-byte paths attribute without the %q marker", len(paths), truncationMarker)
 	}
-	if max := maxLoggedOrphanBytes + len(truncationMarker); len(paths) > max {
-		t.Errorf("orphan report logged a %d-byte paths attribute, want at most %d", len(paths), max)
+	if maxLen := maxLoggedOrphanBytes + len(truncationMarker); len(paths) > maxLen {
+		t.Errorf("orphan report logged a %d-byte paths attribute, want at most %d", len(paths), maxLen)
 	}
 }
 
@@ -693,11 +714,8 @@ func TestStoreReconcile_spares_a_live_bundle_when_an_ancestor_is_swapped_for_a_s
 // the orphan walk into a directory must be left in place, while a later regular
 // orphan is still removed. Serial: captureLogs swaps the process-global slog.Default.
 //
-// It replaces a case that claimed to pin the "skipping (never aborting on) an
-// individual removal FAILURE" arm with a non-empty directory: that fixture never
-// reaches Root.Remove any more, because the non-regular guard now returns first, and
-// the deleted count plus the filesystem state are identical either way. The log
-// assertion is what makes the test fail if the guard is removed.
+// The log assertion is load-bearing: the guard returns before Root.Remove, so the
+// WARN is the only place the refusal is observable beyond the count.
 func TestStoreRemoveOrphans_spares_non_regular_candidate_and_continues(t *testing.T) {
 	const wantMsg = "orphaned output path is not a regular file; leaving it in place"
 
@@ -705,9 +723,6 @@ func TestStoreRemoveOrphans_spares_non_regular_candidate_and_continues(t *testin
 	stuck := filepath.Join(dir, "stuck.pfx")
 	if err := os.Mkdir(stuck, 0o750); err != nil {
 		t.Fatalf("setup: Mkdir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(stuck, "occupant"), []byte("x"), 0o600); err != nil {
-		t.Fatalf("setup: WriteFile occupant: %v", err)
 	}
 	reapable := filepath.Join(dir, "reapable.pfx")
 	if err := os.WriteFile(reapable, []byte("pfx"), 0o600); err != nil {
@@ -1144,12 +1159,7 @@ func TestScannerRun_regenerates_a_bundle_whose_mode_repair_was_refused(t *testin
 			certsRoot := t.TempDir()
 			outRoot := t.TempDir()
 			_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
-			if err := os.WriteFile(filepath.Join(certsRoot, "chain.crt"), chainPEM, 0o644); err != nil {
-				t.Fatalf("setup: write crt: %v", err)
-			}
-			if err := os.WriteFile(filepath.Join(certsRoot, "chain.key"), keyPEM, 0o600); err != nil {
-				t.Fatalf("setup: write key: %v", err)
-			}
+			writePair(t, certsRoot, "chain", chainPEM, keyPEM)
 			scanner := New(&Options{
 				CertsRoot: certsRoot,
 				OutRoot:   outRoot,
@@ -1175,6 +1185,12 @@ func TestScannerRun_regenerates_a_bundle_whose_mode_repair_was_refused(t *testin
 				return &fs.PathError{Op: "chmod", Path: name, Err: tc.errno}
 			}
 			t.Cleanup(func() { chmodInRoot = prev })
+			// The injected refusal MEANS "another UID owns this bundle", so the
+			// ownership read has to agree: a refusal on a file this process owns is the
+			// filesystem refusing the BITS, which is the WARN-only arm.
+			prevOwned := fileOwnedByProcess
+			fileOwnedByProcess = func(os.FileInfo) bool { return false }
+			t.Cleanup(func() { fileOwnedByProcess = prevOwned })
 
 			logs := captureLogs(t)
 			res, err := scanner.Run(t.Context())
@@ -1302,12 +1318,7 @@ func TestScannerRun_when_the_repairing_rewrite_is_also_refused(t *testing.T) {
 			certsRoot := t.TempDir()
 			outRoot := t.TempDir()
 			_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
-			if err := os.WriteFile(filepath.Join(certsRoot, "chain.crt"), chainPEM, 0o644); err != nil {
-				t.Fatalf("setup: write crt: %v", err)
-			}
-			if err := os.WriteFile(filepath.Join(certsRoot, "chain.key"), keyPEM, 0o600); err != nil {
-				t.Fatalf("setup: write key: %v", err)
-			}
+			writePair(t, certsRoot, "chain", chainPEM, keyPEM)
 			scanner := New(&Options{
 				CertsRoot: certsRoot,
 				OutRoot:   outRoot,
@@ -1330,6 +1341,11 @@ func TestScannerRun_when_the_repairing_rewrite_is_also_refused(t *testing.T) {
 				return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EPERM}
 			}
 			t.Cleanup(func() { chmodInRoot = prevChmod })
+			// The injected refusal MEANS "another UID owns this bundle" (see the sibling
+			// table above), so the ownership read has to agree.
+			prevOwned := fileOwnedByProcess
+			fileOwnedByProcess = func(os.FileInfo) bool { return false }
+			t.Cleanup(func() { fileOwnedByProcess = prevOwned })
 			prevWrite := writeFileInRoot
 			writeFileInRoot = func(context.Context, *os.Root, string, []byte,
 				...atomicfile.Option,
@@ -1436,12 +1452,7 @@ func TestScannerRun_a_stale_bundle_whose_mode_repair_was_refused_is_a_conversion
 	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
 	crtPath := filepath.Join(certsRoot, "chain.crt")
 	keyPath := filepath.Join(certsRoot, "chain.key")
-	if err := os.WriteFile(crtPath, chainPEM, 0o644); err != nil {
-		t.Fatalf("setup: write crt: %v", err)
-	}
-	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
-		t.Fatalf("setup: write key: %v", err)
-	}
+	writePair(t, certsRoot, "chain", chainPEM, keyPEM)
 	scanner := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
@@ -1474,6 +1485,11 @@ func TestScannerRun_a_stale_bundle_whose_mode_repair_was_refused_is_a_conversion
 		return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EPERM}
 	}
 	t.Cleanup(func() { chmodInRoot = prevChmod })
+	// The injected refusal MEANS "another UID owns this bundle", so the ownership read
+	// has to agree.
+	prevOwned := fileOwnedByProcess
+	fileOwnedByProcess = func(os.FileInfo) bool { return false }
+	t.Cleanup(func() { fileOwnedByProcess = prevOwned })
 	prevWrite := writeFileInRoot
 	writeFileInRoot = func(context.Context, *os.Root, string, []byte,
 		...atomicfile.Option,
@@ -1903,13 +1919,7 @@ func TestStoreReconcile_defers_once_per_batch(t *testing.T) {
 func TestScannerRun_reports_a_shutdown_that_arrives_during_reconciliation(t *testing.T) {
 	certsRoot := t.TempDir()
 	outRoot := t.TempDir()
-	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "live.example.com", "ecdsa")
-	if err := os.WriteFile(filepath.Join(certsRoot, "live.crt"), certPEM, 0o644); err != nil {
-		t.Fatalf("setup: write crt: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(certsRoot, "live.key"), keyPEM, 0o600); err != nil {
-		t.Fatalf("setup: write key: %v", err)
-	}
+	writeSelfSignedPair(t, certsRoot, "live")
 	// One orphan bundle, so reconciliation has something to confirm and the deferral is
 	// entered at all.
 	orphan := filepath.Join(outRoot, "gone.pfx")
@@ -1961,13 +1971,7 @@ func TestScannerRun_reports_the_reap_count(t *testing.T) {
 	t.Parallel()
 	certsRoot := t.TempDir()
 	outRoot := t.TempDir()
-	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "live.example.com", "ecdsa")
-	if err := os.WriteFile(filepath.Join(certsRoot, "live.crt"), certPEM, 0o644); err != nil {
-		t.Fatalf("setup: write crt: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(certsRoot, "live.key"), keyPEM, 0o600); err != nil {
-		t.Fatalf("setup: write key: %v", err)
-	}
+	writeSelfSignedPair(t, certsRoot, "live")
 	orphan := filepath.Join(outRoot, "gone.pfx")
 	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
 		t.Fatalf("setup: write orphan: %v", err)
@@ -2051,16 +2055,18 @@ func TestScanWalk_streams_directories_larger_than_one_read_batch(t *testing.T) {
 	t.Cleanup(func() { _ = root.Close() })
 	sw := &scanWalk{src: &source{root: root}, seen: make(map[string]struct{}), observations: newObservationLog(0)}
 
-	if walkErr := sw.walkInput(t.Context(), root); walkErr != nil {
-		t.Fatalf("walkInput(a tree spanning several read batches) = %v, want nil", walkErr)
+	if walkErr := walkRoot(root, func(rel string, d fs.DirEntry, err error) error {
+		return sw.visit(t.Context(), rel, d, err)
+	}); walkErr != nil {
+		t.Fatalf("walkRoot(a tree spanning several read batches) = %v, want nil", walkErr)
 	}
 	// The root, every flat entry, the nested directory, and everything inside it.
 	if want := 1 + flat + 1 + deep; sw.entries != want {
-		t.Errorf("walkInput visited %d entries, want %d: a batched read must reach every entry of every directory exactly once",
+		t.Errorf("walkRoot visited %d entries, want %d: a batched read must reach every entry of every directory exactly once",
 			sw.entries, want)
 	}
 	if sw.unreadable != 0 || sw.unresolved != 0 || sw.vanished != 0 {
-		t.Errorf("walkInput reported unreadable=%d unresolved=%d vanished=%d on a clean tree, want zeros",
+		t.Errorf("walkRoot reported unreadable=%d unresolved=%d vanished=%d on a clean tree, want zeros",
 			sw.unreadable, sw.unresolved, sw.vanished)
 	}
 }
@@ -2240,6 +2246,55 @@ func TestObservationLog_counts_only_evidence_it_actually_held(t *testing.T) {
 	}
 }
 
+func TestObservationLog_keeps_reporting_a_lone_key_once_the_dedup_set_is_full(t *testing.T) {
+	log := newObservationLog(1)
+
+	if !log.markLoneKey("a.crt") {
+		t.Fatal("markLoneKey(first retention) = false, want true: a newly retained bundle must be reported")
+	}
+	if log.markLoneKey("a.crt") {
+		t.Error("markLoneKey(same retention again) = true, want false: the report is deduplicated per change, not per scan")
+	}
+
+	// The set is now at its ceiling, so a SECOND retained pair cannot be remembered.
+	// It must still be named -- on every scan, if that is what it takes -- because
+	// nothing else in this app reports a lone key at any level: the bundle is not
+	// converted, not reaped, and counted in nothing.
+	if !log.markLoneKey("b.crt") {
+		t.Error("markLoneKey(second retention at the ceiling) = false, want true: a retention the log cannot remember must still be named")
+	}
+	if !log.markLoneKey("b.crt") {
+		t.Error("markLoneKey(second retention at the ceiling, repeated) = false, want true: re-reporting is the safe direction, silence is not")
+	}
+	if got := len(log.loneKeys); got != 1 {
+		t.Errorf("len(loneKeys) = %d, want 1: the ceiling arm must report without growing the set", got)
+	}
+}
+
+func TestObservationLog_eviction_never_drops_the_path_it_is_reserving_for(t *testing.T) {
+	log := newObservationLog(1)
+	// The reachable shape: a.crt is remembered by the SIGNATURE half (note ran for it)
+	// while its wholeness entry is gone, and the wholeness half is already full. reserve
+	// then evicts on behalf of a path the first loop can actually encounter.
+	log.seen["a.crt"] = pairFingerprint([]byte("a"), []byte("k"))
+	log.whole["b.crt"] = struct{}{}
+
+	log.markWhole("a.crt")
+
+	if _, held := log.seen["a.crt"]; !held {
+		t.Error("markWhole evicted the signature entry of the path it was reserving room for")
+	}
+	if _, held := log.whole["b.crt"]; held {
+		t.Error("markWhole made no room in the wholeness half; want the other path evicted")
+	}
+	if got := len(log.whole); got != 1 {
+		t.Errorf("len(whole) = %d, want 1: the wholeness half must stay at its ceiling", got)
+	}
+	if got := log.takeEvictedWholeness(); got != 1 {
+		t.Errorf("takeEvictedWholeness = %d, want 1: a dropped wholeness entry is this scan's reap veto", got)
+	}
+}
+
 // TestScannerRun_fails_closed_when_the_observation_log_evicts_wholeness_evidence is the
 // deletion-side consequence of the bound above, and the one the bounded-log test cannot
 // see: that test drives the log through one entry point and asserts on its SIZE, while
@@ -2260,20 +2315,14 @@ func TestObservationLog_counts_only_evidence_it_actually_held(t *testing.T) {
 // Serial: it swaps waitBeforeReap and slog.Default.
 func TestScannerRun_fails_closed_when_the_observation_log_evicts_wholeness_evidence(t *testing.T) {
 	certsRoot, outRoot := t.TempDir(), t.TempDir()
-	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "live.example.com", "ecdsa")
-	if err := os.WriteFile(filepath.Join(certsRoot, "live.crt"), certPEM, 0o644); err != nil {
-		t.Fatalf("setup: write crt: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(certsRoot, "live.key"), keyPEM, 0o600); err != nil {
-		t.Fatalf("setup: write key: %v", err)
-	}
+	writeSelfSignedPair(t, certsRoot, "live")
 	// A bundle with no input: the candidate this scan must NOT delete once it admits it
 	// lost the evidence behind its own missing-key classification.
 	orphan := filepath.Join(outRoot, "gone.pfx")
 	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
 		t.Fatalf("setup: write orphan: %v", err)
 	}
-	// Four entries walked (root, live.crt, live.key) sits inside a budget of 4, so the
+	// Three entries walked (root, live.crt, live.key) sit inside a budget of 4, so the
 	// walk completes and every other veto is clear; the log arrives already holding its
 	// four pairs, so reserving room for live.crt has to evict one.
 	scanner := New(&Options{

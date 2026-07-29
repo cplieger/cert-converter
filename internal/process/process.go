@@ -6,12 +6,10 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log/slog"
 	"os"
-	"path"
-	"slices"
+	"strings"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
@@ -164,6 +162,15 @@ const scanBudgetMsg = "the /input tree holds more entries than one scan will enu
 // simply needs a higher ceiling.
 const scanBudgetRemediation = "check that /input is mounted at the certificate directory and holds nothing else, or raise MAX_SCAN_ENTRIES if the tree is legitimately this large"
 
+// scanBudgetSummaryMsg is the end-of-scan summary line for a walk the entry budget
+// stopped. It is deliberately NOT "scan aborted before completion": that message is
+// the README's CertConverterScanAborted signal, documented as an /input root that
+// could not be walked on a container that has gone unhealthy, and this abort is
+// neither — the root walked fine and Run swallows the error, so health is untouched.
+// CertConverterInputTreeTooLarge (which matches scanBudgetMsg) stays this condition's
+// signal; this line only stops it from also raising the wrong one.
+const scanBudgetSummaryMsg = "scan stopped at the /input entry budget"
+
 // Options carries the process-lifetime scan configuration the composition root
 // chooses once at startup: the confined input and output roots, the password
 // embedded in generated PFX files, and the PKCS#12 encoder profile. The encoder
@@ -181,7 +188,7 @@ type Options struct {
 	// refuses the tree (fallbackScanEntries when non-positive). It is INJECTED rather
 	// than read from internal/config here: that package owns MAX_SCAN_ENTRIES' name,
 	// default, ceiling and repaired-value diagnostics, and the composition root wires
-	// its config.MaxScanEntries() into this field. It also bounds the observation log,
+	// its Config.MaxScanEntries into this field. It also bounds the observation log,
 	// whose size a scan's enumeration is what drives (observationLog.maxObservedPairs).
 	MaxScanEntries int
 }
@@ -253,7 +260,9 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	// /output stale-temp sweep does: every step is an openat-relative
 	// syscall and every path handed downstream is root-relative, so no
 	// ambient absolute path exists for a later read to reach for.
-	walkErr := sw.walkInput(ctx, inHandle)
+	walkErr := walkRoot(inHandle, func(rel string, d fs.DirEntry, err error) error {
+		return sw.visit(ctx, rel, d, err)
+	})
 	// A tree over the entry budget is REPORTED, not failed. It stops the walk (so
 	// `seen` is a prefix of the tree and every whole-tree claim below stays vetoed),
 	// visit has already emitted scanBudgetMsg at WARN with the remediation, and the
@@ -295,8 +304,15 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	// an unresolved symlink means `seen` is not the whole input tree, so a pair
 	// hidden behind it would be forgotten and re-warn on the next clean scan.
 	// result.Total is deliberately NOT part of this gate (unlike enumeratedInput): a
-	// clean walk that found nothing proves every remembered pair is gone.
-	if rc.enumerationClean() {
+	// clean walk that found nothing proves every remembered pair is gone. Nor is
+	// evidenceComplete: an eviction does not make the enumeration partial, and gating
+	// the prune on it would let ceiling pressure disable the one mechanism that
+	// relieves it — an evicted live path is unknown again next scan, evicts again, and
+	// the log stays pinned at its ceiling with orphan reaping off until a restart.
+	// forget only drops paths absent from `seen`, so it cannot spend evidence for any
+	// pair this scan observed, and rc was built before this point, so the reap veto
+	// for this scan is unaffected.
+	if rc.walkEnumerationComplete() {
 		s.observations.forget(sw.seen)
 	}
 	rp := &reaper{src: sw.src, out: out, mode: s.opts.Lifecycle, observations: s.observations}
@@ -323,7 +339,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 // reaper.reconcile checks the output tree against). The one exception is
 // observations, which is process-lifetime state owned by the Scanner and shared
 // with the walk, not per-run accounting: it survives across scans by design.
-// Hoisting the WalkDir callback onto this struct keeps Scanner.Run flat.
+// Hoisting the per-entry callback onto this struct keeps Scanner.Run flat.
 type scanWalk struct {
 	src          *source
 	out          *store
@@ -373,115 +389,14 @@ func (sw *scanWalk) entryBudget() int {
 // budget is then checked between batches, on the entries actually taken.
 const scanReadDirBatch = 256
 
-// walkInput enumerates the input tree through the confined root and hands every
-// entry to visit, root-relative, in the same shape fs.WalkDir did: the root first,
-// then each entry pre-order, with a read failure reported through visit for the path
-// it belongs to (fatal at the root, one unreadable sub-path below it) and a visit
-// error — a cancellation or the entry-budget abort — stopping the walk at once.
-//
-// Two deliberate differences from fs.WalkDir. Entries arrive in directory order
-// (sorted only within a batch) rather than globally sorted, because a global sort IS
-// the materialization this walk avoids; nothing downstream depends on the order
-// (`seen` is a set, and the per-path diagnostics stand alone). And a directory's own
-// entries are all visited before the walk descends into its subdirectories, which is
-// what lets it keep exactly ONE directory handle open at a time: a queue of pending
-// directory NAMES cannot exhaust the process's descriptors on a deep tree, and its
-// own size is bounded by the entry budget because every queued directory was counted
-// as an entry when it was visited.
-func (sw *scanWalk) walkInput(ctx context.Context, root *os.Root) error {
-	fi, err := root.Stat(".")
-	if err != nil {
-		return sw.visit(ctx, ".", nil, err)
-	}
-	if visitErr := sw.visit(ctx, ".", fs.FileInfoToDirEntry(fi), nil); visitErr != nil {
-		return visitErr
-	}
-	pending := []string{"."}
-	for len(pending) > 0 {
-		dir := pending[len(pending)-1]
-		pending = pending[:len(pending)-1]
-		subdirs, streamErr := sw.streamDir(ctx, root, dir)
-		if streamErr != nil {
-			return streamErr
-		}
-		// Reversed, so the stack pops the subdirectories in the order they were read.
-		slices.Reverse(subdirs)
-		pending = append(pending, subdirs...)
-	}
-	return nil
-}
-
-// streamDir visits one directory's entries in fixed-size batches and reports the
-// subdirectories found under it, for the caller to stream in turn. The handle is
-// closed before any of them is opened.
-//
-// A directory that cannot be opened or read is reported through visit for its OWN
-// path, which is where fs.WalkDir reported it too: at the root that aborts the scan,
-// below the root it counts one unreadable sub-path (or one vanished path) and the
-// walk goes on with the rest of the tree.
-func (sw *scanWalk) streamDir(ctx context.Context, root *os.Root, dir string) ([]string, error) {
-	handle, err := root.Open(dir)
-	if err != nil {
-		return nil, sw.visit(ctx, dir, nil, err)
-	}
-	defer func() { _ = handle.Close() }()
-
-	var subdirs []string
-	for {
-		entries, readErr := handle.ReadDir(scanReadDirBatch)
-		// Sorted within the batch only: it costs nothing at this size and keeps a
-		// single directory's diagnostics stable from scan to scan.
-		slices.SortFunc(entries, cmpDirEntryName)
-		batchSubdirs, visitErr := sw.visitBatch(ctx, dir, entries)
-		subdirs = append(subdirs, batchSubdirs...)
-		if visitErr != nil {
-			return nil, visitErr
-		}
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
-				return subdirs, nil
-			}
-			// The entries already read are kept: they were visited, and the failure
-			// costs the REST of this directory, not what the walk has seen of it.
-			return subdirs, sw.visit(ctx, dir, nil, readErr)
-		}
-	}
-}
-
-// visitBatch hands one batch of directory entries to visit, root-relative, and reports
-// the subdirectories among them for the caller to stream once this directory's handle
-// is closed. A visit error (a cancellation, or the entry-budget abort) stops the batch
-// and is returned with whatever the batch had already found.
-func (sw *scanWalk) visitBatch(ctx context.Context, dir string, entries []fs.DirEntry) ([]string, error) {
-	var subdirs []string
-	for _, entry := range entries {
-		rel := entry.Name()
-		if dir != "." {
-			rel = path.Join(dir, entry.Name())
-		}
-		if visitErr := sw.visit(ctx, rel, entry, nil); visitErr != nil {
-			return subdirs, visitErr
-		}
-		if entry.IsDir() {
-			subdirs = append(subdirs, rel)
-		}
-	}
-	return subdirs, nil
-}
-
 // cmpDirEntryName orders two directory entries by name, the comparison
 // slices.SortFunc needs for the per-batch sort above.
 func cmpDirEntryName(a, b fs.DirEntry) int {
-	switch {
-	case a.Name() < b.Name():
-		return -1
-	case a.Name() > b.Name():
-		return 1
-	}
-	return 0
+	return strings.Compare(a.Name(), b.Name())
 }
 
-// visit is the WalkDir callback. The context is checked before and after each
+// visit is the walk's per-entry callback (walkRoot -> streamRootDir ->
+// visitRootBatch). The context is checked before and after each
 // entry: a walk error at the root ("."), or a cancelled context, aborts the
 // walk; an error below the root marks one unreadable sub-path and continues.
 // Every path is root-relative (the walk runs through the *os.Root). Directories
@@ -494,24 +409,16 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	// Counted before anything is read or remembered, so the budget bounds the walk's
-	// own state rather than trailing it. Returning an error aborts fs.WalkDir, which is
-	// what keeps `seen` from being read as a complete enumeration downstream.
-	sw.entries++
-	if budget := sw.entryBudget(); sw.entries > budget {
-		slog.Warn(scanBudgetMsg,
-			"path", rel, "entries", sw.entries, "limit", budget,
-			"remediation", scanBudgetRemediation)
-		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.entries, rel)
-	}
 	if err != nil {
 		if rel == "." {
 			return err
 		}
 		// An ENOENT below the root is the WALK's half of the renewal race the read
-		// side already classifies as statusVanished. fs.WalkDir only ReadDirs real
-		// directories -- it never descends a symlink -- so the only way a path it
-		// just enumerated answers ENOENT is that it was removed under the walk;
+		// side already classifies as statusVanished. Only real directories are ever
+		// ReadDir-ed: visitRootBatch queues a subdirectory on the DIRENT type
+		// (entry.IsDir(), which is false for a symlink), so the walk never descends a
+		// link -- and the only way a path it just enumerated answers ENOENT is that it
+		// was removed under the walk;
 		// there is no surviving-symlink reading to rule out here, which is why this
 		// arm needs no src.pathVanished second observation. Counting it as
 		// unreadable raised the documented `unreadable=` alert, whose remediation
@@ -533,6 +440,22 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		slog.Debug("skipping unreadable path", "path", rel, "error", err)
 		sw.unreadable++
 		return nil
+	}
+	// Charged once per ENUMERATED path, and before anything is read or remembered, so
+	// the budget bounds the walk's own state rather than trailing it. Deliberately
+	// below the error arm above: the walk reports a directory it could not open or
+	// finish reading through visit for that directory's OWN path, which was already
+	// charged when its parent enumerated it, so charging there counted one path twice
+	// and enforced the operator's MAX_SCAN_ENTRIES below its configured value. The
+	// root's failed Stat is the only error visit for an uncharged path, and it returns
+	// without converting anything. Returning an error aborts the walk, which is what
+	// keeps `seen` from being read as a complete enumeration downstream.
+	sw.entries++
+	if budget := sw.entryBudget(); sw.entries > budget {
+		slog.Warn(scanBudgetMsg,
+			"path", rel, "entries", sw.entries, "limit", budget,
+			"remediation", scanBudgetRemediation)
+		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.entries, rel)
 	}
 	if d.IsDir() {
 		// A directory occupying a <name>.crt path is a certificate the scan cannot
@@ -577,7 +500,9 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 }
 
 // noteUnwalkableSymlink reports a symlink under the input root that the walk
-// cannot follow. fs.WalkDir never descends a symlinked directory, and a link
+// cannot follow. The walk never descends a symlinked directory (visitRootBatch
+// queues a subdirectory only on the dirent type, which is never a directory for a
+// symlink), and a link
 // the confined handle cannot resolve at all (a target outside the root, or an
 // unreadable component of an in-root target) tells us nothing about what it
 // points to, so every certificate beneath such a link is invisible to the
@@ -641,8 +566,11 @@ func logScanOutcome(ctx context.Context, result *ScanResult, walkErr error) {
 	level, msg := slog.LevelInfo, "scan complete"
 	if walkErr != nil {
 		level, msg = slog.LevelWarn, "scan aborted before completion"
-		if IsShutdown(walkErr) {
+		switch {
+		case IsShutdown(walkErr):
 			level, msg = slog.LevelDebug, "scan cancelled during shutdown"
+		case errors.Is(walkErr, errScanBudgetExceeded):
+			level, msg = slog.LevelWarn, scanBudgetSummaryMsg
 		}
 	}
 	attrs := make([]any, 0, 2+2*len(summaryAttrs))
@@ -1007,7 +935,7 @@ func (o *observationLog) reserve(rel string) {
 		o.evictOne(rel)
 	}
 	if _, known := o.whole[rel]; !known && len(o.whole) >= o.maxObservedPairs() {
-		o.evictOne(rel)
+		o.evictWholeness(rel)
 	}
 }
 
@@ -1029,6 +957,27 @@ func (o *observationLog) evictOne(keep string) {
 		if victim == keep {
 			continue
 		}
+		o.dropWholeness(victim)
+		return
+	}
+}
+
+// evictWholeness makes room in the WHOLENESS half specifically, dropping a victim that
+// actually holds wholeness and dropping that victim's signature with it so the two
+// halves stay in step.
+//
+// evictOne cannot serve this call: its signature-first victim may hold no wholeness at
+// all (a pair forgetPair spent, which keeps its signature), and then the half that was
+// full is not reduced — so `whole` grows past the ceiling while an unrelated pair's
+// de-duplication is spent for nothing and re-emits its observation WARN on the next
+// scan. Every drop here is counted by dropWholeness, which is what makes the reap veto
+// fail closed on a loss that previously went unrecorded.
+func (o *observationLog) evictWholeness(keep string) {
+	for victim := range o.whole {
+		if victim == keep {
+			continue
+		}
+		delete(o.seen, victim)
 		o.dropWholeness(victim)
 		return
 	}

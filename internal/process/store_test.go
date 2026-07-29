@@ -1,10 +1,10 @@
 package process
 
 import (
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -204,38 +204,6 @@ func TestStoreWrite_reports_a_parent_it_cannot_create(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "blocked/cert.pfx") {
 		t.Errorf("error = %q, want it to name the offending path", err.Error())
-	}
-}
-
-// TestStoreLstat_does_not_follow_a_symlink pins why the prior-output check lstats
-// rather than stats: a symlink planted under an output name must not be accepted
-// as a usable prior PFX, or unrelated content could satisfy the coherence gate.
-func TestStoreLstat_does_not_follow_a_symlink(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	target := filepath.Join(dir, "real.pfx")
-	if err := os.WriteFile(target, []byte("pfx"), 0o600); err != nil {
-		t.Fatalf("setup: WriteFile: %v", err)
-	}
-	if err := os.Symlink(target, filepath.Join(dir, "link.pfx")); err != nil {
-		t.Fatalf("setup: Symlink: %v", err)
-	}
-	s := newOutputStore(t, dir)
-
-	fi, err := s.lstat("link.pfx")
-	if err != nil {
-		t.Fatalf("store.lstat(symlink) = error %v, want nil", err)
-	}
-	if fi.Mode().IsRegular() {
-		t.Error("store.lstat reported a symlink as a regular file; the prior-output gate would accept it")
-	}
-
-	fi, err = s.lstat("real.pfx")
-	if err != nil {
-		t.Fatalf("store.lstat(regular file) = error %v, want nil", err)
-	}
-	if !fi.Mode().IsRegular() {
-		t.Error("store.lstat did not report a regular file as regular")
 	}
 }
 
@@ -582,16 +550,14 @@ func TestStoreIsCurrent_reports_a_lax_output_directory(t *testing.T) {
 // (so it counted in ScanResult.Failed and flipped the health marker) and vetoed the
 // reap. On a mount that forces directory modes — CIFS, NFS, vfat, i.e. the Synology
 // shares this app exists to serve — the chmod can NEVER succeed, so the container
-// published nothing and restart-looped forever. The chmod seam is pinned to a refusal
-// here because the suite runs as uid 0, where nothing is refused for real.
+// published nothing and restart-looped forever. No chmod seam is needed: after the
+// removal of enforcement neither store.write nor store.listOutputs touches a
+// directory mode at all, which is the property under test.
 func TestStoreWrite_publishes_into_a_lax_directory_and_still_reaps(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o777); err != nil {
 		t.Fatalf("setup: Chmod(dir): %v", err)
 	}
-	prev := chmodInRoot
-	chmodInRoot = func(*os.Root, string, os.FileMode) error { return fs.ErrPermission }
-	t.Cleanup(func() { chmodInRoot = prev })
 	s := newOutputStore(t, dir)
 
 	if err := s.write(t.Context(), "out.pfx", []byte("pfx")); err != nil {
@@ -656,6 +622,74 @@ func TestStoreRemoveOrphans_reports_vanished_candidate_and_continues(t *testing.
 	}
 }
 
+// TestStoreRemoveOrphans_leaves_a_candidate_it_cannot_recheck pins removeOrphan's
+// OTHER pre-unlink arm: a candidate whose re-check fails for any reason that is not
+// "it is gone" must be left in place, at WARN, with the /output ownership hint.
+//
+// It is the fail-safe half of the vanished-race arm above, and the two are one line
+// apart: fold the ENOENT test into a bare statErr != nil and every unrecheckable
+// candidate is reported as a transient race at DEBUG instead, so an operator whose
+// /output the reap cannot inspect gets no default-level record at all. The whole
+// suite stays green through that change without this test.
+//
+// A closed root is the failure injection, the same one
+// TestStoreReconcile_reports_an_output_tree_it_cannot_enumerate uses: it produces a
+// non-ENOENT Lstat failure whatever uid the suite runs as, where a chmod-based
+// fixture does nothing under uid 0. Deliberately NOT newOutputStore: the closed root
+// IS the injection, so the store must outlive its root handle.
+// Runs serially: it swaps slog.Default().
+func TestStoreRemoveOrphans_leaves_a_candidate_it_cannot_recheck(t *testing.T) {
+	// Spelled out rather than imported from the production call sites: an operator's
+	// log query keys on these words, so a silent rewording must fail here.
+	const recheckWarn = "could not re-check an orphaned output before removing it; leaving it in place"
+	const vanishedMsg = "orphaned output vanished before removal"
+
+	dir := t.TempDir()
+	bundle := filepath.Join(dir, "a.pfx")
+	if err := os.WriteFile(bundle, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	if err := root.Close(); err != nil {
+		t.Fatalf("setup: root.Close: %v", err)
+	}
+	s := &store{root: root}
+	logs := captureLogs(t)
+
+	deleted, err := s.removeOrphans(t.Context(), []string{"a.pfx"})
+	if err != nil {
+		t.Fatalf("removeOrphans(uninspectable candidate) = %v, want nil: a candidate this app cannot"+
+			" re-check is skipped, not a scan failure", err)
+	}
+	if deleted != 0 {
+		t.Errorf("removeOrphans(uninspectable candidate) deleted = %d, want 0", deleted)
+	}
+	if _, statErr := os.Stat(bundle); statErr != nil {
+		t.Errorf("the bundle was deleted after a re-check this app could not make: %v: doubt about the"+
+			" state of a private-key bundle must keep it", statErr)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, recheckWarn); got != 1 {
+		t.Errorf("removeOrphans(uninspectable candidate) logged %q at WARN %d times, want exactly 1: %q",
+			recheckWarn, got, logs.Messages())
+	}
+	if got := logs.CountLevel(slog.LevelDebug, vanishedMsg); got != 0 {
+		t.Errorf("removeOrphans(uninspectable candidate) logged %q %d times, want 0: an /output the reap"+
+			" cannot inspect is an operator condition, not the transient renewal race: %q",
+			vanishedMsg, got, logs.Messages())
+	}
+	if _, ok := logs.AttrValue(recheckWarn, "error"); !ok {
+		t.Errorf("removeOrphans(uninspectable candidate) logged %q with no error attribute, want the"+
+			" re-check failure carried so the operator can diagnose it: %q", recheckWarn, logs.Messages())
+	}
+	if got, ok := logs.AttrValue(recheckWarn, "remediation"); !ok || got != outputPermRemediation {
+		t.Errorf("removeOrphans(uninspectable candidate) logged remediation %q, want %q",
+			got, outputPermRemediation)
+	}
+}
+
 // TestStoreRemoveOrphans_reports_a_vanished_nested_candidate_as_a_race pins the same
 // DEBUG-not-WARN contract for the NESTED layout, which reaches the disappearance
 // through a different call.
@@ -703,5 +737,51 @@ func TestStoreRemoveOrphans_reports_a_vanished_nested_candidate_as_a_race(t *tes
 		t.Errorf("removeOrphans(vanished nested candidate) logged %q at WARN %d times, want 0: a disappearance is a"+
 			" transient race, and that WARN's remediation points at a symlink misconfiguration that is not there: %q",
 			pinMsg, got, logs.Messages())
+	}
+}
+
+// TestStoreListOutputs_enumerates_a_nested_tree pins the enumeration contract the
+// /output walk owes the reap: every bundle this app could have written, at any depth,
+// reaches the candidate list, and nothing else does.
+//
+// It is the /output half of the shared walker's contract (walkRoot, which both mounts
+// now go through): the reap's whole claim is that a candidate it cannot match to an
+// input is an orphan, so a bundle the walk never reported would be retained forever
+// while a non-bundle it wrongly reported could be deleted. Order is deliberately NOT
+// asserted — the streaming walk visits directory order, sorted within a batch only,
+// and every consumer (orphansOf's set membership, sampleOrphanPaths' bounded sample)
+// is order-independent.
+func TestStoreListOutputs_enumerates_a_nested_tree(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "sub", "deeper"), 0o750); err != nil {
+		t.Fatalf("setup: MkdirAll: %v", err)
+	}
+	for _, rel := range []string{
+		"top.pfx",
+		filepath.Join("sub", "mid.pfx"),
+		filepath.Join("sub", "deeper", "leaf.pfx"),
+		"notes.txt",
+		filepath.Join("sub", "chain.pem"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, rel), []byte("x"), 0o600); err != nil {
+			t.Fatalf("setup: WriteFile(%s): %v", rel, err)
+		}
+	}
+
+	s := newOutputStore(t, dir)
+	found, safe, err := s.listOutputs(t.Context())
+	if err != nil {
+		t.Fatalf("listOutputs(nested tree) = %v, want nil", err)
+	}
+	if !safe {
+		t.Error("safe = false, want true: a fully readable tree with no symlink is a complete enumeration")
+	}
+
+	want := []string{"sub/deeper/leaf.pfx", "sub/mid.pfx", "top.pfx"}
+	got := slices.Clone(found)
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Errorf("listOutputs(nested tree) = %v, want %v (any order): every bundle at every depth is a"+
+			" candidate, and a file this app would never have written is never one", got, want)
 	}
 }

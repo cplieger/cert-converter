@@ -7,15 +7,19 @@ import (
 	"os"
 
 	"github.com/cplieger/atomicfile/v2"
+	"github.com/cplieger/cert-converter/internal/convert"
 )
 
 // maxFileSize is the maximum size of an input certificate or key file (10 MB).
 //
-// It lives here rather than in internal/convert because it is a property of the
-// FILESYSTEM boundary — how much of an untrusted file this app is willing to read
-// — not of the PEM codec, which is handed bytes and never learns where they came
-// from.
-const maxFileSize = 10 << 20
+// It is convert.MaxInputBytes, the cap that package's acceptance bounds are
+// calibrated against, so raising it lands in the diff beside the bounds it
+// invalidates rather than silently invalidating them from here. This package owns
+// ENFORCEMENT — reading an untrusted file under a cap is a property of the
+// FILESYSTEM boundary, not of the PEM codec, which is handed bytes and never
+// learns where they came from — while the number itself lives where the reasoning
+// that depends on it lives.
+const maxFileSize = convert.MaxInputBytes
 
 // source owns every read of the input tree.
 //

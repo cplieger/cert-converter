@@ -33,8 +33,7 @@ func TestObservationSignature_properties(t *testing.T) {
 		string(convert.ObsDuplicateCerts),
 	}
 	rapid.Check(t, func(rt *rapid.T) {
-		var input [32]byte
-		copy(input[:], rapid.SliceOfN(rapid.Byte(), 32, 32).Draw(rt, "input"))
+		input := [32]byte(rapid.SliceOfN(rapid.Byte(), 32, 32).Draw(rt, "input"))
 		kind := rapid.SampledFrom(kinds).Draw(rt, "kind")
 		detail := rapid.String().Draw(rt, "detail")
 		obs := []convert.Observation{{Kind: convert.ObservationKind(kind), Detail: detail}}

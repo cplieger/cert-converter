@@ -75,6 +75,16 @@ const (
 	// certificates that are present. This one reports a certificate that is ABSENT,
 	// and every edge below it may be fully proven.
 	ObsChainTrustAnchorAbsent ObservationKind = "chain-trust-anchor-absent"
+	// ObsChainAnchorUnverifiable reports that the chain terminates at a certificate
+	// that names ITSELF as its own issuer while this app could not verify that
+	// self-signature: a corrupt or re-signed certificate, a signature algorithm
+	// crypto/x509 refuses (MD5, DSA), or a key above the verification ceilings.
+	//
+	// It is deliberately NOT ObsChainTrustAnchorAbsent. That kind says the anchor is
+	// ABSENT and is informational because a Caddy/ACME fullchain legitimately omits
+	// it; here the anchor is PRESENT and what is missing is the proof, which is input
+	// a consumer validating the chain will reject — so it is a warning.
+	ObsChainAnchorUnverifiable ObservationKind = "chain-anchor-unverifiable"
 	// ObsIdentityNotYetValid reports a selected identity whose NotBefore is in
 	// the future. Conversion still proceeds; consumers will reject it.
 	ObsIdentityNotYetValid ObservationKind = "identity-not-yet-valid"
@@ -198,7 +208,8 @@ func (k ObservationKind) Class() ObservationClass {
 	case ObsChainTrustAnchorAbsent:
 		return ObservationClassInfo
 	case ObsLeafNotFirst, ObsMultipleKeys, ObsExtraCertsExcluded, ObsRenewedCertTie,
-		ObsCAAsIdentity, ObsChainUnverified, ObsIdentityNotYetValid, ObsIdentityExpired,
+		ObsCAAsIdentity, ObsChainUnverified, ObsChainAnchorUnverifiable,
+		ObsIdentityNotYetValid, ObsIdentityExpired,
 		ObsChainCertOutOfWindow, ObsChainCertCannotIssue, ObsUnrelatedBlocksSkipped,
 		ObsUnusableKeyBlocksSkipped, ObsIssuerMatchIgnored, ObsKeyReusedAcrossCerts,
 		ObsChainEdgeUnprovenIssuer:
@@ -331,9 +342,9 @@ func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 	// the CA, so the operator lands here and is told to remove certificates from a
 	// bundle that is fine while the unreadable key block goes unmentioned.
 	if g.isIssuer(identity.cert) {
-		return Analysis{}, fmt.Errorf(
+		return Analysis{}, errors.New(appendCertIssues(fmt.Sprintf(
 			"the private key matches %q, which is an issuer of another certificate in this bundle, not an end-entity certificate; if you meant to export that CA itself, remove the certificates it issued from the bundle%s",
-			boundSubject(leaf.Subject.String()), in.keyIssues.suffix())
+			boundSubject(leaf.Subject.String()), in.keyIssues.suffix()), in.certIssues))
 	}
 	if leaf.BasicConstraintsValid && leaf.IsCA {
 		obs = append(obs, Observation{
@@ -1201,18 +1212,30 @@ func (g *certGraph) isSelfSigned(i int) bool {
 	return got
 }
 
+// selfIssuedByName reports whether certs[i] names itself as its own issuer, at
+// either name fidelity, WITHOUT asking whether the self-signature verifies. It is
+// the name half of isSelfSigned's question, split out because that is exactly the
+// difference between "the anchor above this chain is absent" and "the anchor is
+// this certificate and its self-signature could not be verified".
+//
+// Same fidelity rule as nameLink: a permitted DirectoryString difference between a
+// certificate's own subject and issuer is still one name, and treating it as two
+// costs the bundle its root.
+func (g *certGraph) selfIssuedByName(i int) bool {
+	c := g.certs[i]
+	if bytes.Equal(c.RawSubject, c.RawIssuer) {
+		return true
+	}
+	subject, subjectOK := g.subjectName(i)
+	issuer, issuerOK := g.issuerName(i)
+	return sameDecodedName(subject, subjectOK, issuer, issuerOK)
+}
+
 // checkSelfSigned is isSelfSigned without the memo: the actual signature check.
 func (g *certGraph) checkSelfSigned(i int) bool {
 	c := g.certs[i]
-	if !bytes.Equal(c.RawSubject, c.RawIssuer) {
-		// Same fidelity rule as nameLink: a permitted DirectoryString difference
-		// between a certificate's own subject and issuer is still one name, and
-		// treating it as two costs the bundle its root.
-		subject, subjectOK := g.subjectName(i)
-		issuer, issuerOK := g.issuerName(i)
-		if !sameDecodedName(subject, subjectOK, issuer, issuerOK) {
-			return false
-		}
+	if !g.selfIssuedByName(i) {
+		return false
 	}
 	if !verifiableKey(c.PublicKey) {
 		return false
@@ -1293,7 +1316,7 @@ func (g *certGraph) selectIdentity(signers []crypto.Signer, keyIssues keyDefects
 	case 1:
 		return matches[0], issuerObs, nil
 	default:
-		best, obs, err := g.resolveAmbiguousMatches(matches, keyIssues)
+		best, obs, err := g.resolveAmbiguousMatches(matches, keyIssues, certIssues)
 		if err != nil {
 			return identityMatch{}, nil, err
 		}
@@ -1434,7 +1457,7 @@ func (g *certGraph) collectMatches(signers []crypto.Signer) (matches []identityM
 // is only reachable when the analysis SUCCEEDS: a chain link relabelled "TRUSTED
 // CERTIFICATE" by `openssl x509 -trustout` is a common cause of exactly this
 // mismatch, and without the clause nothing anywhere names it.
-func (g *certGraph) noMatchError(keyCount, firstUnverifiable int, keyIssues keyDefects, certIssues skippedBlocks) error {
+func (g *certGraph) noMatchError(usableKeys, firstUnverifiable int, keyIssues keyDefects, certIssues skippedBlocks) error {
 	uncomparable := 0
 	for _, c := range g.certs {
 		if !comparableCertKey(c.PublicKey) {
@@ -1475,8 +1498,8 @@ func (g *certGraph) noMatchError(keyCount, firstUnverifiable int, keyIssues keyD
 		return errors.New(appendCertIssues(msg+keyIssues.suffix(), certIssues))
 	}
 	msg := fmt.Sprintf(
-		"none of the %d private key block(s) matches any of the %d certificate(s) in the chain%s",
-		keyCount, len(g.certs), keyIssues.suffix())
+		"none of the %d distinct private key(s) in the key file matches any of the %d certificate(s) in the chain%s",
+		usableKeys, len(g.certs), keyIssues.suffix())
 	if firstUnverifiable >= 0 {
 		// Same split as the all-uncomparable branch above, for the same reason: a nil
 		// PublicKey is a key crypto/x509 could not READ, while a parsed key of an
@@ -1495,10 +1518,11 @@ func (g *certGraph) noMatchError(keyCount, firstUnverifiable int, keyIssues keyD
 }
 
 // appendCertIssues attaches the certificate-file blocks that were neither a
-// certificate nor a private key to a refusal sentence, and is shared by every arm
-// of noMatchError so no diagnosis can drop the clause: the observation that
-// otherwise reports those blocks (ObsUnrelatedBlocksSkipped) is only reachable when
-// the analysis SUCCEEDS.
+// certificate nor a private key to a refusal sentence, and is shared by every
+// refusal identity selection can return - every arm of noMatchError, the
+// issuer-role refusal and the distinct-identities refusal - so no diagnosis can
+// drop the clause: the observation that otherwise reports those blocks
+// (ObsUnrelatedBlocksSkipped) is only reachable when the analysis SUCCEEDS.
 func appendCertIssues(msg string, certIssues skippedBlocks) string {
 	if certIssues.count == 0 {
 		return msg
@@ -1520,13 +1544,13 @@ func appendCertIssues(msg string, certIssues skippedBlocks) string {
 // defects: a combined key file in a multi-certificate bundle otherwise yields a bare
 // count with nothing to act on, and a damaged appended key block is a likely cause of
 // the collision the count cannot mention.
-func (g *certGraph) resolveAmbiguousMatches(matches []identityMatch, keyIssues keyDefects) (identityMatch, []Observation, error) {
+func (g *certGraph) resolveAmbiguousMatches(matches []identityMatch, keyIssues keyDefects, certIssues skippedBlocks) (identityMatch, []Observation, error) {
 	firstKey := matches[0].key
 	for _, m := range matches[1:] {
 		if m.key != firstKey {
-			return identityMatch{}, nil, fmt.Errorf(
+			return identityMatch{}, nil, errors.New(appendCertIssues(fmt.Sprintf(
 				"the input contains %d distinct certificate/key identities; this app converts one certificate/key pair per output (%s)%s",
-				countDistinctKeys(matches), subjectsForLog(g.certsOf(matches)), keyIssues.suffix())
+				countDistinctKeys(matches), subjectsForLog(g.certsOf(matches)), keyIssues.suffix()), certIssues))
 		}
 	}
 
@@ -1570,10 +1594,14 @@ func (g *certGraph) betterIdentity(a, b int) bool {
 // The first element is start itself.
 //
 // At a branch point (a cross-signed certificate has more than one issuer here)
-// the choice is deterministic: prefer a parent that is currently valid, then one
-// with a route to a self-signed root in this bundle proven by signature at
-// every hop, then the shorter such route, then the inclusive route, then the later
-// NotAfter, then a byte comparison of the certificate DER. One path is emitted
+// the choice is deterministic, and edge strength decides first: a parent whose
+// signature proves it issued this certificate is preferred over every merely
+// linked candidate, which are considered only when no proven parent exists
+// (bestParent). Within one strength class the keys are validity at the scan
+// instant, then a route to a self-signed root in this bundle proven by signature
+// at every hop, then the shorter such route, then the inclusive route, then the
+// later NotAfter, then a byte comparison of the certificate DER (betterParent).
+// One path is emitted
 // rather than every ancestor, because a consumer reading the bag sequence
 // positionally should see one coherent chain; alternatives land in Extra.
 func (g *certGraph) pathFrom(start int) []int {
@@ -1801,7 +1829,7 @@ func (g *certGraph) assembleChain(identityCert int) (chain, extra []*x509.Certif
 	if !g.isSelfSigned(terminal) {
 		kept, disqualified := partitionIssuerEligible(extra)
 		chain = append(chain, kept...)
-		fallbackObs := []Observation{terminusObservation(g.certs[terminal], extra, kept)}
+		fallbackObs := []Observation{g.terminusObservation(terminal, extra, kept, len(chain))}
 		if len(disqualified) > 0 {
 			fallbackObs = append(fallbackObs, Observation{
 				Kind: ObsExtraCertsExcluded,
@@ -1823,32 +1851,61 @@ func (g *certGraph) assembleChain(identityCert int) (chain, extra []*x509.Certif
 }
 
 // terminusObservation states what became of a chain whose terminus is not proven
-// self-signed. The split it draws is the one the two kinds mean: with nothing left
-// over, the only fact is that the anchor above the terminus is absent
-// (ObsChainTrustAnchorAbsent, informational — the documented fullchain shape); with
-// certificates left over, the fact is that this app could not place them and
-// included the eligible ones regardless (ObsChainUnverified, a warning).
+// self-signed. The split it draws is the one the kinds mean: a terminus that names
+// itself as its own issuer has its anchor present and only its self-signature
+// unproven (ObsChainAnchorUnverifiable, a warning — a consumer will reject it);
+// otherwise, with nothing left over, the only fact is that the anchor above the
+// terminus is absent (ObsChainTrustAnchorAbsent, informational — the documented
+// fullchain shape); with certificates left over, the fact is that this app could not
+// place them and included the eligible ones regardless (ObsChainUnverified, a
+// warning).
 //
 // It takes the leftovers and the kept subset rather than deriving them, because the
 // caller has already partitioned them to build the chain and re-deriving here would
 // let the sentence and the emitted chain disagree.
-func terminusObservation(terminal *x509.Certificate, extra, kept []*x509.Certificate) Observation {
-	subject := boundSubject(terminal.Subject.String())
-	if len(extra) == 0 {
-		return Observation{
-			Kind: ObsChainTrustAnchorAbsent,
-			Detail: fmt.Sprintf("the chain ends at %q, whose issuer is not in the bundle; every certificate supplied is in the chain, so nothing was left out",
-				subject),
+//
+// chainLen is how many certificates the emitted chain carries, consulted only when
+// nothing was left over: it is what separates a fullchain whose root is absent (chain
+// material is present, the consumer supplies the anchor) from a bundle holding the
+// identity alone (no chain material at all, which a consumer without the issuer cannot
+// complete). Both are the same KIND at the same class; only the sentence differs,
+// because only one of them is a bundle the operator probably did not mean to ship.
+func (g *certGraph) terminusObservation(terminal int, extra, kept []*x509.Certificate, chainLen int) Observation {
+	subject := boundSubject(g.certs[terminal].Subject.String())
+	leftovers := ""
+	if len(extra) > 0 {
+		leftovers = fmt.Sprintf("; the remaining %d certificate(s) were kept rather than dropped", len(kept))
+		if len(kept) == 0 {
+			leftovers = "; none of the remaining certificate(s) could be kept as chain material"
 		}
 	}
-	disposition := fmt.Sprintf("the remaining %d certificate(s) were kept rather than dropped", len(kept))
-	if len(kept) == 0 {
-		disposition = "none of the remaining certificate(s) could be kept as chain material"
+	// A terminus that names ITSELF as its own issuer has its anchor right here, so
+	// what is missing is the proof rather than the certificate, and neither
+	// absent-anchor kind states that. Reporting it as ObsChainTrustAnchorAbsent said
+	// "whose issuer is not in the bundle" about a certificate whose issuer IS in the
+	// bundle, at the informational class the fullchain shape earned.
+	if g.selfIssuedByName(terminal) {
+		return Observation{
+			Kind: ObsChainAnchorUnverifiable,
+			Detail: fmt.Sprintf("the chain ends at %q, which names itself as its own issuer, but its self-signature could not be verified here (a corrupt or re-signed certificate, a signature algorithm crypto/x509 refuses such as MD5 or DSA, or a key above this app's verification ceilings); a consumer that validates the chain will reject this anchor%s",
+				subject, leftovers),
+		}
+	}
+	if len(extra) == 0 {
+		completeness := "every certificate supplied is in the bundle, so nothing was left out"
+		if chainLen == 0 {
+			completeness = "the bundle holds the identity alone and no chain certificates at all, so a consumer that does not already hold the issuer cannot build a path; supply the full chain (Caddy/certbot fullchain.pem) if that was intended"
+		}
+		return Observation{
+			Kind: ObsChainTrustAnchorAbsent,
+			Detail: fmt.Sprintf("the chain ends at %q, whose issuer is not in the bundle; %s",
+				subject, completeness),
+		}
 	}
 	return Observation{
 		Kind: ObsChainUnverified,
-		Detail: fmt.Sprintf("no issuer of %q could be established from the bundle; %s",
-			subject, disposition),
+		Detail: fmt.Sprintf("no issuer of %q could be established from the bundle%s",
+			subject, leftovers),
 	}
 }
 

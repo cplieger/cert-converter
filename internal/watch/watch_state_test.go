@@ -2,6 +2,7 @@ package watch
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -133,5 +134,59 @@ func TestRunDebouncedScan_skips_scan_after_shutdown(t *testing.T) {
 
 	if scans != 0 {
 		t.Errorf("runDebouncedScan(cancelled ctx) ran %d scans, want 0", scans)
+	}
+}
+
+// liveForNCtx reports itself live for the first n Err() observations and
+// cancelled from then on, which makes "cancellation landed in the middle of a
+// helper" deterministic without a sleep or a goroutine race: the helper's own
+// ctx.Err() calls are the clock.
+type liveForNCtx struct {
+	context.Context
+	calls *int
+	live  int
+}
+
+func (c liveForNCtx) Err() error {
+	*c.calls++
+	if *c.calls <= c.live {
+		return nil
+	}
+	return context.Canceled
+}
+
+// TestRunDebouncedScan_skips_the_scan_when_shutdown_cut_the_resync_short pins
+// runDebouncedScan's SECOND cancellation guard, the one after the watch-set
+// re-assert. Its sibling arm has that half pinned
+// (TestHandleFallbackTick_skips_the_scan_when_shutdown_cut_the_resync_short);
+// here only the entry guard was covered, so the post-re-sync guard could be
+// deleted and a shutdown landing mid-re-sync would still start a full /input
+// scan whose ScanResult drives the health marker on the way out.
+//
+// live: 2 is runDebouncedScan's own Err() sequence on this tree: the entry
+// guard, then one visitWatchPath call for the (empty) root, then the guard under
+// test. So the re-sync runs to completion and only the scan is suppressed, which
+// is what the watch-list assertion distinguishes from an early entry-guard
+// return.
+func TestRunDebouncedScan_skips_the_scan_when_shutdown_cut_the_resync_short(t *testing.T) {
+	t.Parallel()
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	scans := 0
+	w := New(root, func(context.Context) { scans++ }, WithDebounce(time.Hour))
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+	st.scheduleScan()
+
+	calls := 0
+	ctx := liveForNCtx{Context: context.Background(), calls: &calls, live: 2}
+
+	st.runDebouncedScan(ctx, watcher)
+
+	if !slices.Contains(watcher.WatchList(), root) {
+		t.Fatalf("the watch-set re-assert never ran (watch list = %v, ctx.Err calls = %d); this test needs the state where shutdown lands AFTER the re-sync started", watcher.WatchList(), calls)
+	}
+	if scans != 0 {
+		t.Errorf("runDebouncedScan ran %d scans after the re-sync was cut short by shutdown, want 0: the loop is about to return and the scan still drives the health marker", scans)
 	}
 }

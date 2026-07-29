@@ -54,6 +54,12 @@ const maxKDFIterations = 10000
 // AES-256 checks already close.
 const minKDFIterations = 2048
 
+// minLegacyMACIterations is the floor for the one derivation location that does not
+// use 2048: the SHA-1 MAC of the two legacy profiles, which derives with a single
+// iteration (go-pkcs12 v0.7.3 pkcs12.go:100, 121). Named here so every bound the
+// preflight applies is declared with the version it was read from.
+const minLegacyMACIterations = 1
+
 // minPBKDF2SaltBytes and minLegacySaltBytes are the salt lengths the profiles
 // emit: 16 octets for both modern profiles (go-pkcs12 v0.7.3 pkcs12.go:164, 191
 // saltLen: 16) and 8 for both legacy profiles (pkcs12.go:102, 123 saltLen: 8).
@@ -144,13 +150,15 @@ func (c *contentInfo) contentTypeOID() (asn1.ObjectIdentifier, error) {
 
 type macData struct {
 	Mac        digestInfo
-	MacSalt    []byte
+	MacSalt    asn1.RawValue
 	Iterations int `asn1:"optional,default:1"`
 }
 
+// The digest itself is deliberately NOT modelled: the preflight never reads it,
+// encoding/asn1 tolerates the trailing element, and a []byte field would copy up
+// to maxPFXSize bytes of unauthenticated input before anything is authenticated.
 type digestInfo struct {
 	Algorithm algorithmIdentifier
-	Digest    []byte
 }
 
 type algorithmIdentifier struct {
@@ -164,6 +172,11 @@ func (a *algorithmIdentifier) algorithmOID() (asn1.ObjectIdentifier, error) {
 	return decodeOID(a.Algorithm)
 }
 
+// MaxBundleBytes is the largest PKCS#12 bundle this codec will inspect. Every bound
+// below (maxOIDBytes, maxAuthenticatedSafes, maxSafeBags) is sized against it, so the
+// limit belongs here rather than in whichever caller happens to read the file.
+const MaxBundleBytes = 2*10<<20 + 64<<10
+
 // maxOIDBytes caps the content length of an object identifier the preflight is
 // willing to decode. Every identifier the four profiles emit is 9 bytes or fewer,
 // so 32 is generous headroom for a file written by some other tool.
@@ -176,8 +189,8 @@ const maxOIDBytes = 32
 // bundle bytes is modelled as an asn1.RawValue rather than an
 // asn1.ObjectIdentifier. Go's ASN.1 decoder allocates one int per encoded byte
 // (len+1) when it decodes into asn1.ObjectIdentifier, roughly eight bytes of
-// backing store per input byte. The store deliberately admits a prior PFX of up to
-// 2*10 MiB plus framing, so a foreign or damaged bundle could spend almost that
+// backing store per input byte. This codec admits a bundle of up to
+// MaxBundleBytes, so a foreign or damaged bundle could spend almost that
 // whole allowance on a single syntactically valid identifier and turn a ~20 MiB
 // file into ~160 MiB of int slice — inside store.isCurrent, before any
 // authentication, on the scan's only goroutine. Retaining the DER keeps the
@@ -199,10 +212,23 @@ func decodeOID(raw asn1.RawValue) (asn1.ObjectIdentifier, error) {
 	return oid, nil
 }
 
+// octetStringBytes returns the content of a primitive OCTET STRING WITHOUT
+// copying it, refusing any other shape. It is the non-allocating counterpart of
+// modelling a field as []byte: encoding/asn1 copies a []byte field
+// (asn1.go MakeSlice+Copy), so a field the preflight only measures or walks would
+// otherwise duplicate up to maxPFXSize bytes of unauthenticated input on the
+// scan's only goroutine. The shape check keeps the accepted set exactly what the
+// []byte field admitted, since asn1 required an OCTET STRING there too.
+func octetStringBytes(raw asn1.RawValue, what string) ([]byte, error) {
+	if raw.Class != asn1.ClassUniversal || raw.Tag != asn1.TagOctetString || raw.IsCompound {
+		return nil, fmt.Errorf("%w: %s is not a primitive OCTET STRING", ErrProfileUnknown, what)
+	}
+	return raw.Bytes, nil
+}
+
 // unmarshalExact decodes one complete DER element into out. Every decode in the
 // preflight must consume its whole input: accepting a prefix would mean gating on
-// one shape while go-pkcs12 then decodes another, which is the check the sites that
-// spelled it out by hand repeated ten times and three others dropped.
+// one shape while go-pkcs12 then decodes another.
 //
 // parseWhat names the element for a parse failure ("parse <parseWhat>: ...");
 // trailingWhat names it for the trailing-byte refusal ("... after <trailingWhat>"),
@@ -226,7 +252,7 @@ const (
 	// sizes a slice of structs from the input's ELEMENT COUNT, and every element
 	// costs 144 bytes (contentInfo) or 216 bytes (safeBag) of RawValue headers
 	// however small its encoding is. A structurally valid ContentInfo is 5 bytes,
-	// so the 2*10 MiB + 64 KiB the store admits holds 4.2 million of them and
+	// so MaxBundleBytes holds 4.2 million of them and
 	// turns a ~20 MiB file into ~1.3 GiB of live heap, inside store.isCurrent,
 	// before any authentication, on the scan's only goroutine.
 	//
@@ -293,13 +319,16 @@ type safeBag struct {
 
 // encryptedPrivateKeyInfo is the pkcs8ShroudedKeyBag payload (RFC 5208 §6).
 type encryptedPrivateKeyInfo struct {
-	Algorithm     algorithmIdentifier
-	EncryptedData []byte
+	Algorithm algorithmIdentifier
 }
+
+// The encrypted key itself is deliberately NOT modelled, for the reason recorded
+// on digestInfo: only Algorithm is read here, and the ciphertext is the largest
+// single field an untrusted bundle controls.
 
 // legacyPBEParams is the pkcs-12PbeParams of the SHA1-based profiles.
 type legacyPBEParams struct {
-	Salt       []byte
+	Salt       asn1.RawValue
 	Iterations int
 }
 
@@ -361,6 +390,10 @@ type inspection struct {
 // to a caller — this is not a bundle we would have written, so replace it. That
 // makes a parse failure safe by construction.
 func inspect(pfx []byte) (inspection, error) {
+	if len(pfx) > MaxBundleBytes {
+		return inspection{}, fmt.Errorf("%w: bundle is %d byte(s), over the %d-byte inspection limit",
+			ErrProfileUnknown, len(pfx), MaxBundleBytes)
+	}
 	var preamble pfxPreamble
 	// asn1.Unmarshal returns trailing bytes rather than rejecting them. A bundle
 	// with anything appended is not one this app wrote, and accepting it would mean
@@ -482,8 +515,12 @@ func authenticatedSafeElements(authSafe *contentInfo) ([][]byte, error) {
 	if !contentType.Equal(oidDataContentType) {
 		return nil, fmt.Errorf("%w: authSafe is not a data ContentInfo", ErrProfileUnknown)
 	}
-	var inner []byte
-	if err := unmarshalExact(authSafe.Content.Bytes, &inner, "authSafe content", "the authSafe content"); err != nil {
+	var wrapper asn1.RawValue
+	if unmarshalErr := unmarshalExact(authSafe.Content.Bytes, &wrapper, "authSafe content", "the authSafe content"); unmarshalErr != nil {
+		return nil, unmarshalErr
+	}
+	inner, err := octetStringBytes(wrapper, "the authSafe content")
+	if err != nil {
 		return nil, err
 	}
 	return sequenceElements(inner, "authenticated safe", maxAuthenticatedSafes)
@@ -565,8 +602,12 @@ func boundedSafeAlgorithms(safe *contentInfo) (safeAlgorithms, error) {
 // A second shrouded key bag in one safe is rejected: it is not a shape this app
 // writes, and the decoder would pay for both derivations before refusing it.
 func keyBagAlgorithm(content []byte) (asn1.ObjectIdentifier, error) {
-	var inner []byte
-	if err := unmarshalExact(content, &inner, "plaintext safe content", "a plaintext safe's content"); err != nil {
+	var wrapper asn1.RawValue
+	if err := unmarshalExact(content, &wrapper, "plaintext safe content", "a plaintext safe's content"); err != nil {
+		return nil, err
+	}
+	inner, err := octetStringBytes(wrapper, "a plaintext safe's content")
+	if err != nil {
 		return nil, err
 	}
 	elements, err := sequenceElements(inner, "plaintext safe bags", maxSafeBags)
@@ -666,23 +707,26 @@ func profileFor(macAlg, certAlg, keyAlg asn1.ObjectIdentifier) (EncoderType, err
 // minPBKDF2SaltBytes: an unsalted derivation is precomputable across every bundle
 // sharing the password. PBMAC1 carries its salt inside the nested PBKDF2 block, so
 // that arm is floored by decodeProfilePBKDF2 instead.
-func checkMACIterations(macOID asn1.ObjectIdentifier, params asn1.RawValue, macSalt []byte, macDataIterations int) error {
+func checkMACIterations(macOID asn1.ObjectIdentifier, params, macSalt asn1.RawValue, macDataIterations int) error {
 	if macOID.Equal(oidPBMAC1) {
 		return checkPBMAC1Parameters(params)
 	}
-	// The SHA-1 MAC of the two legacy profiles derives with a single iteration
-	// (go-pkcs12 v0.7.3 pkcs12.go:100, 121); modern2023's SHA-256 MAC uses 2048
-	// (pkcs12.go:162), so the floor is per-algorithm; the salt floors follow the
-	// same split (8 octets legacy, 16 modern).
-	minIterations := 1
+	// Both floors are per-algorithm: the legacy SHA-1 MAC derives with one iteration
+	// over an 8-octet salt, modern2023's SHA-256 MAC with 2048 over 16 (go-pkcs12
+	// v0.7.3 pkcs12.go:162).
+	minIterations := minLegacyMACIterations
 	minSalt := minLegacySaltBytes
 	if macOID.Equal(oidSHA256) {
 		minIterations = minKDFIterations
 		minSalt = minPBKDF2SaltBytes
 	}
-	if len(macSalt) < minSalt {
+	salt, saltErr := octetStringBytes(macSalt, "mac salt")
+	if saltErr != nil {
+		return saltErr
+	}
+	if len(salt) < minSalt {
 		return fmt.Errorf("%w: mac salt is %d octet(s), want at least %d",
-			ErrProfileUnknown, len(macSalt), minSalt)
+			ErrProfileUnknown, len(salt), minSalt)
 	}
 	return checkIterationsRange("mac", macDataIterations, minIterations)
 }
@@ -837,9 +881,13 @@ func checkEncryptionIterations(algOID asn1.ObjectIdentifier, params asn1.RawValu
 		if err := unmarshalExact(params.FullBytes, &legacy, "PBE parameters", "the PBE parameters"); err != nil {
 			return err
 		}
-		if len(legacy.Salt) < minLegacySaltBytes {
+		salt, saltErr := octetStringBytes(legacy.Salt, "pbe salt")
+		if saltErr != nil {
+			return saltErr
+		}
+		if len(salt) < minLegacySaltBytes {
 			return fmt.Errorf("%w: pbe salt is %d octet(s), want at least %d",
-				ErrProfileUnknown, len(legacy.Salt), minLegacySaltBytes)
+				ErrProfileUnknown, len(salt), minLegacySaltBytes)
 		}
 		return checkIterations("pbe", legacy.Iterations)
 	}

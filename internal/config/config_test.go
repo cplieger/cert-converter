@@ -1000,14 +1000,14 @@ func TestCheckPasswordEncodable_refuses_every_unrepresentable_shape(t *testing.T
 			name:            "non-BMP character",
 			password:        "password-\U0001F600",
 			wantMessage:     "outside the Basic Multilingual Plane",
-			wantRemediation: "use a password made only of BMP characters",
+			wantRemediation: "choose a password made of BMP characters",
 			secretNeedle:    "password-\U0001F600",
 		},
 		{
 			name:            "embedded NUL",
 			password:        "sentinel-secret\x00",
 			wantMessage:     "contains a NUL byte",
-			wantRemediation: "strip NUL bytes from the secret file",
+			wantRemediation: "strip NUL bytes from the secret",
 			secretNeedle:    "sentinel-secret",
 		},
 	} {
@@ -1350,6 +1350,12 @@ func TestLoad_warns_when_both_password_channels_are_set(t *testing.T) {
 		{"file only is quiet", "", path, false},
 		{"env only is quiet", "from-env", "", false},
 		{"whitespace-only env is not a real conflict", "   ", path, false},
+		// The invisible-only class the single classification added: a PFX_PASSWORD
+		// holding nothing but a byte-order mark is blank, so the file does not
+		// "win" over anything and the conflict WARN must stay silent. The
+		// suppression reads isBlank, so narrowing it back to a TrimSpace test
+		// would send the operator to remove a variable that carries nothing.
+		{"invisible-only env is not a real conflict", "\ufeff", path, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
@@ -1492,7 +1498,7 @@ func TestLoad_warns_when_the_password_contains_a_control_character(t *testing.T)
 		{"an interior newline warns", "line1\nline2", true},
 		{"an interior tab warns", "pw\tsecret", true},
 		{"a clean password is silent", "hunter2", false},
-		// The Cc/Cf disjointness isFormatRune's comment relies on, pinned from this
+		// The Cc/Cf disjointness isInvisibleRune's comment relies on, pinned from this
 		// side too: a byte-order mark is not a control character, so one rune must
 		// not produce two records about itself. Widening this guard to "not
 		// printable" catches every Cf rune here as well, and the sibling
@@ -1671,7 +1677,7 @@ func TestLoad_warns_when_the_password_contains_an_invisible_formatting_character
 			if _, err := Load(); err != nil {
 				t.Fatalf("Load() = %v, want nil: an invisible formatting character is a WARN, not a startup refusal", err)
 			}
-			const msg = "invisible Unicode formatting character"
+			const msg = "invisible Unicode character"
 			warned := logs.CountLevel(slog.LevelWarn, msg) > 0
 			if warned != tc.wantWarn {
 				t.Errorf("Load(%s) invisible-formatting WARN = %v, want %v (logs %v)", tc.name, warned, tc.wantWarn, logs.Messages())
@@ -1729,6 +1735,44 @@ func TestLoad_warns_when_the_password_contains_a_non_ascii_space(t *testing.T) {
 	}
 }
 
+// TestLoad_reports_every_hard_to_enter_rune_shape_once pins the one-record-per-shape
+// contract warnPasswordCharacters' comment claims, on both delivery channels: a
+// password carrying a control character, an invisible formatting rune AND a non-ASCII
+// space must produce all three WARNs, each exactly once.
+//
+// Every other rune-shape case carries a single shape, so collapsing the three
+// independent guards into an else-if chain drops the second and third record with the
+// rest of the suite green -- and an operator fixing the one shape that was reported
+// still ships a password no consumer can retype. The file channel is asserted too
+// because the ambiguous-space guard is channel-agnostic while its sibling padding WARN
+// is env-only: folding it into the env-only shape would silence the mounted-secret
+// channel, which is the one where a value pasted from a rendered document arrives.
+// Serial: it mutates env and slog.Default.
+func TestLoad_reports_every_hard_to_enter_rune_shape_once(t *testing.T) {
+	for _, channel := range []string{"PFX_PASSWORD", "PFX_PASSWORD_FILE"} {
+		t.Run(channel, func(t *testing.T) {
+			setPasswordChannel(t, channel, "pw\n\ufeff\u00a0secret")
+			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
+
+			logs := capture.Default(t)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load(%s) = %v, want nil: a hard-to-enter rune is a WARN, not a startup refusal", channel, err)
+			}
+			for _, msg := range []string{
+				"contains a control character",
+				"invisible Unicode character",
+				"non-ASCII space character",
+			} {
+				if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
+					t.Errorf("Load(%s) with a password carrying all three shapes logged %d WARN records matching %q, want exactly 1: each shape needs its own actionable record (logs %v)",
+						channel, n, msg, logs.Messages())
+				}
+			}
+		})
+	}
+}
+
 // TestLoad_warns_when_a_mounted_secret_contains_a_format_character is the
 // file-channel half: the invisible-formatting guard is channel-agnostic today, and
 // the mounted file is where the failure mode actually originates (an editor saving
@@ -1766,7 +1810,7 @@ func TestLoad_warns_when_a_mounted_secret_contains_a_format_character(t *testing
 				t.Errorf("Load() Password = %q, want %q verbatim", cfg.Password, tc.password)
 			}
 
-			const msg = "invisible Unicode formatting character"
+			const msg = "invisible Unicode character"
 			wantCount := 0
 			if tc.wantWarn {
 				wantCount = 1
@@ -1860,7 +1904,7 @@ func TestLoad_refuses_an_invisible_only_password_on_both_channels(t *testing.T) 
 				// CONTAINS an invisible rune must not also fire for a password that
 				// consists of nothing else, or the operator reads two records about
 				// one condition.
-				if n := logs.Count("contains an invisible Unicode formatting character"); n != 0 {
+				if n := logs.Count("contains an invisible Unicode character"); n != 0 {
 					t.Errorf("Load(%s=%q, opt-out) logged %d per-rune invisible-formatting records alongside the invisible-only WARN, want 0 (logs %v)",
 						ch.channel, tc.password, n, logs.Messages())
 				}
@@ -2046,11 +2090,12 @@ func scanRepairName(r scanEntriesRepair) string {
 	return "scanEntriesRepair(" + strconv.Itoa(int(r)) + ")"
 }
 
-// TestMaxScanEntries_is_silent pins the exported reader's contract for every parse
-// class, the same contract FallbackInterval carries: the value is read through a
-// plain accessor, so it must never emit the startup diagnostics Load owns. Without
-// this, moving the WARNs into the parser would print a startup-shaped record from
-// every caller that only wanted the number.
+// TestMaxScanEntries_is_silent pins the env reader's contract for every parse class:
+// the budget is read through a plain reader, so it must never emit the startup
+// diagnostics Load owns. Without this, moving the WARNs into the parser would print a
+// startup-shaped record from every caller that only wanted the number. The budget has
+// no exported reader (it travels to the composition root on Config), so
+// maxScanEntriesFromEnv is the reader whose silence this holds.
 // slog.Default is process-global, so this test must not run in parallel with
 // anything that logs.
 func TestMaxScanEntries_is_silent(t *testing.T) {
@@ -2073,11 +2118,11 @@ func TestMaxScanEntries_is_silent(t *testing.T) {
 
 			logs := capture.Default(t)
 
-			if got := MaxScanEntries(); got != tc.want {
-				t.Errorf("MaxScanEntries() with MAX_SCAN_ENTRIES=%q = %d, want %d", tc.raw, got, tc.want)
+			if got, _, _ := maxScanEntriesFromEnv(); got != tc.want {
+				t.Errorf("maxScanEntriesFromEnv() with MAX_SCAN_ENTRIES=%q = %d, want %d", tc.raw, got, tc.want)
 			}
 			if logs.Len() != 0 {
-				t.Errorf("MaxScanEntries() with MAX_SCAN_ENTRIES=%q logged %v, want no records: the accessor is silent and Load owns the diagnostics",
+				t.Errorf("maxScanEntriesFromEnv() with MAX_SCAN_ENTRIES=%q logged %v, want no records: the reader is silent and Load owns the diagnostics",
 					tc.raw, logs.Messages())
 			}
 		})
@@ -2132,7 +2177,8 @@ func TestLoad_warns_when_the_scan_entry_budget_is_repaired(t *testing.T) {
 
 			logs := capture.Default(t)
 
-			if _, err := Load(); err != nil {
+			cfg, err := Load()
+			if err != nil {
 				t.Fatalf("Load() = %v, want nil: an unusable MAX_SCAN_ENTRIES is repaired, not a startup refusal", err)
 			}
 			if n := logs.CountLevel(slog.LevelWarn, tc.message); n != 1 {
@@ -2154,10 +2200,35 @@ func TestLoad_warns_when_the_scan_entry_budget_is_repaired(t *testing.T) {
 			// The value the scanner will use must agree with the record that
 			// explains the repair, or the log describes a budget nothing enforces.
 			wantLimit, _, _ := maxScanEntriesFromEnv()
-			if got := MaxScanEntries(); got != wantLimit {
-				t.Errorf("MaxScanEntries() = %d, want %d", got, wantLimit)
+			if cfg.MaxScanEntries != wantLimit {
+				t.Errorf("Load().MaxScanEntries = %d, want %d", cfg.MaxScanEntries, wantLimit)
 			}
 		})
+	}
+}
+
+// TestLoad_scan_entry_default_warn_names_the_accepted_range pins the one attribute
+// that answers the question an operator who wrote MAX_SCAN_ENTRIES=0 actually has:
+// the WARN's "expected" text states the usable range AND that no value disables the
+// budget. The sibling PFX_ENCODER and OUTPUT_LIFECYCLE warnings both have their
+// "expected" attribute pinned; this one did not, so dropping it would leave the
+// operator with a rejected value, a substituted default, and nothing saying that
+// "0"/"false" are not opt-outs here. Serial: it mutates env and slog.Default.
+func TestLoad_scan_entry_default_warn_names_the_accepted_range(t *testing.T) {
+	isolatePasswordFile(t)
+	t.Setenv("PFX_PASSWORD", "pw")
+	t.Setenv("MAX_SCAN_ENTRIES", "0")
+
+	logs := capture.Default(t)
+
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() = %v, want nil: an unusable MAX_SCAN_ENTRIES is repaired, not a startup refusal", err)
+	}
+	const msg = "invalid MAX_SCAN_ENTRIES, using default"
+	const want = "a whole number of entries between 1 and 200000 (there is no value that disables the budget)"
+	if !logs.HasAttr(msg, "expected", want) {
+		t.Errorf("Load() with MAX_SCAN_ENTRIES=0 WARN expected = %q, want %q: nothing else tells an operator that no value disables the budget (logs %v)",
+			mustAttr(t, logs, msg, "expected"), want, logs.Messages())
 	}
 }
 

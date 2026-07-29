@@ -96,8 +96,8 @@ func TestInspect_rejects_an_oversized_identifier(t *testing.T) {
 				Version:  3,
 				AuthSafe: contentInfo{ContentType: rawOID(t, oidDataContentType)},
 				MacData: macData{
-					Mac:        digestInfo{Algorithm: algorithmIdentifier{Algorithm: oversizedOID()}, Digest: []byte{0x01}},
-					MacSalt:    bytes.Repeat([]byte{0x01}, minPBKDF2SaltBytes),
+					Mac:        digestInfo{Algorithm: algorithmIdentifier{Algorithm: oversizedOID()}},
+					MacSalt:    testOctetString(t, bytes.Repeat([]byte{0x01}, minPBKDF2SaltBytes)),
 					Iterations: 2048,
 				},
 			},
@@ -108,8 +108,8 @@ func TestInspect_rejects_an_oversized_identifier(t *testing.T) {
 				Version:  3,
 				AuthSafe: contentInfo{ContentType: oversizedOID()},
 				MacData: macData{
-					Mac:        digestInfo{Algorithm: algorithmIdentifier{Algorithm: rawOID(t, oidSHA256)}, Digest: []byte{0x01}},
-					MacSalt:    bytes.Repeat([]byte{0x01}, minPBKDF2SaltBytes),
+					Mac:        digestInfo{Algorithm: algorithmIdentifier{Algorithm: rawOID(t, oidSHA256)}},
+					MacSalt:    testOctetString(t, bytes.Repeat([]byte{0x01}, minPBKDF2SaltBytes)),
 					Iterations: 2048,
 				},
 			},
@@ -355,6 +355,14 @@ func testASN1Marshal(t *testing.T, value any) []byte {
 		t.Fatalf("setup: ASN.1 marshal: %v", err)
 	}
 	return der
+}
+
+// testOctetString wraps raw bytes as the primitive OCTET STRING RawValue the
+// preflight's salt fields are modelled as, so a test can set a salt the same way
+// encoding/asn1 would decode one from a bundle.
+func testOctetString(t *testing.T, content []byte) asn1.RawValue {
+	t.Helper()
+	return asn1.RawValue{FullBytes: testASN1Marshal(t, content)}
 }
 
 // testSafeIndex returns the index of the first authenticated safe whose content type is
@@ -865,8 +873,8 @@ func TestInspect_rejects_salts_one_byte_below_profile_floor(t *testing.T) {
 			name:        "SHA-256 MAC with a 15-byte salt",
 			enc:         EncNameModern2023,
 			wantErrText: "mac salt is 15 octet(s), want at least 16",
-			mutate: func(_ *testing.T, p *pfxPreamble) {
-				p.MacData.MacSalt = shortModernSalt
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				p.MacData.MacSalt = testOctetString(t, shortModernSalt)
 			},
 		},
 		{
@@ -893,8 +901,8 @@ func TestInspect_rejects_salts_one_byte_below_profile_floor(t *testing.T) {
 			name:        "legacy MAC with a 7-byte salt",
 			enc:         EncNameLegacyDES,
 			wantErrText: "mac salt is 7 octet(s), want at least 8",
-			mutate: func(_ *testing.T, p *pfxPreamble) {
-				p.MacData.MacSalt = shortLegacySalt
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				p.MacData.MacSalt = testOctetString(t, shortLegacySalt)
 			},
 		},
 	} {
@@ -973,7 +981,7 @@ func setTestLegacyPBESalt(t *testing.T, alg *algorithmIdentifier, salt []byte) {
 	t.Helper()
 	var params legacyPBEParams
 	testASN1Unmarshal(t, alg.Parameters.FullBytes, &params)
-	params.Salt = salt
+	params.Salt = testOctetString(t, salt)
 	alg.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, params)}
 }
 
