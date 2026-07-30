@@ -633,13 +633,13 @@ func TestLoad_unreadable_password_file_fails_loudly(t *testing.T) {
 			// Built by concatenation: filepath.Join would clean the ".." away.
 			return dir + "/sub/../pfx"
 		}},
-		{"filename holding two consecutive dots is rejected", func(t *testing.T) string {
-			path := filepath.Join(t.TempDir(), "pfx..v2")
-			if err := os.WriteFile(path, []byte("from-file"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			return path
-		}},
+		// Deliberately NOT pinned here: which NON-traversing spellings envx
+		// refuses (a "pfx..v2" filename, say). That is envx's acceptance set,
+		// not this app's contract — envx documented its substring test as
+		// over-broad pending analysis, and narrowing it to a ".." COMPONENT
+		// rule must not read as a cert-converter regression. What this app
+		// depends on is the case above: a path that actually traverses is a
+		// hard startup failure the opt-out cannot rescue.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("PFX_PASSWORD", "from-env")

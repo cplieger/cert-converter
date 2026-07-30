@@ -1,0 +1,39 @@
+# punused findings adjudicated as false positives. One literal substring per
+# line, matched against punused's output line; full-line `#` comments carry the
+# reason. Invalid-by-construction classes: `.kiro/steering/tools.md`.
+#
+# boundedTextError is constructed at five non-test sites (certScan.visit,
+# parsePrivateKeyBlock, Encode, CheckCurrency, decode) and its Unwrap runs on
+# every failed conversion: the error reaches process.failEntry -> IsShutdown ->
+# errors.Is(err, context.Canceled), which walks the chain through it. The
+# embedded field is the `error` interface, which promotes only Error(), so
+# without Unwrap every errors.As traversal past the wrapper dead-ends. The repo
+# has already shipped that bug once (a wrap made IsShutdown false and logged a
+# routine shutdown at ERROR). Upstream: bep/punused#3.
+method (boundedTextError).Unwrap
+#
+# LostError.Unwrap upholds the errors.Is(err, ErrWatchLost) contract documented
+# on the type and is exercised by six assertions across watch's loop, recv and
+# poll suites. Honest caveat: no non-test consumer unwraps it today -- main.go's
+# reportWatchExit uses errors.As on the concrete type, which matches at depth 0
+# -- so removing it would change no caller's decision. Kept rather than deleted
+# because the real question is whether the exported ErrWatchLost / LostError /
+# Unwrap trio should collapse to just *LostError, which is an exported-surface
+# design decision, not a dead-symbol cleanup.
+method (*LostError).Unwrap
+#
+# internal/testcerts has no _test.go of its own; it is a regular package
+# precisely so other packages' _test.go files can import a shared certificate
+# fixture builder, which guarantees EU1001 for every symbol in it. All six are
+# heavily used and none is a leftover: Mint 116 call sites, NewECDSAKey 98,
+# GenerateSelfSignedCert 59, GenerateChainMaterial 48, KeyPEM 46,
+# GenerateCertChain 12. GenerateCertChain and GenerateChainMaterial are not
+# redundant -- the former exposes only the leaf key, the latter exists to express
+# the cases identity selection must get right (issuer-owned key, renewed cert
+# reusing its predecessor's key, future-dated renewal).
+function Mint
+function KeyPEM
+function NewECDSAKey
+function GenerateSelfSignedCert
+function GenerateCertChain
+function GenerateChainMaterial

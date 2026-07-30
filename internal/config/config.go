@@ -117,9 +117,8 @@ type Config struct {
 // ErrUnencodablePassword when the configured password is a shape PKCS#12 cannot
 // carry (invalid UTF-8, a non-BMP rune, or an embedded NUL); and it fails
 // loudly, with no opt-out, when a configured PFX_PASSWORD_FILE cannot be used
-// at all — a path envx rejects (it must already be cleaned and contain no ".."
-// anywhere, so even a "pfx..v2" filename is refused), or an oversized or
-// unreadable file.
+// at all — a path envx rejects (it must already be cleaned and must not
+// traverse), or an oversized or unreadable file.
 func Load() (Config, error) {
 	var blankSecretFile error
 	// Emitted before resolution: a blank pointer is not the file channel at all, so
