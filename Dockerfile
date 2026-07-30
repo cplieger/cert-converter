@@ -15,7 +15,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6
 
 COPY --chmod=755 --from=builder /cert-watcher /cert-watcher
-USER nonroot:nonroot
+# Distroless's `nonroot` user, spelled numerically: a numeric UID needs no
+# /etc/passwd lookup and lets an orchestrator verify the user is non-root
+# without resolving a name (hadolint DL3066). Only a default — compose
+# overrides it with the operator's own UID.
+USER 65532:65532
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=15s \
     CMD ["/cert-watcher", "health"]
 ENTRYPOINT ["/cert-watcher"]
