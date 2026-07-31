@@ -1,0 +1,14 @@
+# punused findings adjudicated as false positives. One literal substring per
+# line, matched against punused's output line; full-line `#` comments carry the
+# reason. Invalid-by-construction classes: `.kiro/steering/tools.md`.
+#
+# internal/testcerts has no _test.go of its own; it is a regular package
+# precisely so OTHER packages' _test.go files can import a shared certificate
+# fixture builder. That guarantees EU1001 ("used in test only") for every symbol
+# it exports, whatever the symbol does -- the finding reports the package's
+# purpose, not a defect. Both are live and neither is a leftover:
+# GenerateSelfSignedCert has 46 call sites and GenerateCertChain 3, all in other
+# packages' tests, and zero production callers by design. Upstream:
+# bep/punused#3.
+function GenerateSelfSignedCert
+function GenerateCertChain
