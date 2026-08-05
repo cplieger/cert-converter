@@ -1,5 +1,5 @@
-github.com/cplieger/atomicfile/v2 v2.6.0 h1:CNS3A+SH4YlDz217BVQyHEoCVu3d/x5W+yFz7b6u7+M=
-github.com/cplieger/atomicfile/v2 v2.6.0/go.mod h1:jgwJ7oU3qahL4NwiF+1iBIzPRpR8LwXnicSalGoJeVA=
+github.com/cplieger/atomicfile/v2 v2.7.0 h1:ZsagNRGXyfkncPfaE/rTI5LOe6oNFgG1moQjIVY2LxY=
+github.com/cplieger/atomicfile/v2 v2.7.0/go.mod h1:jgwJ7oU3qahL4NwiF+1iBIzPRpR8LwXnicSalGoJeVA=
 github.com/cplieger/envx v1.5.0 h1:HVyfOsok1xQlmv8X6ajvFXZlwtWw8IMqEoE7jKSMslk=
 github.com/cplieger/envx v1.5.0/go.mod h1:OA7MSc3ChDXYZgIlHkABJZWt5FqUtr66yWBISLUvq20=
 github.com/cplieger/health v1.4.0 h1:MnLfSZNRnq7wYSMVi1s8Ox0kowk5iPzmqVKQ5JHHsoM=
@@ -8,8 +8,8 @@ github.com/cplieger/pathinside v1.0.0 h1:w58q7tntX7VcVnDmF4r/FNKnvl1yLq4tDac845X
 github.com/cplieger/pathinside v1.0.0/go.mod h1:yHMRs1HFsqkCGWYUzRCD+DoKWCIZE8Uj0wTKkFTFUsg=
 github.com/cplieger/runesafe v1.4.0 h1:gdDYtWTysEl32n68fJM9hfrjoebT/QGiXuSQ08XyQ1g=
 github.com/cplieger/runesafe v1.4.0/go.mod h1:37oz7JJVn1PIWv5UHrJhDhCabmqhMY+eRavwZ6Lp6NI=
-github.com/cplieger/slogx v1.5.0 h1:4K5E9IG0nkYopJqv+BV/YsaMwPSCzyUvdPex24DeKds=
-github.com/cplieger/slogx v1.5.0/go.mod h1:15KA2NVx725imQe/PYXUmd3oM2oMpYpqwU+hdHtz7Fc=
+github.com/cplieger/slogx v1.6.0 h1:ctcE3EqHz0VxmHYGWwcAGpexIWtZrB427UoDa3umpGk=
+github.com/cplieger/slogx v1.6.0/go.mod h1:15KA2NVx725imQe/PYXUmd3oM2oMpYpqwU+hdHtz7Fc=
 github.com/fsnotify/fsnotify v1.10.1 h1:b0/UzAf9yR5rhf3RPm9gf3ehBPpf0oZKIjtpKrx59Ho=
 github.com/fsnotify/fsnotify v1.10.1/go.mod h1:TLheqan6HD6GBK6PrDWyDPBaEV8LspOxvPSjC+bVfgo=
 golang.org/x/crypto v0.54.0 h1:YLIA59K4fiNzHzjnZt2tUJQjQtUWfWbeHBqKtk3eScw=
