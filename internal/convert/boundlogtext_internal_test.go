@@ -408,3 +408,28 @@ func TestParsePrivateKey_bounds_an_oversized_sec1_curve_oid_inside_pkcs8(t *test
 		t.Errorf("ParsePrivateKey(PKCS#8 wrapping a SEC1 key with an 8-byte curve OID) = %v, want no curve-identifier refusal: an ordinary identifier must be left to the parser", smallErr)
 	}
 }
+
+// TestParseCertChain_bounds_the_pem_label_it_names pins the LABEL axis of the bound
+// this file already tests on the subject axis. maxBlockTypeLogLen exists because a PEM
+// type line is arbitrary operator-supplied text capped only by the caller's
+// MaxInputBytes read bound, and skippedBlocks.firstTypeForLog is what a parse
+// diagnostic names -- so a widened or dropped bound puts a multi-megabyte line into the
+// container log on every scan that retries the pair, the same failure
+// maxSubjectLogLen is tested against. Nothing pinned it: widening
+// maxBlockTypeLogLen from 64 to 512 leaves the whole package suite green.
+func TestParseCertChain_bounds_the_pem_label_it_names(t *testing.T) {
+	t.Parallel()
+
+	label := strings.Repeat("A", 200<<10)
+	_, _, err := parseCertChain(pem.EncodeToMemory(&pem.Block{Type: label, Bytes: []byte("opaque")}))
+	if err == nil {
+		t.Fatal("parseCertChain(a block with a 200 KB label) = nil error, want a refusal")
+	}
+	quoted := strings.Repeat("A", maxBlockTypeLogLen)
+	if !strings.Contains(err.Error(), quoted[:maxBlockTypeLogLen-len(truncationMarker)]+truncationMarker) {
+		t.Errorf("parseCertChain error = %q, want the label cut at %d bytes and marked", err.Error(), maxBlockTypeLogLen)
+	}
+	if len(err.Error()) > 256 {
+		t.Errorf("parseCertChain error is %d bytes, want the label bounded before it reaches the log", len(err.Error()))
+	}
+}

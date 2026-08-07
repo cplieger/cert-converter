@@ -122,7 +122,8 @@ func (r *reapContext) unreplaceableOnly() bool {
 	return r.result.Failed == 0 && r.result.Unwritable > 0
 }
 
-// reapDisabledPhrase is the substring the README's CertConverterCannotReap Loki rule matches.
+// reapDisabledPhrase is the substring the README's CertConverterOrphanRemovalDisabled Loki
+// rule matches.
 // Every record that reports a scan declining to reap composes its message from it, so the
 // alert cannot be dropped by rewording one site.
 const reapDisabledPhrase = "orphan removal is disabled for this scan"
@@ -178,7 +179,12 @@ func logIncompleteInputEnumeration(rc *reapContext) {
 			"walk_completed", rc.walkCompleted, "unreadable", rc.result.Unreadable,
 			"unresolved", rc.result.Unresolved, "vanished", rc.result.Vanished,
 			"total", rc.result.Total,
-			"remediation", "check the /input mount and the unreadable-path warnings above")
+			// Names BOTH ways in, because this arm serves two conditions reapContext cannot
+			// tell apart: a walk that could not read part of the tree (unreadable= is
+			// non-zero and its own WARN is above), and a walk the entry budget stopped
+			// (every count here is zero and the action is the budget, not the mount).
+			"remediation", "check the /input mount and the unreadable-path warnings above; "+
+				"if the scan stopped at the entry budget, raise MAX_SCAN_ENTRIES instead")
 	}
 }
 
@@ -572,7 +578,11 @@ type reapDecision struct {
 // narration is only resolved when nothing is deleted; a reaping scan needs neither
 // string.
 func resolveReap(mode outputpolicy.Lifecycle, reapable, walkSafe, refusalOnly bool) reapDecision {
-	if mode == outputpolicy.LifecycleSync && reapable && walkSafe {
+	// reapable already carries walkSafe: reconcile computes it as
+	// `rc.safeToReap() && walkSafe` at the single call site, so an untrustworthy output
+	// walk has already forced it false. walkSafe stays a parameter because the narration
+	// below distinguishes it from the other vetoes.
+	if mode == outputpolicy.LifecycleSync && reapable {
 		return reapDecision{reap: true}
 	}
 	return reapDecision{

@@ -905,3 +905,177 @@ func FuzzScanRSAKeyEnvelope_reports_a_bounded_shape(f *testing.F) {
 		}
 	})
 }
+
+// TestSEC1CurveOIDBytes_fails_open_on_shapes_that_are_not_a_sec1_key is the
+// missing sibling of TestScanRSAKeyEnvelope_fails_open_on_shapes_that_are_not_an_envelope
+// and TestPKCS8HoldsECKey_answers_true_only_for_an_ec_algorithm_identifier: every
+// other DER shape-walker in this package has a fail-open test and this one does not.
+//
+// It is the reader behind oversizedSEC1CurveOIDError, the bound that keeps a
+// file-supplied curve identifier out of encoding/asn1's one-int-per-encoded-byte
+// decode, so a misread is operator-visible in BOTH directions: a shape wrongly read
+// as a SEC1 key measures the wrong element and can refuse an EC key the app converts
+// today (a conversion failure, which flips health), while a shape wrongly skipped
+// leaves the identifier unbounded, which is the allocation the bound exists to close.
+// The existing tests reach this walker only with well-formed SEC1 DER.
+//
+// The two context-specific rows are the class half of the contract: isASN1 checks the
+// ASN.1 CLASS as well as the tag, precisely so a [2] or [4] element cannot be mistaken
+// for a universal INTEGER or OCTET STRING, and nothing in the package asserted that.
+func TestSEC1CurveOIDBytes_fails_open_on_shapes_that_are_not_a_sec1_key(t *testing.T) {
+	t.Parallel()
+
+	version := testASN1Marshal(t, 1)
+	privateKey := testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagOctetString, Bytes: bytes.Repeat([]byte{0x02}, 32)})
+	// prime256v1, whose identifier content is 8 bytes (2A 86 48 CE 3D 03 01 07).
+	curve := testASN1Marshal(t, asn1.ObjectIdentifier{1, 2, 840, 10045, 3, 1, 7})
+	params := func(body []byte) []byte {
+		return testASN1Marshal(t, asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: 0, IsCompound: true, Bytes: body})
+	}
+	contextTagged := func(tag int, body []byte) []byte {
+		return testASN1Marshal(t, asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: tag, IsCompound: true, Bytes: body})
+	}
+
+	cases := map[string]struct {
+		der       []byte
+		wantSize  int
+		wantFound bool
+	}{
+		"a real sec1 key reports its curve identifier's length": {
+			der: derTestSequence(t, version, privateKey, params(curve)), wantSize: 8, wantFound: true,
+		},
+		"not a sequence at all":                     {der: version},
+		"a first element that is not the version":   {der: derTestSequence(t, privateKey, privateKey, params(curve))},
+		"nothing after the version":                 {der: derTestSequence(t, version)},
+		"a private key that is not an octet string": {der: derTestSequence(t, version, version, params(curve))},
+		"parameters that are not the explicit [0] field": {
+			der: derTestSequence(t, version, privateKey, curve),
+		},
+		"parameters holding something that is not an identifier": {
+			der: derTestSequence(t, version, privateKey, params(version)),
+		},
+		"a context-specific [2] element where the version belongs": {
+			der: derTestSequence(t, contextTagged(asn1.TagInteger, nil), privateKey, params(curve)),
+		},
+		"a context-specific [4] element where the private key belongs": {
+			der: derTestSequence(t, version, contextTagged(asn1.TagOctetString, nil), params(curve)),
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			size, found := sec1CurveOIDBytes(tc.der)
+			if found != tc.wantFound {
+				t.Errorf("sec1CurveOIDBytes(%s) found = %v, want %v", name, found, tc.wantFound)
+			}
+			if size != tc.wantSize {
+				t.Errorf("sec1CurveOIDBytes(%s) size = %d, want %d", name, size, tc.wantSize)
+			}
+		})
+	}
+}
+
+// TestPKCS8PrivateKeyDER_fails_open_on_shapes_that_are_not_a_pkcs8_container pins
+// the one-level unwrap oversizedSEC1CurveOIDError needs to reach the curve identifier
+// nested INSIDE a PKCS#8 EC container -- the fourth door
+// TestParsePrivateKey_bounds_an_oversized_sec1_curve_oid_inside_pkcs8 exercises, but
+// only with a well-formed container.
+//
+// Both directions are operator-visible. A shape wrongly unwrapped hands the inner
+// walker bytes taken from the wrong element, so an ordinary EC key can earn a
+// curve-identifier refusal it should never see; a well-formed container wrongly
+// skipped leaves the nested identifier unbounded.
+//
+// The context-specific rows pin isASN1's class check, which nothing else in the
+// package asserts: without it a [2], [16] or [4] element passes for the universal tag
+// of the same number and the unwrap hands out the wrong bytes.
+func TestPKCS8PrivateKeyDER_fails_open_on_shapes_that_are_not_a_pkcs8_container(t *testing.T) {
+	t.Parallel()
+
+	version := testASN1Marshal(t, 0)
+	algorithm := derTestSequence(t, testASN1Marshal(t, ecPublicKeyOID))
+	innerKey := []byte{0x30, 0x00}
+	inner := testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagOctetString, Bytes: innerKey})
+	contextTagged := func(tag int, body []byte) []byte {
+		return testASN1Marshal(t, asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: tag, IsCompound: true, Bytes: body})
+	}
+
+	cases := map[string]struct {
+		der  []byte
+		want []byte
+	}{
+		"a real pkcs8 container yields its inner key structure": {
+			der: derTestSequence(t, version, algorithm, inner), want: innerKey,
+		},
+		"not a sequence at all":                     {der: version},
+		"a first element that is not the version":   {der: derTestSequence(t, algorithm, algorithm, inner)},
+		"nothing after the version":                 {der: derTestSequence(t, version)},
+		"an algorithm field that is not a sequence": {der: derTestSequence(t, version, version, inner)},
+		"nothing after the algorithm":               {der: derTestSequence(t, version, algorithm)},
+		"a private key that is not an octet string": {der: derTestSequence(t, version, algorithm, version)},
+		"a context-specific [2] element where the version belongs": {
+			der: derTestSequence(t, contextTagged(asn1.TagInteger, nil), algorithm, inner),
+		},
+		"a context-specific [16] element where the algorithm belongs": {
+			der: derTestSequence(t, version, contextTagged(asn1.TagSequence, nil), inner),
+		},
+		"a context-specific [4] element where the private key belongs": {
+			der: derTestSequence(t, version, algorithm, contextTagged(asn1.TagOctetString, innerKey)),
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := pkcs8PrivateKeyDER(tc.der); !bytes.Equal(got, tc.want) {
+				t.Errorf("pkcs8PrivateKeyDER(%s) = %x, want %x", name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDerIntegerBits_reports_no_size_for_a_value_that_is_not_one pins the sign and
+// padding rules the envelope pre-scan's SIZE half rests on, which its doc comment
+// states and no test asserts: an empty content, a negative value and zero are not
+// sizes, so they must leave the scan unsized while the shape and factor count it
+// derives from tag-length headers still stand.
+//
+// The consequence of a wrong verdict is a wrong refusal. maxBits feeds
+// oversizedRSAKeyError, so treating a negative INTEGER as a measurement makes a
+// malformed key earn a bit-count ceiling message instead of the parser's own
+// diagnosis, and an operator reads a size problem where there is none. Dropping the
+// sign check leaves the whole package suite green today, including
+// TestScanRSAKeyEnvelope_counts_factors_through_an_unmeasurable_modulus, which asserts
+// the factor count on a negative modulus but never the unsized verdict.
+func TestDerIntegerBits_reports_no_size_for_a_value_that_is_not_one(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		content  []byte
+		wantBits int
+		wantOK   bool
+	}{
+		"a one-byte positive value":           {content: []byte{0x7f}, wantBits: 7, wantOK: true},
+		"a padded large positive value":       {content: []byte{0x00, 0xff, 0xff}, wantBits: 16, wantOK: true},
+		"empty content":                       {content: nil},
+		"zero":                                {content: []byte{0x00}},
+		"a negative value":                    {content: []byte{0xff}},
+		"a large negative value":              {content: []byte{0x80, 0x00, 0x01}},
+		"a negative value that looks padded":  {content: []byte{0xff, 0x00, 0x00}},
+		"only DER's positive-keeping padding": {content: []byte{0x00, 0x00}},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			bits, ok := derIntegerBits(tc.content)
+			if ok != tc.wantOK {
+				t.Errorf("derIntegerBits(%x) ok = %v, want %v", tc.content, ok, tc.wantOK)
+			}
+			if bits != tc.wantBits {
+				t.Errorf("derIntegerBits(%x) = %d bits, want %d", tc.content, bits, tc.wantBits)
+			}
+		})
+	}
+}

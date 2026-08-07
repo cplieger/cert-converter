@@ -742,24 +742,21 @@ func (s *store) tightenMode(rel string, fi os.FileInfo) tightenResult {
 			"path", rel, "mode", perm.String(), "want", want.String(),
 			"error", err, "remediation", outputModeRemediation)
 		return tightenIneffective
-	case err != nil && isPermissionRefusal(err) && fileOwnedByProcess(fi):
-		// A refusal on a bundle this process OWNS is not evidence about ownership: a
-		// UID that owns a file may always chmod it, so what was refused is the
-		// requested BITS, not our right to set them. That is a filesystem which forces
-		// modes and reports the refusal instead of swallowing it (fat_setattr returns
-		// EPERM for any mode outside the mount's fmask), and a rewrite cannot converge
-		// it either — the replacement lands with the same forced mode — so this must
-		// NOT schedule one. Same outcome as a chmod the filesystem accepts and stores
-		// nothing, which is the identical condition reported through the other channel.
-		slog.Warn(modeNotTightenedMsg,
-			"path", rel, "mode", perm.String(), "want", want.String(),
-			"error", err, "remediation", outputModeRemediation)
-		return tightenIneffective
-	case err != nil && isPermissionRefusal(err):
+	case err != nil && isPermissionRefusal(err) && !fileOwnedByProcess(fi):
 		// Not ours to chmod, but ours to replace: bundleState.upToDate reads this outcome
 		// as a reason to rewrite, and the ordinary write path converges it. Named with the ownership
 		// remediation rather than the filesystem one, because that is what a refusal
 		// means.
+		//
+		// The ownership term is what keeps this arm honest. A refusal on a bundle this
+		// process OWNS is not evidence about ownership — a UID that owns a file may always
+		// chmod it, so what was refused is the requested BITS, not our right to set them:
+		// a filesystem which forces modes and reports the refusal instead of swallowing it
+		// (fat_setattr returns EPERM for any mode outside the mount's fmask). A rewrite
+		// cannot converge that either — the replacement lands with the same forced mode —
+		// so it must NOT schedule one, and it falls through to the generic error arm below,
+		// which reports it exactly as a chmod the filesystem accepts and stores nothing is
+		// reported (tightenIneffective, modeNotTightenedMsg, outputModeRemediation).
 		slog.Warn(modeRepairRefusedMsg,
 			"path", rel, "mode", perm.String(), "want", want.String(),
 			"error", err, "remediation", outputPermRemediation)

@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/layout"
-	"github.com/cplieger/pathinside"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -255,15 +254,6 @@ func FallbackLabel(d time.Duration) string {
 	return d.String()
 }
 
-// fallbackStatus renders the ROUTINE safety-net rescan's cadence for a
-// degraded-path WARN, and answers only "is the operator's own cadence running?".
-// "disabled" is the operationally important case, and coverageAttrs is what keeps
-// it from reading as "nothing will ever revisit this": the scan_floor beside it
-// names the reconciliation cadence that still will.
-func (w *Watcher) fallbackStatus() string {
-	return FallbackLabel(w.fallback)
-}
-
 // coverageAttrs closes a degraded-path record with the two cadences that answer
 // the one question such a record raises: will anything revisit what was just lost?
 // Both travel together because either alone answers it wrongly — fallback_scan is
@@ -274,7 +264,10 @@ func (w *Watcher) fallbackStatus() string {
 // record.
 func (w *Watcher) coverageAttrs(attrs ...any) []any {
 	return append(attrs,
-		"fallback_scan", w.fallbackStatus(),
+		// fallback_scan answers only "is the operator's own cadence running?", so
+		// FallbackLabel renders a non-positive interval as "disabled"; scan_floor beside
+		// it is what keeps that from reading as "nothing will ever revisit this".
+		"fallback_scan", FallbackLabel(w.fallback),
 		"scan_floor", w.safetyNetInterval().String())
 }
 
@@ -614,12 +607,12 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 // ambient: a Create event can Lstat and WalkDir beneath event.Name, so a raced
 // ancestor can extend registrations into the replacement target and consume
 // watch descriptors, but it still cannot make the app read or convert content
-// outside the root. handlePathEvent's containment check (pathinside.Inside)
-// bounds only the NAME an
-// event may extend the watch set from, so a registration whose PATH already lies
-// outside the root cannot compound; a registration that escaped through a swapped
-// ancestor still carries an in-root name, so this residual (watch descriptors,
-// never content) stands as described above.
+// outside the root. Every path this package registers is derived from
+// filepath.WalkDir over the root (visitWatchPath is the only watcher.Add site) or
+// from an event fsnotify named under a path already registered, so a registration
+// cannot carry an out-of-root name and cannot compound; a registration that
+// escaped through a swapped ancestor still carries an in-root name, so this
+// residual (watch descriptors, never content) stands as described above.
 //
 // The entry ceiling is TWO bounds, not one. Every walk is capped at maxEntries
 // entries, which bounds one traversal's cost; and the LIVE registration set is capped
@@ -820,6 +813,44 @@ func (w *Watcher) resetWatchSet() {
 	w.watched = make(map[string]struct{})
 }
 
+// takeWatchSet empties the mirror and returns what it held, so a REBUILD over a
+// live watcher can unregister the paths it does not re-establish. resetWatchSet is
+// the attach-time twin: a brand-new watcher's kernel registration set is already
+// empty, so there is nothing to unregister and nothing to hand back.
+func (w *Watcher) takeWatchSet() map[string]struct{} {
+	w.watchedMu.Lock()
+	defer w.watchedMu.Unlock()
+	previous := w.watched
+	w.watched = make(map[string]struct{})
+	return previous
+}
+
+// pruneWatches unregisters every path a rebuild did not re-establish, which is what
+// makes the mirror an honest count of the LIVE registration set rather than only of
+// the last walk.
+//
+// The kernel keeps a registration until it is removed or its directory disappears,
+// and this is the only place that removes one, so without it the live set grows past
+// the ceiling addWatchDirs documents: a walk the entry budget cut short registers a
+// different prefix each time the tree changes, and the registrations the new walk no
+// longer reaches stay live while watchSetSize stops counting them. That ceiling is a
+// share of the per-UID fs.inotify.max_user_watches quota, so overrunning it is paid
+// by unrelated same-UID consumers.
+//
+// Best-effort by design: a path whose directory is already gone has no registration
+// left to remove, so a failure here is expected rather than a degradation and is
+// reported at Debug only.
+func (w *Watcher) pruneWatches(watcher *fsnotify.Watcher, stale map[string]struct{}) {
+	for path := range stale {
+		if w.watchSetHas(path) {
+			continue
+		}
+		if err := watcher.Remove(path); err != nil {
+			slog.Debug("stale fsnotify registration already gone", "path", path, "error", err)
+		}
+	}
+}
+
 // --- Event classification ---
 
 // handleFsEvent keeps directory watches current and reports whether an event
@@ -894,21 +925,6 @@ func (w *Watcher) handlePathEvent(
 	}
 	if !info.IsDir() {
 		return layout.IsRelevant(event.Name)
-	}
-	// Watch-set maintenance is the one place this package can EXTEND its ambient
-	// reach: fsnotify hands back the path a watch was registered with, so a
-	// registration carrying an out-of-root NAME would otherwise keep walking and
-	// registering further outside it, one event at a time. pathinside.Inside is
-	// lexical, which is what this bound needs: it bounds the NAME, not the
-	// resolution, and a symlink is already refused by the Lstat above and by
-	// WalkDir, which does not descend one. It therefore does NOT bound the
-	// swapped-ancestor race addWatchDirs documents: a registration that escaped
-	// that way still carries an in-root name, so that residual (watch
-	// descriptors, never content) stands as addWatchDirs describes.
-	if !pathinside.Inside(w.root, event.Name) {
-		slog.Warn("refusing to extend the watch set outside the watched root; the event path resolves outside it, so renewals under it are not this app's to convert",
-			w.coverageAttrs("path", event.Name, "root", w.root)...)
-		return true
 	}
 	if w.watchSetHas(event.Name) {
 		return true // already watched: nothing to re-attach, the debounced rescan covers content
@@ -1023,7 +1039,7 @@ func (w *Watcher) runWatchLoop(ctx context.Context, watcher *fsnotify.Watcher, s
 // the one loss where the whole set is gone at once, a restart re-attaches it in
 // seconds, and the alternative is a tree that is entirely unwatched until the floor
 // comes due. Any other event reports true untouched.
-func (w *Watcher) handleRootWatchLoss(ctx context.Context, watcher *fsnotify.Watcher, event fsnotify.Event) bool {
+func (w *Watcher) handleRootWatchLoss(ctx context.Context, watcher *fsnotify.Watcher, st *watchState, event fsnotify.Event) bool {
 	if filepath.Clean(event.Name) != filepath.Clean(w.root) {
 		return true
 	}
@@ -1037,7 +1053,7 @@ func (w *Watcher) handleRootWatchLoss(ctx context.Context, watcher *fsnotify.Wat
 	// the debounced rescan reports.
 	slog.Warn("fsnotify root watch lost; re-attaching the watch set, renewals until it succeeds are covered only by the periodic rescan",
 		w.coverageAttrs("root", w.root, "op", event.Op.String())...)
-	w.resyncWatchSet(ctx, watcher,
+	st.resync(ctx, watcher,
 		"failed to re-attach the watch set after the root watch was lost; renewals are covered only by the periodic rescan")
 	return true
 }
@@ -1093,7 +1109,7 @@ func (w *Watcher) handleEventRecv(
 	if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
 		w.forgetWatch(event.Name)
 	}
-	if !w.handleRootWatchLoss(ctx, watcher, event) {
+	if !w.handleRootWatchLoss(ctx, watcher, st, event) {
 		return errRootWatchRemoved
 	}
 	if w.handleFsEvent(ctx, watcher, event) {
@@ -1123,7 +1139,7 @@ func (w *Watcher) handleErrorRecv(
 	if st.handleWatcherError(err) {
 		// The dropped events may have included the Create of a new directory, which
 		// would otherwise stay unwatched for the rest of the process's life.
-		w.resyncWatchSet(ctx, watcher,
+		st.resync(ctx, watcher,
 			"failed to re-sync the watch set after an event-queue overflow; a directory whose Create was dropped stays unwatched until the next re-sync")
 	}
 	return nil
@@ -1146,8 +1162,7 @@ func (w *Watcher) handleSafetyNetTick(ctx context.Context, watcher *fsnotify.Wat
 	// repair deferred earlier finds its interval already covered, and charging every
 	// site to one timestamp is what keeps the walk on a cadence this process chose
 	// (see minPreScanResync).
-	st.lastResync = time.Now()
-	w.resyncWatchSet(ctx, watcher,
+	st.resync(ctx, watcher,
 		"failed to re-sync the watch set during the periodic safety-net scan; the scan below still runs, so a renewal is not missed")
 	// Same stop-request rule as runDebouncedScan, on the success path too: the
 	// select has no ctx precedence, so a safety-net deadline reached in the same
@@ -1177,13 +1192,19 @@ func (w *Watcher) resyncWatchSet(ctx context.Context, watcher *fsnotify.Watcher,
 	// cut short below leaves the mirror emptier than the kernel's set, which errs toward one
 	// extra subtree walk on a later event (the safe direction this mirror already documents),
 	// never toward claiming an unwatched directory is watched.
-	w.resetWatchSet()
+	stale := w.takeWatchSet()
 	if addErr := w.addWatchDirs(ctx, watcher, w.root); addErr != nil {
 		if ctx.Err() == nil {
 			slog.Warn(warning, w.coverageAttrs("root", w.root, "error", addErr)...)
 		}
 		return
 	}
+	// Unregister what this walk did not re-establish, so the mirror the LIVE-set ceiling is
+	// read from (visitWatchPath's watchSetSize test) counts the kernel's registrations rather
+	// than only this walk's. Only on the success path: a walk that failed at the root proves
+	// nothing about which registrations are still wanted, and dropping them all there would
+	// unwatch a tree this process cannot currently re-walk.
+	w.pruneWatches(watcher, stale)
 	// Refresh the Debug dump on success: every re-sync exists to RECOVER watches that were
 	// missing, so the recovered set - not the set as it stood at attach - is what an operator
 	// diagnosing an incomplete watch set needs. The failure half is the WARN above.
@@ -1254,6 +1275,17 @@ func (st *watchState) scheduleScan() {
 	st.debounceTimer.Reset(st.w.debounce)
 }
 
+// resync charges the re-assert clock and then re-asserts the whole watch set.
+// EVERY in-loop re-assert goes through here: minPreScanResync's floor is measured
+// from the last walk whichever site ran it, so a site that walks without charging
+// the clock is exempt from the floor AND leaves the next debounced scan believing
+// no walk has happened, which costs one event two whole-tree walks and two copies
+// of every unwatchable-directory WARN.
+func (st *watchState) resync(ctx context.Context, watcher *fsnotify.Watcher, warning string) {
+	st.lastResync = time.Now()
+	st.w.resyncWatchSet(ctx, watcher, warning)
+}
+
 // scheduleRepair defers the whole-tree re-assert that minPreScanResync just
 // declined to run, arming it for the REMAINDER of the floor rather than for a
 // fresh interval: the floor bounds how often the walk may run, so the repair is
@@ -1297,8 +1329,7 @@ func (st *watchState) runDeferredRepair(ctx context.Context, watcher *fsnotify.W
 	if time.Since(st.lastResync) < minPreScanResync {
 		return
 	}
-	st.lastResync = time.Now()
-	st.w.resyncWatchSet(ctx, watcher,
+	st.resync(ctx, watcher,
 		"failed to re-assert the watch set on the deferred repair schedule; a registration the kernel dropped without an event stays unwatched until the next re-assert")
 }
 
@@ -1335,8 +1366,7 @@ func (st *watchState) runDebouncedScan(ctx context.Context, watcher *fsnotify.Wa
 		return
 	}
 	if time.Since(st.lastResync) >= minPreScanResync {
-		st.lastResync = time.Now()
-		st.w.resyncWatchSet(ctx, watcher,
+		st.resync(ctx, watcher,
 			"failed to re-assert the watch set before a debounced scan; a registration the kernel dropped without an event stays unwatched until the next re-assert")
 		// The re-sync can be cut short by cancellation, and the scan below would then be
 		// spurious work for a loop that is already returning.
@@ -1369,7 +1399,8 @@ func (st *watchState) runSafetyNetScan(ctx context.Context) {
 // other error is logged, the loop continues, and it reports false.
 func (st *watchState) handleWatcherError(err error) bool {
 	if errors.Is(err, fsnotify.ErrEventOverflow) {
-		slog.Warn("fsnotify event queue overflowed; events were dropped, forcing a rescan to recover any missed renewal", "error", err)
+		slog.Warn("fsnotify event queue overflowed; events were dropped, forcing a rescan to recover any missed renewal",
+			st.w.coverageAttrs("root", st.w.root, "error", err)...)
 		st.scheduleScan()
 		return true
 	}

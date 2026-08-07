@@ -465,8 +465,8 @@ func TestInspect_rejects_more_than_one_shrouded_key_bag(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Inspect(%s) = %v, want nil", tc.name, err)
 				}
-				if got.Profile != EncNameModern2023 {
-					t.Errorf("Inspect(%s) reported %q, want %q", tc.name, got.Profile, EncNameModern2023)
+				if got != EncNameModern2023 {
+					t.Errorf("Inspect(%s) reported %q, want %q", tc.name, got, EncNameModern2023)
 				}
 				return
 			}
@@ -1101,8 +1101,8 @@ func TestInspect_rejects_more_safe_bags_than_it_admits(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Inspect(%s) = %v, want nil", tc.name, err)
 				}
-				if got.Profile != EncNameModern2023 {
-					t.Errorf("Inspect(%s) reported %q, want %q", tc.name, got.Profile, EncNameModern2023)
+				if got != EncNameModern2023 {
+					t.Errorf("Inspect(%s) reported %q, want %q", tc.name, got, EncNameModern2023)
 				}
 				return
 			}

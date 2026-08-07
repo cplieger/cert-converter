@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/config"
+	"github.com/cplieger/cert-converter/internal/mounts"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/health"
@@ -62,9 +63,9 @@ var runProbe = health.RunProbe
 // second seam in the same style as runProbe: the production value is the two
 // fixed container paths, and tests point it at temp directories so the refusal
 // itself can be exercised without a /input and /output on the test host.
-var requiredVolumes = []process.Mount{
-	{Role: process.RoleInput, Path: certsRootDir},
-	{Role: process.RoleOutput, Path: outputDir},
+var requiredVolumes = []mounts.Mount{
+	{Role: mounts.RoleInput, Path: certsRootDir},
+	{Role: mounts.RoleOutput, Path: outputDir},
 }
 
 const healthSubcommand = "health"
@@ -182,19 +183,19 @@ func run() int {
 		"encoder", cfg.EncoderName,
 		"output_lifecycle", string(cfg.Lifecycle), "max_scan_entries", cfg.MaxScanEntries)
 
-	volumes, ready := process.OpenMounts(requiredVolumes)
+	volumes, ready := mounts.OpenMounts(requiredVolumes)
 	// The handles come back OPEN so the write probe below inspects the same object
 	// this guard proved openable instead of re-resolving /output. Deferred rather
 	// than closed after the probe so a later return cannot skip it; OpenMounts
 	// returns none on the refusal path, where CloseMounts is a no-op.
-	defer process.CloseMounts(volumes)
+	defer mounts.CloseMounts(volumes)
 	if !ready {
 		return 1
 	}
 	// Same seam as the guard above, deliberately not the outputDir const: a test that
 	// substitutes requiredVolumes and lets the guard pass must not have the write probe
 	// fall through to the real /output.
-	process.ProbeOutputMounts(volumes)
+	mounts.ProbeOutputMounts(volumes)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

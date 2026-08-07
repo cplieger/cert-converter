@@ -194,47 +194,6 @@ func TestHandleFsEvent_does_not_watch_through_a_symlinked_directory(t *testing.T
 	}
 }
 
-// TestHandleFsEvent_refuses_to_extend_the_watch_set_outside_root pins the
-// containment guard the symlink test above cannot reach: a REAL directory whose
-// event-derived name is lexically outside the watched root. fsnotify hands back
-// the path a watch was registered with, so a registration that once escaped the
-// root would otherwise keep walking and registering further outside it, one
-// event at a time. The event must still request the conservative in-root rescan
-// (content inside the root is unaffected by the refusal) and must say so at WARN
-// with the path, the root and whether anything will revisit what stays
-// unwatched.
-// Not parallel: it swaps the process-global slog default.
-func TestHandleFsEvent_refuses_to_extend_the_watch_set_outside_root(t *testing.T) {
-	logs := capture.Default(t)
-	watcher := newTestWatcher(t)
-	root := t.TempDir()
-	outside := filepath.Join(t.TempDir(), "escaped")
-	if err := os.MkdirAll(outside, 0o750); err != nil {
-		t.Fatal(err)
-	}
-	w := New(root, func(context.Context) {})
-
-	if got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: outside, Op: fsnotify.Create}); !got {
-		t.Error("handleFsEvent(Create dir outside root) = false, want true: the in-root rescan must still cover content after refusing the watch extension")
-	}
-	if watched := watcher.WatchList(); slices.Contains(watched, outside) {
-		t.Errorf("watch list after an outside-root event = %v, want %q refused", watched, outside)
-	}
-	const msg = "refusing to extend the watch set outside the watched root"
-	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
-		t.Fatalf("WARN %q logged %d times, want exactly 1; log = %v", msg, n, logs.Messages())
-	}
-	if got, ok := logs.AttrValue(msg, "path"); !ok || got != outside {
-		t.Errorf("WARN %q path = %q (present %v), want %q", msg, got, ok, outside)
-	}
-	if got, ok := logs.AttrValue(msg, "root"); !ok || got != root {
-		t.Errorf("WARN %q root = %q (present %v), want %q", msg, got, ok, root)
-	}
-	if got, ok := logs.AttrValue(msg, "fallback_scan"); !ok || got != "disabled" {
-		t.Errorf("WARN %q fallback_scan = %q (present %v), want disabled", msg, got, ok)
-	}
-}
-
 // TestHandleFsEvent_skips_the_rewalk_for_an_already_watched_directory pins the
 // half of the membership guard that bounds per-event work: a Create for a
 // directory already in the watch set must NOT re-walk its subtree. The oracle is
@@ -283,8 +242,10 @@ func TestHandleRootWatchLoss_reattaches_the_watch_set_when_the_fallback_is_enabl
 	}
 	watcher := newTestWatcher(t)
 	w := New(root, func(context.Context) {}, WithFallback(time.Hour))
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
 
-	if !w.handleRootWatchLoss(t.Context(), watcher, fsnotify.Event{Name: root, Op: fsnotify.Remove}) {
+	if !w.handleRootWatchLoss(t.Context(), watcher, st, fsnotify.Event{Name: root, Op: fsnotify.Remove}) {
 		t.Fatal("handleRootWatchLoss(root Remove, fallback enabled) = false, want true: the periodic rescan still covers renewals, so the process must not exit for a restart")
 	}
 	for _, want := range []string{root, child} {
@@ -335,8 +296,10 @@ func TestHandleRootWatchLoss_only_the_root_being_taken_away_ends_change_detectio
 			}
 			// No WithFallback: the periodic rescan is disabled, so a loss is terminal.
 			w := New(root, func(context.Context) {})
+			st := newWatchState(w)
+			t.Cleanup(st.stop)
 
-			got := w.handleRootWatchLoss(t.Context(), watcher, fsnotify.Event{Name: path, Op: tc.op})
+			got := w.handleRootWatchLoss(t.Context(), watcher, st, fsnotify.Event{Name: path, Op: tc.op})
 
 			if got != tc.wantLive {
 				t.Errorf("handleRootWatchLoss(%s on %s) = %v, want %v", tc.op, path, got, tc.wantLive)
@@ -361,8 +324,10 @@ func TestHandleRootWatchLoss_stays_live_when_the_reattach_fails(t *testing.T) {
 	logs := capture.Default(t)
 	root := t.TempDir()
 	w := New(root, func(context.Context) {}, WithFallback(6*time.Hour))
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
 
-	if !w.handleRootWatchLoss(t.Context(), newClosedTestWatcher(t), fsnotify.Event{Name: root, Op: fsnotify.Remove}) {
+	if !w.handleRootWatchLoss(t.Context(), newClosedTestWatcher(t), st, fsnotify.Event{Name: root, Op: fsnotify.Remove}) {
 		t.Fatal("handleRootWatchLoss(re-attach failing, fallback enabled) = false, want true: the periodic rescan still covers renewals, so a failed repair must not restart the container")
 	}
 	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
@@ -380,54 +345,63 @@ func TestHandleRootWatchLoss_stays_live_when_the_reattach_fails(t *testing.T) {
 	}
 }
 
-// TestHandleFsEvent_refuses_a_directory_whose_name_only_prefixes_the_root pins
-// the containment guard against the prefix-match bypass class. The existing
-// outside-root test uses a path in an unrelated directory, which a naive
-// strings.HasPrefix(path, root) containment check also refuses, so nothing
-// distinguished the lexical Rel-based guard from that bypassable form: a real
-// sibling named "<root>-evil" shares the root's textual prefix while lying
-// outside it, and accepting it lets one event extend inotify registrations into
-// a tree this app must not watch (and, one event at a time, further outside it).
-// The control case keeps the guard honest: a function that refused everything
-// would satisfy the refusal half alone.
+// TestHandleFsEvent_refuses_a_new_registration_once_the_live_watch_set_is_full pins
+// the live-set half of the registration ceiling on the ONLY path that can reach it.
+// addWatchDirs applies two bounds with the same number: how many paths one walk
+// enumerates, and how large the live registration set may grow. A re-walk from the
+// ROOT can never reach the second one, because the per-walk count is spent on the
+// same paths first -- so the across-calls test above passes on the per-walk cap
+// alone and the live-set refusal executes nowhere in the suite.
+//
+// The reachable driver is the per-event SUBTREE walk: handlePathEvent calls
+// addWatchDirs on event.Name, so a directory created one at a time under an
+// already-watched parent hands each call a fresh per-walk budget it never exhausts.
+// That is precisely the writer-driven growth the live-set bound exists to stop, and
+// with it deleted or inverted the app keeps taking inotify descriptors per created
+// directory until the per-UID fs.inotify quota is spent, taking unrelated same-UID
+// consumers down with it.
+//
+// Budget 2 is the root plus one directory, so the live set is full before the event
+// arrives while the subtree walk below enumerates a single entry.
 // Not parallel: it swaps the process-global slog default.
-func TestHandleFsEvent_refuses_a_directory_whose_name_only_prefixes_the_root(t *testing.T) {
-	base := t.TempDir()
-	root := filepath.Join(base, "input")
-	inside := filepath.Join(root, "example.com")
-	sibling := root + "-evil" // shares root's textual prefix, is NOT under it
-	for _, dir := range []string{inside, sibling} {
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatal(err)
-		}
-	}
-	logs := capture.Default(t)
+func TestHandleFsEvent_refuses_a_new_registration_once_the_live_watch_set_is_full(t *testing.T) {
 	watcher := newTestWatcher(t)
-	w := New(root, func(context.Context) {})
+	root := t.TempDir()
+	first := filepath.Join(root, "a.example.com")
+	if err := os.MkdirAll(first, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	w := New(root, func(context.Context) {}, WithMaxEntries(2))
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
 	}
-
-	const msg = "refusing to extend the watch set outside the watched root"
-	if got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: sibling, Op: fsnotify.Create}); !got {
-		t.Error("handleFsEvent(Create of a prefix-sibling dir) = false, want true: content inside the root is unaffected by the refusal, so the rescan must still run")
-	}
-	if watched := watcher.WatchList(); slices.Contains(watched, sibling) {
-		t.Errorf("watch list = %v, want %q refused: it only shares the root's textual prefix", watched, sibling)
-	}
-	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
-		t.Errorf("WARN %q logged %d times, want exactly 1; log = %v", msg, n, logs.Messages())
+	if got := w.watchSetSize(); got != 2 {
+		t.Fatalf("setup: the live watch set holds %d registrations, want the budget of 2 so only the live-set bound can refuse the event below", got)
 	}
 
-	// Control: a directory genuinely under the root is still accepted.
-	nested := filepath.Join(inside, "nested")
-	if err := os.MkdirAll(nested, 0o750); err != nil {
+	// A directory created later, announced by its own Create event: the subtree walk
+	// enumerates one entry, so the per-walk cap cannot refuse it.
+	late := filepath.Join(root, "b.example.com")
+	if err := os.MkdirAll(late, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	if got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: nested, Op: fsnotify.Create}); !got {
-		t.Error("handleFsEvent(Create of a dir under the root) = false, want true")
+	logs := capture.Default(t)
+
+	if got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: late, Op: fsnotify.Create}); !got {
+		t.Error("handleFsEvent(Create of a new directory at the budget) = false, want true: refusing the registration must not cost the rescan that converts a pair already inside it")
 	}
-	if watched := watcher.WatchList(); !slices.Contains(watched, nested) {
-		t.Errorf("watch list = %v, want %q watched: the guard must not refuse a path inside the root", watched, nested)
+
+	if watched := watcher.WatchList(); slices.Contains(watched, late) {
+		t.Errorf("watch list = %v, want %q refused: each per-event walk takes a fresh per-walk budget, so only a bound on the live SET stops a writer from consuming inotify descriptors one directory at a time",
+			watched, late)
+	}
+	if w.watchSetHas(late) {
+		t.Errorf("the membership mirror recorded %q, which the live-set bound refused to register", late)
+	}
+	if n := logs.CountLevel(slog.LevelWarn, watchBudgetMsg); n != 1 {
+		t.Fatalf("the budget WARN fired %d times, want exactly 1 so the operator learns why real-time detection stops extending; log = %v", n, logs.Messages())
+	}
+	if got, ok := logs.AttrValue(watchBudgetMsg, "max_entries"); !ok || got != "2" {
+		t.Errorf("the budget WARN max_entries = %q (present %v), want %q: the operator cannot raise MAX_SCAN_ENTRIES without knowing the budget that was reached", got, ok, "2")
 	}
 }

@@ -563,21 +563,68 @@ func TestOversizedCertificateOIDError_ignores_an_unknown_extensions_opaque_value
 			len(content), err)
 	}
 
-	// The same claim across arbitrary opaque values, since the defect was found as
-	// a rate rather than a case: the guard's verdict must not depend on what an
-	// unknown extension's value happens to contain.
-	for size := range 12 {
-		value := make([]byte, 1<<size)
-		if _, err := rand.Read(value); err != nil {
-			t.Fatalf("setup: rand.Read = error %v, want nil", err)
+	// The same claim across arbitrary opaque values lives in
+	// FuzzCertificateOIDGuard_opaqueExtensionValueMovesNoVerdict below: the defect was
+	// found as a rate rather than as a case, and a durable committed corpus is what a
+	// rate needs.
+}
+
+// FuzzCertificateOIDGuard_opaqueExtensionValueMovesNoVerdict is the arbitrary-value
+// half of the claim above, in BOTH directions: an unknown extension's value may not
+// produce a refusal, and it may not suppress or re-attribute one either.
+//
+// It replaced a loop over twelve crypto/rand values, which could not do the job for
+// two reasons. It was unseeded, so a failure named an input the next run would not
+// see again — and this is the one defect in this file's history that was found as a
+// RATE (8 of 4000 valid certificates), which is exactly the shape you must be able
+// to reproduce. And uniform random bytes are almost never DER: the values that
+// actually reach an identifier-measuring regression are well-formed elements, and
+// the committed seeds below are those. A guard that reads an unknown extnValue only
+// when it happens to be a valid SEQUENCE leaves every other test in this package
+// green and is caught by seed 4 on every PR.
+//
+// The second direction is not otherwise asserted anywhere: record() keeps only the
+// widest identifier it saw, so a value read as DER does not merely add a refusal, it
+// can take over the site the diagnostic names and send an operator to the wrong
+// field.
+func FuzzCertificateOIDGuard_opaqueExtensionValueMovesNoVerdict(f *testing.F) {
+	base := legalCertificateFixture(f)
+	oversized := oversizedOIDContent(f)
+	bareOID := derOID(f, oversized)
+
+	f.Add([]byte(nil))
+	f.Add([]byte{0x04, 0x02, 0x01, 0x02})
+	f.Add(bareOID)
+	f.Add(derSequenceOf(f, bareOID))
+	f.Add(derSequenceOf(f, derSequenceOf(f, bareOID, derSequenceOf(f, bareOID))))
+	f.Add(derSetOf(f, derSequenceOf(f, bareOID, derPrintableString(f, "x"))))
+	f.Add(derOctetString(f, derSequenceOf(f, bareOID)))
+	f.Add(derContextCompound(f, 3, derSequenceOf(f, derSequenceOf(f, bareOID))))
+	f.Add(append([]byte{0x06, 0x82, 0x02, 0x00}, bytes.Repeat([]byte{0x01}, 2*maxCertificateOIDBytes)...))
+	f.Add([]byte{0x30, 0x7f, 0x06, 0x7d})
+	f.Add(bytes.Repeat([]byte{0xff}, 1024))
+
+	f.Fuzz(func(t *testing.T, opaque []byte) {
+		ordinary := *base
+		ordinary.unknownExtensionValue = opaque
+		if err := oversizedCertificateOIDError(certificateBlock(ordinary.build(t))); err != nil {
+			t.Fatalf("oversizedCertificateOIDError(an ordinary certificate carrying %d opaque extension byte(s)) = %v, want nil: an unknown extension's value is bytes whose meaning belongs to whoever minted the extension, and reading them as DER is what refused valid certificates",
+				len(opaque), err)
 		}
-		fixture := legalCertificateFixture(t)
-		fixture.unknownExtensionValue = value
-		block := certificateBlock(fixture.build(t))
-		if err := oversizedCertificateOIDError(block); err != nil {
-			t.Errorf("oversizedCertificateOIDError(%d bytes of random opaque extension value) = %v, want nil", len(value), err)
+
+		planted := *base
+		planted.unknownExtensionValue = opaque
+		planted.subjectAttribute = oversized
+		err := oversizedCertificateOIDError(certificateBlock(planted.build(t)))
+		if err == nil {
+			t.Fatalf("oversizedCertificateOIDError(an oversized subject attribute type beside %d opaque extension byte(s)) = nil, want a refusal",
+				len(opaque))
 		}
-	}
+		if !strings.Contains(err.Error(), siteSubjectAttribute) {
+			t.Fatalf("error = %q, want it to name the %q site: an unknown extension's value must not be measured as an identifier, and it must not take the widest-site diagnostic either",
+				err, siteSubjectAttribute)
+		}
+	})
 }
 
 // --- site coverage ---
@@ -762,6 +809,84 @@ func TestCertificateExtnIDBytes_name_the_extensions_the_walk_descends_into(t *te
 }
 
 // --- the walk's own bounds ---
+
+// legalOIDContentOfSize returns the content bytes of a legal object identifier of
+// EXACTLY size bytes, so a case can sit one byte either side of
+// maxCertificateOIDBytes. legalOIDContent can only build widths of the form 4n+1,
+// which is why neither boundary is expressible with it.
+//
+// Every sub-identifier stays inside the 31 bits crypto/x509 accepts, so the result
+// is an identifier the parser really decodes rather than one it refuses on its own.
+func legalOIDContentOfSize(t testing.TB, size int) []byte {
+	t.Helper()
+	oid := asn1.ObjectIdentifier{1, 2} // the 1.2 prefix: one content byte
+	remaining := size - 1
+	for ; remaining >= 4; remaining -= 4 {
+		oid = append(oid, 1<<28-1) // four base-128 bytes
+	}
+	switch remaining {
+	case 1:
+		oid = append(oid, 1) // one base-128 byte
+	case 2:
+		oid = append(oid, 1<<7) // two
+	case 3:
+		oid = append(oid, 1<<14) // three
+	}
+	content := oidContentBytes(t, oid)
+	if len(content) != size {
+		t.Fatalf("setup: legalOIDContentOfSize(%d) built %d content byte(s)", size, len(content))
+	}
+	return content
+}
+
+// TestOversizedCertificateOIDError_pins_the_ceiling_as_a_boundary pins
+// maxCertificateOIDBytes as the BOUNDARY it is documented to be, the way the salt,
+// iteration and safe-bag bounds in this package are already pinned: one case at
+// exactly the ceiling that must be ACCEPTED, one a single byte past it that must be
+// REFUSED.
+//
+// Nothing else pins the comparison. The accepted case is 37 bytes and the refused
+// one 257, so the whole gap between them is unasserted: with the comparison written
+// >= instead of >, every test in this package stays green while a certificate naming
+// an identifier of exactly the ceiling is refused -- the over-rejection this
+// constant replaced, on the one width the policy says it admits.
+func TestOversizedCertificateOIDError_pins_the_ceiling_as_a_boundary(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		size        int
+		wantRefused bool
+	}{
+		"an identifier of exactly the ceiling": {maxCertificateOIDBytes, false},
+		"an identifier one byte past it":       {maxCertificateOIDBytes + 1, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			fixture := legalCertificateFixture(t)
+			fixture.subjectAttribute = legalOIDContentOfSize(t, tc.size)
+			der := fixture.build(t)
+			if _, parseErr := x509.ParseCertificate(der); parseErr != nil {
+				t.Fatalf("x509.ParseCertificate(a certificate naming a %d-byte identifier as its subject attribute type) = error %v, want nil: the guard is a resource policy, so both cases have to be certificates the parser itself decodes",
+					tc.size, parseErr)
+			}
+
+			err := oversizedCertificateOIDError(certificateBlock(der))
+			if tc.wantRefused {
+				if err == nil {
+					t.Fatalf("oversizedCertificateOIDError(a %d-byte identifier) = nil, want a refusal", tc.size)
+				}
+				if !strings.Contains(err.Error(), siteSubjectAttribute) {
+					t.Errorf("error = %q, want it to name the %q site", err, siteSubjectAttribute)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("oversizedCertificateOIDError(a %d-byte identifier) = %v, want nil: %d bytes is the widest identifier the ceiling admits, and refusing it is the over-rejection this constant replaced",
+					tc.size, err, maxCertificateOIDBytes)
+			}
+		})
+	}
+}
 
 // TestOversizedCertificateOIDError_fails_open_on_what_it_cannot_read pins the half
 // of the contract that says a guard is not a parser: every shape the walk cannot

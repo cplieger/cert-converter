@@ -31,14 +31,21 @@ import (
 //   - 255 is the largest content length one DER length byte can express
 //     (0x81 0xFF). An identifier above it needs a multi-byte length, which is a
 //     shape no certificate a CA issues has any reason to reach.
-//   - What the cap buys is bounded per-identifier allocation. encoding/asn1 and
+//   - What the cap buys is GRANULARITY, not a smaller total. encoding/asn1 and
 //     x509.OID.toASN1OID both size their []int from the encoded LENGTH (one int
 //     per byte), so an identifier costs roughly eight bytes of heap per encoded
-//     byte, and the identifiers a parsed certificate RETAINS (every extension id,
-//     every subject and issuer attribute type, every policy identifier) stay live
-//     for as long as the chain does. At this ceiling one identifier is at most
-//     ~2 KB, against the ~80 MB a single identifier could reach inside the
-//     reader's MaxInputBytes cap with no ceiling at all.
+//     byte at EVERY width, and the identifiers a parsed certificate RETAINS
+//     (every extension id, every subject and issuer attribute type, every policy
+//     identifier) stay live for as long as the chain does. The aggregate is
+//     therefore bounded by the reader's MaxInputBytes cap times that factor -
+//     roughly 80 MB - with or without this ceiling: a block packed with 255-byte
+//     identifiers retains as much as one packed with a single huge identifier.
+//     What the ceiling removes is the single contiguous multi-megabyte []int, and
+//     it refuses the obvious shape cheaply. It is also best-effort: exhausting
+//     maxCertificateOIDElements fails open, so a block that pads its issuer past
+//     the budget is never measured at all. Treat the ceiling as a per-identifier
+//     resource policy the walk applies where it can see, never as the app's
+//     memory bound - MaxInputBytes is that bound.
 //
 // Raising it is safe for correctness and only widens what one identifier may
 // spend; lowering it starts refusing certificates other tools accept, which is the
@@ -63,13 +70,18 @@ const maxCertificateOIDDepth = 10
 // issuer and subject RDNSequences, the extension list, and the identifier lists
 // inside the extensions x509 decodes — so a block that is legitimately shaped but
 // holds hundreds of thousands of one-attribute RDNs would otherwise make the guard
-// the expensive operation it exists to prevent. The budget is TOTAL rather than
-// per loop, because a per-loop cap would multiply.
+// the expensive operation it exists to prevent. The budget is charged PER SUBTREE
+// (withSubtreeBudget), not once for the whole walk: each unbounded region is entered
+// exactly once from a fixed position in the schema, so the total stays bounded, while a
+// shared total let the FIRST such region — the signature algorithm's parameters, or the
+// issuer name — consume the whole allowance and leave every later site unmeasured.
 //
-// Exhaustion FAILS OPEN, like every other verdict this walk cannot reach: what it
-// already measured still stands, and a block that needs more than this many
-// elements to describe its identifiers is left to the parser, which applies its own
-// limits. A real certificate's walk visits under 200 elements.
+// Exhaustion of one subtree's budget FAILS OPEN for that subtree, like every other
+// verdict this walk cannot reach: what it already measured still stands, and the sites
+// outside it are still measured. It does NOT fall back on the parser for this axis —
+// crypto/x509 imposes no limit on an identifier's length (see maxCertificateOIDBytes),
+// which is why the ceiling exists at all. A real certificate's walk visits under 200
+// elements, so no real certificate reaches any of these budgets.
 const maxCertificateOIDElements = 4096
 
 // The identifier sites the walk visits, named for the diagnostic. These are
@@ -114,10 +126,14 @@ var (
 // an extension by comparison instead of decoding what a file supplied.
 //
 // A marshal failure is impossible for the constants above and returns nil rather
-// than panicking: nil matches no extnID, so the walk would simply not descend into
-// that extension's value, which is its fail-open behaviour everywhere else. The
-// tests assert each of these is non-empty, so the impossible case cannot become a
-// silent hole.
+// than panicking. Note that nil is NOT a safe sentinel here: bytes.Equal treats a
+// nil slice and a zero-length one as equal, and a two-byte 06 00 element parses
+// into a primitive OBJECT IDENTIFIER whose content is empty, so a nil constant
+// would MATCH such an extnID and make the walk read that extension's opaque
+// extnValue as DER — the refusal-of-valid-certificates defect walkCertificate
+// describes. What rules that out is not the nil value but the requirement that
+// these four constants are non-empty, which certoidscan's tests assert; keep that
+// assertion, because it is the whole guarantee.
 func oidContent(oid asn1.ObjectIdentifier) []byte {
 	der, err := asn1.Marshal(oid)
 	if err != nil {
@@ -202,7 +218,9 @@ func (s *certOIDScan) walkCertificate(der []byte) {
 	// means a block carrying an oversized identifier in one copy alone is refused
 	// here rather than reaching the parser to be refused for the mismatch.
 	if outer, _, outerOK := s.expect(afterTBS, asn1.TagSequence); outerOK {
-		s.walkAlgorithmIdentifier(outer.Bytes, siteOuterSignatureAlgorithm, siteOuterSignatureParameter)
+		s.withSubtreeBudget(func() {
+			s.walkAlgorithmIdentifier(outer.Bytes, siteOuterSignatureAlgorithm, siteOuterSignatureParameter)
+		})
 	}
 }
 
@@ -220,12 +238,14 @@ func (s *certOIDScan) walkTBSCertificate(der []byte) {
 	if !ok {
 		return
 	}
-	s.walkAlgorithmIdentifier(signature.Bytes, siteSignatureAlgorithm, siteSignatureParameter)
+	s.withSubtreeBudget(func() {
+		s.walkAlgorithmIdentifier(signature.Bytes, siteSignatureAlgorithm, siteSignatureParameter)
+	})
 	issuer, der, ok := s.expect(der, asn1.TagSequence)
 	if !ok {
 		return
 	}
-	s.walkName(issuer.Bytes, siteIssuerAttribute)
+	s.withSubtreeBudget(func() { s.walkName(issuer.Bytes, siteIssuerAttribute) })
 	_, der, ok = s.expect(der, asn1.TagSequence) // validity
 	if !ok {
 		return
@@ -234,13 +254,13 @@ func (s *certOIDScan) walkTBSCertificate(der []byte) {
 	if !ok {
 		return
 	}
-	s.walkName(subject.Bytes, siteSubjectAttribute)
+	s.withSubtreeBudget(func() { s.walkName(subject.Bytes, siteSubjectAttribute) })
 	spki, der, ok := s.expect(der, asn1.TagSequence)
 	if !ok {
 		return
 	}
-	s.walkSubjectPublicKeyInfo(spki.Bytes)
-	s.walkExtensionsField(der)
+	s.withSubtreeBudget(func() { s.walkSubjectPublicKeyInfo(spki.Bytes) })
+	s.withSubtreeBudget(func() { s.walkExtensionsField(der) })
 }
 
 // skipVersion steps over the optional [0] EXPLICIT version field, and returns der
@@ -289,11 +309,21 @@ func (s *certOIDScan) walkExtension(der []byte) {
 		return
 	}
 	s.record(extnID, siteExtensionID)
-	if critical, afterCritical, criticalOK := s.element(rest); criticalOK && isASN1(critical, asn1.TagBoolean) {
-		rest = afterCritical
+	// critical BOOLEAN DEFAULT FALSE: read the next element once and, when it IS
+	// that boolean, step to the element after it. Reading it and then re-reading
+	// the same bytes as extnValue charges the shared element budget twice for one
+	// field, so the walk would stop measuring sooner than maxCertificateOIDElements
+	// says it does.
+	value, afterValue, ok := s.element(rest)
+	if !ok {
+		return
 	}
-	value, _, ok := s.element(rest)
-	if !ok || !isASN1(value, asn1.TagOctetString) || value.IsCompound {
+	if isASN1(value, asn1.TagBoolean) {
+		if value, _, ok = s.element(afterValue); !ok {
+			return
+		}
+	}
+	if !isASN1(value, asn1.TagOctetString) || value.IsCompound {
 		return
 	}
 	s.walkKnownExtensionValue(extnID.Bytes, value.Bytes)
@@ -499,6 +529,19 @@ func (s *certOIDScan) element(der []byte) (asn1.RawValue, []byte, bool) {
 	}
 	s.budget--
 	return asn1Element(der)
+}
+
+// withSubtreeBudget runs one subtree walk on its own element budget, so a block that
+// spends its allowance describing an early field cannot stop the walk from measuring the
+// identifiers x509 decodes later on. The subtrees are the only unbounded SEQUENCE OF
+// regions this schema admits, and each is entered exactly once from a fixed position, so
+// the walk's total stays bounded while nesting inside a subtree keeps sharing that
+// subtree's budget — which is what stops a per-loop cap from multiplying.
+func (s *certOIDScan) withSubtreeBudget(walk func()) {
+	outerBudget := s.budget
+	s.budget = maxCertificateOIDElements
+	walk()
+	s.budget = outerBudget
 }
 
 // record measures one identifier site. Anything that is not a primitive OBJECT

@@ -106,16 +106,9 @@ func GenerateSelfSignedCert(tb FatalTB, cn, keyType string) (certPEM, keyPEM []b
 
 	switch keyType {
 	case "ecdsa":
-		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if err != nil {
-			tb.Fatal(err)
-		}
+		key := NewECDSAKey(tb)
 		_, certPEM = signCert(tb, template, template, &key.PublicKey, key)
-		keyDER, err := x509.MarshalPKCS8PrivateKey(key)
-		if err != nil {
-			tb.Fatal(err)
-		}
-		keyPEM = pem.EncodeToMemory(&pem.Block{Type: pemTypeKeyPKCS8, Bytes: keyDER})
+		keyPEM = KeyPEM(tb, key)
 
 	case "rsa":
 		key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -141,10 +134,7 @@ func GenerateCertChain(tb FatalTB) (leafPEM, keyPEM, caPEM, chainPEM []byte) {
 		h.Helper()
 	}
 
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		tb.Fatal(err)
-	}
+	caKey := NewECDSAKey(tb)
 	caTemplate := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "Test CA"},
@@ -154,17 +144,9 @@ func GenerateCertChain(tb FatalTB) (leafPEM, keyPEM, caPEM, chainPEM []byte) {
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign,
 	}
-	var caDER []byte
-	caDER, caPEM = signCert(tb, caTemplate, caTemplate, &caKey.PublicKey, caKey)
-	caCert, err := x509.ParseCertificate(caDER)
-	if err != nil {
-		tb.Fatal(err)
-	}
+	_, caPEM, caCert := Mint(tb, caTemplate, &caKey.PublicKey, nil, caKey)
 
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		tb.Fatal(err)
-	}
+	leafKey := NewECDSAKey(tb)
 	leafTemplate := &x509.Certificate{
 		SerialNumber: big.NewInt(2),
 		Subject:      pkix.Name{CommonName: "leaf.example.com"},
@@ -173,11 +155,7 @@ func GenerateCertChain(tb FatalTB) (leafPEM, keyPEM, caPEM, chainPEM []byte) {
 	}
 	_, leafPEM = signCert(tb, leafTemplate, caCert, &leafKey.PublicKey, caKey)
 
-	keyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	keyPEM = pem.EncodeToMemory(&pem.Block{Type: pemTypeKeyPKCS8, Bytes: keyDER})
+	keyPEM = KeyPEM(tb, leafKey)
 
 	// Concatenate leaf + CA into the chain. Build via append on a nil
 	// slice rather than make([]byte, 0, len(a)+len(b)): the explicit
@@ -219,10 +197,7 @@ type ChainMaterial struct {
 // GenerateChainMaterial builds a CA, a leaf it issued, and two alternative leaves
 // that reuse the leaf's key (one currently valid, one future-dated).
 func GenerateChainMaterial(tb FatalTB) ChainMaterial {
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		tb.Fatal(err)
-	}
+	caKey := NewECDSAKey(tb)
 	now := time.Now()
 	caTemplate := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
@@ -233,24 +208,9 @@ func GenerateChainMaterial(tb FatalTB) ChainMaterial {
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign,
 	}
-	caDER, caPEM := signCert(tb, caTemplate, caTemplate, &caKey.PublicKey, caKey)
-	caCert, err := x509.ParseCertificate(caDER)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	caKeyDER, err := x509.MarshalPKCS8PrivateKey(caKey)
-	if err != nil {
-		tb.Fatal(err)
-	}
+	_, caPEM, caCert := Mint(tb, caTemplate, &caKey.PublicKey, nil, caKey)
 
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	leafKeyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
-	if err != nil {
-		tb.Fatal(err)
-	}
+	leafKey := NewECDSAKey(tb)
 
 	// Three certificates over ONE key: the original, a renewal already in force,
 	// and a renewal that has not started yet.
@@ -267,9 +227,9 @@ func GenerateChainMaterial(tb FatalTB) ChainMaterial {
 
 	return ChainMaterial{
 		CAPEM:            caPEM,
-		CAKeyPEM:         pem.EncodeToMemory(&pem.Block{Type: pemTypeKeyPKCS8, Bytes: caKeyDER}),
+		CAKeyPEM:         KeyPEM(tb, caKey),
 		LeafPEM:          newLeaf(2, "material-leaf.example.com", now.Add(-30*time.Minute)),
-		LeafKeyPEM:       pem.EncodeToMemory(&pem.Block{Type: pemTypeKeyPKCS8, Bytes: leafKeyDER}),
+		LeafKeyPEM:       KeyPEM(tb, leafKey),
 		RenewedPEM:       newLeaf(3, "material-renewed.example.com", now.Add(-10*time.Minute)),
 		FutureRenewedPEM: newLeaf(4, "material-future.example.com", now.Add(12*time.Hour)),
 	}

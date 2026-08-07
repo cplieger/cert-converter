@@ -9,7 +9,6 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
-	"reflect"
 	"slices"
 	"time"
 )
@@ -253,8 +252,10 @@ type Analysis struct {
 	// own decoder assumes the first certificate is the leaf), so this order is a
 	// contract rather than an implementation detail.
 	//
-	// One exception, always accompanied by ObsChainUnverified: when the issuer of
-	// the certificate the discovered path ended on could not be established from
+	// One exception, always accompanied by ObsChainUnverified - or by
+	// ObsChainAnchorUnverifiable when that terminus names itself as its own issuer: when
+	// the issuer of the certificate the discovered path ended on could not be established
+	// from
 	// the bundle, chain carries the certificates whose ancestry IS established
 	// first and the remaining issuer-eligible ones in INPUT order after them (a
 	// certificate canIssueCertificates disqualifies is excluded instead, and
@@ -267,9 +268,11 @@ type Analysis struct {
 	// every admitted key type exposes a public half, which is the invariant identity
 	// matching and the currency read-back both rest on.
 	key crypto.Signer
-	// extra holds certificates that parsed but are not ancestors of leaf. They
-	// are deliberately excluded from the bundle: embedding an unrelated CA
-	// pollutes the trust chain the consumer sees.
+	// extra holds the certificates that parsed and were deliberately excluded from the
+	// bundle: embedding an unrelated CA pollutes the trust chain the consumer sees. On a
+	// proven self-signed terminus that is every certificate off the discovered path; on the
+	// additive fallback above it is only the subset canIssueCertificates disqualifies,
+	// because the eligible remainder is carried in chain instead.
 	extra []*x509.Certificate
 	// observations are non-fatal findings, in the order discovered.
 	observations []Observation
@@ -336,9 +339,20 @@ func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 	obs = append(obs, tieObs...)
 
 	// Asked once the identity is known, because whether an unverifiable issuer is
-	// load-bearing is a property of the SELECTED path's hops, not of the graph.
-	if err := g.oversizedIssuerError(identity.cert); err != nil {
-		return Analysis{}, err
+	// load-bearing is a property of the SELECTED path's hops, not of the graph. One walk,
+	// shared with assembleChain: the refusal below judges the hops the chain emits, so the
+	// two read the same slice rather than two walks that have to agree.
+	//
+	// The input evidence is folded in for the reason appendCertIssues documents, and
+	// it is sharpest here: this refusal fires only when the selected path had to GUESS
+	// a hop, and a certificate-shaped block left out of the bundle (a link relabelled
+	// "TRUSTED CERTIFICATE") is a leading reason the real signer was not among the
+	// parsed certificates. Folded at the call site rather than inside
+	// oversizedIssuerError, which reasons over the graph and holds no input record.
+	path := g.pathFrom(identity.cert)
+	if err := g.oversizedIssuerError(path); err != nil {
+		return Analysis{}, errors.New(appendCertIssues(
+			err.Error()+in.keyIssues.suffix(), in.certIssues))
 	}
 
 	leaf := certs[identity.cert]
@@ -373,7 +387,7 @@ func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 	}
 	obs = append(obs, validityObservations(leaf, now)...)
 
-	chain, extra, chainObs := g.assembleChain(identity.cert)
+	chain, extra, chainObs := g.assembleChain(path)
 	obs = append(obs, chainObs...)
 	obs = append(obs, chainValidityObservations(chain, now)...)
 	obs = append(obs, chainIssuerEligibilityObservations(chain)...)
@@ -534,11 +548,11 @@ type certGraph struct {
 	// check together pay at most one verification per pair.
 	proof map[[2]int]bool
 	// selfSigned memoises the self-signature check per certificate, for the same
-	// reason verified memoises edges: it is a real signature verification whose cost
+	// reason proof memoises edges: it is a real signature verification whose cost
 	// the input file dictates, and three places ask — the root set, every hop of
 	// pathFrom, and assembleChain's self-signed carve-out.
 	selfSigned map[int]bool
-	// decodedSubjects[i] / decodedIssuers[i] memoise the ASN.1-decoded raw subject
+	// decodedSubjects[i] / decodedIssuers[i] memoise the CANONICALISED raw subject
 	// and issuer names, for the same reason proof memoises a signature: the decode is
 	// O(name size) work the FILE dictates, and the linkage classifier asks for the
 	// subject and the issuer of every certificate against every other one. This is
@@ -696,30 +710,14 @@ func unverifiableKeyReason(pub crypto.PublicKey) string {
 	switch {
 	case k.N == nil:
 		return "holds an RSA key with no modulus, which no signature can be checked against"
-	case rsaModulusBits(pub) > maxVerifiableKeyBits:
+	case k.N.BitLen() > maxVerifiableKeyBits:
 		return fmt.Sprintf("holds a %d-bit RSA key, above the %d-bit modulus ceiling this app will verify a signature against",
-			rsaModulusBits(pub), maxVerifiableKeyBits)
+			k.N.BitLen(), maxVerifiableKeyBits)
 	case k.E > maxVerifiablePublicExponent:
 		return fmt.Sprintf("holds an RSA key with public exponent %d, above the %d exponent ceiling this app will verify a signature against",
 			k.E, maxVerifiablePublicExponent)
 	}
 	return ""
-}
-
-// rsaModulusBits reports the size of pub's RSA modulus, and 0 for any other key
-// type (or for the RSA key x509 left without a modulus, whose BitLen would panic
-// on the nil big.Int — ParseCertificate cannot produce one, since it rejects a
-// non-positive modulus outright).
-//
-// It answers nothing about verifiability: verifiableKey owns that decision, and
-// this exists only so the refusal can NAME the size an operator would otherwise
-// have to pull out of the file with openssl.
-func rsaModulusBits(pub crypto.PublicKey) int {
-	k, ok := pub.(*rsa.PublicKey)
-	if !ok || k.N == nil {
-		return 0
-	}
-	return k.N.BitLen()
 }
 
 // newCertGraph derives the evidence for every pair and the candidate edge set that
@@ -905,7 +903,9 @@ func (g *certGraph) candidateEdge(child, parent int) bool {
 // no consumer can verify.
 //
 // It is asked of the identity's OWN path rather than of the graph, and that scoping is
-// the whole correctness argument. Whether an unverifiable edge is load-bearing depends
+// the whole correctness argument. The path is HANDED to it — the same slice assembleChain
+// is given — rather than walked here, so the hops judged are structurally the hops emitted.
+// Whether an unverifiable edge is load-bearing depends
 // on where the selected path ENTERS a set of mutually-linked certificates, which only
 // the walk knows: in a bundle of leaf -> C proven, C -> P proven and P -> C proven, a
 // path entering at C spends the proven C -> P edge and never needs a guess, while a
@@ -921,8 +921,7 @@ func (g *certGraph) candidateEdge(child, parent int) bool {
 // standing beside a same-subject decoy is an attack shape rather than a
 // configuration. No verification is attempted either way, which is the point of the
 // ceiling; only the outcome changes, from a silent wrong chain to a named refusal.
-func (g *certGraph) oversizedIssuerError(identity int) error {
-	path := g.pathFrom(identity)
+func (g *certGraph) oversizedIssuerError(path []int) error {
 	for hop := 0; hop+1 < len(path); hop++ {
 		child, selected := path[hop], path[hop+1]
 		// The hop is established, so nothing competed for it: an unverifiable
@@ -985,10 +984,12 @@ func (g *certGraph) unverifiableIssuerRival(child int) error {
 // verification: nothing ties those certificates together, so no consumer's question
 // turns on the answer, and verifying anyway would put a file-controlled modexp on
 // every one of the maxChainCerts^2 pairs. A parent key above either verification
-// ceiling is refused too, which is the cost the ceilings exist to refuse; after
-// newCertGraph's oversizedIssuerError that state is only reachable for a certificate
-// this bundle names as nobody's issuer; oversizedIssuerError itself asks the question
-// earlier, and gets the same false for the edge it is refusing.
+// ceiling is refused too, which is the cost the ceilings exist to refuse. No refusal
+// elsewhere makes that branch unreachable: candidateEdge and computeDistances ask it
+// while the graph is being BUILT, and oversizedIssuerError runs later still (analyseAt,
+// after identity selection) and refuses only a bundle whose SELECTED path had to guess a
+// hop beside such a certificate - so a bundle that spends proven edges throughout
+// converts with an over-ceiling stray in it, ranked by this same false.
 func (g *certGraph) proven(child, parent int) bool {
 	key := [2]int{child, parent}
 	if got, ok := g.proof[key]; ok {
@@ -1085,40 +1086,76 @@ func decodedName(raw []byte) (pkix.RDNSequence, bool) {
 	return seq, true
 }
 
-// sameDecodedName reports whether two ASN.1-decoded names are the same name. It is
-// the single home of the semantic half of the package's name rule: a name that could
-// not be decoded matches nothing, and two decodes are equal only as whole
-// RDNSequences, so RDN order and multi-valued grouping are preserved.
-func sameDecodedName(a pkix.RDNSequence, aOK bool, b pkix.RDNSequence, bOK bool) bool {
-	return aOK && bOK && reflect.DeepEqual(a, b)
+// canonicalName ASN.1-decodes a raw DER distinguished name and re-encodes the decoded
+// sequence, so semantic name equality is a byte comparison of two canonical forms
+// rather than a reflect.DeepEqual walk over two decoded trees.
+//
+// The walk is the cost the decoded-name cache was added to remove and only half
+// removed: the DECODE is now paid once per certificate, but the COMPARISON is paid
+// once per ordered pair and costs the same as a decode. Measured on go1.26.5 over a
+// 138 KB name (a 64-block bundle inside MaxInputBytes), one decode is 3.6ms and one
+// DeepEqual 3.2ms, so fillEvidence's 64*63 pairs spend 12.9s where the marshal-once
+// form spends 0.65s.
+//
+// The equivalence holds in the direction that matters: DeepEqual-equal values are
+// identical Go values, so asn1.Marshal renders them to identical bytes and no
+// semantic match is lost. Two DIFFERENT decoded values cannot collide either, because
+// asn1.Unmarshal into an interface always yields the canonical Go type for a tag it
+// knows and an asn1.RawValue for one it does not, and those never marshal alike. A
+// name that cannot be decoded OR cannot be re-encoded matches nothing, the same
+// direction the decode failure already takes: an unreadable name is compared against
+// no other name rather than against everything.
+func canonicalName(raw []byte) ([]byte, bool) {
+	seq, ok := decodedName(raw)
+	if !ok {
+		return nil, false
+	}
+	canonical, err := asn1.Marshal(seq)
+	if err != nil {
+		return nil, false
+	}
+	return canonical, true
 }
 
-// decodedDN is one memoised raw-name decode: the decoded sequence, whether the
-// decode succeeded, and whether it has been attempted at all (a name that cannot
-// be decoded is a legitimate result worth caching, so "not yet asked" needs its
-// own flag).
+// sameDecodedName reports whether two names are the same name. It is the single home
+// of the semantic half of the package's name rule: a name that could not be read
+// matches nothing, and two names are equal only as whole canonicalised RDNSequences,
+// so RDN order and multi-valued grouping are preserved.
+func sameDecodedName(a []byte, aOK bool, b []byte, bOK bool) bool {
+	return aOK && bOK && bytes.Equal(a, b)
+}
+
+// decodedDN is one memoised raw-name canonicalisation: the canonical DER of the
+// decoded sequence, whether it could be produced, and whether it has been attempted
+// at all (a name that cannot be read is a legitimate result worth caching, so "not
+// yet asked" needs its own flag).
+//
+// The canonical DER rather than the decoded sequence, because the pairwise question
+// is asked O(n^2) times and this makes answering it a byte compare; see canonicalName.
+// It is never compared against a certificate's own RawSubject/RawIssuer, which
+// nameLink compares separately and exactly.
 type decodedDN struct {
-	seq    pkix.RDNSequence
-	ok     bool
-	cached bool
+	canonical []byte
+	ok        bool
+	cached    bool
 }
 
-// subjectName is decodedName over certs[i]'s raw subject, memoised.
-func (g *certGraph) subjectName(i int) (pkix.RDNSequence, bool) {
+// subjectName is canonicalName over certs[i]'s raw subject, memoised.
+func (g *certGraph) subjectName(i int) ([]byte, bool) {
 	if !g.decodedSubjects[i].cached {
-		seq, ok := decodedName(g.certs[i].RawSubject)
-		g.decodedSubjects[i] = decodedDN{seq: seq, ok: ok, cached: true}
+		canonical, ok := canonicalName(g.certs[i].RawSubject)
+		g.decodedSubjects[i] = decodedDN{canonical: canonical, ok: ok, cached: true}
 	}
-	return g.decodedSubjects[i].seq, g.decodedSubjects[i].ok
+	return g.decodedSubjects[i].canonical, g.decodedSubjects[i].ok
 }
 
-// issuerName is decodedName over certs[i]'s raw issuer, memoised.
-func (g *certGraph) issuerName(i int) (pkix.RDNSequence, bool) {
+// issuerName is canonicalName over certs[i]'s raw issuer, memoised.
+func (g *certGraph) issuerName(i int) ([]byte, bool) {
 	if !g.decodedIssuers[i].cached {
-		seq, ok := decodedName(g.certs[i].RawIssuer)
-		g.decodedIssuers[i] = decodedDN{seq: seq, ok: ok, cached: true}
+		canonical, ok := canonicalName(g.certs[i].RawIssuer)
+		g.decodedIssuers[i] = decodedDN{canonical: canonical, ok: ok, cached: true}
 	}
-	return g.decodedIssuers[i].seq, g.decodedIssuers[i].ok
+	return g.decodedIssuers[i].canonical, g.decodedIssuers[i].ok
 }
 
 // isSelfSigned reports whether certs[i] is its own issuer, which is what makes it
@@ -1149,9 +1186,10 @@ func (g *certGraph) issuerName(i int) (pkix.RDNSequence, bool) {
 //
 // A certificate whose own RSA key exceeds either verification ceiling is reported as
 // not self-signed — unverified rather than disproven — for the same cost reason
-// proven applies the ceiling. After newCertGraph's refusal that answer is only
-// reachable for a certificate this bundle names as nobody's issuer — which
-// oversizedIssuerError also relies on while deciding that refusal — so it decides
+// proven applies the ceiling. Construction performs no refusal, so the answer is already
+// in the distance walks by the time oversizedIssuerError runs (analyseAt, after identity
+// selection) and refuses the bundles where such a certificate stands beside a guessed
+// hop - which is what leaves the remaining cases harmless: it decides
 // only two harmless things: such a stray is no root for the distance walk, and if
 // it is the IDENTITY itself its empty chain counts as a failure to prove rather
 // than proof, so the additive fallback keeps the rest of the bundle and says so.
@@ -1555,7 +1593,7 @@ func (g *certGraph) betterIdentity(a, b int) bool {
 // later NotAfter, then a byte comparison of the certificate DER (betterParent).
 // One path is emitted
 // rather than every ancestor, because a consumer reading the bag sequence
-// positionally should see one coherent chain; alternatives land in Extra.
+// positionally should see one coherent chain; alternatives land in extra.
 func (g *certGraph) pathFrom(start int) []int {
 	path := []int{start}
 	onPath := make([]bool, len(g.certs))
@@ -1721,7 +1759,8 @@ func partitionIssuerEligible(certs []*x509.Certificate) (eligible, disqualified 
 	return eligible, disqualified
 }
 
-// assembleChain builds the emitted chain for the selected identity, the
+// assembleChain builds the emitted chain for the identity at path[0] — the walked
+// path is handed in, so it is the same slice oversizedIssuerError judged — the
 // certificates deliberately left out of it, and the observations describing
 // either outcome.
 //
@@ -1740,9 +1779,8 @@ func partitionIssuerEligible(certs []*x509.Certificate) (eligible, disqualified 
 // disqualifies is not a possible issuer of anything, so keeping it would emit
 // chain material downstream path validation rejects. Those are excluded and named,
 // while every certificate whose relationship is merely unproven is kept.
-func (g *certGraph) assembleChain(identityCert int) (chain, extra []*x509.Certificate, obs []Observation) {
-	leaf := g.certs[identityCert]
-	path := g.pathFrom(identityCert)
+func (g *certGraph) assembleChain(path []int) (chain, extra []*x509.Certificate, obs []Observation) {
+	leaf := g.certs[path[0]]
 	chain = make([]*x509.Certificate, 0, len(path)-1)
 	for _, i := range path[1:] {
 		chain = append(chain, g.certs[i])

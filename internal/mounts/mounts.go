@@ -1,4 +1,8 @@
-package process
+// Package mounts verifies the container's required volumes at startup -- each one
+// exists as a directory the running UID can open -- and probes the output volume
+// for write access, before any scan runs. It is startup-only: the handles it opens
+// are released by CloseMounts, and internal/process opens its own roots per scan.
+package mounts
 
 import (
 	"context"
@@ -151,8 +155,10 @@ func WarnOutputNotWritable(root *os.Root) {
 }
 
 // outputNotWritableMsg is the WARN an operator acts on when /output refused the
-// probe's write. Named because two legs below emit it; the wording is the
-// operator-visible contract (the README's alerting section quotes it).
+// probe's write. Named because two legs below emit it, so the two records an
+// operator's log query has to match cannot drift apart. No README alert rule keys
+// on it today; it is a startup record, and the README's alerting section covers
+// per-scan conditions only.
 const outputNotWritableMsg = "the output volume is not writable by the running UID, so no PFX can be produced; " +
 	"a scan whose bundles are all current still reports healthy, so this would otherwise " +
 	"surface only at the next renewal"

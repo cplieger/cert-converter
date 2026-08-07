@@ -400,13 +400,13 @@ func FuzzInspect_boundedProfile(f *testing.F) {
 			t.Fatal("Inspect mutated its input; CheckCurrency passes the same bytes on to the decode")
 		}
 		if inspectErr != nil {
-			if got.Profile != "" {
-				t.Fatalf("Inspect = profile %q with error %v; a rejected bundle must carry no profile", got.Profile, inspectErr)
+			if got != "" {
+				t.Fatalf("Inspect = profile %q with error %v; a rejected bundle must carry no profile", got, inspectErr)
 			}
 			return
 		}
-		if !known[got.Profile] {
-			t.Fatalf("Inspect accepted a bundle and reported profile %q, which is not one of the four this app emits", got.Profile)
+		if !known[got] {
+			t.Fatalf("Inspect accepted a bundle and reported profile %q, which is not one of the four this app emits", got)
 		}
 		again, againErr := convert.Inspect(data)
 		if againErr != nil || again != got {

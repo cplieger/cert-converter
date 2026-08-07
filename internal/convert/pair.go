@@ -47,7 +47,8 @@ func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 		return nil, errors.New("analysed pair carries no leaf certificate, so it did not come from Analyse")
 	}
 
-	pfxData, err := encoderFor(encName).Encode(a.key, a.leaf, a.chain, password)
+	_, enc := resolvedProfile(encName)
+	pfxData, err := enc.Encode(a.key, a.leaf, a.chain, password)
 	if err != nil {
 		return nil, fmt.Errorf("encode pfx: %w", boundedTextError{err})
 	}
@@ -177,12 +178,13 @@ func (c Currency) Current() bool { return c.Reason == CurrencyMatch }
 // copying it per call is wasteful (gocritic hugeParam); CheckCurrency does not
 // mutate it.
 func CheckCurrency(pfx []byte, password string, want *Analysis, wantEncoder EncoderType) Currency {
-	insp, err := inspect(pfx)
+	priorProfile, err := inspect(pfx)
 	if err != nil {
 		return Currency{Reason: CurrencyPreflightFailed, Err: boundedTextError{err}}
 	}
-	if insp.Profile != resolvedName(wantEncoder) {
-		return Currency{Reason: CurrencyProfileMismatch, Profile: insp.Profile}
+	resolvedWant, _ := resolvedProfile(wantEncoder)
+	if priorProfile != resolvedWant {
+		return Currency{Reason: CurrencyProfileMismatch, Profile: priorProfile}
 	}
 	prior, err := decode(pfx, password)
 	if err != nil {
@@ -270,14 +272,20 @@ func (d decoded) matchesAnalysis(a *Analysis) bool {
 	return sameKey(d.Key, a.key)
 }
 
-// sameKey reports whether two private keys are the same key, compared through
-// their public halves: every key type crypto/x509 parses is a crypto.Signer, and
-// a public half is safe to compare without touching secret material.
-func sameKey(a, b crypto.PrivateKey) bool {
-	sa, aok := a.(crypto.Signer)
-	sb, bok := b.(crypto.Signer)
-	if !aok || !bok {
+// sameKey reports whether the key read back from a bundle is the key the analysis
+// holds, compared through their public halves: a public half is safe to compare
+// without touching secret material.
+//
+// Only the DECODED key is asserted. go-pkcs12 hands that one back as a bare
+// crypto.PrivateKey, so whether it exposes a public half is a genuine unknown. The
+// analysed key is not: parsePrivateKeys admits only key types that expose one, and
+// Analysis.key records that in its type. Asking the same question of both halves
+// made the compiler's guarantee read as a runtime unknown and hid which side of
+// this comparison is file-supplied.
+func sameKey(decodedKey crypto.PrivateKey, analysed crypto.Signer) bool {
+	signer, ok := decodedKey.(crypto.Signer)
+	if !ok {
 		return false
 	}
-	return samePublicKey(sa.Public(), sb.Public())
+	return samePublicKey(signer.Public(), analysed.Public())
 }

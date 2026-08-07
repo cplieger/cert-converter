@@ -246,13 +246,12 @@ func pkcs8HoldsECKey(der []byte) bool {
 	return err == nil && parsed.Equal(ecPublicKeyOID)
 }
 
-// pkcs8AlgorithmOID returns the retained (undecoded) algorithm OID element of
-// PKCS#8 PrivateKeyInfo DER, together with the DER that follows it INSIDE the same
-// AlgorithmIdentifier (its optional parameters field), and false for anything that is
-// not that shape. It is the one reader of that field: every caller needs a length
-// before anything decodes it, so each element is handed back undecoded for the same
-// reason profile.go retains every untrusted identifier as an asn1.RawValue.
-func pkcs8AlgorithmOID(der []byte) (oid asn1.RawValue, parameters []byte, ok bool) {
+// pkcs8Fields returns a PKCS#8 PrivateKeyInfo's AlgorithmIdentifier element and the
+// DER that follows it (whose first element is the privateKey OCTET STRING), and false
+// for anything that is not that shape. It is the single home of the envelope's header
+// walk — outer SEQUENCE, version INTEGER, algorithm SEQUENCE — so the two pre-parse
+// guards built on it cannot come to disagree about what counts as a PKCS#8 key.
+func pkcs8Fields(der []byte) (algorithm asn1.RawValue, afterAlgorithm []byte, ok bool) {
 	outer, _, ok := asn1Element(der)
 	if !ok || !isASN1(outer, asn1.TagSequence) {
 		return asn1.RawValue{}, nil, false
@@ -261,8 +260,22 @@ func pkcs8AlgorithmOID(der []byte) (oid asn1.RawValue, parameters []byte, ok boo
 	if !ok || !isASN1(version, asn1.TagInteger) {
 		return asn1.RawValue{}, nil, false
 	}
-	algorithm, _, ok := asn1Element(afterVersion)
+	algorithm, afterAlgorithm, ok = asn1Element(afterVersion)
 	if !ok || !isASN1(algorithm, asn1.TagSequence) {
+		return asn1.RawValue{}, nil, false
+	}
+	return algorithm, afterAlgorithm, true
+}
+
+// pkcs8AlgorithmOID returns the retained (undecoded) algorithm OID element of
+// PKCS#8 PrivateKeyInfo DER, together with the DER that follows it INSIDE the same
+// AlgorithmIdentifier (its optional parameters field), and false for anything that is
+// not that shape. It is the one reader of that field: every caller needs a length
+// before anything decodes it, so each element is handed back undecoded for the same
+// reason profile.go retains every untrusted identifier as an asn1.RawValue.
+func pkcs8AlgorithmOID(der []byte) (oid asn1.RawValue, parameters []byte, ok bool) {
+	algorithm, _, ok := pkcs8Fields(der)
+	if !ok {
 		return asn1.RawValue{}, nil, false
 	}
 	oid, parameters, ok = asn1Element(algorithm.Bytes)
@@ -1232,16 +1245,8 @@ func sec1CurveOIDBytes(der []byte) (int, bool) {
 // scanRSAKeyEnvelopePKCS8's unwrap and admits exactly one level for the same
 // reason: a crafted file must not be able to make a pre-parse walk recurse.
 func pkcs8PrivateKeyDER(der []byte) []byte {
-	outer, _, ok := asn1Element(der)
-	if !ok || !isASN1(outer, asn1.TagSequence) {
-		return nil
-	}
-	version, afterVersion, ok := asn1Element(outer.Bytes)
-	if !ok || !isASN1(version, asn1.TagInteger) {
-		return nil
-	}
-	algorithm, afterAlgorithm, ok := asn1Element(afterVersion)
-	if !ok || !isASN1(algorithm, asn1.TagSequence) {
+	_, afterAlgorithm, ok := pkcs8Fields(der)
+	if !ok {
 		return nil
 	}
 	inner, _, ok := asn1Element(afterAlgorithm)

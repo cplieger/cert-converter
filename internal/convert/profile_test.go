@@ -44,8 +44,8 @@ func TestInspect_identifies_every_profile_we_emit(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Inspect(a %s bundle) = error %v, want nil", want, err)
 			}
-			if got.Profile != want {
-				t.Errorf("Inspect identified %q, want %q", got.Profile, want)
+			if got != want {
+				t.Errorf("Inspect identified %q, want %q", got, want)
 			}
 		})
 	}

@@ -661,3 +661,48 @@ func TestHandleEventRecv_reattaches_a_directory_recreated_after_a_rename(t *test
 			dir, watched, child)
 	}
 }
+
+// TestHandleSafetyNetTick_charges_its_reassert_to_the_floor pins the one line of
+// bookkeeping that makes minPreScanResync a bound on ALL the whole-tree re-asserts
+// rather than only on the debounced ones: the safety-net tick re-asserts the whole
+// watch set, so it records the timestamp the floor is measured from. Without it the
+// tick's own walk is invisible to the floor, so a debounced scan arriving right
+// behind it walks the tree again immediately -- re-emitting one WARN per unwatchable
+// directory -- and a repair deferred earlier runs even though the tick already
+// restored everything it would have.
+//
+// The oracle is the shape TestRunDebouncedScan_floors_the_reassert_cadence uses: a
+// registration removed straight on the watcher, which only a re-assert restores. The
+// tick re-asserts, so the scan behind it must leave the second removal dropped.
+func TestHandleSafetyNetTick_charges_its_reassert_to_the_floor(t *testing.T) {
+	t.Parallel()
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	dir := filepath.Join(root, "example.com")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	scans := 0
+	w := New(root, func(context.Context) { scans++ }, WithFallback(time.Hour))
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+
+	w.handleSafetyNetTick(t.Context(), watcher, st)
+	if !slices.Contains(watcher.WatchList(), dir) {
+		t.Fatalf("watch list after the safety-net tick = %v, want %q: the tick must re-assert the watch set before scanning", watcher.WatchList(), dir)
+	}
+
+	if err := watcher.Remove(dir); err != nil {
+		t.Fatalf("setup: watcher.Remove(%q) = %v, want nil", dir, err)
+	}
+
+	st.runDebouncedScan(t.Context(), watcher)
+
+	if watched := watcher.WatchList(); slices.Contains(watched, dir) {
+		t.Errorf("watch list after a debounced scan inside %v of the safety-net tick = %v, want %q still dropped: the tick's own re-assert must be charged to the floor, or every tick is followed by a redundant whole-tree walk and its WARNs",
+			minPreScanResync, watched, dir)
+	}
+	if scans != 2 {
+		t.Errorf("onChange ran %d times, want 2 (the tick's scan and the debounced scan): the floor bounds the re-assert, never change detection", scans)
+	}
+}

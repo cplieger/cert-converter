@@ -142,3 +142,83 @@ func TestSummaryAttrs_names_every_scan_result_counter(t *testing.T) {
 		}
 	}
 }
+
+// The reap-gate role a ScanResult counter plays. Every counter has exactly one, and the
+// table below is the ONE place that classification is written down.
+const (
+	// vetoNone: an outcome count that reports and nothing more.
+	vetoNone = "none"
+	// vetoDurable: a coverage hole a restart cannot clear, so it must veto every claim
+	// about the input tree (durablyEnumerated, and therefore inputFullyEnumerated too).
+	vetoDurable = "durable"
+	// vetoTransient: a mid-scan replacement, so it must veto the whole-tree claim while
+	// leaving the durable one intact.
+	vetoTransient = "transient"
+	// vetoConversion: output work this app is still trying to repair, so it must veto
+	// conversionsClean.
+	vetoConversion = "conversion"
+)
+
+// TestScanResultVetoes_every_counter_is_classified_and_honoured is the reap-gate half of
+// the structural guard TestSummaryAttrs_names_every_scan_result_counter already gives the
+// reporting half.
+//
+// The three veto predicates on ScanResult are spelled once each so their two askers
+// cannot drift, but nothing makes a NEW counter reach them: adding an /input coverage
+// dimension compiles, is forced into the summary by the reporting guard, and is then
+// simply absent from durablyEnumerated -- so a scan that could not enumerate /input passes
+// the gate and reap deletes bundles it cannot prove orphaned, silently, over private key
+// material the documented deployment replicates onward. The case tables that exercise the
+// vetoes name today's fields, so none of them can fail for a field that does not exist
+// yet; reflection is what closes that.
+//
+// It asserts two things per counter: that the counter is classified at all, and that a
+// non-zero value makes exactly the predicates its class owns answer false.
+func TestScanResultVetoes_every_counter_is_classified_and_honoured(t *testing.T) {
+	t.Parallel()
+
+	classes := map[string]string{
+		"Removed":    vetoNone,
+		"Total":      vetoNone,
+		"Converted":  vetoNone,
+		"Unchanged":  vetoNone,
+		"Orphan":     vetoNone,
+		"Failed":     vetoConversion,
+		"Unwritable": vetoConversion,
+		"Unreadable": vetoDurable,
+		"Unresolved": vetoDurable,
+		"Vanished":   vetoTransient,
+	}
+
+	typ := reflect.TypeFor[ScanResult]()
+	for i := range typ.NumField() {
+		name := typ.Field(i).Name
+		class, classified := classes[name]
+		if !classified {
+			t.Errorf("ScanResult.%s is not classified here: wire a new counter into the reap gate"+
+				" (durablyEnumerated for a coverage hole a restart cannot clear, inputFullyEnumerated for a"+
+				" mid-scan replacement, conversionsClean for output work still being repaired) or classify it"+
+				" %q, or a scan that could not enumerate /input will delete bundles it cannot prove orphaned",
+				name, vetoNone)
+			continue
+		}
+		var result ScanResult
+		reflect.ValueOf(&result).Elem().Field(i).SetInt(1)
+
+		for _, check := range []struct {
+			predicate string
+			got       bool
+			want      bool
+		}{
+			{"durablyEnumerated", result.durablyEnumerated(), class != vetoDurable},
+			{"inputFullyEnumerated", result.inputFullyEnumerated(), class != vetoDurable && class != vetoTransient},
+			{"conversionsClean", result.conversionsClean(), class != vetoConversion},
+		} {
+			if check.got != check.want {
+				t.Errorf("ScanResult{%s: 1}.%s() = %v, want %v: %s is classified %q, and that class decides"+
+					" which reap claims the counter must refuse",
+					name, check.predicate, check.got, check.want, name, class)
+			}
+		}
+	}
+}

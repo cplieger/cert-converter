@@ -935,27 +935,18 @@ func (o *observationLog) reserve(rel string) {
 
 // evictOne drops one remembered pair from BOTH halves, never the path being reserved,
 // so an eviction can never leave the two halves out of step. It is reserve's SIGNATURE
-// arm, so it takes its victim from `seen`.
-//
-// The wholeness-only loop below is unreachable from that call site and is kept as a
-// guard, not as a path: reserve calls this only when len(seen) >= maxObservedPairs()
-// (never 0, since the fallback is fallbackScanEntries) and only for a `keep` that is
-// absent from `seen`, so the first loop always finds a victim. A wholeness-only entry —
-// what a pair that read whole and then failed analysis, encoding or its write leaves
-// behind — is evicted by evictWholeness, which reserve's own second arm calls.
+// arm, so it takes its victim from `seen`, and it always finds one: reserve calls it
+// only when len(seen) >= maxObservedPairs() (never 0, since the fallback is
+// fallbackScanEntries) and only for a `keep` that is absent from `seen`. A
+// wholeness-only entry — what a pair that read whole and then failed analysis, encoding
+// or its write leaves behind — is evicted by evictWholeness, which reserve's own second
+// arm calls.
 func (o *observationLog) evictOne(keep string) {
 	for victim := range o.seen {
 		if victim == keep {
 			continue
 		}
 		delete(o.seen, victim)
-		o.dropWholeness(victim)
-		return
-	}
-	for victim := range o.whole {
-		if victim == keep {
-			continue
-		}
 		o.dropWholeness(victim)
 		return
 	}
@@ -1452,13 +1443,10 @@ func logConversionObservations(rel string, observations []convert.Observation) {
 			slog.Debug("cert input observation", attrs...)
 		case convert.ObservationClassInfo:
 			slog.Info("cert input observation", attrs...)
-		case convert.ObservationClassWarning:
-			slog.Warn("cert input observation", attrs...)
 		default:
-			// convert.Class never returns anything else (its own exhaustiveness test
-			// enforces that), and a class this app does not know is reported loudly
-			// rather than dropped — the same safe direction convert takes for an
-			// unclassified kind.
+			// ObservationClassWarning, and any class this app does not know: reported
+			// loudly rather than dropped — the same safe direction convert takes for an
+			// unclassified kind, and the reason Warning needs no case of its own.
 			slog.Warn("cert input observation", attrs...)
 		}
 	}

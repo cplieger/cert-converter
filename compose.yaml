@@ -8,7 +8,8 @@ services:
     user: "${PUID:-1000}:${PGID:-1000}"  # must own the /output host dir
 
     environment:
-      PFX_PASSWORD: "${PFX_PASSWORD:-}"  # set this or configure PFX_PASSWORD_FILE; empty is rejected
+      # Env is readable via `docker inspect`; PFX_PASSWORD_FILE (a mounted secret) is not.
+      PFX_PASSWORD: "${PFX_PASSWORD:-}"  # set this or PFX_PASSWORD_FILE; empty is rejected
       # Orphaned output: warn (default, keeps it) | sync (deletes) | keep (silent).
       # Use sync only once /input is your single source of truth.
       OUTPUT_LIFECYCLE: "${OUTPUT_LIFECYCLE:-warn}"

@@ -113,20 +113,3 @@ func resolvedProfile(name EncoderType) (EncoderType, *pkcs12.Encoder) {
 	}
 	return defaultProfile.name, defaultProfile.encoder
 }
-
-// resolvedName reports the profile name an EncoderType actually selects — the same
-// total fallback encoderFor applies, since both read it from resolvedProfile.
-func resolvedName(name EncoderType) EncoderType {
-	resolved, _ := resolvedProfile(name)
-	return resolved
-}
-
-// encoderFor resolves an already-normalized encoder name to its PKCS#12
-// encoder. It never validates (EncoderName owns name normalization) and
-// never returns nil: an unknown name yields the modern2023 default, so the
-// vendor type stays confined to this package while callers pass the app-owned
-// name around.
-func encoderFor(name EncoderType) *pkcs12.Encoder {
-	_, encoder := resolvedProfile(name)
-	return encoder
-}

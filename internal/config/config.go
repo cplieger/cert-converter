@@ -3,7 +3,6 @@ package config
 
 import (
 	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
@@ -12,7 +11,6 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
-	"github.com/cplieger/envx"
 	"github.com/cplieger/slogx"
 )
 
@@ -88,7 +86,7 @@ const (
 // Config holds the runtime configuration for cert-converter. The PFX encoder is
 // carried as the app-owned convert.EncoderType name, not as a go-pkcs12 value:
 // the vendor type stays confined to internal/convert, which resolves the name
-// with encoderFor inside convert.Encode; main and process only carry the name.
+// with resolvedProfile inside convert.Encode; main and process only carry the name.
 type Config struct {
 	Password         string
 	EncoderName      convert.EncoderType
@@ -118,78 +116,14 @@ type Config struct {
 // carry (invalid UTF-8, a non-BMP rune, or an embedded NUL); and it fails
 // loudly, with no opt-out, when a configured PFX_PASSWORD_FILE cannot be used
 // at all — a path envx rejects (it must already be cleaned and must not
-// traverse), or an oversized or unreadable file.
+// traverse), or an oversized or unreadable file. The sequence that resolves the two
+// password channels, classifies the value and applies those refusals is
+// resolvePassword's, in password.go, which is also where both deliberate orderings live.
 func Load() (Config, error) {
-	var blankSecretFile error
-	// Emitted before resolution: a blank pointer is not the file channel at all, so
-	// neither warnBothPasswordChannels nor envx's own error can report it.
-	warnBlankPasswordFilePointer()
-	password, source, secretErr := envx.SecretWithSource("PFX_PASSWORD")
-	// Emitted here rather than from logPasswordDelivery because every startup
-	// REFUSAL below is about the file channel while PFX_PASSWORD is the variable the
-	// operator can see is set: ErrEmptyPassword's "set PFX_PASSWORD" and envx's "read secret
-	// file for PFX_PASSWORD" both point at the ignored variable unless this line
-	// says the file wins. envx reports SourceFile on its error paths for exactly
-	// this purpose.
-	warnBothPasswordChannels(source)
-	if secretErr != nil {
-		var missing *envx.MissingError
-		switch {
-		case errors.As(secretErr, &missing):
-			// Neither channel supplied a value: fall through to the blank guard,
-			// which the operator can opt out of.
-			password = ""
-		case errors.Is(secretErr, envx.ErrBlankSecretFile):
-			// Route a blank secret file through the same opt-out as a blank
-			// environment value, so PFX_ALLOW_EMPTY_PASSWORD means one thing
-			// regardless of how the secret was delivered.
-			password, blankSecretFile = "", secretErr
-		default:
-			// Unreadable, oversized, or a rejected path: the operator configured a
-			// secret file that cannot be used at all. That is never something the
-			// empty-password opt-out should rescue, because silently degrading to no
-			// password is the outcome the file channel exists to prevent.
-			return Config{}, secretErr
-		}
+	pw, err := resolvePassword()
+	if err != nil {
+		return Config{}, err
 	}
-	// One classification, three consumers: the empty-password guard below, the
-	// weak-password WARN (warnPasswordStrength, emitted last), and the
-	// Config.PasswordStatus the startup line reports. Deriving all three from this
-	// single answer is what keeps a value the guard treats as blank from being
-	// reported as "configured".
-	status := classifyPassword(password)
-	rawAllowEmpty := os.Getenv("PFX_ALLOW_EMPTY_PASSWORD")
-	allowEmpty, allowEmptyRecognized := allowEmptyPassword(rawAllowEmpty)
-	warnUnrecognizedAllowEmptyPassword(rawAllowEmpty, allowEmptyRecognized)
-	// Encodability is asked BEFORE the blank guard, because the two overlap: the
-	// invisible-rune class includes the supplementary variation selectors
-	// (U+E0100-U+E01EF), which are non-BMP and so unencodable by PKCS#12. A
-	// password made only of those is both blank and unencodable, and only one of
-	// the two refusals carries an achievable remediation — PFX_ALLOW_EMPTY_PASSWORD
-	// cannot rescue it, since opting out just reaches this error on the next start.
-	// Encodable blank values (a BOM, a zero-width space) still fall through to the
-	// opt-out below.
-	if err := checkPasswordEncodable(password); err != nil {
-		return Config{}, fmt.Errorf("%w (supplied via %s)", err, passwordChannel(source))
-	}
-	if status != PasswordConfigured && !allowEmpty {
-		if blankSecretFile != nil {
-			// A blank secret FILE is not "no password supplied": name the envx error,
-			// which carries the configured path. A startup FAILURE is the deliberate
-			// exception to omitting the secret-mount path from the logs.
-			return Config{}, fmt.Errorf("%w: %w", ErrEmptyPassword, blankSecretFile)
-		}
-		if source == envx.SourceFile {
-			// A mounted secret that is blank only after classification (an
-			// invisible-only value, which envx does not consider blank because
-			// an invisible rune is not whitespace) reaches here with no
-			// envx error to carry the channel, so name it here or the refusal
-			// sends a file-channel operator to the variable file-wins ignores.
-			return Config{}, fmt.Errorf("%w (supplied via %s)", ErrEmptyPassword, passwordChannel(source))
-		}
-		return Config{}, ErrEmptyPassword
-	}
-	logPasswordDelivery(source, password, status, blankSecretFile != nil)
 
 	rawLifecycle := os.Getenv("OUTPUT_LIFECYCLE")
 	lifecycle, lifecycleKnown := outputpolicy.ParseLifecycle(rawLifecycle)
@@ -213,15 +147,15 @@ func Load() (Config, error) {
 	// Warned last (see warnPasswordStrength), so the weak-password WARN lands after
 	// the delivery, lifecycle, encoder, fallback and scan-ceiling diagnostics rather
 	// than ahead of them.
-	warnPasswordStrength(status, passwordChannel(source), blankSecretFile != nil)
+	warnPasswordStrength(pw.Status, pw.Channel, pw.BlankFile)
 
 	return Config{
-		Password:         password,
+		Password:         pw.Value,
 		EncoderName:      encName,
 		Lifecycle:        lifecycle,
 		FallbackInterval: fallbackInterval,
 		MaxScanEntries:   maxScanEntries,
-		PasswordStatus:   status,
+		PasswordStatus:   pw.Status,
 	}, nil
 }
 

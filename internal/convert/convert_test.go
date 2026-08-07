@@ -1136,3 +1136,58 @@ func TestPasswordEncodingIssue_Explain_words_every_shape_once(t *testing.T) {
 		t.Errorf("PasswordEncodesFine.Explain() = %q, want \"\": both callers treat a non-empty result as a refusal", got)
 	}
 }
+
+// TestParseCertChain_names_the_first_skipped_label_not_the_last pins
+// skippedBlocks' documented rule -- keep the FIRST label seen -- which every
+// diagnostic built on it words as `first %q`. Nothing asserted it: no existing case
+// puts TWO distinct non-certificate labels in one file, so flipping the
+// keep-the-first condition to keep-the-last leaves the whole package suite green.
+//
+// The failure is silent and operator-facing. The message still reads correctly, and it
+// is the one thing that tells an operator WHAT the file held when a cert/key pair is
+// swapped or an ssh-keygen-format file is mounted, so naming the wrong block sends the
+// remedy at the wrong file.
+func TestParseCertChain_names_the_first_skipped_label_not_the_last(t *testing.T) {
+	t.Parallel()
+
+	certFile := bytes.Join([][]byte{
+		pem.EncodeToMemory(&pem.Block{Type: "OPENSSH PRIVATE KEY", Bytes: []byte("opaque")}),
+		pem.EncodeToMemory(&pem.Block{Type: "TRUSTED CERTIFICATE", Bytes: []byte("opaque")}),
+	}, nil)
+
+	_, err := convert.ParseCertChain(certFile)
+	if err == nil {
+		t.Fatal("ParseCertChain(two non-certificate blocks) = nil error, want a refusal")
+	}
+	if !strings.Contains(err.Error(), `first "OPENSSH PRIVATE KEY"`) {
+		t.Errorf("ParseCertChain error = %q, want it to name the FIRST skipped label", err.Error())
+	}
+	if strings.Contains(err.Error(), "TRUSTED CERTIFICATE") {
+		t.Errorf("ParseCertChain error = %q, want the later label absent from the diagnostic", err.Error())
+	}
+}
+
+// TestParsePrivateKey_names_the_first_skipped_label_not_the_last is the key-file
+// half of the same rule. parsePrivateKeys shares skippedBlocks with parseCertChain, so
+// both diagnostics move together, but the two sentences are built separately
+// (noPrivateKeyError composes its own) and a reader looking for the key-file contract
+// should find it asserted here rather than inferred from the certificate case.
+func TestParsePrivateKey_names_the_first_skipped_label_not_the_last(t *testing.T) {
+	t.Parallel()
+
+	keyFile := bytes.Join([][]byte{
+		pem.EncodeToMemory(&pem.Block{Type: "OPENSSH PRIVATE KEY", Bytes: []byte("opaque")}),
+		pem.EncodeToMemory(&pem.Block{Type: "DH PARAMETERS", Bytes: []byte("opaque")}),
+	}, nil)
+
+	_, err := convert.ParsePrivateKey(keyFile)
+	if err == nil {
+		t.Fatal("ParsePrivateKey(two non-key blocks) = nil error, want a refusal")
+	}
+	if !strings.Contains(err.Error(), `first "OPENSSH PRIVATE KEY"`) {
+		t.Errorf("ParsePrivateKey error = %q, want it to name the FIRST skipped label", err.Error())
+	}
+	if strings.Contains(err.Error(), "DH PARAMETERS") {
+		t.Errorf("ParsePrivateKey error = %q, want the later label absent from the diagnostic", err.Error())
+	}
+}
