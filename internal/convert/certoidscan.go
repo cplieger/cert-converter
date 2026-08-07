@@ -42,8 +42,11 @@ import (
 //     identifiers retains as much as one packed with a single huge identifier.
 //     What the ceiling removes is the single contiguous multi-megabyte []int, and
 //     it refuses the obvious shape cheaply. It is also best-effort: exhausting
-//     maxCertificateOIDElements fails open, so a block that pads its issuer past
-//     the budget is never measured at all. Treat the ceiling as a per-identifier
+//     maxCertificateOIDElements fails open for the subtree that exhausted it, and
+//     withSubtreeBudget gives the issuer, the subject, the SPKI and both signature
+//     algorithms a budget each — so what a block can still blind is one unbounded
+//     region from the inside, the extension LIST being the one that matters, leaving
+//     the identifiers after its padding unmeasured. Treat the ceiling as a per-identifier
 //     resource policy the walk applies where it can see, never as the app's
 //     memory bound - MaxInputBytes is that bound.
 //
@@ -532,11 +535,23 @@ func (s *certOIDScan) element(der []byte) (asn1.RawValue, []byte, bool) {
 }
 
 // withSubtreeBudget runs one subtree walk on its own element budget, so a block that
-// spends its allowance describing an early field cannot stop the walk from measuring the
-// identifiers x509 decodes later on. The subtrees are the only unbounded SEQUENCE OF
-// regions this schema admits, and each is entered exactly once from a fixed position, so
-// the walk's total stays bounded while nesting inside a subtree keeps sharing that
-// subtree's budget — which is what stops a per-loop cap from multiplying.
+// spends its allowance describing an early FIELD cannot stop the walk from measuring the
+// fields after it. Each of the six regions it wraps is entered exactly once from a fixed
+// position in the schema, so the walk's total stays bounded at seven budgets, while
+// nesting inside a subtree keeps sharing that subtree's budget — which is what stops a
+// per-loop cap from multiplying.
+//
+// It does NOT make the ceiling complete, and must not be read as if it did. The extension
+// LIST is itself an unbounded SEQUENCE OF inside one of those subtrees: at three elements
+// per extension, ~1,365 minimal extensions exhaust the extensions budget and every
+// extension after them goes unmeasured. Measured: a 14 KB block of 1,400 empty unknown
+// extensions followed by one naming a 257-byte identifier is accepted here, and
+// x509.ParseCertificate decodes that identifier and retains it in Certificate.Extensions.
+// Closing that axis has no cheap shape — a per-extension budget multiplies with the
+// element count, which is the cost this budget exists to bound, and failing CLOSED would
+// refuse valid certificates — so the residual stands: the app's memory bound is the
+// reader's MaxInputBytes cap (see maxCertificateOIDBytes), and this ceiling is a
+// best-effort resource policy the walk applies where it can see.
 func (s *certOIDScan) withSubtreeBudget(walk func()) {
 	outerBudget := s.budget
 	s.budget = maxCertificateOIDElements

@@ -1121,7 +1121,8 @@ func (w *Watcher) handleEventRecv(
 // handleErrorRecv owns watchLoop's whole error-channel arm: it reports which
 // terminal loss that arm observed, or nil while change detection is live. A closed
 // channel means the fsnotify watcher is dead (errErrorsChannelClosed); an
-// event-queue overflow additionally re-syncs the watch set. Naming the loss here
+// event-queue overflow additionally re-syncs the watch set, on minPreScanResync's
+// cadence. Naming the loss here
 // rather than at the call site keeps the loss taxonomy in the arm that observes it,
 // exactly as handleEventRecv does.
 func (w *Watcher) handleErrorRecv(
@@ -1139,8 +1140,22 @@ func (w *Watcher) handleErrorRecv(
 	if st.handleWatcherError(err) {
 		// The dropped events may have included the Create of a new directory, which
 		// would otherwise stay unwatched for the rest of the process's life.
-		st.resync(ctx, watcher,
-			"failed to re-sync the watch set after an event-queue overflow; a directory whose Create was dropped stays unwatched until the next re-sync")
+		//
+		// Floored exactly as runDebouncedScan floors it, and for the same reason: an
+		// overflow arrives on the ERROR channel, whose rate a writer sets, so an
+		// unfloored re-assert here would run the whole-tree walk (and re-emit one WARN
+		// per unwatchable directory) on the writer's cadence rather than on one this
+		// process chose — which is what minPreScanResync exists to bound. A re-assert
+		// the floor declines is DEFERRED, not dropped: scheduleRepair arms it for the
+		// remainder of the interval, so a dropped Create is still recovered on the
+		// floor's own schedule. handleWatcherError has already scheduled the
+		// certificate rescan, so renewal recovery is never what the floor delays.
+		if time.Since(st.lastResync) >= minPreScanResync {
+			st.resync(ctx, watcher,
+				"failed to re-sync the watch set after an event-queue overflow; a directory whose Create was dropped stays unwatched until the next re-sync")
+		} else {
+			st.scheduleRepair()
+		}
 	}
 	return nil
 }
@@ -1188,10 +1203,14 @@ func (w *Watcher) resyncWatchSet(ctx context.Context, watcher *fsnotify.Watcher,
 	// starting from empty makes the mirror exactly the set this walk established. That prunes a
 	// path the tree no longer has - the mirror otherwise only forgets on a DELIVERED
 	// Remove/Rename, and the queue overflow that drops those deliveries is the same condition
-	// that routes here, so without this the map grows with churn for the process's life. A walk
-	// cut short below leaves the mirror emptier than the kernel's set, which errs toward one
-	// extra subtree walk on a later event (the safe direction this mirror already documents),
-	// never toward claiming an unwatched directory is watched.
+	// that routes here, so without this the map grows with churn for the process's life. On the
+	// success path pruneWatches below then unregisters whatever the walk did not re-establish,
+	// so the mirror and the kernel's registration set agree - including when the ENTRY BUDGET
+	// cut the walk short, which is the case the LIVE-set ceiling is read from and the case a
+	// mirror-only rebuild got wrong. A walk cut short by CANCELLATION returns before that
+	// prune, leaving the mirror emptier than the kernel's set, which errs toward one extra
+	// subtree walk on a later event (the safe direction this mirror already documents), never
+	// toward claiming an unwatched directory is watched.
 	stale := w.takeWatchSet()
 	if addErr := w.addWatchDirs(ctx, watcher, w.root); addErr != nil {
 		if ctx.Err() == nil {

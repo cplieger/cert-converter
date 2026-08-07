@@ -173,6 +173,61 @@ func TestHandleSafetyNetTick_skips_the_scan_when_shutdown_cut_the_resync_short(t
 	}
 }
 
+// TestHandleErrorRecv_defers_a_second_overflow_resync_to_the_floor pins the rate
+// limit on overflow recovery, which is the only re-assert site whose trigger rate a
+// WRITER sets: an overflow arrives on the error channel, so an unfloored re-assert
+// here would run the whole-tree walk — and re-emit one WARN per unwatchable
+// directory — as fast as the watcher can report drops. minPreScanResync bounds it to
+// the same cadence a debounced scan is held to, and the declined walk is DEFERRED
+// (scheduleRepair) rather than dropped, so a directory whose Create the overflow ate
+// is still recovered. The certificate rescan is never what the floor delays: a
+// renewal hidden in the dropped events is recovered on the debounce as before.
+//
+// Not parallel-hostile but state-sensitive: the assertions read one watchState's
+// clock, so the two overflows must land on the SAME st.
+func TestHandleErrorRecv_defers_a_second_overflow_resync_to_the_floor(t *testing.T) {
+	t.Parallel()
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	nested := filepath.Join(root, "acme-v02", "example.com")
+	if err := os.MkdirAll(nested, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	w := New(root, func(context.Context) {})
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+
+	// The zero lastResync means the first re-assert of a run always runs.
+	if got := w.handleErrorRecv(t.Context(), watcher, st, fsnotify.ErrEventOverflow, true); got != nil {
+		t.Fatalf("handleErrorRecv(first ErrEventOverflow) = %v, want nil", got)
+	}
+	if watched := watcher.WatchList(); !slices.Contains(watched, nested) {
+		t.Fatalf("setup: watch list = %v, want %q re-asserted by the first overflow", watched, nested)
+	}
+
+	// Drop the registration behind the loop's back, so a second walk would be
+	// observable, and clear the flags the first overflow set so this second delivery
+	// is what the assertions below read.
+	if err := watcher.Remove(nested); err != nil {
+		t.Fatalf("setup: watcher.Remove(%q) = %v", nested, err)
+	}
+	st.pending, st.repairPending = false, false
+
+	if got := w.handleErrorRecv(t.Context(), watcher, st, fsnotify.ErrEventOverflow, true); got != nil {
+		t.Errorf("handleErrorRecv(second ErrEventOverflow) = %v, want nil (an overflow is recoverable, not fatal)", got)
+	}
+	if watched := watcher.WatchList(); slices.Contains(watched, nested) {
+		t.Errorf("watch list = %v, want %q still absent: a second overflow inside minPreScanResync must not re-walk the tree, or the walk runs on the writer's cadence",
+			watched, nested)
+	}
+	if !st.repairPending {
+		t.Error("the second overflow left no repair pending; a re-assert the floor declines must be DEFERRED to the floor's own schedule, not dropped")
+	}
+	if !st.pending {
+		t.Error("the second overflow did not schedule the certificate rescan; the floor delays the watch-set re-assert only, never renewal recovery")
+	}
+}
+
 // TestHandleErrorRecv_keeps_the_loop_running_when_the_overflow_resync_fails
 // pins the liveness half of the overflow recovery: a failed watch-set re-sync
 // is warned about and the loop keeps running, because treating it as fatal

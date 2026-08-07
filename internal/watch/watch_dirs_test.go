@@ -419,3 +419,52 @@ func TestResyncWatchSet_prunes_a_directory_the_tree_no_longer_has(t *testing.T) 
 			gone)
 	}
 }
+
+// TestResyncWatchSet_unregisters_a_directory_the_rebuild_no_longer_reaches pins the
+// KERNEL side of the rebuild, which the mirror-side test above cannot see: the
+// membership mirror is the only thing the LIVE-set ceiling is read from
+// (visitWatchPath's watchSetSize test), so a rebuild that resets the mirror without
+// unregistering what it no longer re-establishes leaves the app holding more inotify
+// registrations than MAX_SCAN_ENTRIES while reporting fewer -- and that ceiling is a
+// share of the per-UID fs.inotify.max_user_watches quota, so overrunning it is paid by
+// unrelated same-UID consumers.
+//
+// The driver is a tree larger than the budget, which is the reachable producer: the
+// first walk registers the lexically-first directories, a new early-sorting domain
+// then pushes the tail out of the next walk, and the tail still EXISTS on disk, so
+// only an explicit Remove can reclaim its descriptor.
+// Not parallel: the walk's budget WARN goes to the process-global slog default.
+func TestResyncWatchSet_unregisters_a_directory_the_rebuild_no_longer_reaches(t *testing.T) {
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	tail := filepath.Join(root, "z.example.com")
+	if err := os.MkdirAll(tail, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	w := New(root, func(context.Context) {}, WithMaxEntries(2))
+
+	w.resyncWatchSet(t.Context(), watcher, "failed to re-sync the watch set")
+	if !slices.Contains(watcher.WatchList(), tail) {
+		t.Fatalf("setup: watch list = %v, want %q registered by the first walk", watcher.WatchList(), tail)
+	}
+
+	// A new early-sorting directory pushes the tail out of the budget-truncated walk
+	// while it still exists on disk.
+	early := filepath.Join(root, "a.example.com")
+	if err := os.MkdirAll(early, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	w.resyncWatchSet(t.Context(), watcher, "failed to re-sync the watch set")
+
+	if !slices.Contains(watcher.WatchList(), early) {
+		t.Errorf("watch list = %v, want %q registered by the rebuild", watcher.WatchList(), early)
+	}
+	if watched := watcher.WatchList(); slices.Contains(watched, tail) {
+		t.Errorf("watch list = %v, want %q unregistered: the rebuild no longer reaches it, so leaving the kernel registration live puts the LIVE set above the ceiling watchSetSize reports",
+			watched, tail)
+	}
+	if got, want := len(watcher.WatchList()), 2; got != want {
+		t.Errorf("the live registration set holds %d watches, want %d (the budget): %v", got, want, watcher.WatchList())
+	}
+}

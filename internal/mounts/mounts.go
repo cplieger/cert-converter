@@ -105,11 +105,11 @@ func CloseMounts(vols []OpenMount) {
 var probeOutputWritable = atomicfile.ProbeWritableInRoot
 
 // staleTempRemediation is the operator action for a probe file left behind. It
-// holds because the probe file carries atomicfile's OWN temp-name shape, so this
-// package's /output stale-temp sweep (store.sweepStaleTemps, which runs
-// atomicfile.CleanupStaleTempsInRoot) reclaims it by construction — this file no
-// longer re-derives that name shape, which it previously did by relying on
-// os.CreateTemp happening to substitute digits for "*".
+// holds because the probe file carries atomicfile's OWN temp-name shape, so the
+// app's per-scan /output stale-temp sweep (internal/process's
+// store.sweepStaleTemps, which runs atomicfile.CleanupStaleTempsInRoot) reclaims it
+// by construction — this file no longer re-derives that name shape, which it
+// previously did by relying on os.CreateTemp happening to substitute digits for "*".
 //
 // Keyed on ProbeResult.Leaked at every site that can leave one, so the sentence is
 // never printed for a probe the volume did remove.
@@ -173,9 +173,9 @@ const outputNotWritableMsg = "the output volume is not writable by the running U
 // diagnostic in this file is an inline slog call, and goconst counts a key repeated
 // inside a composite literal while ignoring one passed as a call argument.
 func warnOutputRefusedWrite(root *os.Root, res atomicfile.ProbeResult) {
-	// Same root cause as outputPermRemediation (store.go), stated as the startup
-	// action: at this point nothing has been written yet, so the operator is
-	// pointed at the host directory rather than at a bundle.
+	// Same root cause as internal/process's outputPermRemediation (store.go), stated
+	// as the startup action: at this point nothing has been written yet, so the
+	// operator is pointed at the host directory rather than at a bundle.
 	remediation := "chown the host directory mounted at " + root.Name() +
 		" to the UID in user: (and check the mount is not read-only)"
 	// A create refusal is an ownership/read-only/missing-mount condition, which the

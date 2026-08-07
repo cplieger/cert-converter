@@ -818,8 +818,8 @@ func (g *certGraph) edge(child, parent int) issuanceEvidence {
 // still normalising the permitted DirectoryString tag difference because both decode
 // to the same Go string.
 //
-// A name that cannot be decoded matches nothing: an unreadable name is compared
-// against no other name rather than against everything.
+// A name that cannot be decoded or re-encoded matches nothing: an unreadable name is
+// compared against no other name rather than against everything.
 func (g *certGraph) nameLink(child, parent int) nameLinkage {
 	if bytes.Equal(g.certs[child].RawIssuer, g.certs[parent].RawSubject) {
 		return nameLinkExact
@@ -1097,14 +1097,20 @@ func decodedName(raw []byte) (pkix.RDNSequence, bool) {
 // DeepEqual 3.2ms, so fillEvidence's 64*63 pairs spend 12.9s where the marshal-once
 // form spends 0.65s.
 //
-// The equivalence holds in the direction that matters: DeepEqual-equal values are
-// identical Go values, so asn1.Marshal renders them to identical bytes and no
-// semantic match is lost. Two DIFFERENT decoded values cannot collide either, because
-// asn1.Unmarshal into an interface always yields the canonical Go type for a tag it
-// knows and an asn1.RawValue for one it does not, and those never marshal alike. A
-// name that cannot be decoded OR cannot be re-encoded matches nothing, the same
-// direction the decode failure already takes: an unreadable name is compared against
-// no other name rather than against everything.
+// The equivalence is exact for every attribute value the interface decode maps to a
+// concrete Go type (string, int64, bool, []byte, time.Time, BitString, OID):
+// identical values marshal to identical bytes, and different values cannot collide
+// because each type re-encodes under its own tag. It deliberately DIVERGES for a
+// value the decode maps to nil (NULL, ENUMERATED, GeneralString and the other tags
+// encoding/asn1 does not surface through an interface): asn1.Marshal refuses a nil
+// value, so such a name cannot be keyed and matches nothing -- where the old
+// reflect.DeepEqual rule compared those values as nil == nil and matched two such
+// names CONTENT-BLIND (DER-different GeneralString values, or a NULL against a
+// GeneralString, compared equal). Refusing the key trades that false link for a
+// lost link on a name shape no real CA emits. A name that cannot be decoded OR
+// cannot be re-encoded matches nothing, the same direction the decode failure
+// already takes: an unreadable name is compared against no other name rather than
+// against everything.
 func canonicalName(raw []byte) ([]byte, bool) {
 	seq, ok := decodedName(raw)
 	if !ok {

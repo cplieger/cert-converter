@@ -245,7 +245,7 @@ func TestCurrency_zero_value_is_not_current(t *testing.T) {
 }
 
 // TestCheckCurrency_resolves_an_unknown_encoder_name_the_way_Encode_does pins the
-// agreement between the write side and the read-back side. encoderFor is total: an
+// agreement between the write side and the read-back side. resolvedProfile is total: an
 // EncoderType no profile row names still selects modern2023, so Encode WRITES a
 // modern2023 bundle. If CheckCurrency compared the file against the raw name it
 // was handed, it would report profile-mismatch on the very bundle Encode had just

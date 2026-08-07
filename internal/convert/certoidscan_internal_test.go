@@ -915,6 +915,58 @@ func TestOversizedCertificateOIDError_fails_open_on_what_it_cannot_read(t *testi
 	}
 }
 
+// TestOversizedCertificateOIDError_measures_a_later_site_behind_a_dense_earlier_field
+// pins what withSubtreeBudget buys, which nothing else in this package does: each
+// unbounded region of the schema walks on its OWN element budget, so a block that
+// spends a whole budget describing an EARLY field cannot stop the walk from measuring
+// a LATER site.
+//
+// Without it the fix is unpinned in both directions. With withSubtreeBudget reduced to
+// a bare walk() every other test in this package stays green, and the starvation bypass
+// reopens: a dense issuer exhausts the shared budget, walkTBSCertificate returns on the
+// next expect, and the subject attribute type, the SPKI algorithm, the whole extensions
+// subtree and the outer signature algorithm all reach x509.ParseCertificate unmeasured.
+func TestOversizedCertificateOIDError_measures_a_later_site_behind_a_dense_earlier_field(t *testing.T) {
+	t.Parallel()
+
+	fixture := legalCertificateFixture(t)
+	// A structurally valid issuer whose RDNSequence costs three elements per attribute,
+	// so this exhausts one whole budget several times over.
+	attribute := derSetOf(t, derSequenceOf(t,
+		derOID(t, oidContentBytes(t, oidCommonName)),
+		derPrintableString(t, "dense-issuer.example.com"),
+	))
+	denseIssuer := derRawValue(t, asn1.ClassUniversal, asn1.TagSequence, true,
+		bytes.Repeat(attribute, maxCertificateOIDElements))
+	oversized := oversizedOIDContent(t)
+
+	der := derSequenceOf(t,
+		derSequenceOf(t,
+			derContextCompound(t, 0, derInteger(t, 2)),
+			derInteger(t, 42),
+			derAlgorithmIdentifier(t, fixture.signatureAlgorithm, fixture.signatureParameters),
+			denseIssuer,
+			derValidity(t),
+			derName(t, oversized, "fixture-subject.example.com"),
+			derSequenceOf(t,
+				derAlgorithmIdentifier(t, fixture.publicKeyAlgorithm, fixture.publicKeyParameters),
+				derBitString(t, fixture.publicKeyBits),
+			),
+			derContextCompound(t, 3, fixture.buildExtensions(t)),
+		),
+		derAlgorithmIdentifier(t, fixture.signatureAlgorithm, fixture.signatureParameters),
+		derBitString(t, []byte{0xde, 0xad, 0xbe, 0xef}),
+	)
+
+	err := oversizedCertificateOIDError(certificateBlock(der))
+	if err == nil {
+		t.Fatal("oversizedCertificateOIDError(an oversized subject attribute type behind a budget-exhausting issuer) = nil, want a refusal: each subtree walks on its own element budget, so a dense issuer must not starve the subject")
+	}
+	if !strings.Contains(err.Error(), siteSubjectAttribute) {
+		t.Errorf("error = %q, want it to name the %q site", err, siteSubjectAttribute)
+	}
+}
+
 // TestOversizedCertificateOIDError_stops_at_the_element_budget pins the bound whose
 // subject is the WALK rather than the certificate. Every element the walk reads
 // costs one asn1.Unmarshal into an asn1.RawValue, and the schema it follows contains
