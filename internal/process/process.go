@@ -1334,8 +1334,8 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	}
 	writeErr := sw.out.write(ctx, pfxRel, pfxData)
 	// The one derivation, after the write, from the three facts this entry resolved:
-	// what the bundle on disk was, whether the mode repair converged, and how the write
-	// itself ended. Nothing below re-decides it; the logging and the observation
+	// what the bundle on disk was, whether its mode was laxer than policy, and how the
+	// write itself ended. Nothing below re-decides it; the logging and the observation
 	// bookkeeping only read the outcome.
 	outcome = writeOutcome(state, writeErr)
 	if writeErr != nil {

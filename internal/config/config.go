@@ -363,10 +363,12 @@ func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
 }
 
 // warnFallbackDisabled warns when the operator's own periodic rescan is gone,
-// because nothing else in the process reports it: either the explicit 0/false
-// opt-out removed it, or the configured cadence sits at maxFallbackHours, where a
-// rescan on that cadence never arrives. The two are operationally the same state,
-// so both earn the same tradeoff record.
+// because nothing else in the process reports it: the explicit 0/false opt-out
+// removed it, the configured cadence sits at maxFallbackHours, where a rescan on
+// that cadence never arrives, or the cadence is above the watcher's reconciliation
+// floor, which overrides it. In all three a rescan on the operator's own cadence
+// never arrives, so the three are operationally the same state and each earns the
+// same tradeoff record.
 //
 // What actually goes away is the operator's CADENCE, not the app's convergence: the
 // watcher keeps a reconciliation floor in every configuration (internal/watch's
@@ -382,10 +384,12 @@ func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
 // missed renewal is acceptable is the operator's judgment, and the app cannot infer
 // it. A wedged loop IS now detected, by the marker deadline.
 //
-// It keys on the parsed interval, which is zero only for the explicit "0"/"false"
-// opt-out and at the ceiling for a value at or above maxFallbackHours (including one
-// Load's warnFallbackRepaired clamped there), so repaired blank or invalid values
-// remain enabled and silent here (warnFallbackRepaired reports those).
+// It keys on the parsed interval: zero for the explicit "0"/"false" opt-out, at the
+// ceiling for a value at or above maxFallbackHours (including one Load's
+// warnFallbackRepaired clamped there), and above watch.MarkerRefreshFloor for a
+// cadence the floor overrides. A repaired blank or invalid value lands on the 6h
+// default, which is below the floor, so it remains enabled and silent here
+// (warnFallbackRepaired reports those).
 func warnFallbackDisabled(interval time.Duration) {
 	if interval >= maxFallbackHours*time.Hour {
 		// The ceiling is documented as far beyond any real cadence, so a rescan at it

@@ -13,6 +13,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
+	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -567,6 +568,92 @@ func TestLoad_warns_when_the_fallback_rescan_is_disabled(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLoad_warns_when_the_fallback_cadence_is_above_the_reconciliation_floor pins the
+// third arm of warnFallbackDisabled: a cadence the watcher's floor overrides never fires,
+// so the operator pays more full-tree walks than they configured and this startup record
+// is the only place that says so.
+//
+// The BOUNDARY matters as much as the band. At exactly the floor the two clocks coincide
+// and the cadence is still the operator's, so the record must stay silent there — the arm
+// reaches that by arithmetic (safetyNetIntervalFor returns the cadence itself, so
+// interval > floor is false) rather than by an explicit case, which is why widening its
+// `>` to `>=` would tell an operator running the floor's own cadence that it never runs
+// and leave every other test in this package green.
+//
+// slog.Default is process-global, so this must not run in parallel with anything that logs.
+func TestLoad_warns_when_the_fallback_cadence_is_above_the_reconciliation_floor(t *testing.T) {
+	const aboveFloorWarn = "FALLBACK_SCAN_HOURS is above the watcher's reconciliation floor"
+
+	// Derived, not hardcoded: the assertion is about this arm's relation to the floor, so
+	// a floor move must not silently turn the boundary row into an in-band one.
+	floor := watch.MarkerRefreshFloor(365 * 24 * time.Hour)
+	floorHours := int(floor / time.Hour)
+
+	for _, tc := range []struct {
+		name     string
+		raw      string
+		wantWarn bool
+	}{
+		{"a cadence well above the floor warns", strconv.Itoa(floorHours * 2), true},
+		{"a cadence one hour above the floor warns", strconv.Itoa(floorHours + 1), true},
+		{"a cadence at the floor is silent", strconv.Itoa(floorHours), false},
+		{"a cadence one hour below the floor is silent", strconv.Itoa(floorHours - 1), false},
+		{"the opt-out is reported by its own record", "0", false},
+		{"a repaired invalid value lands below the floor and is silent", "abc", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", "pw")
+			t.Setenv("FALLBACK_SCAN_HOURS", tc.raw)
+
+			logs := capture.Default(t)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() = %v, want nil", err)
+			}
+
+			want := 0
+			if tc.wantWarn {
+				want = 1
+			}
+			if got := logs.CountLevel(slog.LevelWarn, aboveFloorWarn); got != want {
+				t.Fatalf("Load() with FALLBACK_SCAN_HOURS=%q logged %d WARN records matching %q, want %d: at or below the floor the operator's own cadence fires (logs %v)",
+					tc.raw, got, aboveFloorWarn, want, logs.Messages())
+			}
+			if !tc.wantWarn {
+				return
+			}
+			// Both cadences travel together, exactly as the watcher's own degraded-path
+			// records carry them: without scan_floor the operator cannot see what
+			// overrode the setting they chose.
+			for key, wantVal := range map[string]string{
+				"fallback_scan": (time.Duration(mustAtoi(t, tc.raw)) * time.Hour).String(),
+				"scan_floor":    floor.String(),
+			} {
+				if got, ok := logs.AttrValue(aboveFloorWarn, key); !ok || got != wantVal {
+					t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN %s = %q (present %v), want %q (logs %v)",
+						tc.raw, key, got, ok, wantVal, logs.Messages())
+				}
+			}
+			if !logs.AttrContains(aboveFloorWarn, "remediation", "FALLBACK_SCAN_HOURS") {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN carries no remediation naming the variable (logs %v)",
+					tc.raw, logs.Messages())
+			}
+		})
+	}
+}
+
+// mustAtoi parses one of the table's own hour strings. The rows above build them from
+// the floor, so a parse failure is a broken fixture rather than a finding about Load.
+func mustAtoi(t *testing.T, s string) int {
+	t.Helper()
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		t.Fatalf("setup: strconv.Atoi(%q): %v", s, err)
+	}
+	return n
 }
 
 // TestLoad_password_file_is_verbatim_and_takes_precedence_over_env pins BOTH halves

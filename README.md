@@ -100,10 +100,14 @@ process on that mount replace a bundle.
 This app never `chmod`s anything it finds under `/output`. A `.pfx` left more
 permissive than `0600` — by an earlier deployment, or by whatever wrote it — is
 reported by a WARN naming the mode found and the mode this app will install, and
-then corrected the only way this app changes a file at all: the next scan rewrites
-the bundle, and the atomic replacement lands a fresh file at `0600`. That happens
-once; afterwards the mode is at policy and nothing re-triggers. A mode you made
-_stricter_ than `0600` carries no extra bit and is left alone.
+then corrected the only way this app changes a file at all: the scan that
+reports it also rewrites the bundle, and the atomic replacement lands a fresh
+file at `0600`. On a filesystem that stores the mode, that happens once;
+afterwards the mode is at policy and nothing re-triggers. On a mount that forces
+or ignores permission bits (CIFS/SMB forced mode, NFS squash, vfat `fmask`) the
+replacement lands with the same lax mode, so every scan reports and rewrites the
+bundle the previous scan wrote. A mode you made _stricter_ than `0600` carries no
+extra bit and is left alone.
 
 ## Alerting
 

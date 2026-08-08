@@ -3,6 +3,8 @@ package process
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
@@ -1069,5 +1072,96 @@ func TestStoreRemoveOrphan_reports_a_refused_unlink_and_keeps_the_candidate(t *t
 	}
 	if got, ok := logs.AttrValue(refusedWarn, "remediation"); !ok || got != outputPermRemediation {
 		t.Errorf("removeOrphan(refused unlink) logged remediation %q, want %q", got, outputPermRemediation)
+	}
+}
+
+// TestStoreInspect_classifies_a_read_that_found_nothing_as_verified_stale pins the
+// health-routing half of inspect's read-failure arm, which is the only arm whose
+// classification decides whether a REFUSED rewrite flips health.
+//
+// An ENOENT or a non-regular occupant seen by the READ is the same fact the lstat arms
+// above classify as contentVerifiedStale: the path holds no usable bundle, so failing to
+// write one is a conversion failure however the write failed (types.go's statusUnwritable
+// contract says exactly that). Every OTHER read failure stays "cannot tell" and keeps the
+// health-neutral outcome — the third row is here so the first two cannot pass merely
+// because the arm returns stale for everything.
+//
+// The read seam is the only way in: the bundle has to vanish BETWEEN inspect's classifying
+// lstat and its read, which no temp directory the suite owns can stage. want is never
+// dereferenced; the verdict is reached before any bundle is decoded.
+//
+// Runs serially: it swaps slog.Default() and the read seam.
+func TestStoreInspect_classifies_a_read_that_found_nothing_as_verified_stale(t *testing.T) {
+	// Spelled out rather than imported from the production call site: an operator's log
+	// query keys on these words, so a silent rewording must fail here.
+	const unreadableMsg = "cannot read prior pfx; regenerating"
+	refused := &fs.PathError{Op: "openat", Path: "out.pfx", Err: fs.ErrPermission}
+
+	for _, tc := range []struct {
+		name    string
+		readErr error
+		want    contentState
+		outcome conversionStatus
+	}{
+		{
+			"a bundle unlinked between the lstat and the read",
+			&fs.PathError{Op: "openat", Path: "out.pfx", Err: fs.ErrNotExist},
+			contentVerifiedStale, statusFailed,
+		},
+		{
+			"a bundle that stopped being a regular file",
+			fmt.Errorf("open prior pfx: %w", atomicfile.ErrNotRegular),
+			contentVerifiedStale, statusFailed,
+		},
+		{
+			"a bundle the volume refuses to read",
+			refused,
+			contentUnverified, statusUnwritable,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			s := newOutputStore(t, dir)
+			if err := s.write(t.Context(), "out.pfx", []byte("prior bundle")); err != nil {
+				t.Fatalf("setup: write: %v", err)
+			}
+
+			prev := readBoundedInRoot
+			readBoundedInRoot = func(context.Context, *os.Root, string, int64) ([]byte, error) {
+				return nil, tc.readErr
+			}
+			t.Cleanup(func() { readBoundedInRoot = prev })
+
+			logs := captureLogs(t)
+			state, err := s.inspect(t.Context(), "out.pfx", nil, convert.EncNameModern2023, "pw")
+			if err != nil {
+				t.Fatalf("inspect(read %v) = error %v, want nil: a rewrite is the remedy, not a failed pair",
+					tc.readErr, err)
+			}
+			if state.content != tc.want {
+				t.Errorf("inspect(read %v).content = %v, want %v", tc.readErr, state.content, tc.want)
+			}
+			if state.upToDate() {
+				t.Error("inspect(a bundle it could not read).upToDate() = true, want false: a bundle" +
+					" this app could not read is never one it may skip")
+			}
+			if got := writeOutcome(state, refused); got != tc.outcome {
+				t.Errorf("writeOutcome(%v, refused) = %v, want %v: an absent or non-regular output path"+
+					" stays a conversion failure however the write failed, while a bundle this app could"+
+					" not verify at all is health-neutral", state.content, got, tc.outcome)
+			}
+			if got := logs.CountLevel(slog.LevelWarn, unreadableMsg); got != 1 {
+				t.Errorf("inspect(read %v) logged %q at WARN %d times, want exactly 1: %q",
+					tc.readErr, unreadableMsg, got, logs.Messages())
+			}
+			if !logs.HasAttr(unreadableMsg, "path", "out.pfx") {
+				t.Errorf("inspect(read %v) logged %q without path=out.pfx, so the operator cannot"+
+					" identify the bundle: %q", tc.readErr, unreadableMsg, logs.Messages())
+			}
+			if got, ok := logs.AttrValue(unreadableMsg, "remediation"); !ok || got != outputPermRemediation {
+				t.Errorf("inspect(read %v) logged %q with remediation %q (present %v), want %q: %q",
+					tc.readErr, unreadableMsg, got, ok, outputPermRemediation, logs.Messages())
+			}
+		})
 	}
 }

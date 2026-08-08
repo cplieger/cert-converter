@@ -611,8 +611,11 @@ func contentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 // report and no operator action to request. The lax mode is corrected as a side effect
 // of the ordinary atomic rewrite the app already performs on this bundle
 // (bundleState.upToDate routes it there), which installs a fresh inode at pfxFileMode
-// by construction — so this fires once and never again, and the operator is told what
-// happened rather than asked to do it.
+// by construction — so on a filesystem that stores that mode this fires once and never
+// again, and the operator is told what happened rather than asked to do it. On a mount
+// that forces or ignores permission bits (CIFS/SMB forced mode, NFS squash, vfat fmask)
+// the rewrite succeeds and the stored mode stays lax, so the next scan re-detects the
+// bundle it just wrote and the WARN and the rewrite recur once per scan.
 //
 // The report-only tone is laxDirMsg's, and deliberately: one principle now covers both
 // halves of /output. For a DIRECTORY the app warns and does nothing
@@ -649,11 +652,14 @@ func laxerThanPolicy(perm os.FileMode) bool {
 // nothing, pins nothing and mutates nothing, so the mode on disk is left exactly as
 // found and the correction happens in store.write like any other rewrite.
 //
-// One WARN per lax bundle per scan, and in practice once ever: the fact it reports makes
-// bundleState.upToDate false, so the same scan rewrites the bundle at pfxFileMode and
-// the condition cannot re-trigger. It repeats per scan only while the correcting write
-// is itself refused, which is the standing condition an operator does need told about
-// every scan (unwritableReport emits the message that names it).
+// One WARN per lax bundle per scan, and on a mode-storing filesystem once ever: the fact
+// it reports makes bundleState.upToDate false, so the same scan rewrites the bundle at
+// pfxFileMode and the condition cannot re-trigger. It repeats per scan in two cases.
+// While the correcting write is itself refused — the standing condition an operator does
+// need told about every scan (unwritableReport emits the message that names it). And on a
+// mount that forces or ignores permission bits, where the rewrite SUCCEEDS but the stored
+// mode is still lax, so the correction never converges and every scan reports and rewrites
+// the bundle the previous scan wrote.
 func (s *store) reportLaxBundle(rel string, perm os.FileMode) bool {
 	if !laxerThanPolicy(perm) {
 		return false
@@ -725,8 +731,19 @@ func restartCanClearWrite(err error) bool {
 // inspect's lstat and this open on a volume other containers write to. Those
 // are the same three guarantees the input side already delegates in
 // source.readBoundedLimit.
+//
+// readBoundedInRoot is that read, indirected through a package var for the same reason
+// writeFileInRoot is: the failure that decides a HEALTH outcome here — a prior bundle
+// that is unlinked, or stops being a regular file, between inspect's classifying lstat
+// and this read, which inspect classifies as contentVerifiedStale so a refused rewrite
+// stays a conversion failure — cannot be staged in a temp directory the suite owns.
+// Without the seam that arm is unreachable from a test, and a future simplification
+// could fold it back into the health-neutral "cannot tell" case with the whole suite
+// green.
+var readBoundedInRoot = atomicfile.ReadBoundedInRoot
+
 func (s *store) readBoundedPFX(ctx context.Context, rel string) ([]byte, error) {
-	return atomicfile.ReadBoundedInRoot(ctx, s.root, rel, maxPFXSize)
+	return readBoundedInRoot(ctx, s.root, rel, maxPFXSize)
 }
 
 // --- Output lifecycle: the /output half ---
