@@ -493,27 +493,55 @@ func TestStoreReconcile_oversized_orphan_sample_keeps_the_count(t *testing.T) {
 	}
 }
 
-// TestStoreRemoveOrphans_cancelled_context_stops_before_deletion pins
-// removeOrphans' own shutdown guard: a scan cancelled by SIGTERM must delete no
-// key material and must report the cancellation, so the caller can classify the
-// scan as a shutdown instead of a clean reap.
-func TestStoreRemoveOrphans_cancelled_context_stops_before_deletion(t *testing.T) {
-	t.Parallel()
+// cancelAfterNChecks reports itself live for the first n Err() observations and
+// cancelled from then on, which makes "cancellation landed between two guards of the
+// same loop" deterministic without a sleep or a goroutine race: the code's own
+// ctx.Err() calls are the clock.
+type cancelAfterNChecks struct {
+	context.Context
+	calls *int
+	live  int
+}
+
+func (c cancelAfterNChecks) Err() error {
+	*c.calls++
+	if *c.calls <= c.live {
+		return nil
+	}
+	return context.Canceled
+}
+
+// TestReapConfirmed_cancelled_context_stops_before_deletion pins reapConfirmed's
+// PRE-UNLINK shutdown guard: a scan cancelled by SIGTERM must delete no key material
+// and must report the cancellation, so the caller can classify the scan as a shutdown
+// instead of a clean reap. The guard is load-bearing because cancellation can arrive
+// while the candidate's sibling key is being re-checked, after the guard at the top of
+// the loop has already passed.
+//
+// live: 1 is reapConfirmed's own Err() sequence for one candidate with the deferral's
+// wait stubbed out: the guard after the certificate re-check, and then the guard under
+// test. So the earlier guard cannot answer for this one, and deleting the guard makes
+// the reap unlink the bundle — which every assertion below then fails on.
+// Serial: it swaps the package's reap-wait var.
+func TestReapConfirmed_cancelled_context_stops_before_deletion(t *testing.T) {
 	dir := t.TempDir()
 	orphan := filepath.Join(dir, "orphan.pfx")
 	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	s := newOutputStore(t, dir)
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
+	stubReapWait(t, func(context.Context) error { return nil })
+	calls := 0
+	ctx := cancelAfterNChecks{Context: t.Context(), calls: &calls, live: 1}
 
-	deleted, err := s.removeOrphans(ctx, []string{"orphan.pfx"})
+	deleted, err := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
+		reapConfirmed(ctx, []string{"orphan.pfx"})
+
 	if !errors.Is(err, context.Canceled) {
-		t.Errorf("removeOrphans(cancelled context) error = %v, want context.Canceled", err)
+		t.Errorf("reapConfirmed(cancelled before the unlink) error = %v, want context.Canceled", err)
 	}
 	if deleted != 0 {
-		t.Errorf("removeOrphans(cancelled context) deleted = %d, want 0", deleted)
+		t.Errorf("reapConfirmed(cancelled before the unlink) deleted = %d, want 0", deleted)
 	}
 	if _, err := os.Stat(orphan); err != nil {
 		t.Errorf("orphan was removed after shutdown cancellation: %v", err)
@@ -709,15 +737,15 @@ func TestStoreReconcile_spares_a_live_bundle_when_an_ancestor_is_swapped_for_a_s
 	}
 }
 
-// TestStoreRemoveOrphans_spares_non_regular_candidate_and_continues pins the
+// TestStoreRemoveOrphan_spares_non_regular_candidate_and_continues pins the
 // pre-unlink type re-check: a path that changed from the regular file found during
-// the orphan walk into a directory must be left in place, while a later regular
+// the orphan walk into a directory must be left in place, while another regular
 // orphan is still removed. Serial: captureLogs swaps the process-global slog.Default.
 //
 // The directory is left EMPTY on purpose: Root.Remove would succeed on it, so if the
-// non-regular guard were removed the count, the surviving-directory stat and the WARN
+// non-regular guard were removed the boolean, the surviving-directory stat and the WARN
 // all fail rather than only the log assertion.
-func TestStoreRemoveOrphans_spares_non_regular_candidate_and_continues(t *testing.T) {
+func TestStoreRemoveOrphan_spares_non_regular_candidate_and_continues(t *testing.T) {
 	const wantMsg = "orphaned output path is not a regular file; leaving it in place"
 
 	dir := t.TempDir()
@@ -732,12 +760,11 @@ func TestStoreRemoveOrphans_spares_non_regular_candidate_and_continues(t *testin
 	logs := captureLogs(t)
 	s := newOutputStore(t, dir)
 
-	deleted, err := s.removeOrphans(t.Context(), []string{"stuck.pfx", "reapable.pfx"})
-	if err != nil {
-		t.Fatalf("removeOrphans(non-regular candidate) = %v, want nil", err)
+	if removed := s.removeOrphan("stuck.pfx"); removed {
+		t.Errorf("removeOrphan(non-regular candidate) = true, want false: a directory is not a bundle this app wrote")
 	}
-	if deleted != 1 {
-		t.Errorf("removeOrphans(non-regular candidate) deleted = %d, want 1: the later regular orphan must still go", deleted)
+	if removed := s.removeOrphan("reapable.pfx"); !removed {
+		t.Errorf("removeOrphan(regular candidate) = false, want true: a regular orphan must still go")
 	}
 	if _, statErr := os.Stat(reapable); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Errorf("os.Stat(reapable.pfx) = %v, want fs.ErrNotExist", statErr)
@@ -748,10 +775,10 @@ func TestStoreRemoveOrphans_spares_non_regular_candidate_and_continues(t *testin
 		t.Errorf("stuck.pfx mode = %v, want a directory left in place", fi.Mode())
 	}
 	if got := logs.CountLevel(slog.LevelWarn, wantMsg); got != 1 {
-		t.Fatalf("removeOrphans(non-regular candidate) logged %q at WARN %d times, want exactly 1: %q", wantMsg, got, logs.Messages())
+		t.Fatalf("removeOrphan(non-regular candidate) logged %q at WARN %d times, want exactly 1: %q", wantMsg, got, logs.Messages())
 	}
 	if !logs.HasAttr(wantMsg, "path", "stuck.pfx") {
-		t.Errorf("removeOrphans(non-regular candidate) logged %q without path=stuck.pfx: %q", wantMsg, logs.Messages())
+		t.Errorf("removeOrphan(non-regular candidate) logged %q without path=stuck.pfx: %q", wantMsg, logs.Messages())
 	}
 }
 
@@ -1033,18 +1060,18 @@ func TestStoreInspect_keeps_a_bundle_whose_mode_cannot_be_tightened(t *testing.T
 	}
 	for _, tc := range []struct {
 		name  string
-		chmod func(*os.Root, string, os.FileMode) error
+		chmod func(*os.File, os.FileMode) error
 	}{
 		{
 			"a filesystem that accepts the chmod and stores nothing",
-			func(*os.Root, string, os.FileMode) error { return nil },
+			func(*os.File, os.FileMode) error { return nil },
 		},
 		{
 			// A read-only mount: the chmod fails, but replacing the file would fail too,
 			// so the error is no reason to try.
 			"a chmod a read-only filesystem fails",
-			func(_ *os.Root, name string, _ os.FileMode) error {
-				return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EROFS}
+			func(f *os.File, _ os.FileMode) error {
+				return &fs.PathError{Op: "chmod", Path: f.Name(), Err: syscall.EROFS}
 			},
 		},
 		{
@@ -1052,8 +1079,8 @@ func TestStoreInspect_keeps_a_bundle_whose_mode_cannot_be_tightened(t *testing.T
 			// set it. Same reasoning, and it is what proves the refusal test below keys on
 			// the ERROR rather than on "the chmod failed".
 			"a chmod the filesystem rejects as invalid",
-			func(_ *os.Root, name string, _ os.FileMode) error {
-				return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EINVAL}
+			func(f *os.File, _ os.FileMode) error {
+				return &fs.PathError{Op: "chmod", Path: f.Name(), Err: syscall.EINVAL}
 			},
 		},
 		{
@@ -1066,8 +1093,8 @@ func TestStoreInspect_keeps_a_bundle_whose_mode_cannot_be_tightened(t *testing.T
 			// the fixture is owned by the test process, which is the premise, so the
 			// production discriminator is what routes this case.
 			"a chmod a mode-forcing filesystem refuses on a bundle this process owns",
-			func(_ *os.Root, name string, _ os.FileMode) error {
-				return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EPERM}
+			func(f *os.File, _ os.FileMode) error {
+				return &fs.PathError{Op: "chmod", Path: f.Name(), Err: syscall.EPERM}
 			},
 		},
 	} {
@@ -1081,9 +1108,9 @@ func TestStoreInspect_keeps_a_bundle_whose_mode_cannot_be_tightened(t *testing.T
 			if err := os.Chmod(filepath.Join(dir, "out.pfx"), 0o644); err != nil {
 				t.Fatalf("setup: Chmod: %v", err)
 			}
-			prev := chmodInRoot
-			chmodInRoot = tc.chmod
-			t.Cleanup(func() { chmodInRoot = prev })
+			prev := chmodFile
+			chmodFile = tc.chmod
+			t.Cleanup(func() { chmodFile = prev })
 
 			logs := captureLogs(t)
 			// Spelled out rather than imported from the production const: an operator's
@@ -1198,11 +1225,11 @@ func TestScannerRun_regenerates_a_bundle_whose_mode_repair_was_refused(t *testin
 			// owns, so it comes from the seam — in the shape os.Root.Chmod really returns
 			// it, an *fs.PathError around the errno, because the classification reads
 			// through that wrapping.
-			prev := chmodInRoot
-			chmodInRoot = func(_ *os.Root, name string, _ os.FileMode) error {
-				return &fs.PathError{Op: "chmod", Path: name, Err: tc.errno}
+			prev := chmodFile
+			chmodFile = func(f *os.File, _ os.FileMode) error {
+				return &fs.PathError{Op: "chmod", Path: f.Name(), Err: tc.errno}
 			}
-			t.Cleanup(func() { chmodInRoot = prev })
+			t.Cleanup(func() { chmodFile = prev })
 			// The injected refusal MEANS "another UID owns this bundle", so the
 			// ownership read has to agree: a refusal on a file this process owns is the
 			// filesystem refusing the BITS, which is the WARN-only arm.
@@ -1395,11 +1422,11 @@ func TestScannerRun_when_the_repairing_rewrite_is_also_refused(t *testing.T) {
 			if err := os.Chmod(pfxPath, 0o644); err != nil {
 				t.Fatalf("setup: Chmod: %v", err)
 			}
-			prevChmod := chmodInRoot
-			chmodInRoot = func(_ *os.Root, name string, _ os.FileMode) error {
-				return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EPERM}
+			prevChmod := chmodFile
+			chmodFile = func(f *os.File, _ os.FileMode) error {
+				return &fs.PathError{Op: "chmod", Path: f.Name(), Err: syscall.EPERM}
 			}
-			t.Cleanup(func() { chmodInRoot = prevChmod })
+			t.Cleanup(func() { chmodFile = prevChmod })
 			// The injected refusal MEANS "another UID owns this bundle" (see the sibling
 			// table above), so the ownership read has to agree.
 			prevOwned := fileOwnedByProcess
@@ -1554,11 +1581,11 @@ func TestScannerRun_a_stale_bundle_whose_mode_repair_was_refused_is_a_conversion
 	if err := os.Chmod(pfxPath, 0o644); err != nil {
 		t.Fatalf("setup: Chmod: %v", err)
 	}
-	prevChmod := chmodInRoot
-	chmodInRoot = func(_ *os.Root, name string, _ os.FileMode) error {
-		return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EPERM}
+	prevChmod := chmodFile
+	chmodFile = func(f *os.File, _ os.FileMode) error {
+		return &fs.PathError{Op: "chmod", Path: f.Name(), Err: syscall.EPERM}
 	}
-	t.Cleanup(func() { chmodInRoot = prevChmod })
+	t.Cleanup(func() { chmodFile = prevChmod })
 	// The injected refusal MEANS "another UID owns this bundle", so the ownership read
 	// has to agree.
 	prevOwned := fileOwnedByProcess
@@ -1913,7 +1940,7 @@ func TestStoreReconcile_spares_an_orphan_whose_certificate_returns_during_the_re
 // marker set for a scan that stopped halfway through the output tree.
 //
 // The Debug trace is asserted too, because it is what distinguishes abandoning the
-// window from the next guard downstream: removeOrphans re-checks the context before
+// window from the next guard downstream: reapConfirmed re-checks the context before
 // every unlink, so a wait whose error were dropped would still delete nothing — and
 // nothing would record that the deferral was cut short.
 // Serial: it swaps waitBeforeReap and slog.Default.

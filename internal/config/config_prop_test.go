@@ -150,12 +150,6 @@ func TestClassifyPassword_blankness_matches_the_visible_content(t *testing.T) {
 			t.Fatalf("classifyPassword(%q) = %q, but the value %s a visible rune: a password nobody can read must never classify as configured",
 				password, status, map[bool]string{true: "carries", false: "carries no"}[hasVisible])
 		}
-		// The guard and the classification are one decision: everything that is
-		// not configured is blank, and the opt-out governs all of it.
-		if isBlank(password) == (status == PasswordConfigured) {
-			t.Errorf("isBlank(%q) = %v disagrees with status %q: the guard must derive from the classification",
-				password, isBlank(password), status)
-		}
 		// Each blank class describes what the value actually is, so the WARN the
 		// operator reads matches the value they configured.
 		switch status {

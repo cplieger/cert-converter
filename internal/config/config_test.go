@@ -1526,7 +1526,7 @@ func TestLoad_warns_when_both_password_channels_are_set(t *testing.T) {
 		// The invisible-only class the single classification added: a PFX_PASSWORD
 		// holding nothing but a byte-order mark is blank, so the file does not
 		// "win" over anything and the conflict WARN must stay silent. The
-		// suppression reads isBlank, so narrowing it back to a TrimSpace test
+		// suppression reads classifyPassword, so narrowing it back to a TrimSpace test
 		// would send the operator to remove a variable that carries nothing.
 		{"invisible-only env is not a real conflict", "\ufeff", path, false},
 	} {

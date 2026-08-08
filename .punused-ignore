@@ -12,15 +12,16 @@
 # routine shutdown at ERROR). Upstream: bep/punused#3.
 method (boundedTextError).Unwrap
 #
-# LostError.Unwrap upholds the errors.Is(err, ErrWatchLost) contract documented
-# on the type and is exercised by six assertions across watch's loop, recv and
-# poll suites. Honest caveat: no non-test consumer unwraps it today -- main.go's
-# reportWatchExit uses errors.As on the concrete type, which matches at depth 0
-# -- so removing it would change no caller's decision. Kept rather than deleted
-# because the real question is whether the exported ErrWatchLost / LostError /
-# Unwrap trio should collapse to just *LostError, which is an exported-surface
-# design decision, not a dead-symbol cleanup.
-method (*LostError).Unwrap
+# LostError.Error is the errors.Error interface implementation for the type main
+# receives from watch.Run: *LostError values are returned as `error` (lostOrShutdown,
+# watchMode, Run), so the method cannot be deleted without breaking the interface,
+# and every production render of it is IMPLICIT -- main.go's reportWatchExit puts
+# runErr into slog attrs, which calls Error() through the interface rather than by
+# name. punused sees only explicit references, and the last explicit non-test one
+# disappeared when the exported ErrWatchLost sentinel was removed (the old body was
+# `ErrWatchLost.Error() + ": " + e.Cause`). Interface-contract method: invalid by
+# construction for this check.
+method (*LostError).Error
 #
 # internal/testcerts has no _test.go of its own; it is a regular package
 # precisely so other packages' _test.go files can import a shared certificate

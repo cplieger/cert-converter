@@ -154,8 +154,18 @@ func resolvePassword() (resolvedPassword, error) {
 
 // classifyPassword classifies a PFX password ONCE, and is the single home for the
 // blank-password predicate: resolvePassword's empty-password guard, the
-// weak-password WARN, and the Config.PasswordStatus the startup log reports all
-// derive their decision from it, so they cannot drift.
+// weak-password WARN, the Config.PasswordStatus the startup log reports, and the
+// both-channels WARN all derive their decision from it, so they cannot drift.
+//
+// Anything other than PasswordConfigured is a password that offers no real
+// protection: empty, entirely Unicode whitespace, or entirely invisible formatting
+// runes. That is the single blankness rule for BOTH delivery channels, so
+// PFX_ALLOW_EMPTY_PASSWORD means one thing regardless of how the secret arrived.
+// PFX_PASSWORD=" " (a quoting slip in a compose file or .env) is therefore REJECTED:
+// README documents the guard as refusing to start when the password is empty, which an
+// operator reasonably reads as covering a blank value. A BOM-only secret file is
+// rejected for the same reason — it is blank to every human who reads it, and only
+// the opt-out may start a container with it.
 //
 // The order of the arms is the precedence: a password made only of whitespace stays
 // PasswordWhitespaceOnly (its own WARN names the stray-quote cause), and
@@ -189,20 +199,6 @@ func isInvisibleOnly(password string) bool {
 	return !strings.ContainsFunc(password, func(r rune) bool {
 		return !unicode.IsSpace(r) && !isInvisibleRune(r)
 	})
-}
-
-// isBlank reports whether a password offers no real protection: empty, entirely
-// Unicode whitespace, or entirely invisible formatting runes.
-//
-// This is the single blankness rule for BOTH delivery channels, so
-// PFX_ALLOW_EMPTY_PASSWORD means one thing regardless of how the secret arrived.
-// PFX_PASSWORD=" " (a quoting slip in a compose file or .env) is therefore REJECTED:
-// README documents the guard as refusing to start when the password is empty, which an
-// operator reasonably reads as covering a blank value. A BOM-only secret file is
-// rejected for the same reason — it is blank to every human who reads it, and only
-// the opt-out may start a container with it.
-func isBlank(password string) bool {
-	return classifyPassword(password) != PasswordConfigured
 }
 
 // allowEmptyPassword reports whether PFX_ALLOW_EMPTY_PASSWORD opts out of the
@@ -243,8 +239,8 @@ func warnUnrecognizedAllowEmptyPassword(raw string, recognized bool) {
 }
 
 // checkPasswordEncodable rejects password shapes PKCS#12 cannot preserve. The empty
-// password is not one of them — InspectPasswordEncoding reports it as encodable — so
-// this gate accepts it and PFX_ALLOW_EMPTY_PASSWORD owns whether it may be used.
+// password is not one of them — convert reports it as encodable — so this gate
+// accepts it and PFX_ALLOW_EMPTY_PASSWORD owns whether it may be used.
 //
 // A startup refusal rather than a warning: a non-BMP rune fails every Encode, so the
 // container would be unhealthy on every tick, while invalid UTF-8 (each bad byte
@@ -252,23 +248,20 @@ func warnUnrecognizedAllowEmptyPassword(raw string, recognized bool) {
 // SUCCEED and report healthy, writing bundles no consumer can open with the
 // configured secret.
 //
-// Only the SHAPE is reported, never the value. Recognition is
-// convert.InspectPasswordEncoding's, the same package that encodes, so this gate
-// cannot drift from the encoder; which shape is named when a password carries
-// several is convert.PasswordEncodingIssues.Primary's, the single home of that
-// precedence; and the sentence describing it is
-// convert.PasswordEncodingIssue.Explain's, the single home of that wording. So this
-// gate and convert.Encode's own guard cannot disagree on either the shape or the
-// advice, and this gate contributes only its own sentinel.
+// Only the SHAPE is reported, never the value. The whole verdict is
+// convert.ValidatePasswordEncoding's — the same package that encodes, so this gate
+// cannot drift from the encoder: which shapes are recognised, which one is named
+// when a password carries several, and the sentence describing it all live there
+// once. So this gate and convert.Encode's own guard cannot disagree on either the
+// shape or the advice, and this gate contributes only its own sentinel.
 // This startup gate fails before scanning, while Encode's codec-level guard protects
 // callers that bypass config loading — both are wanted.
 //
-// Explain fails CLOSED, so a future recognised shape stops the container at startup
-// instead of silently shipping bundles this gate never proved openable; no shape
-// escapes today (Primary returns exactly the four Explain covers).
+// The verdict fails CLOSED, so a future recognised shape stops the container at
+// startup instead of silently shipping bundles this gate never proved openable.
 func checkPasswordEncodable(password string) error {
-	if why := convert.InspectPasswordEncoding(password).Primary().Explain(); why != "" {
-		return fmt.Errorf("%w: %s", ErrUnencodablePassword, why)
+	if err := convert.ValidatePasswordEncoding(password); err != nil {
+		return fmt.Errorf("%w: %s", ErrUnencodablePassword, err)
 	}
 	return nil
 }
@@ -286,7 +279,7 @@ func checkPasswordEncodable(password string) error {
 // cannot claim a conflict that did not happen. Neither value is logged, and the path is
 // omitted for the same reason the success line omits it.
 func warnBothPasswordChannels(source envx.SecretSource) {
-	if source != envx.SourceFile || isBlank(os.Getenv("PFX_PASSWORD")) {
+	if source != envx.SourceFile || classifyPassword(os.Getenv("PFX_PASSWORD")) != PasswordConfigured {
 		return
 	}
 	slog.Warn("both PFX_PASSWORD and PFX_PASSWORD_FILE are set; the file wins and PFX_PASSWORD is ignored",

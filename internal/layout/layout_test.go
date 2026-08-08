@@ -91,9 +91,11 @@ func TestCertImpliesRelevant(t *testing.T) {
 		// The generator must be able to REACH a certificate name: a plain
 		// rapid.String() ends in ".crt" with vanishing probability, which leaves the
 		// implication vacuously true and lets an IsRelevant that no longer consults
-		// IsCert pass every run.
+		// IsCert pass every run. The suffixes are the naming contract's own
+		// spellings, written out here because they are layout's implementation
+		// detail rather than part of its exported surface.
 		name := rapid.String().Draw(t, "stem") +
-			rapid.SampledFrom([]string{layout.CertExt, layout.KeyExt, layout.PFXExt, "", ".bak"}).Draw(t, "suffix")
+			rapid.SampledFrom([]string{".crt", ".key", ".pfx", "", ".bak"}).Draw(t, "suffix")
 		if layout.IsCert(name) && !layout.IsRelevant(name) {
 			t.Fatalf("IsCert(%q) is true but IsRelevant is false", name)
 		}
@@ -109,25 +111,25 @@ func TestDerivedNamesShareOneStem(t *testing.T) {
 
 	rapid.Check(t, func(t *rapid.T) {
 		stem := rapid.String().Draw(t, "stem")
-		certPath := stem + layout.CertExt
+		certPath := stem + ".crt"
 
 		if !layout.IsCert(certPath) {
-			t.Fatalf("IsCert(%q) is false for a name built with CertExt", certPath)
+			t.Fatalf("IsCert(%q) is false for a name built with the certificate extension", certPath)
 		}
 
 		gotKey := layout.KeyFor(certPath)
 		gotOutput := layout.OutputFor(certPath)
 
-		if want := stem + layout.KeyExt; gotKey != want {
+		if want := stem + ".key"; gotKey != want {
 			t.Errorf("KeyFor(%q) = %q, want %q", certPath, gotKey, want)
 		}
-		if want := stem + layout.PFXExt; gotOutput != want {
+		if want := stem + ".pfx"; gotOutput != want {
 			t.Errorf("OutputFor(%q) = %q, want %q", certPath, gotOutput, want)
 		}
 
 		// Both siblings must be reachable from the same stem, which is what lets
 		// a scan pair them without a second lookup rule.
-		if strings.TrimSuffix(gotKey, layout.KeyExt) != strings.TrimSuffix(gotOutput, layout.PFXExt) {
+		if strings.TrimSuffix(gotKey, ".key") != strings.TrimSuffix(gotOutput, ".pfx") {
 			t.Errorf("KeyFor(%q) and OutputFor(%q) do not share a stem: %q vs %q",
 				certPath, certPath, gotKey, gotOutput)
 		}
@@ -151,7 +153,7 @@ func TestOutputAndCertNamesAreInverses(t *testing.T) {
 
 	rapid.Check(t, func(t *rapid.T) {
 		stem := rapid.String().Draw(t, "stem")
-		certPath := stem + layout.CertExt
+		certPath := stem + ".crt"
 
 		out := layout.OutputFor(certPath)
 		if !layout.IsOutput(out) {

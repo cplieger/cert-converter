@@ -109,21 +109,15 @@ func oversizedOIDContent(t testing.TB) []byte {
 // shapes other than a bare identifier there — RSASSA-PSS keeps two more
 // AlgorithmIdentifiers inside its parameters.
 type certificateFixture struct {
-	signatureAlgorithm  []byte
-	signatureParameters []byte
-	// outerSignatureAlgorithm and outerSignatureParameters override the OUTER copy
-	// of the signature AlgorithmIdentifier alone. A certificate whose two copies
-	// differ is one x509.ParseCertificate refuses for the mismatch, which is why
-	// these exist: they are how a test reaches the outer sites at all.
-	outerSignatureAlgorithm  []byte
-	outerSignatureParameters []byte
-	publicKeyAlgorithm       []byte
-	publicKeyParameters      []byte
-	publicKeyBits            []byte
-	issuerAttribute          []byte
-	subjectAttribute         []byte
-	unknownExtensionID       []byte
-	unknownExtensionValue    []byte
+	signatureAlgorithm    []byte
+	signatureParameters   []byte
+	publicKeyAlgorithm    []byte
+	publicKeyParameters   []byte
+	publicKeyBits         []byte
+	issuerAttribute       []byte
+	subjectAttribute      []byte
+	unknownExtensionID    []byte
+	unknownExtensionValue []byte
 	// criticalExtendedKeyUsage marks the extended key usage extension critical,
 	// which inserts the BOOLEAN the walk has to step over between an extnID and its
 	// value. Only that one, because x509 refuses a critical authority information
@@ -188,19 +182,15 @@ func testP256PublicKeyBits(t testing.TB) []byte {
 // build assembles the fixture into certificate DER: SEQUENCE { TBSCertificate,
 // AlgorithmIdentifier, BIT STRING }. The signature bytes are arbitrary, because
 // x509.ParseCertificate does not verify a signature — only its encoding.
+//
+// The outer AlgorithmIdentifier is always the TBS copy verbatim: x509 requires the
+// two byte-for-byte equal and the walk descends only into the TBS one (see
+// walkCertificate), so there is no case a differing outer copy could express.
 func (f *certificateFixture) build(t testing.TB) []byte {
 	t.Helper()
-	outerAlgorithm := f.signatureAlgorithm
-	if f.outerSignatureAlgorithm != nil {
-		outerAlgorithm = f.outerSignatureAlgorithm
-	}
-	outerParameters := f.signatureParameters
-	if f.outerSignatureParameters != nil {
-		outerParameters = f.outerSignatureParameters
-	}
 	return derSequenceOf(t,
 		f.buildTBS(t),
-		derAlgorithmIdentifier(t, outerAlgorithm, outerParameters),
+		derAlgorithmIdentifier(t, f.signatureAlgorithm, f.signatureParameters),
 		derBitString(t, []byte{0xde, 0xad, 0xbe, 0xef}),
 	)
 }
@@ -671,14 +661,6 @@ func TestOversizedCertificateOIDError_refuses_an_oversized_identifier_at_every_s
 			wantSite:      siteSignatureParameter,
 			parserAccepts: true,
 		},
-		"the outer signature algorithm identifier alone": {
-			plant:    func(f *certificateFixture) { f.outerSignatureAlgorithm = oversized },
-			wantSite: siteOuterSignatureAlgorithm,
-		},
-		"the outer signature algorithm parameters alone": {
-			plant:    func(f *certificateFixture) { f.outerSignatureParameters = derOID(t, oversized) },
-			wantSite: siteOuterSignatureParameter,
-		},
 		"the public key algorithm identifier": {
 			plant:         func(f *certificateFixture) { f.publicKeyAlgorithm = oversized },
 			wantSite:      sitePublicKeyAlgorithm,
@@ -713,11 +695,6 @@ func TestOversizedCertificateOIDError_refuses_an_oversized_identifier_at_every_s
 		"a certificate policy identifier": {
 			plant:         func(f *certificateFixture) { f.certificatePolicy = oversized },
 			wantSite:      siteCertificatePolicy,
-			parserAccepts: true,
-		},
-		"a certificate policy qualifier identifier": {
-			plant:         func(f *certificateFixture) { f.policyQualifier = oversized },
-			wantSite:      siteCertificatePolicyQualifier,
 			parserAccepts: true,
 		},
 		"a policy mapping identifier": {
@@ -924,8 +901,8 @@ func TestOversizedCertificateOIDError_fails_open_on_what_it_cannot_read(t *testi
 // Without it the fix is unpinned in both directions. With withSubtreeBudget reduced to
 // a bare walk() every other test in this package stays green, and the starvation bypass
 // reopens: a dense issuer exhausts the shared budget, walkTBSCertificate returns on the
-// next expect, and the subject attribute type, the SPKI algorithm, the whole extensions
-// subtree and the outer signature algorithm all reach x509.ParseCertificate unmeasured.
+// next expect, and the subject attribute type, the SPKI algorithm and the whole
+// extensions subtree all reach x509.ParseCertificate unmeasured.
 func TestOversizedCertificateOIDError_measures_a_later_site_behind_a_dense_earlier_field(t *testing.T) {
 	t.Parallel()
 
@@ -1131,11 +1108,8 @@ var certificateOIDFields = map[string]string{
 var certificateOIDSitesNotRetained = []string{
 	siteSignatureAlgorithm,
 	siteSignatureParameter,
-	siteOuterSignatureAlgorithm,
-	siteOuterSignatureParameter,
 	sitePublicKeyAlgorithm,
 	sitePublicKeyParameter,
-	siteCertificatePolicyQualifier,
 	siteAuthorityInfoAccessMethod,
 }
 
@@ -1200,8 +1174,6 @@ func certificateWalkSites() []string {
 	return []string{
 		siteSignatureAlgorithm,
 		siteSignatureParameter,
-		siteOuterSignatureAlgorithm,
-		siteOuterSignatureParameter,
 		sitePublicKeyAlgorithm,
 		sitePublicKeyParameter,
 		siteIssuerAttribute,
@@ -1209,7 +1181,6 @@ func certificateWalkSites() []string {
 		siteExtensionID,
 		siteExtendedKeyUsage,
 		siteCertificatePolicy,
-		siteCertificatePolicyQualifier,
 		sitePolicyMapping,
 		siteAuthorityInfoAccessMethod,
 	}

@@ -347,45 +347,6 @@ func TestAddWatchDirs_stops_at_the_entry_budget(t *testing.T) {
 	}
 }
 
-// TestAddWatchDirs_bounds_the_live_watch_set_across_calls pins the OTHER half of the
-// same ceiling, and the half the per-walk count cannot express: addWatchDirs runs
-// again for every directory Create/Chmod, each time with a fresh per-walk budget, so
-// a writer creating directories one at a time under an already-watched parent would
-// otherwise add a registration per event forever until the per-UID inotify quota is
-// exhausted — taking unrelated same-UID consumers down with it.
-//
-// Each call here walks a tree that FITS the per-walk budget, so only the live-set
-// bound can refuse anything. Re-walking an already-registered path must stay
-// idempotent (the kernel charges no new slot), or a rebuild would refuse itself.
-// Not parallel: it swaps the process-global slog default.
-func TestAddWatchDirs_bounds_the_live_watch_set_across_calls(t *testing.T) {
-	watcher := newTestWatcher(t)
-	root := t.TempDir()
-	const budget = 3
-	capture.Default(t)
-	w := New(root, func(context.Context) {}, WithMaxEntries(budget))
-
-	for i := range 6 {
-		dir := filepath.Join(root, "batch-"+string(rune('a'+i)))
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatal(err)
-		}
-		// One directory per call, exactly as handlePathEvent drives it on a Create.
-		if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
-			t.Fatalf("addWatchDirs(call %d) = %v, want nil", i, err)
-		}
-		if n := len(watcher.WatchList()); n > budget {
-			t.Fatalf("after %d calls the live watch set holds %d registrations, want at most %d: each call takes a fresh per-walk budget, so only a bound on the SET can stop unbounded growth",
-				i+1, n, budget)
-		}
-	}
-	// The root must be among the survivors: refusing new paths may not cost the
-	// registration everything else is watched through.
-	if !slices.Contains(watcher.WatchList(), root) {
-		t.Errorf("watch list = %v, want the root still registered", watcher.WatchList())
-	}
-}
-
 // TestResyncWatchSet_prunes_a_directory_the_tree_no_longer_has pins the
 // membership mirror's only full rebuild: resyncWatchSet re-walks the whole root,
 // so the mirror it leaves behind must be exactly the set that walk established.

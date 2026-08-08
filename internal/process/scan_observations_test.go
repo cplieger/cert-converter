@@ -353,11 +353,11 @@ func TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unw
 	if err := os.Chmod(pfxPath, 0o644); err != nil {
 		t.Fatalf("setup: Chmod: %v", err)
 	}
-	prevChmod := chmodInRoot
-	chmodInRoot = func(_ *os.Root, name string, _ os.FileMode) error {
-		return &fs.PathError{Op: "chmod", Path: name, Err: syscall.EPERM}
+	prevChmod := chmodFile
+	chmodFile = func(f *os.File, _ os.FileMode) error {
+		return &fs.PathError{Op: "chmod", Path: f.Name(), Err: syscall.EPERM}
 	}
-	t.Cleanup(func() { chmodInRoot = prevChmod })
+	t.Cleanup(func() { chmodFile = prevChmod })
 	// The injected refusal MEANS "another UID owns this bundle", so the ownership read
 	// has to agree.
 	prevOwned := fileOwnedByProcess

@@ -2,6 +2,7 @@ package process
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -217,6 +218,19 @@ func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *r
 			slog.Debug("orphan enumeration cancelled during shutdown", "error", err)
 			return 0, err
 		}
+		if errors.Is(err, errOutputBudgetExceeded) {
+			// Its own arm, and its own message, because this is a SIZE condition rather
+			// than a permission one: the generic WARN below points an operator at /output
+			// ownership, which is the wrong action and the wrong diagnosis for a tree that
+			// is simply larger than one scan will enumerate. Health-neutral like the /input
+			// budget and for the same reason — no restart makes the tree smaller — and
+			// carrying reapDisabledPhrase so the standing alert still fires: a budget that
+			// bit silently would look exactly like an /output with nothing to reap.
+			slog.Warn(outputBudgetMsg,
+				"error", err, "dir", rp.out.root.Name(),
+				"remediation", outputBudgetRemediation)
+			return 0, nil
+		}
 		slog.Warn("could not enumerate output orphans; "+reapDisabledPhrase,
 			"error", err, "dir", rp.out.root.Name(),
 			"remediation", outputPermRemediation)
@@ -325,17 +339,23 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 		if rp.keyStillPresent(rel, cert) {
 			continue
 		}
-		n, err := rp.out.removeOrphans(ctx, []string{rel})
-		if n > 0 {
+		// The shutdown guard the removal helper used to own, inlined at the only place
+		// it ever ran: a cancellation between candidates must delete no further key
+		// material and must be reported, so the caller classifies the scan as a
+		// shutdown rather than a clean reap. It stays immediately before the unlink,
+		// because cancellation can arrive during keyStillPresent.
+		if err := ctx.Err(); err != nil {
+			slog.Debug("orphan removal interrupted by shutdown",
+				"removed", deleted, "remaining", len(orphaned)-deleted)
+			return deleted, err
+		}
+		if rp.out.removeOrphan(rel) {
 			removedPaths = append(removedPaths, rel)
 			// The pair is gone from /input entirely and its bundle with it, so the
 			// lone-key report for it is retired: if the same name ever comes back and
 			// loses its certificate again, that is a new condition to name.
 			rp.observations.clearLoneKey(cert)
-		}
-		deleted += n
-		if err != nil {
-			return deleted, err
+			deleted++
 		}
 	}
 	return deleted, nil
@@ -478,7 +498,7 @@ func logReapAudit(removed []string) {
 const reapDeferral = 30 * time.Second
 
 // waitBeforeReap is reapDeferral's wait, indirected through a package var for the
-// same reason chmodInRoot is: the behaviour that matters cannot be produced in a test
+// same reason chmodFile is: the behaviour that matters cannot be produced in a test
 // otherwise. Here it is the delay itself — a suite that really waited reapDeferral per
 // case would cost minutes — plus the two edges the wait owns (a shutdown arriving
 // inside the window, and the batch waiting once rather than once per orphan).

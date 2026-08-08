@@ -299,8 +299,9 @@ func TestLostOrShutdown_gives_cancellation_precedence(t *testing.T) {
 			t.Run("a live ctx is lost change detection", func(t *testing.T) {
 				logs := capture.Default(t)
 				got := lostOrShutdown(t.Context(), lost)
-				if !errors.Is(got, ErrWatchLost) {
-					t.Errorf("lostOrShutdown(live ctx) = %v, want ErrWatchLost (a watcher that dies while the app must keep running is fatal)", got)
+				var gotLost *LostError
+				if !errors.As(got, &gotLost) {
+					t.Errorf("lostOrShutdown(live ctx) = %v, want a *LostError (a watcher that dies while the app must keep running is fatal)", got)
 				}
 				if got != error(lost) {
 					t.Errorf("lostOrShutdown(live ctx) = %v, want the %q loss itself so main can name which loss occurred", got, lost.Cause)

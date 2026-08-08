@@ -4,13 +4,12 @@ import (
 	"errors"
 	"strings"
 	"testing"
-
-	"github.com/cplieger/cert-converter/internal/convert"
+	"unicode/utf8"
 )
 
 // FuzzCheckPasswordEncodable_gate_matches_the_recognizer pins the two contracts
 // the startup gate owns over arbitrary secret bytes: it refuses exactly the
-// shapes convert.InspectPasswordEncoding recognises (a dropped or reordered
+// shapes the PKCS#12 UCS-2 password encoding cannot carry (a dropped or reordered
 // branch would let a silently-unopenable bundle ship), and its error never
 // carries the secret into the startup log every aggregator retains.
 func FuzzCheckPasswordEncodable_gate_matches_the_recognizer(f *testing.F) {
@@ -22,18 +21,20 @@ func FuzzCheckPasswordEncodable_gate_matches_the_recognizer(f *testing.F) {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, password string) {
-		issues := convert.InspectPasswordEncoding(password)
-		// Deliberately an independent restatement of the three shapes, not
-		// issues.Primary() != convert.PasswordEncodesFine: checkPasswordEncodable
-		// selects on Primary, so deriving this side of the comparison from Primary
-		// too would make the oracle tautological and a dropped Primary branch
-		// would pass.
-		unusable := issues.InvalidUTF8 || issues.NonBMP || issues.EmbeddedNUL
+		// Deliberately an INDEPENDENT restatement of the three shapes rather than a
+		// call into convert: the gate reaches its verdict through
+		// convert.ValidatePasswordEncoding, so deriving this side of the comparison
+		// from the same query would make the oracle tautological and a dropped
+		// recognition branch would pass. Kept in step with the classifier by this
+		// test failing if the two ever disagree.
+		unusable := !utf8.ValidString(password) ||
+			strings.ContainsRune(password, 0) ||
+			strings.ContainsFunc(password, func(r rune) bool { return r > 0xFFFF })
 
 		err := checkPasswordEncodable(password)
 		if unusable != (err != nil) {
-			t.Fatalf("checkPasswordEncodable(%q) = %v, but InspectPasswordEncoding reports %+v: the gate must refuse exactly the shapes the encoder cannot carry",
-				password, err, issues)
+			t.Fatalf("checkPasswordEncodable(%q) = %v, but the PKCS#12 UCS-2 encoding %s carry it: the gate must refuse exactly the shapes the encoder cannot carry",
+				password, err, map[bool]string{true: "cannot", false: "can"}[unusable])
 		}
 		if err == nil {
 			return

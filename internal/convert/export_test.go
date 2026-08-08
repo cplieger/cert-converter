@@ -70,3 +70,29 @@ func (a *Analysis) Leaf() *x509.Certificate    { return a.leaf }
 func (a *Analysis) Chain() []*x509.Certificate { return a.chain }
 func (a *Analysis) Key() crypto.PrivateKey     { return a.key }
 func (a *Analysis) Extra() []*x509.Certificate { return a.extra }
+
+// The PKCS#12 password-encoding classifier, as test-only handles. Same rule as
+// the parsers above: the package publishes ValidatePasswordEncoding alone, because
+// the one verdict is all internal/config consumes, and keeping the recognizer, its
+// precedence and its wording unexported is what stops a consumer coupling to the
+// representation the codec classifies with. Their table, property and fuzz
+// coverage is worth keeping at that granularity, so the external tests reach them
+// here rather than through a widened API.
+type (
+	PasswordEncodingIssues = passwordEncodingIssues
+	PasswordEncodingIssue  = passwordEncodingIssue
+)
+
+const (
+	PasswordEncodesFine = passwordEncodesFine
+	PasswordInvalidUTF8 = passwordInvalidUTF8
+	PasswordNonBMP      = passwordNonBMP
+	PasswordEmbeddedNUL = passwordEmbeddedNUL
+)
+
+var InspectPasswordEncoding = inspectPasswordEncoding
+
+// Primary and Explain are the unexported methods under exported names, because an
+// external test package cannot call an unexported method through a type alias.
+func (i PasswordEncodingIssues) Primary() PasswordEncodingIssue { return i.primary() }
+func (s PasswordEncodingIssue) Explain() string                 { return s.explain() }

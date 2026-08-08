@@ -1216,27 +1216,38 @@ func oversizedSEC1CurveOIDError(block *pem.Block) error {
 // the LENGTH comes back, for the reason decodeOID documents: the whole point is to
 // compare it before anything decodes the identifier.
 func sec1CurveOIDBytes(der []byte) (int, bool) {
-	outer, _, ok := asn1Element(der)
-	if !ok || !isASN1(outer, asn1.TagSequence) {
+	outer, _, ok := asn1ElementWithTag(der, asn1.TagSequence)
+	if !ok {
 		return 0, false
 	}
-	version, afterVersion, ok := asn1Element(outer.Bytes)
-	if !ok || !isASN1(version, asn1.TagInteger) {
+	_, afterVersion, ok := asn1ElementWithTag(outer.Bytes, asn1.TagInteger)
+	if !ok {
 		return 0, false
 	}
-	priv, afterPriv, ok := asn1Element(afterVersion)
-	if !ok || !isASN1(priv, asn1.TagOctetString) {
+	_, afterPriv, ok := asn1ElementWithTag(afterVersion, asn1.TagOctetString)
+	if !ok {
 		return 0, false
 	}
 	params, _, ok := asn1Element(afterPriv)
 	if !ok || params.Class != asn1.ClassContextSpecific || params.Tag != 0 || !params.IsCompound {
 		return 0, false
 	}
-	oid, _, oidOK := asn1Element(params.Bytes)
-	if !oidOK || !isASN1(oid, asn1.TagOID) {
+	oid, _, ok := asn1ElementWithTag(params.Bytes, asn1.TagOID)
+	if !ok {
 		return 0, false
 	}
 	return len(oid.Bytes), true
+}
+
+// asn1ElementWithTag reads one DER element and reports it only when it carries the
+// expected UNIVERSAL tag, so a schema walk states each step once instead of
+// repeating the decode-then-check-the-tag conjunction at every field.
+func asn1ElementWithTag(b []byte, tag int) (asn1.RawValue, []byte, bool) {
+	v, rest, ok := asn1Element(b)
+	if !ok || !isASN1(v, tag) {
+		return asn1.RawValue{}, nil, false
+	}
+	return v, rest, true
 }
 
 // pkcs8PrivateKeyDER returns the content of a PKCS#8 PrivateKeyInfo's privateKey
@@ -1256,13 +1267,13 @@ func pkcs8PrivateKeyDER(der []byte) []byte {
 	return inner.Bytes
 }
 
-// PasswordEncodingIssues reports the ways a PFX password cannot survive the
+// passwordEncodingIssues reports the ways a PFX password cannot survive the
 // PKCS#12 BMPString (UCS-2) password encoding (RFC 7292 appendix B.1). It is
-// the single semantic home for that rule: internal/convert enforces it before
-// encoding, and internal/config reuses the same query for its startup
-// diagnostic, so the two cannot drift. The zero value means the password
-// encodes faithfully.
-type PasswordEncodingIssues struct {
+// the single semantic home for that rule, and it stays INTERNAL to this
+// package: ValidatePasswordEncoding is the one verdict published, so
+// internal/config reuses the rule without coupling to the representation the
+// codec classifies with. The zero value means the password encodes faithfully.
+type passwordEncodingIssues struct {
 	// InvalidUTF8 means the password is not valid UTF-8, so every invalid byte
 	// is encoded as U+FFFD and the PFX ends up protected by a different,
 	// lower-entropy password than the configured secret.
@@ -1278,52 +1289,53 @@ type PasswordEncodingIssues struct {
 	EmbeddedNUL bool
 }
 
-// PasswordEncodingIssue names one shape, or none.
-type PasswordEncodingIssue string
+// passwordEncodingIssue names one shape, or none.
+type passwordEncodingIssue string
 
-// The password shapes PasswordEncodingIssues.Primary selects between.
+// The password shapes passwordEncodingIssues.primary selects between.
 const (
-	PasswordEncodesFine PasswordEncodingIssue = ""
-	PasswordInvalidUTF8 PasswordEncodingIssue = "invalid-utf8" //nolint:gosec // G101 false positive: a shape NAME for a diagnostic, not a credential value.
-	PasswordNonBMP      PasswordEncodingIssue = "non-bmp"
-	PasswordEmbeddedNUL PasswordEncodingIssue = "embedded-nul"
+	passwordEncodesFine passwordEncodingIssue = ""
+	passwordInvalidUTF8 passwordEncodingIssue = "invalid-utf8" //nolint:gosec // G101 false positive: a shape NAME for a diagnostic, not a credential value.
+	passwordNonBMP      passwordEncodingIssue = "non-bmp"
+	passwordEmbeddedNUL passwordEncodingIssue = "embedded-nul"
 )
 
-// Primary reports the shape to name when several hold. The ORDER is the
-// contract: internal/config's startup gate and Encode's codec guard must
-// name the same shape for the same password, so it lives here once rather
-// than as two switches kept aligned by comment.
-func (i PasswordEncodingIssues) Primary() PasswordEncodingIssue {
+// primary reports the shape to name when several hold. The ORDER is the
+// contract: internal/config's startup gate and Encode's codec guard both reach
+// it through ValidatePasswordEncoding, so it lives here once rather than as two
+// switches kept aligned by comment.
+func (i passwordEncodingIssues) primary() passwordEncodingIssue {
 	switch {
 	case i.InvalidUTF8:
-		return PasswordInvalidUTF8
+		return passwordInvalidUTF8
 	case i.NonBMP:
-		return PasswordNonBMP
+		return passwordNonBMP
 	case i.EmbeddedNUL:
-		return PasswordEmbeddedNUL
+		return passwordEmbeddedNUL
 	}
-	return PasswordEncodesFine
+	return passwordEncodesFine
 }
 
-// Explain says why a shape cannot survive the PKCS#12 UCS-2 password encoding and
+// explain says why a shape cannot survive the PKCS#12 UCS-2 password encoding and
 // what to do about it, or "" for a password that encodes faithfully. It is the
 // single home of that wording: Encode's codec guard and internal/config's startup
-// gate both refuse on a non-empty result, so neither re-enumerates the shapes and a
-// new shape lands once. Never names the password value; these texts reach the log.
-func (s PasswordEncodingIssue) Explain() string {
+// gate both refuse on a non-empty ValidatePasswordEncoding result, so neither
+// re-enumerates the shapes and a new shape lands once. Never names the password
+// value; these texts reach the log.
+func (s passwordEncodingIssue) explain() string {
 	switch s {
-	case PasswordEncodesFine:
+	case passwordEncodesFine:
 		return ""
-	case PasswordInvalidUTF8:
+	case passwordInvalidUTF8:
 		return "is not valid UTF-8, so the PKCS#12 UCS-2 password encoding would " +
 			"replace every invalid byte with U+FFFD and protect the bundle with a " +
 			"different, lower-entropy password than the one supplied; supply a text " +
 			"secret (for example base64) instead of raw binary bytes"
-	case PasswordNonBMP:
+	case passwordNonBMP:
 		return "contains a character outside the Basic Multilingual Plane, which the " +
 			"PKCS#12 UCS-2 password encoding cannot represent, so every encode would " +
 			"fail; choose a password made of BMP characters (ASCII is safest)"
-	case PasswordEmbeddedNUL:
+	case passwordEmbeddedNUL:
 		return "contains a NUL byte, and PKCS#12 passwords are NUL-terminated, so no " +
 			"consumer that builds the terminated BMPString itself could open the bundle " +
 			"with the password supplied; strip NUL bytes from the secret (a UTF-16 or " +
@@ -1336,7 +1348,7 @@ func (s PasswordEncodingIssue) Explain() string {
 		"PKCS#12 UCS-2 password encoding carries intact", s)
 }
 
-// InspectPasswordEncoding reports how a PFX password fares under the PKCS#12
+// inspectPasswordEncoding reports how a PFX password fares under the PKCS#12
 // UCS-2 password encoding. All shapes are computed in one pass so callers do
 // not re-derive the rule: go-pkcs12 rejects a non-BMP password with a message
 // that names neither the password nor the constraint's source, it silently
@@ -1344,8 +1356,8 @@ func (s PasswordEncodingIssue) Explain() string {
 // into a password format that is itself NUL-terminated. The offending rune or
 // byte is deliberately never reported: it is part of a secret, and the
 // diagnostics built on this query go to the container log.
-func InspectPasswordEncoding(password string) PasswordEncodingIssues {
-	issues := PasswordEncodingIssues{
+func inspectPasswordEncoding(password string) passwordEncodingIssues {
+	issues := passwordEncodingIssues{
 		InvalidUTF8: !utf8.ValidString(password),
 		EmbeddedNUL: strings.ContainsRune(password, 0),
 	}
@@ -1356,4 +1368,24 @@ func InspectPasswordEncoding(password string) PasswordEncodingIssues {
 		}
 	}
 	return issues
+}
+
+// ValidatePasswordEncoding reports why the PKCS#12 UCS-2 password encoding
+// (RFC 7292 appendix B.1) cannot carry password intact, or nil when it can. It is
+// this package's ONLY password-encoding surface: recognition, the precedence
+// between shapes when a password carries several, and the sentence describing the
+// shape all stay unexported, so the sibling package that consumes the verdict
+// cannot drift from the encoder and a newly recognised shape lands here once.
+//
+// The empty password IS encodable and returns nil; whether an empty password may
+// be used is PFX_ALLOW_EMPTY_PASSWORD's decision, not this rule's.
+//
+// Only the SHAPE is named, never the value: the text reaches the container log,
+// and each caller adds its own framing (internal/config wraps it with
+// ErrUnencodablePassword, the codec guard prefixes "pfx password").
+func ValidatePasswordEncoding(password string) error {
+	if why := inspectPasswordEncoding(password).primary().explain(); why != "" {
+		return errors.New(why)
+	}
+	return nil
 }

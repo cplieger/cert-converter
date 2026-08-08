@@ -198,11 +198,12 @@ func TestStoreWrite_creates_the_parent_directory(t *testing.T) {
 // output path whose parent cannot exist. A path component that is already a
 // regular file cannot become a directory.
 //
-// The directory creation is atomicfile's (via WithMkdirMode) rather than a
-// hand-rolled MkdirAll, so the library's own diagnosis surfaces under this
-// package's "write pfx" wrapping. What matters for the operator is that the step
-// is named and the offending path appears; the precise inner wording belongs to
-// the library.
+// The directory creation is this package's own MkdirAll through the confined root
+// (store.write owns why it can no longer be atomicfile's WithMkdirMode: the parent has
+// to exist before the write's parent pin), so the failure surfaces under this package's
+// "write pfx" wrapping with the path it could not create. What matters for the operator
+// is that the step is named and the offending path appears; the precise inner wording
+// belongs to the filesystem.
 func TestStoreWrite_reports_a_parent_it_cannot_create(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -377,14 +378,18 @@ func TestStoreInspect_reports_a_bundle_that_vanishes_mid_inspection(t *testing.T
 	if err := os.Chmod(filepath.Join(dir, "out.pfx"), 0o644); err != nil {
 		t.Fatalf("setup: Chmod: %v", err)
 	}
-	prev := chmodInRoot
-	chmodInRoot = func(r *os.Root, name string, mode os.FileMode) error {
-		if err := r.Chmod(name, mode); err != nil {
+	prev := chmodFile
+	chmodFile = func(f *os.File, mode os.FileMode) error {
+		if err := f.Chmod(mode); err != nil {
 			return err
 		}
-		return r.Remove(name)
+		// Unlinked through the ambient path rather than the handle: the repair's
+		// confirming re-stat reads the bundle's NAME through the pinned parent (a
+		// descriptor's own Stat would keep answering for an unlinked inode), so the
+		// vanishing has to happen to the name for the arm under test to be reached.
+		return os.Remove(filepath.Join(dir, "out.pfx"))
 	}
-	t.Cleanup(func() { chmodInRoot = prev })
+	t.Cleanup(func() { chmodFile = prev })
 
 	// Spelled out rather than imported from the production consts: an operator's log
 	// query keys on these words, so a silent rename must fail here.
@@ -598,15 +603,15 @@ func TestStoreWrite_publishes_into_a_lax_directory_and_still_reaps(t *testing.T)
 	}
 }
 
-// TestStoreRemoveOrphans_reports_vanished_candidate_and_continues pins removeOrphans'
+// TestStoreRemoveOrphan_reports_vanished_candidate_and_continues pins removeOrphan's
 // dedicated pre-unlink RACE arm: a candidate that no longer exists when the unlink is
 // attempted is a transient producer transaction, not an operator-facing permission
 // problem, so it is DEBUG and must not raise the re-check WARN — and it must not stop
-// the loop. Deleting the errors.Is(statErr, fs.ErrNotExist) arm routes the vanished
+// the reap. Deleting the errors.Is(statErr, fs.ErrNotExist) arm routes the vanished
 // candidate through the generic WARN, which is what these two log assertions catch;
-// the deletion count alone would still pass. Serial: captureLogs swaps the
+// the returned boolean alone would still pass. Serial: captureLogs swaps the
 // process-global slog.Default.
-func TestStoreRemoveOrphans_reports_vanished_candidate_and_continues(t *testing.T) {
+func TestStoreRemoveOrphan_reports_vanished_candidate_and_continues(t *testing.T) {
 	const vanishedMsg = "orphaned output vanished before removal"
 	const recheckWarn = "could not re-check an orphaned output before removing it; leaving it in place"
 
@@ -618,28 +623,27 @@ func TestStoreRemoveOrphans_reports_vanished_candidate_and_continues(t *testing.
 	s := newOutputStore(t, dir)
 	logs := captureLogs(t)
 
-	deleted, err := s.removeOrphans(t.Context(), []string{"vanished.pfx", "reapable.pfx"})
-	if err != nil {
-		t.Fatalf("removeOrphans(missing candidate followed by regular file) = %v, want nil", err)
+	if removed := s.removeOrphan("vanished.pfx"); removed {
+		t.Errorf("removeOrphan(missing candidate) = true, want false: there was nothing to unlink")
 	}
-	if deleted != 1 {
-		t.Errorf("removeOrphans(missing candidate followed by regular file) deleted = %d, want 1", deleted)
+	if removed := s.removeOrphan("reapable.pfx"); !removed {
+		t.Errorf("removeOrphan(regular candidate) = false, want true: the vanished candidate must not stop the reap")
 	}
 	if _, statErr := os.Stat(reapable); !os.IsNotExist(statErr) {
-		t.Errorf("os.Stat(reapable.pfx) = %v, want a not-exist error: the vanished first candidate must not stop the loop", statErr)
+		t.Errorf("os.Stat(reapable.pfx) = %v, want a not-exist error: the vanished first candidate must not stop the reap", statErr)
 	}
 	if got := logs.CountLevel(slog.LevelDebug, vanishedMsg); got != 1 {
-		t.Errorf("removeOrphans(missing candidate) logged %q at DEBUG %d times, want exactly 1: %q", vanishedMsg, got, logs.Messages())
+		t.Errorf("removeOrphan(missing candidate) logged %q at DEBUG %d times, want exactly 1: %q", vanishedMsg, got, logs.Messages())
 	}
 	if !logs.HasAttr(vanishedMsg, "path", "vanished.pfx") {
-		t.Errorf("removeOrphans(missing candidate) logged %q without path=vanished.pfx: %q", vanishedMsg, logs.Messages())
+		t.Errorf("removeOrphan(missing candidate) logged %q without path=vanished.pfx: %q", vanishedMsg, logs.Messages())
 	}
 	if got := logs.CountLevel(slog.LevelWarn, recheckWarn); got != 0 {
-		t.Errorf("removeOrphans(missing candidate) logged %q at WARN %d times, want 0: disappearance is a transient race, not an operator permission problem: %q", recheckWarn, got, logs.Messages())
+		t.Errorf("removeOrphan(missing candidate) logged %q at WARN %d times, want 0: disappearance is a transient race, not an operator permission problem: %q", recheckWarn, got, logs.Messages())
 	}
 }
 
-// TestStoreRemoveOrphans_leaves_a_candidate_it_cannot_recheck pins removeOrphan's
+// TestStoreRemoveOrphan_leaves_a_candidate_it_cannot_recheck pins removeOrphan's
 // OTHER pre-unlink arm: a candidate whose re-check fails for any reason that is not
 // "it is gone" must be left in place, at WARN, with the /output ownership hint.
 //
@@ -657,7 +661,7 @@ func TestStoreRemoveOrphans_reports_vanished_candidate_and_continues(t *testing.
 // instead; that arm is pinned by the ancestor-swap and vanished-ancestor tests.
 // Deliberately NOT newOutputStore: nothing is created on disk for this candidate.
 // Runs serially: it swaps slog.Default().
-func TestStoreRemoveOrphans_leaves_a_candidate_it_cannot_recheck(t *testing.T) {
+func TestStoreRemoveOrphan_leaves_a_candidate_it_cannot_recheck(t *testing.T) {
 	// Spelled out rather than imported from the production call sites: an operator's
 	// log query keys on these words, so a silent rewording must fail here.
 	const recheckWarn = "could not re-check an orphaned output before removing it; leaving it in place"
@@ -676,38 +680,34 @@ func TestStoreRemoveOrphans_leaves_a_candidate_it_cannot_recheck(t *testing.T) {
 	s := &store{root: root}
 	logs := captureLogs(t)
 
-	deleted, err := s.removeOrphans(t.Context(), []string{strings.Repeat("a", 300) + ".pfx"})
-	if err != nil {
-		t.Fatalf("removeOrphans(uninspectable candidate) = %v, want nil: a candidate this app cannot"+
-			" re-check is skipped, not a scan failure", err)
-	}
-	if deleted != 0 {
-		t.Errorf("removeOrphans(uninspectable candidate) deleted = %d, want 0", deleted)
+	if removed := s.removeOrphan(strings.Repeat("a", 300) + ".pfx"); removed {
+		t.Errorf("removeOrphan(uninspectable candidate) = true, want false: a candidate this app cannot" +
+			" re-check is skipped, never unlinked")
 	}
 	if _, statErr := os.Stat(bundle); statErr != nil {
 		t.Errorf("the bundle was deleted after a re-check this app could not make: %v: doubt about the"+
 			" state of a private-key bundle must keep it", statErr)
 	}
 	if got := logs.CountLevel(slog.LevelWarn, recheckWarn); got != 1 {
-		t.Errorf("removeOrphans(uninspectable candidate) logged %q at WARN %d times, want exactly 1: %q",
+		t.Errorf("removeOrphan(uninspectable candidate) logged %q at WARN %d times, want exactly 1: %q",
 			recheckWarn, got, logs.Messages())
 	}
 	if got := logs.CountLevel(slog.LevelDebug, vanishedMsg); got != 0 {
-		t.Errorf("removeOrphans(uninspectable candidate) logged %q %d times, want 0: an /output the reap"+
+		t.Errorf("removeOrphan(uninspectable candidate) logged %q %d times, want 0: an /output the reap"+
 			" cannot inspect is an operator condition, not the transient renewal race: %q",
 			vanishedMsg, got, logs.Messages())
 	}
 	if _, ok := logs.AttrValue(recheckWarn, "error"); !ok {
-		t.Errorf("removeOrphans(uninspectable candidate) logged %q with no error attribute, want the"+
+		t.Errorf("removeOrphan(uninspectable candidate) logged %q with no error attribute, want the"+
 			" re-check failure carried so the operator can diagnose it: %q", recheckWarn, logs.Messages())
 	}
 	if got, ok := logs.AttrValue(recheckWarn, "remediation"); !ok || got != outputPermRemediation {
-		t.Errorf("removeOrphans(uninspectable candidate) logged remediation %q, want %q",
+		t.Errorf("removeOrphan(uninspectable candidate) logged remediation %q, want %q",
 			got, outputPermRemediation)
 	}
 }
 
-// TestStoreRemoveOrphans_reports_a_vanished_nested_candidate_as_a_race pins the same
+// TestStoreRemoveOrphan_reports_a_vanished_nested_candidate_as_a_race pins the same
 // DEBUG-not-WARN contract for the NESTED layout, which reaches the disappearance
 // through a different call.
 //
@@ -717,7 +717,7 @@ func TestStoreRemoveOrphans_leaves_a_candidate_it_cannot_recheck(t *testing.T) {
 // remediation ("mount the real output directory instead of linking to it") for an
 // ordinary disappearance that is neither a symlink nor an identity swap. Serial:
 // captureLogs swaps the process-global slog.Default.
-func TestStoreRemoveOrphans_reports_a_vanished_nested_candidate_as_a_race(t *testing.T) {
+func TestStoreRemoveOrphan_reports_a_vanished_nested_candidate_as_a_race(t *testing.T) {
 	const (
 		vanishedMsg = "orphaned output vanished before removal"
 		pinMsg      = pinRedirectedMsg
@@ -739,19 +739,15 @@ func TestStoreRemoveOrphans_reports_a_vanished_nested_candidate_as_a_race(t *tes
 	}
 	logs := captureLogs(t)
 
-	deleted, err := s.removeOrphans(t.Context(), []string{"ca1/gone.pfx"})
-	if err != nil {
-		t.Fatalf("removeOrphans(vanished nested candidate) = %v, want nil", err)
-	}
-	if deleted != 0 {
-		t.Errorf("removeOrphans(vanished nested candidate) deleted = %d, want 0", deleted)
+	if removed := s.removeOrphan("ca1/gone.pfx"); removed {
+		t.Errorf("removeOrphan(vanished nested candidate) = true, want false: the ancestor is gone")
 	}
 	if got := logs.CountLevel(slog.LevelDebug, vanishedMsg); got != 1 {
-		t.Errorf("removeOrphans(vanished nested candidate) logged %q at DEBUG %d times, want exactly 1: %q",
+		t.Errorf("removeOrphan(vanished nested candidate) logged %q at DEBUG %d times, want exactly 1: %q",
 			vanishedMsg, got, logs.Messages())
 	}
 	if got := logs.CountLevel(slog.LevelWarn, pinMsg); got != 0 {
-		t.Errorf("removeOrphans(vanished nested candidate) logged %q at WARN %d times, want 0: a disappearance is a"+
+		t.Errorf("removeOrphan(vanished nested candidate) logged %q at WARN %d times, want 0: a disappearance is a"+
 			" transient race, and that WARN's remediation points at a symlink misconfiguration that is not there: %q",
 			pinMsg, got, logs.Messages())
 	}
@@ -840,3 +836,131 @@ func TestOwnedByThisProcess_answers_the_chmod_authorization_question(t *testing.
 type statlessFileInfo struct{ os.FileInfo }
 
 func (statlessFileInfo) Sys() any { return nil }
+
+// TestStoreWrite_refuses_a_bundle_whose_parent_is_an_in_root_symlink pins the
+// confinement property *os.Root does NOT give this app: a root confines a path without
+// PINNING it, so it deliberately follows a symlink component that stays inside the root.
+//
+// The shape is a co-mounting writer's, and it is reachable wherever /output is a shared
+// volume: it controls one output subtree, replaces the directory the scan is about to
+// publish into with a symlink to a SIBLING subtree, and every step of the confined write
+// (temp creation, the symlink check, the cleanup, the rename) re-resolves the name
+// through that link. Confinement never notices, because the redirection stays inside
+// /output — and the file that gets replaced is another domain's private-key bundle.
+//
+// So the assertion is about the SIBLING, not about the error: the write must refuse, and
+// the bundle it was redirected at must still hold its own bytes and its own mode
+// afterwards. A regression here is silent by construction (the scan reports a successful
+// conversion), which is why the sibling's content is checked rather than only the
+// return.
+func TestStoreWrite_refuses_a_bundle_whose_parent_is_an_in_root_symlink(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	// The victim: another certificate's output directory, holding a bundle this write
+	// has no business touching.
+	victimDir := filepath.Join(dir, "victim")
+	if err := os.Mkdir(victimDir, pfxDirMode); err != nil {
+		t.Fatalf("setup: Mkdir: %v", err)
+	}
+	victim := filepath.Join(victimDir, "cert.pfx")
+	const victimBytes = "the sibling domain's bundle"
+	if err := os.WriteFile(victim, []byte(victimBytes), pfxFileMode); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	// Read back rather than assumed: some filesystems force modes, so what matters here
+	// is that this write leaves the sibling's mode EXACTLY as it found it.
+	victimBefore, err := os.Lstat(victim)
+	if err != nil {
+		t.Fatalf("setup: Lstat: %v", err)
+	}
+	// The swap: the directory this scan publishes into is now a relative symlink to the
+	// victim's. Relative and inside the root, so confinement alone permits it.
+	if err := os.Symlink("victim", filepath.Join(dir, "example.com")); err != nil {
+		t.Fatalf("setup: Symlink: %v", err)
+	}
+	s := newOutputStore(t, dir)
+
+	err = s.write(t.Context(), "example.com/cert.pfx", []byte("this scan's bundle"))
+	if err == nil {
+		t.Error("store.write(through a symlinked parent) = nil error, want a refusal: an in-root symlink" +
+			" must not be able to redirect a private-key bundle onto another name inside /output")
+	}
+	if err != nil && !strings.Contains(err.Error(), "write pfx") {
+		t.Errorf("error = %q, want it to name the write step so the refusal reaches the operator as a"+
+			" conversion failure rather than an unexplained one", err.Error())
+	}
+	got, readErr := os.ReadFile(victim)
+	if readErr != nil {
+		t.Fatalf("reading the sibling bundle: %v", readErr)
+	}
+	if string(got) != victimBytes {
+		t.Errorf("sibling bundle = %q, want %q: the write followed the symlink and overwrote another"+
+			" certificate's private-key bundle", got, victimBytes)
+	}
+	fi, statErr := os.Lstat(victim)
+	if statErr != nil {
+		t.Fatalf("stat-ing the sibling bundle: %v", statErr)
+	}
+	if perm, want := fi.Mode().Perm(), victimBefore.Mode().Perm(); perm != want {
+		t.Errorf("sibling bundle mode = %o, want %o unchanged", perm, want)
+	}
+}
+
+// TestStoreTightenMode_refuses_a_bundle_whose_parent_is_an_in_root_symlink is the mode
+// half of the same hazard, and the reason the repair reads the bundle's OPEN HANDLE
+// rather than its name.
+//
+// inspect classifies the prior bundle by Lstat-ing the output path, which the confined
+// root resolves THROUGH an in-root symlink, so the FileInfo it hands the repair can
+// legitimately describe a file in another subtree — exactly what the fixture passes
+// here. A repair that then chmods the same pathname applies another certificate's
+// private-key bundle the mode this app decided for its own.
+//
+// The refusal is WARN-only and never touches health: a mode this app cannot repair on a
+// stranger's /output is not a reason to restart the container, which is the settled
+// routing for every /output permission state. Runs serially: it swaps slog.Default().
+func TestStoreTightenMode_refuses_a_bundle_whose_parent_is_an_in_root_symlink(t *testing.T) {
+	dir := t.TempDir()
+	victimDir := filepath.Join(dir, "victim")
+	if err := os.Mkdir(victimDir, pfxDirMode); err != nil {
+		t.Fatalf("setup: Mkdir: %v", err)
+	}
+	victim := filepath.Join(victimDir, "cert.pfx")
+	if err := os.WriteFile(victim, []byte("the sibling domain's bundle"), 0o644); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	if err := os.Symlink("victim", filepath.Join(dir, "example.com")); err != nil {
+		t.Fatalf("setup: Symlink: %v", err)
+	}
+	s := newOutputStore(t, dir)
+	// The FileInfo the confined Lstat really produces for the redirected path: the
+	// victim's, laxer than policy, so the repair is asked for at all.
+	classified, err := s.lstat("example.com/cert.pfx")
+	if err != nil {
+		t.Fatalf("setup: lstat through the symlink: %v", err)
+	}
+	before := classified.Mode().Perm()
+	if !laxerThanPolicy(before) {
+		t.Fatalf("setup: classified mode = %o, want a mode laxer than policy: the fixture must present"+
+			" a repairable mode or tightenMode returns before the pin", before)
+	}
+
+	logs := captureLogs(t)
+	if got := s.tightenMode("example.com/cert.pfx", classified); got != tightenIneffective {
+		t.Errorf("tightenMode(through a symlinked parent) = %v, want tightenIneffective: an unpinnable"+
+			" bundle is reported and left alone, and it must not schedule the rewrite a refusal does", got)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, modeRepairUnpinnableMsg); got != 1 {
+		t.Errorf("tightenMode(through a symlinked parent) logged %q at WARN %d times, want exactly 1:"+
+			" nothing else names a repair this app declined to attempt: %q",
+			modeRepairUnpinnableMsg, got, logs.Messages())
+	}
+	fi, statErr := os.Lstat(victim)
+	if statErr != nil {
+		t.Fatalf("stat-ing the sibling bundle: %v", statErr)
+	}
+	if perm := fi.Mode().Perm(); perm != before {
+		t.Errorf("sibling bundle mode = %o, want %o unchanged: the repair followed the symlink and"+
+			" changed the permissions of another certificate's private-key bundle", perm, before)
+	}
+}

@@ -142,7 +142,7 @@ func FuzzParsePrivateKey(f *testing.F) {
 			t.Fatalf("unexpected key type: %T", key)
 		}
 		// The public half must support the Equal-based comparison identity selection
-		// depends on: publicKeyMatches treats a public key WITHOUT
+		// depends on: equalPublicKeys treats a public key WITHOUT
 		// Equal(crypto.PublicKey) bool as unverifiable, which fails the conversion
 		// with an "unsupported algorithm" diagnosis rather than a mismatch. A nil
 		// check cannot fail here - every accepted type returns a typed, non-nil

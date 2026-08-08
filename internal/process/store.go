@@ -47,6 +47,14 @@ type store struct {
 	// twenty certificates must not emit twenty identical records every scan. The
 	// store is constructed per Scanner.Run, so this lasts exactly one scan.
 	laxDirsReported map[string]struct{}
+	// maxEntries is this store's per-walk entry budget for the OUTPUT tree, injected
+	// from Options.MaxScanEntries exactly as scanWalk's is for /input. Non-positive
+	// means "use fallbackScanEntries" (outputWalk.entryBudget), so a store assembled
+	// without one — the package's own focused tests do this — is bounded rather than
+	// unbounded. /output is a mounted tree this app does not own, so the reason for a
+	// bound is the same on both sides: a writer with access to the volume chooses how
+	// many entries one scan is asked to enumerate.
+	maxEntries int
 }
 
 // laxDirMsg is the standing WARN for an /output directory more permissive than
@@ -118,7 +126,7 @@ func (s *store) reportLaxDirAt(dir string) {
 }
 
 // writeFileInRoot is store.write's confined atomic write, indirected through a
-// package var for the same reason chmodInRoot is: the failure that now decides a
+// package var for the same reason chmodFile is: the failure that now decides a
 // HEALTH outcome — an /output write the volume refuses for a reason no restart clears,
 // while the bundle already there is one this app never proved wrong — cannot be staged in
 // a temp directory. The suite owns everything it creates, and as root nothing refuses
@@ -130,14 +138,50 @@ var writeFileInRoot = atomicfile.WriteFileInRoot
 // write puts pfx at rel inside the output tree, atomically, creating rel's parent
 // directory if needed. Every touch goes through the confined root, so a symlink
 // planted under the output directory cannot redirect the private-key-bearing PFX
-// outside the mounted volume.
-// The parent directory is created by atomicfile's own WithMkdirMode rather than
-// by a hand-rolled MkdirAll here. WithMkdirMode creates the parent inside the
-// same confined root as the write, so mode and confinement cannot drift.
+// outside the mounted volume — and through a PINNED parent, so it cannot redirect it
+// to another name INSIDE the volume either.
+//
+// Confinement alone is not enough for this write, which is the whole reason the
+// parent is pinned first. An *os.Root confines a path but does not pin it: it
+// deliberately FOLLOWS a symlink component that stays inside the root, and the
+// confined write resolves rel again for each of its own steps (temp creation, the
+// symlink check, cleanup, the rename). So a co-mounting writer that replaces an
+// ANCESTOR directory of rel with a symlink to a sibling output directory makes those
+// steps land on a different private-key bundle than the one this scan is publishing —
+// inside /output, so confinement never notices. atomicfile.OpenParentInRoot closes
+// that window the same way the orphan unlink already does (removeOrphan owns the full
+// reasoning): it descends component by component, refuses a symlink, confirms each
+// directory's identity, and returns a root pinned to the directory it inspected, so
+// naming only the BASENAME through it removes every ancestor from the write's path.
+//
+// A pin this app cannot obtain FAILS the write, which is a conversion failure and
+// flips health, exactly as the leaf-symlink refusal atomicfile already returns does.
+// That is the healthcheck contract's own scope — failing to write a renewed bundle is
+// a real conversion failure — and it is deliberately not the /output DIRECTORY-mode
+// question, which stays report-only.
+//
+// The parent directory is created first and separately, because the pin needs a
+// directory that already exists: WithMkdirMode would create it inside the write, which
+// is the step the pin has to precede. MkdirAll runs through the same confined root at
+// the same pfxDirMode the option used (that is literally what the option does), so
+// mode and confinement still cannot drift.
 func (s *store) write(ctx context.Context, rel string, pfx []byte) error {
-	if _, err := writeFileInRoot(ctx, s.root, rel, pfx,
+	if dir := path.Dir(rel); dir != "." {
+		if err := s.root.MkdirAll(dir, pfxDirMode); err != nil {
+			// Named as part of the write, and carrying rel, because the step is invisible
+			// to an operator otherwise: the failure the library used to report from inside
+			// the write is now this call's, and the diagnosis has to keep naming the write
+			// it belongs to and the path that could not be created.
+			return fmt.Errorf("write pfx: create output directory for %q: %w", rel, err)
+		}
+	}
+	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
+	if err != nil {
+		return fmt.Errorf("write pfx: pin output directory for %q: %w", rel, err)
+	}
+	defer func() { _ = parent.Close() }()
+	if _, err := writeFileInRoot(ctx, parent, base, pfx,
 		atomicfile.WithMode(pfxFileMode),
-		atomicfile.WithMkdirMode(pfxDirMode),
 		// Mirror the read bound: inspect reads this same file back under
 		// maxPFXSize, so a bundle this app writes above that cap is one its own
 		// currency check would refuse, which is the permanent rewrite loop
@@ -544,6 +588,21 @@ const modeNotTightenedMsg = "prior pfx is more permissive than policy and could 
 // standing condition; this one only ever announces the attempt.
 const modeRepairRefusedMsg = "prior pfx is more permissive than policy and the mode repair was refused; regenerating"
 
+// modeRepairUnpinnableMsg is the message for a mode repair this app REFUSED TO
+// PERFORM, rather than one the filesystem refused: the bundle's own directory could
+// not be pinned to the physical directory that was inspected, or its name no longer
+// holds the regular file that was classified. Separate from the two messages above
+// because the cause is a LAYOUT or a swap under /output rather than a permission bit,
+// so its remediation is the symlink one, and because nothing was attempted at all —
+// the mode on disk is exactly as found.
+const modeRepairUnpinnableMsg = "could not pin the prior pfx for a mode repair; leaving its mode as found"
+
+// outputPinRemediation is the operator action behind every /output pin refusal. It
+// names both causes the pin cannot tell apart: a symlinked output tree (a standing
+// misconfiguration) and a path replaced while the scan was running (a co-mounting
+// writer).
+const outputPinRemediation = "mount the real output directory instead of linking to it, and check /output for paths replaced while the scan was running"
+
 // outputModeRemediation is modeNotTightenedMsg's hint. Deliberately NOT
 // outputPermRemediation: there the app cannot read or write /output and ownership is
 // the fix, while here it can already do both and the permission bit itself is the
@@ -552,14 +611,15 @@ const modeRepairRefusedMsg = "prior pfx is more permissive than policy and the m
 // and does carry outputPermRemediation, because a refusal IS an ownership problem.
 const outputModeRemediation = "chmod the bundle to the wanted mode, and check that /output's filesystem honours permission bits"
 
-// chmodInRoot is tightenMode's confined chmod, indirected through a package var for
-// one reason: the filesystem this design exists to survive — one that ACCEPTS a
+// chmodFile is tightenMode's chmod, applied to the OPEN HANDLE of the bundle rather
+// than to its path (openPinnedBundle owns why), and indirected through a package var
+// for one reason: the filesystem this design exists to survive — one that ACCEPTS a
 // chmod and stores nothing (CIFS/vfat with mount-forced modes, some NFS squash
 // configs) — cannot be staged in a temp directory, so the property that matters
 // there (the bundle stays current, so nothing rewrites it in a loop) would otherwise
 // go unpinned. Same seam shape internal/watch uses for fsnotify.NewWatcher and main
 // for health.RunProbe.
-var chmodInRoot = (*os.Root).Chmod
+var chmodFile = (*os.File).Chmod
 
 // laxerThanPolicy reports whether perm carries a permission bit pfxFileMode does
 // not.
@@ -650,9 +710,9 @@ func restartCanClearWrite(err error) bool {
 }
 
 // fileOwnedByProcess is tightenMode's ownership question, indirected through a
-// package var for the same reason chmodInRoot is: a suite cannot stage a
+// package var for the same reason chmodFile is: a suite cannot stage a
 // foreign-owned bundle in a directory it created itself, and a chmod refusal
-// injected through chmodInRoot means "another UID owns this" only if the ownership
+// injected through chmodFile means "another UID owns this" only if the ownership
 // read agrees.
 var fileOwnedByProcess = ownedByThisProcess
 
@@ -703,14 +763,35 @@ func ownedByThisProcess(fi os.FileInfo) bool {
 // WRITE bit masks to 0000, a mode this app could not read its own bundle back
 // through, so that case targets pfxFileMode instead. See the inline comment.
 //
-// The chmod goes through the store's confined root like every other output touch, so
-// a symlink planted under the output tree cannot redirect it outside the mounted
-// volume. os.Root.Chmod does follow a symlink, and inspect's lstat cannot rule out
-// a swap in the window before this call, but the reach of that race is one permission
-// bit: it never touches content, and anyone able to stage the swap on a co-mounted
-// /output can already replace the bundle itself.
+// The chmod goes through a PINNED parent directory and then through the bundle's own
+// OPEN HANDLE, not through its path (openPinnedBundle owns the reasoning): an *os.Root
+// confines a path without pinning it, so an ancestor swapped for an in-root symlink
+// would otherwise redirect this chmod onto a different private-key bundle inside
+// /output. The mode and the ownership this function decides on are read from that same
+// handle rather than from the caller's earlier path Lstat, so nothing about the
+// mutation rests on a name that was resolved twice.
+//
+// A pin or open this app cannot obtain is WARN-only (tightenIneffective) and never
+// reaches health: a permission bit on somebody else's /output is not a reason to
+// restart the container, which is the settled routing for every /output permission
+// state (dir-write-refusal-health-routing). A genuinely failing WRITE of a renewed
+// bundle is the separate, loud case, and store.write owns it.
 func (s *store) tightenMode(rel string, fi os.FileInfo) tightenResult {
 	perm := fi.Mode().Perm()
+	if !laxerThanPolicy(perm) {
+		return tightenNotNeeded
+	}
+	b, err := s.openPinnedBundle(rel)
+	if err != nil {
+		s.reportUnpinnableBundle(rel, perm, err)
+		return tightenIneffective
+	}
+	defer b.close()
+	// Re-derived from the handle, because the caller's fi was resolved through the
+	// pathname and this is the value the chmod is computed from. A mode that is no
+	// longer laxer than policy means the bundle was replaced or repaired since that
+	// Lstat, and there is nothing to tighten on what is actually open here.
+	perm = b.fi.Mode().Perm()
 	if !laxerThanPolicy(perm) {
 		return tightenNotNeeded
 	}
@@ -731,7 +812,7 @@ func (s *store) tightenMode(rel string, fi os.FileInfo) tightenResult {
 	if want == 0 {
 		want = pfxFileMode
 	}
-	got, err := s.chmodAndObserve(rel, want)
+	got, err := b.chmodAndObserve(want)
 	switch {
 	case errors.Is(err, errModeUnobserved):
 		// The chmod was accepted; only the confirming re-stat failed. That says nothing
@@ -742,7 +823,7 @@ func (s *store) tightenMode(rel string, fi os.FileInfo) tightenResult {
 			"path", rel, "mode", perm.String(), "want", want.String(),
 			"error", err, "remediation", outputModeRemediation)
 		return tightenIneffective
-	case err != nil && isPermissionRefusal(err) && !fileOwnedByProcess(fi):
+	case err != nil && isPermissionRefusal(err) && !fileOwnedByProcess(b.fi):
 		// Not ours to chmod, but ours to replace: bundleState.upToDate reads this outcome
 		// as a reason to rewrite, and the ordinary write path converges it. Named with the ownership
 		// remediation rather than the filesystem one, because that is what a refusal
@@ -790,22 +871,120 @@ func (s *store) tightenMode(rel string, fi os.FileInfo) tightenResult {
 // the bundle, and only that justifies the rewrite tightenRefused schedules.
 var errModeUnobserved = errors.New("mode not observed after chmod")
 
-// chmodAndObserve tightens rel to want inside the output tree and reports the mode
-// the filesystem actually stored.
+// errBundleReplaced marks a confirming re-stat that found a DIFFERENT file under the
+// bundle's name than the one the chmod was applied to. It is joined with
+// errModeUnobserved rather than reported on its own, because the outcome is the same
+// fact: the mode this app installed was never observed, so no claim may be made about
+// it. It must not be read as a refusal — a swap says nothing about ownership.
+var errBundleReplaced = errors.New("bundle replaced before the mode could be observed")
+
+// pinnedBundle is one prior bundle held open for a mode repair: the parent directory
+// pinned to the physical directory that was inspected, the open descriptor every
+// mutation goes through, the FileInfo of THAT descriptor, and the bundle's
+// single-element name inside the pinned parent. Every mode and ownership decision reads
+// the descriptor's FileInfo, so none of them rests on a pathname resolved a second time.
+type pinnedBundle struct {
+	parent *os.Root
+	f      *os.File
+	fi     os.FileInfo
+	base   string
+}
+
+// close releases the descriptor and the pinned parent, in that order.
+func (b *pinnedBundle) close() {
+	_ = b.f.Close()
+	_ = b.parent.Close()
+}
+
+// openPinnedBundle opens rel for a mode repair with every ancestor removed from the
+// path, and refuses anything that is not the regular file it just looked at.
 //
-// The re-stat is the point: a chmod's return value says the request was accepted,
-// not that the bits were kept, and the filesystems this app has to survive differ
-// exactly there — mount-forced modes store nothing, an inherited ACL can widen what
-// it is given.
-func (s *store) chmodAndObserve(rel string, want os.FileMode) (os.FileMode, error) {
-	if err := chmodInRoot(s.root, rel, want); err != nil {
+// It exists because *os.Root confines a path but does not pin it: a root deliberately
+// FOLLOWS a symlink component that stays inside it, so a chmod on a multi-component
+// name can land on a different bundle inside /output if an ANCESTOR is swapped for a
+// symlink after the classifying Lstat. atomicfile.OpenParentInRoot closes that half
+// (removeOrphan owns the full reasoning). The Lstat-then-open pair here closes the
+// remaining one, the bundle's own name: the Lstat refuses a symlink standing there
+// now, and os.SameFile against the OPEN HANDLE's own FileInfo refuses one swapped in
+// while the open was in flight — the same shape the library's descent uses for each
+// directory component, and the reason a bare O_NOFOLLOW is not the tool here (an
+// os.Root always passes O_NOFOLLOW and then resolves the link itself, so the flag
+// cannot express "this file, or nothing").
+//
+// Read-only is enough: a chmod needs no write access, only the descriptor.
+func (s *store) openPinnedBundle(rel string) (*pinnedBundle, error) {
+	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
+	if err != nil {
+		return nil, fmt.Errorf("pin output directory: %w", err)
+	}
+	pinned := false
+	defer func() {
+		if !pinned {
+			_ = parent.Close()
+		}
+	}()
+	before, err := parent.Lstat(base)
+	if err != nil {
+		return nil, fmt.Errorf("re-stat prior pfx through the pinned directory: %w", err)
+	}
+	if !before.Mode().IsRegular() {
+		return nil, fmt.Errorf("open prior pfx: %w (mode %s)", atomicfile.ErrNotRegular, before.Mode())
+	}
+	f, fi, err := atomicfile.OpenRegularInRoot(parent, base)
+	if err != nil {
+		return nil, fmt.Errorf("open prior pfx: %w", err)
+	}
+	if !os.SameFile(before, fi) {
+		_ = f.Close()
+		return nil, fmt.Errorf("open prior pfx: %w", errBundleReplaced)
+	}
+	pinned = true
+	return &pinnedBundle{parent: parent, base: base, f: f, fi: fi}, nil
+}
+
+// reportUnpinnableBundle narrates a bundle tightenMode could not pin or open: the mode
+// is left exactly as found, and the caller reports tightenIneffective.
+//
+// Health is deliberately untouched. A mode repair this app cannot even attempt is an
+// /output permission or layout state, and no restart clears one — the same reading the
+// app already gives a lax output directory and a refused chmod
+// (dir-write-refusal-health-routing). A vanished bundle is not even that: it is the
+// ordinary renewal race, so it stays at Debug and the rewrite that follows reports
+// whatever it finds.
+func (s *store) reportUnpinnableBundle(rel string, perm os.FileMode, err error) {
+	if errors.Is(err, fs.ErrNotExist) {
+		slog.Debug("prior pfx vanished before its mode could be repaired", "path", rel, "error", err)
+		return
+	}
+	slog.Warn(modeRepairUnpinnableMsg,
+		"path", rel, "mode", perm.String(), "want", os.FileMode(pfxFileMode).String(),
+		"error", err, "remediation", outputPinRemediation)
+}
+
+// chmodAndObserve tightens the pinned bundle to want and reports the mode the
+// filesystem actually stored.
+//
+// The chmod goes through the descriptor, so no name is resolved for the mutation at
+// all. The re-stat is the point of the rest: a chmod's return value says the request
+// was accepted, not that the bits were kept, and the filesystems this app has to
+// survive differ exactly there — mount-forced modes store nothing, an inherited ACL
+// can widen what it is given. It reads the pinned parent rather than the descriptor
+// because the descriptor's own Stat would keep answering for an inode that has since
+// been unlinked, which is the one shape that must NOT be reported as a repaired mode;
+// the identity check keeps that read honest, so a bundle replaced in between is
+// reported as unobserved rather than as somebody else's mode.
+func (b *pinnedBundle) chmodAndObserve(want os.FileMode) (os.FileMode, error) {
+	if err := chmodFile(b.f, want); err != nil {
 		return 0, fmt.Errorf("chmod: %w", err)
 	}
-	fi, err := s.lstat(rel)
+	after, err := b.parent.Lstat(b.base)
 	if err != nil {
 		return 0, fmt.Errorf("re-stat after chmod: %w", errors.Join(errModeUnobserved, err))
 	}
-	return fi.Mode().Perm(), nil
+	if !os.SameFile(b.fi, after) {
+		return 0, fmt.Errorf("re-stat after chmod: %w", errors.Join(errModeUnobserved, errBundleReplaced))
+	}
+	return after.Mode().Perm(), nil
 }
 
 // readBoundedPFX reads rel from inside the output tree under maxPFXSize.
@@ -846,13 +1025,35 @@ func (s *store) readBoundedPFX(ctx context.Context, rel string) ([]byte, error) 
 // private-key material, and it had already drifted once when each mount enumerated
 // itself.
 func (s *store) listOutputs(ctx context.Context) (found []string, safe bool, err error) {
-	walk := outputWalk{ctx: ctx, safe: true}
+	walk := outputWalk{ctx: ctx, safe: true, maxEntries: s.maxEntries}
 	if err := atomicfile.WalkDirInRoot(ctx, s.root, walk.visit); err != nil {
 		return nil, false, fmt.Errorf("walk output tree: %w", err)
 	}
 	s.logOrphanWalkOutcome(walk.unreadable, walk.symlinked)
 	return walk.found, walk.safe, nil
 }
+
+// errOutputBudgetExceeded marks an output walk the entry budget stopped. It is its own
+// sentinel, separate from errScanBudgetExceeded, because the two name different trees
+// and therefore different operator actions, and because reconcile has to tell this
+// condition apart from an /output the walk could not read: both disable orphan
+// reconciliation, only this one is about SIZE.
+//
+// Reaching it discards the partial candidate list (listOutputs returns safe=false and
+// no paths), which is what keeps a truncated enumeration from being read as a complete
+// one — the whole premise of a deletion.
+var errOutputBudgetExceeded = errors.New("output tree exceeds the per-scan entry budget")
+
+// outputBudgetMsg is the operator-facing half of that abort. It carries
+// reapDisabledPhrase so the documented CertConverterOrphanRemovalDisabled alert fires
+// on it like every other reason reaping stops — a budget that bites silently is a
+// bundle set that stops being reconciled with nothing to show why — and it names the
+// health outcome, because a too-large /output is not clearable by a restart.
+const outputBudgetMsg = reapDisabledPhrase + ": the /output tree holds more entries than one scan will enumerate, so no output can be proven orphaned; health is unaffected"
+
+// outputBudgetRemediation is that WARN's operator action, naming both ways out exactly
+// as scanBudgetRemediation does for /input.
+const outputBudgetRemediation = "check that /output is mounted at the bundle directory and holds nothing else, or raise MAX_SCAN_ENTRIES if the tree is legitimately this large"
 
 // outputWalk is listOutputs' visitor state: the candidate list plus the two
 // deletion-safety counters and the verdict they feed. It exists so the walk body is a
@@ -865,7 +1066,27 @@ type outputWalk struct {
 	found      []string
 	unreadable int
 	symlinked  int
+	// entries counts every path this walk has been handed, including directories and
+	// entries it could not read, for the same reason scanWalk.entries does: the cap is
+	// about how much of an untrusted tree one scan takes on, so it counts what the walk
+	// TOUCHED rather than what it kept as a candidate. Counting only layout.IsOutput
+	// names would let a flat set of ignored names walk past the bound for free.
+	entries int
+	// maxEntries is this walk's injected budget; non-positive means fallbackScanEntries
+	// (entryBudget), so a walk assembled without one is still bounded.
+	maxEntries int
 	safe       bool
+}
+
+// entryBudget is the effective ceiling for this walk: the injected budget, or
+// fallbackScanEntries when nothing was injected. Resolved HERE rather than at
+// construction for the reason scanWalk.entryBudget states — every assembler of one gets
+// a bound, including the tests that build one field by field.
+func (w *outputWalk) entryBudget() int {
+	if w.maxEntries > 0 {
+		return w.maxEntries
+	}
+	return fallbackScanEntries
 }
 
 // visit is listOutputs' walk callback: one entry, one verdict.
@@ -888,6 +1109,22 @@ func (w *outputWalk) visit(rel string, d fs.DirEntry, err error) error {
 		w.unreadable++
 		w.safe = false
 		return nil
+	}
+	// Charged once per ENUMERATED path and before any classification, so the budget
+	// bounds this walk's own retained state rather than trailing it: w.found holds one
+	// string per candidate until the walk completes, and /output is a mounted tree a
+	// co-mounting writer can fill with cheap zero-length .pfx names. Below the error arm
+	// for the reason scanWalk.visit states in full — a directory the walk could not
+	// finish reading is reported through visit for its OWN path, which its parent
+	// already charged, so charging there would enforce the operator's budget below its
+	// configured value.
+	//
+	// Returning an error aborts the walk, and listOutputs then discards every candidate
+	// it had collected: a partial enumeration cannot prove anything orphaned, and the
+	// alternative — reaping on a prefix of the tree — deletes live bundles.
+	w.entries++
+	if budget := w.entryBudget(); w.entries > budget {
+		return fmt.Errorf("%w: stopped at %d entries (%s)", errOutputBudgetExceeded, w.entries, rel)
 	}
 	// A symlink anywhere in the output tree makes this walk and the WRITE path
 	// disagree about where a bundle lives: writes resolve through *os.Root,
@@ -938,25 +1175,6 @@ func (s *store) logOrphanWalkOutcome(unreadable, symlinked int) {
 	}
 }
 
-// removeOrphans deletes each named output bundle, stopping early on shutdown and
-// skipping (never aborting on) an individual removal failure. Returns how many
-// were actually deleted, plus the context's cancellation error when shutdown cut
-// the loop short so the caller does not report the scan as complete.
-func (s *store) removeOrphans(ctx context.Context, orphaned []string) (int, error) {
-	var deleted int
-	for _, rel := range orphaned {
-		if err := ctx.Err(); err != nil {
-			slog.Debug("orphan removal interrupted by shutdown",
-				"removed", deleted, "remaining", len(orphaned)-deleted)
-			return deleted, err
-		}
-		if s.removeOrphan(rel) {
-			deleted++
-		}
-	}
-	return deleted, nil
-}
-
 // pinRedirectedMsg is the WARN for a candidate whose own output directory could not be
 // pinned to the physical directory the orphan walk classified: a component that is a
 // symlink or not a directory at all, or one that changed identity while it was being
@@ -995,7 +1213,7 @@ func (s *store) removeOrphan(rel string) bool {
 			return false
 		}
 		slog.Warn(pinRedirectedMsg, "path", rel, "error", err,
-			"remediation", "mount the real output directory instead of linking to it, and check /output for paths replaced while the scan was running")
+			"remediation", outputPinRemediation)
 		return false
 	}
 	defer func() { _ = parent.Close() }()

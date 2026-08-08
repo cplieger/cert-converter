@@ -1424,7 +1424,7 @@ func (g *certGraph) collectMatches(signers []crypto.Signer) (matches []identityM
 	firstUnverifiable = -1
 	for ki, s := range signers {
 		for ci, c := range g.certs {
-			matched, supported := publicKeyMatches(c.PublicKey, s)
+			matched, supported := equalPublicKeys(c.PublicKey, s.Public())
 			if !supported {
 				if firstUnverifiable == -1 {
 					firstUnverifiable = ci
@@ -1711,20 +1711,12 @@ func (g *certGraph) outsidePath(path []int) []*x509.Certificate {
 	return extra
 }
 
-// publicKeyMatches reports whether pub is the public half of signer's private
-// key. supported is false when pub's type does not provide the
-// Equal(crypto.PublicKey) bool method every crypto/x509 public key type
-// implements, in which case matched carries no meaning and the caller must treat
-// the key type as unverifiable rather than as a mismatch.
-func publicKeyMatches(pub crypto.PublicKey, signer crypto.Signer) (matched, supported bool) {
-	return equalPublicKeys(pub, signer.Public())
-}
-
-// equalPublicKeys is the single home of the comparison rule publicKeyMatches
-// and samePublicKey share: every public key type crypto/x509 parses exposes
-// Equal(crypto.PublicKey) bool, and a type that does not is unverifiable rather
-// than unequal. supported reports which of the two it was, so a caller that
-// must distinguish them can, and one that need not can ignore it.
+// equalPublicKeys is the single home of the comparison rule every caller shares:
+// every public key type crypto/x509 parses exposes Equal(crypto.PublicKey) bool,
+// and a type that does not is unverifiable rather than unequal. supported reports
+// which of the two it was, so a caller that must distinguish them can (identity
+// selection needs the algorithm-unsupported diagnosis), and one that need not can
+// ignore it (samePublicKey collapses unsupported to false).
 func equalPublicKeys(a, b crypto.PublicKey) (matched, supported bool) {
 	matcher, ok := a.(interface{ Equal(crypto.PublicKey) bool })
 	if !ok {

@@ -43,12 +43,12 @@ import (
 //     What the ceiling removes is the single contiguous multi-megabyte []int, and
 //     it refuses the obvious shape cheaply. It is also best-effort: exhausting
 //     maxCertificateOIDElements fails open for the subtree that exhausted it, and
-//     withSubtreeBudget gives the issuer, the subject, the SPKI and both signature
-//     algorithms a budget each — so what a block can still blind is one unbounded
-//     region from the inside, the extension LIST being the one that matters, leaving
-//     the identifiers after its padding unmeasured. Treat the ceiling as a per-identifier
-//     resource policy the walk applies where it can see, never as the app's
-//     memory bound - MaxInputBytes is that bound.
+//     withSubtreeBudget gives the signature algorithm, the issuer, the subject, the
+//     SPKI and the extensions a budget each — so what a block can still blind is one
+//     unbounded region from the inside, the extension LIST being the one that matters,
+//     leaving the identifiers after its padding unmeasured. Treat the ceiling as a
+//     per-identifier resource policy the walk applies where it can see, never as the
+//     app's memory bound - MaxInputBytes is that bound.
 //
 // Raising it is safe for correctness and only widens what one identifier may
 // spend; lowering it starts refusing certificates other tools accept, which is the
@@ -65,19 +65,20 @@ const maxCertificateOIDBytes = 255
 // crafted parameters field from making the walk recurse without bound.
 const maxCertificateOIDDepth = 10
 
-// maxCertificateOIDElements bounds how many DER elements the certificate walk
-// reads in TOTAL, and it is the certificate-side twin of maxRSAKeyElements: the
-// subject of the bound is the WALK rather than the certificate. Every element costs
-// one asn1.Unmarshal into an asn1.RawValue, and the walk's schema admits several
-// unbounded SEQUENCE OF loops a structurally valid certificate may fill — the
-// issuer and subject RDNSequences, the extension list, and the identifier lists
-// inside the extensions x509 decodes — so a block that is legitimately shaped but
-// holds hundreds of thousands of one-attribute RDNs would otherwise make the guard
-// the expensive operation it exists to prevent. The budget is charged PER SUBTREE
-// (withSubtreeBudget), not once for the whole walk: each unbounded region is entered
-// exactly once from a fixed position in the schema, so the total stays bounded, while a
-// shared total let the FIRST such region — the signature algorithm's parameters, or the
-// issuer name — consume the whole allowance and leave every later site unmeasured.
+// maxCertificateOIDElements bounds how many DER elements each independently
+// budgeted certificate-walk subtree reads. It is the certificate-side twin of
+// maxRSAKeyElements: the subject of the bound is the WALK rather than the
+// certificate. Every element costs one asn1.Unmarshal into an asn1.RawValue, and
+// the walk's schema admits several unbounded SEQUENCE OF loops a structurally valid
+// certificate may fill — the issuer and subject RDNSequences, the extension list,
+// and the identifier lists inside the extensions x509 decodes — so a block that is
+// legitimately shaped but holds hundreds of thousands of one-attribute RDNs would
+// otherwise make the guard the expensive operation it exists to prevent. The budget
+// is charged PER SUBTREE (withSubtreeBudget), not once for the whole walk: each
+// unbounded region is entered exactly once from a fixed position in the schema, so
+// the total stays bounded, while a shared total let the FIRST such region — the
+// signature algorithm's parameters, or the issuer name — consume the whole
+// allowance and leave every later site unmeasured.
 //
 // Exhaustion of one subtree's budget FAILS OPEN for that subtree, like every other
 // verdict this walk cannot reach: what it already measured still stands, and the sites
@@ -91,20 +92,17 @@ const maxCertificateOIDElements = 4096
 // positions in the certificate's schema, not certificate-supplied text, so they
 // reach the error message as-is.
 const (
-	siteSignatureAlgorithm         = "signature algorithm identifier"
-	siteSignatureParameter         = "signature algorithm parameter identifier"
-	siteOuterSignatureAlgorithm    = "outer signature algorithm identifier"
-	siteOuterSignatureParameter    = "outer signature algorithm parameter identifier"
-	sitePublicKeyAlgorithm         = "subject public key algorithm identifier"
-	sitePublicKeyParameter         = "subject public key algorithm parameter identifier"
-	siteIssuerAttribute            = "issuer attribute type"
-	siteSubjectAttribute           = "subject attribute type"
-	siteExtensionID                = "extension identifier"
-	siteExtendedKeyUsage           = "extended key usage identifier"
-	siteCertificatePolicy          = "certificate policy identifier"
-	siteCertificatePolicyQualifier = "certificate policy qualifier identifier"
-	sitePolicyMapping              = "policy mapping identifier"
-	siteAuthorityInfoAccessMethod  = "authority information access method identifier"
+	siteSignatureAlgorithm        = "signature algorithm identifier"
+	siteSignatureParameter        = "signature algorithm parameter identifier"
+	sitePublicKeyAlgorithm        = "subject public key algorithm identifier"
+	sitePublicKeyParameter        = "subject public key algorithm parameter identifier"
+	siteIssuerAttribute           = "issuer attribute type"
+	siteSubjectAttribute          = "subject attribute type"
+	siteExtensionID               = "extension identifier"
+	siteExtendedKeyUsage          = "extended key usage identifier"
+	siteCertificatePolicy         = "certificate policy identifier"
+	sitePolicyMapping             = "policy mapping identifier"
+	siteAuthorityInfoAccessMethod = "authority information access method identifier"
 )
 
 // The extensions crypto/x509 decodes further identifiers OUT OF, recognised by the
@@ -208,23 +206,17 @@ func (s *certOIDScan) walkCertificate(der []byte) {
 	if !ok {
 		return
 	}
-	tbs, afterTBS, ok := s.expect(certificate.Bytes, asn1.TagSequence)
+	tbs, _, ok := s.expect(certificate.Bytes, asn1.TagSequence)
 	if !ok {
 		return
 	}
-	// The TBS copy first, because it is the one x509 parses: it reads the outer
-	// AlgorithmIdentifier only to require it byte-for-byte equal to this one, so
-	// with both oversized the diagnostic should name the field the parser decodes.
+	// The TBS copy is the only signature AlgorithmIdentifier x509 decodes. It reads
+	// the outer copy solely to require it byte-for-byte equal to this one — that
+	// comparison runs on the raw DER, before either identifier is parsed — so a
+	// block whose copies differ is rejected by the parser without allocating, and
+	// walking the outer copy could not prevent an allocation this ceiling exists to
+	// prevent.
 	s.walkTBSCertificate(tbs.Bytes)
-	// The outer copy is still walked. It cannot differ from the TBS one in a
-	// certificate that parses, so this covers nothing new in a real file — it only
-	// means a block carrying an oversized identifier in one copy alone is refused
-	// here rather than reaching the parser to be refused for the mismatch.
-	if outer, _, outerOK := s.expect(afterTBS, asn1.TagSequence); outerOK {
-		s.withSubtreeBudget(func() {
-			s.walkAlgorithmIdentifier(outer.Bytes, siteOuterSignatureAlgorithm, siteOuterSignatureParameter)
-		})
-	}
 }
 
 // walkTBSCertificate mirrors TBSCertificate (RFC 5280 4.1.2) field by field, in
@@ -335,9 +327,8 @@ func (s *certOIDScan) walkExtension(der []byte) {
 // walkKnownExtensionValue descends into the value of an extension whose schema
 // x509 reads identifiers out of, and does nothing for any other extnID. The four
 // are the whole set for a certificate: extended key usage (each usage), certificate
-// policies (each policy identifier, and each qualifier's identifier), policy
-// mappings (both halves of each mapping), and authority information access (each
-// access method).
+// policies (each policy identifier), policy mappings (both halves of each mapping),
+// and authority information access (each access method).
 func (s *certOIDScan) walkKnownExtensionValue(extnID, value []byte) {
 	switch {
 	case bytes.Equal(extnID, extKeyUsageExtnID):
@@ -361,33 +352,27 @@ func (s *certOIDScan) walkKnownExtensionValue(extnID, value []byte) {
 
 // walkPolicyInformation reads one PolicyInformation — SEQUENCE {
 // policyIdentifier OBJECT IDENTIFIER, policyQualifiers SEQUENCE OF
-// PolicyQualifierInfo OPTIONAL } — recording the policy identifier and each
-// qualifier's policyQualifierId.
+// PolicyQualifierInfo OPTIONAL } — recording the policy identifier only.
 //
 // x509 decodes the policy identifier itself (into Certificate.Policies, and again
 // into the deprecated PolicyIdentifiers, which allocates an int per byte). It does
-// NOT currently decode a qualifier's identifier, which is covered anyway because
-// the schema says that field IS an identifier: it costs one element of budget, and
-// it means a future Go release that starts reading qualifiers finds the site
-// already bounded. The qualifier's VALUE stays untouched, like any other opaque
-// field.
+// NOT decode anything out of a qualifier, so the qualifiers are opaque as far as
+// this app is concerned: walking them would refuse a certificate the parser accepts
+// without protecting any allocation the parser makes. The parser-source drift guard
+// is what watches for a future Go release that starts reading them.
 func (s *certOIDScan) walkPolicyInformation(information asn1.RawValue) {
 	if !isASN1(information, asn1.TagSequence) || !information.IsCompound {
 		return
 	}
-	policy, rest, ok := s.element(information.Bytes)
+	policy, _, ok := s.element(information.Bytes)
 	if !ok {
 		return
 	}
 	s.record(policy, siteCertificatePolicy)
-	s.forEachElementOf(rest, func(qualifier asn1.RawValue) {
-		s.walkLeadingOID(qualifier, siteCertificatePolicyQualifier)
-	})
 }
 
-// walkLeadingOID records the identifier that opens a constructed element, the
-// shape shared by AccessDescription { accessMethod, accessLocation } and
-// PolicyQualifierInfo { policyQualifierId, qualifier }: the identifier x509 reads
+// walkLeadingOID records the identifier that opens a constructed element, the shape
+// of AccessDescription { accessMethod, accessLocation }: the identifier x509 reads
 // first, followed by a value this walk has no business reading.
 func (s *certOIDScan) walkLeadingOID(elem asn1.RawValue, site string) {
 	if !isASN1(elem, asn1.TagSequence) || !elem.IsCompound {
@@ -536,8 +521,8 @@ func (s *certOIDScan) element(der []byte) (asn1.RawValue, []byte, bool) {
 
 // withSubtreeBudget runs one subtree walk on its own element budget, so a block that
 // spends its allowance describing an early FIELD cannot stop the walk from measuring the
-// fields after it. Each of the six regions it wraps is entered exactly once from a fixed
-// position in the schema, so the walk's total stays bounded at seven budgets, while
+// fields after it. Each of the five regions it wraps is entered exactly once from a fixed
+// position in the schema, so the walk's total stays bounded at six budgets, while
 // nesting inside a subtree keeps sharing that subtree's budget — which is what stops a
 // per-loop cap from multiplying.
 //

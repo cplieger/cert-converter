@@ -56,12 +56,12 @@ func TestWatchLoop_converts_a_real_cert_write_through_the_debounce(t *testing.T)
 	}
 }
 
-// TestWatchLoop_returns_ErrWatchLost_when_the_watcher_dies pins the liveness
+// TestWatchLoop_returns_a_LostError_when_the_watcher_dies pins the liveness
 // exit through the loop rather than through the helper: closing the watcher
 // closes its Events channel under a live ctx, which must end the loop with
-// ErrWatchLost so main exits non-zero and the container restarts with a fresh
+// a *LostError so main exits non-zero and the container restarts with a fresh
 // watcher instead of running forever with no change detection.
-func TestWatchLoop_returns_ErrWatchLost_when_the_watcher_dies(t *testing.T) {
+func TestWatchLoop_returns_a_LostError_when_the_watcher_dies(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)
 	root := t.TempDir()
@@ -79,8 +79,9 @@ func TestWatchLoop_returns_ErrWatchLost_when_the_watcher_dies(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if !errors.Is(err, ErrWatchLost) {
-			t.Errorf("watchLoop(dead watcher) = %v, want ErrWatchLost", err)
+		var lost *LostError
+		if !errors.As(err, &lost) {
+			t.Errorf("watchLoop(dead watcher) = %v, want a *LostError", err)
 		}
 		// The specific loss, not just "something died": main names it in the one
 		// announcement it makes. Closing the watcher closes BOTH channels and the
@@ -107,7 +108,7 @@ func TestWatchLoop_returns_ErrWatchLost_when_the_watcher_dies(t *testing.T) {
 // operator's first signal would be a downstream service serving an expired
 // certificate.
 //
-// Returning ErrWatchLost reaches main's existing non-zero exit path. That is the
+// Returning a *LostError reaches main's existing non-zero exit path. That is the
 // right answer here specifically BECAUSE the failure is restart-clearable — unlike
 // a missing volume or a bad symlink, an exhausted inotify table usually clears — so
 // the restart has a real chance of succeeding rather than looping pointlessly.
@@ -136,9 +137,6 @@ func TestPollLoopWithUpgrade_reports_dead_change_detection(t *testing.T) {
 		if res.upgraded != nil {
 			res.upgraded.Close()
 			t.Error("pollLoopWithUpgrade(no fallback, no fsnotify) handed back a watcher, want none")
-		}
-		if !errors.Is(res.err, ErrWatchLost) {
-			t.Errorf("pollLoopWithUpgrade(no fallback, no fsnotify) = %v, want ErrWatchLost", res.err)
 		}
 		var lost *LostError
 		if !errors.As(res.err, &lost) {
@@ -169,13 +167,14 @@ func TestRun_falls_back_to_polling_when_the_watch_set_cannot_be_built(t *testing
 	scans := 0
 	missingRoot := filepath.Join(t.TempDir(), "missing")
 	// No WithFallback: poll mode then has no interval, so it scans once and returns
-	// ErrWatchLost -- an outcome reachable only through the poll fallback.
+	// a *LostError -- an outcome reachable only through the poll fallback.
 	w := New(missingRoot, func(context.Context) { scans++ })
 
 	err := w.Run(t.Context())
 
-	if !errors.Is(err, ErrWatchLost) {
-		t.Errorf("Run(unwatchable root) = %v, want ErrWatchLost via the poll fallback: an unwatchable /input must degrade to polling, not abort the watcher", err)
+	var lost *LostError
+	if !errors.As(err, &lost) {
+		t.Errorf("Run(unwatchable root) = %v, want a *LostError via the poll fallback: an unwatchable /input must degrade to polling, not abort the watcher", err)
 	}
 	if scans != 1 {
 		t.Errorf("Run(unwatchable root) ran %d scans, want 1: poll mode must still convert what is already on disk", scans)
@@ -222,7 +221,7 @@ func TestWatchLoop_runs_the_periodic_fallback_scan_without_any_event(t *testing.
 // pins handleRootWatchLoss's terminal branch: with the periodic rescan disabled, losing the watch on
 // the root itself is unrecoverable in-process (no Create can announce a
 // replacement, and both fsnotify channels stay open), so the loop must exit with
-// ErrWatchLost for a restart rather than schedule a rescan — reporting the
+// a *LostError for a restart rather than schedule a rescan — reporting the
 // root-watch loss specifically, and announcing nothing itself (main owns the
 // single ERROR).
 // Serial (no t.Parallel): it swaps the process-global slog default.
@@ -249,8 +248,9 @@ func TestWatchLoop_reports_lost_change_detection_when_the_root_watch_disappears(
 	}
 	select {
 	case err := <-done:
-		if !errors.Is(err, ErrWatchLost) {
-			t.Errorf("watchLoop(root removed, fallback disabled) = %v, want ErrWatchLost", err)
+		var lost *LostError
+		if !errors.As(err, &lost) {
+			t.Errorf("watchLoop(root removed, fallback disabled) = %v, want a *LostError", err)
 		}
 		if err != error(errRootWatchRemoved) {
 			t.Errorf("watchLoop(root removed, fallback disabled) = %v, want the root-watch-removed loss (%v)", err, errRootWatchRemoved)

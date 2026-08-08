@@ -553,13 +553,6 @@ func TestReportWatchExit_announces_dead_change_detection_exactly_once(t *testing
 			runErr:   &watch.LostError{Cause: "the fsnotify events channel closed"},
 			wantCode: 1,
 		},
-		{
-			// Defensive: a future loss returned as the bare sentinel must still
-			// be announced, not swallowed for lack of a *LostError.
-			name:     "the bare sentinel is still announced",
-			runErr:   watch.ErrWatchLost,
-			wantCode: 1,
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)

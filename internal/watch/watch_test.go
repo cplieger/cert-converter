@@ -164,7 +164,7 @@ func TestHandleFsEvent_rescans_when_a_repaired_directory_cannot_be_rewatched(t *
 // branch: filepath.WalkDir Lstats its root and does not follow it, so a
 // regular-file root and a symlinked root each visit exactly one non-directory
 // entry. Reporting that is what routes the case into Run's degraded paths (poll
-// mode, or ErrWatchLost with the fallback disabled); returning nil would leave Run
+// mode, or a *LostError with the fallback disabled); returning nil would leave Run
 // logging "fsnotify active" over an empty watch set, parked in a loop no event can
 // reach while the scan keeps the health marker green.
 func TestAddWatchDirs_refuses_a_non_directory_root(t *testing.T) {

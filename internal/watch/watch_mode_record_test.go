@@ -256,7 +256,7 @@ func TestPollLoopWithUpgrade_reports_poll_mode_on_its_initial_scan(t *testing.T)
 		fw.Close()
 		t.Fatal("pollLoopWithUpgrade handed back a watcher, want none")
 	} else if err == nil {
-		t.Fatal("pollLoopWithUpgrade(no fallback) = nil, want ErrWatchLost")
+		t.Fatal("pollLoopWithUpgrade(no fallback) = nil, want a *LostError")
 	}
 	if scans != 1 {
 		t.Fatalf("pollLoopWithUpgrade ran %d scans, want 1", scans)

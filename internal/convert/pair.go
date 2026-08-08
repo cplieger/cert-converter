@@ -58,21 +58,18 @@ func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 // unencodablePasswordError reports why the PKCS#12 UCS-2 password encoding
 // (RFC 7292 appendix B.1) cannot carry password intact, or nil when it can.
 //
-// It refuses every shape PasswordEncodingIssues reports, not just the one
-// go-pkcs12 refuses on its own. The two the library accepts are the worse
-// outcomes: it replaces invalid UTF-8 rune-by-rune and encodes an interior NUL
-// verbatim, so in both cases Encode would SUCCEED and write a bundle protected by
-// a different password than the one supplied, with the failure surfacing at
-// whatever later tries to open it.
+// It refuses every shape the classifier recognises, not just the one go-pkcs12
+// refuses on its own. The two the library accepts are the worse outcomes: it
+// replaces invalid UTF-8 rune-by-rune and encodes an interior NUL verbatim, so in
+// both cases Encode would SUCCEED and write a bundle protected by a different
+// password than the one supplied, with the failure surfacing at whatever later
+// tries to open it.
 //
-// Recognition is InspectPasswordEncoding's, so the encoder cannot drift from the
-// startup gate that consumes the same query; which shape is named when a password
-// carries several is PasswordEncodingIssues.Primary's, the single home of that
-// precedence; and the sentence describing the shape is
-// PasswordEncodingIssue.Explain's, the single home of that wording. So this guard
-// and internal/config's checkPasswordEncodable name the same shape AND give the
-// same advice for the same password by construction, each contributing only its
-// own framing.
+// The whole verdict is ValidatePasswordEncoding's — recognition, the precedence
+// between shapes, and the sentence describing the one named — so this guard and
+// internal/config's checkPasswordEncodable name the same shape AND give the same
+// advice for the same password by construction, each contributing only its own
+// framing.
 //
 // Only the SHAPE is named, never the value: these messages reach the container
 // log and the password is a secret. No sentinel wraps them because no caller
@@ -80,8 +77,8 @@ func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 // conversion failure, and config.ErrUnencodablePassword (which cannot be reused
 // here anyway: internal/config imports this package) exists for callers of Load.
 func unencodablePasswordError(password string) error {
-	if why := InspectPasswordEncoding(password).Primary().Explain(); why != "" {
-		return errors.New("pfx password " + why)
+	if err := ValidatePasswordEncoding(password); err != nil {
+		return errors.New("pfx password " + err.Error())
 	}
 	return nil
 }

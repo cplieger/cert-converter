@@ -18,16 +18,17 @@ package layout
 
 import "strings"
 
-// File extensions of the naming contract. They are exported so a caller that
-// must name an extension in a log line or an error uses the same spelling the
-// predicates match on, rather than a second literal that can drift.
+// File extensions of the naming contract. They are implementation details of this
+// package: every caller reaches a name through the semantic functions below, so the
+// three spellings live in exactly one place and a second literal cannot drift from
+// them.
 const (
-	// CertExt is the extension of an input certificate chain, PEM-encoded.
-	CertExt = ".crt"
-	// KeyExt is the extension of the sibling private key, PEM-encoded.
-	KeyExt = ".key"
-	// PFXExt is the extension of the converted PKCS#12 bundle.
-	PFXExt = ".pfx"
+	// certExt is the extension of an input certificate chain, PEM-encoded.
+	certExt = ".crt"
+	// keyExt is the extension of the sibling private key, PEM-encoded.
+	keyExt = ".key"
+	// pfxExt is the extension of the converted PKCS#12 bundle.
+	pfxExt = ".pfx"
 )
 
 // IsCert reports whether name is an input certificate — the entries a scan
@@ -35,7 +36,7 @@ const (
 // reached through its certificate's stem, so a walk that acted on keys too would
 // convert every pair twice.
 func IsCert(name string) bool {
-	return strings.HasSuffix(name, CertExt)
+	return strings.HasSuffix(name, certExt)
 }
 
 // IsRelevant reports whether name participates in conversion at all, as either
@@ -43,12 +44,12 @@ func IsCert(name string) bool {
 // own (a rotation that writes the key before the certificate) must still trigger
 // a rescan, even though the scan itself is driven by certificates.
 func IsRelevant(name string) bool {
-	return IsCert(name) || strings.HasSuffix(name, KeyExt)
+	return IsCert(name) || strings.HasSuffix(name, keyExt)
 }
 
 // IsOutput reports whether name is a converted bundle.
 func IsOutput(name string) bool {
-	return strings.HasSuffix(name, PFXExt)
+	return strings.HasSuffix(name, pfxExt)
 }
 
 // CertForOutput is the REVERSE of OutputFor: the certificate path that would have
@@ -63,25 +64,25 @@ func IsOutput(name string) bool {
 // The argument must satisfy IsOutput; the same precondition reasoning as KeyFor
 // applies.
 func CertForOutput(pfxPath string) string {
-	return strings.TrimSuffix(pfxPath, PFXExt) + CertExt
+	return strings.TrimSuffix(pfxPath, pfxExt) + certExt
 }
 
 // KeyFor returns the sibling private-key path for a certificate path.
 //
 // The argument must satisfy IsCert; callers reach this only after a walk or an
 // event classifier has established that. Passing a non-certificate path returns
-// the input with KeyExt appended rather than an error, because there is no
+// the input with keyExt appended rather than an error, because there is no
 // production path that can do so and an error return would put an impossible
 // branch in every call site.
 func KeyFor(certPath string) string {
-	return stem(certPath) + KeyExt
+	return stem(certPath) + keyExt
 }
 
 // OutputFor returns the PKCS#12 output path for a certificate path. It preserves
 // any directory prefix, so the output tree mirrors the input tree's shape rather
 // than flattening it. The same precondition as KeyFor applies.
 func OutputFor(certPath string) string {
-	return stem(certPath) + PFXExt
+	return stem(certPath) + pfxExt
 }
 
 // stem returns certPath without its certificate extension: the shared prefix
@@ -89,5 +90,5 @@ func OutputFor(certPath string) string {
 // wants one of the derived names, never the stem itself, and keeping it internal
 // means the three names can only ever be derived one way.
 func stem(certPath string) string {
-	return strings.TrimSuffix(certPath, CertExt)
+	return strings.TrimSuffix(certPath, certExt)
 }

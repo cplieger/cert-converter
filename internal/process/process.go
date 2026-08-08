@@ -186,12 +186,16 @@ type Options struct {
 	CertsRoot string
 	OutRoot   string
 	Password  string
-	// MaxScanEntries is how many /input entries one scan may enumerate before it
-	// refuses the tree (fallbackScanEntries when non-positive). It is INJECTED rather
-	// than read from internal/config here: that package owns MAX_SCAN_ENTRIES' name,
-	// default, ceiling and repaired-value diagnostics, and the composition root wires
-	// its Config.MaxScanEntries into this field. It also bounds the observation log,
-	// whose size a scan's enumeration is what drives (observationLog.maxObservedPairs).
+	// MaxScanEntries is how many entries one scan may enumerate in EACH mounted tree
+	// before it refuses that tree (fallbackScanEntries when non-positive): the /input
+	// walk (scanWalk.entryBudget) and the /output orphan walk (outputWalk.entryBudget)
+	// each get the same ceiling, applied per tree rather than shared, because both are
+	// mounts this app does not own and either one can be made large by whoever can write
+	// to it. It is INJECTED rather than read from internal/config here: that package owns
+	// MAX_SCAN_ENTRIES' name, default, ceiling and repaired-value diagnostics, and the
+	// composition root wires its Config.MaxScanEntries into this field. It also bounds
+	// the observation log, whose size a scan's enumeration is what drives
+	// (observationLog.maxObservedPairs).
 	MaxScanEntries int
 }
 
@@ -246,7 +250,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	}
 	defer func() { _ = outHandle.Close() }()
 
-	out := &store{root: outHandle}
+	out := &store{root: outHandle, maxEntries: s.opts.MaxScanEntries}
 	out.sweepStaleTemps(ctx)
 
 	sw := &scanWalk{
@@ -258,6 +262,13 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		seen:         make(map[string]struct{}),
 		maxEntries:   s.opts.MaxScanEntries,
 	}
+	// Protect the wholeness this walk establishes from the observation log's own
+	// eviction: reserve's victim is arbitrary, so without this window a pair markWhole
+	// read earlier in THIS scan could lose the evidence noteMissingKey classifies a
+	// replaced key with, and the veto that covers the eviction (evictedWholeness) is
+	// spent by the end of this scan. Closed on every exit path.
+	s.observations.beginScan()
+	defer s.observations.endScan()
 	// Enumerate the input tree THROUGH the root handle, exactly as the
 	// /output stale-temp sweep does: every step is an openat-relative
 	// syscall and every path handed downstream is root-relative, so no
@@ -320,7 +331,9 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	// the log stays pinned at its ceiling with orphan reaping off until a restart.
 	// forget only drops paths absent from `seen`, so it cannot spend evidence for any
 	// pair this scan observed, and rc was built before this point, so the reap veto
-	// for this scan is unaffected.
+	// for this scan is unaffected. Eviction obeys the same rule for the same reason
+	// (observationLog.canEvict): neither pruning nor the ceiling may drop wholeness a
+	// pair of the active scan established.
 	if rc.walkEnumerationComplete() {
 		s.observations.forget(sw.seen)
 	}
@@ -775,6 +788,15 @@ type observationLog struct {
 	// certificate is by definition absent from that enumeration, so pruning it there
 	// would re-report the same unchanged condition on every scan.
 	loneKeys map[string]struct{}
+	// activeWhole holds the paths whose wholeness this SCAN established, and exists
+	// only for the duration of one input walk (beginScan / endScan). Eviction skips
+	// them: reserve's victim is otherwise arbitrary, so a pair markWhole read earlier
+	// in the SAME scan could lose its evidence, and the counter that vetoes reaping for
+	// the evicting scan (evictedWholeness) is reset before a later scan needs that
+	// evidence — at which point a replaced key reads as an ordinary orphan and the reap
+	// gate treats the enumeration as complete. A nil map means no walk is in progress,
+	// and then nothing is protected.
+	activeWhole map[string]struct{}
 	// maxPairs is the injected ceiling (Options.MaxScanEntries); non-positive means
 	// fallbackScanEntries. Resolved through maxObservedPairs.
 	maxPairs int
@@ -800,13 +822,46 @@ func newObservationLog(maxPairs int) *observationLog {
 	}
 }
 
+// beginScan opens the window in which wholeness established by this walk is protected
+// from eviction. Paired with endScan through a defer in Scanner.Run, so the protection
+// never outlives the walk that needs it.
+func (o *observationLog) beginScan() {
+	o.activeWhole = make(map[string]struct{})
+}
+
+// endScan closes that window: outside a walk no path is protected, so a later scan's
+// reserve is free to take any victim it needs.
+func (o *observationLog) endScan() {
+	o.activeWhole = nil
+}
+
+// canEvict reports whether victim may be dropped while reserving room for keep. The
+// path being reserved is never its own victim, and neither is a pair this scan already
+// read whole — dropping the latter spends evidence the CURRENT scan established, and
+// the veto that covers the eviction is reset before the scan that would need it.
+func (o *observationLog) canEvict(victim, keep string) bool {
+	if victim == keep {
+		return false
+	}
+	_, observedThisScan := o.activeWhole[victim]
+	return !observedThisScan
+}
+
 // markWhole records the structural fact that this process read both inputs for rel.
 // It is called at the readPair success boundary, independently of analysis, currency,
 // encoding, and output-write outcomes — so it is reached for pairs that never get as
 // far as note or record (an analysis failure, an encode failure, a failed write), and
 // it therefore has to reserve against the same ceiling they do rather than trusting
-// their reservations to bound it.
+// their reservations to bound it. note and record route their reservation THROUGH this
+// one — a single pass makes room for the wholeness entry and the signature both — so
+// this reserve is the only one either of them performs.
+//
+// The path is recorded as observed-this-scan BEFORE reserving, so the reservation this
+// call performs cannot pick it — or any earlier pair of the same walk — as its victim.
 func (o *observationLog) markWhole(rel string) {
+	if o.activeWhole != nil {
+		o.activeWhole[rel] = struct{}{}
+	}
 	o.reserve(rel)
 	o.whole[rel] = struct{}{}
 	// A pair that reads whole is not a lone key any more, so the next time it becomes
@@ -869,11 +924,12 @@ func observationSignature(input [sha256.Size]byte, observations []convert.Observ
 // signature reports each one on the scan that introduced it, which is what
 // unconditional logging would turn into noise.
 func (o *observationLog) note(rel string, fp [sha256.Size]byte, obs []convert.Observation) {
-	o.reserve(rel)
 	current := observationSignature(fp, obs)
 	previous, ok := o.seen[rel]
-	o.seen[rel] = current
+	// markWhole first: its reserve makes room for BOTH entries this call commits, and
+	// rel is its own `keep`, so the reservation cannot evict what it is making room for.
 	o.markWhole(rel)
+	o.seen[rel] = current
 	if !ok || previous != current {
 		logConversionObservations(rel, obs)
 	}
@@ -882,9 +938,9 @@ func (o *observationLog) note(rel string, fp [sha256.Size]byte, obs []convert.Ob
 // record commits the signature without re-emitting: the conversion path has
 // already logged the observations unconditionally.
 func (o *observationLog) record(rel string, fp [sha256.Size]byte, obs []convert.Observation) {
-	o.reserve(rel)
-	o.seen[rel] = observationSignature(fp, obs)
+	// One reservation covers both halves, exactly as in note.
 	o.markWhole(rel)
+	o.seen[rel] = observationSignature(fp, obs)
 }
 
 // maxObservedPairs bounds this log's process-lifetime size.
@@ -933,17 +989,22 @@ func (o *observationLog) reserve(rel string) {
 	}
 }
 
-// evictOne drops one remembered pair from BOTH halves, never the path being reserved,
-// so an eviction can never leave the two halves out of step. It is reserve's SIGNATURE
-// arm, so it takes its victim from `seen`, and it always finds one: reserve calls it
-// only when len(seen) >= maxObservedPairs() (never 0, since the fallback is
-// fallbackScanEntries) and only for a `keep` that is absent from `seen`. A
+// evictOne drops one remembered pair from BOTH halves, never the path being reserved
+// and never a pair this scan already read whole (canEvict), so an eviction can never
+// leave the two halves out of step and can never spend evidence the active scan
+// established. It is reserve's SIGNATURE arm, so it takes its victim from `seen`, and
+// it normally finds one: reserve calls it only when len(seen) >= maxObservedPairs()
+// (never 0, since the fallback is fallbackScanEntries) and only for a `keep` that is
+// absent from `seen`, while the paths protected for the active scan are a strict subset
+// of the entries charged to that same scan-entry ceiling. If every candidate IS
+// protected, the log holds one entry over the ceiling for the rest of the walk rather
+// than dropping evidence the scan is about to need. A
 // wholeness-only entry — what a pair that read whole and then failed analysis, encoding
 // or its write leaves behind — is evicted by evictWholeness, which reserve's own second
 // arm calls.
 func (o *observationLog) evictOne(keep string) {
 	for victim := range o.seen {
-		if victim == keep {
+		if !o.canEvict(victim, keep) {
 			continue
 		}
 		delete(o.seen, victim)
@@ -954,7 +1015,8 @@ func (o *observationLog) evictOne(keep string) {
 
 // evictWholeness makes room in the WHOLENESS half specifically, dropping a victim that
 // actually holds wholeness and dropping that victim's signature with it so the two
-// halves stay in step.
+// halves stay in step. Like evictOne it skips the path being reserved and any pair the
+// active scan read whole (canEvict).
 //
 // evictOne cannot serve this call: its signature-first victim may hold no wholeness at
 // all (a pair forgetPair spent, which keeps its signature), and then the half that was
@@ -964,7 +1026,7 @@ func (o *observationLog) evictOne(keep string) {
 // fail closed on a loss that previously went unrecorded.
 func (o *observationLog) evictWholeness(keep string) {
 	for victim := range o.whole {
-		if victim == keep {
+		if !o.canEvict(victim, keep) {
 			continue
 		}
 		delete(o.seen, victim)
