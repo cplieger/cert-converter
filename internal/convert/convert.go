@@ -152,14 +152,63 @@ func (s *certScan) visit(block *pem.Block) error {
 		}
 		return nil
 	}
-	if err := oversizedCertificateOIDError(block); err != nil {
-		return fmt.Errorf("certificate PEM block %d: %w", len(s.certs)+1, err)
-	}
 	c, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		return fmt.Errorf("certificate PEM block %d: %w", len(s.certs)+1, boundedTextError{err})
 	}
+	if err := oversizedExtensionIdentifiersError(c); err != nil {
+		return fmt.Errorf("certificate PEM block %d: %w", len(s.certs)+1, err)
+	}
 	s.certs = append(s.certs, c)
+	return nil
+}
+
+// Aggregate ceilings on what ONE parsed certificate's extension identifiers may
+// RETAIN for the life of the chain. x509.ParseCertificate decodes every extension
+// identifier at one int per identifier arc and keeps the result in
+// Certificate.Extensions for as long as the chain is held, so inside the 10 MB
+// MaxInputBytes cap a crafted block could otherwise retain tens of megabytes of
+// live []int per certificate. The bound is this app's own resource policy, not an
+// X.509 validity rule.
+//
+// It is measured POST-parse, off the parsed certificate, by design (the class-c1-1
+// decision, 2026-08): the pre-parse DER walk this replaces shadowed crypto/x509's
+// schema, shared one exhaustible element budget across sites — a ~12 KB issuer
+// name could spend it and skip the measurement entirely, and exhaustion was
+// indistinguishable from malformed DER — and its per-identifier ceiling never
+// bounded the aggregate a 10 MB block can pack anyway. A bound read off
+// Certificate.Extensions cannot be starved and needs no schema shadowing; the
+// parse's own transient allocation stays bounded by MaxInputBytes and the
+// 64-block cap, and refusing here releases the parsed certificate instead of
+// retaining it with the chain.
+//
+// Both numbers are far above anything legitimate: a real certificate carries
+// around ten extensions of around ten arcs each, so 64 extensions and 4096 total
+// arcs (~32 KiB retained) pass every real chain while capping the retained cost
+// four orders of magnitude below the unbounded case.
+const (
+	maxCertExtensions       = 64
+	maxCertExtensionOIDArcs = 4096
+)
+
+// oversizedExtensionIdentifiersError refuses a parsed certificate whose extension
+// set exceeds the aggregate retention ceilings above. The refusal counts as a
+// conversion failure exactly as an unparseable block does — the chain is rejected
+// and the failure flips health — and the message names the ceiling so an operator
+// can tell this app's own resource policy from an X.509 error.
+func oversizedExtensionIdentifiersError(c *x509.Certificate) error {
+	if len(c.Extensions) > maxCertExtensions {
+		return fmt.Errorf("certificate carries %d extensions, above the %d this app accepts (this app's own ceiling on what a parsed chain may retain, not an X.509 limit)",
+			len(c.Extensions), maxCertExtensions)
+	}
+	arcs := 0
+	for _, ext := range c.Extensions {
+		arcs += len(ext.Id)
+	}
+	if arcs > maxCertExtensionOIDArcs {
+		return fmt.Errorf("certificate's extension identifiers total %d arcs, above the %d this app retains for a parsed chain (this app's own ceiling, not an X.509 limit: the parser keeps one int per identifier arc for as long as the chain)",
+			arcs, maxCertExtensionOIDArcs)
+	}
 	return nil
 }
 
