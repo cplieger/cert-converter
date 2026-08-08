@@ -389,3 +389,66 @@ func TestLogIncompleteInputEnumeration_quiet_arms(t *testing.T) {
 		}
 	})
 }
+
+// TestStoreListOutputs_stops_at_the_output_entry_budget pins the /output entry budget's
+// enumeration half: /output is a mounted tree this app does not own, so one walk takes on
+// a bounded number of entries, and a truncated enumeration must never be read as a
+// complete one.
+//
+// Three things are asserted together because the abort is only safe when all three hold:
+// the sentinel survives listOutputs' `walk output tree: %w` wrapping (reconcile routes on
+// errors.Is, and a misrouted sentinel takes the generic /output-ownership remediation
+// instead), the partial candidate list is discarded, and the walk's verdict is unsafe. A
+// non-.pfx name is in the fixture on purpose: the budget charges every ENUMERATED path,
+// so a flat set of ignored names must not walk past the bound for free.
+func TestStoreListOutputs_stops_at_the_output_entry_budget(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	for _, name := range []string{"a.pfx", "b.pfx", "c.txt", "d.pfx"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := newOutputStore(t, dir)
+	s.maxEntries = 2
+
+	found, safe, err := s.listOutputs(t.Context())
+
+	if !errors.Is(err, errOutputBudgetExceeded) {
+		t.Errorf("listOutputs(a tree over the budget) error = %v, want errOutputBudgetExceeded through the"+
+			" walk-output-tree wrapper: reconcile routes this condition on errors.Is", err)
+	}
+	if found != nil || safe {
+		t.Errorf("listOutputs(a tree over the budget) = (%v, %v), want (nil, false): a partial enumeration"+
+			" cannot prove anything orphaned, and reaping on a prefix of the tree deletes live bundles", found, safe)
+	}
+}
+
+// TestStoreListOutputs_enumerates_a_tree_inside_the_budget is the other side of the
+// boundary, and what keeps the case above from passing because the walk is simply broken.
+func TestStoreListOutputs_enumerates_a_tree_inside_the_budget(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	for _, name := range []string{"a.pfx", "c.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := newOutputStore(t, dir)
+	// The root, a.pfx and c.txt: three enumerated paths, exactly at the ceiling. `>`
+	// rather than `>=` is the contract, so a tree the operator sized to the budget is
+	// enumerated rather than refused.
+	s.maxEntries = 3
+
+	found, safe, err := s.listOutputs(t.Context())
+
+	if err != nil || !safe {
+		t.Fatalf("listOutputs(a tree exactly at the budget) = (_, %v, %v), want (_, true, nil)", safe, err)
+	}
+	if len(found) != 1 || found[0] != "a.pfx" {
+		t.Errorf("listOutputs(a tree exactly at the budget) found %v, want [a.pfx]: only this app's own"+
+			" output shape is a candidate", found)
+	}
+}

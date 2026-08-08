@@ -321,12 +321,18 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 	// every exit from this loop, including the shutdown return below: a deletion that
 	// happened must not go unrecorded because the process stopped afterwards.
 	defer func() { logReapAudit(removedPaths) }()
-	for _, rel := range orphaned {
+	// The index is the remaining-work count's only accurate source: `deleted` counts
+	// UNLINKS, so len(orphaned)-deleted charges every candidate this loop already
+	// examined and legitimately skipped (its certificate came back, its key is still
+	// there, or removeOrphan refused) to the work still outstanding. Both shutdown
+	// guards below abandon the loop BEFORE candidate i's unlink, so the candidates that
+	// remain are i and everything after it.
+	for i, rel := range orphaned {
 		cert := layout.CertForOutput(rel)
 		absent := rp.src.pathAbsent(cert)
 		if err := ctx.Err(); err != nil {
 			slog.Debug("orphan removal interrupted by shutdown during the confirming re-check",
-				"removed", deleted, "remaining", len(orphaned)-deleted, "error", err)
+				"removed", deleted, "remaining", len(orphaned)-i, "error", err)
 			return deleted, err
 		}
 		if !absent {
@@ -343,10 +349,12 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 		// it ever ran: a cancellation between candidates must delete no further key
 		// material and must be reported, so the caller classifies the scan as a
 		// shutdown rather than a clean reap. It stays immediately before the unlink,
-		// because cancellation can arrive during keyStillPresent.
+		// because cancellation can arrive during keyStillPresent. Same attributes and
+		// same remaining-work arithmetic as its sibling guard above — two records for
+		// one condition in one loop must not disagree about what they are counting.
 		if err := ctx.Err(); err != nil {
 			slog.Debug("orphan removal interrupted by shutdown",
-				"removed", deleted, "remaining", len(orphaned)-deleted)
+				"removed", deleted, "remaining", len(orphaned)-i, "error", err)
 			return deleted, err
 		}
 		if rp.out.removeOrphan(rel) {

@@ -662,9 +662,10 @@ func (b *watchSetBudget) spendEntry() bool {
 	return b.visited <= b.max
 }
 
-// warnWatchBudget emits the budget WARN. Both call sites return fs.SkipAll in the same
-// frame, which stops the walk, so one budget produces exactly one record — the
-// remainder is unbounded and the operator action is the same for all of it.
+// warnWatchBudget emits the budget WARN. Every call site returns fs.SkipAll in the
+// same frame, which stops its walk (or, in reassertWatches, the re-assert phase), so
+// one budget produces exactly one record — the remainder is unbounded and the
+// operator action is the same for all of it.
 func (w *Watcher) warnWatchBudget(budget *watchSetBudget) {
 	slog.Warn(watchBudgetMsg, w.coverageAttrs(
 		"root", budget.root, "max_entries", budget.max,
@@ -1305,8 +1306,11 @@ func (w *Watcher) desiredWatchDirs(ctx context.Context, root string) (map[string
 // admission rule the event-driven walk applies (attachWatch): a path already in the
 // mirror re-adds idempotently and costs no slot, and a NEW one is refused once the live
 // set is at the budget. It re-asserts from the preflight's set rather than walking the
-// tree a second time, so one re-sync enumerates the root once and emits at most one
-// budget WARN.
+// tree a second time, so one re-sync enumerates the root once. Each phase's budget
+// warns at most once, but one re-sync can emit two budget WARNs: the preflight's
+// per-walk exhaustion plus the live-set refusal here, reachable together when a
+// kernel-refused Remove left the mirror charged (pruneWatches' stays-charged
+// direction) while the tree also outgrew the walk budget.
 //
 // Cancellable like the walk it replaces, and checked AFTER each registration rather than
 // before: the enumeration — the expensive half, and the one that can block on a stranger's

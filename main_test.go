@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -586,6 +587,31 @@ func TestReportWatchExit_announces_dead_change_detection_exactly_once(t *testing
 			}
 		})
 	}
+
+	t.Run("an error that is not a LostError still exits non-zero, announced once", func(t *testing.T) {
+		logs := capture.Default(t)
+		// The half the *LostError cases above cannot pin: reportWatchExit branches on
+		// errors.As only to DECORATE the record with a remediation, so every non-nil
+		// error must reach the same exit code and the same single announcement. This
+		// case replaces the bare-sentinel one the ErrWatchLost removal deleted (l-f12),
+		// which was the table's only error of another type — it cannot be a table row,
+		// because the shared body asserts the error attr names "change detection lost",
+		// which no foreign-typed error carries.
+		runErr := errors.New("a loss shape this app does not model")
+
+		if got := reportWatchExit(t.Context(), runErr); got != 1 {
+			t.Errorf("reportWatchExit(%v) = %d, want 1: any non-shutdown exit is dead change detection, whatever the error's type", runErr, got)
+		}
+		if n := logs.CountLevel(slog.LevelError, ""); n != 1 {
+			t.Fatalf("reportWatchExit(%v) logged %d ERROR records %v, want exactly 1: the alert counts lines", runErr, n, logs.Messages())
+		}
+		if n := logs.CountExact(deadMsg); n != 1 {
+			t.Errorf("reportWatchExit(%v) logged %d records with the alerted message %q, want 1 (logs %v)", runErr, n, deadMsg, logs.Messages())
+		}
+		if got, has := logs.AttrValue(deadMsg, "remediation"); has {
+			t.Errorf("reportWatchExit(%v) attached remediation %q, want none: only a *LostError carries one", runErr, got)
+		}
+	})
 
 	t.Run("a shutdown says nothing about dead change detection", func(t *testing.T) {
 		logs := capture.Default(t)

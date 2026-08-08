@@ -548,6 +548,70 @@ func TestReapConfirmed_cancelled_context_stops_before_deletion(t *testing.T) {
 	}
 }
 
+// TestReapConfirmed_shutdown_reports_the_candidates_it_has_not_reached pins what the two
+// shutdown records in reapConfirmed's loop COUNT, which is the half a "did it delete
+// anything" assertion cannot see.
+//
+// `remaining` answers one operator question — how much of this batch did the shutdown
+// leave undone — so it must be derived from the loop's POSITION, not from the deletion
+// count. len(orphaned)-deleted charges every candidate the loop already examined and
+// legitimately skipped (a certificate that came back, a key still present, a removal the
+// store refused) to the outstanding work, so a batch that was fully examined and
+// deliberately deleted nothing reports its whole length as remaining. Both guards in the
+// loop abandon it before candidate i's unlink, so the accurate answer is len(orphaned)-i
+// and both must give it: two records for one condition in one loop that disagree about
+// their scope are worse than either alone.
+//
+// The fixture makes the two arithmetics differ: candidate one is skipped because its
+// certificate came back, so at candidate two's pre-unlink guard deleted is still 0 while
+// i is 1. Reverting either guard to len(orphaned)-deleted reports remaining=2.
+// Serial: it swaps the package's reap-wait var and slog's default.
+func TestReapConfirmed_shutdown_reports_the_candidates_it_has_not_reached(t *testing.T) {
+	logs := captureLogs(t)
+	out := t.TempDir()
+	for _, name := range []string{"back.pfx", "gone.pfx"} {
+		if err := os.WriteFile(filepath.Join(out, name), []byte("pfx"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// back.crt is present again: the ordinary producer transaction the delay exists for,
+	// so this candidate is examined and skipped rather than deleted.
+	in := t.TempDir()
+	if err := os.WriteFile(filepath.Join(in, "back.crt"), []byte("cert"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stubReapWait(t, func(context.Context) error { return nil })
+	// The loop's Err() sequence: back's top-of-loop guard, gone's top-of-loop guard, then
+	// gone's pre-unlink guard, which is the one under test.
+	calls := 0
+	ctx := cancelAfterNChecks{Context: t.Context(), calls: &calls, live: 2}
+
+	deleted, err := newReaper(newOutputStore(t, out), newInputSource(t, in), outputpolicy.LifecycleSync).
+		reapConfirmed(ctx, []string{"back.pfx", "gone.pfx"})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("reapConfirmed(cancelled before the second unlink) error = %v, want context.Canceled", err)
+	}
+	if deleted != 0 {
+		t.Errorf("reapConfirmed(cancelled before every unlink) deleted = %d, want 0", deleted)
+	}
+	const msg = "orphan removal interrupted by shutdown"
+	if got := logs.CountExact(msg); got != 1 {
+		t.Fatalf("reapConfirmed logged %q %d times, want exactly 1 (logs %v)", msg, got, logs.Messages())
+	}
+	if got, ok := logs.AttrValueExact(msg, "remaining"); !ok || got != "1" {
+		t.Errorf("reapConfirmed(shutdown at candidate 2 of 2, one already examined and skipped) logged remaining=%q, want \"1\": a candidate this loop already examined is not outstanding work", got)
+	}
+	if got, ok := logs.AttrValueExact(msg, "removed"); !ok || got != "0" {
+		t.Errorf("reapConfirmed logged removed=%q, want \"0\": nothing was unlinked", got)
+	}
+	// The sibling guard at the top of the loop carries the cancellation cause; one
+	// condition reported two ways must not drop it on one of them.
+	if _, ok := logs.AttrValueExact(msg, "error"); !ok {
+		t.Errorf("reapConfirmed's pre-unlink shutdown record carries no %q attribute, unlike the same loop's re-check guard", "error")
+	}
+}
+
 // TestStoreReconcile_propagates_a_shutdown_from_the_orphan_walk pins the one
 // reconcile outcome that must reach the caller as an ERROR rather than as "nothing to
 // reap": a cancellation that arrives after the input walk finished cleanly, which is
@@ -579,6 +643,56 @@ func TestStoreReconcile_propagates_a_shutdown_from_the_orphan_walk(t *testing.T)
 	}
 	if _, statErr := os.Stat(orphan); statErr != nil {
 		t.Errorf("orphan.pfx was deleted during a cancelled scan: %v", statErr)
+	}
+}
+
+// TestStoreReconcile_reports_the_output_budget_as_its_own_condition pins the /output
+// entry budget's REPORTING half: which arm reconcile takes when listOutputs aborts on
+// size, and that the abort is health-neutral.
+//
+// The two arms are one `errors.Is` apart and their remediations point at different
+// things: this one names the tree's size and MAX_SCAN_ENTRIES, the generic one sends the
+// operator to /output ownership, which repairs nothing when the tree is simply larger
+// than one walk enumerates. Both disable reaping, and a disabled reap is invisible
+// otherwise — the README says it is indistinguishable from "nothing to reap" except
+// through this WARN — so a misrouted sentinel turns off orphan removal indefinitely with
+// health green and the wrong operator action on screen.
+// Serial: it swaps slog.Default.
+func TestStoreReconcile_reports_the_output_budget_as_its_own_condition(t *testing.T) {
+	logs := captureLogs(t)
+	dir := t.TempDir()
+	for _, name := range []string{"a.pfx", "b.pfx", "c.pfx"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("pfx"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := newOutputStore(t, dir)
+	s.maxEntries = 2
+	// sync over a tree of nothing but orphans: the mode that would delete every one of
+	// them, so only the budget stands between this scan and three deletions.
+	deleted, err := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
+		reconcile(t.Context(), map[string]struct{}{}, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+
+	if deleted != 0 || err != nil {
+		t.Fatalf("reconcile(an /output over the budget) = (%d, %v), want (0, nil): the abort is"+
+			" health-neutral, because no restart shrinks the tree", deleted, err)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, outputBudgetMsg); got != 1 {
+		t.Fatalf("reconcile(an /output over the budget) logged %q at WARN %d times, want exactly 1: %q",
+			outputBudgetMsg, got, logs.Messages())
+	}
+	if got, ok := logs.AttrValue(outputBudgetMsg, "remediation"); !ok || got != outputBudgetRemediation {
+		t.Errorf("reconcile(an /output over the budget) logged remediation %q, want %q: a SIZE condition"+
+			" must not send the operator to /output ownership", got, outputBudgetRemediation)
+	}
+	if logs.Contains(outputPermRemediation) {
+		t.Errorf("reconcile(an /output over the budget) took the generic permission arm as well (%q):"+
+			" the sentinel must route to exactly one diagnosis", logs.Messages())
+	}
+	for _, name := range []string{"a.pfx", "b.pfx", "c.pfx"} {
+		if _, statErr := os.Stat(filepath.Join(dir, name)); statErr != nil {
+			t.Errorf("%s was deleted on a scan that could not enumerate /output: %v", name, statErr)
+		}
 	}
 }
 
@@ -2480,6 +2594,67 @@ func TestObservationLog_wholeness_eviction_makes_room_without_touching_the_reser
 	if got := log.takeEvictedWholeness(); got != 1 {
 		t.Errorf("takeEvictedWholeness = %d, want 1: a dropped wholeness entry is this scan's reap veto", got)
 	}
+}
+
+// TestObservationLog_eviction_spares_the_wholeness_the_active_scan_established pins
+// canEvict's active-scan arm, which is the whole of the protection the ceiling's victim
+// choice would otherwise defeat.
+//
+// reserve's victim is arbitrary (map iteration order), so without the arm a pair THIS
+// walk already read whole can be the one evicted — and then noteMissingKey, later in the
+// same walk, cannot tell a private key being replaced from one that was never there. The
+// eviction does raise the scan's reap veto, but that veto is consumed by the scan that
+// spent the evidence, so it is already gone by the scan that needed the evidence: the
+// protection has to be in the victim choice, not in the counter.
+//
+// Two halves, because either alone is passable for the wrong reason. The protected half
+// drives the ceiling with the active pair as the ONLY candidate, so deleting canEvict's
+// activeWhole arm fails it deterministically rather than half the time. The unprotected
+// half proves the same ceiling really does evict, so the first half cannot be passing
+// merely because nothing was ever at risk.
+func TestObservationLog_eviction_spares_the_wholeness_the_active_scan_established(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a pair this walk read whole survives the ceiling", func(t *testing.T) {
+		t.Parallel()
+		log := newObservationLog(1)
+		log.beginScan()
+		t.Cleanup(log.endScan)
+
+		log.markWhole("active.crt")
+		// At the ceiling now, so reserving a second pair looks for a victim — and the
+		// only candidate is the pair this walk just read whole.
+		log.markWhole("fresh.crt")
+
+		if !log.completedPair("active.crt") {
+			t.Error("the pair this walk read whole lost its wholeness to the ceiling: noteMissingKey" +
+				" would report a key being replaced as an ordinary orphan, which vetoes nothing")
+		}
+		if got := log.takeEvictedWholeness(); got != 0 {
+			t.Errorf("takeEvictedWholeness = %d, want 0: nothing evictable existed, so the log holds"+
+				" one entry over the ceiling rather than spending the active scan's evidence", got)
+		}
+	})
+
+	t.Run("a pair an earlier scan read whole is still evictable", func(t *testing.T) {
+		t.Parallel()
+		log := newObservationLog(1)
+		// Established outside any walk: what an earlier scan leaves behind, and what an
+		// eviction may legitimately take.
+		log.markWhole("stale.crt")
+		log.beginScan()
+		t.Cleanup(log.endScan)
+
+		log.markWhole("fresh.crt")
+
+		if log.completedPair("stale.crt") {
+			t.Error("nothing was evicted at the ceiling, so the protected-pair case above would pass" +
+				" even with the ceiling removed")
+		}
+		if got := log.takeEvictedWholeness(); got != 1 {
+			t.Errorf("takeEvictedWholeness = %d, want 1: a dropped wholeness entry is this scan's reap veto", got)
+		}
+	})
 }
 
 // TestScannerRun_fails_closed_when_the_observation_log_evicts_wholeness_evidence is the

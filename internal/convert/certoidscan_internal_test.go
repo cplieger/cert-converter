@@ -524,6 +524,29 @@ func TestOversizedCertificateOIDError_accepts_a_wide_but_legal_identifier(t *tes
 	}
 }
 
+// TestOversizedCertificateOIDError_ignores_a_policy_qualifier_identifier is the
+// regression test for the third defect: the walk refused an identifier crypto/x509
+// never decodes.
+//
+// parseCertificatePoliciesExtension reads one OBJECT IDENTIFIER per PolicyInformation
+// and then advances to the next, so a qualifier's policyQualifierId is never decoded and
+// never allocated. Measuring it protected no allocation while turning a certificate the
+// parser accepts into a conversion failure. Nothing else in this file pins that, because
+// the row that asserted the old refusal was deleted together with the walk.
+func TestOversizedCertificateOIDError_ignores_a_policy_qualifier_identifier(t *testing.T) {
+	t.Parallel()
+
+	fixture := legalCertificateFixture(t)
+	fixture.policyQualifier = oversizedOIDContent(t)
+	der := fixture.build(t)
+	if _, err := x509.ParseCertificate(der); err != nil {
+		t.Fatalf("x509.ParseCertificate(a certificate naming an oversized policy qualifier identifier) = error %v, want nil: the parser reads nothing out of a qualifier", err)
+	}
+	if err := oversizedCertificateOIDError(certificateBlock(der)); err != nil {
+		t.Errorf("oversizedCertificateOIDError(an oversized policy qualifier identifier) = %v, want nil: x509 decodes nothing out of a qualifier, so refusing one rejects a certificate the parser accepts", err)
+	}
+}
+
 // TestOversizedCertificateOIDError_ignores_an_unknown_extensions_opaque_value is
 // the regression test for the second defect: the guard read opaque bytes as DER.
 //

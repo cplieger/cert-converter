@@ -429,3 +429,50 @@ func TestResyncWatchSet_unregisters_a_directory_the_rebuild_no_longer_reaches(t 
 		t.Errorf("the live registration set holds %d watches, want %d (the budget): %v", got, want, watcher.WatchList())
 	}
 }
+
+// TestResyncWatchSet_keeps_the_mirror_charged_when_the_rebuild_is_abandoned pins the
+// three-phase rebuild's central invariant, and the one every success-path test above is
+// blind to: the membership mirror is the ONLY count the live-set ceiling is read from
+// (visitWatchPath's watchSetSize test), so a rebuild the PREFLIGHT abandons must leave it
+// charged with the registrations the kernel is still holding. Emptying it first — what the
+// clear-then-prune rebuild did — loses those descriptors from the count permanently, and
+// the next rebuild then admits another whole budget on top of a live set that is still
+// there, while watchSetSize keeps reporting at most the cap. That ceiling is a share of
+// the per-UID fs.inotify.max_user_watches quota, so the overrun is paid by unrelated
+// same-UID consumers.
+//
+// Every other resyncWatchSet test in this file passes identically on the clear-then-prune
+// rebuild, because all of them drive the SUCCESS path, which emptied the mirror and then
+// re-recorded the walk's survivors. Only a failure direction separates the two shapes.
+//
+// The driver is the reachable producer: an /input mount that goes away mid-run, so WalkDir
+// reports the failure for the ROOT entry and the rebuild returns before it has touched the
+// watcher or the mirror.
+// Not parallel: the abandoned rebuild WARNs to the process-global slog default.
+func TestResyncWatchSet_keeps_the_mirror_charged_when_the_rebuild_is_abandoned(t *testing.T) {
+	capture.Default(t)
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "example.com"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	w := New(root, func(context.Context) {})
+
+	w.resyncWatchSet(t.Context(), watcher, "failed to re-sync the watch set")
+	charged := w.watchSetSize()
+	if charged != 2 {
+		t.Fatalf("setup: the mirror holds %d registrations, want 2 (the root and example.com)", charged)
+	}
+
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+
+	w.resyncWatchSet(t.Context(), watcher, "failed to re-sync the watch set")
+
+	if got := w.watchSetSize(); got != charged {
+		t.Errorf("after an abandoned rebuild the mirror holds %d registrations, want the %d it was charged:"+
+			" every failure direction must OVER-count the kernel's set, or the next rebuild admits a second"+
+			" full budget over registrations this one forgot", got, charged)
+	}
+}

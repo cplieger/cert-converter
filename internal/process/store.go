@@ -60,8 +60,9 @@ type store struct {
 // laxDirMsg is the standing WARN for an /output directory more permissive than
 // pfxDirMode: a group- or world-WRITABLE directory lets any other process on the
 // shared mount unlink a bundle or replace it, and a world-TRAVERSABLE one exposes the
-// bundle names. This app creates the directory at pfxDirMode
-// (atomicfile.WithMkdirMode) and never revisits it, so a directory an operator or an
+// bundle names. This app creates the directory at pfxDirMode (store.write's own
+// root.MkdirAll, which is what atomicfile's WithMkdirMode did before the write's parent
+// pin needed it to exist first) and never revisits it, so a directory an operator or an
 // earlier deployment left lax is reported nowhere else — while the README's own setup
 // step (`mkdir -p ... && chown ...`) produces 0755 under the default umask, and 0775
 // under a umask of 0002.
@@ -1049,7 +1050,14 @@ var errOutputBudgetExceeded = errors.New("output tree exceeds the per-scan entry
 // on it like every other reason reaping stops — a budget that bites silently is a
 // bundle set that stops being reconciled with nothing to show why — and it names the
 // health outcome, because a too-large /output is not clearable by a restart.
-const outputBudgetMsg = reapDisabledPhrase + ": the /output tree holds more entries than one scan will enumerate, so no output can be proven orphaned; health is unaffected"
+//
+// Its wording must NOT contain "holds more entries than one scan will enumerate": the
+// README publishes that phrase as CertConverterInputTreeTooLarge's whole matcher, whose
+// remediation sends the operator to the /input mount. Two documented conditions with
+// different remediations cannot share a matcher, so this message says "bundles" and
+// "output walk" where scanBudgetMsg says "entries" and "scan". The exclusion is pinned
+// in alert_contract_test.go.
+const outputBudgetMsg = reapDisabledPhrase + ": the /output tree holds more bundles than one output walk will enumerate, so no output can be proven orphaned; health is unaffected"
 
 // outputBudgetRemediation is that WARN's operator action, naming both ways out exactly
 // as scanBudgetRemediation does for /input.

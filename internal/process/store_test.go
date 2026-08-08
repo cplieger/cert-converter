@@ -437,8 +437,8 @@ func TestStoreInspect_reports_a_bundle_that_vanishes_mid_inspection(t *testing.T
 // that is a user choice. you can throw a warning but dont make the container
 // unhealthy").
 //
-// The app creates the directory at pfxDirMode once, through
-// atomicfile.WithMkdirMode, and MkdirAll is a no-op on a directory that already
+// The app creates the directory at pfxDirMode once, through store.write's own confined
+// MkdirAll, which is a no-op on a directory that already
 // exists — so a directory an operator (or the README's own `mkdir -p`, which yields
 // 0755 under the default umask and 0775 under a umask of 0002) left group- or
 // world-accessible is named nowhere else, while this app polices the private-key

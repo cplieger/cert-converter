@@ -59,3 +59,54 @@ func TestOperatorLogContract_pins_every_published_message_substring(t *testing.T
 		})
 	}
 }
+
+// inputBudgetPhrase is the whole of CertConverterInputTreeTooLarge's matcher, restated
+// here for the exclusion below. The inclusion side is the table case above.
+const inputBudgetPhrase = "holds more entries than one scan will enumerate"
+
+// TestOperatorLogContract_keeps_the_published_matchers_mutually_exclusive is the other
+// half of the contract above, and the half a Contains-only table cannot see.
+//
+// CertConverterInputTreeTooLarge matches on a PHRASE, not on a whole message, so any
+// other message containing that phrase fires it too -- and its remediation ("check that
+// /input is mounted at the certificate directory ... or raise MAX_SCAN_ENTRIES") sends
+// the operator to the wrong mount for any condition that is not the /input walk. The
+// /output entry budget is the near miss: it is a different documented condition with its
+// own rule (CertConverterOrphanRemovalDisabled), its own remediation naming /output, and
+// a WARN whose own doc comment says the generic /output-ownership diagnosis is the wrong
+// one for it. Sharing a matcher with the /input rule would undo exactly that.
+//
+// So scanBudgetMsg is the phrase's ONLY carrier. This test fails if a reword gives it a
+// second one.
+func TestOperatorLogContract_keeps_the_published_matchers_mutually_exclusive(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		message string
+	}{
+		{
+			// Same shaped condition, different mount, different remediation: the one
+			// message most likely to be worded into a collision.
+			name:    "the /output entry budget does not fire the /input rule",
+			message: outputBudgetMsg,
+		},
+		{
+			// Also a ceiling condition, also reported through reapDisabledPhrase, so the
+			// same wording pull applies to it.
+			name:    "the evicted-wholeness abort does not fire the /input rule",
+			message: evictedEvidenceMsg,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if strings.Contains(tc.message, inputBudgetPhrase) {
+				t.Errorf("this app logs %q, which contains %q -- the substring the README publishes as"+
+					" CertConverterInputTreeTooLarge's matcher. This condition would fire the /input rule and"+
+					" hand the operator the /input remediation, pointing them at the wrong mount; reword it so"+
+					" only scanBudgetMsg carries the phrase", tc.message, inputBudgetPhrase)
+			}
+		})
+	}
+}
