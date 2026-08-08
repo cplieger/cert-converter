@@ -1,6 +1,7 @@
 package process
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"os"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
+	"github.com/cplieger/cert-converter/internal/testcerts"
 )
 
 // newOutputStore opens dir as a confined output root and returns the store under test,
@@ -346,88 +348,6 @@ func TestStoreInspect_names_a_non_regular_prior_output(t *testing.T) {
 				t.Errorf("inspect(non-regular) logged %q, want a remediation hint", logs.Messages())
 			}
 		})
-	}
-}
-
-// TestStoreInspect_reports_a_bundle_that_vanishes_mid_inspection pins the two arms
-// inspect takes when the prior bundle disappears after the lstat that classified it
-// as a usable regular file: the tightening whose RESULT cannot be observed, and the
-// read that then finds nothing.
-//
-// Both are reachable on a co-mounted /output -- a second writer, or a restore that
-// replaces the tree while a scan runs -- and neither is named anywhere else. The
-// tightening arm is the one a plausible simplification silently inverts: drop
-// chmodAndObserve's re-stat error and the zero FileMode it returns is not laxer than
-// policy, so the switch takes its DEFAULT arm and reports "tightened the file mode of
-// a prior pfx" at INFO, telling an operator that private-key permissions were repaired
-// on a bundle this app can no longer see at all. The read arm must stay a WARN plus a
-// stale verdict rather than an error: an error here fails the pair and pins the
-// container unhealthy over a condition the rewrite itself fixes.
-//
-// want is never dereferenced: both verdicts are reached before any bundle is decoded.
-// The chmod seam stands in for the timing, exactly as the untightenable-mode test uses
-// it for a filesystem that stores no permission bits; neither is stageable in a temp
-// directory. Runs serially: it swaps slog.Default() and the chmod seam.
-func TestStoreInspect_reports_a_bundle_that_vanishes_mid_inspection(t *testing.T) {
-	dir := t.TempDir()
-	s := newOutputStore(t, dir)
-	if err := s.write(t.Context(), "out.pfx", []byte("prior bundle")); err != nil {
-		t.Fatalf("setup: write: %v", err)
-	}
-	// Lax enough that tightenMode acts at all; the vanishing happens inside it.
-	if err := os.Chmod(filepath.Join(dir, "out.pfx"), 0o644); err != nil {
-		t.Fatalf("setup: Chmod: %v", err)
-	}
-	prev := chmodFile
-	chmodFile = func(f *os.File, mode os.FileMode) error {
-		if err := f.Chmod(mode); err != nil {
-			return err
-		}
-		// Unlinked through the ambient path rather than the handle: the repair's
-		// confirming re-stat reads the bundle's NAME through the pinned parent (a
-		// descriptor's own Stat would keep answering for an unlinked inode), so the
-		// vanishing has to happen to the name for the arm under test to be reached.
-		return os.Remove(filepath.Join(dir, "out.pfx"))
-	}
-	t.Cleanup(func() { chmodFile = prev })
-
-	// Spelled out rather than imported from the production consts: an operator's log
-	// query keys on these words, so a silent rename must fail here.
-	const notTightenedMsg = "prior pfx is more permissive than policy and could not be tightened"
-	const tightenedMsg = "tightened the file mode of a prior pfx"
-	const unreadableMsg = "cannot read prior pfx; regenerating"
-
-	logs := captureLogs(t)
-	current, err := inspectCurrent(t.Context(), s, "out.pfx", nil, convert.EncNameModern2023, "pw")
-	if err != nil {
-		t.Fatalf("inspect(bundle removed mid-inspection) = error %v, want nil: an unreadable prior bundle is"+
-			" something this app fixes by rewriting, not a failure that flips health", err)
-	}
-	if current {
-		t.Error("inspect(bundle removed mid-inspection) = true, want false: a bundle that is not there cannot be the current one")
-	}
-	if got := logs.CountLevel(slog.LevelWarn, notTightenedMsg); got != 1 {
-		t.Errorf("inspect(bundle removed mid-inspection) logged %q at WARN %d times, want exactly 1: %q",
-			notTightenedMsg, got, logs.Messages())
-	}
-	if _, ok := logs.AttrValue(notTightenedMsg, "error"); !ok {
-		t.Errorf("inspect(bundle removed mid-inspection) logged %q without an error attribute, want the re-stat"+
-			" failure carried so the operator learns the mode was never observed: %q", notTightenedMsg, logs.Messages())
-	}
-	if got := logs.CountLevel(slog.LevelInfo, tightenedMsg); got != 0 {
-		t.Errorf("inspect(bundle removed mid-inspection) logged %q %d times, want 0: the chmod's result was never"+
-			" observed, so claiming the repair tells the operator the opposite of the truth: %q", tightenedMsg, got, logs.Messages())
-	}
-	if got := logs.CountLevel(slog.LevelWarn, unreadableMsg); got != 1 {
-		t.Errorf("inspect(bundle removed mid-inspection) logged %q at WARN %d times, want exactly 1: %q",
-			unreadableMsg, got, logs.Messages())
-	}
-	if !logs.HasAttr(unreadableMsg, "path", "out.pfx") {
-		t.Errorf("inspect(bundle removed mid-inspection) logged %q, want path=out.pfx so the operator can identify"+
-			" the bundle: %q", unreadableMsg, logs.Messages())
-	}
-	if _, ok := logs.AttrValue(unreadableMsg, "remediation"); !ok {
-		t.Errorf("inspect(bundle removed mid-inspection) logged %q without a remediation hint: %q", unreadableMsg, logs.Messages())
 	}
 }
 
@@ -800,43 +720,6 @@ func TestStoreListOutputs_enumerates_a_nested_tree(t *testing.T) {
 	}
 }
 
-// TestOwnedByThisProcess_answers_the_chmod_authorization_question pins the
-// discriminator the untightenable-mode arms branch on, which every chmod-refusal test
-// reaches through the fileOwnedByProcess seam and therefore never executes.
-//
-// Both halves matter. A file this process just created is OWNED, which is what routes
-// a mode-forcing filesystem's EPERM onto the WARN-only arm instead of scheduling a
-// rewrite that would land with the same forced mode. And a FileInfo carrying no
-// *syscall.Stat_t answers false, which keeps the documented deployment shape (a
-// root-owned bundle left by an earlier PUID mapping) on the arm that repairs it —
-// failing OPEN toward repair rather than assuming ownership it could not read.
-func TestOwnedByThisProcess_answers_the_chmod_authorization_question(t *testing.T) {
-	t.Parallel()
-	path := filepath.Join(t.TempDir(), "owned")
-	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
-		t.Fatalf("setup: WriteFile: %v", err)
-	}
-	fi, err := os.Lstat(path)
-	if err != nil {
-		t.Fatalf("setup: Lstat: %v", err)
-	}
-	if !ownedByThisProcess(fi) {
-		t.Errorf("ownedByThisProcess(a file this process created) = false, want true: the euid that"+
-			" owns a file may always chmod it, which is the premise the WARN-only refusal arm rests on"+
-			" (file uid vs euid %d)", os.Geteuid())
-	}
-	if ownedByThisProcess(statlessFileInfo{fi}) {
-		t.Error("ownedByThisProcess(a FileInfo with no *syscall.Stat_t) = true, want false: an" +
-			" unreadable ownership must route the refusal to the arm that regenerates")
-	}
-}
-
-// statlessFileInfo is an os.FileInfo whose Sys() carries no *syscall.Stat_t, the
-// shape a non-POSIX or synthetic filesystem hands back.
-type statlessFileInfo struct{ os.FileInfo }
-
-func (statlessFileInfo) Sys() any { return nil }
-
 // TestStoreWrite_refuses_a_bundle_whose_parent_is_an_in_root_symlink pins the
 // confinement property *os.Root does NOT give this app: a root confines a path without
 // PINNING it, so it deliberately follows a symlink component that stays inside the root.
@@ -906,61 +789,285 @@ func TestStoreWrite_refuses_a_bundle_whose_parent_is_an_in_root_symlink(t *testi
 	}
 }
 
-// TestStoreTightenMode_refuses_a_bundle_whose_parent_is_an_in_root_symlink is the mode
-// half of the same hazard, and the reason the repair reads the bundle's OPEN HANDLE
-// rather than its name.
+// TestScannerRun_rewrites_a_content_current_bundle_whose_mode_is_lax pins the whole of
+// the ratified fix-on-write shape end to end: a bundle whose CONTENT matches what these
+// inputs produce but whose mode carries a bit pfxFileMode does not is REWRITTEN rather
+// than skipped, and the fresh inode the rewrite installs is what corrects the mode.
 //
-// inspect classifies the prior bundle by Lstat-ing the output path, which the confined
-// root resolves THROUGH an in-root symlink, so the FileInfo it hands the repair can
-// legitimately describe a file in another subtree — exactly what the fixture passes
-// here. A repair that then chmods the same pathname applies another certificate's
-// private-key bundle the mode this app decided for its own.
+// It is the load-bearing test for two things a plausible simplification silently breaks.
+// Read bundleState.upToDate as "content matched, so skip the write" and the private-key
+// bundle keeps its lax mode for the life of the deployment with nothing logged after the
+// first scan -- which is exactly the state the retired chmod mechanism existed to prevent,
+// so removing that mechanism without this routing would be a regression rather than a
+// simplification. And the mode must arrive from the WRITE (atomicfile's WithMode on a
+// staged temp, confirmed to survive the rename over a laxer file), never from a chmod on
+// the operator's file: this app does not mutate a mode it finds under /output.
 //
-// The refusal is WARN-only and never touches health: a mode this app cannot repair on a
-// stranger's /output is not a reason to restart the container, which is the settled
-// routing for every /output permission state. Runs serially: it swaps slog.Default().
-func TestStoreTightenMode_refuses_a_bundle_whose_parent_is_an_in_root_symlink(t *testing.T) {
-	dir := t.TempDir()
-	victimDir := filepath.Join(dir, "victim")
-	if err := os.Mkdir(victimDir, pfxDirMode); err != nil {
-		t.Fatalf("setup: Mkdir: %v", err)
+// The mode is asserted as a CHANGE (laxer-than-policy before, not-laxer after, and the
+// exact policy mode) rather than only as an absolute, because a filesystem with
+// mount-forced modes stores something else entirely and the property under test is that
+// the app stopped needing to care. The bytes are asserted to have CHANGED too: a rewrite
+// that reused the old inode would pass the mode assertion while proving nothing.
+//
+// Serial: it swaps slog.Default().
+func TestScannerRun_rewrites_a_content_current_bundle_whose_mode_is_lax(t *testing.T) {
+	for _, lax := range []os.FileMode{
+		// Group- and world-readable: the realistic shapes, a private key others can read.
+		0o640, 0o644, 0o664,
+		// The family the retired chmod got WRONG (h-f4): perm & pfxFileMode masks 0o244
+		// to 0o200, an owner-write-but-not-read mode the app could not read its own
+		// bundle back through. The rewrite has no target mode to compute, so it installs
+		// pfxFileMode outright and the whole class stops existing.
+		0o244, 0o204,
+		// Masks to 0o000 under that same computation, the family whose special case the
+		// deleted floor existed for.
+		0o044, 0o100,
+	} {
+		t.Run(lax.String(), func(t *testing.T) {
+			certsRoot := t.TempDir()
+			outRoot := t.TempDir()
+			_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
+			writePair(t, certsRoot, "chain", chainPEM, keyPEM)
+			scanner := New(&Options{
+				CertsRoot: certsRoot,
+				OutRoot:   outRoot,
+				Password:  "pw",
+				Encoder:   convert.EncNameModern2023,
+			})
+			if res, err := scanner.Run(t.Context()); err != nil || res.Converted != 1 {
+				t.Fatalf("setup: initial Run = %+v, %v, want Converted 1 and nil", res, err)
+			}
+			pfxPath := filepath.Join(outRoot, "chain.pfx")
+			before, beforeInfo := readBundle(t, pfxPath)
+
+			// Content untouched, mode loosened: the only reason to rewrite is the mode.
+			if err := os.Chmod(pfxPath, lax); err != nil {
+				t.Fatalf("setup: Chmod(%v): %v", lax, err)
+			}
+			staged, _ := readBundle(t, pfxPath)
+			if !bytes.Equal(staged, before) {
+				t.Fatalf("setup: Chmod(%v) changed the bundle's bytes, want only the mode touched", lax)
+			}
+			if stored := storedPerm(t, pfxPath); !laxerThanPolicy(stored) {
+				t.Skipf("this filesystem stored %v for a chmod to %v, so there is no lax mode to correct",
+					stored, lax)
+			}
+
+			res, err := scanner.Run(t.Context())
+			if err != nil {
+				t.Fatalf("Run(content-current, lax mode) = error %v, want nil", err)
+			}
+			// Converted, not Unchanged: the write is how the mode is corrected, so a scan
+			// that skipped it would report the bundle as needing nothing.
+			if res.Converted != 1 || res.Failed != 0 || res.Unwritable != 0 {
+				t.Errorf("Run(content-current, lax mode) = %+v, want Converted 1 Failed 0 Unwritable 0:"+
+					" a lax mode must route through the ordinary rewrite", res)
+			}
+			after, afterInfo := readBundle(t, pfxPath)
+			if perm := afterInfo.Mode().Perm(); laxerThanPolicy(perm) {
+				t.Errorf("Run(content-current, lax mode %v) left mode %v, still laxer than policy %v:"+
+					" the rewrite must install a mode carrying no extra bit",
+					lax, perm, os.FileMode(pfxFileMode))
+			}
+			if perm := afterInfo.Mode().Perm(); perm != pfxFileMode {
+				t.Errorf("Run(content-current, lax mode %v) left mode %v, want %v: the write installs"+
+					" pfxFileMode outright rather than masking the mode it found",
+					lax, perm, os.FileMode(pfxFileMode))
+			}
+			// A fresh inode, which is the mechanism: atomicfile stages a temp at the wanted
+			// mode and renames it over the old file. Same certificates, so the PFX differs
+			// only by its fresh KDF salts -- but it MUST differ, or nothing was rewritten.
+			if bytes.Equal(after, before) {
+				t.Error("Run(content-current, lax mode) left the bundle's bytes identical, want a fresh" +
+					" bundle: the mode is corrected by REPLACING the inode, not by chmodding it")
+			}
+			if os.SameFile(beforeInfo, afterInfo) {
+				t.Error("Run(content-current, lax mode) kept the same inode, want a replacement: a mode" +
+					" that changed in place means something chmodded the operator's file")
+			}
+
+			// Once ever, not once per scan: the corrected bundle is at policy, so the next
+			// scan finds nothing lax, skips the write and leaves the bytes alone.
+			settled, settledInfo := readBundle(t, pfxPath)
+			res, err = scanner.Run(t.Context())
+			if err != nil {
+				t.Fatalf("Run(third scan) = error %v, want nil", err)
+			}
+			if res.Unchanged != 1 || res.Converted != 0 {
+				t.Errorf("Run(third scan) = %+v, want Unchanged 1 Converted 0: a bundle already at policy"+
+					" must not be rewritten again", res)
+			}
+			final, finalInfo := readBundle(t, pfxPath)
+			if !bytes.Equal(final, settled) || !os.SameFile(settledInfo, finalInfo) {
+				t.Error("Run(third scan) rewrote a bundle already at policy, want it left alone: the" +
+					" one-time cost must not become a per-scan rewrite loop")
+			}
+		})
 	}
-	victim := filepath.Join(victimDir, "cert.pfx")
-	if err := os.WriteFile(victim, []byte("the sibling domain's bundle"), 0o644); err != nil {
-		t.Fatalf("setup: WriteFile: %v", err)
-	}
-	if err := os.Symlink("victim", filepath.Join(dir, "example.com")); err != nil {
-		t.Fatalf("setup: Symlink: %v", err)
-	}
-	s := newOutputStore(t, dir)
-	// The FileInfo the confined Lstat really produces for the redirected path: the
-	// victim's, laxer than policy, so the repair is asked for at all.
-	classified, err := s.lstat("example.com/cert.pfx")
+}
+
+// storedPerm reports the permission bits the filesystem actually stored for path. It
+// exists because the mode assertions above are about a CHANGE the filesystem has to have
+// accepted for the case to mean anything, and a mount that forces modes stores something
+// else (which is why the caller skips rather than fails there).
+func storedPerm(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	fi, err := os.Stat(path)
 	if err != nil {
-		t.Fatalf("setup: lstat through the symlink: %v", err)
+		t.Fatalf("stat %s: %v", path, err)
 	}
-	before := classified.Mode().Perm()
-	if !laxerThanPolicy(before) {
-		t.Fatalf("setup: classified mode = %o, want a mode laxer than policy: the fixture must present"+
-			" a repairable mode or tightenMode returns before the pin", before)
+	return fi.Mode().Perm()
+}
+
+// TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install pins the
+// report half of the shape: the single WARN a lax prior bundle earns, and what it says.
+//
+// Three properties, each of which a reasonable-looking edit breaks. The message must be
+// the report-only one and NOT a claim that a repair happened -- the retired mechanism
+// logged "tightened the file mode of a prior pfx" at INFO, and on the 0o244 family it
+// logged that over a bundle it had just made unreadable, which is how a success record
+// came to mean the opposite of the truth. It must name BOTH modes, because "more
+// permissive than policy" alone tells an operator neither what is on their volume nor
+// what the app is about to do about it. And it must fire exactly once per bundle per
+// scan, since the fact is a property of one file and an operator reading a lax /output
+// must not get a line per retry behind it.
+//
+// Asserted through inspect rather than through Run so the WARN is attributed to the
+// detection itself, with no write in the picture.
+// Serial: it swaps slog.Default().
+func TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install(t *testing.T) {
+	outRoot := t.TempDir()
+	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
+	analysis, err := convert.Analyse(chainPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
 	}
+	pfx, err := convert.Encode(&analysis, convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+	pfxPath := filepath.Join(outRoot, "chain.pfx")
+	if err := os.WriteFile(pfxPath, pfx, 0o600); err != nil {
+		t.Fatalf("setup: write bundle: %v", err)
+	}
+	if err := os.Chmod(pfxPath, 0o644); err != nil {
+		t.Fatalf("setup: Chmod: %v", err)
+	}
+	found := storedPerm(t, pfxPath)
+	if !laxerThanPolicy(found) {
+		t.Skipf("this filesystem stored %v for a chmod to 0644, so there is no lax mode to report", found)
+	}
+	s := newOutputStore(t, outRoot)
 
 	logs := captureLogs(t)
-	if got := s.tightenMode("example.com/cert.pfx", classified); got != tightenIneffective {
-		t.Errorf("tightenMode(through a symlinked parent) = %v, want tightenIneffective: an unpinnable"+
-			" bundle is reported and left alone, and it must not schedule the rewrite a refusal does", got)
+	state, err := s.inspect(t.Context(), "chain.pfx", &analysis, convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("inspect(lax bundle) = error %v, want nil", err)
 	}
-	if got := logs.CountLevel(slog.LevelWarn, modeRepairUnpinnableMsg); got != 1 {
-		t.Errorf("tightenMode(through a symlinked parent) logged %q at WARN %d times, want exactly 1:"+
-			" nothing else names a repair this app declined to attempt: %q",
-			modeRepairUnpinnableMsg, got, logs.Messages())
+	// The two facts the WARN accompanies: content matched, mode lax. Together they are
+	// what makes this rewrite a mode-only one, which is what keeps a failed rewrite of it
+	// health-neutral.
+	if state.content != contentVerifiedCurrent || !state.modeLax {
+		t.Errorf("inspect(lax bundle) = %+v, want contentVerifiedCurrent with modeLax set", state)
 	}
-	fi, statErr := os.Lstat(victim)
-	if statErr != nil {
-		t.Fatalf("stat-ing the sibling bundle: %v", statErr)
+	if state.upToDate() {
+		t.Error("inspect(lax bundle).upToDate() = true, want false: a lax mode is corrected by the" +
+			" rewrite, so the write must not be skipped")
 	}
-	if perm := fi.Mode().Perm(); perm != before {
-		t.Errorf("sibling bundle mode = %o, want %o unchanged: the repair followed the symlink and"+
-			" changed the permissions of another certificate's private-key bundle", perm, before)
+	if !state.modeRepairOnly() {
+		t.Error("inspect(lax bundle).modeRepairOnly() = false, want true: this rewrite carries no new" +
+			" bytes, which is what keeps its failure health-neutral")
+	}
+	if got := logs.CountLevel(slog.LevelWarn, laxBundleMsg); got != 1 {
+		t.Errorf("inspect(lax bundle) logged %q at WARN %d times, want exactly 1: %q",
+			laxBundleMsg, got, logs.Messages())
+	}
+	// Names the mode FOUND and the mode this app will INSTALL. Read from the filesystem
+	// rather than hardcoded, so a mount that stored something other than 0644 still
+	// asserts that the WARN reports what is really there.
+	for key, want := range map[string]string{
+		"path": "chain.pfx",
+		"mode": found.String(),
+		"want": os.FileMode(pfxFileMode).String(),
+	} {
+		if !logs.HasAttr(laxBundleMsg, key, want) {
+			got, _ := logs.AttrValue(laxBundleMsg, key)
+			t.Errorf("inspect(lax bundle) logged %s=%q, want %q", key, got, want)
+		}
+	}
+	// No repair is claimed, and none is attempted: the mode on disk is exactly as found
+	// after an inspection, because correcting it is the write path's job.
+	if got := storedPerm(t, pfxPath); got != found {
+		t.Errorf("inspect(lax bundle) changed the mode to %v, want %v untouched: inspection must never"+
+			" chmod the operator's file", got, found)
+	}
+	for _, unwanted := range []string{
+		"tightened the file mode of a prior pfx",
+		"prior pfx is more permissive than policy and could not be tightened",
+		"could not pin the prior pfx for a mode repair; leaving its mode as found",
+	} {
+		if logs.Count(unwanted) != 0 {
+			t.Errorf("inspect(lax bundle) logged %q, want it gone: this app no longer repairs a mode in"+
+				" place, so no record may describe one: %q", unwanted, logs.Messages())
+		}
+	}
+}
+
+// TestStoreRemoveOrphan_reports_a_refused_unlink_and_keeps_the_candidate pins
+// removeOrphan's final arm, the refused unlink itself: the candidate is kept
+// (removed=false, so it is never counted, never audited as deleted, and its lone-key
+// report is not retired), and the refusal is a WARN with the error and the /output
+// ownership hint -- the only operator signal that sync mode is silently failing to
+// reconcile. Reporting a refused unlink as removed would corrupt the deletion audit
+// for the one destructive action this app takes.
+//
+// A parent directory without the write bit is the failure injection (the pin and the
+// re-check Lstat need only read+exec, so they succeed and only the unlink is
+// refused); it does nothing under uid 0, so the test skips there, exactly like the
+// suite's other permission-based fixtures. Runs serially: it swaps slog.Default().
+func TestStoreRemoveOrphan_reports_a_refused_unlink_and_keeps_the_candidate(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	// Spelled out rather than imported from the production call site: an operator's
+	// log query keys on these words, so a silent rewording must fail here.
+	const refusedWarn = "could not remove orphaned output"
+
+	dir := t.TempDir()
+	nested := filepath.Join(dir, "ca1")
+	if err := os.Mkdir(nested, 0o750); err != nil {
+		t.Fatalf("setup: Mkdir: %v", err)
+	}
+	bundle := filepath.Join(nested, "gone.pfx")
+	if err := os.WriteFile(bundle, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	// Read+exec but no write: the pinned descent and the re-check Lstat succeed,
+	// only the unlink is refused.
+	if err := os.Chmod(nested, 0o550); err != nil {
+		t.Fatalf("setup: Chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(nested, 0o750) })
+	s := newOutputStore(t, dir)
+	logs := captureLogs(t)
+
+	if removed := s.removeOrphan("ca1/gone.pfx"); removed {
+		t.Error("removeOrphan(refused unlink) = true, want false: a bundle still on disk must" +
+			" not be counted as removed, audited as deleted, or have its lone-key report retired")
+	}
+	if _, statErr := os.Stat(bundle); statErr != nil {
+		t.Errorf("the bundle is gone after a refused unlink: %v", statErr)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, refusedWarn); got != 1 {
+		t.Errorf("removeOrphan(refused unlink) logged %q at WARN %d times, want exactly 1: it"+
+			" is the only signal that sync mode is silently failing to reconcile: %q",
+			refusedWarn, got, logs.Messages())
+	}
+	if _, ok := logs.AttrValue(refusedWarn, "error"); !ok {
+		t.Errorf("removeOrphan(refused unlink) logged %q with no error attribute: %q",
+			refusedWarn, logs.Messages())
+	}
+	if got, ok := logs.AttrValue(refusedWarn, "remediation"); !ok || got != outputPermRemediation {
+		t.Errorf("removeOrphan(refused unlink) logged remediation %q, want %q", got, outputPermRemediation)
 	}
 }

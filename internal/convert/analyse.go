@@ -552,7 +552,7 @@ type certGraph struct {
 	// the input file dictates, and three places ask — the root set, every hop of
 	// pathFrom, and assembleChain's self-signed carve-out.
 	selfSigned map[int]bool
-	// decodedSubjects[i] / decodedIssuers[i] memoise the CANONICALISED raw subject
+	// canonicalSubjects[i] / canonicalIssuers[i] memoise the CANONICALISED raw subject
 	// and issuer names, for the same reason proof memoises a signature: the decode is
 	// O(name size) work the FILE dictates, and the linkage classifier asks for the
 	// subject and the issuer of every certificate against every other one. This is
@@ -560,8 +560,8 @@ type certGraph struct {
 	// here, once per certificate, and stored as a fact on the edge. Measured on a
 	// 64-block, 8.87 MB bundle inside both existing caps: 12.4s of a 15.2s Analyse
 	// went on repeated decodes, against 97ms to parse all 64 blocks once.
-	decodedSubjects []decodedDN
-	decodedIssuers  []decodedDN
+	canonicalSubjects []canonicalDN
+	canonicalIssuers  []canonicalDN
 	// candidateParents[i]: indices that could be issuers of certs[i] — linked to it
 	// by key identifier or by name (byte-identical DER, or semantically equal after
 	// an ASN.1 decode) and not excluded as key reuse, and either RFC-eligible to
@@ -745,15 +745,15 @@ func unverifiableKeyReason(pub crypto.PublicKey) string {
 // refused for a key it never reads.
 func newCertGraph(certs []*x509.Certificate, now time.Time) *certGraph {
 	g := &certGraph{
-		now:              now,
-		certs:            certs,
-		evidence:         make([]issuanceEvidence, len(certs)*len(certs)),
-		candidateParents: make([][]int, len(certs)),
-		children:         make([][]int, len(certs)),
-		proof:            make(map[[2]int]bool),
-		selfSigned:       make(map[int]bool, len(certs)),
-		decodedSubjects:  make([]decodedDN, len(certs)),
-		decodedIssuers:   make([]decodedDN, len(certs)),
+		now:               now,
+		certs:             certs,
+		evidence:          make([]issuanceEvidence, len(certs)*len(certs)),
+		candidateParents:  make([][]int, len(certs)),
+		children:          make([][]int, len(certs)),
+		proof:             make(map[[2]int]bool),
+		selfSigned:        make(map[int]bool, len(certs)),
+		canonicalSubjects: make([]canonicalDN, len(certs)),
+		canonicalIssuers:  make([]canonicalDN, len(certs)),
 	}
 	g.fillEvidence()
 	for child := range certs {
@@ -826,7 +826,7 @@ func (g *certGraph) nameLink(child, parent int) nameLinkage {
 	}
 	childIssuer, issuerOK := g.issuerName(child)
 	parentSubject, subjectOK := g.subjectName(parent)
-	if sameDecodedName(childIssuer, issuerOK, parentSubject, subjectOK) {
+	if sameCanonicalName(childIssuer, issuerOK, parentSubject, subjectOK) {
 		return nameLinkSemantic
 	}
 	return nameLinkNone
@@ -850,7 +850,7 @@ func (g *certGraph) sameNameSameKey(child, parent int) bool {
 	if !bytes.Equal(c.RawSubject, p.RawSubject) {
 		childSubject, childOK := g.subjectName(child)
 		parentSubject, parentOK := g.subjectName(parent)
-		if !sameDecodedName(childSubject, childOK, parentSubject, parentOK) {
+		if !sameCanonicalName(childSubject, childOK, parentSubject, parentOK) {
 			return false
 		}
 	}
@@ -1123,15 +1123,15 @@ func canonicalName(raw []byte) ([]byte, bool) {
 	return canonical, true
 }
 
-// sameDecodedName reports whether two names are the same name. It is the single home
+// sameCanonicalName reports whether two names are the same name. It is the single home
 // of the semantic half of the package's name rule: a name that could not be read
 // matches nothing, and two names are equal only as whole canonicalised RDNSequences,
 // so RDN order and multi-valued grouping are preserved.
-func sameDecodedName(a []byte, aOK bool, b []byte, bOK bool) bool {
+func sameCanonicalName(a []byte, aOK bool, b []byte, bOK bool) bool {
 	return aOK && bOK && bytes.Equal(a, b)
 }
 
-// decodedDN is one memoised raw-name canonicalisation: the canonical DER of the
+// canonicalDN is one memoised raw-name canonicalisation: the canonical DER of the
 // decoded sequence, whether it could be produced, and whether it has been attempted
 // at all (a name that cannot be read is a legitimate result worth caching, so "not
 // yet asked" needs its own flag).
@@ -1140,7 +1140,7 @@ func sameDecodedName(a []byte, aOK bool, b []byte, bOK bool) bool {
 // is asked O(n^2) times and this makes answering it a byte compare; see canonicalName.
 // It is never compared against a certificate's own RawSubject/RawIssuer, which
 // nameLink compares separately and exactly.
-type decodedDN struct {
+type canonicalDN struct {
 	canonical []byte
 	ok        bool
 	cached    bool
@@ -1148,20 +1148,20 @@ type decodedDN struct {
 
 // subjectName is canonicalName over certs[i]'s raw subject, memoised.
 func (g *certGraph) subjectName(i int) ([]byte, bool) {
-	if !g.decodedSubjects[i].cached {
+	if !g.canonicalSubjects[i].cached {
 		canonical, ok := canonicalName(g.certs[i].RawSubject)
-		g.decodedSubjects[i] = decodedDN{canonical: canonical, ok: ok, cached: true}
+		g.canonicalSubjects[i] = canonicalDN{canonical: canonical, ok: ok, cached: true}
 	}
-	return g.decodedSubjects[i].canonical, g.decodedSubjects[i].ok
+	return g.canonicalSubjects[i].canonical, g.canonicalSubjects[i].ok
 }
 
 // issuerName is canonicalName over certs[i]'s raw issuer, memoised.
 func (g *certGraph) issuerName(i int) ([]byte, bool) {
-	if !g.decodedIssuers[i].cached {
+	if !g.canonicalIssuers[i].cached {
 		canonical, ok := canonicalName(g.certs[i].RawIssuer)
-		g.decodedIssuers[i] = decodedDN{canonical: canonical, ok: ok, cached: true}
+		g.canonicalIssuers[i] = canonicalDN{canonical: canonical, ok: ok, cached: true}
 	}
-	return g.decodedIssuers[i].canonical, g.decodedIssuers[i].ok
+	return g.canonicalIssuers[i].canonical, g.canonicalIssuers[i].ok
 }
 
 // isSelfSigned reports whether certs[i] is its own issuer, which is what makes it
@@ -1224,7 +1224,7 @@ func (g *certGraph) selfIssuedByName(i int) bool {
 	}
 	subject, subjectOK := g.subjectName(i)
 	issuer, issuerOK := g.issuerName(i)
-	return sameDecodedName(subject, subjectOK, issuer, issuerOK)
+	return sameCanonicalName(subject, subjectOK, issuer, issuerOK)
 }
 
 // checkSelfSigned is isSelfSigned without the memo: the actual signature check.
@@ -1862,7 +1862,7 @@ func (g *certGraph) terminusObservation(terminal int, extra, kept []*x509.Certif
 	subject := boundSubject(g.certs[terminal].Subject.String())
 	leftovers := ""
 	if len(extra) > 0 {
-		leftovers = fmt.Sprintf("; the remaining %d certificate(s) were kept rather than dropped", len(kept))
+		leftovers = fmt.Sprintf("; %d of the remaining %d certificate(s) were kept rather than dropped", len(kept), len(extra))
 		if len(kept) == 0 {
 			leftovers = "; none of the remaining certificate(s) could be kept as chain material"
 		}

@@ -317,7 +317,7 @@ func TestObservationLog_forgetPair_spends_wholeness_without_resetting_deduplicat
 // own per-scan WARN (unwritableBundleMsg): the operator must keep being told /output is
 // foreign-owned, without the input diagnostic riding along.
 //
-// Serial: it swaps slog.Default(), the chmod seam and the write seam.
+// Serial: it swaps slog.Default() and the write seam.
 func TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unwritable(t *testing.T) {
 	certsRoot := t.TempDir()
 	outRoot := t.TempDir()
@@ -353,16 +353,6 @@ func TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unw
 	if err := os.Chmod(pfxPath, 0o644); err != nil {
 		t.Fatalf("setup: Chmod: %v", err)
 	}
-	prevChmod := chmodFile
-	chmodFile = func(f *os.File, _ os.FileMode) error {
-		return &fs.PathError{Op: "chmod", Path: f.Name(), Err: syscall.EPERM}
-	}
-	t.Cleanup(func() { chmodFile = prevChmod })
-	// The injected refusal MEANS "another UID owns this bundle", so the ownership read
-	// has to agree.
-	prevOwned := fileOwnedByProcess
-	fileOwnedByProcess = func(os.FileInfo) bool { return false }
-	t.Cleanup(func() { fileOwnedByProcess = prevOwned })
 	prevWrite := writeFileInRoot
 	writeFileInRoot = func(context.Context, *os.Root, string, []byte,
 		...atomicfile.Option,

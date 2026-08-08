@@ -54,12 +54,12 @@ func TestWriteOutcome_derives_the_status_from_three_independent_facts(t *testing
 		"a write that landed over an unverifiable prior is a conversion too": {
 			state: bundleState{content: contentUnverified}, writeErr: nil, want: statusConverted,
 		},
-		"a mode-repair rewrite refused for permissions is health-neutral": {
-			state:    bundleState{content: contentVerifiedCurrent, repair: tightenRefused},
+		"a mode-only rewrite refused for permissions is health-neutral": {
+			state:    bundleState{content: contentVerifiedCurrent, modeLax: true},
 			writeErr: refused, want: statusUnwritable,
 		},
-		"a mode-repair rewrite refused by a full volume is health-neutral too": {
-			state:    bundleState{content: contentVerifiedCurrent, repair: tightenRefused},
+		"a mode-only rewrite refused by a full volume is health-neutral too": {
+			state:    bundleState{content: contentVerifiedCurrent, modeLax: true},
 			writeErr: full, want: statusUnwritable,
 		},
 		"an unverifiable prior whose rewrite is refused for permissions is health-neutral": {
@@ -71,8 +71,8 @@ func TestWriteOutcome_derives_the_status_from_three_independent_facts(t *testing
 		"an unverifiable prior whose rewrite fails for an unattributable reason fails": {
 			state: bundleState{content: contentUnverified}, writeErr: brokenIO, want: statusFailed,
 		},
-		"a mode-repair rewrite that fails for an unattributable reason fails": {
-			state:    bundleState{content: contentVerifiedCurrent, repair: tightenRefused},
+		"a mode-only rewrite that fails for an unattributable reason fails": {
+			state:    bundleState{content: contentVerifiedCurrent, modeLax: true},
 			writeErr: brokenIO, want: statusFailed,
 		},
 		"a stale bundle whose rewrite is refused for permissions is still a failure": {

@@ -95,6 +95,14 @@ var (
 // where inotify works, in the same style as atomicfile's osChown/fsyncDir seams.
 var newFSWatcher = fsnotify.NewWatcher
 
+// removeWatch is the kernel-unregistration seam, a package var in the same style
+// as newFSWatcher: pruneWatches' stays-charged direction fires only when
+// inotify_rm_watch itself fails (EINVAL/EBADF), which no test can produce on a
+// healthy host, so a test injects the refusal here.
+var removeWatch = func(watcher *fsnotify.Watcher, path string) error {
+	return watcher.Remove(path)
+}
+
 // Watcher monitors a directory tree for cert/key changes and invokes a callback.
 //
 // Field order is govet fieldalignment's: the pointer-bearing fields lead so the
@@ -273,8 +281,13 @@ func (w *Watcher) safetyNetInterval() time.Duration {
 // the operator's configured cadence, or the reconciliation floor standing in for it.
 // Keeping the two apart in the log is what lets an operator confirm that
 // FALLBACK_SCAN_HOURS=0 took effect while still seeing the floor's walk happen.
+//
+// Derived from safetyNetIntervalFor rather than re-spelling its boundary: the scan
+// runs on the operator's clock exactly when the effective interval IS the configured
+// fallback (at fallback == reconcileFloor the two clocks coincide and the operator's
+// name wins, which is what the old "<=" spelling encoded by hand).
 func (w *Watcher) safetyNetTrigger() string {
-	if w.fallback > 0 && w.fallback <= reconcileFloor {
+	if w.safetyNetInterval() == w.fallback {
 		return triggerFallback
 	}
 	return triggerReconcile
@@ -874,7 +887,7 @@ func (w *Watcher) pruneWatches(watcher *fsnotify.Watcher, desired map[string]str
 		if _, wanted := desired[path]; wanted {
 			continue
 		}
-		if err := watcher.Remove(path); err != nil {
+		if err := removeWatch(watcher, path); err != nil {
 			if !errors.Is(err, fsnotify.ErrNonExistentWatch) {
 				slog.Warn("failed to unregister a stale fsnotify watch; it stays charged to the live watch set",
 					w.coverageAttrs("path", path, "error", err)...)
@@ -1176,21 +1189,16 @@ func (w *Watcher) handleErrorRecv(
 		// The dropped events may have included the Create of a new directory, which
 		// would otherwise stay unwatched for the rest of the process's life.
 		//
-		// Floored exactly as runDebouncedScan floors it, and for the same reason: an
-		// overflow arrives on the ERROR channel, whose rate a writer sets, so an
+		// Floored (resyncOrDefer) for a reason specific to this trigger: an overflow
+		// arrives on the ERROR channel, whose rate a writer sets, so an
 		// unfloored re-assert here would run the whole-tree walk (and re-emit one WARN
 		// per unwatchable directory) on the writer's cadence rather than on one this
-		// process chose — which is what minPreScanResync exists to bound. A re-assert
-		// the floor declines is DEFERRED, not dropped: scheduleRepair arms it for the
-		// remainder of the interval, so a dropped Create is still recovered on the
+		// process chose — which is what minPreScanResync exists to bound. Because the
+		// floor defers rather than drops, a dropped Create is still recovered on the
 		// floor's own schedule. handleWatcherError has already scheduled the
 		// certificate rescan, so renewal recovery is never what the floor delays.
-		if time.Since(st.lastResync) >= minPreScanResync {
-			st.resync(ctx, watcher,
-				"failed to re-sync the watch set after an event-queue overflow; a directory whose Create was dropped stays unwatched until the next re-sync")
-		} else {
-			st.scheduleRepair()
-		}
+		st.resyncOrDefer(ctx, watcher,
+			"failed to re-sync the watch set after an event-queue overflow; a directory whose Create was dropped stays unwatched until the next re-sync")
 	}
 	return nil
 }
@@ -1433,6 +1441,21 @@ func (st *watchState) scheduleRepair() {
 	st.repairTimer.Reset(minPreScanResync - time.Since(st.lastResync))
 }
 
+// resyncOrDefer applies the minPreScanResync floor to one re-assert trigger, and is
+// the single spelling of the floor's defer-not-drop rule: past the floor the watch
+// set is re-asserted now; inside it the re-assert is deferred to the remainder of the
+// interval (scheduleRepair), so a trigger is postponed to a cadence this process chose
+// rather than dropped. Shared by the debounced-scan and event-queue-overflow triggers,
+// which previously each spelled the rule themselves and pointed comments at each other
+// to keep the copies agreeing.
+func (st *watchState) resyncOrDefer(ctx context.Context, watcher *fsnotify.Watcher, warning string) {
+	if time.Since(st.lastResync) >= minPreScanResync {
+		st.resync(ctx, watcher, warning)
+		return
+	}
+	st.scheduleRepair()
+}
+
 // runDeferredRepair runs the re-assert a debounced scan deferred, and NOTHING else:
 // no certificate scan, so watch-set repair runs on its own bounded schedule instead
 // of borrowing the scan cadence an operator may have deliberately switched off.
@@ -1491,16 +1514,12 @@ func (st *watchState) runDebouncedScan(ctx context.Context, watcher *fsnotify.Wa
 	if ctx.Err() != nil {
 		return
 	}
-	if time.Since(st.lastResync) >= minPreScanResync {
-		st.resync(ctx, watcher,
-			"failed to re-assert the watch set before a debounced scan; a registration the kernel dropped without an event stays unwatched until the next re-assert")
-		// The re-sync can be cut short by cancellation, and the scan below would then be
-		// spurious work for a loop that is already returning.
-		if ctx.Err() != nil {
-			return
-		}
-	} else {
-		st.scheduleRepair()
+	st.resyncOrDefer(ctx, watcher,
+		"failed to re-assert the watch set before a debounced scan; a registration the kernel dropped without an event stays unwatched until the next re-assert")
+	// The re-sync can be cut short by cancellation, and the scan below would then be
+	// spurious work for a loop that is already returning.
+	if ctx.Err() != nil {
+		return
 	}
 	st.w.logScanState(ctx, modeWatch, triggerEvent)
 	st.w.onChange(ctx)

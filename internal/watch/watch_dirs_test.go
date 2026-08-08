@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cplieger/slogx/capture"
+	"github.com/fsnotify/fsnotify"
 )
 
 // TestAddWatchDirs_watches_whole_subtree_and_fails_on_missing_root pins the
@@ -474,5 +475,64 @@ func TestResyncWatchSet_keeps_the_mirror_charged_when_the_rebuild_is_abandoned(t
 		t.Errorf("after an abandoned rebuild the mirror holds %d registrations, want the %d it was charged:"+
 			" every failure direction must OVER-count the kernel's set, or the next rebuild admits a second"+
 			" full budget over registrations this one forgot", got, charged)
+	}
+}
+
+// TestPruneWatches_keeps_a_refused_removal_charged_to_the_mirror pins the
+// stays-charged failure direction of the rebuild's REMOVE phase, the invariant
+// resyncWatchSet's transaction is built on: a stale registration whose kernel
+// removal FAILS (inotify_rm_watch can return EINVAL/EBADF) must stay in the
+// membership mirror, because the mirror is the only count the live-set ceiling
+// reads and every failure direction must OVER-count the kernel's set. Forgetting
+// a path the kernel still holds lets the next rebuild admit a whole further
+// budget of registrations over descriptors the count no longer sees, and the
+// per-UID inotify quota overrun is paid by unrelated same-UID consumers.
+// The refusal must also be WARNed once with the path, so the operator can see
+// which registration is stuck.
+// Not parallel: it swaps the process-global slog default and the removeWatch seam.
+func TestPruneWatches_keeps_a_refused_removal_charged_to_the_mirror(t *testing.T) {
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	stuck := filepath.Join(root, "stuck.example.com")
+	stale := filepath.Join(root, "stale.example.com")
+	for _, dir := range []string{stuck, stale} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := New(root, func(context.Context) {})
+	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
+		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
+	}
+
+	refused := errors.New("inotify_rm_watch: invalid argument")
+	prev := removeWatch
+	removeWatch = func(fw *fsnotify.Watcher, path string) error {
+		if path == stuck {
+			return refused
+		}
+		return prev(fw, path)
+	}
+	t.Cleanup(func() { removeWatch = prev })
+	logs := capture.Default(t)
+
+	// A rebuild that no longer wants either directory: only the root survives.
+	w.pruneWatches(watcher, map[string]struct{}{root: {}})
+
+	if !w.watchSetHas(stuck) {
+		t.Errorf("the mirror forgot %q after the kernel refused its removal; the live-set ceiling now under-counts the kernel's registrations, so the next rebuild can overrun the per-UID inotify quota", stuck)
+	}
+	if w.watchSetHas(stale) {
+		t.Errorf("the mirror still holds %q, whose removal the kernel confirmed; a confirmed removal must be forgotten", stale)
+	}
+	const msg = "failed to unregister a stale fsnotify watch"
+	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
+		t.Fatalf("WARN %q logged %d times, want exactly 1 (one per refused removal); log = %v", msg, n, logs.Messages())
+	}
+	if got, ok := logs.AttrValue(msg, "path"); !ok || got != stuck {
+		t.Errorf("WARN %q path = %q (present %v), want %q: the operator cannot see which registration is stuck without it", msg, got, ok, stuck)
+	}
+	if got, ok := logs.AttrValue(msg, "error"); !ok || got != refused.Error() {
+		t.Errorf("WARN %q error = %q (present %v), want %q", msg, got, ok, refused.Error())
 	}
 }

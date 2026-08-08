@@ -143,6 +143,17 @@ func (r *ScanResult) inputFullyEnumerated() bool {
 // operator contract, this one is the floor under a missing wiring.
 const fallbackScanEntries = 10_000
 
+// effectiveEntryBudget resolves an injected per-scan budget: non-positive means
+// fallbackScanEntries, so every consumer of Options.MaxScanEntries — the /input walk,
+// the /output orphan walk and the observation log — is bounded even when assembled
+// field by field without one, and the rule is spelled once.
+func effectiveEntryBudget(n int) int {
+	if n > 0 {
+		return n
+	}
+	return fallbackScanEntries
+}
+
 // errScanBudgetExceeded marks the abort above. It is its own sentinel so the walk's
 // own callers (and a test) can tell a refused-because-too-large tree from an
 // unreadable one.
@@ -396,10 +407,7 @@ type scanWalk struct {
 // than at construction so every assembler of a scanWalk gets a bound, including the
 // tests that build one field by field.
 func (sw *scanWalk) entryBudget() int {
-	if sw.maxEntries > 0 {
-		return sw.maxEntries
-	}
-	return fallbackScanEntries
+	return effectiveEntryBudget(sw.maxEntries)
 }
 
 // visit is the walk's per-entry callback (atomicfile.WalkDirInRoot). The context is
@@ -835,14 +843,12 @@ func (o *observationLog) endScan() {
 	o.activeWhole = nil
 }
 
-// canEvict reports whether victim may be dropped while reserving room for keep. The
-// path being reserved is never its own victim, and neither is a pair this scan already
-// read whole — dropping the latter spends evidence the CURRENT scan established, and
-// the veto that covers the eviction is reset before the scan that would need it.
-func (o *observationLog) canEvict(victim, keep string) bool {
-	if victim == keep {
-		return false
-	}
+// canEvict reports whether victim may be dropped: a pair this scan already read whole
+// is never evicted — dropping it spends evidence the CURRENT scan established, and the
+// veto that covers the eviction is reset before the scan that would need it. The path
+// being reserved is never a candidate at all: reserve hunts victims only in a map that
+// does not contain it, and markWhole protects it in activeWhole before reserving.
+func (o *observationLog) canEvict(victim string) bool {
 	_, observedThisScan := o.activeWhole[victim]
 	return !observedThisScan
 }
@@ -927,7 +933,9 @@ func (o *observationLog) note(rel string, fp [sha256.Size]byte, obs []convert.Ob
 	current := observationSignature(fp, obs)
 	previous, ok := o.seen[rel]
 	// markWhole first: its reserve makes room for BOTH entries this call commits, and
-	// rel is its own `keep`, so the reservation cannot evict what it is making room for.
+	// markWhole has already protected rel in activeWhole — and reserve only hunts victims
+	// in maps that do not contain rel — so the reservation cannot evict what it is making
+	// room for.
 	o.markWhole(rel)
 	o.seen[rel] = current
 	if !ok || previous != current {
@@ -954,10 +962,7 @@ func (o *observationLog) record(rel string, fp [sha256.Size]byte, obs []convert.
 // which is why the budget is injected into this log too rather than derived a second
 // time from anything else.
 func (o *observationLog) maxObservedPairs() int {
-	if o.maxPairs > 0 {
-		return o.maxPairs
-	}
-	return fallbackScanEntries
+	return effectiveEntryBudget(o.maxPairs)
 }
 
 // reserve makes room for a path this log has not seen before, evicting one remembered
@@ -982,19 +987,20 @@ func (o *observationLog) reserve(rel string) {
 	// or record, so a `seen`-only ceiling would leave the structural half growing for
 	// the process lifetime.
 	if _, known := o.seen[rel]; !known && len(o.seen) >= o.maxObservedPairs() {
-		o.evictOne(rel)
+		o.evictOne()
 	}
 	if _, known := o.whole[rel]; !known && len(o.whole) >= o.maxObservedPairs() {
-		o.evictWholeness(rel)
+		o.evictWholeness()
 	}
 }
 
-// evictOne drops one remembered pair from BOTH halves, never the path being reserved
-// and never a pair this scan already read whole (canEvict), so an eviction can never
+// evictOne drops one remembered pair from BOTH halves, never a pair this scan already
+// read whole (canEvict); the reserved path is excluded by reserve's own membership gate,
+// which only hunts victims in a map that does not contain it. So an eviction can never
 // leave the two halves out of step and can never spend evidence the active scan
 // established. It is reserve's SIGNATURE arm, so it takes its victim from `seen`, and
 // it normally finds one: reserve calls it only when len(seen) >= maxObservedPairs()
-// (never 0, since the fallback is fallbackScanEntries) and only for a `keep` that is
+// (never 0, since the fallback is fallbackScanEntries) and only for a path that is
 // absent from `seen`, while the paths protected for the active scan are a strict subset
 // of the entries charged to that same scan-entry ceiling. If every candidate IS
 // protected, the log holds one entry over the ceiling for the rest of the walk rather
@@ -1002,9 +1008,9 @@ func (o *observationLog) reserve(rel string) {
 // wholeness-only entry — what a pair that read whole and then failed analysis, encoding
 // or its write leaves behind — is evicted by evictWholeness, which reserve's own second
 // arm calls.
-func (o *observationLog) evictOne(keep string) {
+func (o *observationLog) evictOne() {
 	for victim := range o.seen {
-		if !o.canEvict(victim, keep) {
+		if !o.canEvict(victim) {
 			continue
 		}
 		delete(o.seen, victim)
@@ -1015,8 +1021,8 @@ func (o *observationLog) evictOne(keep string) {
 
 // evictWholeness makes room in the WHOLENESS half specifically, dropping a victim that
 // actually holds wholeness and dropping that victim's signature with it so the two
-// halves stay in step. Like evictOne it skips the path being reserved and any pair the
-// active scan read whole (canEvict).
+// halves stay in step. Like evictOne it skips any pair the active scan read whole
+// (canEvict); the reserved path is excluded by reserve's membership gate.
 //
 // evictOne cannot serve this call: its signature-first victim may hold no wholeness at
 // all (a pair forgetPair spent, which keeps its signature), and then the half that was
@@ -1024,9 +1030,9 @@ func (o *observationLog) evictOne(keep string) {
 // de-duplication is spent for nothing and re-emits its observation WARN on the next
 // scan. Every drop here is counted by dropWholeness, which is what makes the reap veto
 // fail closed on a loss that previously went unrecorded.
-func (o *observationLog) evictWholeness(keep string) {
+func (o *observationLog) evictWholeness() {
 	for victim := range o.whole {
-		if !o.canEvict(victim, keep) {
+		if !o.canEvict(victim) {
 			continue
 		}
 		delete(o.seen, victim)
@@ -1361,9 +1367,9 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 
 // writeOutcome derives one entry's conversionStatus, and it is the ONLY place that
 // derivation happens. Its inputs are the three facts this scan resolved independently:
-// what this app learned about the bundle already on disk (state.content), whether the
-// mode repair converged (state.repair, the one non-content reason a matching bundle is
-// rewritten at all), and — when the write failed — whether a restart could clear that
+// what this app learned about the bundle already on disk (state.content), whether its
+// mode was laxer than policy (state.modeLax, the one non-content reason a matching bundle
+// is rewritten at all), and — when the write failed — whether a restart could clear that
 // failure (restartCanClearWrite). Deriving it once, after the write, is what replaced
 // threading a staleness cause into the failure handler: each fact now arrives unmodified,
 // so a fix to one of them cannot overwrite another on the way here.
@@ -1398,21 +1404,20 @@ func writeOutcome(state bundleState, writeErr error) conversionStatus {
 	}
 }
 
-// unwritableBundleMsg is the standing WARN for the ORIGINAL health-neutral /output
-// shape, and its promise is unchanged: a prior bundle whose bytes were COMPARED and
-// MATCHED, whose mode is laxer than policy, whose chmod the filesystem refused, and whose
-// repairing rewrite it refused for a permission reason too. It is its own message rather
-// than a variant of modeRepairRefusedMsg because that line announces an attempt this one
-// reports the outcome of, and an operator correlating a permanently-lax private key with a
-// log query must find the standing condition rather than the attempt.
+// unwritableBundleMsg is the standing WARN for the health-neutral /output shape whose
+// rewrite carried no new bytes: a prior bundle whose bytes were COMPARED and MATCHED,
+// whose mode is laxer than policy, and whose mode-correcting rewrite the volume refused
+// for a permission reason. It promises exactly that — the bytes on disk are the right
+// bytes and only the permission bits are wrong — which is why it is its own message
+// rather than a variant of the general refusal below.
 //
-// It is emitted for exactly the condition it was emitted for before this routing was
-// restructured, so the README's alerting section and any operator query keyed on it are
-// untouched. Every OTHER health-neutral write refusal — one over content this app could
-// not verify, or one refused by the volume rather than by ownership — carries
-// unreplaceableBundleMsg instead, because widening this text would quietly widen what it
-// promises about the operator's bytes.
-const unwritableBundleMsg = "prior pfx is more permissive than policy and neither the mode repair nor the replacing write was permitted; leaving the existing bundle in place, health is unaffected"
+// It no longer names a chmod, because there is none: this app corrects a lax mode only by
+// rewriting the bundle, so a refused rewrite IS the whole failure to report rather than
+// the second of two attempts. Every OTHER health-neutral write refusal — one over content
+// this app could not verify, or one refused by the volume rather than by ownership —
+// carries unreplaceableBundleMsg instead, because widening this text would quietly widen
+// what it promises about the operator's bytes.
+const unwritableBundleMsg = "prior pfx is more permissive than policy and the rewrite that would correct its mode was not permitted; leaving the existing bundle in place, health is unaffected"
 
 // unreplaceableBundleMsg is the standing WARN for every other health-neutral write
 // refusal: a prior bundle this app could not VERIFY at all (above the readable bound,

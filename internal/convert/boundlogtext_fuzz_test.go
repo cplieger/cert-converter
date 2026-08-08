@@ -5,6 +5,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/runesafe"
 )
 
@@ -44,8 +45,8 @@ func FuzzBoundLogText_bounded_and_loggable(f *testing.F) {
 	f.Add(strings.Repeat("\xff", 200))
 	// Text that legitimately ENDS with the marker without having been cut, which
 	// is why marker provenance is asserted in one direction only.
-	f.Add(truncationMarker)
-	f.Add("CN=a.example.com" + truncationMarker)
+	f.Add(logtext.Marker)
+	f.Add("CN=a.example.com" + logtext.Marker)
 
 	f.Fuzz(func(t *testing.T, s string) {
 		got := boundLogText(s, maxSubjectLogLen)
@@ -82,18 +83,18 @@ func FuzzBoundLogText_bounded_and_loggable(f *testing.F) {
 		// result alone: an input that legitimately ENDS with the marker text is
 		// returned unchanged when it fits (the seeds above), so a biconditional fails
 		// on correct output.
-		if !strings.HasSuffix(got, truncationMarker) {
+		if !strings.HasSuffix(got, logtext.Marker) {
 			t.Fatalf("boundLogText(%d bytes, %d sanitized) = %q, cut text must be marked",
 				len(s), len(sanitized), got)
 		}
-		if len(got) > maxSubjectLogLen+len(truncationMarker) {
+		if len(got) > maxSubjectLogLen+len(logtext.Marker) {
 			t.Fatalf("boundLogText(%d bytes) is %d bytes, want at most %d",
-				len(s), len(got), maxSubjectLogLen+len(truncationMarker))
+				len(s), len(got), maxSubjectLogLen+len(logtext.Marker))
 		}
 		// The kept text is a prefix of the sanitized form: the cut removes a tail and
 		// invents nothing. This is what catches a cap that reorders, re-encodes or
 		// drops interior bytes.
-		if kept := strings.TrimSuffix(got, truncationMarker); !strings.HasPrefix(sanitized, kept) {
+		if kept := strings.TrimSuffix(got, logtext.Marker); !strings.HasPrefix(sanitized, kept) {
 			t.Fatalf("boundLogText(%q) kept %q, which is not a prefix of the sanitized form %q",
 				s, kept, sanitized)
 		}

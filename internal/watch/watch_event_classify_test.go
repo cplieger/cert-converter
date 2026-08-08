@@ -115,7 +115,7 @@ func TestHandleFsEvent_classifies_a_chmod_it_cannot_stat(t *testing.T) {
 	}
 }
 
-// TestFallbackStatus_tells_the_operator_whether_anything_will_rescan pins the
+// TestFallbackScanAttr_tells_the_operator_whether_anything_will_rescan pins the
 // fallback_scan attribute every degraded-path WARN carries. The existing
 // classify tests assert only that the WARN fires, so the attribute's value --
 // the operator's single statement of when (or whether) the reported path is
@@ -124,7 +124,7 @@ func TestHandleFsEvent_classifies_a_chmod_it_cannot_stat(t *testing.T) {
 // nothing re-scans that path for the life of the process, so rendering it as a
 // duration would read as a promise the process cannot keep.
 // Not parallel: it swaps the process-global slog default.
-func TestFallbackStatus_tells_the_operator_whether_anything_will_rescan(t *testing.T) {
+func TestFallbackScanAttr_tells_the_operator_whether_anything_will_rescan(t *testing.T) {
 	const msg = "cannot classify a path whose permissions changed"
 
 	watcher := newTestWatcher(t)

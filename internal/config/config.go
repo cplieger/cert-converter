@@ -11,6 +11,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
+	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/slogx"
 )
 
@@ -99,8 +100,6 @@ type Config struct {
 	MaxScanEntries int
 }
 
-// Load is the only entry point that reads the environment; the PFX-password classification and its diagnostics live in password.go.
-//
 // Load reads environment variables and returns a populated Config. The PFX
 // password follows the Docker-secrets convention: when PFX_PASSWORD_FILE is
 // set the secret is read from that file (bounded, and delivered verbatim apart
@@ -398,6 +397,18 @@ func warnFallbackDisabled(interval time.Duration) {
 			"full-tree reconciliation instead (the startup line's scan_floor names it, and the health-marker freshness deadline is derived from it)",
 			"hours", maxFallbackHours,
 			"remediation", "set FALLBACK_SCAN_HOURS to a real cadence (unset it for the 6h default) if a missed renewal should be recovered on your own cadence rather than on the reconciliation floor")
+		return
+	}
+	if floor := watch.MarkerRefreshFloor(interval); interval > floor {
+		// Same state as the ceiling arm above, reached by any cadence between
+		// the reconciliation floor and the clamp: the safety-net timer always
+		// arms with the smaller of the configured cadence and the floor
+		// (watch.safetyNetIntervalFor), so this cadence never fires and the
+		// floor's walk runs instead — more often than the operator asked for.
+		slog.Warn("FALLBACK_SCAN_HOURS is above the watcher's reconciliation floor, so no re-scan will ever run on your configured cadence; "+
+			"the floor's full-tree reconciliation runs instead, more often than the cadence you set",
+			"fallback_scan", interval.String(), "scan_floor", floor.String(),
+			"remediation", "set FALLBACK_SCAN_HOURS at or below the floor's hours if the cadence should be yours, or leave it as is: coverage is unaffected")
 		return
 	}
 	if interval > 0 {

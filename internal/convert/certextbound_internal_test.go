@@ -72,12 +72,12 @@ func TestOversizedExtensionIdentifiersError_applies_the_aggregate_ceilings(t *te
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			err := oversizedExtensionIdentifiersError(tc.cert)
+			err := oversizedParsedCertificateError(tc.cert)
 			if tc.refused && err == nil {
-				t.Fatal("oversizedExtensionIdentifiersError = nil, want a refusal")
+				t.Fatal("oversizedParsedCertificateError = nil, want a refusal")
 			}
 			if !tc.refused && err != nil {
-				t.Fatalf("oversizedExtensionIdentifiersError = %v, want nil", err)
+				t.Fatalf("oversizedParsedCertificateError = %v, want nil", err)
 			}
 			if tc.refused && !strings.Contains(err.Error(), "not an X.509 limit") {
 				t.Errorf("refusal %q does not name the ceiling as this app's own resource policy", err)

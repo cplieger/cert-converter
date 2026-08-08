@@ -82,8 +82,8 @@ the first start. Export `PUID` and `PGID` with the same values Compose uses,
 then run `mkdir -p /path/to/pfx/output && chown "${PUID:-1000}:${PGID:-1000}" /path/to/pfx/output`
 (both default to `1000`, matching `compose.yaml`). An unwritable `/output` fails
 every conversion and keeps the container unhealthy. The one exception is a bundle
-that already holds the right bytes and is only being rewritten to tighten a file
-mode a refused `chmod` could not: the refused write leaves it in place, warns with
+that already holds the right bytes and is only being rewritten to correct a file
+mode more permissive than `0600`: the refused write leaves it in place, warns with
 the same ownership remediation, and leaves health alone, since no restart grants
 the UID ownership of the volume.
 
@@ -96,6 +96,14 @@ as found: the bundle is still published and health is unaffected (a forced-mode
 mount such as CIFS, NFS, or vfat cannot be chmod'ed at all). Tightening it is
 yours to do, and worth doing: a group- or world-writable directory lets any other
 process on that mount replace a bundle.
+
+This app never `chmod`s anything it finds under `/output`. A `.pfx` left more
+permissive than `0600` — by an earlier deployment, or by whatever wrote it — is
+reported by a WARN naming the mode found and the mode this app will install, and
+then corrected the only way this app changes a file at all: the next scan rewrites
+the bundle, and the atomic replacement lands a fresh file at `0600`. That happens
+once; afterwards the mode is at policy and nothing re-triggers. A mode you made
+_stricter_ than `0600` carries no extra bit and is left alone.
 
 ## Alerting
 
@@ -324,7 +332,7 @@ Setting `FALLBACK_SCAN_HOURS` to `0`/`false` turns off re-scans on **your** cade
 
 Health answers one question: should an orchestrator restart this container? It therefore tracks only failures a restart could plausibly clear. The container becomes **unhealthy** when the `/input` root itself cannot be read or a certificate fails to convert (PEM or key parse error, cert/key mismatch, or PFX write failure). It **auto-recovers** on the next clean cycle (an fsnotify event, or the next periodic re-scan) without a restart.
 
-An unreadable _sub-path_ under `/input` (e.g. one certificate directory with the wrong permissions or owner) is a steady-state misconfiguration a restart would not fix, so it is logged as a warning, its certificates are skipped, and health is left alone. Three other conditions are reported the same way, each with its own remediation in the record: an `/input` tree holding more entries than `MAX_SCAN_ENTRIES` (that scan stops early and skips orphan cleanup), an `/output` directory more permissive than `0750`, and a refused permission repair on a bundle that already holds the right bytes.
+An unreadable _sub-path_ under `/input` (e.g. one certificate directory with the wrong permissions or owner) is a steady-state misconfiguration a restart would not fix, so it is logged as a warning, its certificates are skipped, and health is left alone. Three other conditions are reported the same way, each with its own remediation in the record: an `/input` tree holding more entries than `MAX_SCAN_ENTRIES` (that scan stops early and skips orphan cleanup), an `/output` directory more permissive than `0750`, and a refused rewrite of a bundle that already holds the right bytes and was only being rewritten to correct its file mode.
 
 ## Security
 

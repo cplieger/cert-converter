@@ -321,7 +321,25 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 			wantAttrs: map[string]string{
 				"stage": atomicfile.ProbeStageWrite.String(), "leaked_probe": leakedPath,
 				"cleanup": staleTempRemediation,
+				"remediation": "the directory entry was accepted and the data was not, so this is not an ownership problem: " +
+					"check free space and any quota on the filesystem backing " + dir,
 			},
+		},
+		{
+			name: "a refused flush is not an ownership problem",
+			res: atomicfile.ProbeResult{
+				Dir: dir, Name: leakedName, Stage: atomicfile.ProbeStageSync,
+				Err: errors.New("disk quota exceeded"),
+			},
+			wantMsg:     wantOutputNotWritableMsg,
+			wantWarns:   1,
+			wantRecords: 1,
+			wantAttrs: map[string]string{
+				"stage": atomicfile.ProbeStageSync.String(),
+				"remediation": "the directory entry was accepted and the data was not, so this is not an ownership problem: " +
+					"check free space and any quota on the filesystem backing " + dir,
+			},
+			wantAbsent: "cleanup",
 		},
 		{
 			name: "a close failure keeps its own message",

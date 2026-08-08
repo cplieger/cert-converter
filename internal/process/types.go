@@ -26,6 +26,15 @@ type conversionStatus int
 // "a certificate with no key" — reporting it as an orphan would misdescribe the
 // condition in the scan summary and in the all-orphan diagnostic.
 //
+// One TRANSIENT case is deliberately routed here rather than to statusVanished: a
+// read cancelled by shutdown (noteUnreadableInput's IsShutdown arm). It is logged at
+// Debug so the documented WARN never pages for a normal SIGTERM, and it takes this
+// status because an interrupted read leaves the tree unproven exactly as an
+// unreadable path does — health-neutral and reap-vetoing — while statusVanished
+// stays reserved for the ENOENT renewal race. The scan it counts toward is itself
+// aborted, so the count never reaches the unreadable WARN aggregate
+// (logInputCoverageWarnings returns early on a non-nil walk error).
+//
 // statusVanished is the TRANSIENT sibling of statusUnreadable: the entry was there a
 // moment ago and is gone now — it existed at readdir and was gone by the bounded read,
 // or its sibling key was read whole by an earlier scan of this process and is gone by

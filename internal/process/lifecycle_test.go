@@ -17,6 +17,7 @@ import (
 
 	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/slogx/capture"
@@ -260,7 +261,7 @@ func TestStoreReconcile_unsafe_output_walk_never_advises_deletion(t *testing.T) 
 	if _, err := os.Stat(orphan); err != nil {
 		t.Errorf("orphan candidate was removed after an unsafe output walk: %v", err)
 	}
-	const msg = "output bundles have no matching input"
+	const msg = "output bundles have no matching input; " + reapDisabledPhrase
 	if !logs.HasAttr(msg, "action",
 		"kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle") {
 		got, _ := logs.AttrValue(msg, "action")
@@ -380,9 +381,9 @@ func TestSampleOrphanPaths_bounds_the_sample_by_bytes(t *testing.T) {
 			t.Errorf("sampleOrphanPaths(%d realistic paths) = %q, want it byte-for-byte %q: the byte cap must not touch an ordinary report",
 				len(paths), got, want)
 		}
-		if strings.Contains(got, truncationMarker) {
+		if strings.Contains(got, logtext.Marker) {
 			t.Errorf("sampleOrphanPaths(%d realistic paths) = %q, want no %q marker on a sample inside the budget",
-				len(paths), got, truncationMarker)
+				len(paths), got, logtext.Marker)
 		}
 	})
 
@@ -395,18 +396,18 @@ func TestSampleOrphanPaths_bounds_the_sample_by_bytes(t *testing.T) {
 		t.Parallel()
 		paths := []string{strings.Repeat("→", maxLoggedOrphanBytes) + "/leaf.pfx"}
 		got := sampleOrphanPaths(paths)
-		if !strings.HasSuffix(got, truncationMarker) {
+		if !strings.HasSuffix(got, logtext.Marker) {
 			t.Errorf("sampleOrphanPaths(one %d-byte path) rendered %d bytes without the %q marker: a reader cannot tell the list was cut",
-				len(paths[0]), len(got), truncationMarker)
+				len(paths[0]), len(got), logtext.Marker)
 		}
-		if maxLen := maxLoggedOrphanBytes + len(truncationMarker); len(got) > maxLen {
+		if maxLen := maxLoggedOrphanBytes + len(logtext.Marker); len(got) > maxLen {
 			t.Errorf("sampleOrphanPaths(one %d-byte path) rendered %d bytes, want at most %d",
 				len(paths[0]), len(got), maxLen)
 		}
 		if !utf8.ValidString(got) {
 			t.Errorf("sampleOrphanPaths(one %d-byte path) rendered invalid UTF-8: the cut split a rune", len(paths[0]))
 		}
-		kept := strings.TrimSuffix(got, truncationMarker)
+		kept := strings.TrimSuffix(got, logtext.Marker)
 		if !strings.HasPrefix(paths[0], kept) {
 			t.Errorf("sampleOrphanPaths(one %d-byte path) kept %d bytes that are not a prefix of the path: the sample must not rewrite a name",
 				len(paths[0]), len(kept))
@@ -436,11 +437,11 @@ func TestSampleOrphanPaths_bounds_the_sample_by_bytes(t *testing.T) {
 			t.Errorf("sampleOrphanPaths(%d oversized paths) rendered %d bytes not ending in %q: the byte cap dropped the item cap's scale",
 				len(paths), len(got), wantMore)
 		}
-		if !strings.Contains(got, truncationMarker) {
+		if !strings.Contains(got, logtext.Marker) {
 			t.Errorf("sampleOrphanPaths(%d oversized paths) rendered %d bytes without the %q marker: the item cap is not a byte bound",
-				len(paths), len(got), truncationMarker)
+				len(paths), len(got), logtext.Marker)
 		}
-		if maxLen := maxLoggedOrphanBytes + len(truncationMarker) + len(wantMore); len(got) > maxLen {
+		if maxLen := maxLoggedOrphanBytes + len(logtext.Marker) + len(wantMore); len(got) > maxLen {
 			t.Errorf("sampleOrphanPaths(%d oversized paths) rendered %d bytes, want at most %d", len(paths), len(got), maxLen)
 		}
 	})
@@ -485,10 +486,10 @@ func TestStoreReconcile_oversized_orphan_sample_keeps_the_count(t *testing.T) {
 	if !ok {
 		t.Fatalf("orphan report logged no paths attribute; records: %v", logs.Messages())
 	}
-	if !strings.HasSuffix(paths, truncationMarker) {
-		t.Errorf("orphan report logged a %d-byte paths attribute without the %q marker", len(paths), truncationMarker)
+	if !strings.HasSuffix(paths, logtext.Marker) {
+		t.Errorf("orphan report logged a %d-byte paths attribute without the %q marker", len(paths), logtext.Marker)
 	}
-	if maxLen := maxLoggedOrphanBytes + len(truncationMarker); len(paths) > maxLen {
+	if maxLen := maxLoggedOrphanBytes + len(logtext.Marker); len(paths) > maxLen {
 		t.Errorf("orphan report logged a %d-byte paths attribute, want at most %d", len(paths), maxLen)
 	}
 }
@@ -1025,390 +1026,6 @@ func TestStoreInspect_regenerates_an_oversized_prior(t *testing.T) {
 	}
 }
 
-// TestStoreInspect_tightens_a_lax_mode_without_regenerating pins the approved
-// replacement for the retired mode arm: pfxFileMode is enforced on a bundle already
-// on disk with a chmod, never with a rewrite, and only downward.
-//
-// Both halves are load-bearing. A bundle the operator made STRICTER than policy
-// (0400) is left exactly as it is — it was already usable, since the atomic
-// temp+rename never needs the old file to be owner-writable, and "converging" it to
-// 0600 would have discarded the protection they chose and moved its mtime. A LAXER
-// bundle is tightened in place, and the content-and-mtime assertions are what catch a
-// regression to rewriting it: a rewrite re-encodes with a fresh KDF salt and leaves a
-// fresh mtime, which the documented downstream rsync replication then copies again.
-//
-// Successful real-filesystem cases assert the exact surviving bits: tightening may
-// clear only permissions outside policy, never an allowed owner bit. The next test
-// separately covers filesystems that refuse or ignore chmod. Runs serially: it swaps
-// slog.Default().
-func TestStoreInspect_tightens_a_lax_mode_without_regenerating(t *testing.T) {
-	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
-	if err != nil {
-		t.Fatalf("setup: Analyse: %v", err)
-	}
-	for _, tc := range []struct {
-		name        string
-		mode        os.FileMode
-		wantTighten bool
-		// wantMode is the mode expected after the tightening; zero means the generic
-		// ceiling every mode carrying an owner read or write bit masks to
-		// (tc.mode & pfxFileMode). A lax mode with NO owner read or write bit masks to
-		// 0000, which is not a tightening at all — the app could not read its own
-		// bundle back through it — so that case names the mode it must land on instead.
-		wantMode os.FileMode
-	}{
-		{"the policy mode is left alone", pfxFileMode, false, 0},
-		{"a stricter read-only bundle is left alone", 0o400, false, 0},
-		{"a group-readable bundle is tightened", 0o640, true, 0},
-		{"a world-readable bundle is tightened", 0o644, true, 0},
-		{"an execute bit is cleared too", 0o700, true, 0},
-		{"a mode with no owner read or write bit is tightened to policy, not to 0000", 0o044, true, pfxFileMode},
-		{"an owner-execute-only mode is tightened to policy, not to 0000", 0o100, true, pfxFileMode},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			s := newOutputStore(t, dir)
-			if err := s.write(t.Context(), "out.pfx", mustEncode(t, &analysis)); err != nil {
-				t.Fatalf("setup: write: %v", err)
-			}
-			path := filepath.Join(dir, "out.pfx")
-			// The output DIRECTORY's mode is fixture noise here, but it is not noise to
-			// inspect: reportLaxDir warns when the directory is laxer than pfxDirMode,
-			// and what t.TempDir creates depends on the host (an inherited ACL widens it).
-			// Pinned so the log assertions below observe the FILE's mode only.
-			if err := os.Chmod(dir, pfxDirMode); err != nil {
-				t.Fatalf("setup: Chmod(dir): %v", err)
-			}
-			// Chmod explicitly: a filesystem can widen the mode O_CREATE asks for (an
-			// inherited ACL does), so the fixture cannot get tc.mode from the write.
-			if err := os.Chmod(path, tc.mode); err != nil {
-				t.Fatalf("setup: Chmod: %v", err)
-			}
-			wantContent, before := readBundle(t, path)
-
-			logs := captureLogs(t)
-			// Spelled out rather than imported from the production const: an operator's
-			// log query keys on these words, so a silent rename must fail here.
-			const tightenedMsg = "tightened the file mode of a prior pfx"
-			current, err := inspectCurrent(t.Context(), s, "out.pfx", &analysis, convert.EncNameModern2023, "pw")
-			if err != nil {
-				t.Fatalf("inspect(mode %o) = error %v, want nil", tc.mode, err)
-			}
-			if !current {
-				t.Errorf("inspect(mode %o) = false, want true: a permission bit is not part of currency,"+
-					" and rewriting for one cannot converge on a filesystem that will not store it", tc.mode)
-			}
-
-			gotContent, after := readBundle(t, path)
-			if !bytes.Equal(gotContent, wantContent) {
-				t.Errorf("inspect(mode %o) changed the bundle's bytes; the mode must be fixed with a"+
-					" chmod, not by re-encoding it with a fresh salt", tc.mode)
-			}
-			if !after.ModTime().Equal(before.ModTime()) {
-				t.Errorf("inspect(mode %o) moved the mtime from %v to %v; a chmod does not, a rewrite does",
-					tc.mode, before.ModTime(), after.ModTime())
-			}
-			if tc.wantTighten {
-				if got := logs.CountLevel(slog.LevelInfo, tightenedMsg); got != 1 {
-					t.Errorf("inspect(mode %o) logged %q at INFO %d times, want exactly 1: %q",
-						tc.mode, tightenedMsg, got, logs.Messages())
-				}
-				if logs.Len() != 1 {
-					t.Errorf("inspect(mode %o) logged %q, want only the tighten notice: a repaired mode is"+
-						" not also a warning", tc.mode, logs.Messages())
-				}
-				want := tc.wantMode
-				if want == 0 {
-					want = tc.mode & pfxFileMode
-				}
-				if got := after.Mode().Perm(); got != want {
-					t.Errorf("inspect(mode %o) tightened mode to %o, want %o: allowed owner bits must survive", tc.mode, got, want)
-				}
-				return
-			}
-			if logs.Len() != 0 {
-				t.Errorf("inspect(mode %o) logged %q, want nothing at all: a mode at or stricter than"+
-					" policy is not this app's to touch", tc.mode, logs.Messages())
-			}
-			if got, want := after.Mode().Perm(), before.Mode().Perm(); got != want {
-				t.Errorf("inspect(mode %o) changed the mode to %v, want %v left untouched", tc.mode, got, want)
-			}
-		})
-	}
-}
-
-// TestStoreInspect_keeps_a_bundle_whose_mode_cannot_be_tightened pins the
-// convergence property the retired mode arm got wrong, for every tightening failure a
-// rewrite would NOT fix.
-//
-// On a filesystem that will not store the bit — CIFS/vfat with mount-forced modes, an
-// NFS squash config, all plausible for the /output volume of a Synology deployment —
-// the old design called every bundle stale on every scan, so the "fix" was a
-// permanent rewrite loop: fresh KDF salts, fresh mtimes, and the documented
-// downstream rsync re-replicating the entire output tree every cycle. A read-only or
-// mode-forcing mount that fails the chmod outright (EROFS, EINVAL) is the same
-// situation: the error proves the chmod did not land, never that a rewrite would, and
-// rewriting there trades one WARN per scan for a failed encode+write per scan. Here
-// the bundle stays CURRENT and the whole cost is one WARN per scan naming the mode
-// found and the mode wanted, which a second scan repeats rather than compounding.
-//
-// The one failure that IS convergeable — a chmod refused on a bundle owned by ANOTHER
-// UID — deliberately does not appear in this table; it belongs to
-// TestScannerRun_regenerates_a_bundle_whose_mode_repair_was_refused, which pins the
-// opposite verdict. Keeping the two in separate tests is what stops a future
-// simplification from collapsing them back into one non-action. A refusal on a bundle
-// this process OWNS is NOT that case and does belong here: a UID that owns a file may
-// always chmod it, so what was refused is the requested BITS, and the replacement a
-// rewrite would write lands with the same forced mode.
-//
-// The chmod is stubbed because none of these failures is reproducible in a temp
-// directory: no local filesystem ignores permission bits or refuses a chmod to the
-// UID running the suite.
-// Runs serially: it swaps slog.Default() and the chmod seam.
-func TestStoreInspect_keeps_a_bundle_whose_mode_cannot_be_tightened(t *testing.T) {
-	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
-	if err != nil {
-		t.Fatalf("setup: Analyse: %v", err)
-	}
-	for _, tc := range []struct {
-		name  string
-		chmod func(*os.File, os.FileMode) error
-	}{
-		{
-			"a filesystem that accepts the chmod and stores nothing",
-			func(*os.File, os.FileMode) error { return nil },
-		},
-		{
-			// A read-only mount: the chmod fails, but replacing the file would fail too,
-			// so the error is no reason to try.
-			"a chmod a read-only filesystem fails",
-			func(f *os.File, _ os.FileMode) error {
-				return &fs.PathError{Op: "chmod", Path: f.Name(), Err: syscall.EROFS}
-			},
-		},
-		{
-			// A filesystem that rejects the mode itself rather than the caller's right to
-			// set it. Same reasoning, and it is what proves the refusal test below keys on
-			// the ERROR rather than on "the chmod failed".
-			"a chmod the filesystem rejects as invalid",
-			func(f *os.File, _ os.FileMode) error {
-				return &fs.PathError{Op: "chmod", Path: f.Name(), Err: syscall.EINVAL}
-			},
-		},
-		{
-			// A mode-forcing mount that REFUSES rather than silently ignoring the
-			// chmod (fat_setattr returns EPERM for any mode outside the mount's
-			// fmask). The bundle is this process's own, so the refusal is about the
-			// BITS and not about ownership, and the replacement a rewrite would
-			// publish lands with the same forced mode — the one arm where a refusal
-			// must NOT schedule one. Deliberately no fileOwnedByProcess override:
-			// the fixture is owned by the test process, which is the premise, so the
-			// production discriminator is what routes this case.
-			"a chmod a mode-forcing filesystem refuses on a bundle this process owns",
-			func(f *os.File, _ os.FileMode) error {
-				return &fs.PathError{Op: "chmod", Path: f.Name(), Err: syscall.EPERM}
-			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			s := newOutputStore(t, dir)
-			if err := s.write(t.Context(), "out.pfx", mustEncode(t, &analysis)); err != nil {
-				t.Fatalf("setup: write: %v", err)
-			}
-			// Same bytes, laxer mode: a cp/tar restore of the output volume.
-			if err := os.Chmod(filepath.Join(dir, "out.pfx"), 0o644); err != nil {
-				t.Fatalf("setup: Chmod: %v", err)
-			}
-			prev := chmodFile
-			chmodFile = tc.chmod
-			t.Cleanup(func() { chmodFile = prev })
-
-			logs := captureLogs(t)
-			// Spelled out rather than imported from the production const: an operator's
-			// log query keys on these words, so a silent rename must fail here.
-			const notTightenedMsg = "prior pfx is more permissive than policy and could not be tightened"
-			current, err := inspectCurrent(t.Context(), s, "out.pfx", &analysis, convert.EncNameModern2023, "pw")
-			if err != nil {
-				t.Fatalf("inspect(untightenable mode) = error %v, want nil", err)
-			}
-			if !current {
-				t.Error("inspect(untightenable mode) = false, want true: calling it stale is the rewrite" +
-					" loop this design exists to avoid")
-			}
-			if got := logs.CountLevel(slog.LevelWarn, notTightenedMsg); got != 1 {
-				t.Errorf("inspect(untightenable mode) logged %q at WARN %d times, want exactly 1: %q",
-					notTightenedMsg, got, logs.Messages())
-			}
-			// Keyed attributes, not a line substring: the mode found and the mode wanted
-			// must each appear under their own key, or a line naming one twice would pass.
-			for key, want := range map[string]string{"mode": "-rw-r--r--", "want": "-rw-------"} {
-				if !logs.HasAttr(notTightenedMsg, key, want) {
-					got, _ := logs.AttrValue(notTightenedMsg, key)
-					t.Errorf("inspect(untightenable mode) logged %s=%q, want %q", key, got, want)
-				}
-			}
-
-			// The next scan reaches the same verdict and says the same thing once more:
-			// steady state, not an escalation and not a rewrite.
-			current, err = inspectCurrent(t.Context(), s, "out.pfx", &analysis, convert.EncNameModern2023, "pw")
-			if err != nil || !current {
-				t.Fatalf("inspect(untightenable mode, second scan) = (%v, %v), want (true, nil)", current, err)
-			}
-			if got := logs.CountLevel(slog.LevelWarn, notTightenedMsg); got != 2 {
-				t.Errorf("two scans logged %q at WARN %d times, want exactly 2 (one per scan): %q",
-					notTightenedMsg, got, logs.Messages())
-			}
-			// Neither the refusal message nor a repair notice belongs here: this bundle is
-			// not being regenerated and its mode was not repaired.
-			for _, unwanted := range []string{
-				"prior pfx is more permissive than policy and the mode repair was refused; regenerating",
-				"tightened the file mode of a prior pfx",
-			} {
-				if logs.Contains(unwanted) {
-					t.Errorf("inspect(untightenable mode) logged %q; %q is the wrong message for a"+
-						" tightening no rewrite can fix", logs.Messages(), unwanted)
-				}
-			}
-			if _, after := readBundle(t, filepath.Join(dir, "out.pfx")); after.Mode().Perm() != 0o644 {
-				t.Errorf("inspect(untightenable mode) left mode %o, want 0644 untouched: the stub stored"+
-					" nothing, so nothing may claim otherwise", after.Mode().Perm())
-			}
-		})
-	}
-}
-
-// TestScannerRun_regenerates_a_bundle_whose_mode_repair_was_refused pins the other
-// half of the mode policy, and the reason it is a WHOLE-SCAN test rather than an
-// inspect one: the property that matters is that the refusal ends in a REPLACED
-// bundle, which only the scan can show.
-//
-// The scenario is the one this file's stat-failure arm already names as realistic: a
-// prior .pfx owned by another UID (a root-owned bundle left behind by an earlier
-// deployment, before the user: mapping changed) whose bytes are still correct but
-// whose mode is 0644 — a private key readable by every process on the /output volume
-// and by the documented downstream rsync replica. A chmod cannot fix that, because
-// os.Root.Chmod needs ownership; a temp+rename rewrite can, because it needs write
-// permission on the output DIRECTORY instead. Before this arm existed the bundle kept
-// mode 0644 for the life of the deployment and produced one WARN per scan forever.
-//
-// Both refusal errnos are covered because they are two different refusals of the same
-// kind (EPERM: not the owner; EACCES: the path denies it) and only the errno
-// classification tells them apart from the EROFS/EINVAL failures the sibling test
-// keeps WARN-only. The third scan is the point of the test as much as the second: a
-// permanently refusing chmod must still converge, because the REPLACEMENT is
-// owner-only and never reaches the repair path again.
-//
-// Runs serially: it swaps slog.Default() and the chmod seam.
-func TestScannerRun_regenerates_a_bundle_whose_mode_repair_was_refused(t *testing.T) {
-	// Spelled out rather than imported from the production consts: an operator's log
-	// query keys on these words, so a silent rename must fail here.
-	const refusedMsg = "prior pfx is more permissive than policy and the mode repair was refused; regenerating"
-	const notTightenedMsg = "prior pfx is more permissive than policy and could not be tightened"
-	for _, tc := range []struct {
-		name  string
-		errno syscall.Errno
-	}{
-		{"a bundle owned by another UID", syscall.EPERM},
-		{"a chmod the path denies", syscall.EACCES},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			certsRoot := t.TempDir()
-			outRoot := t.TempDir()
-			_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
-			writePair(t, certsRoot, "chain", chainPEM, keyPEM)
-			scanner := New(&Options{
-				CertsRoot: certsRoot,
-				OutRoot:   outRoot,
-				Password:  "pw",
-				Encoder:   convert.EncNameModern2023,
-			})
-			if res, err := scanner.Run(t.Context()); err != nil || res.Converted != 1 {
-				t.Fatalf("setup: initial Run = %+v, %v, want Converted 1 and nil", res, err)
-			}
-			pfxPath := filepath.Join(outRoot, "chain.pfx")
-			before, _ := readBundle(t, pfxPath)
-			// Correct bytes, wrong mode: a restore of the output volume, or a bundle
-			// written by an earlier deployment under a different UID.
-			if err := os.Chmod(pfxPath, 0o644); err != nil {
-				t.Fatalf("setup: Chmod: %v", err)
-			}
-			// The refusal itself cannot be staged in a temp directory the suite's own UID
-			// owns, so it comes from the seam — in the shape os.Root.Chmod really returns
-			// it, an *fs.PathError around the errno, because the classification reads
-			// through that wrapping.
-			prev := chmodFile
-			chmodFile = func(f *os.File, _ os.FileMode) error {
-				return &fs.PathError{Op: "chmod", Path: f.Name(), Err: tc.errno}
-			}
-			t.Cleanup(func() { chmodFile = prev })
-			// The injected refusal MEANS "another UID owns this bundle", so the
-			// ownership read has to agree: a refusal on a file this process owns is the
-			// filesystem refusing the BITS, which is the WARN-only arm.
-			prevOwned := fileOwnedByProcess
-			fileOwnedByProcess = func(os.FileInfo) bool { return false }
-			t.Cleanup(func() { fileOwnedByProcess = prevOwned })
-
-			logs := captureLogs(t)
-			res, err := scanner.Run(t.Context())
-			if err != nil {
-				t.Fatalf("Run(refused mode repair) = error %v, want nil", err)
-			}
-			if res.Converted != 1 || res.Unchanged != 0 || res.Failed != 0 {
-				t.Errorf("Run(refused mode repair) = %+v, want Converted 1 Unchanged 0 Failed 0: a repair"+
-					" this app cannot make with a chmod is one it must make by rewriting", res)
-			}
-			if got := logs.CountLevel(slog.LevelWarn, refusedMsg); got != 1 {
-				t.Errorf("Run(refused mode repair) logged %q at WARN %d times, want exactly 1: %q",
-					refusedMsg, got, logs.Messages())
-			}
-			if logs.Contains(notTightenedMsg) {
-				t.Errorf("Run(refused mode repair) logged %q, want the refusal message instead: the two"+
-					" causes now end differently and must not share one line", logs.Messages())
-			}
-			// The refusal is an ownership problem, so it must carry the ownership hint and
-			// name both modes under their own keys.
-			for key, want := range map[string]string{
-				"mode":        "-rw-r--r--",
-				"want":        "-rw-------",
-				"remediation": "check /output ownership and permissions for the UID in user:",
-			} {
-				if !logs.HasAttr(refusedMsg, key, want) {
-					got, _ := logs.AttrValue(refusedMsg, key)
-					t.Errorf("Run(refused mode repair) logged %s=%q, want %q", key, got, want)
-				}
-			}
-			after, afterInfo := readBundle(t, pfxPath)
-			if bytes.Equal(after, before) {
-				t.Error("Run(refused mode repair) left the bundle's bytes untouched, want a rewritten bundle:" +
-					" a replacement is encoded with a fresh KDF salt, so identical bytes mean nothing was written")
-			}
-			if got := afterInfo.Mode().Perm(); got != pfxFileMode {
-				t.Errorf("Run(refused mode repair) left mode %o, want %o: the rewrite is what converges the"+
-					" mode the chmod could not", got, pfxFileMode)
-			}
-
-			// Converged: the replacement is owner-only, so the next scan has nothing to
-			// repair, nothing to say, and nothing to rewrite. Without this the fix would
-			// trade one WARN per scan for one rewrite per scan.
-			res, err = scanner.Run(t.Context())
-			if err != nil {
-				t.Fatalf("Run(after the rewrite) = error %v, want nil", err)
-			}
-			if res.Unchanged != 1 || res.Converted != 0 {
-				t.Errorf("Run(after the rewrite) = %+v, want Unchanged 1 Converted 0: the rewritten bundle is"+
-					" already at policy", res)
-			}
-			if got := logs.CountLevel(slog.LevelWarn, refusedMsg); got != 1 {
-				t.Errorf("two scans logged %q at WARN %d times, want exactly 1 (the second scan has nothing"+
-					" left to repair): %q", refusedMsg, got, logs.Messages())
-			}
-		})
-	}
-}
-
 // boolCount turns "should this message have been logged?" into the count a log assertion
 // compares against, so a table case can name the message it expects rather than carry a
 // number per message.
@@ -1450,26 +1067,27 @@ func boolCount(want bool) int {
 // failure and still flips health, which is what keeps "a failed PFX write is a
 // conversion failure" the default the README documents.
 //
-// The two messages are load-bearing too: only the content-matched-plus-permission shape
-// carries unwritableBundleMsg, whose text promises the bytes were compared and matched
-// and which the README's alerting section keys on. A refusal by the VOLUME cannot make
-// that promise about permissions, so it carries unreplaceableBundleMsg with the volume
-// remediation instead — an operator sent to check ownership over a full disk reads the
-// WARN as noise.
+// Both messages are load-bearing too: only the mode-only shape carries
+// unwritableBundleMsg, whose text promises the bytes were compared and matched and only
+// the permission bits are wrong. A refusal by the VOLUME cannot make that promise about
+// permissions, so it carries unreplaceableBundleMsg with the volume remediation instead —
+// an operator sent to check ownership over a full disk reads the WARN as noise.
 //
 // The second scan matters as much as the first: the condition is steady state, so the
 // WARN repeats once per scan rather than compounding, and nothing may be deleted or
 // corrupted while it persists.
 //
-// Both seams are the only way in: the suite owns every file it creates (and here runs
-// as root), so no temp directory can refuse it either a chmod or a write.
-// Runs serially: it swaps slog.Default(), the chmod seam and the write seam.
-func TestScannerRun_when_the_repairing_rewrite_is_also_refused(t *testing.T) {
+// The write seam is the only way in: the suite owns every file it creates (and here runs
+// as root), so no temp directory can refuse it a write. The LAX MODE needs no seam at
+// all — a plain os.Chmod on the bundle is the whole trigger now, because detection is a
+// bitmask test on what the scan lstats and nothing is attempted against the file.
+// Runs serially: it swaps slog.Default() and the write seam.
+func TestScannerRun_when_the_mode_correcting_rewrite_is_refused(t *testing.T) {
 	// Spelled out rather than imported from the production consts: an operator's log
 	// query keys on these words, so a silent rename must fail here.
-	const refusedMsg = "prior pfx is more permissive than policy and the mode repair was refused; regenerating"
-	const unwritableMsg = "prior pfx is more permissive than policy and neither the mode repair nor the replacing" +
-		" write was permitted; leaving the existing bundle in place, health is unaffected"
+	const laxMsg = "prior pfx is more permissive than policy; rewriting it at the wanted mode"
+	const unwritableMsg = "prior pfx is more permissive than policy and the rewrite that would correct its mode" +
+		" was not permitted; leaving the existing bundle in place, health is unaffected"
 	const unreplaceableMsg = "prior pfx could not be replaced and the /output condition that refused the write is" +
 		" not one a restart clears; leaving the existing bundle in place, health is unaffected"
 	const failedMsg = "conversion failed"
@@ -1525,27 +1143,17 @@ func TestScannerRun_when_the_repairing_rewrite_is_also_refused(t *testing.T) {
 				Password:  "pw",
 				Encoder:   convert.EncNameModern2023,
 			})
-			// The first scan runs with both seams live, so the bundle under test is a real
-			// one this app wrote.
+			// The first scan runs with the write seam live, so the bundle under test is a
+			// real one this app wrote.
 			if res, err := scanner.Run(t.Context()); err != nil || res.Converted != 1 {
 				t.Fatalf("setup: initial Run = %+v, %v, want Converted 1 and nil", res, err)
 			}
 			pfxPath := filepath.Join(outRoot, "chain.pfx")
 			before, _ := readBundle(t, pfxPath)
-			// Correct bytes, wrong mode: the foreign-owned bundle the mode arm exists for.
+			// Correct bytes, wrong mode: the whole trigger, and no seam needed for it.
 			if err := os.Chmod(pfxPath, 0o644); err != nil {
 				t.Fatalf("setup: Chmod: %v", err)
 			}
-			prevChmod := chmodFile
-			chmodFile = func(f *os.File, _ os.FileMode) error {
-				return &fs.PathError{Op: "chmod", Path: f.Name(), Err: syscall.EPERM}
-			}
-			t.Cleanup(func() { chmodFile = prevChmod })
-			// The injected refusal MEANS "another UID owns this bundle" (see the sibling
-			// table above), so the ownership read has to agree.
-			prevOwned := fileOwnedByProcess
-			fileOwnedByProcess = func(os.FileInfo) bool { return false }
-			t.Cleanup(func() { fileOwnedByProcess = prevOwned })
 			prevWrite := writeFileInRoot
 			writeFileInRoot = func(context.Context, *os.Root, string, []byte,
 				...atomicfile.Option,
@@ -1557,39 +1165,39 @@ func TestScannerRun_when_the_repairing_rewrite_is_also_refused(t *testing.T) {
 			logs := captureLogs(t)
 			res, err := scanner.Run(t.Context())
 			if err != nil {
-				t.Fatalf("Run(refused repair, refused rewrite) = error %v, want nil: neither outcome is a"+
+				t.Fatalf("Run(lax mode, refused rewrite) = error %v, want nil: neither outcome is a"+
 					" scan-level failure", err)
 			}
 			if res.Unwritable != tc.wantUnwritable || res.Failed != tc.wantFailed || res.Converted != 0 {
-				t.Errorf("Run(refused repair, refused rewrite) = %+v, want Unwritable %d Failed %d Converted 0",
+				t.Errorf("Run(lax mode, refused rewrite) = %+v, want Unwritable %d Failed %d Converted 0",
 					res, tc.wantUnwritable, tc.wantFailed)
 			}
-			// The refusal of the chmod is announced either way: it is what schedules the
-			// rewrite, so its absence would mean this test is not exercising the arm at all.
-			if got := logs.CountLevel(slog.LevelWarn, refusedMsg); got != 1 {
-				t.Errorf("Run(refused repair, refused rewrite) logged %q at WARN %d times, want exactly 1: %q",
-					refusedMsg, got, logs.Messages())
+			// The lax mode is announced either way: it is what schedules the rewrite, so its
+			// absence would mean this test is not exercising the arm at all.
+			if got := logs.CountLevel(slog.LevelWarn, laxMsg); got != 1 {
+				t.Errorf("Run(lax mode, refused rewrite) logged %q at WARN %d times, want exactly 1: %q",
+					laxMsg, got, logs.Messages())
 			}
 			wantUnwritableLines, wantFailedLines := 0, 1
 			if tc.wantUnwritable > 0 {
 				wantUnwritableLines, wantFailedLines = 1, 0
 			}
 			// Once per scan for this bundle, not once per attempt: the entry is written at
-			// most once per scan, and an operator watching a permanently foreign-owned
-			// volume must not get a line per retry behind it. The message is asserted by
-			// NAME, so a neutral outcome reported under the content-matched promise when the
-			// volume was the refuser fails here.
+			// most once per scan, and an operator watching a permanently unwritable volume
+			// must not get a line per retry behind it. The message is asserted by NAME, so a
+			// neutral outcome reported under the mode-only promise when the volume was the
+			// refuser fails here.
 			for msg, want := range map[string]int{
 				unwritableMsg:    boolCount(tc.wantNeutralMsg == unwritableMsg),
 				unreplaceableMsg: boolCount(tc.wantNeutralMsg == unreplaceableMsg),
 			} {
 				if got := logs.CountLevel(slog.LevelWarn, msg); got != want {
-					t.Errorf("Run(refused repair, refused rewrite) logged %q at WARN %d times, want %d: %q",
+					t.Errorf("Run(lax mode, refused rewrite) logged %q at WARN %d times, want %d: %q",
 						msg, got, want, logs.Messages())
 				}
 			}
 			if got := logs.CountLevel(slog.LevelError, failedMsg); got != wantFailedLines {
-				t.Errorf("Run(refused repair, refused rewrite) logged %q at ERROR %d times, want %d: %q",
+				t.Errorf("Run(lax mode, refused rewrite) logged %q at ERROR %d times, want %d: %q",
 					failedMsg, got, wantFailedLines, logs.Messages())
 			}
 			if tc.wantUnwritable > 0 {
@@ -1603,7 +1211,7 @@ func TestScannerRun_when_the_repairing_rewrite_is_also_refused(t *testing.T) {
 				} {
 					if !logs.HasAttr(tc.wantNeutralMsg, key, want) {
 						got, _ := logs.AttrValue(tc.wantNeutralMsg, key)
-						t.Errorf("Run(refused repair, refused rewrite) logged %s=%q, want %q", key, got, want)
+						t.Errorf("Run(lax mode, refused rewrite) logged %s=%q, want %q", key, got, want)
 					}
 				}
 			}
@@ -1611,12 +1219,12 @@ func TestScannerRun_when_the_repairing_rewrite_is_also_refused(t *testing.T) {
 			// operator is still serving must survive a refused replacement untouched.
 			after, afterInfo := readBundle(t, pfxPath)
 			if !bytes.Equal(after, before) {
-				t.Error("Run(refused repair, refused rewrite) changed the bundle's bytes, want them untouched:" +
+				t.Error("Run(lax mode, refused rewrite) changed the bundle's bytes, want them untouched:" +
 					" a write that never landed must leave the served bundle alone")
 			}
 			if got := afterInfo.Mode().Perm(); got != 0o644 {
-				t.Errorf("Run(refused repair, refused rewrite) left mode %o, want 0644 untouched: both the"+
-					" chmod and the rewrite were refused, so nothing may claim otherwise", got)
+				t.Errorf("Run(lax mode, refused rewrite) left mode %o, want 0644 untouched: the rewrite was"+
+					" refused and this app never chmods a bundle in place, so the mode found must survive", got)
 			}
 
 			// Steady state: the same verdict, the same one line, no compounding and still no
@@ -1643,25 +1251,29 @@ func TestScannerRun_when_the_repairing_rewrite_is_also_refused(t *testing.T) {
 	}
 }
 
-// TestScannerRun_a_stale_bundle_whose_mode_repair_was_refused_is_a_conversion_failure pins
-// the boundary of the health-neutral outcome from the other side: neutrality is granted only
-// where this app never PROVED the bundle on disk wrong. A bundle that is a renewal behind was
-// compared and found stale (contentVerifiedStale), so a refused rewrite of it counts in
+// TestScannerRun_a_stale_bundle_with_a_lax_mode_is_a_conversion_failure pins the boundary
+// of the health-neutral outcome from the other side: neutrality is granted only where this
+// app never PROVED the bundle on disk wrong. A bundle that is a renewal behind was compared
+// and found stale (contentVerifiedStale), so a refused rewrite of it counts in
 // ScanResult.Failed and flips health -- otherwise the operator's PFX holds the previous
 // certificate with a green marker and no alert, which is the condition this boundary exists
 // to prevent. The two sibling tests stage the facts that DO earn neutrality (correct bytes
-// with a refused mode repair, and content this app could not verify at all); all three are
+// with only a lax mode, and content this app could not verify at all); all three are
 // needed, or any one arm can be deleted silently.
 //
-// The write is refused for permissions here on purpose: it is the errno that earns neutrality
-// under either other fact, so this case proves the CONTENT fact is what refuses it and not the
-// error class.
+// The lax mode is staged here on purpose, so the ONLY difference from the neutral sibling is
+// the content fact. It proves the mode does not launder a stale bundle into neutrality: a
+// rewrite carrying NEW BYTES is not a mode-only rewrite however lax the mode was.
+//
+// The write is refused for permissions here on purpose too: it is the errno that earns
+// neutrality under either other fact, so this case proves the CONTENT fact is what refuses
+// it and not the error class.
 //
 // Failed rather than main.healthyAfterScan is asserted because that predicate lives in
 // package main and reads exactly this field (`return r.Failed == 0`), pinned there by
 // TestHealthyAfterScan.
-// Runs serially: it swaps slog.Default(), the chmod seam and the write seam.
-func TestScannerRun_a_stale_bundle_whose_mode_repair_was_refused_is_a_conversion_failure(t *testing.T) {
+// Runs serially: it swaps slog.Default() and the write seam.
+func TestScannerRun_a_stale_bundle_with_a_lax_mode_is_a_conversion_failure(t *testing.T) {
 	certsRoot := t.TempDir()
 	outRoot := t.TempDir()
 	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
@@ -1674,7 +1286,7 @@ func TestScannerRun_a_stale_bundle_whose_mode_repair_was_refused_is_a_conversion
 		Password:  "pw",
 		Encoder:   convert.EncNameModern2023,
 	})
-	// The first scan runs with both seams live, so the bundle under test is a real one
+	// The first scan runs with the write seam live, so the bundle under test is a real one
 	// this app wrote -- for the PREVIOUS certificate.
 	if res, err := scanner.Run(t.Context()); err != nil || res.Converted != 1 {
 		t.Fatalf("setup: initial Run = %+v, %v, want Converted 1 and nil", res, err)
@@ -1691,20 +1303,11 @@ func TestScannerRun_a_stale_bundle_whose_mode_repair_was_refused_is_a_conversion
 	if err := os.WriteFile(keyPath, renewedKeyPEM, 0o600); err != nil {
 		t.Fatalf("setup: rewrite key: %v", err)
 	}
-	// Laxer than pfxFileMode, so tightenMode runs and its refusal is remembered.
+	// Laxer than pfxFileMode, so the mode fact is set as well as the content fact: the
+	// point of this case is that the stale content still decides the outcome.
 	if err := os.Chmod(pfxPath, 0o644); err != nil {
 		t.Fatalf("setup: Chmod: %v", err)
 	}
-	prevChmod := chmodFile
-	chmodFile = func(f *os.File, _ os.FileMode) error {
-		return &fs.PathError{Op: "chmod", Path: f.Name(), Err: syscall.EPERM}
-	}
-	t.Cleanup(func() { chmodFile = prevChmod })
-	// The injected refusal MEANS "another UID owns this bundle", so the ownership read
-	// has to agree.
-	prevOwned := fileOwnedByProcess
-	fileOwnedByProcess = func(os.FileInfo) bool { return false }
-	t.Cleanup(func() { fileOwnedByProcess = prevOwned })
 	prevWrite := writeFileInRoot
 	writeFileInRoot = func(context.Context, *os.Root, string, []byte,
 		...atomicfile.Option,
@@ -1716,17 +1319,17 @@ func TestScannerRun_a_stale_bundle_whose_mode_repair_was_refused_is_a_conversion
 	logs := captureLogs(t)
 	res, err := scanner.Run(t.Context())
 	if err != nil {
-		t.Fatalf("Run(stale bundle, refused repair, refused rewrite) = error %v, want nil: this is a"+
+		t.Fatalf("Run(stale bundle, lax mode, refused rewrite) = error %v, want nil: this is a"+
 			" pair-level failure, not a scan-level one", err)
 	}
 	if res.Failed != 1 || res.Unwritable != 0 || res.Converted != 0 {
-		t.Errorf("Run(stale bundle, refused repair, refused rewrite) = %+v, want Failed 1 Unwritable 0"+
+		t.Errorf("Run(stale bundle, lax mode, refused rewrite) = %+v, want Failed 1 Unwritable 0"+
 			" Converted 0: only a content-matched bundle earns the health-neutral arm", res)
 	}
-	// The chmod refusal is still announced: tightenMode runs before the content read, so
-	// its absence would mean this test never reached the arm under test.
-	if got := logs.CountLevel(slog.LevelWarn, modeRepairRefusedMsg); got != 1 {
-		t.Errorf("logged %q at WARN %d times, want exactly 1: %q", modeRepairRefusedMsg, got, logs.Messages())
+	// The lax mode is still announced: detection runs before the content read, so its
+	// absence would mean this test never reached the arm under test.
+	if got := logs.CountLevel(slog.LevelWarn, laxBundleMsg); got != 1 {
+		t.Errorf("logged %q at WARN %d times, want exactly 1: %q", laxBundleMsg, got, logs.Messages())
 	}
 	if got := logs.CountLevel(slog.LevelError, "conversion failed"); got != 1 {
 		t.Errorf("logged %q at ERROR %d times, want exactly 1: an unwritten renewal is a conversion"+

@@ -244,7 +244,19 @@ func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *r
 	reapable := rc.safeToReap() && walkSafe
 	d := resolveReap(rp.mode, reapable, walkSafe, rc.unreplaceableOnly())
 	if !d.reap {
-		slog.Warn("output bundles have no matching input",
+		msg := "output bundles have no matching input"
+		// In sync mode reaching this line means orphan removal is OFF for this scan,
+		// which is the condition the README's CertConverterOrphanRemovalDisabled rule
+		// matches, and the README's OUTPUT_LIFECYCLE row promises the phrase for every
+		// failed proof term, the conversion-failure and refused-replacement vetoes
+		// included. The report-only modes reach this line as their normal feature, so
+		// they must not compose it. On !walkSafe, logOrphanWalkOutcome has already
+		// emitted a phrase-carrying WARN; a second occurrence in one scan is harmless
+		// to a count_over_time rule.
+		if rp.mode == outputpolicy.LifecycleSync {
+			msg += "; " + reapDisabledPhrase
+		}
+		slog.Warn(msg,
 			"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),
 			"action", d.inaction,
 			"remediation", d.remediation)
@@ -506,7 +518,7 @@ func logReapAudit(removed []string) {
 const reapDeferral = 30 * time.Second
 
 // waitBeforeReap is reapDeferral's wait, indirected through a package var for the
-// same reason chmodFile is: the behaviour that matters cannot be produced in a test
+// same reason writeFileInRoot is: the behaviour that matters cannot be produced in a test
 // otherwise. Here it is the delay itself — a suite that really waited reapDeferral per
 // case would cost minutes — plus the two edges the wait owns (a shutdown arriving
 // inside the window, and the batch waiting once rather than once per orphan).
@@ -548,13 +560,6 @@ const maxLoggedOrphans = 20
 // — so it only ever engages on the pathological tree.
 const maxLoggedOrphanBytes = 4096
 
-// truncationMarker names a sample maxLoggedOrphanBytes had to cut, so a reader can
-// tell a path list that ends mid-name from one that genuinely ends there. The wording
-// and the cap that appends it live in internal/logtext, which internal/convert shares,
-// so the two cannot drift apart on it; this alias is what the package's own
-// assertions read.
-const truncationMarker = logtext.Marker
-
 // sampleOrphanPaths renders at most maxLoggedOrphans paths within
 // maxLoggedOrphanBytes, naming how many were elided so the log line stays bounded
 // without hiding the scale.
@@ -568,10 +573,12 @@ const truncationMarker = logtext.Marker
 //
 // The byte cut runs on the JOINED sample (that is what the budget is about) through
 // logtext.Cap, which backs the cut off to a rune start so a multi-byte name is
-// never cut into a partial rune. Paths are NOT sanitized: /input is a read-only mount
-// of the operator's own tree, and these attributes are the operator's query key for
-// which bundles were reported (the settled path-attribute-runesafe-adoption
-// decision).
+// never cut into a partial rune. Paths are NOT sanitized: these are /output-walk names
+// this app itself wrote, mirroring the operator's own /input tree, and they are the
+// operator's query key for which bundles were reported (the settled
+// path-attribute-runesafe-adoption decision). A hostile name a co-writer plants on a
+// permissive /output mount is covered without sanitizing — slog's handlers escape
+// non-printing runes, and such a writer can already replace bundles outright.
 //
 // Both suffixes are appended AFTER the cut, so a truncated sample exceeds the budget
 // by their own length: the bound exists to stop a multi-kilobyte record, not to hit

@@ -4,11 +4,16 @@
 // NOT sanitize.
 //
 // It exists for the marker and for the ONE consumer whose text must be bounded
-// without being sanitized: internal/process's orphan path sample. Those paths come
-// from /input, a read-only mount of the operator's own tree, and they are the
-// operator's query key for which bundles were reported, so rewriting runes in them
-// would damage the attribute (the settled path-attribute-runesafe-adoption
-// decision) — which rules out every sanitize-and-cap primitive, runesafe's included.
+// without being sanitized: internal/process's orphan path sample. Those names come
+// from the /output walk — bundles this app itself wrote, named after the operator's
+// own /input tree — and they are the operator's query key for which bundles were
+// reported, so rewriting runes in them would damage the attribute (the settled
+// path-attribute-runesafe-adoption decision), which rules out every sanitize-and-cap
+// primitive, runesafe's included. A name only a hostile co-writer on a permissive
+// /output mount could plant is outside what this exemption trusts, and is covered
+// anyway: slog's handlers escape non-printing runes before any record reaches the
+// stream, and such a writer already holds the strictly stronger power of replacing
+// bundles outright.
 //
 // internal/convert's certificate-derived text is the opposite case and does NOT come
 // through here: it takes runesafe.SanitizeSingleLineCapped directly, passing Marker.

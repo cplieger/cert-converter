@@ -637,8 +637,8 @@ func TestNameLink_refuses_a_name_it_cannot_decode(t *testing.T) {
 					{RawIssuer: tc.childIssuer},
 					{RawSubject: tc.parentSubject},
 				},
-				decodedSubjects: make([]decodedDN, 2),
-				decodedIssuers:  make([]decodedDN, 2),
+				canonicalSubjects: make([]canonicalDN, 2),
+				canonicalIssuers:  make([]canonicalDN, 2),
 			}
 			if got := g.nameLink(0, 1); got != tc.want {
 				t.Errorf("nameLink(child issuer %x, parent subject %x) = %d, want %d",

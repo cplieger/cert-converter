@@ -152,51 +152,75 @@ func (s *certScan) visit(block *pem.Block) error {
 		}
 		return nil
 	}
+	if len(block.Bytes) > maxCertDERBytes {
+		return fmt.Errorf("certificate PEM block %d: certificate is %d bytes of DER, above the %d this app parses (this app's own ceiling on what one certificate may allocate inside the parser, not an X.509 limit)",
+			len(s.certs)+1, len(block.Bytes), maxCertDERBytes)
+	}
 	c, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		return fmt.Errorf("certificate PEM block %d: %w", len(s.certs)+1, boundedTextError{err})
 	}
-	if err := oversizedExtensionIdentifiersError(c); err != nil {
+	if err := oversizedParsedCertificateError(c); err != nil {
 		return fmt.Errorf("certificate PEM block %d: %w", len(s.certs)+1, err)
 	}
 	s.certs = append(s.certs, c)
 	return nil
 }
 
-// Aggregate ceilings on what ONE parsed certificate's extension identifiers may
-// RETAIN for the life of the chain. x509.ParseCertificate decodes every extension
-// identifier at one int per identifier arc and keeps the result in
-// Certificate.Extensions for as long as the chain is held, so inside the 10 MB
+// maxCertDERBytes bounds one CERTIFICATE block's DER before x509.ParseCertificate
+// sees it. It is the TRANSIENT half of the retention policy below, and it exists
+// because a post-parse ceiling structurally cannot bound the parse's own
+// allocation: measured on go1.26.5, a 6.96 MB DER carrying one subjectAltName
+// extension of 3,650,000 empty uniformResourceIdentifier names allocates 534 MB
+// inside ParseCertificate, so a refusal read off the parsed certificate fires only
+// once the cost has already been paid. This is a LENGTH check on the block, not a
+// walk of its DER: the pre-parse schema shadow it replaces was removed on purpose
+// (class-c1-1) and nothing here re-reads the certificate's structure.
+//
+// 64 KiB is far above anything issued: a real certificate is 1-2 KB, and even a
+// 250-name SAN certificate is under 10 KB, so this refuses an amplification shape
+// rather than a configuration.
+const maxCertDERBytes = 64 << 10
+
+// Aggregate ceilings on what ONE parsed certificate may RETAIN for the life of the
+// chain, in both of the shapes x509.ParseCertificate keeps: the extension
+// IDENTIFIERS (one int per identifier arc, held in Certificate.Extensions) and the
+// decoded extension CONTENT (one freshly allocated Go value per encoded name,
+// identifier or URI, held in the typed fields the parser fills). Inside the 10 MB
 // MaxInputBytes cap a crafted block could otherwise retain tens of megabytes of
-// live []int per certificate. The bound is this app's own resource policy, not an
-// X.509 validity rule.
+// live []int and hundreds of megabytes of decoded content per certificate. The
+// bound is this app's own resource policy, not an X.509 validity rule.
 //
 // It is measured POST-parse, off the parsed certificate, by design (the class-c1-1
 // decision, 2026-08): the pre-parse DER walk this replaces shadowed crypto/x509's
 // schema, shared one exhaustible element budget across sites — a ~12 KB issuer
 // name could spend it and skip the measurement entirely, and exhaustion was
 // indistinguishable from malformed DER — and its per-identifier ceiling never
-// bounded the aggregate a 10 MB block can pack anyway. A bound read off
-// Certificate.Extensions cannot be starved and needs no schema shadowing; the
-// parse's own transient allocation stays bounded by MaxInputBytes and the
-// 64-block cap, and refusing here releases the parsed certificate instead of
-// retaining it with the chain.
+// bounded the aggregate a 10 MB block can pack anyway. A bound read off the parsed
+// certificate cannot be starved and needs no schema shadowing, and refusing here
+// releases the parsed certificate instead of retaining it with the chain. What it
+// cannot reach is the parse's OWN transient allocation, which is why
+// maxCertDERBytes above bounds that separately.
 //
-// Both numbers are far above anything legitimate: a real certificate carries
+// All three numbers are far above anything legitimate: a real certificate carries
 // around ten extensions of around ten arcs each, so 64 extensions and 4096 total
-// arcs (~32 KiB retained) pass every real chain while capping the retained cost
-// four orders of magnitude below the unbounded case.
+// arcs (~32 KiB retained) pass every real chain, and 4096 decoded elements is ~16x
+// the largest SAN list any CA issues (Let's Encrypt caps at 100 names), holding the
+// retained content under ~600 KB per certificate and ~38 MB for a full 64-certificate
+// chain.
 const (
-	maxCertExtensions       = 64
-	maxCertExtensionOIDArcs = 4096
+	maxCertExtensions        = 64
+	maxCertExtensionOIDArcs  = 4096
+	maxCertExtensionElements = 4096
 )
 
-// oversizedExtensionIdentifiersError refuses a parsed certificate whose extension
-// set exceeds the aggregate retention ceilings above. The refusal counts as a
-// conversion failure exactly as an unparseable block does — the chain is rejected
-// and the failure flips health — and the message names the ceiling so an operator
-// can tell this app's own resource policy from an X.509 error.
-func oversizedExtensionIdentifiersError(c *x509.Certificate) error {
+// oversizedParsedCertificateError refuses a parsed certificate whose extension
+// identifiers or decoded extension content exceed the aggregate retention ceilings
+// above. The refusal counts as a conversion failure exactly as an unparseable block
+// does — the chain is rejected and the failure flips health — and the message names
+// the ceiling so an operator can tell this app's own resource policy from an X.509
+// error.
+func oversizedParsedCertificateError(c *x509.Certificate) error {
 	if len(c.Extensions) > maxCertExtensions {
 		return fmt.Errorf("certificate carries %d extensions, above the %d this app accepts (this app's own ceiling on what a parsed chain may retain, not an X.509 limit)",
 			len(c.Extensions), maxCertExtensions)
@@ -209,7 +233,25 @@ func oversizedExtensionIdentifiersError(c *x509.Certificate) error {
 		return fmt.Errorf("certificate's extension identifiers total %d arcs, above the %d this app retains for a parsed chain (this app's own ceiling, not an X.509 limit: the parser keeps one int per identifier arc for as long as the chain)",
 			arcs, maxCertExtensionOIDArcs)
 	}
+	if elements := retainedExtensionElements(c); elements > maxCertExtensionElements {
+		return fmt.Errorf("certificate's extensions decode to %d retained elements (names, identifiers and URIs), above the %d this app retains for a parsed chain (this app's own ceiling, not an X.509 limit: the parser keeps one allocated value per element for as long as the chain)",
+			elements, maxCertExtensionElements)
+	}
 	return nil
+}
+
+// retainedExtensionElements counts the decoded extension content the parser kept on
+// c. Every field here is a slice x509 grows one element per encoded GeneralName,
+// policy, OID or URI, so the count is what the ceiling is expressed in rather than
+// any one field's meaning.
+func retainedExtensionElements(c *x509.Certificate) int {
+	return len(c.DNSNames) + len(c.EmailAddresses) + len(c.IPAddresses) + len(c.URIs) +
+		len(c.UnknownExtKeyUsage) + len(c.ExtKeyUsage) + len(c.PolicyIdentifiers) +
+		len(c.Policies) + len(c.CRLDistributionPoints) + len(c.OCSPServer) +
+		len(c.IssuingCertificateURL) + len(c.PermittedDNSDomains) +
+		len(c.ExcludedDNSDomains) + len(c.PermittedEmailAddresses) +
+		len(c.ExcludedEmailAddresses) + len(c.PermittedIPRanges) +
+		len(c.ExcludedIPRanges) + len(c.PermittedURIDomains) + len(c.ExcludedURIDomains)
 }
 
 // isExpectedCertFilePassenger reports whether a non-certificate PEM label in the
@@ -301,16 +343,16 @@ func pkcs8HoldsECKey(der []byte) bool {
 // walk — outer SEQUENCE, version INTEGER, algorithm SEQUENCE — so the two pre-parse
 // guards built on it cannot come to disagree about what counts as a PKCS#8 key.
 func pkcs8Fields(der []byte) (algorithm asn1.RawValue, afterAlgorithm []byte, ok bool) {
-	outer, _, ok := asn1Element(der)
-	if !ok || !isASN1(outer, asn1.TagSequence) {
+	outer, _, ok := asn1ElementWithTag(der, asn1.TagSequence)
+	if !ok {
 		return asn1.RawValue{}, nil, false
 	}
-	version, afterVersion, ok := asn1Element(outer.Bytes)
-	if !ok || !isASN1(version, asn1.TagInteger) {
+	_, afterVersion, ok := asn1ElementWithTag(outer.Bytes, asn1.TagInteger)
+	if !ok {
 		return asn1.RawValue{}, nil, false
 	}
-	algorithm, afterAlgorithm, ok = asn1Element(afterVersion)
-	if !ok || !isASN1(algorithm, asn1.TagSequence) {
+	algorithm, afterAlgorithm, ok = asn1ElementWithTag(afterVersion, asn1.TagSequence)
+	if !ok {
 		return asn1.RawValue{}, nil, false
 	}
 	return algorithm, afterAlgorithm, true
@@ -327,8 +369,8 @@ func pkcs8AlgorithmOID(der []byte) (oid asn1.RawValue, parameters []byte, ok boo
 	if !ok {
 		return asn1.RawValue{}, nil, false
 	}
-	oid, parameters, ok = asn1Element(algorithm.Bytes)
-	if !ok || !isASN1(oid, asn1.TagOID) {
+	oid, parameters, ok = asn1ElementWithTag(algorithm.Bytes, asn1.TagOID)
+	if !ok {
 		return asn1.RawValue{}, nil, false
 	}
 	return oid, parameters, true
@@ -445,6 +487,11 @@ const maxBlockTypeLogLen = 64
 // names the cut with the marker this app supplies. Nothing is re-implemented here;
 // the app contributes only the marker and the limit.
 //
+// The marker (logtext.Marker) is deliberately more explicit than runesafe's own
+// "..." preset, which is why boundLogText passes a marker of its own to the
+// library's caller-marker primitive; internal/process bounds its orphan path
+// sample with the same shared constant.
+//
 // The bound exists because the source file is capped only by the caller's input read
 // bound (MaxInputBytes), so an unbounded
 // interpolation would put a multi-megabyte line into the log of every scan that
@@ -465,15 +512,6 @@ func boundLogText(s string, limit int) string {
 	text, _ := runesafe.SanitizeSingleLineCapped(s, limit, logtext.Marker)
 	return text
 }
-
-// truncationMarker names text boundLogText had to cut, so a reader can tell a
-// diagnostic that ends mid-subject from one that genuinely ends there. It is
-// deliberately more explicit than runesafe's own "..." preset marker, which is why
-// boundLogText passes a marker of its own to the library's caller-marker primitive.
-// The wording lives in internal/logtext because internal/process bounds its orphan
-// path sample with the same marker and the two must not drift; this alias is what
-// the package's own assertions read.
-const truncationMarker = logtext.Marker
 
 // maxSubjectLogLen bounds the certificate-controlled subject interpolated into a
 // diagnostic. The subject is parsed out of a PEM file the app does not control
@@ -904,12 +942,12 @@ type rsaKeyPreScan struct {
 // and OVER-FACTORED keys, not to become a second parser: every other verdict is left
 // to the existing parsers and their existing errors.
 func scanRSAKeyEnvelope(der []byte, depth int) rsaKeyPreScan {
-	outer, _, ok := asn1Element(der)
-	if !ok || !isASN1(outer, asn1.TagSequence) {
+	outer, _, ok := asn1ElementWithTag(der, asn1.TagSequence)
+	if !ok {
 		return rsaKeyPreScan{}
 	}
-	version, afterVersion, ok := asn1Element(outer.Bytes)
-	if !ok || !isASN1(version, asn1.TagInteger) {
+	_, afterVersion, ok := asn1ElementWithTag(outer.Bytes, asn1.TagInteger)
+	if !ok {
 		return rsaKeyPreScan{}
 	}
 	second, afterSecond, ok := asn1Element(afterVersion)
@@ -945,8 +983,8 @@ func scanRSAKeyEnvelopePKCS8(afterAlgorithm []byte, depth int) rsaKeyPreScan {
 	if depth <= 0 {
 		return rsaKeyPreScan{}
 	}
-	inner, _, ok := asn1Element(afterAlgorithm)
-	if !ok || !isASN1(inner, asn1.TagOctetString) {
+	inner, _, ok := asn1ElementWithTag(afterAlgorithm, asn1.TagOctetString)
+	if !ok {
 		return rsaKeyPreScan{}
 	}
 	return scanRSAKeyEnvelope(inner.Bytes, depth-1)
@@ -1048,8 +1086,8 @@ func (s *rsaKeyPreScan) fold(elem asn1.RawValue) {
 // the caller refuses on what it already counted.
 func rsaOtherPrimeInfos(body []byte, limit int) (additional, maxBits int) {
 	for len(body) > 0 && additional < limit {
-		info, remaining, ok := asn1Element(body)
-		if !ok || !isASN1(info, asn1.TagSequence) {
+		info, remaining, ok := asn1ElementWithTag(body, asn1.TagSequence)
+		if !ok {
 			break
 		}
 		additional++
@@ -1068,8 +1106,8 @@ func otherPrimeInfoBits(info asn1.RawValue) int {
 	var maxBits int
 	fields := info.Bytes
 	for range 3 {
-		field, afterField, ok := asn1Element(fields)
-		if !ok || !isASN1(field, asn1.TagInteger) {
+		field, afterField, ok := asn1ElementWithTag(fields, asn1.TagInteger)
+		if !ok {
 			break
 		}
 		if fieldBits, bitsOK := derIntegerBits(field.Bytes); bitsOK && fieldBits > maxBits {
@@ -1097,6 +1135,17 @@ func asn1Element(b []byte) (asn1.RawValue, []byte, bool) {
 // [0] parameters) from being mistaken for the universal tag of the same number.
 func isASN1(v asn1.RawValue, tag int) bool {
 	return v.Class == asn1.ClassUniversal && v.Tag == tag
+}
+
+// asn1ElementWithTag reads one DER element and reports it only when it carries the
+// expected UNIVERSAL tag, so a schema walk states each step once instead of
+// repeating the decode-then-check-the-tag conjunction at every field.
+func asn1ElementWithTag(b []byte, tag int) (asn1.RawValue, []byte, bool) {
+	v, rest, ok := asn1Element(b)
+	if !ok || !isASN1(v, tag) {
+		return asn1.RawValue{}, nil, false
+	}
+	return v, rest, true
 }
 
 // derIntegerBits reports the bit length of a DER INTEGER's content bytes, and
@@ -1220,7 +1269,7 @@ func oversizedKeyAlgorithmOIDError(block *pem.Block) error {
 	// IDENTIFIER reaches that allocation; a compound tag or a SEQUENCE (explicit EC
 	// parameters, RSASSA-PSS parameters) is refused by encoding/asn1 without
 	// allocating, so it is left alone.
-	if params, _, paramsOK := asn1Element(parameters); paramsOK && isASN1(params, asn1.TagOID) &&
+	if params, _, paramsOK := asn1ElementWithTag(parameters, asn1.TagOID); paramsOK &&
 		!params.IsCompound && len(params.Bytes) > maxOIDBytes {
 		return fmt.Errorf("private key in a %q block names a %d-byte algorithm parameter identifier, above the %d-byte ceiling this app decodes an identifier at (decoding it would allocate one int per encoded byte before the key could be rejected)",
 			boundLogText(block.Type, maxBlockTypeLogLen), len(params.Bytes), maxOIDBytes)
@@ -1288,17 +1337,6 @@ func sec1CurveOIDBytes(der []byte) (int, bool) {
 	return len(oid.Bytes), true
 }
 
-// asn1ElementWithTag reads one DER element and reports it only when it carries the
-// expected UNIVERSAL tag, so a schema walk states each step once instead of
-// repeating the decode-then-check-the-tag conjunction at every field.
-func asn1ElementWithTag(b []byte, tag int) (asn1.RawValue, []byte, bool) {
-	v, rest, ok := asn1Element(b)
-	if !ok || !isASN1(v, tag) {
-		return asn1.RawValue{}, nil, false
-	}
-	return v, rest, true
-}
-
 // pkcs8PrivateKeyDER returns the content of a PKCS#8 PrivateKeyInfo's privateKey
 // OCTET STRING — the inner key structure x509 hands to the algorithm's own parser —
 // and nil for anything that is not that shape. It is the sibling of
@@ -1309,8 +1347,8 @@ func pkcs8PrivateKeyDER(der []byte) []byte {
 	if !ok {
 		return nil
 	}
-	inner, _, ok := asn1Element(afterAlgorithm)
-	if !ok || !isASN1(inner, asn1.TagOctetString) {
+	inner, _, ok := asn1ElementWithTag(afterAlgorithm, asn1.TagOctetString)
+	if !ok {
 		return nil
 	}
 	return inner.Bytes

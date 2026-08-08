@@ -16,16 +16,9 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"testing"
 	"time"
 )
-
-// FatalTB is the minimal TB surface this helper needs. Satisfied by
-// both *testing.T and *rapid.T (which lacks testing.TB methods like
-// ArtifactDir, Helper, TempDir, etc.).
-type FatalTB interface {
-	Fatal(args ...any)
-	Fatalf(format string, args ...any)
-}
 
 // pemTypeCert, pemTypeKeyPKCS8 and pemTypeKeyPKCS1 are the PEM block types this
 // helper emits: X.509 certificates, PKCS#8 private keys (the ECDSA path) and the
@@ -38,7 +31,7 @@ const (
 
 // signCert signs template with parent (parent == template yields a self-signed
 // certificate) and returns both the DER bytes and the PEM encoding.
-func signCert(tb FatalTB, template, parent *x509.Certificate, pub crypto.PublicKey, priv crypto.Signer) (der, pemBytes []byte) {
+func signCert(tb testing.TB, template, parent *x509.Certificate, pub crypto.PublicKey, priv crypto.Signer) (der, pemBytes []byte) {
 	der, err := x509.CreateCertificate(rand.Reader, template, parent, pub, priv)
 	if err != nil {
 		tb.Fatal(err)
@@ -58,7 +51,7 @@ func signCert(tb FatalTB, template, parent *x509.Certificate, pub crypto.PublicK
 // already reads. It is the template-level primitive the fixed-shape generators
 // below are built from, exported because the app's test suites otherwise
 // re-derive it per file.
-func Mint(tb FatalTB, template *x509.Certificate, pub crypto.PublicKey,
+func Mint(tb testing.TB, template *x509.Certificate, pub crypto.PublicKey,
 	parent *x509.Certificate, parentKey crypto.Signer,
 ) (der, pemBytes []byte, parsed *x509.Certificate) {
 	if parent == nil {
@@ -77,7 +70,7 @@ func Mint(tb FatalTB, template *x509.Certificate, pub crypto.PublicKey,
 
 // KeyPEM marshals key as a PKCS#8 PRIVATE KEY block, the form cert-converter's
 // key parser reads first.
-func KeyPEM(tb FatalTB, key crypto.PrivateKey) []byte {
+func KeyPEM(tb testing.TB, key crypto.PrivateKey) []byte {
 	der, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
 		tb.Fatal(err)
@@ -86,7 +79,7 @@ func KeyPEM(tb FatalTB, key crypto.PrivateKey) []byte {
 }
 
 // NewECDSAKey generates a P-256 key, the default fixture key type.
-func NewECDSAKey(tb FatalTB) *ecdsa.PrivateKey {
+func NewECDSAKey(tb testing.TB) *ecdsa.PrivateKey {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		tb.Fatal(err)
@@ -96,7 +89,7 @@ func NewECDSAKey(tb FatalTB) *ecdsa.PrivateKey {
 
 // GenerateSelfSignedCert creates a self-signed certificate with the given
 // key type ("rsa" or "ecdsa") and common name. Returns PEM-encoded cert and key.
-func GenerateSelfSignedCert(tb FatalTB, cn, keyType string) (certPEM, keyPEM []byte) {
+func GenerateSelfSignedCert(tb testing.TB, cn, keyType string) (certPEM, keyPEM []byte) {
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: cn},
@@ -127,12 +120,8 @@ func GenerateSelfSignedCert(tb FatalTB, cn, keyType string) (certPEM, keyPEM []b
 
 // GenerateCertChain creates a CA + leaf certificate chain.
 // Returns leaf PEM, key PEM, CA PEM, and the full chain (leaf + CA).
-func GenerateCertChain(tb FatalTB) (leafPEM, keyPEM, caPEM, chainPEM []byte) {
-	// Helper() is line-attribution sugar, not part of the contract: *testing.T has it
-	// and *rapid.T (the reason FatalTB exists) does not, so it is taken when offered.
-	if h, ok := tb.(interface{ Helper() }); ok {
-		h.Helper()
-	}
+func GenerateCertChain(tb testing.TB) (leafPEM, keyPEM, caPEM, chainPEM []byte) {
+	tb.Helper()
 
 	caKey := NewECDSAKey(tb)
 	caTemplate := &x509.Certificate{
@@ -196,7 +185,7 @@ type ChainMaterial struct {
 
 // GenerateChainMaterial builds a CA, a leaf it issued, and two alternative leaves
 // that reuse the leaf's key (one currently valid, one future-dated).
-func GenerateChainMaterial(tb FatalTB) ChainMaterial {
+func GenerateChainMaterial(tb testing.TB) ChainMaterial {
 	caKey := NewECDSAKey(tb)
 	now := time.Now()
 	caTemplate := &x509.Certificate{

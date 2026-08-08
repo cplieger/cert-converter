@@ -398,7 +398,7 @@ type pbkdf2Params struct {
 // running it after a decode would bound nothing. Every failure means the same thing
 // to a caller — this is not a bundle we would have written, so replace it. That
 // makes a parse failure safe by construction.
-func inspect(pfx []byte) (profile EncoderType, err error) {
+func inspect(pfx []byte) (EncoderType, error) {
 	if len(pfx) > MaxBundleBytes {
 		return "", fmt.Errorf("%w: bundle is %d byte(s), over the %d-byte inspection limit",
 			ErrProfileUnknown, len(pfx), MaxBundleBytes)
@@ -722,7 +722,7 @@ func profileFor(macAlg, certAlg, keyAlg asn1.ObjectIdentifier) (EncoderType, err
 // at all — it carries a full PBKDF2 parameter block in the algorithm identifier, so
 // the count is nested there and go-pkcs12 writes macData.iterations as an explicit
 // 0 beside an empty salt, which is why that profile returns above without reading
-// it. A zero reaching checkIterations therefore comes only from a file that spelled
+// it. A zero reaching checkIterationsRange therefore comes only from a file that spelled
 // one out, which is not a value any profile emits and is rejected like any other
 // out-of-range count.
 //
@@ -819,7 +819,7 @@ func decodeProfilePBKDF2(label string, alg *algorithmIdentifier) (pbkdf2Params, 
 		return pbkdf2Params{}, fmt.Errorf("%w: %s PBKDF2 salt is %d octet(s), want at least %d",
 			ErrProfileUnknown, label, len(salt), minPBKDF2SaltBytes)
 	}
-	if iterErr := checkIterations(label, kdf.Iterations); iterErr != nil {
+	if iterErr := checkIterationsRange(label, kdf.Iterations, minKDFIterations); iterErr != nil {
 		return pbkdf2Params{}, iterErr
 	}
 	return kdf, nil
@@ -927,14 +927,8 @@ func checkEncryptionIterations(algOID asn1.ObjectIdentifier, params asn1.RawValu
 			return fmt.Errorf("%w: pbe salt is %d octet(s), want at least %d",
 				ErrProfileUnknown, len(salt), minLegacySaltBytes)
 		}
-		return checkIterations("pbe", legacy.Iterations)
+		return checkIterationsRange("pbe", legacy.Iterations, minKDFIterations)
 	}
-}
-
-// checkIterations rejects a count outside the range this app is willing to run,
-// at the derivation locations every profile emits 2048 at.
-func checkIterations(label string, n int) error {
-	return checkIterationsRange(label, n, minKDFIterations)
 }
 
 // checkIterationsRange rejects a count outside the range this app is willing to

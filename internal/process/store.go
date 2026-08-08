@@ -21,10 +21,17 @@ import (
 // read, matching the documented deployment where a matching host UID owns the
 // volume.
 //
-// pfxFileMode is a CEILING on a bundle already on disk, not an exact target:
-// tightenMode chmods away any bit beyond it and leaves a mode the operator made
-// stricter alone. The mode a bundle HAS is never part of the currency decision;
-// only a mode repair the filesystem REFUSED is (see tightenMode's tightenRefused).
+// pfxFileMode is both the mode this app INSTALLS on every bundle it writes and the
+// policy a bundle already on disk is measured against. It is a CEILING for the second
+// job, not an exact target: a mode the operator made STRICTER (0400) carries no bit
+// beyond it and is left alone, which is what laxerThanPolicy tests.
+//
+// A prior bundle laxer than it is never chmodded in place. It is reported
+// (laxBundleMsg) and then corrected as a side effect of the ordinary atomic rewrite
+// this app already performs, which installs a fresh inode at this mode by construction
+// (store.write's atomicfile.WithMode). So the mode a bundle HAS does reach the currency
+// decision — bundleState.modeLax routes it to that rewrite — but nothing here ever
+// mutates a mode on the operator's volume.
 const (
 	pfxFileMode = 0o600
 	pfxDirMode  = 0o750
@@ -127,13 +134,17 @@ func (s *store) reportLaxDirAt(dir string) {
 }
 
 // writeFileInRoot is store.write's confined atomic write, indirected through a
-// package var for the same reason chmodFile is: the failure that now decides a
-// HEALTH outcome — an /output write the volume refuses for a reason no restart clears,
-// while the bundle already there is one this app never proved wrong — cannot be staged in
-// a temp directory. The suite owns everything it creates, and as root nothing refuses
-// it at all, so without this seam the health-neutral arm in
-// writeOutcome would go unpinned and a future simplification could fold
-// it back into the ordinary conversion failure that restart-loops the container.
+// package var because the failure that decides a HEALTH outcome — an /output write the
+// volume refuses for a reason no restart clears, while the bundle already there is one
+// this app never proved wrong — cannot be staged in a temp directory. The suite owns
+// everything it creates, and as root nothing refuses it at all, so without this seam the
+// health-neutral arm in writeOutcome would go unpinned and a future simplification could
+// fold it back into the ordinary conversion failure that restart-loops the container.
+// Same seam shape internal/watch uses for fsnotify.NewWatcher and main for
+// health.RunProbe.
+//
+// It is also now the ONLY way a mode reaches a bundle on disk: this write installs
+// pfxFileMode on a fresh inode, which is what corrects a lax prior bundle.
 var writeFileInRoot = atomicfile.WriteFileInRoot
 
 // write puts pfx at rel inside the output tree, atomically, creating rel's parent
@@ -325,7 +336,8 @@ const (
 	// remedy and a rewrite that fails is a conversion failure whatever the errno.
 	contentVerifiedStale
 	// contentUnverified: nobody compared the bytes. The stat failed, the file is above
-	// maxPFXSize, the read failed, or the codec's preflight refused to look at it. A
+	// maxPFXSize, the read failed for a reason that does not itself settle what is on
+	// disk, or the codec's preflight refused to look at it. A
 	// rewrite is still the right move — this app can answer "I cannot tell" by writing
 	// what it knows — but the fact carries NO claim that the bundle on disk is wrong, so
 	// on its own it never affects health.
@@ -351,34 +363,39 @@ func (c contentState) String() string {
 
 // bundleState is what one inspection of the output path resolved, as two INDEPENDENT
 // facts rather than one verdict: what this app knows about the bytes on disk
-// (contentState) and whether the mode repair converged (tightenResult). Neither says
-// what should happen next — convertEntry derives that once, after the write, from these
-// two facts plus the write's own outcome (writeOutcome).
+// (contentState) and whether the mode on disk is laxer than policy (modeLax). Neither
+// says what should happen next — convertEntry derives that once, after the write, from
+// these two facts plus the write's own outcome (writeOutcome).
 //
-// Two ints: cheap to pass by value, and nothing here is mutated after inspect returns.
+// Cheap to pass by value, and nothing here is mutated after inspect returns.
 type bundleState struct {
 	content contentState
-	repair  tightenResult
+	// modeLax is the whole of what a permission bit contributes to the decision: the
+	// bundle on disk carries a bit pfxFileMode does not. It replaced a four-valued
+	// mode-repair outcome, because with no chmod there is no repair to have converged,
+	// failed, or been refused — only a mode that needs rewriting or does not.
+	modeLax bool
 }
 
 // upToDate reports whether the output path needs no write at all: the bytes on disk are
-// already the bundle these inputs produce AND the mode repair converged. A REFUSED mode
-// repair is the one non-content reason to rewrite — a chmod this process may not perform
-// on a file it does not own, which a temp+rename replacement can still converge because
-// it needs permission on the output DIRECTORY rather than on the file (tightenMode owns
-// that reasoning).
+// already the bundle these inputs produce AND its mode is not laxer than policy. A lax
+// mode is the one non-content reason to rewrite, because the rewrite is the ONLY way
+// this app corrects a mode: store.write installs pfxFileMode on a fresh inode, so
+// routing a lax bundle through the ordinary write path is what fixes it. Skipping the
+// write on content alone would leave a private-key bundle permanently over-permissive.
 func (st bundleState) upToDate() bool {
-	return st.content == contentVerifiedCurrent && st.repair != tightenRefused
+	return st.content == contentVerifiedCurrent && !st.modeLax
 }
 
 // modeRepairOnly reports the one shape whose rewrite carries no new bytes: the content
-// was compared and matched, the mode is laxer than policy, and the chmod was refused.
-// It is DERIVED from the two facts here rather than remembered by whoever noticed the
-// refusal first, which is the whole reason they are separate — the previous shape had to
-// tag its currency verdict to keep this promise, and the arms that could not read the
-// bundle overwrote the tag.
+// was compared and matched, and only the mode is laxer than policy. It survives the
+// removal of the chmod mechanism because it still names the distinction health turns on
+// — a rewrite that carries no new bytes and fails leaves the operator exactly the bundle
+// they already had, so it must not flip health, while a failed write of a RENEWED bundle
+// must. It is DERIVED from the two facts rather than remembered by whoever noticed the
+// lax mode first, which is the whole reason they are separate.
 func (st bundleState) modeRepairOnly() bool {
-	return st.content == contentVerifiedCurrent && st.repair == tightenRefused
+	return st.content == contentVerifiedCurrent && st.modeLax
 }
 
 // bundleNotProvenWrong reports whether a failed rewrite leaves the operator with a
@@ -391,9 +408,9 @@ func (st bundleState) bundleNotProvenWrong() bool {
 }
 
 // inspect resolves what this app knows about the output at rel, by READING it rather
-// than by remembering what was written: the state of its content, and the outcome of the
-// mode repair. It decides nothing else — not whether to write, not whether a failure is
-// a failure. Those are derived once, after the write, in writeOutcome.
+// than by remembering what was written: the state of its content, and whether its mode is
+// laxer than policy. It decides nothing else — not whether to write, not whether a
+// failure is a failure. Those are derived once, after the write, in writeOutcome.
 //
 // Reading the output keeps currency stable across process restarts and detects
 // out-of-band replacement, password rotation, and encoder-profile changes without
@@ -403,7 +420,9 @@ func (st bundleState) bundleNotProvenWrong() bool {
 // failure is the exception, because the codec DID look and the bundle will not open with
 // the configured password, which proves it is not the one these inputs produce
 // (contentVerifiedStale). The unverified arms are the stat failure, the file above
-// maxPFXSize, the read failure and the codec's preflight refusing to look. All of them
+// maxPFXSize, a read failure that does not itself prove the path holds no usable bundle
+// (an ENOENT or a non-regular occupant seen by the read is verified-stale, like the lstat
+// arms that see the same two facts) and the codec's preflight refusing to look. All of them
 // still lead to a rewrite — the app can answer "I cannot tell" by writing what it knows —
 // but none of them claims the bundle on disk is wrong, and that distinction is exactly
 // what health has to respect. The stat and read arms carry the /output ownership hint,
@@ -413,15 +432,15 @@ func (st bundleState) bundleNotProvenWrong() bool {
 // a hard error: it is neither current nor stale, and treating it as stale would rewrite
 // every in-flight pair on the way out.
 //
-// Permission bits never reach the content fact. A bundle laxer than pfxFileMode is
-// normally tightened in place with a chmod (tightenMode, which owns the reasoning) and
-// its content is compared as usual; when that chmod is REFUSED outright (EPERM/EACCES,
-// i.e. the bundle belongs to another UID) the chmod can never converge but a rewrite can,
-// because the temp+rename needs write permission on the output DIRECTORY rather than on
-// the file it replaces. That refusal is REPORTED as the repair fact and nothing else:
-// bundleState.upToDate is what turns it into a rewrite, and bundleState.modeRepairOnly is
-// what lets the caller say afterwards that this rewrite carried no new bytes. Returning
-// it folded into the currency verdict is what previously made those two facts one value.
+// Permission bits never reach the content fact, and are never acted on in place. A
+// bundle laxer than pfxFileMode is REPORTED (laxBundleMsg) and recorded as the second
+// fact; its content is compared as usual. Correcting it is the ordinary write path's job
+// and nothing else's: bundleState.upToDate turns the lax mode into a rewrite, store.write
+// installs pfxFileMode on the fresh inode, and bundleState.modeRepairOnly is what lets
+// the caller say afterwards that this rewrite carried no new bytes. No chmod is
+// attempted, which is the settled shape for both halves of /output — the app warns about
+// a mode it would not have chosen and changes nothing about what is already there
+// (output-dir-write-bit-enforcement, extended to files).
 func (s *store) inspect(ctx context.Context, rel string, want *convert.Analysis,
 	wantEncoder convert.EncoderType, password string,
 ) (bundleState, error) {
@@ -475,17 +494,18 @@ func (s *store) inspect(ctx context.Context, rel string, want *convert.Analysis,
 		return bundleState{content: contentVerifiedStale}, nil
 	}
 
-	// Fact two, resolved in full rather than reduced to a boolean. It runs before every
-	// return below so a bundle this app keeps and one it is about to replace are treated
-	// alike, and so a rewrite that then fails does not leave a private key readable by the
-	// world with nothing logged. The three arms above return before it because no repair
-	// was attempted there, which is exactly what tightenNotNeeded (the zero value) says.
-	repair := s.tightenMode(rel, fi)
+	// Fact two. It runs before every return below so a bundle this app keeps and one it
+	// is about to replace are treated alike, and so a rewrite that then fails does not
+	// leave a private key readable by the world with nothing logged. The three arms above
+	// return before it because there is no mode on disk worth reporting there — nothing
+	// is present, or what is present is not a bundle at all — which is exactly what the
+	// zero value says.
+	modeLax := s.reportLaxBundle(rel, fi.Mode().Perm())
 
 	if fi.Size() > maxPFXSize {
 		slog.Warn("prior pfx exceeds the readable bound; regenerating",
 			"path", rel, "size", fi.Size(), "limit", maxPFXSize)
-		return bundleState{content: contentUnverified, repair: repair}, nil
+		return bundleState{content: contentUnverified, modeLax: modeLax}, nil
 	}
 
 	prior, err := s.readBoundedPFX(ctx, rel)
@@ -498,13 +518,26 @@ func (s *store) inspect(ctx context.Context, rel string, want *convert.Analysis,
 			// and wrapping that alone made IsShutdown false and logged a routine
 			// shutdown at ERROR. The decode-failure gate below already wraps ctx.Err()
 			// for the same reason; joining keeps the read error for diagnosis.
-			return bundleState{repair: repair}, fmt.Errorf("read prior pfx: %w", errors.Join(ctxErr, err))
+			return bundleState{modeLax: modeLax}, fmt.Errorf("read prior pfx: %w", errors.Join(ctxErr, err))
 		}
-		// Same reasoning as the stat failure above: unreadable means "cannot tell".
+		// An ENOENT or a non-regular occupant here is not "cannot tell": the read looked
+		// and VERIFIED the path holds no usable prior bundle, the same two facts the lstat
+		// arms above classify as contentVerifiedStale, and the shape types.go promises
+		// stays a conversion failure when the rewrite is then refused ("an absent or
+		// non-regular output path... stays statusFailed and still flips health however the
+		// write failed"). Routing them to contentUnverified made the same absent path
+		// health-neutral or health-flipping depending on which syscall observed it first,
+		// and let unreplaceableBundleMsg promise "leaving the existing bundle in place"
+		// over a path that holds nothing. Every OTHER read failure stays the stat arm's
+		// "cannot tell". The WARN is unchanged: it is the pinned record of the race.
+		content := contentUnverified
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, atomicfile.ErrNotRegular) {
+			content = contentVerifiedStale
+		}
 		slog.Warn("cannot read prior pfx; regenerating",
 			"path", rel, "error", err,
 			"remediation", outputPermRemediation)
-		return bundleState{content: contentUnverified, repair: repair}, nil
+		return bundleState{content: content, modeLax: modeLax}, nil
 	}
 
 	// CheckCurrency owns the mandatory preflight -> profile -> decode -> content
@@ -519,7 +552,7 @@ func (s *store) inspect(ctx context.Context, rel string, want *convert.Analysis,
 	// internal/convert profile.go maxKDFIterations.
 	res := convert.CheckCurrency(prior, password, want, wantEncoder)
 	content, err := contentFromCurrency(ctx, rel, res, wantEncoder)
-	return bundleState{content: content, repair: repair}, err
+	return bundleState{content: content, modeLax: modeLax}, err
 }
 
 // contentFromCurrency turns a convert.Currency outcome into a content fact: what each
@@ -572,31 +605,27 @@ func contentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 	}
 }
 
-// modeNotTightenedMsg is the message for a tightening that did not take effect and
-// that a rewrite cannot fix either: a chmod the filesystem accepted without storing,
-// or a chmod that failed for a reason other than a refusal. The fact the operator has
-// to act on is that a bundle under /output is more permissive than this app's policy
-// and this app could not fix it, and will not keep trying to.
-const modeNotTightenedMsg = "prior pfx is more permissive than policy and could not be tightened"
-
-// modeRepairRefusedMsg is the message for the OTHER half: the chmod was refused
-// outright, so this app does not own the bundle. Separate from modeNotTightenedMsg
-// because the two now differ in what happens next — this one is followed by a
-// regeneration, which converges wherever the output DIRECTORY is writable — and an
-// operator must not read one message for two causes with two outcomes. When the
-// directory refuses the write too, this line is followed by unwritableBundleMsg (or, for
-// a refusal that is not a permission denial, unreplaceableBundleMsg), which names the
-// standing condition; this one only ever announces the attempt.
-const modeRepairRefusedMsg = "prior pfx is more permissive than policy and the mode repair was refused; regenerating"
-
-// modeRepairUnpinnableMsg is the message for a mode repair this app REFUSED TO
-// PERFORM, rather than one the filesystem refused: the bundle's own directory could
-// not be pinned to the physical directory that was inspected, or its name no longer
-// holds the regular file that was classified. Separate from the two messages above
-// because the cause is a LAYOUT or a swap under /output rather than a permission bit,
-// so its remediation is the symlink one, and because nothing was attempted at all —
-// the mode on disk is exactly as found.
-const modeRepairUnpinnableMsg = "could not pin the prior pfx for a mode repair; leaving its mode as found"
+// laxBundleMsg is the standing WARN for a prior bundle carrying a permission bit
+// pfxFileMode does not. It names the mode found and the mode this app will install, and
+// it promises nothing else: no chmod is attempted, so there is no repair outcome to
+// report and no operator action to request. The lax mode is corrected as a side effect
+// of the ordinary atomic rewrite the app already performs on this bundle
+// (bundleState.upToDate routes it there), which installs a fresh inode at pfxFileMode
+// by construction — so this fires once and never again, and the operator is told what
+// happened rather than asked to do it.
+//
+// The report-only tone is laxDirMsg's, and deliberately: one principle now covers both
+// halves of /output. For a DIRECTORY the app warns and does nothing
+// (output-dir-write-bit-enforcement); for a FILE it warns and lets its own write path
+// install the mode it wants. Neither half mutates a mode in place, which is the
+// ecosystem consensus — OpenSSH refuses an over-permissive key without chmodding it,
+// certbot warns and requires the operator to act, and certbot's own renewal applies its
+// restrictive mode to the NEW file it writes rather than to the old one.
+//
+// Carries no remediation: unlike every other /output WARN, nothing is being asked of the
+// operator. If the correcting rewrite is then REFUSED, that standing condition gets its
+// own WARN with the right remediation (unwritableBundleMsg via unwritableReport).
+const laxBundleMsg = "prior pfx is more permissive than policy; rewriting it at the wanted mode"
 
 // outputPinRemediation is the operator action behind every /output pin refusal. It
 // names both causes the pin cannot tell apart: a symlinked output tree (a standing
@@ -604,64 +633,41 @@ const modeRepairUnpinnableMsg = "could not pin the prior pfx for a mode repair; 
 // writer).
 const outputPinRemediation = "mount the real output directory instead of linking to it, and check /output for paths replaced while the scan was running"
 
-// outputModeRemediation is modeNotTightenedMsg's hint. Deliberately NOT
-// outputPermRemediation: there the app cannot read or write /output and ownership is
-// the fix, while here it can already do both and the permission bit itself is the
-// problem — which an ownership change alone need not fix, because a filesystem with
-// mount-forced modes stores no bit at all. modeRepairRefusedMsg is the opposite case
-// and does carry outputPermRemediation, because a refusal IS an ownership problem.
-const outputModeRemediation = "chmod the bundle to the wanted mode, and check that /output's filesystem honours permission bits"
-
-// chmodFile is tightenMode's chmod, applied to the OPEN HANDLE of the bundle rather
-// than to its path (openPinnedBundle owns why), and indirected through a package var
-// for one reason: the filesystem this design exists to survive — one that ACCEPTS a
-// chmod and stores nothing (CIFS/vfat with mount-forced modes, some NFS squash
-// configs) — cannot be staged in a temp directory, so the property that matters
-// there (the bundle stays current, so nothing rewrites it in a loop) would otherwise
-// go unpinned. Same seam shape internal/watch uses for fsnotify.NewWatcher and main
-// for health.RunProbe.
-var chmodFile = (*os.File).Chmod
-
 // laxerThanPolicy reports whether perm carries a permission bit pfxFileMode does
-// not.
+// not. It is the WHOLE of the mode decision now: set means the bundle needs rewriting,
+// nothing more.
 //
 // A bitmask test rather than an inequality, because a mode can differ from policy by
-// being STRICTER: 0400 and 0600 have nothing to tighten, while 0640, 0644 and 0700
-// each do.
+// being STRICTER: 0400 and 0600 carry no extra bit and are left exactly as found, while
+// 0640, 0644 and 0700 each do.
 func laxerThanPolicy(perm os.FileMode) bool {
 	return perm&^pfxFileMode != 0
 }
 
-// tightenResult is the outcome of one mode-repair attempt, as its caller needs to see
-// it: whether the extra permission bits are gone, and when they are not, whether a
-// rewrite could still remove them. The distinction is the whole point of the type —
-// exactly one failure shape (a refusal) is convergeable by rewriting, so collapsing
-// them into a bare error or a bool would either leave a world-readable private key in
-// place forever or churn a bundle a rewrite cannot fix.
-type tightenResult int
-
-const (
-	// tightenNotNeeded: the mode is already at or stricter than policy, so nothing was
-	// attempted.
-	tightenNotNeeded tightenResult = iota
-	// tightenApplied: the chmod took and the mode the filesystem stored is within policy.
-	tightenApplied
-	// tightenRefused: the kernel refused the chmod outright (EPERM/EACCES). In the
-	// documented deployment that means the bundle belongs to another UID, which a
-	// temp+rename rewrite replaces even though a chmod cannot touch it.
-	tightenRefused
-	// tightenIneffective: the repair did not take effect for a reason a rewrite need
-	// not fix — a filesystem that accepts a chmod and stores nothing (mount-forced
-	// modes), or any other chmod/re-stat failure (EROFS, EINVAL, a bundle that vanished
-	// mid-inspection).
-	tightenIneffective
-)
+// reportLaxBundle warns when a prior bundle's mode is laxer than pfxFileMode, and
+// reports that fact to the caller. It is detection and narration only — it opens
+// nothing, pins nothing and mutates nothing, so the mode on disk is left exactly as
+// found and the correction happens in store.write like any other rewrite.
+//
+// One WARN per lax bundle per scan, and in practice once ever: the fact it reports makes
+// bundleState.upToDate false, so the same scan rewrites the bundle at pfxFileMode and
+// the condition cannot re-trigger. It repeats per scan only while the correcting write
+// is itself refused, which is the standing condition an operator does need told about
+// every scan (unwritableReport emits the message that names it).
+func (s *store) reportLaxBundle(rel string, perm os.FileMode) bool {
+	if !laxerThanPolicy(perm) {
+		return false
+	}
+	slog.Warn(laxBundleMsg,
+		"path", rel, "mode", perm.String(), "want", os.FileMode(pfxFileMode).String())
+	return true
+}
 
 // isPermissionRefusal reports whether err is the filesystem REFUSING an operation for
-// a permission reason, as opposed to failing it for any other reason. Two /output
-// questions turn on that distinction and both ask it here: tightenMode's chmod, where a
-// refusal is the evidence that another UID owns the bundle, and restartCanClearWrite,
-// where it is the first of the classes no restart clears.
+// a permission reason, as opposed to failing it for any other reason. Its consumer is
+// restartCanClearWrite, where a refusal is the first of the classes no restart clears,
+// and unwritableReport, which turns the same distinction into the operator remediation
+// (ownership versus volume).
 //
 // fs.ErrPermission is the whole test rather than two errors.Is calls against
 // syscall.EPERM and syscall.EACCES: os.Root.Chmod and atomicfile's confined write both
@@ -708,284 +714,6 @@ func restartCanClearWrite(err error) bool {
 	default:
 		return true
 	}
-}
-
-// fileOwnedByProcess is tightenMode's ownership question, indirected through a
-// package var for the same reason chmodFile is: a suite cannot stage a
-// foreign-owned bundle in a directory it created itself, and a chmod refusal
-// injected through chmodFile means "another UID owns this" only if the ownership
-// read agrees.
-var fileOwnedByProcess = ownedByThisProcess
-
-// ownedByThisProcess reports whether fi is owned by the UID this process runs as.
-// It is the discriminator the refused-chmod arm's premise rests on: only a bundle
-// this process does NOT own is one a temp+rename rewrite can converge.
-//
-// Geteuid, not Getuid: the kernel checks a chmod against the EFFECTIVE (fs) uid
-// (inode_owner_or_capable -> current_fsuid), which is the authorization this
-// discriminator models. Where the two differ, the real uid would answer "owned" for a
-// bundle this process may not chmod (routing a genuinely unconvergeable refusal onto
-// the WARN-only arm) or the reverse.
-//
-// A missing *syscall.Stat_t answers false, which keeps the documented deployment
-// shape (a root-owned bundle left behind by an earlier PUID mapping) on the arm
-// that repairs it.
-func ownedByThisProcess(fi os.FileInfo) bool {
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false
-	}
-	return int(st.Uid) == os.Geteuid()
-}
-
-// tightenMode chmods a prior bundle whose mode is laxer than pfxFileMode back to
-// policy and reports, as a tightenResult, whether the tightening took effect — and
-// when it did not, whether a rewrite could still converge it. It moves permission
-// bits only: the bundle's bytes and its mtime are never touched.
-//
-// Tighten with chmod rather than rewriting: rewriting would loosen an operator's
-// deliberate 0400 mode and would churn the bundle forever on filesystems that
-// accept chmod without storing permission bits.
-//
-// The ONE exception is a REFUSED chmod (tightenRefused), which is the one repair
-// outcome bundleState.upToDate turns into a rewrite even over content that matched:
-// there the chmod can never converge — this process does not own the file — while a
-// temp+rename rewrite can, because it needs permission on the output directory rather
-// than on the file. Without that arm a private-key-bearing bundle
-// left world-readable by another UID keeps its mode for the life of the deployment
-// and is re-warned once per scan. Every other failure stays WARN-only
-// (tightenIneffective): a chmod error is not evidence that a rewrite would land, and
-// on a mode-forcing or read-only mount rewriting would turn one WARN per scan into a
-// failed encode+write per scan.
-//
-// Only the EXTRA bits are cleared, so a deliberately stricter mode survives
-// untouched (laxerThanPolicy is what protects it) and the tightening adds no bit the
-// file did not already carry — with one exception: a lax mode with no owner READ or
-// WRITE bit masks to 0000, a mode this app could not read its own bundle back
-// through, so that case targets pfxFileMode instead. See the inline comment.
-//
-// The chmod goes through a PINNED parent directory and then through the bundle's own
-// OPEN HANDLE, not through its path (openPinnedBundle owns the reasoning): an *os.Root
-// confines a path without pinning it, so an ancestor swapped for an in-root symlink
-// would otherwise redirect this chmod onto a different private-key bundle inside
-// /output. The mode and the ownership this function decides on are read from that same
-// handle rather than from the caller's earlier path Lstat, so nothing about the
-// mutation rests on a name that was resolved twice.
-//
-// A pin or open this app cannot obtain is WARN-only (tightenIneffective) and never
-// reaches health: a permission bit on somebody else's /output is not a reason to
-// restart the container, which is the settled routing for every /output permission
-// state (dir-write-refusal-health-routing). A genuinely failing WRITE of a renewed
-// bundle is the separate, loud case, and store.write owns it.
-func (s *store) tightenMode(rel string, fi os.FileInfo) tightenResult {
-	perm := fi.Mode().Perm()
-	if !laxerThanPolicy(perm) {
-		return tightenNotNeeded
-	}
-	b, err := s.openPinnedBundle(rel)
-	if err != nil {
-		s.reportUnpinnableBundle(rel, perm, err)
-		return tightenIneffective
-	}
-	defer b.close()
-	// Re-derived from the handle, because the caller's fi was resolved through the
-	// pathname and this is the value the chmod is computed from. A mode that is no
-	// longer laxer than policy means the bundle was replaced or repaired since that
-	// Lstat, and there is nothing to tighten on what is actually open here.
-	perm = b.fi.Mode().Perm()
-	if !laxerThanPolicy(perm) {
-		return tightenNotNeeded
-	}
-	want := perm & pfxFileMode
-	// A lax mode carrying no owner READ or WRITE bit (0044, 0060, 0004, and the
-	// execute-only 0100 family) masks to 0000, which is not a tightening: it leaves
-	// this app unable to read the bundle. It is also the one arm here that adds owner
-	// bits the file did not carry, which is why it is spelled out. Output-derived
-	// currency then fails on the very next read — "cannot read prior pfx; regenerating"
-	// plus a rewrite with fresh KDF salts and a fresh mtime, the downstream
-	// re-replication maxPFXSize's comment exists to prevent — or, where the process can
-	// still read it (running as root), the private-key bundle sits at 0000 for the life
-	// of the deployment, unreadable to the documented downstream replicator, while this
-	// function logs a successful tighten at INFO. pfxFileMode is the right target there:
-	// it is the mode a rewrite would install anyway, it still removes every group/other
-	// bit, and the deliberately-stricter case is protected by laxerThanPolicy above, not
-	// by this mask.
-	if want == 0 {
-		want = pfxFileMode
-	}
-	got, err := b.chmodAndObserve(want)
-	switch {
-	case errors.Is(err, errModeUnobserved):
-		// The chmod was accepted; only the confirming re-stat failed. That says nothing
-		// about ownership, so it must not schedule the rewrite tightenRefused asks for —
-		// the bits may well be correct now, and rewriting would churn the bundle with
-		// fresh KDF salts and a fresh mtime for nothing.
-		slog.Warn(modeNotTightenedMsg,
-			"path", rel, "mode", perm.String(), "want", want.String(),
-			"error", err, "remediation", outputModeRemediation)
-		return tightenIneffective
-	case err != nil && isPermissionRefusal(err) && !fileOwnedByProcess(b.fi):
-		// Not ours to chmod, but ours to replace: bundleState.upToDate reads this outcome
-		// as a reason to rewrite, and the ordinary write path converges it. Named with the ownership
-		// remediation rather than the filesystem one, because that is what a refusal
-		// means.
-		//
-		// The ownership term is what keeps this arm honest. A refusal on a bundle this
-		// process OWNS is not evidence about ownership — a UID that owns a file may always
-		// chmod it, so what was refused is the requested BITS, not our right to set them:
-		// a filesystem which forces modes and reports the refusal instead of swallowing it
-		// (fat_setattr returns EPERM for any mode outside the mount's fmask). A rewrite
-		// cannot converge that either — the replacement lands with the same forced mode —
-		// so it must NOT schedule one, and it falls through to the generic error arm below,
-		// which reports it exactly as a chmod the filesystem accepts and stores nothing is
-		// reported (tightenIneffective, modeNotTightenedMsg, outputModeRemediation).
-		slog.Warn(modeRepairRefusedMsg,
-			"path", rel, "mode", perm.String(), "want", want.String(),
-			"error", err, "remediation", outputPermRemediation)
-		return tightenRefused
-	case err != nil:
-		slog.Warn(modeNotTightenedMsg,
-			"path", rel, "mode", perm.String(), "want", want.String(),
-			"error", err, "remediation", outputModeRemediation)
-		return tightenIneffective
-	case laxerThanPolicy(got):
-		// The filesystem took the chmod and kept nothing. Saying so is all this can
-		// do, and all it SHOULD do: the bytes are still the right bytes, so the bundle
-		// stays current and the WARN no longer drags a rewrite behind it.
-		slog.Warn(modeNotTightenedMsg,
-			"path", rel, "mode", got.String(), "want", want.String(),
-			"remediation", outputModeRemediation)
-		return tightenIneffective
-	default:
-		// Named at the default level because this app just changed the permissions of
-		// a file on the operator's volume, as every other output-tree mutation is
-		// named (a write, a reaped temp, a removed orphan).
-		slog.Info("tightened the file mode of a prior pfx",
-			"path", rel, "from", perm.String(), "to", got.String())
-		return tightenApplied
-	}
-}
-
-// errModeUnobserved marks a repair whose CHMOD was ACCEPTED and whose confirming
-// re-stat then failed. It exists so tightenMode cannot read a refused re-stat as a
-// refused chmod: only the chmod being refused is evidence this process does not own
-// the bundle, and only that justifies the rewrite tightenRefused schedules.
-var errModeUnobserved = errors.New("mode not observed after chmod")
-
-// errBundleReplaced marks a confirming re-stat that found a DIFFERENT file under the
-// bundle's name than the one the chmod was applied to. It is joined with
-// errModeUnobserved rather than reported on its own, because the outcome is the same
-// fact: the mode this app installed was never observed, so no claim may be made about
-// it. It must not be read as a refusal — a swap says nothing about ownership.
-var errBundleReplaced = errors.New("bundle replaced before the mode could be observed")
-
-// pinnedBundle is one prior bundle held open for a mode repair: the parent directory
-// pinned to the physical directory that was inspected, the open descriptor every
-// mutation goes through, the FileInfo of THAT descriptor, and the bundle's
-// single-element name inside the pinned parent. Every mode and ownership decision reads
-// the descriptor's FileInfo, so none of them rests on a pathname resolved a second time.
-type pinnedBundle struct {
-	parent *os.Root
-	f      *os.File
-	fi     os.FileInfo
-	base   string
-}
-
-// close releases the descriptor and the pinned parent, in that order.
-func (b *pinnedBundle) close() {
-	_ = b.f.Close()
-	_ = b.parent.Close()
-}
-
-// openPinnedBundle opens rel for a mode repair with every ancestor removed from the
-// path, and refuses anything that is not the regular file it just looked at.
-//
-// It exists because *os.Root confines a path but does not pin it: a root deliberately
-// FOLLOWS a symlink component that stays inside it, so a chmod on a multi-component
-// name can land on a different bundle inside /output if an ANCESTOR is swapped for a
-// symlink after the classifying Lstat. atomicfile.OpenParentInRoot closes that half
-// (removeOrphan owns the full reasoning). The Lstat-then-open pair here closes the
-// remaining one, the bundle's own name: the Lstat refuses a symlink standing there
-// now, and os.SameFile against the OPEN HANDLE's own FileInfo refuses one swapped in
-// while the open was in flight — the same shape the library's descent uses for each
-// directory component, and the reason a bare O_NOFOLLOW is not the tool here (an
-// os.Root always passes O_NOFOLLOW and then resolves the link itself, so the flag
-// cannot express "this file, or nothing").
-//
-// Read-only is enough: a chmod needs no write access, only the descriptor.
-func (s *store) openPinnedBundle(rel string) (*pinnedBundle, error) {
-	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
-	if err != nil {
-		return nil, fmt.Errorf("pin output directory: %w", err)
-	}
-	pinned := false
-	defer func() {
-		if !pinned {
-			_ = parent.Close()
-		}
-	}()
-	before, err := parent.Lstat(base)
-	if err != nil {
-		return nil, fmt.Errorf("re-stat prior pfx through the pinned directory: %w", err)
-	}
-	if !before.Mode().IsRegular() {
-		return nil, fmt.Errorf("open prior pfx: %w (mode %s)", atomicfile.ErrNotRegular, before.Mode())
-	}
-	f, fi, err := atomicfile.OpenRegularInRoot(parent, base)
-	if err != nil {
-		return nil, fmt.Errorf("open prior pfx: %w", err)
-	}
-	if !os.SameFile(before, fi) {
-		_ = f.Close()
-		return nil, fmt.Errorf("open prior pfx: %w", errBundleReplaced)
-	}
-	pinned = true
-	return &pinnedBundle{parent: parent, base: base, f: f, fi: fi}, nil
-}
-
-// reportUnpinnableBundle narrates a bundle tightenMode could not pin or open: the mode
-// is left exactly as found, and the caller reports tightenIneffective.
-//
-// Health is deliberately untouched. A mode repair this app cannot even attempt is an
-// /output permission or layout state, and no restart clears one — the same reading the
-// app already gives a lax output directory and a refused chmod
-// (dir-write-refusal-health-routing). A vanished bundle is not even that: it is the
-// ordinary renewal race, so it stays at Debug and the rewrite that follows reports
-// whatever it finds.
-func (s *store) reportUnpinnableBundle(rel string, perm os.FileMode, err error) {
-	if errors.Is(err, fs.ErrNotExist) {
-		slog.Debug("prior pfx vanished before its mode could be repaired", "path", rel, "error", err)
-		return
-	}
-	slog.Warn(modeRepairUnpinnableMsg,
-		"path", rel, "mode", perm.String(), "want", os.FileMode(pfxFileMode).String(),
-		"error", err, "remediation", outputPinRemediation)
-}
-
-// chmodAndObserve tightens the pinned bundle to want and reports the mode the
-// filesystem actually stored.
-//
-// The chmod goes through the descriptor, so no name is resolved for the mutation at
-// all. The re-stat is the point of the rest: a chmod's return value says the request
-// was accepted, not that the bits were kept, and the filesystems this app has to
-// survive differ exactly there — mount-forced modes store nothing, an inherited ACL
-// can widen what it is given. It reads the pinned parent rather than the descriptor
-// because the descriptor's own Stat would keep answering for an inode that has since
-// been unlinked, which is the one shape that must NOT be reported as a repaired mode;
-// the identity check keeps that read honest, so a bundle replaced in between is
-// reported as unobserved rather than as somebody else's mode.
-func (b *pinnedBundle) chmodAndObserve(want os.FileMode) (os.FileMode, error) {
-	if err := chmodFile(b.f, want); err != nil {
-		return 0, fmt.Errorf("chmod: %w", err)
-	}
-	after, err := b.parent.Lstat(b.base)
-	if err != nil {
-		return 0, fmt.Errorf("re-stat after chmod: %w", errors.Join(errModeUnobserved, err))
-	}
-	if !os.SameFile(b.fi, after) {
-		return 0, fmt.Errorf("re-stat after chmod: %w", errors.Join(errModeUnobserved, errBundleReplaced))
-	}
-	return after.Mode().Perm(), nil
 }
 
 // readBoundedPFX reads rel from inside the output tree under maxPFXSize.
@@ -1091,10 +819,7 @@ type outputWalk struct {
 // construction for the reason scanWalk.entryBudget states — every assembler of one gets
 // a bound, including the tests that build one field by field.
 func (w *outputWalk) entryBudget() int {
-	if w.maxEntries > 0 {
-		return w.maxEntries
-	}
-	return fallbackScanEntries
+	return effectiveEntryBudget(w.maxEntries)
 }
 
 // visit is listOutputs' walk callback: one entry, one verdict.

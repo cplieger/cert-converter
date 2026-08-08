@@ -137,7 +137,7 @@ func TestBoundLogText_bounds_and_marks(t *testing.T) {
 	// (256) is not a multiple of 3, so the library's rune-boundary backoff must move
 	// the cut. A 2-byte rune divides 256 evenly and would never exercise it.
 	got := boundLogText(strings.Repeat("\u2603", 4000), maxSubjectLogLen)
-	if !strings.HasSuffix(got, truncationMarker) {
+	if !strings.HasSuffix(got, logtext.Marker) {
 		t.Errorf("boundLogText(oversized) = %q..., want the truncation marked", got[:32])
 	}
 	if !utf8.ValidString(got) {
@@ -192,7 +192,7 @@ func TestBoundLogText_is_the_library_primitive_with_this_apps_marker(t *testing.
 				t.Errorf("runesafe reported cut = %v for %s, want %v: the fixture no longer exercises what it claims",
 					wantCut, name, tc.wantCut)
 			}
-			if marked := strings.HasSuffix(got, truncationMarker); marked != tc.wantCut {
+			if marked := strings.HasSuffix(got, logtext.Marker); marked != tc.wantCut {
 				t.Errorf("boundLogText(%s) = %q, marked = %v, want it marked exactly when the text was cut (%v)",
 					name, got, marked, tc.wantCut)
 			}
@@ -265,7 +265,7 @@ func TestParsePrivateKey_bounds_an_oversized_pkcs8_algorithm_oid(t *testing.T) {
 	}
 	// The refusal carries no input-derived text at all, so the same ceiling the
 	// truncating path had to respect bounds it with room to spare.
-	if want := maxSubjectLogLen + len(truncationMarker) + 256; len(err.Error()) > want {
+	if want := maxSubjectLogLen + len(logtext.Marker) + 256; len(err.Error()) > want {
 		t.Errorf("error is %d bytes, want at most %d: the OID reaches the log unbounded", len(err.Error()), want)
 	}
 	if strings.Contains(err.Error(), strings.Repeat("\x01", 8)) {
@@ -300,7 +300,7 @@ func TestParsePrivateKey_bounds_an_oversized_pkcs8_parameters_oid(t *testing.T) 
 	if err == nil {
 		t.Fatal("ParsePrivateKey(PKCS#8 with a 64 KB parameters OID) = nil error, want a refusal")
 	}
-	if want := maxSubjectLogLen + len(truncationMarker) + 256; len(err.Error()) > want {
+	if want := maxSubjectLogLen + len(logtext.Marker) + 256; len(err.Error()) > want {
 		t.Errorf("error is %d bytes, want at most %d: the parameter OID reaches the log unbounded", len(err.Error()), want)
 	}
 	if strings.Contains(err.Error(), strings.Repeat("\x01", 8)) {
@@ -336,7 +336,7 @@ func TestParsePrivateKey_bounds_an_oversized_sec1_curve_oid(t *testing.T) {
 	if err == nil {
 		t.Fatal("ParsePrivateKey(SEC1 with a 64 KB curve OID) = nil error, want a refusal")
 	}
-	if want := maxSubjectLogLen + len(truncationMarker) + 256; len(err.Error()) > want {
+	if want := maxSubjectLogLen + len(logtext.Marker) + 256; len(err.Error()) > want {
 		t.Errorf("error is %d bytes, want at most %d: the curve OID reaches the log unbounded", len(err.Error()), want)
 	}
 	if strings.Contains(err.Error(), strings.Repeat("\x01", 8)) {
@@ -426,7 +426,7 @@ func TestParseCertChain_bounds_the_pem_label_it_names(t *testing.T) {
 		t.Fatal("parseCertChain(a block with a 200 KB label) = nil error, want a refusal")
 	}
 	quoted := strings.Repeat("A", maxBlockTypeLogLen)
-	if !strings.Contains(err.Error(), quoted[:maxBlockTypeLogLen-len(truncationMarker)]+truncationMarker) {
+	if !strings.Contains(err.Error(), quoted[:maxBlockTypeLogLen-len(logtext.Marker)]+logtext.Marker) {
 		t.Errorf("parseCertChain error = %q, want the label cut at %d bytes and marked", err.Error(), maxBlockTypeLogLen)
 	}
 	if len(err.Error()) > 256 {

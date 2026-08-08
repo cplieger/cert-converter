@@ -6,6 +6,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"github.com/cplieger/cert-converter/internal/logtext"
 	"pgregory.net/rapid"
 )
 
@@ -56,7 +57,7 @@ func TestSampleOrphanPaths_properties(t *testing.T) {
 		if !utf8.ValidString(got) {
 			rt.Fatalf("sampleOrphanPaths(%d paths) rendered invalid UTF-8: a cut split a rune", len(paths))
 		}
-		kept := strings.TrimSuffix(strings.TrimSuffix(got, elided), truncationMarker)
+		kept := strings.TrimSuffix(strings.TrimSuffix(got, elided), logtext.Marker)
 		if !strings.HasPrefix(full, kept) {
 			rt.Fatalf("sampleOrphanPaths(%d paths) kept %d bytes that are not a prefix of the joined sample: a name was rewritten",
 				len(paths), len(kept))
@@ -68,11 +69,11 @@ func TestSampleOrphanPaths_properties(t *testing.T) {
 			}
 			return
 		}
-		if !strings.Contains(got, truncationMarker) {
+		if !strings.Contains(got, logtext.Marker) {
 			rt.Fatalf("sampleOrphanPaths(%d paths joining to %d bytes) rendered %d bytes with no %q marker: a reader cannot tell the list was cut",
-				len(paths), len(full), len(got), truncationMarker)
+				len(paths), len(full), len(got), logtext.Marker)
 		}
-		if maxLen := maxLoggedOrphanBytes + len(truncationMarker) + len(elided); len(got) > maxLen {
+		if maxLen := maxLoggedOrphanBytes + len(logtext.Marker) + len(elided); len(got) > maxLen {
 			rt.Fatalf("sampleOrphanPaths(%d paths joining to %d bytes) rendered %d bytes, want at most %d",
 				len(paths), len(full), len(got), maxLen)
 		}
