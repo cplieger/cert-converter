@@ -13,18 +13,18 @@ import (
 	"github.com/cplieger/slogx/capture"
 )
 
-// wantVolumeMissingMsg is the ERROR substring OpenMounts must log for a mount
+// wantVolumeMissingMsg is the ERROR substring Open must log for a mount
 // that is absent or is not a directory. One copy, matched as a substring of the
 // full record (main.go appends "; refusing to start").
 const wantVolumeMissingMsg = "required volume is missing or not a directory"
 
-// TestOpenMounts pins the startup volume guard, the one decision in run()
+// TestOpen pins the startup volume guard, the one decision in run()
 // that decides between a single actionable refusal and an endless
 // restart-unhealthy loop: every required mount must already exist AND be a
 // directory, EVERY offender is named at ERROR with its role and a
 // remediation, and a fully-mounted pair starts silently. Serial: it swaps
 // slog.Default().
-func TestOpenMounts(t *testing.T) {
+func TestOpen(t *testing.T) {
 	existingDir := t.TempDir()
 	regularFile := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(regularFile, nil, 0o600); err != nil {
@@ -34,108 +34,104 @@ func TestOpenMounts(t *testing.T) {
 
 	for _, tc := range []struct {
 		name       string
-		dirs       []Mount
-		want       bool
 		wantRole   string
 		wantErrSub string
+		dirs       Paths
+		want       bool
 	}{
-		{"both mounted", []Mount{{"input", existingDir}, {"output", existingDir}}, true, "", ""},
-		{"missing input", []Mount{{"input", absent}, {"output", existingDir}}, false, "input", "no such file"},
-		{"missing output", []Mount{{"input", existingDir}, {"output", absent}}, false, "output", "no such file"},
-		{"input is a regular file", []Mount{{"input", regularFile}, {"output", existingDir}}, false, "input", "path exists but is not a directory"},
-		{"output is a regular file", []Mount{{"input", existingDir}, {"output", regularFile}}, false, "output", "path exists but is not a directory"},
-		{"no volumes required", nil, true, "", ""},
+		{"both mounted", "", "", Paths{Input: existingDir, Output: existingDir}, true},
+		{"missing input", "input", "no such file", Paths{Input: absent, Output: existingDir}, false},
+		{"missing output", "output", "no such file", Paths{Input: existingDir, Output: absent}, false},
+		{"input is a regular file", "input", "path exists but is not a directory", Paths{Input: regularFile, Output: existingDir}, false},
+		{"output is a regular file", "output", "path exists but is not a directory", Paths{Input: existingDir, Output: regularFile}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
 
-			open, got := OpenMounts(tc.dirs)
-			t.Cleanup(func() { CloseMounts(open) })
+			open, got := Open(tc.dirs)
+			t.Cleanup(open.Close)
 			if got != tc.want {
-				t.Errorf("OpenMounts(%+v) = %v, want %v", tc.dirs, got, tc.want)
+				t.Errorf("Open(%+v) = %v, want %v", tc.dirs, got, tc.want)
 			}
 			if tc.want {
 				// Every accepted volume comes back with its confined handle open: that
 				// handle is what the /output write probe runs against, so a guard that
 				// returned the verdict alone would send the probe back to re-resolving
 				// the path it just proved openable.
-				if len(open) != len(tc.dirs) {
-					t.Errorf("OpenMounts(%+v) returned %d handles, want one per required volume (%d)",
-						tc.dirs, len(open), len(tc.dirs))
+				if open.Input == nil {
+					t.Errorf("Open(%+v) returned a nil input root", tc.dirs)
 				}
-				for i, vol := range open {
-					if vol.Root == nil {
-						t.Errorf("OpenMounts(%+v) handle %d (role %q) has a nil root", tc.dirs, i, vol.Role)
-					}
+				if open.Output == nil {
+					t.Errorf("Open(%+v) returned a nil output root", tc.dirs)
 				}
 				if logs.Len() != 0 {
-					t.Errorf("OpenMounts(%+v) logged %v, want silence when every volume is mounted", tc.dirs, logs.Messages())
+					t.Errorf("Open(%+v) logged %v, want silence when every volume is mounted", tc.dirs, logs.Messages())
 				}
 				return
 			}
 			// A refusal must hand back nothing: run() returns 1 without looking at the
-			// slice, so any handle opened before the offender has to be closed here or
+			// handles, so any root opened before the offender has to be closed here or
 			// it is leaked for the life of the process.
-			if open != nil {
-				t.Errorf("OpenMounts(%+v) returned %d handles on the refusal path, want none", tc.dirs, len(open))
+			if open.Input != nil || open.Output != nil {
+				t.Errorf("Open(%+v) returned handles on the refusal path, want none", tc.dirs)
 			}
 			const msg = wantVolumeMissingMsg
 			if n := logs.CountLevel(slog.LevelError, msg); n != 1 {
-				t.Fatalf("OpenMounts(%+v) logged %d ERROR records matching %q, want exactly 1 (logs %v)",
+				t.Fatalf("Open(%+v) logged %d ERROR records matching %q, want exactly 1 (logs %v)",
 					tc.dirs, n, msg, logs.Messages())
 			}
 			if !logs.AttrContains(msg, "role", tc.wantRole) {
-				t.Errorf("OpenMounts(%+v) ERROR does not name role %q (logs %v)", tc.dirs, tc.wantRole, logs.Messages())
+				t.Errorf("Open(%+v) ERROR does not name role %q (logs %v)", tc.dirs, tc.wantRole, logs.Messages())
 			}
 			if !logs.AttrContains(msg, "remediation", "mount ") {
-				t.Errorf("OpenMounts(%+v) ERROR is missing an actionable remediation attr (logs %v)", tc.dirs, logs.Messages())
+				t.Errorf("Open(%+v) ERROR is missing an actionable remediation attr (logs %v)", tc.dirs, logs.Messages())
 			}
 			// The two causes need different remedies — a missing mount versus a
 			// bind-mounted FILE — so the error attr must distinguish them. It
 			// carried error=<nil> for the non-directory case before the
-			// substitution in OpenMounts, which is unactionable.
+			// substitution in openMount, which is unactionable.
 			if !logs.AttrContains(msg, "error", tc.wantErrSub) {
-				t.Errorf("OpenMounts(%+v) ERROR attr does not name the cause %q (logs %v)", tc.dirs, tc.wantErrSub, logs.Messages())
+				t.Errorf("Open(%+v) ERROR attr does not name the cause %q (logs %v)", tc.dirs, tc.wantErrSub, logs.Messages())
 			}
 		})
 	}
 }
 
-// TestOpenMounts_names_every_missing_volume pins the whole point of the
+// TestOpen_names_every_missing_volume pins the whole point of the
 // all-offenders sweep: an operator who omitted the volumes block entirely has
 // both mounts missing, and a report naming only /input costs a restart to
 // discover /output. Serial: it swaps slog.Default().
-func TestOpenMounts_names_every_missing_volume(t *testing.T) {
+func TestOpen_names_every_missing_volume(t *testing.T) {
 	absentInput := filepath.Join(t.TempDir(), "absent-input")
 	absentOutput := filepath.Join(t.TempDir(), "absent-output")
 
 	logs := capture.Default(t)
 
-	if _, ready := OpenMounts([]Mount{{"input", absentInput}, {"output", absentOutput}}); ready {
-		t.Fatal("OpenMounts(both absent) = true, want false")
+	if _, ready := Open(Paths{Input: absentInput, Output: absentOutput}); ready {
+		t.Fatal("Open(both absent) = true, want false")
 	}
 	const msg = wantVolumeMissingMsg
 	if n := logs.CountLevel(slog.LevelError, msg); n != 2 {
-		t.Fatalf("OpenMounts(both absent) logged %d ERROR records matching %q, want 2 so one start attempt names the whole misconfiguration (logs %v)",
+		t.Fatalf("Open(both absent) logged %d ERROR records matching %q, want 2 so one start attempt names the whole misconfiguration (logs %v)",
 			n, msg, logs.Messages())
 	}
 	for _, role := range []string{"input", "output"} {
 		if !logs.AttrContains(msg, "role", role) {
-			t.Errorf("OpenMounts(both absent) ERROR set does not name role %q (logs %v)", role, logs.Messages())
+			t.Errorf("Open(both absent) ERROR set does not name role %q (logs %v)", role, logs.Messages())
 		}
 	}
 }
 
-// TestOpenMounts_refuses_a_volume_it_cannot_open pins the third refusal leg of
+// TestOpen_refuses_a_volume_it_cannot_open pins the third refusal leg of
 // the startup guard, the one whose remediation differs from the other two: a
 // mount that EXISTS as a directory but cannot be opened by the running UID is a
 // permissions problem on the host directory, so the operator must be told to
 // grant that UID access, not to mount a path they already mounted. The refusal
-// also has to hand back no handles, because run() returns 1 without reading the
-// slice.
+// also has to hand back no handles, because run() returns 1 without reading
+// them.
 // Serial (no t.Parallel): it swaps the openMountRoot package var and
 // slog.Default().
-func TestOpenMounts_refuses_a_volume_it_cannot_open(t *testing.T) {
+func TestOpen_refuses_a_volume_it_cannot_open(t *testing.T) {
 	existing, blocked := t.TempDir(), t.TempDir()
 
 	prev := openMountRoot
@@ -149,19 +145,18 @@ func TestOpenMounts_refuses_a_volume_it_cannot_open(t *testing.T) {
 
 	logs := capture.Default(t)
 
-	open, ready := OpenMounts([]Mount{{"input", existing}, {"output", blocked}})
-	t.Cleanup(func() { CloseMounts(open) })
+	open, ready := Open(Paths{Input: existing, Output: blocked})
+	t.Cleanup(open.Close)
 
 	if ready {
-		t.Fatalf("OpenMounts(%q unopenable) = true, want false: starting anyway converts nothing and restart-loops on a condition a restart cannot clear", blocked)
+		t.Fatalf("Open(%q unopenable) = true, want false: starting anyway converts nothing and restart-loops on a condition a restart cannot clear", blocked)
 	}
-	if open != nil {
-		t.Errorf("OpenMounts returned %d handles on the unopenable-volume path, want none: the input handle opened before the offender leaks for the life of the process otherwise",
-			len(open))
+	if open.Input != nil || open.Output != nil {
+		t.Error("Open returned handles on the unopenable-volume path, want none: the input handle opened before the offender leaks for the life of the process otherwise")
 	}
 	const msg = "required volume cannot be opened by this container's user; refusing to start"
 	if n := logs.CountLevel(slog.LevelError, msg); n != 1 {
-		t.Fatalf("OpenMounts(%q unopenable) logged %d ERROR records matching %q, want exactly 1 (logs %v)",
+		t.Fatalf("Open(%q unopenable) logged %d ERROR records matching %q, want exactly 1 (logs %v)",
 			blocked, n, msg, logs.Messages())
 	}
 	if !logs.HasAttr(msg, "role", "output") {
@@ -181,7 +176,7 @@ func TestOpenMounts_refuses_a_volume_it_cannot_open(t *testing.T) {
 }
 
 // TestWarnOutputNotWritable_reports_failed_probe pins the startup probe's only
-// output: OpenMounts proves /output is a directory this UID can OPEN, so this
+// output: Open proves /output is a directory this UID can OPEN, so this
 // WARN is the sole immediate signal that it cannot be WRITTEN. A scan whose
 // bundles are all current writes nothing and still reports healthy, so without
 // this record the misconfiguration surfaces only at the next renewal.
@@ -426,38 +421,6 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 				}
 			}
 		})
-	}
-}
-
-// TestProbeOutputMounts_probes_only_the_output_volume pins the wiring run()
-// performs between the volume guard and the write probe: the probe inspects the
-// handle for the OUTPUT role and no other. /input is mounted read-only in
-// production, so a probe pointed at it would emit the "output volume is not
-// writable" WARN on every start, and dropping the wiring entirely would remove
-// the only immediate signal that /output cannot be written.
-// Serial (no t.Parallel): it swaps the probeOutputWritable package var.
-func TestProbeOutputMounts_probes_only_the_output_volume(t *testing.T) {
-	inDir, outDir := t.TempDir(), t.TempDir()
-
-	vols, ready := OpenMounts([]Mount{{"input", inDir}, {"output", outDir}})
-	if !ready {
-		t.Fatalf("setup: OpenMounts(%q, %q) refused two usable temp dirs", inDir, outDir)
-	}
-	t.Cleanup(func() { CloseMounts(vols) })
-
-	var probed []string
-	prev := probeOutputWritable
-	probeOutputWritable = func(_ context.Context, root *os.Root, _ string, _ ...atomicfile.Option) (atomicfile.ProbeResult, error) {
-		probed = append(probed, root.Name())
-		return atomicfile.ProbeResult{Dir: root.Name(), Name: ".atomicfile-1234567890.tmp"}, nil
-	}
-	t.Cleanup(func() { probeOutputWritable = prev })
-
-	ProbeOutputMounts(vols)
-
-	if len(probed) != 1 || probed[0] != outDir {
-		t.Errorf("ProbeOutputMounts probed %q, want exactly [%q]: the input mount is read-only in production, so probing it reports /output as unwritable on every start",
-			probed, outDir)
 	}
 }
 

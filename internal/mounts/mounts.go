@@ -1,7 +1,7 @@
 // Package mounts verifies the container's required volumes at startup -- each one
 // exists as a directory the running UID can open -- and probes the output volume
 // for write access, before any scan runs. It is startup-only: the handles it opens
-// are released by CloseMounts, and internal/process opens its own roots per scan.
+// are released by Roots.Close, and internal/process opens its own roots per scan.
 package mounts
 
 import (
@@ -14,83 +14,114 @@ import (
 	"github.com/cplieger/atomicfile/v2"
 )
 
-// Mount is a required mount point and the role it plays in the startup log.
-type Mount struct {
-	Role, Path string
+// Paths is the required mount set. This product mounts exactly two volumes, so
+// they are named FIELDS rather than a list keyed by a free-form role string: the
+// compiler then holds the contract, and the output volume can no longer be
+// renamed out of the write probe's reach by a role literal that still compiles.
+type Paths struct {
+	Input, Output string
 }
 
-// The role names Mount.Role carries. They are named because the write probe
-// SELECTS its mount by role (see ProbeOutputMounts): a renamed literal would
-// compile, keep every test green, and silently stop the probe from ever running.
+// The role names the startup diagnostics carry. Unexported because nothing
+// SELECTS a mount by role any more -- a role is a log attribute and nothing else,
+// so a renamed literal can no longer stop a check from running.
 const (
-	RoleInput  = "input"
-	RoleOutput = "output"
+	roleInput  = "input"
+	roleOutput = "output"
 )
 
-// OpenMount pairs a required mount with the confined handle OpenMounts opened
-// to prove it usable. The handle is what any FURTHER check on that mount runs
-// against, so the check inspects the same object the guard inspected instead of
-// re-resolving the path and testing whatever it resolves to the second time. The
-// caller owns it and releases the set with CloseMounts.
-type OpenMount struct {
-	Root *os.Root
-	Mount
+// Roots holds the confined handles Open opened to prove each required mount
+// usable. The handle is what any FURTHER check on that mount runs against, so the
+// check inspects the same object the guard inspected instead of re-resolving the
+// path and testing whatever it resolves to the second time. The caller owns them
+// and releases the set with Close.
+type Roots struct {
+	Input, Output *os.Root
 }
 
-// OpenMounts verifies every required mount already exists as a directory and
-// can be opened by the running UID. It reports every offender in one startup
-// attempt and never creates a missing mount in the container's ephemeral layer.
-// Output write access is checked separately by WarnOutputNotWritable, which runs
-// against the handle returned here.
+// mountSpec is one required volume's inspection: the role its diagnostics carry,
+// the path to inspect, and where its handle lands on success. The table stays
+// private so the all-offender sweep is an implementation detail of Open rather
+// than a shape a caller can build a third role in.
+type mountSpec struct {
+	assign func(*os.Root)
+	role   string
+	path   string
+}
+
+// Open verifies every required mount already exists as a directory and can be
+// opened by the running UID. It reports every offender in one startup attempt and
+// never creates a missing mount in the container's ephemeral layer. Output write
+// access is checked separately by WarnOutputNotWritable, which runs against the
+// handles returned here.
 //
-// On success it returns one OpenMount per input dir, in order, with its root
-// open. On refusal it closes everything it opened and returns no handles, so a
-// caller that ignores the returned slice on the failure path cannot leak one.
-func OpenMounts(dirs []Mount) ([]OpenMount, bool) {
-	open := make([]OpenMount, 0, len(dirs))
+// On success it returns both roots open. On refusal it closes everything it
+// opened and returns no handles, so a caller that ignores the returned value on
+// the failure path cannot leak one.
+func Open(dirs Paths) (Roots, bool) {
+	var open Roots
 	ready := true
-	for _, dir := range dirs {
-		fi, statErr := os.Stat(dir.Path)
-		if statErr == nil && fi.IsDir() {
-			root, openErr := openMountRoot(dir.Path)
-			if openErr == nil {
-				open = append(open, OpenMount{Root: root, Mount: dir})
-				continue
-			}
-			slog.Error("required volume cannot be opened by this container's user; refusing to start",
-				"role", dir.Role, "path", dir.Path, "error", openErr,
-				"remediation", "grant the UID in the container's `user:` read access to "+dir.Path+
-					" (chgrp/chmod the host directory), or run the container as a UID that already has it")
+	for _, spec := range []mountSpec{
+		{role: roleInput, path: dirs.Input, assign: func(root *os.Root) { open.Input = root }},
+		{role: roleOutput, path: dirs.Output, assign: func(root *os.Root) { open.Output = root }},
+	} {
+		root, ok := openMount(spec)
+		if !ok {
 			ready = false
 			continue
 		}
-		if statErr == nil {
-			// os.Stat succeeded, so the path exists as a file, FIFO or device. The
-			// synthesised cause is what separates the two remedies: an absent path is a
-			// missing mount, a non-directory is a bind-mounted FILE.
-			statErr = errors.New("path exists but is not a directory")
-		}
-		slog.Error("required volume is missing or not a directory; refusing to start",
-			"role", dir.Role, "path", dir.Path, "error", statErr,
-			"remediation", "mount "+dir.Path+" into the container before starting it")
-		ready = false
+		spec.assign(root)
 	}
 	if !ready {
-		CloseMounts(open)
-		return nil, false
+		open.Close()
+		return Roots{}, false
 	}
 	return open, true
 }
 
-// CloseMounts releases the confined handles OpenMounts returned. It tolerates a
-// nil slice, so the refusal path can defer it unconditionally. A close failure on
-// a handle the process is finished with gives an operator nothing to act on, so it
-// goes to Debug rather than a WARN they would have to triage.
-func CloseMounts(vols []OpenMount) {
-	for _, vol := range vols {
-		if err := vol.Root.Close(); err != nil {
+// openMount inspects one required volume and returns its confined handle. On
+// refusal it has already logged that offender at ERROR with the remediation its
+// cause calls for, so Open can carry on and name the rest of them.
+func openMount(spec mountSpec) (*os.Root, bool) {
+	fi, statErr := os.Stat(spec.path)
+	if statErr == nil && fi.IsDir() {
+		root, openErr := openMountRoot(spec.path)
+		if openErr == nil {
+			return root, true
+		}
+		slog.Error("required volume cannot be opened by this container's user; refusing to start",
+			"role", spec.role, "path", spec.path, "error", openErr,
+			"remediation", "grant the UID in the container's `user:` read access to "+spec.path+
+				" (chgrp/chmod the host directory), or run the container as a UID that already has it")
+		return nil, false
+	}
+	if statErr == nil {
+		// os.Stat succeeded, so the path exists as a file, FIFO or device. The
+		// synthesised cause is what separates the two remedies: an absent path is a
+		// missing mount, a non-directory is a bind-mounted FILE.
+		statErr = errors.New("path exists but is not a directory")
+	}
+	slog.Error("required volume is missing or not a directory; refusing to start",
+		"role", spec.role, "path", spec.path, "error", statErr,
+		"remediation", "mount "+spec.path+" into the container before starting it")
+	return nil, false
+}
+
+// Close releases the confined handles Open returned. It tolerates a zero Roots,
+// so the refusal path can defer it unconditionally. A close failure on a handle
+// the process is finished with gives an operator nothing to act on, so it goes to
+// Debug rather than a WARN they would have to triage.
+func (r Roots) Close() {
+	for _, vol := range []struct {
+		root *os.Root
+		role string
+	}{{r.Input, roleInput}, {r.Output, roleOutput}} {
+		if vol.root == nil {
+			continue
+		}
+		if err := vol.root.Close(); err != nil {
 			slog.Debug("failed to close a required volume's handle",
-				"role", vol.Role, "path", vol.Path, "error", err)
+				"role", vol.role, "path", vol.root.Name(), "error", err)
 		}
 	}
 }
@@ -142,7 +173,7 @@ func WarnOutputNotWritable(root *os.Root) {
 		// condition. Nothing is known about /output either way, so this must NOT
 		// print the not-writable diagnosis an operator would act on.
 		slog.Debug("the output write probe could not be attempted",
-			"role", RoleOutput, "path", root.Name(), "error", err)
+			"role", roleOutput, "path", root.Name(), "error", err)
 	case res.OK():
 		// Deliberately silent: /output being usable is the expected case, and main's
 		// startup line already states the path and the UID. A record here would print
@@ -192,13 +223,13 @@ func warnOutputRefusedWrite(root *os.Root, res atomicfile.ProbeResult) {
 		// Reachable when the write or the flush failed AND the follow-up unlink failed
 		// too: the volume is unusable and is still holding the probe file.
 		slog.Warn(outputNotWritableMsg,
-			"role", RoleOutput, "path", res.Dir, "stage", res.Stage.String(), "error", res.Err,
+			"role", roleOutput, "path", res.Dir, "stage", res.Stage.String(), "error", res.Err,
 			"uid", os.Getuid(), "gid", os.Getgid(), "remediation", remediation,
 			"leaked_probe", probePath(res), "cleanup", staleTempRemediation)
 		return
 	}
 	slog.Warn(outputNotWritableMsg,
-		"role", RoleOutput, "path", res.Dir, "stage", res.Stage.String(), "error", res.Err,
+		"role", roleOutput, "path", res.Dir, "stage", res.Stage.String(), "error", res.Err,
 		"uid", os.Getuid(), "gid", os.Getgid(), "remediation", remediation)
 }
 
@@ -229,19 +260,6 @@ func warnOutputProbeTeardown(res atomicfile.ProbeResult) {
 // filepath.Join then reports the directory alone rather than a bogus path.
 func probePath(res atomicfile.ProbeResult) string {
 	return filepath.Join(res.Dir, res.Name)
-}
-
-// ProbeOutputMounts runs the write probe against the mount playing the output
-// role. Separate from the guard so WHICH handle the probe inspects is assertable
-// without starting a watcher: /input is mounted read-only in production, so a
-// probe pointed at it would report the output volume as unwritable on every
-// start.
-func ProbeOutputMounts(vols []OpenMount) {
-	for _, vol := range vols {
-		if vol.Role == RoleOutput {
-			WarnOutputNotWritable(vol.Root)
-		}
-	}
 }
 
 // openMountRoot opens a required mount's confined handle. It is a seam in the

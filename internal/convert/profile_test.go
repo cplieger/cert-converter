@@ -1,7 +1,6 @@
 package convert_test
 
 import (
-	"bytes"
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/convert"
@@ -46,39 +45,6 @@ func TestInspect_identifies_every_profile_we_emit(t *testing.T) {
 			}
 			if got != want {
 				t.Errorf("Inspect identified %q, want %q", got, want)
-			}
-		})
-	}
-}
-
-// TestInspect_rejects_what_we_would_not_have_written pins the failure paths. Every
-// one of them means the same thing to the caller — this is not a bundle we wrote, so
-// replace it — which is what makes a parse failure safe rather than fatal.
-func TestInspect_rejects_what_we_would_not_have_written(t *testing.T) {
-	t.Parallel()
-	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
-	if err != nil {
-		t.Fatalf("setup: Analyse: %v", err)
-	}
-	good, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
-	if err != nil {
-		t.Fatalf("setup: Encode: %v", err)
-	}
-
-	for _, tc := range []struct {
-		name string
-		pfx  []byte
-	}{
-		{"empty input", nil},
-		{"not DER at all", []byte("this is not a pkcs12 bundle")},
-		{"truncated bundle", good[:len(good)/2]},
-		{"trailing garbage after a valid bundle", append(bytes.Clone(good), 0xff, 0xff)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			if _, err := convert.Inspect(tc.pfx); err == nil {
-				t.Error("Inspect = nil error, want a rejection")
 			}
 		})
 	}

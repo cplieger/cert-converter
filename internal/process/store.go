@@ -450,7 +450,39 @@ func (s *store) inspect(ctx context.Context, rel string, want *convert.Analysis,
 	// never changes the currency answer, the write, the reap or health — see
 	// reportLaxDir.
 	s.reportLaxDir(rel)
-	fi, err := s.lstat(rel)
+	// Pin rel's parent ONCE and address the bundle by basename through that pin for
+	// both syscalls below. An *os.Root confines a path but does not pin it: it
+	// deliberately follows an in-root symlink component and re-resolves the whole name
+	// on every call, so classifying rel with one resolution and reading it back with
+	// another lets a co-mounting writer swap an ANCESTOR between the two and have the
+	// read address a different physical bundle than the one whose shape, mode and size
+	// were just classified — inside /output, so confinement never notices, and the
+	// currency gate can then be satisfied by a sibling bundle while the stale one stays
+	// served. store.write and removeOrphan close the same window the same way
+	// (atomicfile.OpenParentInRoot descends component by component, refuses a symlink
+	// and confirms each directory's identity); the inspection path has to close it too,
+	// because it is what decides whether a write happens at all.
+	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// An ancestor of the output name does not exist, so neither does the bundle.
+		// Nothing on disk is the strongest form of "not the bundle these inputs produce":
+		// there is no copy for a consumer to read, so a rewrite that fails here is a
+		// conversion failure whatever refused it.
+		return bundleState{content: contentVerifiedStale}, nil
+	case err != nil:
+		// A pin this app cannot obtain — a symlinked output tree, a component it may not
+		// traverse, a directory replaced mid-descent — is "I cannot tell what is on disk",
+		// the same fact as a stat failure, and it degrades the same way rather than
+		// failing the pair. The remediation names the pin's own two causes.
+		slog.Warn("cannot stat prior pfx; regenerating",
+			"path", rel, "error", err,
+			"remediation", outputPinRemediation)
+		return bundleState{content: contentUnverified}, nil
+	}
+	defer func() { _ = parent.Close() }()
+
+	fi, err := parent.Lstat(base)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		// Nothing on disk is the strongest form of "not the bundle these inputs produce":
@@ -508,7 +540,7 @@ func (s *store) inspect(ctx context.Context, rel string, want *convert.Analysis,
 		return bundleState{content: contentUnverified}, nil
 	}
 
-	prior, err := s.readBoundedPFX(ctx, rel)
+	prior, err := readBoundedInRoot(ctx, parent, base, maxPFXSize)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			// Shutdown, not an unreadable output: propagate so the scan reports the
@@ -721,7 +753,7 @@ func restartCanClearWrite(err error) bool {
 	}
 }
 
-// readBoundedPFX reads rel from inside the output tree under maxPFXSize.
+// readBoundedInRoot reads a bundle from inside the output tree under maxPFXSize.
 //
 // atomicfile owns the confined read: it opens through the root non-blocking (so a
 // FIFO or device node planted at an output name is rejected rather than wedging
@@ -729,10 +761,11 @@ func restartCanClearWrite(err error) bool {
 // stats the OPEN HANDLE rather than the path — closing the window between
 // inspect's lstat and this open on a volume other containers write to. Those
 // are the same three guarantees the input side already delegates in
-// source.readBoundedLimit.
+// source.readBoundedLimit. inspect passes it the parent root it pinned plus the
+// BASENAME, so no ancestor component takes part in this resolution either.
 //
-// readBoundedInRoot is that read, indirected through a package var for the same reason
-// writeFileInRoot is: the failure that decides a HEALTH outcome here — a prior bundle
+// It is indirected through a package var for the same reason writeFileInRoot is: the
+// failure that decides a HEALTH outcome here — a prior bundle
 // that is unlinked, or stops being a regular file, between inspect's classifying lstat
 // and this read, which inspect classifies as contentVerifiedStale so a refused rewrite
 // stays a conversion failure — cannot be staged in a temp directory the suite owns.
@@ -740,10 +773,6 @@ func restartCanClearWrite(err error) bool {
 // could fold it back into the health-neutral "cannot tell" case with the whole suite
 // green.
 var readBoundedInRoot = atomicfile.ReadBoundedInRoot
-
-func (s *store) readBoundedPFX(ctx context.Context, rel string) ([]byte, error) {
-	return readBoundedInRoot(ctx, s.root, rel, maxPFXSize)
-}
 
 // --- Output lifecycle: the /output half ---
 //
@@ -770,12 +799,12 @@ func (s *store) readBoundedPFX(ctx context.Context, rel string) ([]byte, error) 
 // private-key material, and it had already drifted once when each mount enumerated
 // itself.
 func (s *store) listOutputs(ctx context.Context) (found []string, safe bool, err error) {
-	walk := outputWalk{ctx: ctx, safe: true, maxEntries: s.maxEntries}
+	walk := outputWalk{ctx: ctx, maxEntries: s.maxEntries}
 	if err := atomicfile.WalkDirInRoot(ctx, s.root, walk.visit); err != nil {
 		return nil, false, fmt.Errorf("walk output tree: %w", err)
 	}
 	s.logOrphanWalkOutcome(walk.unreadable, walk.symlinked)
-	return walk.found, walk.safe, nil
+	return walk.found, walk.unreadable == 0 && walk.symlinked == 0, nil
 }
 
 // errOutputBudgetExceeded marks an output walk the entry budget stopped. It is its own
@@ -808,11 +837,16 @@ const outputBudgetMsg = reapDisabledPhrase + ": the /output tree holds more bund
 const outputBudgetRemediation = "check that /output is mounted at the bundle directory and holds nothing else, or raise MAX_SCAN_ENTRIES if the tree is legitimately this large"
 
 // outputWalk is listOutputs' visitor state: the candidate list plus the two
-// deletion-safety counters and the verdict they feed. It exists so the walk body is a
+// deletion-safety counters that derive the verdict. It exists so the walk body is a
 // named method with explicit state rather than a closure mutating five captured
 // variables — the traversal control, the safety accounting, the diagnostics and the
 // candidate collection are the same branches either way, but the state a deletion
 // decision rests on is now spelled out as fields.
+//
+// The safety verdict is DERIVED from unreadable and symlinked rather than mirrored in
+// a field of its own: nothing can restore it once either counter moves, so a stored
+// boolean would be a second representation of one invariant that both veto arms would
+// have to keep in step.
 type outputWalk struct {
 	ctx        context.Context
 	found      []string
@@ -827,7 +861,6 @@ type outputWalk struct {
 	// maxEntries is this walk's injected budget; non-positive means scanbudget.Default
 	// (scanbudget.Effective), so a walk assembled without one is still bounded.
 	maxEntries int
-	safe       bool
 }
 
 // visit is listOutputs' walk callback: one entry, one verdict.
@@ -848,7 +881,6 @@ func (w *outputWalk) visit(rel string, d fs.DirEntry, err error) error {
 		// default level is a permanent log stream for a condition already reported.
 		slog.Debug("skipping unreadable output path while looking for orphans", "path", rel, "error", err)
 		w.unreadable++
-		w.safe = false
 		return nil
 	}
 	// Charged once per ENUMERATED path and before any classification, so the budget
@@ -880,7 +912,6 @@ func (w *outputWalk) visit(rel string, d fs.DirEntry, err error) error {
 	if d.Type()&fs.ModeSymlink != 0 {
 		slog.Debug("output tree contains a symlink; "+reapDisabledPhrase, "path", rel)
 		w.symlinked++
-		w.safe = false
 		return nil
 	}
 	if d.IsDir() {

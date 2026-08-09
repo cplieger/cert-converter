@@ -345,42 +345,32 @@ func TestHandleRootWatchLoss_stays_live_when_the_reattach_fails(t *testing.T) {
 	}
 }
 
-// TestHandleFsEvent_refuses_a_new_registration_once_the_live_watch_set_is_full pins
-// the live-set half of the registration ceiling on the ONLY path that can reach it.
-// addWatchDirs applies two bounds with the same number: how many paths one walk
-// enumerates, and how large the live registration set may grow. A re-walk from the
-// ROOT can never reach the second one, because the per-walk count is spent on the
-// same paths first -- so the across-calls test above passes on the per-walk cap
-// alone and the live-set refusal executes nowhere in the suite.
-//
-// The reachable driver is the per-event SUBTREE walk: handlePathEvent calls
+// TestHandleFsEvent_registers_a_directory_created_under_a_watched_parent pins the
+// per-event SUBTREE walk on the path a writer drives: handlePathEvent calls
 // addWatchDirs on event.Name, so a directory created one at a time under an
-// already-watched parent hands each call a fresh per-walk budget it never exhausts.
-// That is precisely the writer-driven growth the live-set bound exists to stop, and
-// with it deleted or inverted the app keeps taking inotify descriptors per created
-// directory until the per-UID fs.inotify quota is spent, taking unrelated same-UID
-// consumers down with it.
+// already-watched parent is registered when its Create event arrives, and the pair
+// inside it is converted by the rescan the same event schedules.
 //
-// Budget 2 is the root plus one directory, so the live set is full before the event
-// arrives while the subtree walk below enumerates a single entry.
+// The app imposes no ceiling on how many registrations it holds: the kernel owns
+// fs.inotify.max_user_watches and refuses the Add itself once the per-UID quota is
+// spent (handleWatchAddError reports that, WARN-and-skip below the root). This test is
+// what keeps a re-added app-side registration ceiling from passing silently -- an
+// admission refusal here would leave the late directory unwatched, so every renewal
+// underneath it would wait for a periodic rescan.
 // Not parallel: it swaps the process-global slog default.
-func TestHandleFsEvent_refuses_a_new_registration_once_the_live_watch_set_is_full(t *testing.T) {
+func TestHandleFsEvent_registers_a_directory_created_under_a_watched_parent(t *testing.T) {
 	watcher := newTestWatcher(t)
 	root := t.TempDir()
 	first := filepath.Join(root, "a.example.com")
 	if err := os.MkdirAll(first, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {}, WithMaxEntries(2))
+	w := New(root, func(context.Context) {})
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
 	}
-	if got := w.watchSetSize(); got != 2 {
-		t.Fatalf("setup: the live watch set holds %d registrations, want the budget of 2 so only the live-set bound can refuse the event below", got)
-	}
 
-	// A directory created later, announced by its own Create event: the subtree walk
-	// enumerates one entry, so the per-walk cap cannot refuse it.
+	// A directory created later, announced by its own Create event.
 	late := filepath.Join(root, "b.example.com")
 	if err := os.MkdirAll(late, 0o750); err != nil {
 		t.Fatal(err)
@@ -388,20 +378,17 @@ func TestHandleFsEvent_refuses_a_new_registration_once_the_live_watch_set_is_ful
 	logs := capture.Default(t)
 
 	if got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: late, Op: fsnotify.Create}); !got {
-		t.Error("handleFsEvent(Create of a new directory at the budget) = false, want true: refusing the registration must not cost the rescan that converts a pair already inside it")
+		t.Error("handleFsEvent(Create of a new directory) = false, want true: the directory arm must schedule the rescan that converts a pair already inside it")
 	}
 
-	if watched := watcher.WatchList(); slices.Contains(watched, late) {
-		t.Errorf("watch list = %v, want %q refused: each per-event walk takes a fresh per-walk budget, so only a bound on the live SET stops a writer from consuming inotify descriptors one directory at a time",
+	if watched := watcher.WatchList(); !slices.Contains(watched, late) {
+		t.Errorf("watch list = %v, want %q registered: a directory created under a watched parent must be watched, or renewals inside it wait for a periodic rescan",
 			watched, late)
 	}
-	if w.watchSetHas(late) {
-		t.Errorf("the membership mirror recorded %q, which the live-set bound refused to register", late)
+	if !w.watchSetHas(late) {
+		t.Errorf("the membership mirror does not hold %q after its registration; the per-event guard would re-walk its subtree on every later event", late)
 	}
-	if n := logs.CountLevel(slog.LevelWarn, watchBudgetMsg); n != 1 {
-		t.Fatalf("the budget WARN fired %d times, want exactly 1 so the operator learns why real-time detection stops extending; log = %v", n, logs.Messages())
-	}
-	if got, ok := logs.AttrValue(watchBudgetMsg, "max_entries"); !ok || got != "2" {
-		t.Errorf("the budget WARN max_entries = %q (present %v), want %q: the operator cannot raise MAX_SCAN_ENTRIES without knowing the budget that was reached", got, ok, "2")
+	if n := logs.CountLevel(slog.LevelWarn, watchBudgetMsg); n != 0 {
+		t.Errorf("the entry-ceiling WARN fired %d times for a tree well inside the budget, want 0; log = %v", n, logs.Messages())
 	}
 }

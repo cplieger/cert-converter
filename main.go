@@ -63,9 +63,9 @@ var runProbe = health.RunProbe
 // second seam in the same style as runProbe: the production value is the two
 // fixed container paths, and tests point it at temp directories so the refusal
 // itself can be exercised without a /input and /output on the test host.
-var requiredVolumes = []mounts.Mount{
-	{Role: mounts.RoleInput, Path: certsRootDir},
-	{Role: mounts.RoleOutput, Path: outputDir},
+var requiredVolumes = mounts.Paths{
+	Input:  certsRootDir,
+	Output: outputDir,
 }
 
 const healthSubcommand = "health"
@@ -183,19 +183,19 @@ func run() int {
 		"encoder", cfg.EncoderName,
 		"output_lifecycle", string(cfg.Lifecycle), "max_scan_entries", cfg.MaxScanEntries)
 
-	volumes, ready := mounts.OpenMounts(requiredVolumes)
+	roots, ready := mounts.Open(requiredVolumes)
 	// The handles come back OPEN so the write probe below inspects the same object
 	// this guard proved openable instead of re-resolving /output. Deferred rather
-	// than closed after the probe so a later return cannot skip it; OpenMounts
-	// returns none on the refusal path, where CloseMounts is a no-op.
-	defer mounts.CloseMounts(volumes)
+	// than closed after the probe so a later return cannot skip it; Open returns no
+	// handles on the refusal path, where Close is a no-op.
+	defer roots.Close()
 	if !ready {
 		return 1
 	}
-	// Same seam as the guard above, deliberately not the outputDir const: a test that
-	// substitutes requiredVolumes and lets the guard pass must not have the write probe
-	// fall through to the real /output.
-	mounts.ProbeOutputMounts(volumes)
+	// The probe runs against the guard's own output handle, deliberately not the
+	// outputDir const: a test that substitutes requiredVolumes and lets the guard
+	// pass must not have the write probe fall through to the real /output.
+	mounts.WarnOutputNotWritable(roots.Output)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

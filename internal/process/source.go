@@ -63,12 +63,19 @@ func (s *source) pathVanished(rel string) bool {
 	return fi.Mode()&fs.ModeSymlink == 0
 }
 
-// pathAbsent reports whether rel does not exist inside the input tree.
+// pathAbsent reports whether rel does not exist inside the input tree, and returns any
+// failure that left the question UNANSWERED.
 //
 // It is the reap's durability question: an orphan candidate is only deleted when its
 // certificate is still missing after the confirmation delay, so a "cannot tell"
-// answer must read as PRESENT — the caller deletes private key material on a true.
-// Any Lstat failure other than ENOENT therefore answers false.
+// answer must read as NOT ABSENT — the caller deletes private key material on a true.
+// Any Lstat failure other than ENOENT therefore answers (false, err): the fail-closed
+// half is the false, and the err is what stops a caller narrating the retention as a
+// positive observation ("the certificate came back", "the private key is still in
+// /input") when the truth is that /input became unreadable, was unmounted, or changed
+// permissions during the delay. Both are diagnoses an operator acts on differently, and
+// collapsing the second into the first left a retained stale bundle unexplained — at
+// LOG_LEVEL=warn, with no record at all.
 //
 // Lstat, like pathVanished, so a dangling symlink at an input name reads as present:
 // the entry is still in the tree the operator manages, and no output under it may be
@@ -79,9 +86,15 @@ func (s *source) pathVanished(rel string) bool {
 // pathVanished answers true for a path that exists. The reap needs the opposite
 // reading of exactly that case — a certificate that is back is a certificate that is
 // present — which is why absence is asked for directly rather than through it.
-func (s *source) pathAbsent(rel string) bool {
+func (s *source) pathAbsent(rel string) (bool, error) {
 	_, err := s.root.Lstat(rel)
-	return errors.Is(err, fs.ErrNotExist)
+	if errors.Is(err, fs.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 // readBounded opens rel within the input tree and reads it under maxFileSize,

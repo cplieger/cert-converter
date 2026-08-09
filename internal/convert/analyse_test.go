@@ -459,7 +459,7 @@ func TestAnalyse_reports_an_out_of_window_chain_certificate(t *testing.T) {
 // TestAnalyse_caps_the_subjects_it_names_in_the_exclusion_observation pins the
 // count cap on the excluded-certificate observation. Subjects are
 // certificate-controlled text bounded only by the 10 MB input read bound, and
-// boundSubject caps each one at 256 bytes but not how MANY are listed; the cap of
+// boundLogText caps each one at 256 bytes but not how MANY are listed; the cap of
 // three plus an "and N more" summary is the only thing keeping a bundle full of
 // extras from producing an observation line that grows with the input, logged on
 // every scan that revisits the pair.

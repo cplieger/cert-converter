@@ -142,12 +142,6 @@ type contentInfo struct {
 	Content     asn1.RawValue `asn1:"tag:0,explicit,optional"`
 }
 
-// contentTypeOID decodes this ContentInfo's content-type identifier under the
-// preflight's bounds. See decodeOID for why the raw DER is retained.
-func (c *contentInfo) contentTypeOID() (asn1.ObjectIdentifier, error) {
-	return decodeOID(c.ContentType)
-}
-
 type macData struct {
 	Mac        digestInfo
 	MacSalt    asn1.RawValue
@@ -172,15 +166,10 @@ type algorithmIdentifier struct {
 	Parameters asn1.RawValue `asn1:"optional"`
 }
 
-// algorithmOID decodes this AlgorithmIdentifier's algorithm identifier under the
-// preflight's bounds. See decodeOID for why the raw DER is retained.
-func (a *algorithmIdentifier) algorithmOID() (asn1.ObjectIdentifier, error) {
-	return decodeOID(a.Algorithm)
-}
-
-// MaxBundleBytes is the largest PKCS#12 bundle this codec will inspect. Every bound
-// below (maxOIDBytes, maxAuthenticatedSafes, maxSafeBags) is sized against it, so the
-// limit belongs here rather than in whichever caller happens to read the file. It is
+// MaxBundleBytes is the largest prior bundle the app admits to this codec through
+// the store. Every bound below (maxOIDBytes, maxAuthenticatedSafes, maxSafeBags) is
+// sized against it, so the limit belongs here rather than in whichever caller
+// happens to read the file. It is
 // two of this package's own input files plus PKCS#12 framing, derived from
 // MaxInputBytes rather than restated, so raising the input cap raises this with it
 // instead of silently invalidating the allocation analysis these bounds were sized
@@ -199,7 +188,7 @@ const maxOIDBytes = 32
 // bundle bytes is modelled as an asn1.RawValue rather than an
 // asn1.ObjectIdentifier. Go's ASN.1 decoder allocates one int per encoded byte
 // (len+1) when it decodes into asn1.ObjectIdentifier, roughly eight bytes of
-// backing store per input byte. This codec admits a bundle of up to
+// backing store per input byte. The store admits a bundle of up to
 // MaxBundleBytes, so a foreign or damaged bundle could spend almost that
 // whole allowance on a single syntactically valid identifier and turn a ~20 MiB
 // file into ~160 MiB of int slice — inside store.isCurrent, before any
@@ -399,10 +388,6 @@ type pbkdf2Params struct {
 // to a caller — this is not a bundle we would have written, so replace it. That
 // makes a parse failure safe by construction.
 func inspect(pfx []byte) (EncoderType, error) {
-	if len(pfx) > MaxBundleBytes {
-		return "", fmt.Errorf("%w: bundle is %d byte(s), over the %d-byte inspection limit",
-			ErrProfileUnknown, len(pfx), MaxBundleBytes)
-	}
 	var preamble pfxPreamble
 	// asn1.Unmarshal returns trailing bytes rather than rejecting them. A bundle
 	// with anything appended is not one this app wrote, and accepting it would mean
@@ -426,7 +411,7 @@ func inspect(pfx []byte) (EncoderType, error) {
 		// A bundle with no MacData is not one of ours: all four profiles set a MAC.
 		return "", fmt.Errorf("%w: no MAC present", ErrProfileUnknown)
 	}
-	macOID, err := macAlg.algorithmOID()
+	macOID, err := decodeOID(macAlg.Algorithm)
 	if err != nil {
 		return "", err
 	}
@@ -526,7 +511,7 @@ func bundleAlgorithms(authSafe *contentInfo) (safeAlgorithms, error) {
 // ContentInfo wrapping an OCTET STRING that holds the AuthenticatedSafe DER — and
 // returns the bounded SEQUENCE OF ContentInfo elements inside it.
 func authenticatedSafeElements(authSafe *contentInfo) ([][]byte, error) {
-	contentType, err := authSafe.contentTypeOID()
+	contentType, err := decodeOID(authSafe.ContentType)
 	if err != nil {
 		return nil, err
 	}
@@ -571,7 +556,7 @@ func (a *safeAlgorithms) merge(found safeAlgorithms) error {
 // carries: an encrypted safe's content encryption, or a plaintext safe's shrouded
 // key-bag encryption. A safe of neither kind contributes nothing.
 func boundedSafeAlgorithms(safe *contentInfo) (safeAlgorithms, error) {
-	contentType, err := safe.contentTypeOID()
+	contentType, err := decodeOID(safe.ContentType)
 	if err != nil {
 		return safeAlgorithms{}, err
 	}
@@ -590,7 +575,7 @@ func boundedSafeAlgorithms(safe *contentInfo) (safeAlgorithms, error) {
 				ErrProfileUnknown, enc.Version)
 		}
 		certEnc := enc.EncryptedContentInfo.ContentEncryptionAlgorithm
-		certOID, err := certEnc.algorithmOID()
+		certOID, err := decodeOID(certEnc.Algorithm)
 		if err != nil {
 			return safeAlgorithms{}, err
 		}
@@ -678,7 +663,7 @@ func boundedKeyBagEncryption(bag *safeBag) (asn1.ObjectIdentifier, error) {
 		"a shrouded key bag's EncryptedPrivateKeyInfo"); unmarshalErr != nil {
 		return nil, unmarshalErr
 	}
-	keyOID, err := info.Algorithm.algorithmOID()
+	keyOID, err := decodeOID(info.Algorithm.Algorithm)
 	if err != nil {
 		return nil, err
 	}
@@ -796,7 +781,7 @@ func parseProfilePBKDF2(label string, alg *algorithmIdentifier) (pbkdf2Params, e
 // block, and checks the fields that describe the derivation itself: the salt's
 // encoding and the iteration count.
 func decodeProfilePBKDF2(label string, alg *algorithmIdentifier) (pbkdf2Params, error) {
-	algOID, err := alg.algorithmOID()
+	algOID, err := decodeOID(alg.Algorithm)
 	if err != nil {
 		return pbkdf2Params{}, err
 	}
@@ -834,7 +819,7 @@ func checkProfilePBKDF2PRF(label string, prf *algorithmIdentifier) error {
 		return fmt.Errorf("%w: %s PBKDF2 names no PRF, which defaults to HMAC-SHA1",
 			ErrProfileUnknown, label)
 	}
-	prfOID, err := prf.algorithmOID()
+	prfOID, err := decodeOID(prf.Algorithm)
 	if err != nil {
 		return err
 	}
@@ -862,7 +847,7 @@ func checkPBES2Parameters(params asn1.RawValue) error {
 	if _, kdfErr := parseProfilePBKDF2("pbes2", &outer.KeyDerivationFunc); kdfErr != nil {
 		return kdfErr
 	}
-	schemeOID, err := outer.EncryptionScheme.algorithmOID()
+	schemeOID, err := decodeOID(outer.EncryptionScheme.Algorithm)
 	if err != nil {
 		return err
 	}
@@ -896,7 +881,7 @@ func checkPBMAC1Parameters(params asn1.RawValue) error {
 		return fmt.Errorf("%w: pbmac1 derives a %d-octet key, want %d",
 			ErrProfileUnknown, kdf.KeyLength, pbmac1KeyOctets)
 	}
-	macOID, err := outer.MessageAuthScheme.algorithmOID()
+	macOID, err := decodeOID(outer.MessageAuthScheme.Algorithm)
 	if err != nil {
 		return err
 	}

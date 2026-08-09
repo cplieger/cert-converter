@@ -61,9 +61,6 @@ func Mint(tb testing.TB, template *x509.Certificate, pub crypto.PublicKey,
 	if parent == nil {
 		parent = template // self-signed: the template is its own issuer
 	}
-	if parentKey == nil {
-		tb.Fatal("setup: Mint needs a signing key")
-	}
 	der, pemBytes = signCert(tb, template, parent, pub, parentKey)
 	parsed, err := x509.ParseCertificate(der)
 	if err != nil {

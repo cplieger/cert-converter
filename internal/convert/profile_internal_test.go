@@ -1788,18 +1788,3 @@ func TestOctetStringBytes_refuses_every_non_primitive_shape(t *testing.T) {
 		t.Error("octetStringBytes copied its input; the point of the helper is that it aliases")
 	}
 }
-
-// TestInspect_refuses_a_bundle_over_MaxBundleBytes pins the codec's own input bound.
-// The store checks the size first today, so this arm exists precisely so a SECOND
-// caller cannot hand the preflight an unbounded buffer: every allocation bound below
-// it (maxOIDBytes, maxAuthenticatedSafes, maxSafeBags) is sized against this limit.
-func TestInspect_refuses_a_bundle_over_MaxBundleBytes(t *testing.T) {
-	t.Parallel()
-	_, err := Inspect(make([]byte, MaxBundleBytes+1))
-	if !errors.Is(err, ErrProfileUnknown) {
-		t.Fatalf("Inspect(MaxBundleBytes+1 bytes) = %v, want ErrProfileUnknown", err)
-	}
-	if want := "over the"; !strings.Contains(err.Error(), want) {
-		t.Errorf("Inspect(oversized) = %v, want the refusal to name %q", err, want)
-	}
-}

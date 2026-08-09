@@ -28,8 +28,10 @@ var oidEmailAddress = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 1}
 func TestSubjectForLog_bound_does_not_change_what_an_operator_reads(t *testing.T) {
 	t.Parallel()
 
-	for _, count := range []int{1, 4, maxSubjectRenderAttrs - 1, maxSubjectRenderAttrs,
-		maxSubjectRenderAttrs + 1, 1000, 5000} {
+	for _, count := range []int{
+		1, 4, maxSubjectRenderAttrs - 1, maxSubjectRenderAttrs,
+		maxSubjectRenderAttrs + 1, 1000, 5000,
+	} {
 		t.Run(fmt.Sprintf("%d attributes", count), func(t *testing.T) {
 			t.Parallel()
 			var n pkix.Name
@@ -50,7 +52,7 @@ func TestSubjectForLog_bound_does_not_change_what_an_operator_reads(t *testing.T
 	}
 }
 
-// cutTo truncates to n bytes, mirroring what boundSubject's cut compares.
+// cutTo truncates to n bytes, mirroring what subjectForLog's boundLogText cut compares.
 func cutTo(s string, n int) string {
 	if len(s) > n {
 		return s[:n]
@@ -110,6 +112,6 @@ func TestDNSequence_surfaces_the_attributes_ToRDNSequence_drops(t *testing.T) {
 			mirrored)
 	}
 	if dropped := n.ToRDNSequence().String(); strings.Contains(dropped, oidEmailAddress.String()) {
-		t.Skip("pkix.Name.ToRDNSequence now surfaces Names; re-derive dnSequence's justification")
+		t.Fatal("pkix.Name.ToRDNSequence now surfaces Names; re-derive dnSequence's justification")
 	}
 }

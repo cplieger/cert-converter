@@ -22,7 +22,7 @@ const absentWatchRoot = "/nonexistent-cert-converter-watch-root"
 // loop's periodic safety-net timer is armed in every configuration, on the
 // reconciliation floor when the operator switched their own cadence off. Before
 // this contract the disabled fallback left the loop holding no clock at all, so a
-// silently dropped watch, a directory past the registration budget, and a wedged
+// silently dropped watch, a directory past the walk's entry budget, and a wedged
 // watcher were all permanent and the health marker never went stale.
 //
 // The other two timers must still start stopped: nothing is pending until an event

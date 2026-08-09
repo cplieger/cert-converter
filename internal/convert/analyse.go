@@ -301,15 +301,18 @@ func (a *Analysis) Observations() []Observation {
 // Analyse resolves a certificate bundle and a key file into the identity, chain
 // and key a PKCS#12 bundle needs. It performs no I/O.
 //
-// ctx is the caller's shutdown signal. It is consulted only where a signature
-// verification is about to be paid for (certGraph.verifiable), which is the only
-// cost in an analysis the input FILE dictates: one analysis can pay up to
-// maxChainCerts^2 verifications, each bounded by maxVerifiableKeyBits and
-// maxVerifiablePublicExponent to milliseconds but not bounded in number. A
-// cancellation abandons the analysis and returns an error wrapping ctx.Err(), so
-// errors.Is(err, context.Canceled) holds and the caller classifies it as a
-// shutdown rather than a conversion failure. No accepted input's outcome changes:
-// with a live context this behaves exactly as it did before.
+// ctx is the caller's shutdown signal. It is consulted immediately before each
+// signature verification (certGraph.verifiable), the repeated file-controlled
+// cost that can occur up to maxChainCerts^2 times, each bounded by
+// maxVerifiableKeyBits and maxVerifiablePublicExponent to milliseconds but not
+// bounded in number. Parsing and the once-per-certificate name canonicalisation
+// are file-sized too — bounded by MaxInputBytes and maxChainCerts, but not
+// individually interruptible — so a cancellation is honoured between
+// verifications rather than instantly. A cancellation abandons the analysis and
+// returns an error wrapping ctx.Err(), so errors.Is(err, context.Canceled) holds
+// and the caller classifies it as a shutdown rather than a conversion failure. No
+// accepted input's outcome changes: with a live context this behaves exactly as it
+// did before.
 //
 // Identity selection is key-first and structural, never positional. The private
 // key is matched against every certificate in the bundle, and the certificate it
@@ -479,7 +482,12 @@ func prepareAnalysisInput(certPEM, keyPEM []byte) (analysisInput, error) {
 	}
 	keys, keyIssues, err := parsePrivateKeys(keyPEM)
 	if err != nil {
-		return analysisInput{}, fmt.Errorf("parse private key: %w", err)
+		// The certificate-file evidence is folded in here for the reason
+		// appendCertIssues documents: this refusal happens BEFORE analysisInput
+		// exists, so neither ObsUnrelatedBlocksSkipped nor the identity-selection
+		// refusals can report those blocks, and the operator would have to repair
+		// the key before hearing that a certificate-shaped block was left out too.
+		return analysisInput{}, fmt.Errorf("parse private key: %w%s", err, certIssuesSuffix(unrelatedBlocks))
 	}
 
 	var obs []Observation
@@ -591,11 +599,13 @@ type certGraph struct {
 	// milliseconds at the maxVerifiableKeyBits / maxVerifiablePublicExponent
 	// ceilings, and one analysis can ask about maxChainCerts^2 pairs.
 	//
-	// Two rules bound it, both enforced by proven: a pair with no name or key
-	// linkage at all is NEVER verified (nothing links it, so no consumer's question
-	// turns on its signature), and every answer is memoised, so candidate
-	// construction, the proven-distance walk, chain assembly and the identity role
-	// check together pay at most one verification per pair.
+	// Two rules bound it. A pair with no name or key linkage at all is never
+	// verified, and that rule is owned by candidate-edge construction rather than by
+	// proven: candidateEdge refuses an unlinked pair before it asks, and it is the
+	// only builder of the candidate parents, children and paths every other caller
+	// selects from. And every answer is memoised, so candidate construction, the
+	// proven-distance walk, chain assembly and the identity role check together pay
+	// at most one verification per pair.
 	proof map[[2]int]bool
 	// selfSigned memoises the self-signature check per certificate, for the same
 	// reason proof memoises edges: it is a real signature verification whose cost
@@ -1043,34 +1053,34 @@ func (g *certGraph) unverifiableIssuerRival(child int) error {
 // facts. crypto/x509's CheckSignature also accepts SHA-1 where CheckSignatureFrom
 // refuses it, so a legacy SHA-1 chain becomes provable rather than merely plausible.
 //
-// Two bounds, both load-bearing. A pair with no linkage is refused without a
-// verification: nothing ties those certificates together, so no consumer's question
-// turns on the answer, and verifying anyway would put a file-controlled modexp on
-// every one of the maxChainCerts^2 pairs. A parent key above either verification
-// ceiling is refused too, which is the cost the ceilings exist to refuse. No refusal
-// elsewhere makes that branch unreachable: candidateEdge and computeDistances ask it
-// while the graph is being BUILT, and oversizedIssuerError runs later still (analyseAt,
-// after identity selection) and refuses only a bundle whose SELECTED path had to guess a
-// hop beside such a certificate - so a bundle that spends proven edges throughout
-// converts with an over-ceiling stray in it, ranked by this same false.
+// Two bounds. Linkage is owned by candidate-edge construction, not by this method:
+// candidateEdge refuses an unlinked pair before it asks, and it is the only builder
+// of the candidate parents, children and paths every other caller selects from, so
+// every production caller supplies a candidate edge and a file-controlled modexp can
+// never be spent on a pair nothing ties together. A parent key above either
+// verification ceiling IS refused here, which is the cost the ceilings exist to
+// refuse. No refusal elsewhere makes that branch unreachable: candidateEdge and
+// computeDistances ask it while the graph is being BUILT, and oversizedIssuerError runs
+// later still (analyseAt, after identity selection) and refuses only a bundle whose
+// SELECTED path had to guess a hop beside such a certificate - so a bundle that spends
+// proven edges throughout converts with an over-ceiling stray in it, ranked by this
+// same false.
 func (g *certGraph) proven(child, parent int) bool {
 	key := [2]int{child, parent}
 	if got, ok := g.proof[key]; ok {
 		return got
 	}
 	got := false
-	if g.edge(child, parent).linked() {
-		c, p := g.certs[child], g.certs[parent]
-		if verifiableKey(p.PublicKey) {
-			if !g.verifiable() {
-				// Not memoised: a cancelled pair is the ABSENCE of an answer, and
-				// recording false would make any later read of this pair a silent
-				// negative rather than a missing one.
-				return false
-			}
-			g.proofChecks++
-			got = p.CheckSignature(c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) == nil
+	c, p := g.certs[child], g.certs[parent]
+	if verifiableKey(p.PublicKey) {
+		if !g.verifiable() {
+			// Not memoised: a cancelled pair is the ABSENCE of an answer, and
+			// recording false would make any later read of this pair a silent
+			// negative rather than a missing one.
+			return false
 		}
+		g.proofChecks++
+		got = p.CheckSignature(c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) == nil
 	}
 	g.proof[key] = got
 	return got
@@ -1621,10 +1631,16 @@ func (g *certGraph) noMatchError(usableKeys, firstUnverifiable int, keyIssues ke
 // drop the clause: the observation that otherwise reports those blocks
 // (ObsUnrelatedBlocksSkipped) is only reachable when the analysis SUCCEEDS.
 func appendCertIssues(msg string, certIssues skippedBlocks) string {
+	return msg + certIssuesSuffix(certIssues)
+}
+
+// certIssuesSuffix is the clause itself, shared with the pre-analysis key-parse
+// refusal in prepareAnalysisInput so both wordings stay identical.
+func certIssuesSuffix(certIssues skippedBlocks) string {
 	if certIssues.count == 0 {
-		return msg
+		return ""
 	}
-	return msg + fmt.Sprintf("; the certificate file also holds %d block(s) that are neither a certificate nor a private key and were left out of the bundle (first %q)",
+	return fmt.Sprintf("; the certificate file also holds %d block(s) that are neither a certificate nor a private key and were left out of the bundle (first %q)",
 		certIssues.count, certIssues.firstTypeForLog())
 }
 

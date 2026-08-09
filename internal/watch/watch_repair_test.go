@@ -23,11 +23,10 @@ import (
 // to mean the reconciliation floor at the earliest, or never before this change.
 //
 // The oracle is a registration removed straight on the watcher between two
-// debounced scans, the same kernel-silent state the floor test uses. The floor is
-// aged to almost-expired so the deferred repair comes due in milliseconds instead
-// of a minute; the deferral itself is what is under test, not the length of the
-// wait. The loop is handed the positioned state (runWatchLoop) so the assertion
-// covers the select arm, not just the timer.
+// debounced scans. The second scan is placed inside the floor without a timing
+// window, then the already-armed repair timer is moved to its deadline. That keeps
+// this test focused on the loop's select arm; TestScheduleRepair_arms_for_the_
+// remainder_of_the_floor owns the timer arithmetic.
 func TestWatchLoop_runs_the_repair_the_reassert_floor_deferred(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)
@@ -55,12 +54,9 @@ func TestWatchLoop_runs_the_repair_the_reassert_floor_deferred(t *testing.T) {
 	if err := watcher.Remove(dir); err != nil {
 		t.Fatalf("setup: watcher.Remove(%q) = %v, want nil", dir, err)
 	}
-	// Age the floor to almost-expired: the next scan is still INSIDE it (so the
-	// re-assert must be skipped), and the repair it defers comes due promptly. The
-	// remaining half second is deliberately generous — only a few statements run
-	// before the scan below, so no scheduling delay can carry us past the floor and
-	// turn the precondition into a spurious failure.
-	st.lastResync = time.Now().Add(-minPreScanResync + 500*time.Millisecond)
+	// Put the second scan unambiguously inside the floor. No scheduler delay can
+	// turn this setup into the past-floor branch before the assertion runs.
+	st.lastResync = time.Now()
 
 	st.runDebouncedScan(t.Context(), watcher)
 
@@ -69,18 +65,29 @@ func TestWatchLoop_runs_the_repair_the_reassert_floor_deferred(t *testing.T) {
 			minPreScanResync, watched, dir)
 	}
 
+	if !st.repairPending {
+		t.Fatal("the scan inside the floor left no repair pending")
+	}
+	// Timer arithmetic is covered separately. Move this positioned state directly
+	// to the deadline so this integration test never sleeps for the floor.
+	st.lastResync = time.Now().Add(-minPreScanResync)
+	st.repairTimer.Reset(0)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- w.runWatchLoop(ctx, watcher, st) }()
 
-	deadline := time.Now().Add(10 * time.Second)
+	probe := time.NewTicker(time.Millisecond)
+	defer probe.Stop()
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
 	for !slices.Contains(watcher.WatchList(), dir) {
-		if time.Now().After(deadline) {
+		select {
+		case <-probe.C:
+		case <-timeout.C:
 			cancel()
-			t.Fatalf("the watch on %q was never re-asserted (watch list = %v): the re-assert the floor skipped was DROPPED rather than deferred, so a registration the kernel discarded without an event stays outside the watch set",
-				dir, watcher.WatchList())
+			t.Fatalf("the watch on %q was never re-asserted (watch list = %v): the re-assert the floor skipped was dropped rather than deferred", dir, watcher.WatchList())
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 
 	cancel()

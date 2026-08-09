@@ -112,7 +112,9 @@ type Watcher struct {
 	onChange func(ctx context.Context)
 
 	// watched mirrors the fsnotify registration set, so membership is a map
-	// lookup rather than a scan of fsnotify's own list (see watchSetHas). It is
+	// lookup rather than a scan of fsnotify's own list (see watchSetHas). It is a
+	// membership CACHE and nothing else: no ceiling is read from it, because the
+	// kernel owns the inotify quota (see addWatchDirs). It is
 	// mutated only from the goroutine running Run, but a test may drive the
 	// event helpers directly while a loop runs, so watchedMu (below) keeps that
 	// honest.
@@ -182,9 +184,11 @@ const watchBudgetRemediation = "check that /input is mounted at the certificate 
 // a process that has gone a whole floor without scanning reaches it.
 //
 // Why it exists. fsnotify events are a LATENCY optimisation here, not the liveness
-// mechanism: registrations are deliberately BOUNDED (addWatchDirs caps both the walk
-// and the live set, because the inotify quota is shared per UID), the kernel discards
-// watches without emitting an event at all (IN_UNMOUNT/IN_IGNORED), and a descriptor
+// mechanism: one walk's enumeration is deliberately BOUNDED (addWatchDirs caps how many
+// paths a walk visits, because the tree it enumerates is one this app does not own), so
+// a tree larger than that budget is watched only in part; the kernel refuses a
+// registration outright once the per-UID inotify quota is spent; the kernel discards
+// watches without emitting an event at all (IN_UNMOUNT/IN_IGNORED); and a descriptor
 // the kernel refused is only recovered by a re-assert. An app that notices change
 // ONLY through events therefore has states in which it converts nothing indefinitely.
 // This floor is what makes eventual convergence a property of the app rather than of
@@ -615,17 +619,18 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 // escaped through a swapped ancestor still carries an in-root name, so this
 // residual (watch descriptors, never content) stands as described above.
 //
-// The entry ceiling is TWO bounds, not one. Every walk is capped at maxEntries
-// entries, which bounds one traversal's cost; and the LIVE registration set is capped
-// at the same number across calls, which is the host-resource bound the per-walk cap
-// alone does not give. addWatchDirs runs again for every directory Create/Chmod
-// (handlePathEvent), so a writer creating directories one at a time under an
-// already-watched parent hands each call a fresh per-walk budget it never exhausts,
-// and the registration set would grow until the per-UID
-// fs.inotify.max_user_instances/max_user_watches quota is spent — taking unrelated
-// same-UID consumers down with it. Re-registering a path already in the set is
-// idempotent in the kernel and costs no new slot, so a rebuild is never refused by
-// its own existing registrations.
+// The entry ceiling is ONE bound: every walk is capped at maxEntries entries, which
+// bounds one traversal's cost over a tree this app does not own. It is not a bound on
+// the LIVE registration set, and this package deliberately does not impose one — the
+// kernel owns fs.inotify.max_user_watches, it is the only party that knows the real
+// state of that resource, and it already refuses the registration when the per-UID
+// quota is spent. handleWatchAddError is what that refusal reaches: WARN naming the
+// directory and skip it below the root (the fallback rescan covers renewals
+// underneath), propagate at the root so Run degrades to polling. An app-side ceiling
+// calibrated to MAX_SCAN_ENTRIES instead refused two orders of magnitude below a
+// modern host's quota. Re-registering a path already in the set is idempotent in the
+// kernel and costs no new slot, so a rebuild is never refused by its own existing
+// registrations.
 //
 // The traversal is cancellable: it checks ctx before each entry and returns
 // ctx.Err() as soon as the process is shutting down, so a shutdown arriving
@@ -643,19 +648,19 @@ func (w *Watcher) addWatchDirs(ctx context.Context, watcher *fsnotify.Watcher, r
 	})
 }
 
-// newWatchSetBudget resolves one walk's share of the two entry ceilings, falling back
-// to scanbudget.Default when no ceiling was configured: an unbounded walk is not an
+// newWatchSetBudget resolves one walk's entry ceiling, falling back to
+// scanbudget.Default when no ceiling was configured: an unbounded walk is not an
 // option, because the tree it enumerates is one this app does not own.
 func (w *Watcher) newWatchSetBudget(root string) *watchSetBudget {
 	budget := &watchSetBudget{max: scanbudget.Effective(w.maxEntries), root: root}
 	return budget
 }
 
-// watchSetBudget is one walk's share of the two entry ceilings addWatchDirs applies:
-// how many paths this traversal may visit, and — read through the Watcher's own
-// registration mirror — how large the live watch set may grow. Both ceilings stop the
-// walk when they refuse a path, so the WARN each emits is once-per-walk by
-// construction and needs no state here to make it so.
+// watchSetBudget is one walk's entry ceiling: how many paths this traversal may visit,
+// and the root it is walking (which the ceiling's WARN names). Reaching the ceiling
+// stops the walk, so that WARN is once-per-walk by construction and needs no state here
+// to make it so. It carries no bound on the live registration set: the kernel owns the
+// inotify quota (see addWatchDirs).
 type watchSetBudget struct {
 	root    string
 	max     int
@@ -668,10 +673,10 @@ func (b *watchSetBudget) spendEntry() bool {
 	return b.visited <= b.max
 }
 
-// warnWatchBudget emits the budget WARN. Every call site returns fs.SkipAll in the
-// same frame, which stops its walk (or, in reassertWatches, the re-assert phase), so
-// one budget produces exactly one record — the remainder is unbounded and the
-// operator action is the same for all of it.
+// warnWatchBudget emits the entry-ceiling WARN. Both call sites — the registering walk
+// and the rebuild's preflight enumeration — return fs.SkipAll in the same frame, which
+// stops that walk, so one budget produces exactly one record: the remainder is
+// unbounded and the operator action is the same for all of it.
 func (w *Watcher) warnWatchBudget(budget *watchSetBudget) {
 	slog.Warn(watchBudgetMsg, w.coverageAttrs(
 		"root", budget.root, "max_entries", budget.max,
@@ -683,10 +688,6 @@ func (w *Watcher) warnWatchBudget(budget *watchSetBudget) {
 // warn-and-skip below it), and registers a watch for every directory. Only
 // directories are registered; a regular file is watched through its parent
 // directory.
-//
-// A NEW registration is refused once the live watch set is at the budget (see
-// addWatchDirs): that is the bound the per-walk count cannot express, because each
-// event-driven call starts a fresh count.
 func (w *Watcher) visitWatchPath(
 	ctx context.Context, watcher *fsnotify.Watcher, budget *watchSetBudget, path string, d fs.DirEntry, walkErr error,
 ) error {
@@ -694,7 +695,7 @@ func (w *Watcher) visitWatchPath(
 	if err != nil || !register {
 		return err
 	}
-	return w.attachWatch(watcher, budget, path)
+	return w.attachWatch(watcher, budget.root, path)
 }
 
 // classifyWatchEntry applies the per-entry policy BOTH watch-set walks share — the
@@ -724,17 +725,14 @@ func (w *Watcher) classifyWatchEntry(
 	return true, nil
 }
 
-// attachWatch registers one directory and records it in the mirror, refusing a NEW
-// registration once the live watch set is at the budget. Re-adding a path already in
-// the mirror is idempotent in the kernel and consumes no further slot, so a rebuild
-// never refuses itself.
-func (w *Watcher) attachWatch(watcher *fsnotify.Watcher, budget *watchSetBudget, path string) error {
-	if !w.watchSetHas(path) && w.watchSetSize() >= budget.max {
-		w.warnWatchBudget(budget)
-		return fs.SkipAll
-	}
+// attachWatch registers one directory and records it in the membership mirror. It
+// imposes no ceiling of its own: the kernel owns fs.inotify.max_user_watches and
+// refuses the Add when the per-UID quota is spent, which handleWatchAddError reports
+// (see addWatchDirs). Re-adding a path already in the mirror is idempotent in the
+// kernel and consumes no further slot, so a rebuild never refuses itself.
+func (w *Watcher) attachWatch(watcher *fsnotify.Watcher, root, path string) error {
 	if addErr := watcher.Add(path); addErr != nil {
-		return w.handleWatchAddError(budget.root, path, addErr)
+		return w.handleWatchAddError(root, path, addErr)
 	}
 	w.recordWatch(path)
 	return nil
@@ -763,14 +761,26 @@ func validateWatchRootEntry(root, path string, d fs.DirEntry) error {
 
 // handleWatchAddError applies addWatchDirs' walk-error policy to a failed watch
 // REGISTRATION: fatal at the root, warn-and-skip below it.
+//
+// This is the ONLY place inotify quota exhaustion is reported — the app imposes no
+// registration ceiling of its own — so the WARN names raising
+// fs.inotify.max_user_watches beside the other reason a directory's watch is refused
+// (this UID cannot read it). Below the root it stays health-neutral: neither condition
+// is clearable by a restart, and the fallback rescan still covers renewals underneath.
 func (w *Watcher) handleWatchAddError(root, path string, addErr error) error {
 	if path == root {
 		return addErr
 	}
 	slog.Warn("skipping unwatchable directory; renewals under it require a full rescan",
-		w.coverageAttrs("path", path, "error", addErr)...)
+		w.coverageAttrs("path", path, "error", addErr,
+			"remediation", watchAddRemediation)...)
 	return nil
 }
+
+// watchAddRemediation names the two operator actions a refused registration can call
+// for: the directory may be unreadable to this UID, or the per-UID inotify watch quota
+// may be exhausted (ENOSPC from inotify_add_watch), which only the host can raise.
+const watchAddRemediation = "check that this directory is readable by the UID the container runs as, or raise the host's fs.inotify.max_user_watches if the per-UID inotify watch quota is exhausted"
 
 // watchSetHas reports whether path is already registered with the watcher. It
 // guards the one piece of unbounded per-event work in this loop: the directory
@@ -797,9 +807,10 @@ func (w *Watcher) watchSetHas(path string) bool {
 	return ok
 }
 
-// watchSetSize reports how many registrations the mirror holds, which is the live
-// watch set addWatchDirs bounds across calls. Read under the same lock as
-// watchSetHas, because a Remove/Rename handler can forget a path concurrently.
+// watchSetSize reports how many registrations the mirror holds. It is a diagnostic
+// count of the membership cache, not a ceiling anything is read against — the kernel
+// owns the inotify quota (see addWatchDirs). Read under the same lock as watchSetHas,
+// because a Remove/Rename handler can forget a path concurrently.
 func (w *Watcher) watchSetSize() int {
 	w.watchedMu.Lock()
 	defer w.watchedMu.Unlock()
@@ -853,16 +864,18 @@ func (w *Watcher) watchSetSnapshot() []string {
 }
 
 // pruneWatches unregisters every live registration a rebuild's preflight no longer
-// wants, which is what makes the mirror an honest count of the LIVE registration set
+// wants, which is what keeps the mirror an honest picture of the LIVE registration set
 // rather than only of the last walk.
 //
-// The kernel keeps a registration until it is removed or its directory disappears,
-// and this is the only place that removes one, so without it the live set grows past
-// the ceiling addWatchDirs documents: a walk the entry budget cut short registers a
+// The kernel keeps a registration until it is removed or its directory disappears, and
+// this is the only place that removes one, so without it the app holds descriptors for
+// directories the tree no longer wants: a walk the entry budget cut short registers a
 // different prefix each time the tree changes, and the registrations the new walk no
-// longer reaches stay live while watchSetSize stops counting them. That ceiling is a
-// share of the per-UID fs.inotify.max_user_watches quota, so overrunning it is paid
-// by unrelated same-UID consumers.
+// longer reaches stay live while the mirror stops claiming them. Releasing them keeps
+// this app's share of the per-UID fs.inotify.max_user_watches quota to what it is
+// actually watching, which is the only quota discipline it owes — the kernel refuses an
+// Add once the quota is spent (handleWatchAddError), and this app imposes no ceiling of
+// its own.
 //
 // It runs BEFORE the rebuild re-asserts anything (resyncWatchSet), which is what makes
 // a replacement directory reachable when the quota is already spent: the stale
@@ -873,8 +886,10 @@ func (w *Watcher) watchSetSnapshot() []string {
 // successful Remove, or ErrNonExistentWatch, which means fsnotify already dropped it
 // with its directory (reported at Debug: expected, not a degradation). Any other Remove
 // error leaves an uncertain descriptor live, so the path stays charged to the mirror and
-// the ceiling, and the operator is told: every failure direction here must OVER-count
-// the kernel's set, never under-count it.
+// the operator is told which one is stuck. Keeping it charged is the cheap direction: a
+// mirror that claims a path the kernel no longer holds costs at most one redundant
+// idempotent Add on the next re-assert (which re-adds every desired path regardless of
+// the mirror), never a lost slot, because no ceiling is read from this count.
 func (w *Watcher) pruneWatches(watcher *fsnotify.Watcher, desired map[string]struct{}) {
 	for _, path := range w.watchSetSnapshot() {
 		if _, wanted := desired[path]; wanted {
@@ -902,7 +917,12 @@ func (w *Watcher) handleFsEvent(ctx context.Context, watcher *fsnotify.Watcher, 
 	slog.Debug("fs event", "op", event.Op.String(), "path", event.Name)
 	switch {
 	case event.Has(fsnotify.Create):
-		return w.handleCreate(ctx, watcher, event)
+		// A newly created directory joins the watch set (and triggers a rescan,
+		// because it may already hold a pair created before the watch attached); a
+		// newly created file is classified by name.
+		return w.handlePathEvent(ctx, watcher, event,
+			"cannot classify a created path; rescanning because it may be a directory, but if it is one it stays unwatched until the next re-assert of the watch set",
+			"failed to watch new directory subtree; renewals under it are covered only by the periodic rescan")
 	case event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename):
 		// event.Name is already gone on Remove/Rename (inotify reports the old
 		// name), so there is nothing to add to the watch set: fsnotify drops the
@@ -913,7 +933,24 @@ func (w *Watcher) handleFsEvent(ctx context.Context, watcher *fsnotify.Watcher, 
 	case event.Has(fsnotify.Write):
 		return layout.IsRelevant(event.Name)
 	case event.Has(fsnotify.Chmod):
-		return w.handleChmod(ctx, watcher, event)
+		// The recovery path for a permission repair on a cert, on a key, or on a
+		// directory the watch set had to skip -- the app's most likely operator
+		// error. A pair the scan could not read fails conversion and clears the
+		// health marker; the operator fixes it with chmod, and without this arm that
+		// chmod schedules nothing, so the container stays unhealthy and the .pfx
+		// stays stale until the next periodic tick (six hours on the documented
+		// cadence, a day on the reconciliation floor when the routine rescan is off).
+		// On a DIRECTORY it is the same recovery one step up: a sub-directory this
+		// UID could not read (README: "Fix the directory permissions") has just
+		// become readable, so its subtree is re-attached and a rescan runs now --
+		// and that outcome is health-neutral (ScanResult.Unreadable), so nothing
+		// else would signal the operator that the repair has not taken effect yet.
+		// A chmod storm is absorbed by the debounce like a write storm, and the
+		// re-attach walk is bounded separately: handlePathEvent skips it for a
+		// directory already in the watch set.
+		return w.handlePathEvent(ctx, watcher, event,
+			"cannot classify a path whose permissions changed; rescanning because it may be an unwatched directory",
+			"failed to watch a directory whose permissions changed; renewals under it are covered only by the periodic rescan")
 	}
 	return false
 }
@@ -975,47 +1012,6 @@ func (w *Watcher) handlePathEvent(
 			w.coverageAttrs("path", event.Name, "error", addErr)...)
 	}
 	return true
-}
-
-// handleCreate is handleFsEvent's Create arm: a newly created directory joins the
-// watch set (and triggers a rescan, because it may already hold a pair created
-// before the watch attached), and a newly created file is classified by name.
-func (w *Watcher) handleCreate(ctx context.Context, watcher *fsnotify.Watcher, event fsnotify.Event) bool {
-	return w.handlePathEvent(ctx, watcher, event,
-		"cannot classify a created path; rescanning because it may be a directory, but if it is one it stays unwatched until the next re-assert of the watch set",
-		"failed to watch new directory subtree; renewals under it are covered only by the periodic rescan")
-}
-
-// handleChmod is handleFsEvent's Chmod arm: the recovery path for a permission
-// repair on a cert, on a key, or on a directory the watch set had to skip.
-//
-// A chmod on a DIRECTORY is that same recovery one step up: an /input
-// sub-directory the watch set had to skip because this UID could not read it
-// (README: "Fix the directory permissions") has just become readable, so its
-// subtree is re-attached and a rescan runs now instead of at the next periodic
-// tick. Unlike the file case this outcome is
-// health-neutral (ScanResult.Unreadable), so nothing else signals the operator
-// that the repair has not taken effect yet.
-//
-// A chmod on a cert or key IS conversion-relevant, and this arm is the recovery
-// path for the app's most likely operator error: a pair the scan could not read
-// fails conversion and clears the health marker; the operator fixes it with
-// chmod; without this arm that chmod schedules nothing, so the container stays
-// unhealthy and the .pfx stays stale until the next periodic tick -- six hours on
-// the documented cadence, and a day on the reconciliation floor when the routine
-// rescan is switched off.
-//
-// Scoped to the naming contract, so a chmod on an unrelated file still schedules
-// nothing. A chmod storm is absorbed by the debounce, exactly as a write storm
-// is, and /input is a certificate directory rather than a busy tree. The debounce
-// coalesces SCANS only, so the directory arm's re-attach walk is bounded
-// separately: handlePathEvent skips it for a directory already in the watch set
-// (watchSetHas), leaving the walk for the skipped-directory recovery this arm is
-// here for.
-func (w *Watcher) handleChmod(ctx context.Context, watcher *fsnotify.Watcher, event fsnotify.Event) bool {
-	return w.handlePathEvent(ctx, watcher, event,
-		"cannot classify a path whose permissions changed; rescanning because it may be an unwatched directory",
-		"failed to watch a directory whose permissions changed; renewals under it are covered only by the periodic rescan")
 }
 
 // --- Watch loop, its receive arms, and its timer state ---
@@ -1235,17 +1231,16 @@ func (w *Watcher) handleSafetyNetTick(ctx context.Context, watcher *fsnotify.Wat
 // degradation -- so neither can be changed for one re-sync site and silently left
 // wrong at the others. warning names what stays uncovered until the next re-sync.
 func (w *Watcher) resyncWatchSet(ctx context.Context, watcher *fsnotify.Watcher, warning string) {
-	// A TRANSACTION, in three phases, and the ordering is the whole point: the mirror is
-	// the only count the LIVE-set ceiling is read from, so it may never be emptied while
-	// the kernel still holds the registrations it described. Clearing it first (what this
-	// did before) let the walk admit a whole further budget of registrations on top of a
-	// live set that was still there, and a walk that then failed at the root left those
-	// descriptors live and permanently absent from the count — so the next rebuild could
-	// admit another full budget, and watchSetSize kept reporting at most the cap.
+	// A TRANSACTION, in three phases, and the ordering is the whole point: the mirror
+	// describes the registrations the kernel is holding, so it may never be emptied while
+	// the kernel still holds them. Clearing it first (what this did before) left the
+	// descriptors of a walk that then failed at the root live and permanently absent from
+	// the mirror, so nothing would ever unregister them and the per-event fast path would
+	// treat their paths as unwatched.
 	//
 	// 1. PREFLIGHT: enumerate what the tree wants, touching neither the watcher nor the
 	//    mirror, so any failure — including cancellation — leaves both exactly as they
-	//    were and the next re-sync starts from an honest count.
+	//    were and the next re-sync starts from an honest mirror.
 	desired, walkErr := w.desiredWatchDirs(ctx, w.root)
 	if walkErr != nil {
 		if ctx.Err() == nil {
@@ -1253,16 +1248,14 @@ func (w *Watcher) resyncWatchSet(ctx context.Context, watcher *fsnotify.Watcher,
 		}
 		return
 	}
-	// 2. REMOVE, before adding anything: unregister what the preflight no longer wants,
-	//    so the mirror the ceiling is read from counts the kernel's registrations rather
-	//    than only the last walk's — and so a replacement directory can take the slot a
-	//    stale registration was holding when the per-UID quota is already spent. A
-	//    removal the kernel refused stays charged (pruneWatches), which keeps every
-	//    failure direction here over-counting rather than under-counting.
+	// 2. REMOVE, before adding anything: unregister what the preflight no longer wants, so
+	//    this app holds descriptors only for what it is actually watching — and so a
+	//    replacement directory can take the slot a stale registration was holding when the
+	//    per-UID inotify quota is already spent. A removal the kernel refused stays charged
+	//    (pruneWatches), which costs at most a redundant idempotent Add below.
 	w.pruneWatches(watcher, desired)
 	// 3. RE-ASSERT the preflight's set. Add is idempotent, so this restores exactly what
-	//    was lost; a path the budget refuses is reported once and waits for the next
-	//    re-sync.
+	//    was lost, and it re-adds every desired path regardless of what the mirror claims.
 	if addErr := w.reassertWatches(ctx, watcher, desired); addErr != nil {
 		if ctx.Err() == nil {
 			slog.Warn(warning, w.coverageAttrs("root", w.root, "error", addErr)...)
@@ -1303,32 +1296,24 @@ func (w *Watcher) desiredWatchDirs(ctx context.Context, root string) (map[string
 	return desired, nil
 }
 
-// reassertWatches registers every path the preflight wants, applying the same live-set
-// admission rule the event-driven walk applies (attachWatch): a path already in the
-// mirror re-adds idempotently and costs no slot, and a NEW one is refused once the live
-// set is at the budget. It re-asserts from the preflight's set rather than walking the
-// tree a second time, so one re-sync enumerates the root once. Each phase's budget
-// warns at most once, but one re-sync can emit two budget WARNs: the preflight's
-// per-walk exhaustion plus the live-set refusal here, reachable together when a
-// kernel-refused Remove left the mirror charged (pruneWatches' stays-charged
-// direction) while the tree also outgrew the walk budget.
+// reassertWatches registers every path the preflight wants. It re-asserts from the
+// preflight's set rather than walking the tree a second time, so one re-sync enumerates
+// the root once, and it Adds every desired path regardless of what the mirror claims:
+// Add is idempotent in the kernel, so a path already registered costs no slot, and a
+// path the mirror wrongly claims is still watched is repaired here rather than waiting
+// for another re-sync. There is no admission ceiling to reach — the kernel refuses an
+// Add once the per-UID inotify quota is spent, and handleWatchAddError reports that,
+// WARNing and skipping below the root so one refused directory cannot abandon the rest
+// of the rebuild (including the root's own watch).
 //
 // Cancellable like the walk it replaces, and checked AFTER each registration rather than
 // before: the enumeration — the expensive half, and the one that can block on a stranger's
 // tree — is the preflight's, so what remains here is a bounded run of one syscall per
 // already-known directory, and stopping it before it has re-established anything would
 // abandon a registration this rebuild had already removed the stale twin of.
-//
-// A refusal is not an error: fs.SkipAll is the walk's "stop here", so it stops this
-// phase the same way and leaves the rest to the next re-sync, exactly as the
-// budget-truncated walk does.
 func (w *Watcher) reassertWatches(ctx context.Context, watcher *fsnotify.Watcher, desired map[string]struct{}) error {
-	budget := w.newWatchSetBudget(w.root)
 	for path := range desired {
-		if err := w.attachWatch(watcher, budget, path); err != nil {
-			if errors.Is(err, fs.SkipAll) {
-				return nil
-			}
+		if err := w.attachWatch(watcher, w.root, path); err != nil {
 			return err
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {

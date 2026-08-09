@@ -157,13 +157,13 @@ func TestStoreOrphanReportRemediation_advice_matches_the_mode(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := orphanReportRemediation(tc.mode, tc.walkSafe, tc.refusalOnly)
+			got := resolveReap(tc.mode, false, tc.walkSafe, tc.refusalOnly).remediation
 			if !strings.Contains(got, tc.wantHas) {
-				t.Errorf("orphanReportRemediation(%v, %v) = %q, want it to contain %q",
+				t.Errorf("resolveReap(%v, %v).remediation = %q, want it to contain %q",
 					tc.mode, tc.walkSafe, got, tc.wantHas)
 			}
 			if tc.wantLacks != "" && strings.Contains(got, tc.wantLacks) {
-				t.Errorf("orphanReportRemediation(%v, %v) = %q, want it NOT to advise %q",
+				t.Errorf("resolveReap(%v, %v).remediation = %q, want it NOT to advise %q",
 					tc.mode, tc.walkSafe, got, tc.wantLacks)
 			}
 		})

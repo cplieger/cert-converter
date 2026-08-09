@@ -398,18 +398,18 @@ func TestResyncWatchSet_prunes_a_directory_the_tree_no_longer_has(t *testing.T) 
 }
 
 // TestResyncWatchSet_unregisters_a_directory_the_rebuild_no_longer_reaches pins the
-// KERNEL side of the rebuild, which the mirror-side test above cannot see: the
-// membership mirror is the only thing the LIVE-set ceiling is read from
-// (visitWatchPath's watchSetSize test), so a rebuild that resets the mirror without
-// unregistering what it no longer re-establishes leaves the app holding more inotify
-// registrations than MAX_SCAN_ENTRIES while reporting fewer -- and that ceiling is a
-// share of the per-UID fs.inotify.max_user_watches quota, so overrunning it is paid by
-// unrelated same-UID consumers.
+// KERNEL side of the rebuild, which the mirror-side test above cannot see: a rebuild
+// that drops a path from the mirror without unregistering it leaves this app holding an
+// inotify descriptor for a directory it is no longer watching, so its share of the
+// per-UID fs.inotify.max_user_watches quota grows with tree churn while nothing it
+// watches grows -- and that quota is shared, so the waste is paid by unrelated
+// same-UID consumers. The app imposes no ceiling of its own; releasing what it no
+// longer wants is the whole of the quota discipline it owes.
 //
-// The driver is a tree larger than the budget, which is the reachable producer: the
-// first walk registers the lexically-first directories, a new early-sorting domain
-// then pushes the tail out of the next walk, and the tail still EXISTS on disk, so
-// only an explicit Remove can reclaim its descriptor.
+// The driver is a tree larger than the WALK's entry budget, which is the reachable
+// producer: the first walk registers the lexically-first directories, a new
+// early-sorting domain then pushes the tail out of the next walk, and the tail still
+// EXISTS on disk, so only an explicit Remove can reclaim its descriptor.
 // Not parallel: the walk's budget WARN goes to the process-global slog default.
 func TestResyncWatchSet_unregisters_a_directory_the_rebuild_no_longer_reaches(t *testing.T) {
 	watcher := newTestWatcher(t)
@@ -438,24 +438,22 @@ func TestResyncWatchSet_unregisters_a_directory_the_rebuild_no_longer_reaches(t 
 		t.Errorf("watch list = %v, want %q registered by the rebuild", watcher.WatchList(), early)
 	}
 	if watched := watcher.WatchList(); slices.Contains(watched, tail) {
-		t.Errorf("watch list = %v, want %q unregistered: the rebuild no longer reaches it, so leaving the kernel registration live puts the LIVE set above the ceiling watchSetSize reports",
+		t.Errorf("watch list = %v, want %q unregistered: the rebuild no longer reaches it, so leaving the kernel registration live spends a slot of the per-UID inotify quota on a directory this app is not watching",
 			watched, tail)
 	}
 	if got, want := len(watcher.WatchList()), 2; got != want {
-		t.Errorf("the live registration set holds %d watches, want %d (the budget): %v", got, want, watcher.WatchList())
+		t.Errorf("the live registration set holds %d watches, want %d (what the walk's entry budget enumerated): %v", got, want, watcher.WatchList())
 	}
 }
 
 // TestResyncWatchSet_keeps_the_mirror_charged_when_the_rebuild_is_abandoned pins the
 // three-phase rebuild's central invariant, and the one every success-path test above is
-// blind to: the membership mirror is the ONLY count the live-set ceiling is read from
-// (visitWatchPath's watchSetSize test), so a rebuild the PREFLIGHT abandons must leave it
-// charged with the registrations the kernel is still holding. Emptying it first — what the
-// clear-then-prune rebuild did — loses those descriptors from the count permanently, and
-// the next rebuild then admits another whole budget on top of a live set that is still
-// there, while watchSetSize keeps reporting at most the cap. That ceiling is a share of
-// the per-UID fs.inotify.max_user_watches quota, so the overrun is paid by unrelated
-// same-UID consumers.
+// blind to: a rebuild the PREFLIGHT abandons must leave the membership mirror describing
+// the registrations the kernel is still holding. Emptying it first -- what the
+// clear-then-prune rebuild did -- loses those descriptors from the mirror permanently,
+// so nothing ever unregisters them (pruneWatches sweeps the mirror, not the kernel's
+// list) and this app keeps spending slots of the shared per-UID
+// fs.inotify.max_user_watches quota on directories it no longer watches.
 //
 // Every other resyncWatchSet test in this file passes identically on the clear-then-prune
 // rebuild, because all of them drive the SUCCESS path, which emptied the mirror and then
@@ -488,20 +486,22 @@ func TestResyncWatchSet_keeps_the_mirror_charged_when_the_rebuild_is_abandoned(t
 
 	if got := w.watchSetSize(); got != charged {
 		t.Errorf("after an abandoned rebuild the mirror holds %d registrations, want the %d it was charged:"+
-			" every failure direction must OVER-count the kernel's set, or the next rebuild admits a second"+
-			" full budget over registrations this one forgot", got, charged)
+			" a registration the kernel still holds must stay in the mirror, or nothing ever unregisters it"+
+			" and this app keeps a slot of the shared inotify quota it does not use", got, charged)
 	}
 }
 
-// TestPruneWatches_keeps_a_refused_removal_charged_to_the_mirror pins the
-// stays-charged failure direction of the rebuild's REMOVE phase, the invariant
-// resyncWatchSet's transaction is built on: a stale registration whose kernel
-// removal FAILS (inotify_rm_watch can return EINVAL/EBADF) must stay in the
-// membership mirror, because the mirror is the only count the live-set ceiling
-// reads and every failure direction must OVER-count the kernel's set. Forgetting
-// a path the kernel still holds lets the next rebuild admit a whole further
-// budget of registrations over descriptors the count no longer sees, and the
-// per-UID inotify quota overrun is paid by unrelated same-UID consumers.
+// TestPruneWatches_keeps_a_refused_removal_charged_to_the_mirror pins the failure
+// direction of the rebuild's REMOVE phase: a stale registration whose kernel removal
+// FAILS (inotify_rm_watch can return EINVAL/EBADF) must stay in the membership mirror,
+// because the kernel may still be holding that descriptor and the mirror is this app's
+// only record of it -- dropped from the mirror, no later prune would ever retry the
+// removal. The cost of keeping it is bounded and deliberately the cheap direction: no
+// ceiling is read from this count, and the next re-assert re-Adds every desired path
+// idempotently regardless of what the mirror claims, so a stale entry costs at most one
+// redundant Add. A removal the kernel CONFIRMED (success, or ErrNonExistentWatch) must
+// be forgotten, or the per-event membership guard would keep skipping the re-attach of a
+// path that is no longer watched.
 // The refusal must also be WARNed once with the path, so the operator can see
 // which registration is stuck.
 // Not parallel: it swaps the process-global slog default and the removeWatch seam.
@@ -535,7 +535,7 @@ func TestPruneWatches_keeps_a_refused_removal_charged_to_the_mirror(t *testing.T
 	w.pruneWatches(watcher, map[string]struct{}{root: {}})
 
 	if !w.watchSetHas(stuck) {
-		t.Errorf("the mirror forgot %q after the kernel refused its removal; the live-set ceiling now under-counts the kernel's registrations, so the next rebuild can overrun the per-UID inotify quota", stuck)
+		t.Errorf("the mirror forgot %q after the kernel refused its removal; the mirror is the only record of that descriptor, so no later prune would retry the removal and the slot stays spent for the life of the process", stuck)
 	}
 	if w.watchSetHas(stale) {
 		t.Errorf("the mirror still holds %q, whose removal the kernel confirmed; a confirmed removal must be forgotten", stale)

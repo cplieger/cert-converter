@@ -40,7 +40,7 @@ type reapContext struct {
 	// logInputCoverageWarnings cannot drift apart.
 	result ScanResult
 	// evidenceEvicted counts pairs whose "this pair was once read whole" evidence the
-	// observation log's ceiling dropped during this scan (observationLog.reserve). It
+	// observation log's ceiling dropped during this scan (observationLog.reserveWhole). It
 	// is a veto because that evidence is what noteMissingKey uses to classify a
 	// missing sibling key: without it a key being replaced right now is recorded as an
 	// ordinary orphan, which does NOT block reaping, so this scan would delete other
@@ -356,11 +356,22 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 	// remain are i and everything after it.
 	for i, rel := range orphaned {
 		cert := layout.CertForOutput(rel)
-		absent := rp.src.pathAbsent(cert)
+		absent, absentErr := rp.src.pathAbsent(cert)
 		if err := ctx.Err(); err != nil {
 			slog.Debug("orphan removal interrupted by shutdown during the confirming re-check",
 				"removed", deleted, "remaining", len(orphaned)-i, "error", err)
 			return deleted, err
+		}
+		if absentErr != nil {
+			// The re-check could not be made, so this candidate is kept — and the
+			// retention is named for what it is. The INFO below must NOT be reached
+			// here: reporting an uninspectable /input as "the certificate came back"
+			// tells the operator the producer is working when the mount is not, and at
+			// LOG_LEVEL=warn it reports nothing at all while the stale bundle stays.
+			slog.Warn(recheckUnreadableMsg,
+				"path", rel, "input", cert, "error", absentErr,
+				"remediation", recheckUnreadableRemediation)
+			continue
 		}
 		if !absent {
 			// Named at the default level: this is the deletion this app decided NOT to
@@ -404,7 +415,7 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 // does not repeat on every fsnotify event and fallback tick.
 //
 // An OUTPUT walk that could not enumerate the tree is skipped for the same reason
-// orphanReportRemediation withholds its delete advice on it: that candidate list can
+// resolveReap withholds its delete advice on it: that candidate list can
 // hold live bundles, so naming one of them as a half-deleted pair would be a wrong
 // diagnosis. On a trustworthy list the input enumeration was proven complete, so every
 // candidate's certificate really is gone and the only open question is the key.
@@ -445,9 +456,24 @@ func (rp *reaper) reportRetainedLoneKeys(orphaned []string, walkSafe bool) {
 // that the operator removed the key. It never counts SILENTLY: the retention is reported
 // below, which is what turns a stray directory at a key path from an invisible
 // never-reaped bundle into a named condition.
+//
+// A key path the Lstat could not classify AT ALL — an unmounted or unreadable /input —
+// vetoes the deletion on the same fail-closed reading, but is reported by its OWN record
+// (recheckUnreadableMsg): the lone-key WARN below asserts the private key is still there,
+// and that is a positive observation a failed Lstat did not make.
 func (rp *reaper) keyStillPresent(rel, cert string) bool {
 	key := layout.KeyFor(cert)
-	if rp.src.pathAbsent(key) {
+	absent, err := rp.src.pathAbsent(key)
+	if err != nil {
+		// Fail closed WITHOUT claiming a key was observed: the lone-key WARN below says
+		// the private key is still in /input, which is a positive fact this Lstat did
+		// not establish. Name the uninspectable path instead, and keep the bundle.
+		slog.Warn(recheckUnreadableMsg,
+			"path", rel, "input", cert, "key", key, "error", err,
+			"remediation", recheckUnreadableRemediation)
+		return true
+	}
+	if absent {
 		// The retention this report describes no longer holds, so retire it HERE: the
 		// leftover key is gone, and a half-deleted pair at this name later is a NEW
 		// condition to name. Retiring it on the DELETION instead left it un-retired in
@@ -481,6 +507,23 @@ const loneKeyRetainedMsg = "keeping an output bundle whose certificate is gone b
 // looking at: a pair mid-arrival (finish writing it) or one mid-removal (finish removing
 // it).
 const loneKeyRemediation = "finish the change under /input: add the matching <name>.crt, or remove the leftover <name>.key so the bundle can be reaped"
+
+// recheckUnreadableMsg is the report for a confirming re-check that could not be made at
+// all: the /input path answered neither "here" nor ENOENT, which is what an unmounted,
+// unreadable or newly permission-changed input tree looks like during the confirmation
+// delay.
+//
+// It is its own record rather than a reuse of the two positive ones, because those state
+// facts this failure did not establish — that the certificate came back, or that the
+// private key is still there. The bundle is kept either way (an unanswerable question
+// never authorizes deleting key material), so the only thing at stake is whether the
+// operator can tell WHY, and the certificate arm previously said nothing at
+// LOG_LEVEL=warn while the stale bundle stayed on disk.
+const recheckUnreadableMsg = "keeping an output bundle whose /input path could not be re-checked before removal; an unreadable input tree is not proof the bundle is orphaned"
+
+// recheckUnreadableRemediation points at the mount rather than at the pair: nothing under
+// /input needs fixing when the tree itself cannot be inspected.
+const recheckUnreadableRemediation = "fix the /input mount named in the error (unmounted, permissions, or an unreadable parent), then re-check on the next scan"
 
 // reapAuditMsg is the once-per-scan audit record for deletions this app actually made.
 //
@@ -615,9 +658,9 @@ func sampleOrphanPaths(paths []string) string {
 
 // reapDecision is the whole OUTPUT_LIFECYCLE decision for one scan: whether this
 // app deletes anything, plus the operator wording that goes with not deleting. The
-// two strings are resolved next to the deletion they explain, so the agreement
-// lifecycleInaction's doc requires between them is settled at one site instead of
-// being maintained by hand across two functions.
+// two strings are resolved next to the deletion they explain, and next to each other,
+// so the agreement between them is a property of one switch arm rather than something
+// maintained by hand across two parallel mappings.
 type reapDecision struct {
 	inaction    string
 	remediation string
@@ -630,6 +673,37 @@ type reapDecision struct {
 // mode or a moved veto is one edit here instead of three that can disagree. The
 // narration is only resolved when nothing is deleted; a reaping scan needs neither
 // string.
+//
+// Four independent reasons can hold the reap back and the mode alone does not pick
+// between them, so each gets one arm, strongest first, and each arm pairs the reason
+// with the advice that clears it:
+//
+// An OUTPUT walk that could not enumerate the tree makes the LIST itself
+// untrustworthy, so the advice withholds removal entirely: the candidate list then
+// holds live bundles — a bundle written through a symlinked output directory is
+// enumerated under its physical path, whose derived input name is absent from `seen`,
+// so it reads as an orphan on the very scan that created it — and every entry in the
+// list carries a private key.
+//
+// The refused REPLACEMENT (ScanResult.Unwritable, via conversionsClean) is a veto of
+// its own and ranks ahead of the conversion-failure arm: it logs no conversion failure
+// anywhere, so telling the operator one failed contradicts the same scan's failed=0
+// summary, and it is cleared on the output volume — ownership, free space, a
+// read-write remount, whichever the standing WARN named — rather than by fixing a
+// conversion. That WARN is where the errno is known, so the advice sends the operator
+// there instead of naming the condition a second time.
+//
+// Otherwise, in sync mode, the list is trustworthy — the input enumeration was
+// complete, or reconcile would have returned earlier — and this app is only
+// withholding its own deletion until a scan with no conversion failures.
+//
+// A non-sync mode is report-only and is the default arm, which is also why it must not
+// outrank the two vetoes above: their wording promises removal on the next clean scan,
+// which a mode that never removes anything cannot deliver, and the advice must not
+// offer a setting that is already in effect.
+//
+// The sync arms need no separate reapable term: a sync scan that is reapable returns
+// above, so every arm below is a scan that keeps its candidates.
 func resolveReap(mode outputpolicy.Lifecycle, reapable, walkSafe, refusalOnly bool) reapDecision {
 	// reapable already carries walkSafe: reconcile computes it as
 	// `rc.safeToReap() && walkSafe` at the single call site, so an untrustworthy output
@@ -638,70 +712,26 @@ func resolveReap(mode outputpolicy.Lifecycle, reapable, walkSafe, refusalOnly bo
 	if mode == outputpolicy.LifecycleSync && reapable {
 		return reapDecision{reap: true}
 	}
-	return reapDecision{
-		inaction:    lifecycleInaction(mode, walkSafe, refusalOnly),
-		remediation: orphanReportRemediation(mode, walkSafe, refusalOnly),
-	}
-}
-
-// lifecycleInaction explains why an orphan was reported rather than removed. Four
-// independent reasons can apply and the mode alone does not pick between them, so
-// each is named separately and the strongest wins, in this order:
-//
-// An OUTPUT walk that could not enumerate the tree makes the LIST itself
-// untrustworthy (orphanReportRemediation withholds the delete advice for exactly
-// this case, so the two attributes must agree on it).
-//
-// A non-sync mode is report-only, so it outranks the conversion-failure veto: the
-// veto's wording promises removal on the next clean scan, which a mode that never
-// removes anything cannot deliver — and the operator would wait for a recovery that
-// cannot happen while a stale bundle stays served.
-//
-// The refused REPLACEMENT (ScanResult.Unwritable, via conversionsClean) is a veto of its
-// own and gets its own arm ahead of the conversion-failure one: it logs no conversion
-// failure anywhere, so telling the operator one failed contradicts the same scan's
-// failed=0 summary, and it is cleared on the output volume — ownership, free space, a
-// read-write remount, whichever the standing WARN named — rather than by fixing a
-// conversion.
-//
-// Otherwise the list is trustworthy — the input enumeration was complete, or
-// reconcile would have returned earlier — and sync mode is only withholding this
-// app's own deletion until a scan with no conversion failures.
-//
-// A sync-mode scan that reaches this function is never reapable: resolveReap returns
-// before calling it in that case, which is why the sync arms below need no separate
-// reapable term and why this signature matches orphanReportRemediation's.
-func lifecycleInaction(mode outputpolicy.Lifecycle, walkSafe, refusalOnly bool) string {
 	switch {
 	case !walkSafe:
-		return "kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle"
+		return reapDecision{
+			inaction:    "kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle",
+			remediation: "do not remove anything from this list yet: fix the /output warnings above, then re-check it on a scan that reports no disabled orphan removal",
+		}
 	case mode == outputpolicy.LifecycleSync && refusalOnly:
-		return "kept: the output volume refused to let this app replace a prior bundle on this scan, so nothing is removed until a scan with no refused replacement"
+		return reapDecision{
+			inaction:    "kept: the output volume refused to let this app replace a prior bundle on this scan, so nothing is removed until a scan with no refused replacement",
+			remediation: "this app removes them itself on the next scan with no failed conversion and no refused replacement: fix the /output condition named in the warning above, or remove these from the output volume by hand",
+		}
 	case mode == outputpolicy.LifecycleSync:
-		return "kept: a conversion failed on this scan, so nothing is removed until a scan with no failures"
+		return reapDecision{
+			inaction:    "kept: a conversion failed on this scan, so nothing is removed until a scan with no failures",
+			remediation: "this app removes them itself on the next scan with no conversion failures: fix the conversion failure reported above, or remove them from the output volume by hand",
+		}
+	default:
+		return reapDecision{
+			inaction:    "reported only (OUTPUT_LIFECYCLE=" + string(mode) + ")",
+			remediation: "remove them from the output volume, or set OUTPUT_LIFECYCLE=sync to have this app do it",
+		}
 	}
-	return "reported only (OUTPUT_LIFECYCLE=" + string(mode) + ")"
-}
-
-// orphanReportRemediation is the orphan report's operator advice. It must not tell
-// an operator to delete anything on a scan whose OUTPUT walk could not enumerate
-// the tree: the candidate list then holds live bundles — a bundle written through a
-// symlinked output directory is enumerated under its physical path, whose derived
-// input name is absent from `seen`, so it reads as an orphan on the very scan that
-// created it — and every entry in the list carries a private key.
-func orphanReportRemediation(mode outputpolicy.Lifecycle, walkSafe, refusalOnly bool) string {
-	if !walkSafe {
-		return "do not remove anything from this list yet: fix the /output warnings above, then re-check it on a scan that reports no disabled orphan removal"
-	}
-	if mode == outputpolicy.LifecycleSync && refusalOnly {
-		// The specific volume condition — ownership, free space, a read-only mount — is named
-		// by the standing WARN for the bundle itself, which is where the errno is known; this
-		// line only has to send the operator there rather than at a conversion that never
-		// failed.
-		return "this app removes them itself on the next scan with no failed conversion and no refused replacement: fix the /output condition named in the warning above, or remove these from the output volume by hand"
-	}
-	if mode == outputpolicy.LifecycleSync {
-		return "this app removes them itself on the next scan with no conversion failures: fix the conversion failure reported above, or remove them from the output volume by hand"
-	}
-	return "remove them from the output volume, or set OUTPUT_LIFECYCLE=sync to have this app do it"
 }

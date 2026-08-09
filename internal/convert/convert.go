@@ -562,7 +562,7 @@ const maxSubjectLogLen = 256
 // 256 is far above anything real (a public-CA subject carries under ten attributes)
 // and is chosen so the bound cannot change what an operator reads: every rendered
 // attribute contributes at least a type name, an "=" and a separator, so 256 of them
-// always overrun maxSubjectLogLen and boundSubject's cut lands in identical bytes.
+// always overrun maxSubjectLogLen and subjectForLog's cut lands in identical bytes.
 // Verified against the unbounded render over 4 attribute-OID shapes x 5 sizes (1, 4,
 // 1,000, 5,000 and 11,900 attributes): the first 256 bytes are byte-identical in all
 // 20, and the worst render falls from 1,121ms to 1.6ms.
@@ -572,11 +572,11 @@ const maxSubjectRenderAttrs = 256
 // package's only door to a certificate-supplied name, and it bounds BOTH axes: the
 // attributes handed to pkix's quadratic renderer, and the bytes of the result.
 //
-// The sanitize step still runs AFTER the render (boundSubject -> boundLogText ->
+// The sanitize step still runs AFTER the render (boundLogText ->
 // runesafe.SanitizeSingleLineCapped), which is the order that rule requires: pkix
 // escapes only the DN metacharacters and leaves control bytes and newlines intact.
 func subjectForLog(c *x509.Certificate) string {
-	return boundSubject(boundedDN(dnSequence(&c.Subject)).String())
+	return boundLogText(boundedDN(dnSequence(&c.Subject)).String(), maxSubjectLogLen)
 }
 
 // dnSequence returns the RDNSequence pkix.Name.String() renders, mirroring that
@@ -629,14 +629,6 @@ func boundedDN(seq pkix.RDNSequence) pkix.RDNSequence {
 		budget -= len(rdn)
 	}
 	return seq
-}
-
-// boundSubject truncates an ALREADY-RENDERED certificate subject to maxSubjectLogLen
-// bytes for a log-bound diagnostic, dropping the partial rune the cut may leave
-// behind so the %q form stays readable. It is a named alias for the package's shared
-// boundLogText rule, reached through subjectForLog so the render is bounded too.
-func boundSubject(subject string) string {
-	return boundLogText(subject, maxSubjectLogLen)
 }
 
 // boundedTextError caps the rendered text of an input-derived error. The

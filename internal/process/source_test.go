@@ -63,20 +63,26 @@ func TestSourcePathAbsent(t *testing.T) {
 	s := newInputSource(t, dir)
 
 	for _, tc := range []struct {
-		rel  string
-		want bool
-		why  string
+		rel     string
+		want    bool
+		wantErr bool
+		why     string
 	}{
-		{"missing.crt", true, "an ENOENT path is the durable absence the reap needs"},
-		{"back.crt", false, "a certificate that is present must keep its bundle, which is the case " +
+		{"missing.crt", true, false, "an ENOENT path is the durable absence the reap needs"},
+		{"back.crt", false, false, "a certificate that is present must keep its bundle, which is the case " +
 			"pathVanished would have answered true for"},
-		{"dangling.crt", false, "a symlink whose target is missing is still an entry in the operator's tree"},
-		{"plain/tls.crt", false, "a path the scan cannot classify is not proof of absence"},
+		{"dangling.crt", false, false, "a symlink whose target is missing is still an entry in the operator's tree"},
+		{"plain/tls.crt", false, true, "a path the scan cannot classify is not proof of absence, and the " +
+			"failure must reach the caller so the retention is not narrated as a positive observation"},
 	} {
 		t.Run(tc.rel, func(t *testing.T) {
 			t.Parallel()
-			if got := s.pathAbsent(tc.rel); got != tc.want {
+			got, err := s.pathAbsent(tc.rel)
+			if got != tc.want {
 				t.Errorf("source.pathAbsent(%q) = %v, want %v: %s", tc.rel, got, tc.want, tc.why)
+			}
+			if (err != nil) != tc.wantErr {
+				t.Errorf("source.pathAbsent(%q) error = %v, want error: %v: %s", tc.rel, err, tc.wantErr, tc.why)
 			}
 		})
 	}

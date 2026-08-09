@@ -265,17 +265,15 @@ func TestOutputWalkVisit_an_unreadable_path_vetoes_the_reap(t *testing.T) {
 		t.Fatalf("setup: WriteFile: %v", err)
 	}
 	logs := captureLogs(t)
-	w := &outputWalk{ctx: t.Context(), safe: true}
+	w := &outputWalk{ctx: t.Context()}
 
 	if err := w.visit("locked/tls.pfx", nil, errors.New("permission denied")); err != nil {
 		t.Fatalf("visit(unreadable output sub-path) = %v, want nil so the rest of the tree is still walked", err)
 	}
-	if w.safe {
-		t.Error("safe = true after an unreadable output sub-path, want false: a tree this scan could not" +
-			" fully read cannot prove any bundle orphaned, and the bundles hold private keys")
-	}
 	if w.unreadable != 1 {
-		t.Errorf("unreadable = %d, want 1 so the aggregate in logOrphanWalkOutcome fires", w.unreadable)
+		t.Errorf("unreadable = %d, want 1: the counter listOutputs derives its veto from, and the aggregate"+
+			" in logOrphanWalkOutcome, both rest on it — a tree this scan could not fully read cannot prove"+
+			" any bundle orphaned, and the bundles hold private keys", w.unreadable)
 	}
 	if len(w.found) != 0 {
 		t.Errorf("found = %v, want empty: a path the walk could not read is not a deletion candidate", w.found)
@@ -287,8 +285,9 @@ func TestOutputWalkVisit_an_unreadable_path_vetoes_the_reap(t *testing.T) {
 	if len(w.found) != 1 || w.found[0] != "live.pfx" {
 		t.Errorf("found = %v, want [live.pfx]: the unreadable path vetoes deletion, it does not stop enumeration", w.found)
 	}
-	if w.safe {
-		t.Error("safe = true, want it to stay false: a later readable entry cannot re-authorise deletions")
+	if w.unreadable != 1 {
+		t.Errorf("unreadable = %d after a later readable entry, want it to stay 1: nothing can decrement the"+
+			" veto, so a readable entry cannot re-authorise deletions", w.unreadable)
 	}
 
 	assertDebugOnly(t, logs, wantMsg, "locked/tls.pfx")
@@ -320,7 +319,7 @@ func TestOutputWalkVisit_stops_the_orphan_walk_once_the_scan_is_cancelled(t *tes
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	w := &outputWalk{ctx: ctx, safe: true}
+	w := &outputWalk{ctx: ctx}
 
 	err := w.visit("live.pfx", dirEntryOf(t, bundle), nil)
 
