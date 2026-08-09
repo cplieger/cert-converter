@@ -135,7 +135,7 @@ func TestAnalyseAt_reports_every_input_defect_in_discovery_order(t *testing.T) {
 		[]byte("-----BEGIN PRIVATE KEY-----\nZm9v\n"),
 	)
 
-	a, err := analyseAt(certFile, keyFile, now)
+	a, err := analyseAt(t.Context(), certFile, keyFile, now)
 	if err != nil {
 		t.Fatalf("analyseAt(a bundle carrying every input defect) = error %v, want a resolved analysis", err)
 	}
@@ -187,11 +187,11 @@ func TestAnalyseAt_validity_window_is_inclusive_at_both_edges(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			a, err := analyseAt(certPEM, keyPEM, tt.now)
+			a, err := analyseAt(t.Context(), certPEM, keyPEM, tt.now)
 			if err != nil {
 				t.Fatalf("analyseAt(_, _, %s) = error %v, want a resolved analysis", tt.now.UTC().Format(time.RFC3339Nano), err)
 			}
-			if got := testValidityKinds(&a); !slices.Equal(got, tt.want) {
+			if got := testValidityKinds(a); !slices.Equal(got, tt.want) {
 				t.Errorf("analyseAt at %s produced validity observations %v, want %v",
 					tt.now.UTC().Format(time.RFC3339Nano), got, tt.want)
 			}
@@ -359,7 +359,7 @@ func TestAnalyseAt_renewed_cert_tie_turns_on_validity_at_the_instant(t *testing.
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			a, err := analyseAt(certPEM, keyPEM, tt.now)
+			a, err := analyseAt(t.Context(), certPEM, keyPEM, tt.now)
 			if err != nil {
 				t.Fatalf("analyseAt(_, _, %s) = error %v, want a resolved analysis", tt.now.UTC().Format(time.RFC3339), err)
 			}
@@ -428,7 +428,7 @@ func testRawDN(t *testing.T, tag int, rdns ...testRDN) []byte {
 // testNameLinkGraph builds a graph over certs at a fixed instant.
 func testNameLinkGraph(t *testing.T, certs ...*x509.Certificate) *certGraph {
 	t.Helper()
-	g := newCertGraph(certs, time.Now())
+	g := newCertGraph(t.Context(), certs, time.Now())
 	return g
 }
 

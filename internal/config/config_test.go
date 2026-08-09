@@ -13,6 +13,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
+	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/slogx/capture"
 )
@@ -2300,33 +2301,33 @@ func TestParseMaxScanEntries(t *testing.T) {
 		want       int
 		wantRepair scanEntriesRepair
 	}{
-		{"empty uses default", "", defaultMaxScanEntries, scanEntriesAccepted},
-		{"whitespace uses default", "   ", defaultMaxScanEntries, scanEntriesAccepted},
+		{"empty uses default", "", scanbudget.Default, scanEntriesAccepted},
+		{"whitespace uses default", "   ", scanbudget.Default, scanEntriesAccepted},
 		{"valid", "5000", 5000, scanEntriesAccepted},
 		{"padded valid", "  5000  ", 5000, scanEntriesAccepted},
 		// 1 is the smallest usable budget: a tree with a single entry still scans.
 		{"one is usable", "1", 1, scanEntriesAccepted},
-		{"at ceiling unclamped", "200000", maxScanEntriesCeiling, scanEntriesAccepted},
-		{"one above ceiling clamped", "200001", maxScanEntriesCeiling, scanEntriesClamped},
-		{"far above ceiling clamped", "10000000", maxScanEntriesCeiling, scanEntriesClamped},
+		{"at ceiling unclamped", "200000", scanbudget.Ceiling, scanEntriesAccepted},
+		{"one above ceiling clamped", "200001", scanbudget.Ceiling, scanEntriesClamped},
+		{"far above ceiling clamped", "10000000", scanbudget.Ceiling, scanEntriesClamped},
 		// A valid decimal too large for int is still a positive above-ceiling
 		// value, so it clamps rather than falling through to the default.
-		{"beyond int64 clamped", "999999999999999999999999999999", maxScanEntriesCeiling, scanEntriesClamped},
-		{"signed beyond int64 clamped", "+999999999999999999999999999999", maxScanEntriesCeiling, scanEntriesClamped},
+		{"beyond int64 clamped", "999999999999999999999999999999", scanbudget.Ceiling, scanEntriesClamped},
+		{"signed beyond int64 clamped", "+999999999999999999999999999999", scanbudget.Ceiling, scanEntriesClamped},
 		// strconv reports ErrRange once the digit prefix overflows even when junk
 		// follows, so a malformed value must stay malformed instead of being
 		// mistaken for an above-ceiling number.
-		{"overflowing prefix with junk", "999999999999999999999999999999x", defaultMaxScanEntries, scanEntriesInvalid},
-		{"non-numeric", "abc", defaultMaxScanEntries, scanEntriesInvalid},
+		{"overflowing prefix with junk", "999999999999999999999999999999x", scanbudget.Default, scanEntriesInvalid},
+		{"non-numeric", "abc", scanbudget.Default, scanEntriesInvalid},
 		// There is deliberately no disable spelling: "0" and "false" are unusable
 		// input, not an opt-out, because a scan with no entry budget is the
 		// exhaustion path the ceiling exists to close.
-		{"zero is not a disable value", "0", defaultMaxScanEntries, scanEntriesInvalid},
-		{"padded zero is not a disable value", " 0 ", defaultMaxScanEntries, scanEntriesInvalid},
-		{"false is not a disable value", "false", defaultMaxScanEntries, scanEntriesInvalid},
-		{"negative uses default", "-1", defaultMaxScanEntries, scanEntriesInvalid},
-		{"beyond negative int64 uses default", "-999999999999999999999999999999", defaultMaxScanEntries, scanEntriesInvalid},
-		{"a decimal fraction is invalid", "1.5", defaultMaxScanEntries, scanEntriesInvalid},
+		{"zero is not a disable value", "0", scanbudget.Default, scanEntriesInvalid},
+		{"padded zero is not a disable value", " 0 ", scanbudget.Default, scanEntriesInvalid},
+		{"false is not a disable value", "false", scanbudget.Default, scanEntriesInvalid},
+		{"negative uses default", "-1", scanbudget.Default, scanEntriesInvalid},
+		{"beyond negative int64 uses default", "-999999999999999999999999999999", scanbudget.Default, scanEntriesInvalid},
+		{"a decimal fraction is invalid", "1.5", scanbudget.Default, scanEntriesInvalid},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, repair := parseMaxScanEntries(tc.val)
@@ -2369,15 +2370,15 @@ func TestMaxScanEntries_is_silent(t *testing.T) {
 		raw  string
 		want int
 	}{
-		{"", defaultMaxScanEntries},
-		{"   ", defaultMaxScanEntries},
-		{"abc", defaultMaxScanEntries},
-		{"0", defaultMaxScanEntries},
-		{"-1", defaultMaxScanEntries},
+		{"", scanbudget.Default},
+		{"   ", scanbudget.Default},
+		{"abc", scanbudget.Default},
+		{"0", scanbudget.Default},
+		{"-1", scanbudget.Default},
 		{"5000", 5000},
-		{"200000", maxScanEntriesCeiling},
-		{"200001", maxScanEntriesCeiling},
-		{"999999999999999999999999999999", maxScanEntriesCeiling},
+		{"200000", scanbudget.Ceiling},
+		{"200001", scanbudget.Ceiling},
+		{"999999999999999999999999999999", scanbudget.Ceiling},
 	} {
 		t.Run(tc.raw, func(t *testing.T) {
 			t.Setenv("MAX_SCAN_ENTRIES", tc.raw)

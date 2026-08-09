@@ -14,6 +14,7 @@ import (
 	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
+	"github.com/cplieger/cert-converter/internal/scanbudget"
 )
 
 // Output file and directory modes. A PFX carries a private key, so it is
@@ -24,7 +25,7 @@ import (
 // pfxFileMode is both the mode this app INSTALLS on every bundle it writes and the
 // policy a bundle already on disk is measured against. It is a CEILING for the second
 // job, not an exact target: a mode the operator made STRICTER (0400) carries no bit
-// beyond it and is left alone, which is what laxerThanPolicy tests.
+// beyond it and is left alone, which is what laxerThan tests.
 //
 // A prior bundle laxer than it is REPORTED (laxBundleMsg) and otherwise left exactly as
 // found: no chmod, and no write either. The mode a bundle HAS never reaches the currency
@@ -58,7 +59,7 @@ type store struct {
 	laxDirsReported map[string]struct{}
 	// maxEntries is this store's per-walk entry budget for the OUTPUT tree, injected
 	// from Options.MaxScanEntries exactly as scanWalk's is for /input. Non-positive
-	// means "use fallbackScanEntries" (outputWalk.entryBudget), so a store assembled
+	// means "use scanbudget.Default" (scanbudget.Effective), so a store assembled
 	// without one — the package's own focused tests do this — is bounded rather than
 	// unbounded. /output is a mounted tree this app does not own, so the reason for a
 	// bound is the same on both sides: a writer with access to the volume chooses how
@@ -124,7 +125,7 @@ func (s *store) reportLaxDirAt(dir string) {
 		s.laxDirsReported = make(map[string]struct{})
 	}
 	s.laxDirsReported[dir] = struct{}{}
-	if perm := fi.Mode().Perm(); perm&^pfxDirMode != 0 {
+	if perm := fi.Mode().Perm(); laxerThan(perm, pfxDirMode) {
 		// dir is root-relative, so it is "." for the flat /output the README's own setup
 		// step produces; the root is named alongside it, as logOrphanWalkOutcome does for
 		// its own directory-level records.
@@ -305,7 +306,7 @@ func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
 // read cap here and the preflight's own bounds cannot drift apart.
 const maxPFXSize = convert.MaxBundleBytes
 
-// contentState is the first of the two facts one prior-bundle inspection resolves:
+// contentState is what one prior-bundle inspection resolves:
 // what this app KNOWS about the bytes already at the output path. It answers only that
 // question — never "should a write happen", never "is this a failure" — so the facts
 // that used to be smuggled through a single currency verdict each have a home of their
@@ -363,50 +364,54 @@ func (c contentState) String() string {
 	}
 }
 
-// bundleState is what one inspection of the output path resolved, as two INDEPENDENT
-// facts rather than one verdict: what this app knows about the bytes on disk
-// (contentState) and whether the mode on disk is laxer than policy (modeLax). Only the
-// first one routes anything — convertEntry derives the entry's outcome from it plus the
-// write's own result (writeOutcome); the second is a fact for the operator's log.
+// bundleState is what one inspection of the output path resolved: what this app knows
+// about the bytes on disk. That is the ONE fact an inspection produces that routes
+// anything — convertEntry derives the entry's outcome from it plus the write's own
+// result (writeOutcome).
+//
+// The mode on disk is deliberately NOT carried here. A bundle laxer than pfxFileMode is
+// REPORTED where it is observed (reportLaxBundle's WARN) and acts on nothing: it does
+// not make the bundle out of date, it schedules no write, and it never reaches health
+// (output-dir-write-bit-enforcement, extended to files). Carrying the fact past its own
+// WARN would hand every future reader of writeOutcome a routing input that routes
+// nothing.
+//
+// A struct rather than a bare contentState so upToDate and bundleNotProvenWrong stay
+// the named questions convertEntry asks of one inspection.
 //
 // Cheap to pass by value, and nothing here is mutated after inspect returns.
 type bundleState struct {
 	content contentState
-	// modeLax records that the bundle on disk carries a bit pfxFileMode does not. It is
-	// REPORTED (reportLaxBundle's WARN) and acts on nothing: it does not make the bundle
-	// out of date, it schedules no write, and it never reaches health. A permission bit
-	// the operator left on their own volume is their choice
-	// (output-dir-write-bit-enforcement, extended to files), and a mode-driven rewrite
-	// could not converge anyway on a mount that forces or ignores permission bits.
-	modeLax bool
 }
 
 // upToDate reports whether the output path needs no write at all: the bytes on disk are
 // already the bundle these inputs produce. Currency is a question about CONTENT and
 // nothing else — a lax mode is reported and left alone, because this app never writes a
-// bundle in order to change its permissions (see modeLax).
+// bundle in order to change its permissions (see reportLaxBundle).
 func (st bundleState) upToDate() bool {
 	return st.content == contentVerifiedCurrent
 }
 
 // bundleNotProvenWrong reports whether a failed rewrite leaves the operator with a
-// bundle this app has no evidence against: one it compared and matched, or one it could
-// not read at all. Spelled as an ALLOWLIST of exactly those two facts, so the zero value
-// and any fact added later take the loud direction — a conversion failure — by
-// construction rather than by omission.
+// bundle this app has no evidence against: one it could not read at all. Spelled as an
+// ALLOWLIST of exactly that one fact, so the zero value and any fact added later take the
+// loud direction — a conversion failure — by construction rather than by omission.
 //
-// The contentVerifiedCurrent arm is defensive rather than live: currency is decided on
-// content alone, so a matching bundle is skipped and never reaches a write. It stays in
-// the allowlist because the statement is true of the FACT independently of what routes
-// there, and narrowing it would make a future non-content write reason silently loud.
+// contentVerifiedCurrent is deliberately absent, and could not be honoured if it were
+// present: currency is decided on content alone, so convertEntry returns at
+// `if state.upToDate()` (process.go:1356) before the sole call to writeOutcome
+// (process.go:1376). A future write reason that does NOT pass through that content gate
+// would arrive here as a fact this list does not name and would be counted a conversion
+// failure — the loud direction, which is the point of the shape.
 func (st bundleState) bundleNotProvenWrong() bool {
-	return st.content == contentVerifiedCurrent || st.content == contentUnverified
+	return st.content == contentUnverified
 }
 
 // inspect resolves what this app knows about the output at rel, by READING it rather
-// than by remembering what was written: the state of its content, and whether its mode is
-// laxer than policy. It decides nothing else — not whether to write, not whether a
-// failure is a failure. Those are derived once, after the write, in writeOutcome.
+// than by remembering what was written: the state of its content. A mode laxer than
+// policy is WARNED about where it is observed, here, and carried no further. It decides
+// nothing else — not whether to write, not whether a failure is a failure. Those are
+// derived once, after the write, in writeOutcome.
 //
 // Reading the output keeps currency stable across process restarts and detects
 // out-of-band replacement, password rotation, and encoder-profile changes without
@@ -429,13 +434,13 @@ func (st bundleState) bundleNotProvenWrong() bool {
 // every in-flight pair on the way out.
 //
 // Permission bits never reach the content fact, and are never acted on at all. A bundle
-// laxer than pfxFileMode is REPORTED (laxBundleMsg) and recorded as the second fact; its
-// content is compared as usual, and the mode changes nothing about what happens next. No
-// chmod is attempted and no write is scheduled, which is the settled shape for both
-// halves of /output — the app warns about a mode it would not have chosen and changes
-// nothing about what is already there (output-dir-write-bit-enforcement, extended to
-// files). When the bundle is next written for a CONTENT reason, that write's fresh inode
-// carries pfxFileMode.
+// laxer than pfxFileMode is REPORTED (laxBundleMsg) where it is observed and carried no
+// further; its content is compared as usual, and the mode changes nothing about what
+// happens next. No chmod is attempted and no write is scheduled, which is the settled
+// shape for both halves of /output — the app warns about a mode it would not have chosen
+// and changes nothing about what is already there (output-dir-write-bit-enforcement,
+// extended to files). When the bundle is next written for a CONTENT reason, that write's
+// fresh inode carries pfxFileMode.
 func (s *store) inspect(ctx context.Context, rel string, want *convert.Analysis,
 	wantEncoder convert.EncoderType, password string,
 ) (bundleState, error) {
@@ -489,18 +494,17 @@ func (s *store) inspect(ctx context.Context, rel string, want *convert.Analysis,
 		return bundleState{content: contentVerifiedStale}, nil
 	}
 
-	// Fact two. It runs before every return below so a bundle this app keeps and one it
-	// is about to replace are treated alike, and so a rewrite that then fails does not
-	// leave a private key readable by the world with nothing logged. The three arms above
-	// return before it because there is no mode on disk worth reporting there — nothing
-	// is present, or what is present is not a bundle at all — which is exactly what the
-	// zero value says.
-	modeLax := s.reportLaxBundle(rel, fi.Mode().Perm())
+	// The mode report. It runs before every return below so a bundle this app keeps and
+	// one it is about to replace are treated alike, and so a rewrite that then fails does
+	// not leave a private key readable by the world with nothing logged. The three arms
+	// above return before it because there is no mode on disk worth reporting there —
+	// nothing is present, or what is present is not a bundle at all.
+	s.reportLaxBundle(rel, fi.Mode().Perm())
 
 	if fi.Size() > maxPFXSize {
 		slog.Warn("prior pfx exceeds the readable bound; regenerating",
 			"path", rel, "size", fi.Size(), "limit", maxPFXSize)
-		return bundleState{content: contentUnverified, modeLax: modeLax}, nil
+		return bundleState{content: contentUnverified}, nil
 	}
 
 	prior, err := s.readBoundedPFX(ctx, rel)
@@ -513,7 +517,7 @@ func (s *store) inspect(ctx context.Context, rel string, want *convert.Analysis,
 			// and wrapping that alone made IsShutdown false and logged a routine
 			// shutdown at ERROR. The decode-failure gate below already wraps ctx.Err()
 			// for the same reason; joining keeps the read error for diagnosis.
-			return bundleState{modeLax: modeLax}, fmt.Errorf("read prior pfx: %w", errors.Join(ctxErr, err))
+			return bundleState{}, fmt.Errorf("read prior pfx: %w", errors.Join(ctxErr, err))
 		}
 		// An ENOENT or a non-regular occupant here is not "cannot tell": the read looked
 		// and VERIFIED the path holds no usable prior bundle, the same two facts the lstat
@@ -532,7 +536,7 @@ func (s *store) inspect(ctx context.Context, rel string, want *convert.Analysis,
 		slog.Warn("cannot read prior pfx; regenerating",
 			"path", rel, "error", err,
 			"remediation", outputPermRemediation)
-		return bundleState{content: content, modeLax: modeLax}, nil
+		return bundleState{content: content}, nil
 	}
 
 	// CheckCurrency owns the mandatory preflight -> profile -> decode -> content
@@ -547,7 +551,7 @@ func (s *store) inspect(ctx context.Context, rel string, want *convert.Analysis,
 	// internal/convert profile.go maxKDFIterations.
 	res := convert.CheckCurrency(prior, password, want, wantEncoder)
 	content, err := contentFromCurrency(ctx, rel, res, wantEncoder)
-	return bundleState{content: content, modeLax: modeLax}, err
+	return bundleState{content: content}, err
 }
 
 // contentFromCurrency turns a convert.Currency outcome into a content fact: what each
@@ -630,21 +634,22 @@ const laxBundleMsg = "prior pfx is more permissive than policy; leaving its mode
 // writer).
 const outputPinRemediation = "mount the real output directory instead of linking to it, and check /output for paths replaced while the scan was running"
 
-// laxerThanPolicy reports whether perm carries a permission bit pfxFileMode does
-// not. It is the WHOLE of the mode question: set means the mode is REPORTED, and nothing
-// else follows from it.
+// laxerThan reports whether perm carries a permission bit policy does not. It is the
+// WHOLE of the mode question for BOTH halves of /output — a bundle measured against
+// pfxFileMode and its ancestor directories against pfxDirMode: set means the mode is
+// REPORTED, and nothing else follows from it.
 //
 // A bitmask test rather than an inequality, because a mode can differ from policy by
-// being STRICTER: 0400 and 0600 carry no extra bit and are left exactly as found, while
-// 0640, 0644 and 0700 each do.
-func laxerThanPolicy(perm os.FileMode) bool {
-	return perm&^pfxFileMode != 0
+// being STRICTER: against pfxFileMode, 0400 and 0600 carry no extra bit and are left
+// exactly as found, while 0640, 0644 and 0700 each do.
+func laxerThan(perm, policy os.FileMode) bool {
+	return perm&^policy != 0
 }
 
-// reportLaxBundle warns when a prior bundle's mode is laxer than pfxFileMode, and
-// reports that fact to the caller. It is detection and narration only — it opens
-// nothing, pins nothing and mutates nothing, so the mode on disk is left exactly as
-// found, and nothing downstream acts on the fact either.
+// reportLaxBundle warns when a prior bundle's mode is laxer than pfxFileMode. It is
+// detection and narration only — it opens nothing, pins nothing, mutates nothing and
+// tells no caller, so the mode on disk is left exactly as found and nothing downstream
+// can act on the fact. The WARN is the whole of what a lax mode does.
 //
 // One WARN per lax bundle per scan, and it recurs on every scan for as long as the mode
 // does: this app changes nothing about the file, so the condition it reports is not one
@@ -655,13 +660,12 @@ func laxerThanPolicy(perm os.FileMode) bool {
 // written for a CONTENT reason lands at pfxFileMode by construction, which is the only
 // way this app ever corrects a mode, so on a mode-storing filesystem the next renewal
 // ends the WARN by itself.
-func (s *store) reportLaxBundle(rel string, perm os.FileMode) bool {
-	if !laxerThanPolicy(perm) {
-		return false
+func (s *store) reportLaxBundle(rel string, perm os.FileMode) {
+	if !laxerThan(perm, pfxFileMode) {
+		return
 	}
 	slog.Warn(laxBundleMsg,
 		"path", rel, "mode", perm.String(), "want", os.FileMode(pfxFileMode).String())
-	return true
 }
 
 // isPermissionRefusal reports whether err is the filesystem REFUSING an operation for
@@ -819,18 +823,10 @@ type outputWalk struct {
 	// TOUCHED rather than what it kept as a candidate. Counting only layout.IsOutput
 	// names would let a flat set of ignored names walk past the bound for free.
 	entries int
-	// maxEntries is this walk's injected budget; non-positive means fallbackScanEntries
-	// (entryBudget), so a walk assembled without one is still bounded.
+	// maxEntries is this walk's injected budget; non-positive means scanbudget.Default
+	// (scanbudget.Effective), so a walk assembled without one is still bounded.
 	maxEntries int
 	safe       bool
-}
-
-// entryBudget is the effective ceiling for this walk: the injected budget, or
-// fallbackScanEntries when nothing was injected. Resolved HERE rather than at
-// construction for the reason scanWalk.entryBudget states — every assembler of one gets
-// a bound, including the tests that build one field by field.
-func (w *outputWalk) entryBudget() int {
-	return effectiveEntryBudget(w.maxEntries)
 }
 
 // visit is listOutputs' walk callback: one entry, one verdict.
@@ -867,7 +863,7 @@ func (w *outputWalk) visit(rel string, d fs.DirEntry, err error) error {
 	// it had collected: a partial enumeration cannot prove anything orphaned, and the
 	// alternative — reaping on a prefix of the tree — deletes live bundles.
 	w.entries++
-	if budget := w.entryBudget(); w.entries > budget {
+	if budget := scanbudget.Effective(w.maxEntries); w.entries > budget {
 		return fmt.Errorf("%w: stopped at %d entries (%s)", errOutputBudgetExceeded, w.entries, rel)
 	}
 	// A symlink anywhere in the output tree makes this walk and the WRITE path

@@ -71,7 +71,7 @@ func TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established(t *tes
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &otherKey.PublicKey, nil, otherKey)
 
-	got, err := convert.Analyse(concatPEM(leafPEM, otherPEM), testcerts.KeyPEM(t, leafKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, otherPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(leaf whose issuer is absent) = error %v, want nil", err)
 	}
@@ -130,7 +130,7 @@ func TestAnalyse_still_excludes_an_unrelated_cert_from_a_self_signed_identity(t 
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &strangerKey.PublicKey, nil, strangerKey)
 
-	got, err := convert.Analyse(concatPEM(identityPEM, strangerPEM), testcerts.KeyPEM(t, key))
+	got, err := convert.Analyse(t.Context(), concatPEM(identityPEM, strangerPEM), testcerts.KeyPEM(t, key))
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}
@@ -235,7 +235,7 @@ func TestAnalyse_excludes_a_certificate_that_cannot_issue_certificates(t *testin
 			tc.disqualify(decoy)
 			_, decoyPEM, _ := testcerts.Mint(t, decoy, &decoyKey.PublicKey, nil, decoyKey)
 
-			got, err := convert.Analyse(concatPEM(leafPEM, decoyPEM), testcerts.KeyPEM(t, leafKey))
+			got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, decoyPEM), testcerts.KeyPEM(t, leafKey))
 			if err != nil {
 				t.Fatalf("Analyse(leaf beside a %s) = error %v, want nil", tc.name, err)
 			}
@@ -291,7 +291,7 @@ func TestAnalyse_reports_an_unproven_edge_linked_only_by_key_identifier(t *testi
 		t.Fatal("setup: authority and subject key identifiers differ, so no candidate edge exists")
 	}
 
-	got, err := convert.Analyse(concatPEM(leafPEM, decoyPEM), testcerts.KeyPEM(t, leafKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, decoyPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}
@@ -368,7 +368,7 @@ func TestAnalyse_keeps_a_signing_CA_that_is_not_issuer_eligible(t *testing.T) {
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, caCert, caKey)
 
-	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, leafKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(leaf signed by a CA with no basic constraints) = error %v, want nil", err)
 	}
@@ -452,7 +452,7 @@ func TestAnalyse_emits_a_compliant_chain_unchanged_and_silently(t *testing.T) {
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, interCert, interKey)
 
-	got, err := convert.Analyse(concatPEM(leafPEM, interPEM, rootPEM), testcerts.KeyPEM(t, leafKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, interPEM, rootPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(compliant leaf+intermediate+root) = error %v, want nil", err)
 	}
@@ -508,7 +508,7 @@ func TestAnalyse_reports_an_unproven_emitted_chain_edge(t *testing.T) {
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, absentCert, absentKey)
 
-	got, err := convert.Analyse(concatPEM(leafPEM, decoyPEM), testcerts.KeyPEM(t, leafKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, decoyPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}
@@ -546,7 +546,7 @@ func TestAnalyse_treats_a_reencoded_self_issued_certificate_as_its_own_root(t *t
 	_, strangerPEM, _ := testcerts.Mint(t, unverifiableCA(861, "Unrelated Bystander CA", notBefore, notBefore.Add(48*time.Hour)),
 		&strangerKey.PublicKey, nil, strangerKey)
 
-	got, err := convert.Analyse(concatPEM(selfPEM, strangerPEM), testcerts.KeyPEM(t, key))
+	got, err := convert.Analyse(t.Context(), concatPEM(selfPEM, strangerPEM), testcerts.KeyPEM(t, key))
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}
@@ -602,7 +602,7 @@ func TestAnalyse_reports_an_unfinished_chain_with_nothing_left_over(t *testing.T
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, caCert, caKey)
 
-	got, err := convert.Analyse(leafPEM, testcerts.KeyPEM(t, leafKey))
+	got, err := convert.Analyse(t.Context(), leafPEM, testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(a CA-signed leaf alone) = error %v, want nil", err)
 	}
@@ -683,7 +683,7 @@ func TestAnalyse_reports_an_unfinished_chain_when_only_the_root_is_absent(t *tes
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, interCert, interKey)
 
-	got, err := convert.Analyse(concatPEM(leafPEM, interPEM), testcerts.KeyPEM(t, leafKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, interPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(a proven leaf/intermediate pair without its root) = error %v, want nil", err)
 	}
@@ -765,7 +765,7 @@ func TestAnalyse_reports_a_terminus_whose_self_signature_does_not_verify(t *test
 	tampered[at] ^= 0x01
 	brokenRootPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tampered})
 
-	got, err := convert.Analyse(concatPEM(leafPEM, brokenRootPEM), testcerts.KeyPEM(t, leafKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, brokenRootPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(a leaf under a root whose self-signature is broken) = error %v, want nil", err)
 	}

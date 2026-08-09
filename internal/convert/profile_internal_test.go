@@ -152,11 +152,11 @@ func TestInspect_rejects_an_oversized_identifier(t *testing.T) {
 func TestInspect_rejects_an_oversized_safe_bag_identifier(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	pfx, err := Encode(analysis, EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestInspect_rejects_an_oversized_safe_bag_identifier(t *testing.T) {
 func TestInspect_rejects_excessive_iterations_in_every_derivation_location(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestInspect_rejects_excessive_iterations_in_every_derivation_location(t *te
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			pfx, err := Encode(&analysis, tc.enc, "pw")
+			pfx, err := Encode(analysis, tc.enc, "pw")
 			if err != nil {
 				t.Fatalf("setup: Encode(%s): %v", tc.enc, err)
 			}
@@ -424,11 +424,11 @@ func testShroudedKeyBagIndex(t *testing.T, bags []safeBag) int {
 func TestInspect_rejects_more_than_one_shrouded_key_bag(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	pfx, err := Encode(analysis, EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -488,11 +488,11 @@ func TestInspect_rejects_more_than_one_shrouded_key_bag(t *testing.T) {
 func TestInspect_rejects_a_non_v3_pfx_version(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	pfx, err := Encode(analysis, EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -516,11 +516,11 @@ func TestInspect_rejects_a_non_v3_pfx_version(t *testing.T) {
 func TestInspect_rejects_a_non_zero_encrypted_safe_version(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	pfx, err := Encode(analysis, EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -647,11 +647,11 @@ func appendTestPlaintextSafe(t *testing.T, safes []contentInfo) []contentInfo {
 func TestInspect_rejects_a_weaker_pbes2_cipher(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	pfx, err := Encode(analysis, EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -693,7 +693,7 @@ func setTestPBES2Cipher(t *testing.T, alg *algorithmIdentifier, scheme asn1.Obje
 func TestInspect_rejects_a_weaker_nested_modern_algorithm(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
@@ -790,7 +790,7 @@ func TestInspect_rejects_a_weaker_nested_modern_algorithm(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			pfx, err := Encode(&analysis, tc.enc, "pw")
+			pfx, err := Encode(analysis, tc.enc, "pw")
 			if err != nil {
 				t.Fatalf("setup: Encode(%s): %v", tc.enc, err)
 			}
@@ -829,7 +829,7 @@ func TestInspect_rejects_a_weaker_nested_modern_algorithm(t *testing.T) {
 func TestInspect_rejects_salts_one_byte_below_profile_floor(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
@@ -956,7 +956,7 @@ func TestInspect_rejects_salts_one_byte_below_profile_floor(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			pfx, err := Encode(&analysis, tc.enc, "pw")
+			pfx, err := Encode(analysis, tc.enc, "pw")
 			if err != nil {
 				t.Fatalf("setup: Encode(%s): %v", tc.enc, err)
 			}
@@ -1063,11 +1063,11 @@ func setTestPBMAC1Mac(t *testing.T, alg *algorithmIdentifier, mac asn1.ObjectIde
 func TestInspect_rejects_more_safe_bags_than_it_admits(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	pfx, err := Encode(analysis, EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1129,11 +1129,11 @@ func TestInspect_rejects_more_safe_bags_than_it_admits(t *testing.T) {
 func TestInspect_rejects_a_non_positive_iteration_count(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	pfx, err := Encode(analysis, EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1169,11 +1169,11 @@ func TestInspect_rejects_a_non_positive_iteration_count(t *testing.T) {
 func TestInspect_rejects_trailing_bytes_after_the_authSafe_content(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	pfx, err := Encode(analysis, EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1201,11 +1201,11 @@ func TestInspect_rejects_trailing_bytes_after_the_authSafe_content(t *testing.T)
 func TestBundleAlgorithms_rejects_wrong_auth_safe_type(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	pfx, err := Encode(analysis, EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1380,11 +1380,11 @@ func setTestAuthenticatedSafeDER(t *testing.T, p *pfxPreamble, der []byte) {
 func TestInspect_rejects_malformed_sequence_framing(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	pfx, err := Encode(analysis, EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1485,11 +1485,11 @@ func testTruncatedTailSequence(t *testing.T, elements ...[]byte) []byte {
 func TestInspect_rejects_a_malformed_element_in_a_bounded_sequence(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	pfx, err := Encode(analysis, EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1583,11 +1583,11 @@ func testWithoutMACData(t *testing.T, pfx []byte) []byte {
 func TestInspect_rejects_an_unusable_MAC_identifier(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	pfx, err := Encode(analysis, EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1650,7 +1650,7 @@ func TestInspect_rejects_an_unusable_MAC_identifier(t *testing.T) {
 func TestInspect_rejects_iterations_one_below_profile_floor(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := Analyse(slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
@@ -1735,7 +1735,7 @@ func TestInspect_rejects_iterations_one_below_profile_floor(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			pfx, err := Encode(&analysis, tc.enc, "pw")
+			pfx, err := Encode(analysis, tc.enc, "pw")
 			if err != nil {
 				t.Fatalf("setup: Encode(%s): %v", tc.enc, err)
 			}

@@ -128,7 +128,7 @@ func TestAnalyse_refuses_an_over_ceiling_rsa_issuer(t *testing.T) {
 	} {
 		t.Run(order.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
+			got, err := convert.Analyse(t.Context(), concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
 			if err == nil {
 				t.Fatalf("Analyse(leaf + a %d-bit RSA issuer + a same-subject ordinary-key certificate) = nil error and a chain of serial(s) %v, want a refusal: with the oversized edge left unverified the decoy (serial 211) outranks it, so the emitted chain does not verify",
 					oversizedBits, chainSerials(got.Chain()))
@@ -212,7 +212,7 @@ func TestAnalyse_refuses_an_over_ceiling_issuer_whose_alternative_is_cycle_exclu
 	} {
 		t.Run(order.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
+			got, err := convert.Analyse(t.Context(), concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
 			if err == nil {
 				t.Fatalf("Analyse(a mutually-signed pair + a same-subject %d-bit decoy) = nil error and a chain of serial(s) %v, want a refusal: the only proven alternative for the second hop is excluded by cycle avoidance, so the oversized edge is guessed",
 					oversizedBits, chainSerials(got.Chain()))
@@ -280,7 +280,7 @@ func TestAnalyse_converts_when_a_proven_parent_outranks_an_over_ceiling_namesake
 	} {
 		t.Run(order.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
+			got, err := convert.Analyse(t.Context(), concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
 			if err != nil {
 				t.Fatalf("Analyse(leaf + its proven CA + a same-subject %d-bit decoy) = error %v, want the bundle converted: the proven edge leaves nothing to guess",
 					oversizedBits, err)
@@ -367,7 +367,7 @@ func TestAnalyse_converts_when_the_path_enters_a_signed_cycle_at_its_proven_hop(
 	} {
 		t.Run(order.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
+			got, err := convert.Analyse(t.Context(), concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
 			if err != nil {
 				t.Fatalf("Analyse(a mutually-signed pair entered at its proven hop + a same-subject %d-bit namesake) = error %v, want the bundle converted: every hop the path selects is proven, so nothing is guessed",
 					oversizedBits, err)
@@ -415,7 +415,7 @@ func TestAnalyse_converts_beside_an_over_ceiling_certificate_that_issues_nothing
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, oversizedRSAPublicKey(convert.MaxVerifiableKeyBits+17), nil, throwawayKey)
 
-	got, err := convert.Analyse(concatPEM(identityPEM, strangerPEM), testcerts.KeyPEM(t, identityKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(identityPEM, strangerPEM), testcerts.KeyPEM(t, identityKey))
 	if err != nil {
 		t.Fatalf("Analyse(self-signed identity + an unrelated oversized certificate) = error %v, want nil: an oversized certificate that issues nothing here cannot influence the chain", err)
 	}

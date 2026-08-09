@@ -50,7 +50,7 @@ func TestEncode_preserves_the_order_of_a_multi_CA_chain(t *testing.T) {
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, interCert, interKey)
 
-	analysis, err := convert.Analyse(concatPEM(leafPEM, rootPEM, interPEM), testcerts.KeyPEM(t, leafKey))
+	analysis, err := convert.Analyse(t.Context(), concatPEM(leafPEM, rootPEM, interPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("setup: Analyse(leaf, root, intermediate) = error %v, want nil", err)
 	}
@@ -59,7 +59,7 @@ func TestEncode_preserves_the_order_of_a_multi_CA_chain(t *testing.T) {
 		t.Fatalf("setup: Analyse chain = %v, want %v nearest-parent-first", got, want)
 	}
 
-	pfx, err := convert.Encode(&analysis, convert.EncNameModern2023, "pw")
+	pfx, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("Encode = error %v, want nil", err)
 	}
@@ -77,7 +77,7 @@ func TestEncode_preserves_the_order_of_a_multi_CA_chain(t *testing.T) {
 				i, got[i], want[i])
 		}
 	}
-	if res := convert.CheckCurrency(pfx, "pw", &analysis, convert.EncNameModern2023); !res.Current() {
+	if res := convert.CheckCurrency(pfx, "pw", analysis, convert.EncNameModern2023); !res.Current() {
 		t.Errorf("CheckCurrency(the bundle Encode just wrote) = %q, want a match: a chain order the round trip does not preserve makes every scan rewrite the file",
 			res.Reason)
 	}

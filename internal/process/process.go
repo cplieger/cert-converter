@@ -14,6 +14,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
+	"github.com/cplieger/cert-converter/internal/scanbudget"
 )
 
 // ScanResult carries per-pair outcome summary counts from a scan run.
@@ -117,8 +118,9 @@ func (r *ScanResult) inputFullyEnumerated() bool {
 	return r.durablyEnumerated() && r.Vanished == 0
 }
 
-// fallbackScanEntries bounds how many /input entries ONE scan enumerates when the
-// composition root injected no budget of its own.
+// The per-scan entry budget bounds how many /input entries ONE scan enumerates. Its
+// value and its non-positive-means-default rule live in internal/scanbudget; what
+// follows is why the bound exists at all.
 //
 // The per-file and per-PEM-block caps bound what one certificate costs; nothing
 // bounded how MANY the walk would take on. /input is a mounted tree this app does not
@@ -136,23 +138,8 @@ func (r *ScanResult) inputFullyEnumerated() bool {
 // scanner would invert that direction and give the silent `health` subcommand a path
 // into the scan machinery.
 //
-// This constant is only the guard for a Scanner constructed without a budget (a
-// caller that never wired one, and the package's own tests): it matches
-// internal/config's default so a never-wired scanner behaves like a default-configured
-// one, which is why the two numbers are allowed to be spelled twice — config's is the
-// operator contract, this one is the floor under a missing wiring.
-const fallbackScanEntries = 10_000
-
-// effectiveEntryBudget resolves an injected per-scan budget: non-positive means
-// fallbackScanEntries, so every consumer of Options.MaxScanEntries — the /input walk,
-// the /output orphan walk and the observation log — is bounded even when assembled
-// field by field without one, and the rule is spelled once.
-func effectiveEntryBudget(n int) int {
-	if n > 0 {
-		return n
-	}
-	return fallbackScanEntries
-}
+// The floor under a Scanner constructed without a budget is scanbudget.Default, the same
+// number internal/config hands the operator, from the one home both packages read.
 
 // errScanBudgetExceeded marks the abort above. It is its own sentinel so the walk's
 // own callers (and a test) can tell a refused-because-too-large tree from an
@@ -205,8 +192,8 @@ type Options struct {
 	OutRoot   string
 	Password  string
 	// MaxScanEntries is how many entries one scan may enumerate in EACH mounted tree
-	// before it refuses that tree (fallbackScanEntries when non-positive): the /input
-	// walk (scanWalk.entryBudget) and the /output orphan walk (outputWalk.entryBudget)
+	// before it refuses that tree (scanbudget.Default when non-positive): the /input
+	// walk (scanWalk.maxEntries) and the /output orphan walk (outputWalk.maxEntries)
 	// each get the same ceiling, applied per tree rather than shared, because both are
 	// mounts this app does not own and either one can be made large by whoever can write
 	// to it. It is INJECTED rather than read from internal/config here: that package owns
@@ -403,18 +390,10 @@ type scanWalk struct {
 	// TOUCHED rather than what it converted.
 	entries int
 	// maxEntries is this walk's entry budget, injected from Options.MaxScanEntries.
-	// Non-positive means "use fallbackScanEntries" (entryBudget), so a scanWalk
+	// Non-positive means "use scanbudget.Default" (scanbudget.Effective), so a scanWalk
 	// assembled without one — the package's own focused tests do this — is bounded
 	// rather than unbounded.
 	maxEntries int
-}
-
-// entryBudget is the effective ceiling for this walk: the injected budget, or
-// fallbackScanEntries when nothing was injected. The fallback is resolved HERE rather
-// than at construction so every assembler of a scanWalk gets a bound, including the
-// tests that build one field by field.
-func (sw *scanWalk) entryBudget() int {
-	return effectiveEntryBudget(sw.maxEntries)
 }
 
 // visit is the walk's per-entry callback (atomicfile.WalkDirInRoot). The context is
@@ -473,7 +452,7 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 	// without converting anything. Returning an error aborts the walk, which is what
 	// keeps `seen` from being read as a complete enumeration downstream.
 	sw.entries++
-	if budget := sw.entryBudget(); sw.entries > budget {
+	if budget := scanbudget.Effective(sw.maxEntries); sw.entries > budget {
 		slog.Warn(scanBudgetMsg,
 			"path", rel, "entries", sw.entries, "limit", budget,
 			"remediation", scanBudgetRemediation)
@@ -842,7 +821,7 @@ type observationLog struct {
 	// and then nothing is protected.
 	activeWhole map[string]struct{}
 	// maxPairs is the injected ceiling (Options.MaxScanEntries); non-positive means
-	// fallbackScanEntries. Resolved through maxObservedPairs.
+	// scanbudget.Default. Resolved through maxObservedPairs.
 	maxPairs int
 	// evictedWholeness counts wholeness entries reserve had to drop since the last
 	// take. It is the log's own report that it can no longer answer completedPair for
@@ -854,9 +833,12 @@ type observationLog struct {
 	evictedWholeness int
 }
 
-// newObservationLog builds an empty log bounded at maxPairs entries per half. A
-// non-positive maxPairs means fallbackScanEntries: an unbounded log is not an option
-// this constructor offers, because /input path churn is what fills it.
+// newObservationLog builds an empty log whose EACH of three sets — the signatures
+// (seen), the wholeness evidence (whole) and the lone-key reports (loneKeys) — is
+// bounded at maxPairs entries independently, so the log's process-lifetime ceiling is
+// three times maxPairs rather than two. A non-positive maxPairs means
+// scanbudget.Default: an unbounded log is not an option this constructor offers,
+// because /input path churn is what fills it.
 func newObservationLog(maxPairs int) *observationLog {
 	return &observationLog{
 		seen:     make(map[string][sha256.Size]byte),
@@ -915,7 +897,8 @@ func (o *observationLog) markWhole(rel string) {
 // markLoneKey records that rel's bundle is being retained because a sibling key is
 // still present while the certificate is gone, and reports whether that is NEW — i.e.
 // whether the condition has to be logged on this scan. Once reported it stays silent
-// until markWhole sees the pair whole again or clearLoneKey retires it with the bundle.
+// until markWhole sees the pair whole again or clearLoneKey retires it because the
+// leftover key went.
 //
 // A full log answers true every time rather than remembering: this set is bounded by
 // the same ceiling as the rest of the log, and re-reporting a retained private-key
@@ -934,7 +917,7 @@ func (o *observationLog) markLoneKey(rel string) bool {
 }
 
 // clearLoneKey retires the lone-key report for rel: the pair read whole again, or the
-// bundle was finally deleted once the key went too.
+// leftover key is gone, so the retention this report described no longer holds.
 func (o *observationLog) clearLoneKey(rel string) {
 	delete(o.loneKeys, rel)
 }
@@ -998,7 +981,7 @@ func (o *observationLog) record(rel string, fp [sha256.Size]byte, obs []convert.
 // which is why the budget is injected into this log too rather than derived a second
 // time from anything else.
 func (o *observationLog) maxObservedPairs() int {
-	return effectiveEntryBudget(o.maxPairs)
+	return scanbudget.Effective(o.maxPairs)
 }
 
 // reserve makes room for a path this log has not seen before, evicting one remembered
@@ -1036,7 +1019,7 @@ func (o *observationLog) reserve(rel string) {
 // leave the two halves out of step and can never spend evidence the active scan
 // established. It is reserve's SIGNATURE arm, so it takes its victim from `seen`, and
 // it normally finds one: reserve calls it only when len(seen) >= maxObservedPairs()
-// (never 0, since the fallback is fallbackScanEntries) and only for a path that is
+// (never 0, since the fallback is scanbudget.Default) and only for a path that is
 // absent from `seen`, while the paths protected for the active scan are a strict subset
 // of the entries charged to that same scan-entry ceiling. If every candidate IS
 // protected, the log holds one entry over the ceiling for the rest of the walk rather
@@ -1336,12 +1319,12 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	// bundle those inputs produce is known. Observations describe the INPUT, so
 	// they are logged either way — a reordered bundle or a multi-key file is the
 	// same operator-visible fact whether or not a write follows.
-	analysis, err := convert.Analyse(certPEM, keyPEM)
+	analysis, err := convert.Analyse(ctx, certPEM, keyPEM)
 	if err != nil {
 		return failEntry(rel, "conversion failed", err)
 	}
 	observations := analysis.Observations()
-	state, err := sw.out.inspect(ctx, pfxRel, &analysis, sw.enc, sw.password)
+	state, err := sw.out.inspect(ctx, pfxRel, analysis, sw.enc, sw.password)
 	if err != nil {
 		// A cancellation, and nothing else: inspect resolves every "I cannot tell what
 		// is on disk" outcome (an unreadable, oversized, non-regular or undecodable
@@ -1363,7 +1346,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	}
 
 	slog.Debug("converting cert pair", "path", rel)
-	pfxData, err := convert.Encode(&analysis, sw.enc, sw.password)
+	pfxData, err := convert.Encode(analysis, sw.enc, sw.password)
 	if err != nil {
 		logConversionObservations(rel, observations)
 		return failEntry(rel, "conversion failed", err)
@@ -1416,11 +1399,12 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 // BOTH hold before the health-neutral outcome is granted instead:
 //
 //  1. This app never proved the bundle on disk wrong (bundleState.bundleNotProvenWrong):
-//     it either compared the bytes and they matched, or it could not read them at all. A
-//     bundle it DID compare and find stale — a renewal behind, a rotated password, an
-//     absent or non-regular output path — stays a conversion failure whatever refused the
-//     write, because the operator is being served the wrong bundle and that has to be
-//     loud (the README's /output contract).
+//     it could not read the bytes at all. A bundle it DID compare and find stale — a
+//     renewal behind, a rotated password, an absent or non-regular output path — stays a
+//     conversion failure whatever refused the write, because the operator is being served
+//     the wrong bundle and that has to be loud (the README's /output contract). A bundle
+//     it compared and MATCHED never reaches here at all: convertEntry returns at
+//     `if state.upToDate()` before the write.
 //  2. No restart can clear what refused the write (restartCanClearWrite): a permission
 //     denial, a read-only mount, a full volume, an exhausted quota.
 //

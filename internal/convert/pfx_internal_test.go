@@ -49,11 +49,11 @@ func TestEncode_encode_failure_is_wrapped(t *testing.T) {
 func TestDecode_bounds_the_library_message(t *testing.T) {
 	t.Parallel()
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "bounded-error", "ecdsa")
-	analysis, err := Analyse(certPEM, keyPEM)
+	analysis, err := Analyse(t.Context(), certPEM, keyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(&analysis, EncNameModern2023, "pw")
+	pfx, err := Encode(analysis, EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}

@@ -136,6 +136,21 @@ const reapDisabledPhrase = "orphan removal is disabled for this scan"
 // removed — so the emit and the test that pins it cannot drift.
 const evictedEvidenceMsg = reapDisabledPhrase + ": the observation log dropped the evidence that separates a replaced private key from a missing one, so an orphan cannot be proven"
 
+// evictedEvidenceRemediation is that WARN's operator action, and it deliberately does
+// NOT lead with the pair count. The log's ceiling is MAX_SCAN_ENTRIES and so is the walk
+// budget (scanbudget.Effective serves both), while one scan charges at least two entries
+// per pair (the .crt and its sibling .key), so a single scan can never fill the ceiling:
+// reaching it means the log accumulated entries for paths that are GONE, which
+// observationLog.forget prunes on any walk that proves the enumeration complete. The
+// first action is therefore to clear whatever leaves scans incomplete; raising the
+// ceiling only helps against genuine path churn, and against the count of paths this
+// /input has HELD, not the count it holds now.
+const evictedEvidenceRemediation = "clear whatever leaves scans incomplete first - the unreadable-path, " +
+	"unresolved-symlink and entry-budget warnings above - because the observation log only " +
+	"prunes paths that are gone on a scan that fully enumerates /input; if /input legitimately " +
+	"churns certificate paths, raise MAX_SCAN_ENTRIES above the number of distinct paths it has " +
+	"held since this container started, not the number it holds now"
+
 // logIncompleteInputEnumeration reports why orphan reconciliation is skipped when
 // the input enumeration is incomplete. Without a complete enumeration, "this output
 // has no matching input" is not a claim the scan can make: a bundle whose cert the
@@ -166,7 +181,7 @@ func logIncompleteInputEnumeration(rc *reapContext) {
 		// the transient Debug line and lose the only remediation an operator gets.
 		slog.Warn(evictedEvidenceMsg,
 			"evidence_evicted", rc.evidenceEvicted,
-			"remediation", "raise MAX_SCAN_ENTRIES to at least the number of certificate pairs under /input, or reduce what /input holds")
+			"remediation", evictedEvidenceRemediation)
 	case rc.enumerationClean():
 		// A complete walk that found no pair at all: the enumeration did not fail, there
 		// is simply nothing to compare the output tree against. logInputCoverageWarnings
@@ -371,10 +386,6 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 		}
 		if rp.out.removeOrphan(rel) {
 			removedPaths = append(removedPaths, rel)
-			// The pair is gone from /input entirely and its bundle with it, so the
-			// lone-key report for it is retired: if the same name ever comes back and
-			// loses its certificate again, that is a new condition to name.
-			rp.observations.clearLoneKey(cert)
 			deleted++
 		}
 	}
@@ -437,13 +448,20 @@ func (rp *reaper) reportRetainedLoneKeys(orphaned []string, walkSafe bool) {
 func (rp *reaper) keyStillPresent(rel, cert string) bool {
 	key := layout.KeyFor(cert)
 	if rp.src.pathAbsent(key) {
+		// The retention this report describes no longer holds, so retire it HERE: the
+		// leftover key is gone, and a half-deleted pair at this name later is a NEW
+		// condition to name. Retiring it on the DELETION instead left it un-retired in
+		// every mode that does not delete — warn is the default — so one report per
+		// name lasted the process lifetime.
+		rp.observations.clearLoneKey(cert)
 		return false
 	}
 	// De-duplicated per CHANGE, not per scan: the retention persists for as long as the
 	// operator leaves the pair half-deleted, and this WARN would otherwise repeat on
-	// every fsnotify event and every fallback tick. observationLog.markWhole retires the
-	// report when the pair reads whole again, and reapConfirmed retires it when the
-	// bundle is finally deleted.
+	// every fsnotify event and every fallback tick. It is retired by whichever change
+	// ends the retention: observationLog.markWhole when the pair reads whole again, and
+	// the absent-key arm above when the leftover key goes — whether or not this app is
+	// the thing that then deletes the bundle.
 	if rp.observations.markLoneKey(cert) {
 		slog.Warn(loneKeyRetainedMsg,
 			"path", rel, "input", cert, "key", key,
@@ -621,7 +639,7 @@ func resolveReap(mode outputpolicy.Lifecycle, reapable, walkSafe, refusalOnly bo
 		return reapDecision{reap: true}
 	}
 	return reapDecision{
-		inaction:    lifecycleInaction(mode, reapable, walkSafe, refusalOnly),
+		inaction:    lifecycleInaction(mode, walkSafe, refusalOnly),
 		remediation: orphanReportRemediation(mode, walkSafe, refusalOnly),
 	}
 }
@@ -649,13 +667,17 @@ func resolveReap(mode outputpolicy.Lifecycle, reapable, walkSafe, refusalOnly bo
 // Otherwise the list is trustworthy — the input enumeration was complete, or
 // reconcile would have returned earlier — and sync mode is only withholding this
 // app's own deletion until a scan with no conversion failures.
-func lifecycleInaction(mode outputpolicy.Lifecycle, reapable, walkSafe, refusalOnly bool) string {
+//
+// A sync-mode scan that reaches this function is never reapable: resolveReap returns
+// before calling it in that case, which is why the sync arms below need no separate
+// reapable term and why this signature matches orphanReportRemediation's.
+func lifecycleInaction(mode outputpolicy.Lifecycle, walkSafe, refusalOnly bool) string {
 	switch {
 	case !walkSafe:
 		return "kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle"
-	case mode == outputpolicy.LifecycleSync && !reapable && refusalOnly:
+	case mode == outputpolicy.LifecycleSync && refusalOnly:
 		return "kept: the output volume refused to let this app replace a prior bundle on this scan, so nothing is removed until a scan with no refused replacement"
-	case mode == outputpolicy.LifecycleSync && !reapable:
+	case mode == outputpolicy.LifecycleSync:
 		return "kept: a conversion failed on this scan, so nothing is removed until a scan with no failures"
 	}
 	return "reported only (OUTPUT_LIFECYCLE=" + string(mode) + ")"

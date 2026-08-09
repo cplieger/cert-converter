@@ -59,7 +59,7 @@ func FuzzAnalyse_keeps_the_bundle_internally_consistent(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, certPEM, keyPEM []byte) {
-		got, err := convert.Analyse(certPEM, keyPEM)
+		got, err := convert.Analyse(t.Context(), certPEM, keyPEM)
 		if err != nil {
 			// An unresolvable pair is a documented outcome (no key matches, several
 			// identities, the key belongs to an issuer), not a broken invariant.

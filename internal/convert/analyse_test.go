@@ -102,7 +102,7 @@ func TestAnalyse_is_invariant_under_input_order(t *testing.T) {
 			orderedKeys = append(orderedKeys, keyBlobs[i])
 		}
 
-		got, err := convert.Analyse(concatPEM(orderedCerts...), concatPEM(orderedKeys...))
+		got, err := convert.Analyse(t.Context(), concatPEM(orderedCerts...), concatPEM(orderedKeys...))
 		if err != nil {
 			rt.Fatalf("Analyse(cert order %v, key order %v) = error %v, want nil", certOrder, keyOrder, err)
 		}
@@ -128,7 +128,7 @@ func TestAnalyse_is_invariant_under_input_order(t *testing.T) {
 func assertKeyMatchesLeaf(tb interface {
 	Errorf(string, ...any)
 	Fatalf(string, ...any)
-}, a convert.Analysis,
+}, a *convert.Analysis,
 ) {
 	signer, ok := a.Key().(crypto.Signer)
 	if !ok {
@@ -234,7 +234,7 @@ func TestAnalyse_resolves_every_documented_input_shape(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := convert.Analyse(tc.certPEM, tc.keyPEM)
+			got, err := convert.Analyse(t.Context(), tc.certPEM, tc.keyPEM)
 
 			if tc.wantErr != "" {
 				if err == nil {
@@ -271,7 +271,7 @@ func TestAnalyse_orders_the_chain_nearest_parent_first(t *testing.T) {
 	m := testcerts.GenerateChainMaterial(t)
 
 	// Deliberately the worst input order: CA first, leaf last.
-	got, err := convert.Analyse(concatPEM(m.CAPEM, m.LeafPEM), m.LeafKeyPEM)
+	got, err := convert.Analyse(t.Context(), concatPEM(m.CAPEM, m.LeafPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}
@@ -314,7 +314,7 @@ func TestAnalyse_treats_a_key_repeated_twice_as_one_key(t *testing.T) {
 	t.Parallel()
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "repeated-key.example.com", "ecdsa")
 
-	got, err := convert.Analyse(certPEM, concatPEM(keyPEM, keyPEM))
+	got, err := convert.Analyse(t.Context(), certPEM, concatPEM(keyPEM, keyPEM))
 	if err != nil {
 		t.Fatalf("Analyse(one certificate, the same key twice) = error %v, want nil: two blocks holding one key are one key", err)
 	}
@@ -371,7 +371,7 @@ func TestAnalyse_reports_an_out_of_window_identity_without_refusing_it(t *testin
 				NotAfter:     tc.notAfter,
 			}, &key.PublicKey, nil, key)
 
-			got, err := convert.Analyse(certPEM, testcerts.KeyPEM(t, key))
+			got, err := convert.Analyse(t.Context(), certPEM, testcerts.KeyPEM(t, key))
 			if err != nil {
 				t.Fatalf("Analyse(%s) = error %v, want nil: validity is never a gate", tc.name, err)
 			}
@@ -399,7 +399,7 @@ func TestAnalyse_reports_no_validity_observation_for_a_current_identity(t *testi
 		NotAfter:     now.Add(time.Hour),
 	}, &key.PublicKey, nil, key)
 
-	got, err := convert.Analyse(certPEM, testcerts.KeyPEM(t, key))
+	got, err := convert.Analyse(t.Context(), certPEM, testcerts.KeyPEM(t, key))
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}
@@ -439,7 +439,7 @@ func TestAnalyse_reports_an_out_of_window_chain_certificate(t *testing.T) {
 		NotAfter:     now.Add(time.Hour),
 	}, &leafKey.PublicKey, caCert, caKey)
 
-	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, leafKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(valid leaf + expired issuer) = error %v, want nil: validity is never a gate", err)
 	}
@@ -472,7 +472,7 @@ func TestAnalyse_caps_the_subjects_it_names_in_the_exclusion_observation(t *test
 		bundle = append(bundle, extraPEM...)
 	}
 
-	got, err := convert.Analyse(bundle, identityKeyPEM)
+	got, err := convert.Analyse(t.Context(), bundle, identityKeyPEM)
 	if err != nil {
 		t.Fatalf("Analyse(identity + 5 unrelated certificates) = error %v, want nil", err)
 	}
@@ -518,7 +518,7 @@ func TestAnalyse_reports_a_chain_link_left_out_because_its_label_is_not_CERTIFIC
 		t.Run(label, func(t *testing.T) {
 			bundle := concatPEM(leafPEM, relabelPEM(t, caPEM, label))
 
-			got, err := convert.Analyse(bundle, keyPEM)
+			got, err := convert.Analyse(t.Context(), bundle, keyPEM)
 			if err != nil {
 				t.Fatalf("Analyse(leaf + %q block) = error %v, want nil", label, err)
 			}
@@ -546,7 +546,7 @@ func TestAnalyse_reports_no_skipped_block_for_a_combined_cert_and_key_file(t *te
 	leafPEM, keyPEM, caPEM, _ := testcerts.GenerateCertChain(t)
 	combined := concatPEM(leafPEM, keyPEM, caPEM)
 
-	got, err := convert.Analyse(combined, keyPEM)
+	got, err := convert.Analyse(t.Context(), combined, keyPEM)
 	if err != nil {
 		t.Fatalf("Analyse(combined cert+key file) = error %v, want nil", err)
 	}
@@ -571,7 +571,7 @@ func TestAnalyse_names_the_unusable_key_blocks_when_nothing_matches(t *testing.T
 	// write into /input leaves it.
 	truncated := truncatedKeyBlock()
 
-	_, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), concatPEM(unrelatedKeyPEM, truncated))
+	_, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), concatPEM(unrelatedKeyPEM, truncated))
 	if err == nil {
 		t.Fatal("Analyse(unrelated key + truncated key block) = nil error, want a no-match error")
 	}
@@ -604,7 +604,7 @@ func TestAnalyse_names_an_unparseable_and_an_encrypted_key_block_when_nothing_ma
 	garbage := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("not a DER key")})
 	encrypted := pem.EncodeToMemory(&pem.Block{Type: "ENCRYPTED PRIVATE KEY", Bytes: []byte("ciphertext")})
 
-	_, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), concatPEM(unrelatedKeyPEM, garbage, encrypted))
+	_, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), concatPEM(unrelatedKeyPEM, garbage, encrypted))
 	if err == nil {
 		t.Fatal("Analyse(unrelated key + unparseable key + encrypted key) = nil error, want a no-match error")
 	}
@@ -634,7 +634,7 @@ func TestAnalyse_reports_unusable_key_blocks_when_a_usable_key_still_matches(t *
 	// only the declaration count knows it was ever there.
 	truncated := truncatedKeyBlock()
 
-	got, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), concatPEM(m.LeafKeyPEM, truncated))
+	got, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), concatPEM(m.LeafKeyPEM, truncated))
 	if err != nil {
 		t.Fatalf("Analyse(matching key + truncated key block) = %v, want success: the usable key still matches", err)
 	}
@@ -667,7 +667,7 @@ func TestAnalyse_reports_unusable_key_blocks_for_an_unreadable_label(t *testing.
 	// Low-entropy placeholder body: only the label matters to the rule under test.
 	openssh := pem.EncodeToMemory(&pem.Block{Type: "OPENSSH PRIVATE KEY", Bytes: []byte("foo")})
 
-	got, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), concatPEM(m.LeafKeyPEM, openssh))
+	got, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), concatPEM(m.LeafKeyPEM, openssh))
 	if err != nil {
 		t.Fatalf("Analyse(matching key + OpenSSH-format block) = %v, want success: the usable key still matches", err)
 	}
@@ -697,7 +697,7 @@ func TestAnalyse_reports_unusable_key_blocks_for_an_unreadable_label(t *testing.
 func TestAnalyse_reports_no_key_block_observation_for_a_certificate_passenger(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	got, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), concatPEM(m.LeafKeyPEM, m.LeafPEM))
+	got, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), concatPEM(m.LeafKeyPEM, m.LeafPEM))
 	if err != nil {
 		t.Fatalf("Analyse(combined cert+key file) = %v, want success", err)
 	}
@@ -717,7 +717,7 @@ func TestAnalyse_reports_no_key_block_observation_for_an_ec_parameters_passenger
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
 
-	got, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), concatPEM(ecParametersPEM(), m.LeafKeyPEM))
+	got, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), concatPEM(ecParametersPEM(), m.LeafKeyPEM))
 	if err != nil {
 		t.Fatalf("Analyse(ecparam -genkey key file) = %v, want success", err)
 	}
@@ -789,7 +789,7 @@ func TestAnalyse_reports_no_unrelated_block_observation_for_a_combined_ec_file(t
 			t.Parallel()
 			combined := concatPEM(m.LeafPEM, ecParametersPEM(), keyPEM)
 
-			got, err := convert.Analyse(combined, combined)
+			got, err := convert.Analyse(t.Context(), combined, combined)
 			if err != nil {
 				t.Fatalf("Analyse(combined ecparam -genkey file) = %v, want success", err)
 			}
@@ -836,7 +836,7 @@ func TestAnalyse_reports_ec_parameters_the_certificate_file_cannot_account_for(t
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			got, err := convert.Analyse(tc.certFile, tc.keyFile)
+			got, err := convert.Analyse(t.Context(), tc.certFile, tc.keyFile)
 			if err != nil {
 				t.Fatalf("Analyse(certificate file with stray EC parameters) = %v, want success", err)
 			}
@@ -863,7 +863,7 @@ func TestAnalyse_reports_ec_parameters_the_certificate_file_cannot_account_for(t
 func TestAnalyse_reports_no_key_block_observation_for_a_clean_key_file(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	got, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	got, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("Analyse(clean input) = %v, want success", err)
 	}
@@ -885,7 +885,7 @@ func TestAnalyse_names_the_original_block_number_of_a_leaf_that_is_not_first(t *
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
 
-	got, err := convert.Analyse(concatPEM(m.CAPEM, m.CAPEM, m.LeafPEM), m.LeafKeyPEM)
+	got, err := convert.Analyse(t.Context(), concatPEM(m.CAPEM, m.CAPEM, m.LeafPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("Analyse(duplicated CA ahead of the leaf) = error %v, want nil", err)
 	}
@@ -914,7 +914,7 @@ func TestAnalysis_Observations_returns_a_copy(t *testing.T) {
 	m := testcerts.GenerateChainMaterial(t)
 
 	// A duplicated certificate guarantees at least one observation to mutate.
-	got, err := convert.Analyse(concatPEM(m.LeafPEM, m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	got, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("Analyse(duplicated leaf) = error %v, want nil", err)
 	}
@@ -941,7 +941,7 @@ func TestAnalyse_names_the_skipped_certificate_file_blocks_when_nothing_matches(
 	m := testcerts.GenerateChainMaterial(t)
 	_, unrelatedKeyPEM := testcerts.GenerateSelfSignedCert(t, "unrelated.example.com", "ecdsa")
 
-	_, err := convert.Analyse(concatPEM(m.LeafPEM, relabelPEM(t, m.CAPEM, "TRUSTED CERTIFICATE")), unrelatedKeyPEM)
+	_, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, relabelPEM(t, m.CAPEM, "TRUSTED CERTIFICATE")), unrelatedKeyPEM)
 	if err == nil {
 		t.Fatal("Analyse(relabelled CA link + unrelated key) = nil error, want a no-match error")
 	}
@@ -957,7 +957,7 @@ func TestAnalyse_names_the_skipped_certificate_file_blocks_when_nothing_matches(
 	}
 
 	// A clean certificate file adds no clause.
-	_, err = convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), unrelatedKeyPEM)
+	_, err = convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), unrelatedKeyPEM)
 	if err == nil {
 		t.Fatal("Analyse(clean bundle + unrelated key) = nil error, want a no-match error")
 	}

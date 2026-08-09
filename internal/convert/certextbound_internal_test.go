@@ -397,14 +397,14 @@ func TestAnalyse_converts_a_realistic_large_SAN_certificate(t *testing.T) {
 		t.Fatalf("fixture is only %d bytes of DER: it no longer reproduces the size that regressed", derLen)
 	}
 
-	analysis, err := Analyse(certPEM, keyPEM)
+	analysis, err := Analyse(t.Context(), certPEM, keyPEM)
 	if err != nil {
 		t.Fatalf("Analyse refused a valid %d-byte large-SAN certificate: %v", derLen, err)
 	}
 	if got := len(analysis.Leaf().DNSNames); got != 300 {
 		t.Errorf("analysed leaf carries %d DNS names, want 300", got)
 	}
-	if _, err := Encode(&analysis, EncNameModern2023, "fixture-password"); err != nil {
+	if _, err := Encode(analysis, EncNameModern2023, "fixture-password"); err != nil {
 		t.Fatalf("Encode failed for a valid %d-byte large-SAN certificate: %v", derLen, err)
 	}
 }

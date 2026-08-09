@@ -23,7 +23,7 @@ import (
 func TestInspect_identifies_every_profile_we_emit(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
@@ -36,7 +36,7 @@ func TestInspect_identifies_every_profile_we_emit(t *testing.T) {
 	} {
 		t.Run(string(want), func(t *testing.T) {
 			t.Parallel()
-			pfx, err := convert.Encode(&analysis, want, "pw")
+			pfx, err := convert.Encode(analysis, want, "pw")
 			if err != nil {
 				t.Fatalf("Encode(%s) = %v, want nil", want, err)
 			}
@@ -57,11 +57,11 @@ func TestInspect_identifies_every_profile_we_emit(t *testing.T) {
 func TestInspect_rejects_what_we_would_not_have_written(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	good, err := convert.Encode(&analysis, convert.EncNameModern2023, "pw")
+	good, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
+	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/slogx"
 )
@@ -29,22 +30,16 @@ const defaultFallbackInterval = 6 * time.Hour
 // clamp WARN, and the two must report the same ceiling.
 const maxFallbackHours = 87600
 
-// defaultMaxScanEntries is the number of /input paths ONE scan will enumerate when
-// MAX_SCAN_ENTRIES is unset, empty, or unusable. A Caddy certificate directory holds
-// a handful of entries per domain, so ten thousand is already orders of magnitude
-// above any real deployment while keeping the walk's worst case small.
-const defaultMaxScanEntries = 10000
-
-// maxScanEntriesCeiling is the largest ceiling MAX_SCAN_ENTRIES may raise the budget
-// to; a higher configured value is clamped to it. It is the historical hardcoded
-// bound, kept as the upper limit so raising the setting cannot restore an
-// effectively unbounded walk.
+// MAX_SCAN_ENTRIES' value domain — the default and the ceiling — lives in
+// internal/scanbudget, because internal/process and internal/watch enforce the same two
+// numbers for their own walks and neither of them may import this package. What stays
+// here is what config DOES with them: parsing the operator's raw value, clamping it, and
+// naming a repaired one in a warning.
 //
 // There is deliberately NO disable value (no "0"/"false" spelling, unlike
-// FALLBACK_SCAN_HOURS): disabling the budget would reopen the single-scan
-// memory/CPU exhaustion path the ceiling exists to close, so a zero or negative
-// value is treated as unusable input and falls back to the default.
-const maxScanEntriesCeiling = 200000
+// FALLBACK_SCAN_HOURS): disabling the budget would reopen the single-scan memory/CPU
+// exhaustion path the ceiling exists to close, so a zero or negative value is treated as
+// unusable input and falls back to scanbudget.Default.
 
 // scanEntriesRepair reports whether parsing accepted, defaulted, or clamped the
 // configured MAX_SCAN_ENTRIES. Parsing stays silent because maxScanEntriesFromEnv is
@@ -58,9 +53,9 @@ const (
 	// default.
 	scanEntriesAccepted scanEntriesRepair = iota
 	// scanEntriesInvalid means the value was unparseable or non-positive and
-	// defaultMaxScanEntries was substituted.
+	// scanbudget.Default was substituted.
 	scanEntriesInvalid
-	// scanEntriesClamped means the value was above maxScanEntriesCeiling and was
+	// scanEntriesClamped means the value was above scanbudget.Ceiling and was
 	// clamped down to it.
 	scanEntriesClamped
 )
@@ -284,12 +279,12 @@ func isPositiveOverflow(trimmed string, err error) bool {
 // paths one scan may enumerate, and reports how the value had to be repaired to get
 // there. Surrounding whitespace is trimmed first, so " 5000 " parses as 5000.
 // An empty or whitespace-only value — or any unparseable, zero, or negative value —
-// yields defaultMaxScanEntries, matching an unset variable, so a misconfigured
-// budget never becomes an unbounded walk. A value above maxScanEntriesCeiling is
+// yields scanbudget.Default, matching an unset variable, so a misconfigured
+// budget never becomes an unbounded walk. A value above scanbudget.Ceiling is
 // clamped to it, including a valid decimal too large for int64: a positive
 // out-of-range number counts as above-ceiling, not as malformed input.
 //
-// There is deliberately no disable spelling (see maxScanEntriesCeiling): "0" and
+// There is deliberately no disable spelling (see scanbudget.Ceiling): "0" and
 // "false" are unusable input here, not an opt-out, because a scan with no entry
 // budget is the exhaustion path the ceiling exists to close.
 //
@@ -299,19 +294,19 @@ func isPositiveOverflow(trimmed string, err error) bool {
 func parseMaxScanEntries(v string) (int, scanEntriesRepair) {
 	trimmed := strings.TrimSpace(v)
 	if trimmed == "" {
-		return defaultMaxScanEntries, scanEntriesAccepted
+		return scanbudget.Default, scanEntriesAccepted
 	}
 	// Atoi rather than ParseInt: the budget is an int, so parsing at the target
 	// width keeps the clamp from needing a narrowing conversion, and an
 	// int-overflowing value still arrives as ErrRange.
 	n, err := strconv.Atoi(trimmed)
-	if isPositiveOverflow(trimmed, err) || (err == nil && n > maxScanEntriesCeiling) {
-		return maxScanEntriesCeiling, scanEntriesClamped
+	if isPositiveOverflow(trimmed, err) || (err == nil && n > scanbudget.Ceiling) {
+		return scanbudget.Ceiling, scanEntriesClamped
 	}
 	if err == nil && n > 0 {
 		return n, scanEntriesAccepted
 	}
-	return defaultMaxScanEntries, scanEntriesInvalid
+	return scanbudget.Default, scanEntriesInvalid
 }
 
 // warnFallbackRepaired emits the operator-facing diagnostic for a
@@ -352,11 +347,11 @@ func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
 	switch repair {
 	case scanEntriesClamped:
 		slog.Warn("MAX_SCAN_ENTRIES too large, clamping",
-			"value", raw, "max_entries", maxScanEntriesCeiling)
+			"value", raw, "max_entries", scanbudget.Ceiling)
 	case scanEntriesInvalid:
 		slog.Warn("invalid MAX_SCAN_ENTRIES, using default",
-			"value", raw, "default", defaultMaxScanEntries,
-			"expected", "a whole number of entries between 1 and "+strconv.Itoa(maxScanEntriesCeiling)+" (there is no value that disables the budget)")
+			"value", raw, "default", scanbudget.Default,
+			"expected", "a whole number of entries between 1 and "+strconv.Itoa(scanbudget.Ceiling)+" (there is no value that disables the budget)")
 	case scanEntriesAccepted:
 		// The configured budget was used as-is; nothing to report.
 	}

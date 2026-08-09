@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/layout"
+	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -122,7 +123,7 @@ type Watcher struct {
 	fallback time.Duration
 
 	// maxEntries is how many paths ONE watch-set walk may enumerate before it
-	// stops registering (fallbackWatchEntries when non-positive). It is INJECTED
+	// stops registering (scanbudget.Default when non-positive). It is INJECTED
 	// exactly as internal/process.Options.MaxScanEntries is: internal/config owns
 	// MAX_SCAN_ENTRIES' name, default, ceiling and repaired-value diagnostics, and
 	// this package stays a leaf that package configures.
@@ -154,16 +155,10 @@ func WithFallback(d time.Duration) Option {
 }
 
 // WithMaxEntries sets how many paths one watch-set walk may enumerate. Zero or a
-// negative value uses fallbackWatchEntries.
+// negative value uses scanbudget.Default.
 func WithMaxEntries(n int) Option {
 	return func(w *Watcher) { w.maxEntries = n }
 }
-
-// fallbackWatchEntries guards a Watcher constructed without a budget (a caller
-// that never wired one, and this package's own tests). It matches
-// internal/config's MAX_SCAN_ENTRIES default so an un-wired Watcher walks like a
-// default-configured one.
-const fallbackWatchEntries = 10000
 
 // watchBudgetMsg is the operator-facing half of a watch-set walk that stopped at
 // the budget. It names the health consequence (none) and what is lost (real-time
@@ -648,13 +643,10 @@ func (w *Watcher) addWatchDirs(ctx context.Context, watcher *fsnotify.Watcher, r
 }
 
 // newWatchSetBudget resolves one walk's share of the two entry ceilings, falling back
-// to fallbackWatchEntries when no ceiling was configured: an unbounded walk is not an
+// to scanbudget.Default when no ceiling was configured: an unbounded walk is not an
 // option, because the tree it enumerates is one this app does not own.
 func (w *Watcher) newWatchSetBudget(root string) *watchSetBudget {
-	budget := &watchSetBudget{max: w.maxEntries, root: root}
-	if budget.max <= 0 {
-		budget.max = fallbackWatchEntries
-	}
+	budget := &watchSetBudget{max: scanbudget.Effective(w.maxEntries), root: root}
 	return budget
 }
 

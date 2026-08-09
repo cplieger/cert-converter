@@ -8,11 +8,13 @@ import (
 	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"math/bits"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -190,13 +192,16 @@ func (s *certScan) visit(block *pem.Block) error {
 // 256 KiB clears the sibling's ~78 KB largest legal shape with real headroom for
 // large-SAN private PKI (a public-CA leaf is 1-2 KB; 250 SAN entries of 243 bytes
 // measure 61,826 bytes), and it still bounds the parse's transient allocation by a
-// wide margin: the reproduced amplification retained ~534 MB from a 9.43 MB block,
-// so the same shape at 256 KiB retains on the order of 14 MB — comfortably inside
-// a container memory limit.
+// wide margin: the reproduced amplification retained ~534 MB from a 6.96 MB DER
+// block (the 9.43 MB PEM file that carries it), i.e. ~77 bytes retained per DER
+// byte, so the same shape at 256 KiB retains ~19 MB — comfortably inside a
+// container memory limit.
 const maxCertDERBytes = 256 << 10
 
 // Aggregate ceilings on what ONE parsed certificate may RETAIN for the life of the
-// chain, in both of the shapes x509.ParseCertificate keeps: the extension
+// chain, in the two EXTENSION shapes x509.ParseCertificate keeps (a parsed
+// distinguished name is a third, counted by none of these and bounded only by
+// maxCertDERBytes): the extension
 // IDENTIFIERS (one int per identifier arc, held in Certificate.Extensions) and the
 // decoded extension CONTENT (one freshly allocated Go value per encoded name,
 // identifier or URI, held in the typed fields the parser fills). Inside the 10 MB
@@ -537,10 +542,99 @@ func boundLogText(s string, limit int) string {
 // puts a multi-megabyte line into the logs of every scan that retries the pair.
 const maxSubjectLogLen = 256
 
-// boundSubject truncates a certificate subject to maxSubjectLogLen bytes for a
-// log-bound diagnostic, dropping the partial rune the cut may leave behind so
-// the %q form stays readable. It is a named alias for the package's shared
-// boundLogText rule.
+// maxSubjectRenderAttrs bounds how many distinguished-name attributes are handed to
+// pkix.RDNSequence.String() when a certificate subject is rendered for a diagnostic.
+//
+// It exists because that renderer is QUADRATIC in its own output: pkix accumulates
+// with `s += ...` once per attribute (go1.26.5, crypto/x509/pkix/pkix.go), so
+// rendering a whole name and then truncating it costs O(rendered bytes^2). None of
+// this package's retention ceilings bounds a distinguished name — maxCertExtensions,
+// maxCertExtensionOIDArcs and maxCertExtensionElements all measure EXTENSIONS — so a
+// certificate inside maxCertDERBytes may spend its whole DER on subject attributes.
+// Measured on go1.26.5, every shape below reporting zero extensions, zero identifier
+// arcs and zero retained elements, so every existing ceiling waves them through. A
+// subject of attributes pkix keeps in NAMED fields renders in 2.9ms at 1,000
+// attributes, 62ms at 5,000 and 317ms at 11,900 (the most maxCertDERBytes admits);
+// one built from attributes pkix does NOT name (emailAddress, a private arc) is the
+// worse shape, because each renders to a longer hex form: 7.4ms, 257ms and 1,121ms at
+// the same three sizes.
+//
+// 256 is far above anything real (a public-CA subject carries under ten attributes)
+// and is chosen so the bound cannot change what an operator reads: every rendered
+// attribute contributes at least a type name, an "=" and a separator, so 256 of them
+// always overrun maxSubjectLogLen and boundSubject's cut lands in identical bytes.
+// Verified against the unbounded render over 4 attribute-OID shapes x 5 sizes (1, 4,
+// 1,000, 5,000 and 11,900 attributes): the first 256 bytes are byte-identical in all
+// 20, and the worst render falls from 1,121ms to 1.6ms.
+const maxSubjectRenderAttrs = 256
+
+// subjectForLog renders a certificate's subject for a log-bound diagnostic. It is the
+// package's only door to a certificate-supplied name, and it bounds BOTH axes: the
+// attributes handed to pkix's quadratic renderer, and the bytes of the result.
+//
+// The sanitize step still runs AFTER the render (boundSubject -> boundLogText ->
+// runesafe.SanitizeSingleLineCapped), which is the order that rule requires: pkix
+// escapes only the DN metacharacters and leaves control bytes and newlines intact.
+func subjectForLog(c *x509.Certificate) string {
+	return boundSubject(boundedDN(dnSequence(&c.Subject)).String())
+}
+
+// dnSequence returns the RDNSequence pkix.Name.String() renders, mirroring that
+// method's own construction so the bounded render below is byte-identical to the
+// unbounded one it replaces.
+//
+// The mirror is load-bearing and Name.ToRDNSequence() is NOT a substitute for it:
+// ToRDNSequence reports only the nine attribute types pkix keeps in named fields,
+// whereas String() additionally surfaces every OTHER attribute the parser left in
+// Names, placed at the front of the sequence so it renders at the end of the string.
+// Rendering ToRDNSequence alone therefore DROPS attributes a certificate really
+// carries — measured over 4 OID shapes x 5 sizes, it matched the unbounded render in
+// only 5 of 20 cases, and a subject holding one emailAddress attribute
+// (1.2.840.113549.1.9.1, not a named field) rendered 68 bytes through String() and 29
+// through ToRDNSequence, losing the attribute silently — and it would leave the
+// quadratic path unbounded for exactly the names built out of unrecognised OIDs. The
+// skipped arc set below is pkix's, and it is the set ToRDNSequence already covers.
+func dnSequence(n *pkix.Name) pkix.RDNSequence {
+	var rdns pkix.RDNSequence
+	if n.ExtraNames == nil {
+		for _, atv := range n.Names {
+			t := atv.Type
+			if len(t) == 4 && t[0] == 2 && t[1] == 5 && t[2] == 4 {
+				switch t[3] {
+				case 3, 5, 6, 7, 8, 9, 10, 11, 17:
+					// Already carried by a named field, so ToRDNSequence emits it.
+					continue
+				}
+			}
+			rdns = append(rdns, []pkix.AttributeTypeAndValue{atv})
+		}
+	}
+	return append(rdns, n.ToRDNSequence()...)
+}
+
+// boundedDN returns the part of seq that pkix.RDNSequence.String() emits FIRST — it
+// walks the sequence in REVERSE — carrying at most maxSubjectRenderAttrs attributes.
+// The trailing RDNs are kept whole and the one the budget runs out inside keeps its
+// LEADING members, because String() emits an RDN's members in forward order. A name
+// holding fewer attributes than the budget is returned unchanged, so no real name is
+// rendered differently at all.
+func boundedDN(seq pkix.RDNSequence) pkix.RDNSequence {
+	budget := maxSubjectRenderAttrs
+	for i, rdn := range slices.Backward(seq) {
+		if len(rdn) >= budget {
+			bounded := make(pkix.RDNSequence, 0, len(seq)-i)
+			bounded = append(bounded, rdn[:budget])
+			return append(bounded, seq[i+1:]...)
+		}
+		budget -= len(rdn)
+	}
+	return seq
+}
+
+// boundSubject truncates an ALREADY-RENDERED certificate subject to maxSubjectLogLen
+// bytes for a log-bound diagnostic, dropping the partial rune the cut may leave
+// behind so the %q form stays readable. It is a named alias for the package's shared
+// boundLogText rule, reached through subjectForLog so the render is bounded too.
 func boundSubject(subject string) string {
 	return boundLogText(subject, maxSubjectLogLen)
 }
@@ -657,7 +751,7 @@ func parsePrivateKeys(pemBytes []byte) ([]crypto.Signer, keyDefects, error) {
 	}
 	if len(scan.keys) == 0 {
 		return nil, keyDefects{}, noPrivateKeyError(scan.firstParseErr, scan.sawEncrypted, scan.skipped,
-			declaredKeyBlocks-scan.decodedBlocks)
+			scan.unrelated, declaredKeyBlocks-scan.decodedBlocks)
 	}
 	return scan.keys, keyDefects{
 		firstUnreadable:   scan.unrelated.firstTypeForLog(),
@@ -672,15 +766,17 @@ func parsePrivateKeys(pemBytes []byte) ([]crypto.Signer, keyDefects, error) {
 // noPrivateKeyError explains why parsePrivateKeys decoded no usable key, in
 // order of specificity: a DER parse failure from a key-labelled block outranks
 // "everything was encrypted", which outranks "there were PEM blocks, none of
-// them a key" (which names the first skipped block's label, bounded, so an
-// ssh-keygen-format or otherwise unsupported key file is diagnosable from the
-// message alone), which outranks "no PEM block at all". The last two are further
+// them a key" (which names the first label that names no key format this app
+// reads, falling back to the first skipped label when every skipped block is an
+// expected companion, bounded, so an ssh-keygen-format or otherwise unsupported
+// key file is diagnosable from the message alone), which outranks "no PEM block
+// at all". The last two are further
 // qualified by undecodedKeyBlocks, the number of private-key declarations the
 // file carries that encoding/pem dropped (truncated armour, a corrupt body, or
 // a run-together END/BEGIN line), so a damaged key file is not reported with
 // the same sentence as a file that genuinely holds no key. The base sentence is
 // kept as the prefix so existing log matching is unaffected.
-func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped skippedBlocks, undecodedKeyBlocks int) error {
+func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped, unrelated skippedBlocks, undecodedKeyBlocks int) error {
 	switch {
 	case firstParseErr != nil:
 		return firstParseErr
@@ -688,7 +784,18 @@ func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped skippedBl
 		return errors.New("private key PEM block is encrypted; decrypt it before use")
 	}
 	msg := "no private key PEM block found"
-	if skipped.count > 0 {
+	// The label named is the first one that names NO key format this app reads, not
+	// simply the first skipped one: a key file may legitimately carry its certificate
+	// or the EC PARAMETERS companion of the key beside it, and those come FIRST in
+	// every file that has them, so naming the first skipped block pointed the operator
+	// at an expected passenger while the ssh-keygen-format block this clause exists to
+	// diagnose went unmentioned. It is the same preference keyDefects.firstUnreadable
+	// already applies on the success path, so the two diagnoses name the same block.
+	switch {
+	case unrelated.count > 0:
+		msg = fmt.Sprintf("%s (%d of the %d skipped PEM block(s) name no key format this app reads, first %q)",
+			msg, unrelated.count, skipped.count, unrelated.firstTypeForLog())
+	case skipped.count > 0:
 		msg = fmt.Sprintf("%s (skipped %d PEM block(s), first %q)", msg, skipped.count,
 			skipped.firstTypeForLog())
 	}

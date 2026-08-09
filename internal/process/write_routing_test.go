@@ -27,13 +27,13 @@ import (
 //
 // Three properties are load-bearing here and none of them is visible from a single case:
 //
-//   - contentUnverified earns the same health-neutral treatment as contentVerifiedCurrent.
-//     "I could not read it" is not "it is out of date", and only the second is evidence
-//     that the operator is being served the wrong bundle.
+//   - contentUnverified is the ONE fact that earns the health-neutral treatment. "I could
+//     not read it" is not "it is out of date", and only the second is evidence that the
+//     operator is being served the wrong bundle.
 //   - contentVerifiedStale NEVER earns it, whatever refused the write. A renewal this app
 //     could not publish has to be loud, which is the README's /output contract.
 //   - The clearability question is asked of the ERROR, not of the reason for the rewrite,
-//     so the same errno routes the same way under both facts that grant neutrality.
+//     so the errno alone decides the routing once the fact grants neutrality.
 //
 // The bundle's MODE is deliberately absent from every case: it decides nothing here, and
 // listing it would imply otherwise. contentUnresolved is here as the zero value: the
@@ -55,14 +55,6 @@ func TestWriteOutcome_derives_the_status_from_two_independent_facts(t *testing.T
 		"a write that landed over an unverifiable prior is a conversion too": {
 			state: bundleState{content: contentUnverified}, writeErr: nil, want: statusConverted,
 		},
-		"a content-matched prior whose rewrite is refused for permissions is health-neutral": {
-			state:    bundleState{content: contentVerifiedCurrent},
-			writeErr: refused, want: statusUnwritable,
-		},
-		"a content-matched prior whose rewrite a full volume refuses is health-neutral too": {
-			state:    bundleState{content: contentVerifiedCurrent},
-			writeErr: full, want: statusUnwritable,
-		},
 		"an unverifiable prior whose rewrite is refused for permissions is health-neutral": {
 			state: bundleState{content: contentUnverified}, writeErr: refused, want: statusUnwritable,
 		},
@@ -71,10 +63,6 @@ func TestWriteOutcome_derives_the_status_from_two_independent_facts(t *testing.T
 		},
 		"an unverifiable prior whose rewrite fails for an unattributable reason fails": {
 			state: bundleState{content: contentUnverified}, writeErr: brokenIO, want: statusFailed,
-		},
-		"a content-matched prior whose rewrite fails for an unattributable reason fails": {
-			state:    bundleState{content: contentVerifiedCurrent},
-			writeErr: brokenIO, want: statusFailed,
 		},
 		"a stale bundle whose rewrite is refused for permissions is still a failure": {
 			state: bundleState{content: contentVerifiedStale}, writeErr: refused, want: statusFailed,
@@ -144,7 +132,7 @@ func TestRestartCanClearWrite_enumerates_the_unclearable_classes(t *testing.T) {
 // loop.
 func TestStoreInspect_reports_content_it_could_not_verify(t *testing.T) {
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
@@ -168,7 +156,7 @@ func TestStoreInspect_reports_content_it_could_not_verify(t *testing.T) {
 			stage(t, dir)
 			s := newOutputStore(t, dir)
 
-			state, err := s.inspect(t.Context(), "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+			state, err := s.inspect(t.Context(), "out.pfx", analysis, convert.EncNameModern2023, "pw")
 			if err != nil {
 				t.Fatalf("inspect(unverifiable prior) = error %v, want nil: it must resolve to a fact, not fail the pair", err)
 			}
@@ -473,9 +461,9 @@ func statSize(t *testing.T, path string) int64 {
 // only to ask CheckCurrency whether a written bundle matches it.
 func mustAnalyse(t *testing.T, certPEM, keyPEM []byte) *convert.Analysis {
 	t.Helper()
-	analysis, err := convert.Analyse(certPEM, keyPEM)
+	analysis, err := convert.Analyse(t.Context(), certPEM, keyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	return &analysis
+	return analysis
 }

@@ -1,6 +1,7 @@
 package process
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"log/slog"
@@ -291,6 +292,49 @@ func TestOutputWalkVisit_an_unreadable_path_vetoes_the_reap(t *testing.T) {
 	}
 
 	assertDebugOnly(t, logs, wantMsg, "locked/tls.pfx")
+}
+
+// TestOutputWalkVisit_stops_the_orphan_walk_once_the_scan_is_cancelled pins the orphan
+// walk's PER-ENTRY cancellation guard, the one contract of visit nothing else reaches.
+//
+// The shared walker checks the context once per READ BATCH (atomicfile's fixed 256-entry
+// batch), so inside a batch this guard is the only thing that stops the enumeration -- and
+// a flat /output smaller than one batch is checked exactly once, before any entry is
+// visited. Drop it and a scan cancelled inside that batch enumerates the rest of the tree
+// and reports its candidates: under the default OUTPUT_LIFECYCLE=warn that is the orphan
+// WARN, its bounded path sample and the lone-key retentions, all emitted while the
+// container is stopping -- the noise every other shutdown arm in this package refuses --
+// and listOutputs returns no error, so a scan cancelled mid-reconciliation can still be
+// reported complete. Nothing in the suite goes red for any of it.
+//
+// Asserted on the visitor directly, exactly as the unreadable-path case above is, and with
+// a REAL candidate: an entry that would otherwise be collected is what shows the guard runs
+// before the classification rather than merely somewhere in the function.
+func TestOutputWalkVisit_stops_the_orphan_walk_once_the_scan_is_cancelled(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundle := filepath.Join(dir, "live.pfx")
+	if err := os.WriteFile(bundle, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	w := &outputWalk{ctx: ctx, safe: true}
+
+	err := w.visit("live.pfx", dirEntryOf(t, bundle), nil)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("visit(cancelled scan) = %v, want context.Canceled so the walk abandons the tree", err)
+	}
+	if len(w.found) != 0 {
+		t.Errorf("visit(cancelled scan) collected %v, want no candidate: a bundle enumerated after the"+
+			" shutdown was observed must not be reported as an orphan or reaped", w.found)
+	}
+	if w.entries != 0 {
+		t.Errorf("visit(cancelled scan) charged %d entries, want 0: the cancellation is answered before"+
+			" the budget accounting", w.entries)
+	}
 }
 
 // TestWalkLogPolicy_quiet_when_nothing_is_wrong pins the steady state: a readable

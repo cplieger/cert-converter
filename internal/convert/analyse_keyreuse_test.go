@@ -46,7 +46,7 @@ func TestAnalyse_accepts_a_regenerated_self_signed_certificate(t *testing.T) {
 	_, oldPEM, _ := testcerts.Mint(t, tmpl(60), &key.PublicKey, nil, key)
 	_, newPEM, _ := testcerts.Mint(t, tmpl(61), &key.PublicKey, nil, key)
 
-	got, err := convert.Analyse(concatPEM(oldPEM, newPEM), testcerts.KeyPEM(t, key))
+	got, err := convert.Analyse(t.Context(), concatPEM(oldPEM, newPEM), testcerts.KeyPEM(t, key))
 	if err != nil {
 		t.Fatalf("Analyse(regenerated self-signed cert beside its predecessor) = error %v, want nil", err)
 	}
@@ -93,7 +93,7 @@ func TestAnalyse_reports_a_key_that_belongs_to_an_issuer(t *testing.T) {
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, caCert, caKey)
 
-	_, err := convert.Analyse(concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, caKey))
+	_, err := convert.Analyse(t.Context(), concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, caKey))
 	if err == nil {
 		t.Fatal("Analyse(CA key beside a certificate it issued) = nil error, want a rejection")
 	}
@@ -139,7 +139,7 @@ func TestAnalyse_converts_a_key_shared_by_a_ca_and_its_leaf(t *testing.T) {
 		NotAfter:     leafNotBefore.Add(24 * time.Hour),
 	}, &sharedKey.PublicKey, caCert, sharedKey)
 
-	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, sharedKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, sharedKey))
 	if err != nil {
 		t.Fatalf("Analyse(one key for a CA and the leaf it signed) = %v, want the leaf to be selected", err)
 	}
@@ -208,7 +208,7 @@ func TestAnalyse_reports_the_shared_key_as_reuse_when_the_issuer_match_is_droppe
 		t.Fatalf("setup: CA did not actually sign the leaf: %v", err)
 	}
 
-	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, sharedKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, sharedKey))
 	if err != nil {
 		t.Fatalf("Analyse(one key for a CA and the leaf it signed) = %v, want the leaf selected", err)
 	}
@@ -272,7 +272,7 @@ func TestAnalyse_reports_both_a_renewal_tie_and_key_reuse(t *testing.T) {
 		NotAfter:     caNotBefore.Add(72 * time.Hour),
 	}, &sharedKey.PublicKey, caCert, sharedKey)
 
-	got, err := convert.Analyse(concatPEM(oldLeafPEM, newLeafPEM, caPEM), testcerts.KeyPEM(t, sharedKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(oldLeafPEM, newLeafPEM, caPEM), testcerts.KeyPEM(t, sharedKey))
 	if err != nil {
 		t.Fatalf("Analyse(renewed leaf pair plus their shared-key CA) = %v, want the newest leaf selected", err)
 	}
@@ -318,10 +318,9 @@ func TestAnalyse_reports_no_key_reuse_when_the_key_file_holds_two_keys(t *testin
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, caCert, caKey)
 
-	got, err := convert.Analyse(
+	got, err := convert.Analyse(t.Context(),
 		concatPEM(leafPEM, caPEM),
-		concatPEM(testcerts.KeyPEM(t, leafKey), testcerts.KeyPEM(t, caKey)),
-	)
+		concatPEM(testcerts.KeyPEM(t, leafKey), testcerts.KeyPEM(t, caKey)))
 	if err != nil {
 		t.Fatalf("Analyse(leaf and issuer certificates with both private keys) = %v, want the leaf selected", err)
 	}
@@ -361,10 +360,9 @@ func TestAnalyse_converts_when_key_file_holds_leaf_and_issuer_keys(t *testing.T)
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, caCert, caKey)
 
-	got, err := convert.Analyse(
+	got, err := convert.Analyse(t.Context(),
 		concatPEM(leafPEM, caPEM),
-		concatPEM(testcerts.KeyPEM(t, leafKey), testcerts.KeyPEM(t, caKey)),
-	)
+		concatPEM(testcerts.KeyPEM(t, leafKey), testcerts.KeyPEM(t, caKey)))
 	if err != nil {
 		t.Fatalf("Analyse(leaf and issuer certificates with both private keys) = %v, want the leaf selected", err)
 	}

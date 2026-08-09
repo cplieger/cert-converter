@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/slogx/capture"
 	"github.com/fsnotify/fsnotify"
 )
@@ -178,7 +179,7 @@ func TestVisitWatchPath_applies_the_walk_error_policy(t *testing.T) {
 			}
 			w := New(root, func(context.Context) {}, WithFallback(tc.fallback))
 
-			err := w.visitWatchPath(t.Context(), nil, &watchSetBudget{max: fallbackWatchEntries, root: root}, path, nil, walkErr)
+			err := w.visitWatchPath(t.Context(), nil, &watchSetBudget{max: scanbudget.Default, root: root}, path, nil, walkErr)
 
 			if tc.wantFatal {
 				if !errors.Is(err, walkErr) {
@@ -210,7 +211,7 @@ func TestVisitWatchPath_reports_shutdown_ahead_of_a_walk_error(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := w.visitWatchPath(ctx, nil, &watchSetBudget{max: fallbackWatchEntries, root: root}, filepath.Join(root, "example.com"), nil, errors.New("permission denied"))
+	err := w.visitWatchPath(ctx, nil, &watchSetBudget{max: scanbudget.Default, root: root}, filepath.Join(root, "example.com"), nil, errors.New("permission denied"))
 
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("visitWatchPath(cancelled ctx, walkErr) = %v, want context.Canceled: shutdown outranks the walk error so Run treats it as a clean stop", err)

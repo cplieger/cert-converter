@@ -2,6 +2,7 @@ package convert
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/rsa"
 	"crypto/x509"
@@ -244,6 +245,14 @@ type Observation struct {
 // is this package's business. Keeping the fields unexported is also what makes
 // Analyse's invariant hold — no caller can swap the leaf, reorder the chain or
 // null the key and hand the result back to Encode or CheckCurrency.
+//
+// Analyse returns a *Analysis and never mutates one afterwards: Encode,
+// CheckCurrency and matchesAnalysis all read it and none writes to it, so the
+// value is safe to share and to hand back to the codec unchanged. Callers hold the
+// pointer rather than a copy because the struct is large enough that copying it
+// per call is wasteful (gocritic hugeParam), and because Observations is a pointer
+// method — a value return could not be consumed through the type's own only
+// exported method without being bound to a variable first.
 type Analysis struct {
 	// leaf is the end-entity certificate the PFX is built around.
 	leaf *x509.Certificate
@@ -292,6 +301,16 @@ func (a *Analysis) Observations() []Observation {
 // Analyse resolves a certificate bundle and a key file into the identity, chain
 // and key a PKCS#12 bundle needs. It performs no I/O.
 //
+// ctx is the caller's shutdown signal. It is consulted only where a signature
+// verification is about to be paid for (certGraph.verifiable), which is the only
+// cost in an analysis the input FILE dictates: one analysis can pay up to
+// maxChainCerts^2 verifications, each bounded by maxVerifiableKeyBits and
+// maxVerifiablePublicExponent to milliseconds but not bounded in number. A
+// cancellation abandons the analysis and returns an error wrapping ctx.Err(), so
+// errors.Is(err, context.Canceled) holds and the caller classifies it as a
+// shutdown rather than a conversion failure. No accepted input's outcome changes:
+// with a live context this behaves exactly as it did before.
+//
 // Identity selection is key-first and structural, never positional. The private
 // key is matched against every certificate in the bundle, and the certificate it
 // matches is the identity wherever it appeared in the file. That is what makes
@@ -314,8 +333,8 @@ func (a *Analysis) Observations() []Observation {
 // mid-reduction. Everything past this line is a pure function of the input plus
 // that one instant, which is what lets analyseAt reproduce a validity or
 // tie-break decision at an exact moment instead of near it.
-func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
-	return analyseAt(certPEM, keyPEM, time.Now())
+func Analyse(ctx context.Context, certPEM, keyPEM []byte) (*Analysis, error) {
+	return analyseAt(ctx, certPEM, keyPEM, time.Now())
 }
 
 // analyseAt is Analyse with the scan instant supplied rather than read, so the
@@ -323,18 +342,32 @@ func Analyse(certPEM, keyPEM []byte) (Analysis, error) {
 // exact time. Unexported on purpose: no caller outside this package has a reason
 // to analyse a bundle at anything other than now, and widening the exported
 // surface to hand one in would invite exactly that.
-func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
+//
+// ctx carries Analyse's cancellation contract unchanged.
+func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (*Analysis, error) {
 	in, err := prepareAnalysisInput(certPEM, keyPEM)
 	if err != nil {
-		return Analysis{}, err
+		return nil, err
 	}
 	certs, obs := in.certs, in.observations
 
-	g := newCertGraph(certs, now)
+	// Three cancellation reads, one after each phase that can pay a verification.
+	// A verdict derived from a partially built graph is not merely incomplete, it is
+	// WRONG in an operator-visible way: selectIdentity and oversizedIssuerError both
+	// return refusals derived from proven, so propagating one built on a cancelled
+	// graph would log a bogus "conversion failed" at Error and flip the health
+	// marker on a container that was only asked to stop.
+	g := newCertGraph(ctx, certs, now)
+	if g.cancelErr != nil {
+		return nil, fmt.Errorf("analyse cancelled: %w", g.cancelErr)
+	}
 
 	identity, tieObs, err := g.selectIdentity(in.signers, in.keyIssues, in.certIssues)
+	if g.cancelErr != nil {
+		return nil, fmt.Errorf("analyse cancelled: %w", g.cancelErr)
+	}
 	if err != nil {
-		return Analysis{}, err
+		return nil, err
 	}
 	obs = append(obs, tieObs...)
 
@@ -350,8 +383,11 @@ func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 	// parsed certificates. Folded at the call site rather than inside
 	// oversizedIssuerError, which reasons over the graph and holds no input record.
 	path := g.pathFrom(identity.cert)
+	if g.cancelErr != nil {
+		return nil, fmt.Errorf("analyse cancelled: %w", g.cancelErr)
+	}
 	if err := g.oversizedIssuerError(path); err != nil {
-		return Analysis{}, errors.New(appendCertIssues(
+		return nil, errors.New(appendCertIssues(
 			err.Error()+in.keyIssues.suffix(), in.certIssues))
 	}
 
@@ -367,14 +403,14 @@ func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 	// the CA, so the operator lands here and is told to remove certificates from a
 	// bundle that is fine while the unreadable key block goes unmentioned.
 	if g.isIssuer(identity.cert) {
-		return Analysis{}, errors.New(appendCertIssues(fmt.Sprintf(
+		return nil, errors.New(appendCertIssues(fmt.Sprintf(
 			"the private key matches %q, which is an issuer of another certificate in this bundle, not an end-entity certificate; if you meant to export that CA itself, remove the certificates it issued from the bundle%s",
-			boundSubject(leaf.Subject.String()), in.keyIssues.suffix()), in.certIssues))
+			subjectForLog(leaf), in.keyIssues.suffix()), in.certIssues))
 	}
 	if leaf.BasicConstraintsValid && leaf.IsCA {
 		obs = append(obs, Observation{
 			Kind:   ObsCAAsIdentity,
-			Detail: fmt.Sprintf("selected identity %q asserts IsCA", boundSubject(leaf.Subject.String())),
+			Detail: fmt.Sprintf("selected identity %q asserts IsCA", subjectForLog(leaf)),
 		})
 	}
 
@@ -392,7 +428,11 @@ func analyseAt(certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 	obs = append(obs, chainValidityObservations(chain, now)...)
 	obs = append(obs, chainIssuerEligibilityObservations(chain)...)
 
-	return Analysis{
+	if g.cancelErr != nil {
+		return nil, fmt.Errorf("analyse cancelled: %w", g.cancelErr)
+	}
+
+	return &Analysis{
 		leaf:         leaf,
 		chain:        chain,
 		key:          in.signers[identity.key],
@@ -527,8 +567,18 @@ type identityMatch struct {
 // operator is told about them. A proven edge here does not mean the chain is
 // trusted, and trust semantics must not be added to it.
 type certGraph struct {
-	now   time.Time
-	certs []*x509.Certificate
+	// ctx is the analysis's cancellation signal, consulted only where a signature
+	// verification is about to be paid for: maxVerifiableKeyBits and
+	// maxVerifiablePublicExponent bound ONE verification to milliseconds, and one
+	// analysis pays up to maxChainCerts^2 of them, so this is the granularity at
+	// which the work is actually interruptible.
+	ctx context.Context
+	// cancelErr latches the first cancellation seen, so a partially built graph is
+	// never mistaken for a complete one: analyseAt refuses to trust any verdict
+	// derived from it, including an error verdict.
+	cancelErr error
+	now       time.Time
+	certs     []*x509.Certificate
 	// evidence holds the cheap facts for every ORDERED pair, flattened row-major by
 	// child (edge indexes it). Filled eagerly by newCertGraph, because every fact in
 	// it is a byte, OID or decoded-name comparison over data already in memory. The
@@ -651,11 +701,23 @@ type issuanceEvidence struct {
 	eligible bool
 }
 
+// nameOrKeyIDLink reports whether a name or key-identifier relation ties the pair
+// together at all, BEFORE the key-reuse exclusion. It is the single home of that
+// conjunction because two sites turn on it and must not diverge: linked() negates
+// keyReuse against it, and fillEvidence uses it to decide whether the key-reuse
+// comparison is worth paying for. A widened linkage rule reaching only one of the
+// two would leave keyReuse uncomputed for a newly-linked pair, so a regenerated
+// self-signed certificate beside the one it replaces would record a mutual
+// issuance edge - the shape keyReuse exists to exclude.
+func (e issuanceEvidence) nameOrKeyIDLink() bool {
+	return e.name != nameLinkNone || e.keyID
+}
+
 // linked reports whether anything in this bundle ties the two certificates together
 // at all. It is the gate on the expensive fact: a pair with no name and no key-id
 // relationship has nothing for a signature to confirm, so proven never verifies one.
 func (e issuanceEvidence) linked() bool {
-	return !e.keyReuse && (e.name != nameLinkNone || e.keyID)
+	return !e.keyReuse && e.nameOrKeyIDLink()
 }
 
 // maxVerifiableKeyBits bounds the public-key size this app will run a signature
@@ -743,8 +805,9 @@ func unverifiableKeyReason(pub crypto.PublicKey) string {
 // the hops of the path chain selection actually chose, because a bundle whose selected
 // path spends only proven edges does not depend on the unverifiable one and was being
 // refused for a key it never reads.
-func newCertGraph(certs []*x509.Certificate, now time.Time) *certGraph {
+func newCertGraph(ctx context.Context, certs []*x509.Certificate, now time.Time) *certGraph {
 	g := &certGraph{
+		ctx:               ctx,
 		now:               now,
 		certs:             certs,
 		evidence:          make([]issuanceEvidence, len(certs)*len(certs)),
@@ -789,7 +852,7 @@ func (g *certGraph) fillEvidence() {
 			}
 			// Only a pair something already links can be excluded as key reuse, and
 			// the exclusion costs a public-key comparison, so it is asked last.
-			if e.name != nameLinkNone || e.keyID {
+			if e.nameOrKeyIDLink() {
 				e.keyReuse = g.sameNameSameKey(child, parent)
 			}
 			g.evidence[child*len(g.certs)+parent] = e
@@ -961,7 +1024,7 @@ func (g *certGraph) unverifiableIssuerRival(child int) error {
 		}
 		return fmt.Errorf(
 			"certificate %q is named as the issuer of another certificate in this bundle and %s; no signature can be checked against it, so its place in the chain could only be guessed; remove it from the bundle",
-			boundSubject(c.Subject.String()), reason)
+			subjectForLog(c), reason)
 	}
 	return nil
 }
@@ -999,12 +1062,41 @@ func (g *certGraph) proven(child, parent int) bool {
 	if g.edge(child, parent).linked() {
 		c, p := g.certs[child], g.certs[parent]
 		if verifiableKey(p.PublicKey) {
+			if !g.verifiable() {
+				// Not memoised: a cancelled pair is the ABSENCE of an answer, and
+				// recording false would make any later read of this pair a silent
+				// negative rather than a missing one.
+				return false
+			}
 			g.proofChecks++
 			got = p.CheckSignature(c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) == nil
 		}
 	}
 	g.proof[key] = got
 	return got
+}
+
+// verifiable reports whether this analysis may still pay for a signature
+// verification, latching the first cancellation it sees. It returns a bool rather
+// than an error because every caller is a predicate; analyseAt reads cancelErr.
+//
+// This is the interruption point, and it sits HERE — immediately before a
+// CheckSignature — rather than at a phase boundary, because the phases are what
+// take the time: computeDistances pays the proven BFS eagerly and pathFrom asks
+// proven for every candidate parent of every node it walks, so a bundle whose
+// certificates are mutually name-linked fills the memo with up to
+// maxChainCerts*(maxChainCerts-1) distinct pairs. A check at entry to each phase
+// would leave that whole product uninterruptible; a check per verification bounds
+// the delay to one signature check.
+func (g *certGraph) verifiable() bool {
+	if g.cancelErr != nil {
+		return false
+	}
+	if err := g.ctx.Err(); err != nil {
+		g.cancelErr = err
+		return false
+	}
+	return true
 }
 
 // canIssueCertificates reports whether c's own extensions leave it able to issue
@@ -1074,18 +1166,6 @@ func (g *certGraph) isIssuer(i int) bool {
 	return false
 }
 
-// decodedName ASN.1-decodes a raw DER distinguished name. The false result means
-// the name could not be read as an RDNSequence (or carried trailing bytes), which
-// no caller may treat as a match: an undecodable name is compared against nothing.
-func decodedName(raw []byte) (pkix.RDNSequence, bool) {
-	var seq pkix.RDNSequence
-	rest, err := asn1.Unmarshal(raw, &seq)
-	if err != nil || len(rest) != 0 {
-		return nil, false
-	}
-	return seq, true
-}
-
 // canonicalName ASN.1-decodes a raw DER distinguished name and re-encodes the decoded
 // sequence, so semantic name equality is a byte comparison of two canonical forms
 // rather than a reflect.DeepEqual walk over two decoded trees.
@@ -1126,8 +1206,10 @@ func decodedName(raw []byte) (pkix.RDNSequence, bool) {
 // already takes: an unreadable name is compared against no other name rather than
 // against everything.
 func canonicalName(raw []byte) ([]byte, bool) {
-	seq, ok := decodedName(raw)
-	if !ok {
+	// A name that cannot be read as an RDNSequence, or that carries trailing
+	// bytes, is undecodable: it matches nothing rather than everything.
+	var seq pkix.RDNSequence
+	if rest, err := asn1.Unmarshal(raw, &seq); err != nil || len(rest) != 0 {
 		return nil, false
 	}
 	canonical, err := asn1.Marshal(seq)
@@ -1218,6 +1300,11 @@ func (g *certGraph) isSelfSigned(i int) bool {
 		return got
 	}
 	got := g.checkSelfSigned(i)
+	if g.cancelErr != nil {
+		// Same rule as proven's memo: a cancelled check produced no answer, so
+		// nothing is recorded for i.
+		return false
+	}
 	g.selfSigned[i] = got
 	return got
 }
@@ -1247,7 +1334,7 @@ func (g *certGraph) checkSelfSigned(i int) bool {
 	if !g.selfIssuedByName(i) {
 		return false
 	}
-	if !verifiableKey(c.PublicKey) {
+	if !verifiableKey(c.PublicKey) || !g.verifiable() {
 		return false
 	}
 	return c.CheckSignature(c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) == nil
@@ -1491,11 +1578,11 @@ func (g *certGraph) noMatchError(usableKeys, firstUnverifiable int, keyIssues ke
 			// type to name. Say what happened instead.
 			msg = fmt.Sprintf(
 				"certificate %q uses a public key algorithm crypto/x509 does not recognise, so it cannot be verified against the private key; re-issue it with an RSA, ECDSA or Ed25519 key",
-				boundSubject(c.Subject.String()))
+				subjectForLog(c))
 		} else {
 			msg = fmt.Sprintf(
 				"certificate %q has a public key of type %T that cannot be verified against the private key",
-				boundSubject(c.Subject.String()), c.PublicKey)
+				subjectForLog(c), c.PublicKey)
 		}
 		// The uncomparable count only covers PARSED certificate blocks, so "the
 		// unsupported key is the only explanation left" does not rule out a
@@ -1518,10 +1605,10 @@ func (g *certGraph) noMatchError(usableKeys, firstUnverifiable int, keyIssues ke
 		// to re-issue a certificate whose encoding is intact.
 		if c := g.certs[firstUnverifiable]; c.PublicKey == nil {
 			msg += fmt.Sprintf("; certificate %q holds a public key crypto/x509 could not read, so it was compared against no key",
-				boundSubject(c.Subject.String()))
+				subjectForLog(c))
 		} else {
 			msg += fmt.Sprintf("; certificate %q has a public key of type %T that cannot be compared against the supplied private key, so it was compared against no key",
-				boundSubject(c.Subject.String()), c.PublicKey)
+				subjectForLog(c), c.PublicKey)
 		}
 	}
 	return errors.New(appendCertIssues(msg, certIssues))
@@ -1573,7 +1660,7 @@ func (g *certGraph) resolveAmbiguousMatches(matches []identityMatch, keyIssues k
 	return best, []Observation{{
 		Kind: ObsRenewedCertTie,
 		Detail: fmt.Sprintf("one private key matches %d certificates; selected %q (NotBefore %s)",
-			len(matches), boundSubject(g.certs[best.cert].Subject.String()),
+			len(matches), subjectForLog(g.certs[best.cert]),
 			g.certs[best.cert].NotBefore.UTC().Format(time.RFC3339)),
 	}}, nil
 }
@@ -1836,7 +1923,7 @@ func (g *certGraph) assembleChain(path []int) (chain, extra []*x509.Certificate,
 			fallbackObs = append(fallbackObs, Observation{
 				Kind: ObsExtraCertsExcluded,
 				Detail: fmt.Sprintf("%d certificate(s) cannot issue certificates, so they are no issuer of %q and were excluded: %s",
-					len(disqualified), boundSubject(g.certs[terminal].Subject.String()), subjectsForLog(disqualified)),
+					len(disqualified), subjectForLog(g.certs[terminal]), subjectsForLog(disqualified)),
 			})
 		}
 		return chain, disqualified, append(obs, fallbackObs...)
@@ -1846,7 +1933,7 @@ func (g *certGraph) assembleChain(path []int) (chain, extra []*x509.Certificate,
 		obs = append(obs, Observation{
 			Kind: ObsExtraCertsExcluded,
 			Detail: fmt.Sprintf("%d certificate(s) are not part of %q's chain and were excluded: %s",
-				len(extra), boundSubject(leaf.Subject.String()), subjectsForLog(extra)),
+				len(extra), subjectForLog(leaf), subjectsForLog(extra)),
 		})
 	}
 	return chain, extra, obs
@@ -1873,13 +1960,13 @@ func (g *certGraph) assembleChain(path []int) (chain, extra []*x509.Certificate,
 // complete). Both are the same KIND at the same class; only the sentence differs,
 // because only one of them is a bundle the operator probably did not mean to ship.
 func (g *certGraph) terminusObservation(terminal int, extra, kept []*x509.Certificate, chainLen int) Observation {
-	subject := boundSubject(g.certs[terminal].Subject.String())
+	subject := subjectForLog(g.certs[terminal])
 	leftovers := ""
-	if len(extra) > 0 {
+	switch {
+	case len(kept) > 0:
 		leftovers = fmt.Sprintf("; %d of the remaining %d certificate(s) were kept rather than dropped", len(kept), len(extra))
-		if len(kept) == 0 {
-			leftovers = "; none of the remaining certificate(s) could be kept as chain material"
-		}
+	case len(extra) > 0:
+		leftovers = "; none of the remaining certificate(s) could be kept as chain material"
 	}
 	// A terminus that names ITSELF as its own issuer has its anchor right here, so
 	// what is missing is the proof rather than the certificate, and neither
@@ -1955,7 +2042,7 @@ func chainValidityObservations(chain []*x509.Certificate, now time.Time) []Obser
 			Kind: ObsChainCertOutOfWindow,
 			Detail: fmt.Sprintf(
 				"chain certificate %d of %d, %q, is outside its validity window (NotBefore %s, NotAfter %s)",
-				i+1, len(chain), boundSubject(c.Subject.String()),
+				i+1, len(chain), subjectForLog(c),
 				c.NotBefore.UTC().Format(time.RFC3339), c.NotAfter.UTC().Format(time.RFC3339)),
 		})
 	}
@@ -1985,8 +2072,8 @@ func (g *certGraph) unprovenPathObservations(path []int) []Observation {
 			Kind: ObsChainEdgeUnprovenIssuer,
 			Detail: fmt.Sprintf(
 				"chain certificate %d, %q, %s %q but no signature here proves it issued that certificate; it was included because nothing in this bundle could be proven to have signed that certificate, so a consumer may be unable to verify the chain",
-				i, boundSubject(g.certs[parent].Subject.String()), linkage,
-				boundSubject(g.certs[child].Subject.String())),
+				i, subjectForLog(g.certs[parent]), linkage,
+				subjectForLog(g.certs[child])),
 		})
 	}
 	return obs
@@ -2019,7 +2106,7 @@ func chainIssuerEligibilityObservations(chain []*x509.Certificate) []Observation
 			Kind: ObsChainCertCannotIssue,
 			Detail: fmt.Sprintf(
 				"chain certificate %d of %d, %q, %s; it is included in the bundle because it is part of the chain established here, but a strict consumer will reject the chain until that CA is re-issued",
-				i+1, len(chain), boundSubject(c.Subject.String()), reason),
+				i+1, len(chain), subjectForLog(c), reason),
 		})
 	}
 	return obs
@@ -2093,7 +2180,7 @@ func subjectsForLog(certs []*x509.Certificate) string {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		fmt.Fprintf(&b, "%q", boundSubject(c.Subject.String()))
+		fmt.Fprintf(&b, "%q", subjectForLog(c))
 	}
 	return b.String()
 }

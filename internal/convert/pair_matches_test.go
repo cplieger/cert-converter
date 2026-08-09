@@ -27,12 +27,12 @@ func TestDecodedMatchesAnalysis_leaf_guard(t *testing.T) {
 	t.Parallel()
 
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "leaf.example.com", "ecdsa")
-	analysis, err := convert.Analyse(certPEM, keyPEM)
+	analysis, err := convert.Analyse(t.Context(), certPEM, keyPEM)
 	if err != nil {
 		t.Fatal(err)
 	}
 	otherPEM, otherKeyPEM := testcerts.GenerateSelfSignedCert(t, "other.example.com", "ecdsa")
-	other, err := convert.Analyse(otherPEM, otherKeyPEM)
+	other, err := convert.Analyse(t.Context(), otherPEM, otherKeyPEM)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestDecodedMatchesAnalysis_leaf_guard(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			if got := convert.MatchesAnalysis(tt.decoded, &analysis); got != tt.want {
+			if got := convert.MatchesAnalysis(tt.decoded, analysis); got != tt.want {
 				t.Errorf("MatchesAnalysis = %v, want %v", got, tt.want)
 			}
 		})
@@ -69,7 +69,7 @@ func TestDecodedMatchesAnalysis_leaf_guard(t *testing.T) {
 func TestDecodedMatchesAnalysis_nil_analysis_leaf(t *testing.T) {
 	t.Parallel()
 	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "leaf.example.com", "ecdsa")
-	analysis, err := convert.Analyse(certPEM, keyPEM)
+	analysis, err := convert.Analyse(t.Context(), certPEM, keyPEM)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,11 +97,11 @@ func TestDecodedMatchesAnalysis_nil_analysis_leaf(t *testing.T) {
 func TestDecode_round_trips_an_encoded_bundle_into_a_currency_match(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := convert.Encode(&analysis, convert.EncNameModern2023, "pw")
+	pfx, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestDecode_round_trips_an_encoded_bundle_into_a_currency_match(t *testing.T
 		t.Fatalf("Decode returned %d CA cert(s), want %d: the chain must survive the round trip",
 			len(decoded.CACerts), len(analysis.Chain()))
 	}
-	if !convert.MatchesAnalysis(decoded, &analysis) {
+	if !convert.MatchesAnalysis(decoded, analysis) {
 		t.Error("MatchesAnalysis(the bundle just written from this analysis) = false, want true: a correct bundle would be rewritten on every scan")
 	}
 
@@ -134,7 +134,7 @@ func TestDecode_round_trips_an_encoded_bundle_into_a_currency_match(t *testing.T
 func TestDecodedMatchesAnalysis_rejects_a_bundle_whose_chain_or_key_differs(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestDecodedMatchesAnalysis_rejects_a_bundle_whose_chain_or_key_differs(t *t
 		t.Fatalf("setup: analysis chain length = %d, want 1", len(analysis.Chain()))
 	}
 	strangerPEM, strangerKeyPEM := testcerts.GenerateSelfSignedCert(t, "stranger.example.com", "ecdsa")
-	stranger, err := convert.Analyse(strangerPEM, strangerKeyPEM)
+	stranger, err := convert.Analyse(t.Context(), strangerPEM, strangerKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse(stranger): %v", err)
 	}
@@ -170,7 +170,7 @@ func TestDecodedMatchesAnalysis_rejects_a_bundle_whose_chain_or_key_differs(t *t
 	for name, decoded := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			if convert.MatchesAnalysis(decoded, &analysis) {
+			if convert.MatchesAnalysis(decoded, analysis) {
 				t.Errorf("MatchesAnalysis(%s) = true, want false: the bundle on disk is not the one these inputs produce", name)
 			}
 		})

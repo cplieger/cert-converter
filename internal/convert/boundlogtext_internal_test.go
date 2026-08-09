@@ -203,23 +203,6 @@ func TestBoundLogText_is_the_library_primitive_with_this_apps_marker(t *testing.
 	}
 }
 
-// TestTruncationMarker_does_not_drift_from_the_shared_leaf pins the one thing the
-// two bounding paths still share after the sanitizing one moved to the library.
-// internal/process bounds its orphan path sample with logtext.Cap (deliberately
-// unsanitized: those paths are the operator's own tree and its query key), and this
-// package hands runesafe the same const. The marker is an operator's log query key,
-// so two spellings would give one condition two vocabularies — the whole reason the
-// shared leaf exists. This asserts the wording reaching a diagnostic here IS that
-// const, not a copy that happens to match today.
-func TestTruncationMarker_does_not_drift_from_the_shared_leaf(t *testing.T) {
-	t.Parallel()
-	cut := boundLogText(strings.Repeat("a", maxSubjectLogLen+1), maxSubjectLogLen)
-	if !strings.HasSuffix(cut, logtext.Marker) {
-		t.Errorf("boundLogText marked a cut with %q, want the shared marker %q",
-			cut[max(0, len(cut)-32):], logtext.Marker)
-	}
-}
-
 // TestBoundedTextError_keeps_the_wrapped_error_reachable pins the Unwrap contract
 // boundedTextError's doc comment promises. The type replaces a crypto/x509 error's
 // rendered text with a bounded copy, so without Unwrap the wrapping is opaque and

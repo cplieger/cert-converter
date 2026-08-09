@@ -44,7 +44,7 @@ func TestAnalyse_drops_a_shared_key_issuer_across_a_name_encoding_difference(t *
 	if err := leafCert.CheckSignatureFrom(caCert); err != nil {
 		t.Fatalf("setup: CA did not actually sign leaf: %v", err)
 	}
-	got, err := convert.Analyse(concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, sharedKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, sharedKey))
 	if err != nil {
 		t.Fatalf("Analyse = %v, want the end-entity identity", err)
 	}
@@ -158,7 +158,7 @@ func TestAnalyse_keeps_a_ca_identity_whose_subject_only_matches_an_issuer_name_a
 		t.Fatal("setup: the pkix.Name approximations of the two names differ, so this bundle no longer reproduces the false issuer match")
 	}
 
-	got, err := convert.Analyse(concatPEM(caPEM, otherPEM), testcerts.KeyPEM(t, caKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(caPEM, otherPEM), testcerts.KeyPEM(t, caKey))
 	if err != nil {
 		t.Fatalf("Analyse(CA whose subject only approximately matches a co-bundled issuer name) = error %v, want the CA identity: it issued nothing in this bundle", err)
 	}
@@ -220,7 +220,7 @@ func TestAnalyse_orders_a_chain_proven_across_a_name_encoding_difference(t *test
 
 	// Input order deliberately breaks ancestry: root before upper. The additive
 	// fallback would emit 802,800,801.
-	got, err := convert.Analyse(concatPEM(leafPEM, lowerPEM, rootPEM, upperPEM), testcerts.KeyPEM(t, leafKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, lowerPEM, rootPEM, upperPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(chain proven across an encoding difference) = error %v, want nil", err)
 	}
@@ -276,7 +276,7 @@ func TestAnalyse_excludes_a_stranger_once_the_encoding_gap_is_proven(t *testing.
 		t.Fatal("setup: issuer and subject encodings unexpectedly match, so the gap under test is absent")
 	}
 
-	got, err := convert.Analyse(concatPEM(leafPEM, caPEM, strangerPEM), testcerts.KeyPEM(t, leafKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, caPEM, strangerPEM), testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}

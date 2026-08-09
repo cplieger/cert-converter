@@ -435,6 +435,47 @@ func TestNoteUnreadableInput_levels(t *testing.T) {
 	}
 }
 
+// TestNoteUnreadableInput_names_the_published_unreachable_prefix pins the exact substring
+// the README publishes as one of CertConverterInputPathUnreachable's four matchers,
+// `skipping cert: cannot read`.
+//
+// The table above asserts the SUFFIX only ("cannot read certificate"), and every other
+// assertion in this package compares a captured record against the production string
+// itself -- so rewording the emitted message (to "cannot read the certificate for cert",
+// say) keeps the whole suite green while the documented alert stops matching and an
+// operator whose /input has become unreadable is never paged. The rule's other three
+// matchers are each spelled out literally somewhere in the suite; this was the one that
+// was not.
+//
+// Both `what` values are driven because the message is composed at the call site
+// ("skipping cert: cannot read " + what) rather than held as a const, so the prefix is not
+// pinned by any single string.
+// Runs serially: it swaps slog.Default().
+func TestNoteUnreadableInput_names_the_published_unreachable_prefix(t *testing.T) {
+	const published = "skipping cert: cannot read"
+
+	root, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	sw := &scanWalk{src: &source{root: root}}
+
+	for _, what := range []string{"certificate", "private key"} {
+		logs := captureLogs(t)
+		if got := sw.noteUnreadableInput("example.com/tls.crt", "tls.crt", what,
+			errors.New("permission denied")); got != statusUnreadable {
+			t.Fatalf("noteUnreadableInput(%s, permission denied) = %v, want statusUnreadable", what, got)
+		}
+		if got := logs.CountLevel(slog.LevelWarn, published); got != 1 {
+			t.Errorf("noteUnreadableInput(%s, permission denied) logged %q at WARN %d times, want exactly"+
+				" 1: the README publishes that substring as CertConverterInputPathUnreachable's matcher,"+
+				" so rewording it silently stops the documented alert from ever firing again: %q",
+				what, published, got, logs.Messages())
+		}
+	}
+}
+
 // TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key pins the
 // partial-orphan notice, the sibling of the all-orphan one above: when only SOME
 // .crt files lack their .key, the pairs that do have a key still convert, so the

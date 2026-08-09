@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"pgregory.net/rapid"
 )
 
@@ -198,20 +199,20 @@ func TestParseMaxScanEntries_permitted_budget_and_padding_invariant(t *testing.T
 		// No input may yield a non-positive or above-ceiling budget: a zero budget
 		// would refuse every tree, and an above-ceiling one would reopen the
 		// single-scan exhaustion path the ceiling exists to close.
-		if got < 1 || got > maxScanEntriesCeiling {
-			t.Errorf("parseMaxScanEntries(%q) = %d, want a budget in [1, %d]", v, got, maxScanEntriesCeiling)
+		if got < 1 || got > scanbudget.Ceiling {
+			t.Errorf("parseMaxScanEntries(%q) = %d, want a budget in [1, %d]", v, got, scanbudget.Ceiling)
 		}
 
 		switch repair {
 		case scanEntriesClamped:
-			if got != maxScanEntriesCeiling {
+			if got != scanbudget.Ceiling {
 				t.Errorf("parseMaxScanEntries(%q) reported a clamp but returned %d, want %d",
-					v, got, maxScanEntriesCeiling)
+					v, got, scanbudget.Ceiling)
 			}
 		case scanEntriesInvalid:
-			if got != defaultMaxScanEntries {
+			if got != scanbudget.Default {
 				t.Errorf("parseMaxScanEntries(%q) reported an invalid value but returned %d, want %d",
-					v, got, defaultMaxScanEntries)
+					v, got, scanbudget.Default)
 			}
 		case scanEntriesAccepted:
 		default:
@@ -227,7 +228,7 @@ func TestParseMaxScanEntries_permitted_budget_and_padding_invariant(t *testing.T
 // everywhere except the handful of values the table names.
 func TestParseMaxScanEntries_accepts_every_count_up_to_the_ceiling(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		n := rapid.IntRange(1, maxScanEntriesCeiling).Draw(t, "entries")
+		n := rapid.IntRange(1, scanbudget.Ceiling).Draw(t, "entries")
 		raw := strconv.Itoa(n)
 		got, repair := parseMaxScanEntries(raw)
 		if repair != scanEntriesAccepted {
@@ -247,12 +248,12 @@ func TestParseMaxScanEntries_accepts_every_count_up_to_the_ceiling(t *testing.T)
 // int64 that reach it through the overflow path rather than the comparison.
 func TestParseMaxScanEntries_clamps_every_value_above_the_ceiling(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		n := rapid.Int64Range(maxScanEntriesCeiling+1, math.MaxInt64).Draw(t, "entries")
+		n := rapid.Int64Range(scanbudget.Ceiling+1, math.MaxInt64).Draw(t, "entries")
 		raw := strconv.FormatInt(n, 10)
 		got, repair := parseMaxScanEntries(raw)
-		if repair != scanEntriesClamped || got != maxScanEntriesCeiling {
+		if repair != scanEntriesClamped || got != scanbudget.Ceiling {
 			t.Errorf("parseMaxScanEntries(%q) = %d/%s, want %d/scanEntriesClamped: an above-ceiling budget must clamp instead of being accepted",
-				raw, got, scanRepairName(repair), maxScanEntriesCeiling)
+				raw, got, scanRepairName(repair), scanbudget.Ceiling)
 		}
 	})
 }

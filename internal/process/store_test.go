@@ -37,11 +37,11 @@ func newOutputStore(t *testing.T, dir string) *store {
 // about what a scan does with an output file, not about the shape of the fact set, so they
 // read better through this than through two lines of destructuring.
 //
-// The two facts inspect resolves independently — what it learned about the content, and
-// whether the mode on disk is laxer than policy — are asserted directly by the tests that
-// own them (TestStoreInspect_reports_content_it_could_not_verify,
-// TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install and the
-// write-routing tests), which is why this helper is allowed to collapse them.
+// The content fact inspect resolves is asserted directly by the tests that own it
+// (TestStoreInspect_reports_content_it_could_not_verify and the write-routing tests),
+// and the mode it reports on the way past by
+// TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install, which is
+// why this helper is allowed to collapse the state to one bool.
 func inspectCurrent(ctx context.Context, s *store, rel string, want *convert.Analysis,
 	enc convert.EncoderType, password string,
 ) (bool, error) {
@@ -854,7 +854,7 @@ func TestScannerRun_reports_but_does_not_rewrite_a_content_current_bundle_whose_
 				t.Fatalf("setup: Chmod(%v) changed the bundle's bytes, want only the mode touched", lax)
 			}
 			found := storedPerm(t, pfxPath)
-			if !laxerThanPolicy(found) {
+			if !laxerThan(found, pfxFileMode) {
 				t.Skipf("this filesystem stored %v for a chmod to %v, so there is no lax mode to report",
 					found, lax)
 			}
@@ -953,7 +953,7 @@ func TestScannerRun_a_write_for_its_own_reasons_installs_the_policy_mode(t *test
 		t.Fatalf("setup: Chmod: %v", err)
 	}
 	found := storedPerm(t, pfxPath)
-	if !laxerThanPolicy(found) {
+	if !laxerThan(found, pfxFileMode) {
 		t.Skipf("this filesystem stored %v for a chmod to 0644, so there is no lax mode to correct", found)
 	}
 
@@ -1009,12 +1009,12 @@ func TestScannerRun_a_write_for_its_own_reasons_installs_the_policy_mode(t *test
 func TestStoreInspect_treats_a_bundle_it_cannot_read_as_unverified_content(t *testing.T) {
 	outRoot := t.TempDir()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
 	pfxPath := filepath.Join(outRoot, "chain.pfx")
-	if err := os.WriteFile(pfxPath, mustEncode(t, &analysis), 0o600); err != nil {
+	if err := os.WriteFile(pfxPath, mustEncode(t, analysis), 0o600); err != nil {
 		t.Fatalf("setup: write bundle: %v", err)
 	}
 	// Laxer than policy AND unreadable by its owner: the two facts this case couples.
@@ -1022,7 +1022,7 @@ func TestStoreInspect_treats_a_bundle_it_cannot_read_as_unverified_content(t *te
 		t.Fatalf("setup: Chmod: %v", err)
 	}
 	found := storedPerm(t, pfxPath)
-	if !laxerThanPolicy(found) {
+	if !laxerThan(found, pfxFileMode) {
 		t.Skipf("this filesystem stored %v for a chmod to 0044, so there is no lax mode to report", found)
 	}
 	prevRead := readBoundedInRoot
@@ -1034,7 +1034,7 @@ func TestStoreInspect_treats_a_bundle_it_cannot_read_as_unverified_content(t *te
 	out := newOutputStore(t, outRoot)
 
 	logs := captureLogs(t)
-	state, err := out.inspect(t.Context(), "chain.pfx", &analysis, convert.EncNameModern2023, "pw")
+	state, err := out.inspect(t.Context(), "chain.pfx", analysis, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("inspect(unreadable bundle) = error %v, want nil: an unreadable prior resolves to a fact,"+
 			" not a failed pair", err)
@@ -1046,10 +1046,6 @@ func TestStoreInspect_treats_a_bundle_it_cannot_read_as_unverified_content(t *te
 	if state.upToDate() {
 		t.Error("inspect(unreadable bundle).upToDate() = true, want false: a bundle this app cannot read is" +
 			" one it cannot prove current, so it is rewritten through the CONTENT path")
-	}
-	if !state.modeLax {
-		t.Error("inspect(unreadable bundle).modeLax = false, want true: detection runs on what the lstat" +
-			" saw, independently of whether the read then succeeded")
 	}
 	if got := logs.CountLevel(slog.LevelWarn, laxBundleMsg); got != 1 {
 		t.Errorf("inspect(unreadable bundle) logged %q at WARN %d times, want exactly 1: %q",
@@ -1096,11 +1092,11 @@ func storedPerm(t *testing.T, path string) os.FileMode {
 func TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install(t *testing.T) {
 	outRoot := t.TempDir()
 	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
-	analysis, err := convert.Analyse(chainPEM, keyPEM)
+	analysis, err := convert.Analyse(t.Context(), chainPEM, keyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := convert.Encode(&analysis, convert.EncNameModern2023, "pw")
+	pfx, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1112,21 +1108,20 @@ func TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install(t
 		t.Fatalf("setup: Chmod: %v", err)
 	}
 	found := storedPerm(t, pfxPath)
-	if !laxerThanPolicy(found) {
+	if !laxerThan(found, pfxFileMode) {
 		t.Skipf("this filesystem stored %v for a chmod to 0644, so there is no lax mode to report", found)
 	}
 	s := newOutputStore(t, outRoot)
 
 	logs := captureLogs(t)
-	state, err := s.inspect(t.Context(), "chain.pfx", &analysis, convert.EncNameModern2023, "pw")
+	state, err := s.inspect(t.Context(), "chain.pfx", analysis, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("inspect(lax bundle) = error %v, want nil", err)
 	}
-	// The two facts the WARN accompanies: content matched, mode lax. They are INDEPENDENT
-	// now -- the second one routes nothing, which is why the currency answer below is
-	// unaffected by it.
-	if state.content != contentVerifiedCurrent || !state.modeLax {
-		t.Errorf("inspect(lax bundle) = %+v, want contentVerifiedCurrent with modeLax set", state)
+	// The content fact the WARN accompanies. The mode is reported and routes nothing,
+	// which is why the currency answer below is unaffected by it.
+	if state.content != contentVerifiedCurrent {
+		t.Errorf("inspect(lax bundle) = %+v, want contentVerifiedCurrent", state)
 	}
 	if !state.upToDate() {
 		t.Error("inspect(lax bundle).upToDate() = false, want true: currency is a question about content" +

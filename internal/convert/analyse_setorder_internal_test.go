@@ -235,7 +235,7 @@ func TestSETMemberOrder_is_one_rule_across_all_three_name_consumers(t *testing.T
 	// pair of fixtures exercises all three consumers.
 	first := certWithRawNames(t, 900, cnFirst, orgFirst, key)
 	second := certWithRawNames(t, 901, orgFirst, cnFirst, key)
-	g := newCertGraph([]*x509.Certificate{first, second}, time.Now())
+	g := newCertGraph(t.Context(), []*x509.Certificate{first, second}, time.Now())
 
 	// selfIssuedByName: each certificate's own subject and issuer are one name in the
 	// two orderings, so each is self-issued by name.
@@ -255,7 +255,7 @@ func TestSETMemberOrder_is_one_rule_across_all_three_name_consumers(t *testing.T
 	// exact arm), so each direction gets its own leaf.
 	leafCNIssuer := certWithRawNames(t, 902, rawRDNSequence(t, leafCN("a")), cnFirst, key)
 	leafOrgIssuer := certWithRawNames(t, 903, rawRDNSequence(t, leafCN("b")), orgFirst, key)
-	g = newCertGraph([]*x509.Certificate{first, second, leafCNIssuer, leafOrgIssuer}, time.Now())
+	g = newCertGraph(t.Context(), []*x509.Certificate{first, second, leafCNIssuer, leafOrgIssuer}, time.Now())
 
 	for _, tc := range []struct {
 		name          string

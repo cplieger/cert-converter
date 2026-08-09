@@ -71,7 +71,7 @@ func TestAnalyse_prefers_the_certificate_that_actually_signed_the_leaf(t *testin
 	} {
 		t.Run(order.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
+			got, err := convert.Analyse(t.Context(), concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
 			if err != nil {
 				t.Fatalf("Analyse = error %v, want nil", err)
 			}
@@ -121,7 +121,7 @@ func TestAnalyse_role_check_ignores_an_unverified_claim(t *testing.T) {
 	}
 	_, strangerPEM, _ := testcerts.Mint(t, strangerTmpl, &strangerKey.PublicKey, strangerSelf, strangerKey)
 
-	got, err := convert.Analyse(concatPEM(idPEM, strangerPEM), testcerts.KeyPEM(t, idKey))
+	got, err := convert.Analyse(t.Context(), concatPEM(idPEM, strangerPEM), testcerts.KeyPEM(t, idKey))
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil: a certificate merely CLAIMING this one as issuer must not make it an issuer", err)
 	}
@@ -204,7 +204,7 @@ func TestAnalyse_prefers_the_issuer_whose_route_to_a_root_verifies(t *testing.T)
 	} {
 		t.Run(order.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
+			got, err := convert.Analyse(t.Context(), concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
 			if err != nil {
 				t.Fatalf("Analyse = error %v, want nil", err)
 			}
@@ -289,7 +289,7 @@ func TestAnalyse_ranks_verified_issuers_by_validity_then_expiry(t *testing.T) {
 				NotAfter:     now.Add(24 * time.Hour),
 			}, &leafKey.PublicKey, secondCert, issuerKey)
 
-			got, err := convert.Analyse(concatPEM(leafPEM, firstPEM, secondPEM), testcerts.KeyPEM(t, leafKey))
+			got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, firstPEM, secondPEM), testcerts.KeyPEM(t, leafKey))
 			if err != nil {
 				t.Fatalf("Analyse = error %v, want nil", err)
 			}
@@ -372,7 +372,7 @@ func TestAnalyse_prefers_an_unverified_issuer_with_a_route_to_a_root(t *testing.
 	} {
 		t.Run(order.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
+			got, err := convert.Analyse(t.Context(), concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
 			if err != nil {
 				t.Fatalf("Analyse = error %v, want nil", err)
 			}
@@ -446,7 +446,7 @@ func TestAnalyse_prefers_the_shorter_inclusive_route(t *testing.T) {
 	} {
 		t.Run(order.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
+			got, err := convert.Analyse(t.Context(), concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
 			if err != nil {
 				t.Fatalf("Analyse = error %v, want nil", err)
 			}
@@ -513,7 +513,7 @@ func TestAnalyse_keeps_an_unproven_name_match_from_being_promoted(t *testing.T) 
 		} {
 			t.Run(order.name, func(t *testing.T) {
 				t.Parallel()
-				got, err := convert.Analyse(concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
+				got, err := convert.Analyse(t.Context(), concatPEM(order.certs...), testcerts.KeyPEM(t, leafKey))
 				if err != nil {
 					t.Fatalf("Analyse = error %v, want nil", err)
 				}
@@ -554,7 +554,7 @@ func TestAnalyse_keeps_an_unproven_name_match_from_being_promoted(t *testing.T) 
 			t.Fatal("setup: the regenerated certificate is not self-signed under its own re-encoded name")
 		}
 
-		got, err := convert.Analyse(concatPEM(firstPEM, secondPEM), testcerts.KeyPEM(t, sharedKey))
+		got, err := convert.Analyse(t.Context(), concatPEM(firstPEM, secondPEM), testcerts.KeyPEM(t, sharedKey))
 		if err != nil {
 			t.Fatalf("Analyse(a regenerated self-signed certificate re-encoding its own subject) = error %v, want nil: reusing a key is not issuing a certificate", err)
 		}

@@ -21,8 +21,6 @@ import (
 // bag first, then its chain nearest-parent-first. That is a contract rather than an
 // implementation detail — PKCS#12 stores an ordered SEQUENCE of bags (RFC 7292
 // §4.2) and decoders read it positionally, go-pkcs12's own DecodeChain included.
-// The Analysis is taken by pointer only because the struct is large enough that
-// copying it per call is wasteful (gocritic hugeParam); Encode does not mutate it.
 func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 	// Defensive, and deliberately NOT redundant with internal/config's
 	// checkPasswordEncodable: both guards are wanted, and neither is the only line
@@ -168,12 +166,8 @@ func (c Currency) Current() bool { return c.Reason == CurrencyMatch }
 //
 // Nothing here is fatal. Every non-match outcome means "rewrite the file", so a
 // parse or decode failure is reported as a reason rather than as an error return;
-// the caller owns what a reason is worth and, since this package takes no context,
+// the caller owns what a reason is worth and, since CheckCurrency takes no context,
 // owns the shutdown classification too. pfx is never mutated.
-//
-// The Analysis is taken by pointer only because the struct is large enough that
-// copying it per call is wasteful (gocritic hugeParam); CheckCurrency does not
-// mutate it.
 func CheckCurrency(pfx []byte, password string, want *Analysis, wantEncoder EncoderType) Currency {
 	priorProfile, err := inspect(pfx)
 	if err != nil {

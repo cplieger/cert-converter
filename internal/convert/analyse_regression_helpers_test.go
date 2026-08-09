@@ -49,7 +49,7 @@ func assertOrderInvariant(t *testing.T, label string, certBlobs [][]byte, keyPEM
 		for i := range certBlobs {
 			rotated = append(rotated, certBlobs[(i+r)%len(certBlobs)])
 		}
-		got, err := convert.Analyse(concatPEM(rotated...), keyPEM)
+		got, err := convert.Analyse(t.Context(), concatPEM(rotated...), keyPEM)
 		if err != nil {
 			t.Fatalf("%s: Analyse(rotation %d) = error %v, want nil", label, r, err)
 		}

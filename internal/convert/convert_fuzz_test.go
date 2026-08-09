@@ -261,7 +261,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		// first embedded in the PFX, chain membership unchecked), so a bundle with
 		// an unrelated or duplicated certificate would fail this target for being
 		// CORRECT.
-		analysis, analyseErr := convert.Analyse(data, data)
+		analysis, analyseErr := convert.Analyse(t.Context(), data, data)
 		if analyseErr != nil {
 			// A parseable certificate and key can still be an unresolvable pair
 			// (no key matches, several identities, the key belongs to an issuer).
@@ -360,7 +360,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 // mutate the slice CheckCurrency then hands to the decode.
 func FuzzInspect_boundedProfile(f *testing.F) {
 	m := testcerts.GenerateChainMaterial(f)
-	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := convert.Analyse(f.Context(), concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		f.Fatalf("setup: Analyse: %v", err)
 	}
@@ -373,7 +373,7 @@ func FuzzInspect_boundedProfile(f *testing.F) {
 		convert.EncNameLegacyDES,
 		convert.EncNameLegacyRC2,
 	} {
-		pfx, encErr := convert.Encode(&analysis, enc, "pw")
+		pfx, encErr := convert.Encode(analysis, enc, "pw")
 		if encErr != nil {
 			f.Fatalf("setup: Encode(%s): %v", enc, encErr)
 		}

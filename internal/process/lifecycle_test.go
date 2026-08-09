@@ -613,6 +613,71 @@ func TestReapConfirmed_shutdown_reports_the_candidates_it_has_not_reached(t *tes
 	}
 }
 
+// TestReapConfirmed_shutdown_at_the_recheck_reports_the_candidates_it_has_not_reached
+// pins the FIRST of reapConfirmed's two shutdown records: the one that fires when the
+// cancellation is observed at the top of the loop, before that candidate's certificate
+// verdict is used.
+//
+// Its sibling above drives the PRE-UNLINK guard, and the two must agree about what
+// `remaining` counts -- the loop's POSITION, not the deletion count -- because two
+// records for one condition in one loop that disagree about their scope are worse than
+// either alone. Nothing exercised this one, so reverting it alone to
+// len(orphaned)-deleted (which charges every candidate the loop already examined and
+// legitimately skipped to the outstanding work) leaves the whole suite green while the
+// operator is told a shutdown left more of the batch undone than it did.
+//
+// The fixture makes the two arithmetics differ: candidate one is examined and skipped
+// because its certificate came back, so at candidate two's top-of-loop guard `deleted`
+// is still 0 while `i` is 1 -- len(orphaned)-i is 1, len(orphaned)-deleted is 2.
+// live: 1 is the loop's own Err() sequence: back's top-of-loop guard, then gone's,
+// which is the one under test.
+// Serial: it swaps the package's reap-wait var and slog's default.
+func TestReapConfirmed_shutdown_at_the_recheck_reports_the_candidates_it_has_not_reached(t *testing.T) {
+	const msg = "orphan removal interrupted by shutdown during the confirming re-check"
+
+	logs := captureLogs(t)
+	out := t.TempDir()
+	for _, name := range []string{"back.pfx", "gone.pfx"} {
+		if err := os.WriteFile(filepath.Join(out, name), []byte("pfx"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// back.crt is present again: the ordinary producer transaction the delay exists for,
+	// so this candidate is examined and skipped rather than deleted.
+	in := t.TempDir()
+	if err := os.WriteFile(filepath.Join(in, "back.crt"), []byte("cert"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stubReapWait(t, func(context.Context) error { return nil })
+	calls := 0
+	ctx := cancelAfterNChecks{Context: t.Context(), calls: &calls, live: 1}
+
+	deleted, err := newReaper(newOutputStore(t, out), newInputSource(t, in), outputpolicy.LifecycleSync).
+		reapConfirmed(ctx, []string{"back.pfx", "gone.pfx"})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("reapConfirmed(cancelled at the second candidate's re-check) error = %v, want context.Canceled", err)
+	}
+	if deleted != 0 {
+		t.Errorf("reapConfirmed(cancelled before every unlink) deleted = %d, want 0", deleted)
+	}
+	if got := logs.CountExact(msg); got != 1 {
+		t.Fatalf("reapConfirmed logged %q %d times, want exactly 1: %q", msg, got, logs.Messages())
+	}
+	if got, ok := logs.AttrValueExact(msg, "remaining"); !ok || got != "1" {
+		t.Errorf("reapConfirmed(shutdown at candidate 2 of 2, one already examined and skipped) logged"+
+			" remaining=%q, want \"1\": a candidate this loop already examined is not outstanding work", got)
+	}
+	if got, ok := logs.AttrValueExact(msg, "removed"); !ok || got != "0" {
+		t.Errorf("reapConfirmed logged removed=%q, want \"0\": nothing was unlinked", got)
+	}
+	for _, name := range []string{"back.pfx", "gone.pfx"} {
+		if _, statErr := os.Stat(filepath.Join(out, name)); statErr != nil {
+			t.Errorf("%s was deleted after the shutdown was observed: %v", name, statErr)
+		}
+	}
+}
+
 // TestStoreReconcile_propagates_a_shutdown_from_the_orphan_walk pins the one
 // reconcile outcome that must reach the caller as an ERROR rather than as "nothing to
 // reap": a cancellation that arrives after the input walk finished cleanly, which is
@@ -707,7 +772,7 @@ func TestStoreReconcile_reports_the_output_budget_as_its_own_condition(t *testin
 func TestStoreInspect_rewrites_on_an_encoder_change(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
@@ -715,7 +780,7 @@ func TestStoreInspect_rewrites_on_an_encoder_change(t *testing.T) {
 	dir := t.TempDir()
 	s := newOutputStore(t, dir)
 
-	written, err := convert.Encode(&analysis, convert.EncNameModern2023, "pw")
+	written, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -724,7 +789,7 @@ func TestStoreInspect_rewrites_on_an_encoder_change(t *testing.T) {
 	}
 
 	// Same configured profile: current, nothing to do.
-	current, err := inspectCurrent(t.Context(), s, "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+	current, err := inspectCurrent(t.Context(), s, "out.pfx", analysis, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("inspect(same profile) = error %v, want nil", err)
 	}
@@ -741,7 +806,7 @@ func TestStoreInspect_rewrites_on_an_encoder_change(t *testing.T) {
 		convert.EncNameLegacyRC2,
 	} {
 		t.Run(string(other), func(t *testing.T) {
-			current, err := inspectCurrent(t.Context(), s, "out.pfx", &analysis, other, "pw")
+			current, err := inspectCurrent(t.Context(), s, "out.pfx", analysis, other, "pw")
 			if err != nil {
 				t.Fatalf("inspect(configured %s) = error %v, want nil", other, err)
 			}
@@ -906,13 +971,13 @@ func TestStoreRemoveOrphan_spares_non_regular_candidate_and_continues(t *testing
 func TestStoreInspect_rewrites_after_a_password_rotation(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
 	s := newOutputStore(t, t.TempDir())
 
-	written, err := convert.Encode(&analysis, convert.EncNameModern2023, "old-password")
+	written, err := convert.Encode(analysis, convert.EncNameModern2023, "old-password")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -920,7 +985,7 @@ func TestStoreInspect_rewrites_after_a_password_rotation(t *testing.T) {
 		t.Fatalf("setup: write: %v", err)
 	}
 
-	current, err := inspectCurrent(t.Context(), s, "out.pfx", &analysis, convert.EncNameModern2023, "old-password")
+	current, err := inspectCurrent(t.Context(), s, "out.pfx", analysis, convert.EncNameModern2023, "old-password")
 	if err != nil {
 		t.Fatalf("inspect(unrotated password) = error %v, want nil", err)
 	}
@@ -928,7 +993,7 @@ func TestStoreInspect_rewrites_after_a_password_rotation(t *testing.T) {
 		t.Fatal("inspect(unrotated password) = false, want true: nothing about this bundle changed")
 	}
 
-	current, err = inspectCurrent(t.Context(), s, "out.pfx", &analysis, convert.EncNameModern2023, "new-password")
+	current, err = inspectCurrent(t.Context(), s, "out.pfx", analysis, convert.EncNameModern2023, "new-password")
 	if err != nil {
 		t.Fatalf("inspect(rotated password) = error %v, want nil: a bundle that will not decode is stale, not fatal", err)
 	}
@@ -945,11 +1010,11 @@ func TestStoreInspect_rewrites_after_a_password_rotation(t *testing.T) {
 // Runs serially: it swaps slog.Default().
 func TestStoreInspect_treats_an_undecodable_prior_as_stale(t *testing.T) {
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	full, err := convert.Encode(&analysis, convert.EncNameModern2023, "pw")
+	full, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -970,7 +1035,7 @@ func TestStoreInspect_treats_an_undecodable_prior_as_stale(t *testing.T) {
 				t.Fatalf("setup: WriteFile: %v", err)
 			}
 			logs := captureLogs(t)
-			current, err := inspectCurrent(t.Context(), s, tc.rel, &analysis, convert.EncNameModern2023, "pw")
+			current, err := inspectCurrent(t.Context(), s, tc.rel, analysis, convert.EncNameModern2023, "pw")
 			if err != nil {
 				t.Errorf("inspect(%s) = error %v, want nil: an undecodable prior output is stale, not a failed pair", tc.name, err)
 			}
@@ -1162,20 +1227,20 @@ func readBundle(t *testing.T, path string) ([]byte, os.FileInfo) {
 func TestStoreInspect_propagates_a_shutdown_instead_of_reporting_stale(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	analysis, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
 	s := newOutputStore(t, t.TempDir())
 	// Written through store.write, so the file on disk is a real bundle and only the
 	// read can answer the question.
-	if err := s.write(t.Context(), "out.pfx", mustEncode(t, &analysis)); err != nil {
+	if err := s.write(t.Context(), "out.pfx", mustEncode(t, analysis)); err != nil {
 		t.Fatalf("setup: write: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	current, err := inspectCurrent(ctx, s, "out.pfx", &analysis, convert.EncNameModern2023, "pw")
+	current, err := inspectCurrent(ctx, s, "out.pfx", analysis, convert.EncNameModern2023, "pw")
 
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("inspect(cancelled ctx) error = %v, want context.Canceled: a shutdown is neither current nor stale", err)
@@ -2040,6 +2105,47 @@ func TestObservationLog_eviction_spares_the_wholeness_the_active_scan_establishe
 			t.Errorf("takeEvictedWholeness = %d, want 1: a dropped wholeness entry is this scan's reap veto", got)
 		}
 	})
+}
+
+// TestObservationLog_signature_eviction_spares_the_wholeness_the_active_scan_established
+// is the SIGNATURE arm of the protection the test above pins on the wholeness arm.
+//
+// reserve has two eviction entry points and each consults canEvict for itself: evictOne
+// takes its victim from `seen` and drops that victim's wholeness with it (dropWholeness),
+// while evictWholeness takes a victim that actually holds wholeness. The test above drives
+// markWhole only, which leaves `seen` empty, so evictOne is never entered there --
+// deleting canEvict's consultation from evictOne alone therefore keeps the whole suite
+// green while a pair THIS walk read whole loses the evidence noteMissingKey classifies a
+// replaced private key against. The scan then reads a key being replaced as an ordinary
+// orphan, which vetoes nothing, and unrelated bundles are deleted on an enumeration it can
+// no longer defend.
+//
+// note rather than markWhole is what puts the pair in BOTH halves, which is what makes the
+// signature half reach its ceiling and hunt a victim at all.
+func TestObservationLog_signature_eviction_spares_the_wholeness_the_active_scan_established(t *testing.T) {
+	t.Parallel()
+	log := newObservationLog(1)
+	log.beginScan()
+	t.Cleanup(log.endScan)
+
+	log.note("active.crt", pairFingerprint([]byte("cert"), []byte("key")), nil)
+	// The signature half is at its ceiling now, so reserving room for a second pair hunts a
+	// victim in `seen` -- where the only candidate is the pair this walk read whole.
+	log.note("fresh.crt", pairFingerprint([]byte("fresh"), []byte("key")), nil)
+
+	if !log.completedPair("active.crt") {
+		t.Error("the signature eviction spent the wholeness of a pair this walk read whole:" +
+			" noteMissingKey would report a key being replaced as an ordinary orphan, which vetoes" +
+			" nothing, so the scan would delete bundles on an enumeration it cannot defend")
+	}
+	if got := log.takeEvictedWholeness(); got != 0 {
+		t.Errorf("takeEvictedWholeness = %d, want 0: nothing evictable existed, so the log holds one"+
+			" entry over the ceiling rather than spending the active scan's evidence", got)
+	}
+	if !log.completedPair("fresh.crt") {
+		t.Error("the pair being reserved for lost its own wholeness: reserve must never take the path" +
+			" it is making room for as its victim")
+	}
 }
 
 // TestScannerRun_fails_closed_when_the_observation_log_evicts_wholeness_evidence is the

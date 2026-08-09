@@ -22,11 +22,11 @@ import (
 func convertPairInRoot(ctx context.Context, certPEM, keyPEM []byte, root *os.Root,
 	rel, password string, enc convert.EncoderType,
 ) ([]convert.Observation, error) {
-	analysis, err := convert.Analyse(certPEM, keyPEM)
+	analysis, err := convert.Analyse(ctx, certPEM, keyPEM)
 	if err != nil {
 		return nil, err
 	}
-	pfx, err := convert.Encode(&analysis, enc, password)
+	pfx, err := convert.Encode(analysis, enc, password)
 	if err != nil {
 		return analysis.Observations(), err
 	}
