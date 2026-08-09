@@ -52,8 +52,9 @@ type conversionStatus int
 // could not replace a bundle at the output path, it never PROVED that bundle wrong, and
 // what refused the replacement is a steady-state condition of the operator's volume that
 // no restart changes (a permission denial, a read-only mount, a full volume, an exhausted
-// quota, or an output directory this app cannot pin — a symlinked output tree, or a
-// component another writer replaced — restartCanClearWrite enumerates them).
+// quota, an output directory this app cannot pin — a symlinked output tree, or a
+// component another writer replaced — or a regular file occupying a directory
+// component of the output path — restartCanClearWrite enumerates them).
 //
 // "Never proved it wrong" means this app could not verify the content AT ALL: a bundle
 // above the readable bound, unreadable, un-stat-able, or refused by the codec's preflight.

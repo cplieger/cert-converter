@@ -237,17 +237,18 @@ func MarkerRefreshFloor(fallback time.Duration) time.Duration {
 	return safetyNetIntervalFor(fallback)
 }
 
-// FallbackLabel renders a periodic-rescan interval for an operator-facing log
+// fallbackLabel renders a periodic-rescan interval for an operator-facing log
 // record. A non-positive interval is reported as "disabled" rather than as a
 // bare "0s": that value is the operator's confirmation that
 // FALLBACK_SCAN_HOURS=0/false took effect, i.e. that no ROUTINE rescan runs on
 // their cadence. It does NOT mean nothing rescans — the reconciliation floor
 // still does, and the probe's staleness deadline is derived from that floor
 // (MarkerRefreshFloor), which is why every record carrying this label also
-// carries scan_floor. It is exported so the composition root's startup line and
-// this package's degraded-path WARNs render the shared fallback_scan attribute
-// identically.
-func FallbackLabel(d time.Duration) string {
+// carries scan_floor. It is unexported because CoverageAttrs is the one home for
+// the pair: the composition root, internal/config and this package's
+// degraded-path WARNs all render fallback_scan through that, never by calling
+// this directly.
+func fallbackLabel(d time.Duration) string {
 	if d <= 0 {
 		return "disabled"
 	}
@@ -263,9 +264,9 @@ func FallbackLabel(d time.Duration) string {
 func CoverageAttrs(fallback time.Duration) []any {
 	return []any{
 		// fallback_scan answers only "is the operator's own cadence running?", so
-		// FallbackLabel renders a non-positive interval as "disabled"; scan_floor beside
+		// fallbackLabel renders a non-positive interval as "disabled"; scan_floor beside
 		// it is what keeps that from reading as "nothing will ever revisit this".
-		"fallback_scan", FallbackLabel(fallback),
+		"fallback_scan", fallbackLabel(fallback),
 		"scan_floor", MarkerRefreshFloor(fallback).String(),
 	}
 }
@@ -1329,6 +1330,9 @@ func (w *Watcher) reassertWatches(ctx context.Context, watcher *fsnotify.Watcher
 	if _, ok := desired[rootPath]; ok {
 		if err := w.attachWatch(watcher, w.root, rootPath); err != nil {
 			return err
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
 		}
 	}
 	for path := range desired {

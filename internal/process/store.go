@@ -192,6 +192,17 @@ func (s *store) write(ctx context.Context, rel string, pfx []byte) error {
 			// to an operator otherwise: the failure the library used to report from inside
 			// the write is now this call's, and the diagnosis has to keep naming the write
 			// it belongs to and the path that could not be created.
+			//
+			// A non-directory occupant of a mirrored directory path is the SAME operator
+			// layout state the parent pin refuses one statement later, so it is joined with
+			// the same sentinel rather than left for a caller to re-derive from an errno:
+			// Root.MkdirAll reports EEXIST when the occupant is the LAST component of dir
+			// (mkdirat) and ENOTDIR when it is an earlier one (openat), and both mean a
+			// layout no restart re-reads differently. Anything else here (EROFS, ENOSPC,
+			// EACCES, EIO) keeps its own classification.
+			if errors.Is(err, syscall.EEXIST) || errors.Is(err, syscall.ENOTDIR) {
+				err = errors.Join(err, errOutputPinRefused)
+			}
 			return fmt.Errorf("write pfx: create output directory for %q: %w", rel, err)
 		}
 	}
@@ -733,9 +744,6 @@ func isPermissionRefusal(err error) bool {
 //   - EROFS: a read-only mount is a mount option, not process state.
 //   - ENOSPC / EDQUOT: a full volume or an exhausted quota. A restarted container writes
 //     the same bytes into the same full volume.
-//   - ENOTDIR: a regular file occupying a directory component of the output
-//     path (store.write's MkdirAll reports it before the pin can). The same
-//     layout class as a refused pin; a restart re-reads the same volume.
 //
 // It says nothing about whether the write SHOULD have succeeded: writeOutcome asks this
 // only after establishing that the bundle already on disk is not one this app proved
@@ -747,13 +755,6 @@ func restartCanClearWrite(err error) bool {
 	case errors.Is(err, errOutputPinRefused):
 		return false
 	case errors.Is(err, syscall.EROFS), errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT):
-		return false
-	case errors.Is(err, syscall.ENOTDIR):
-		// A regular file occupying a directory component of the output path: the
-		// same operator layout state errOutputPinRefused names ("a component that
-		// is not a directory"), reachable one step earlier from store.write's own
-		// MkdirAll, which runs before the pin exists to refuse it. A restart
-		// re-reads the same layout.
 		return false
 	default:
 		return true

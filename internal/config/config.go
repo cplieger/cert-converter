@@ -409,7 +409,7 @@ func warnFallbackDisabled(interval time.Duration) {
 		// floor's walk runs instead — more often than the operator asked for.
 		// The pair is rendered by watch.CoverageAttrs, the one home for its keys and
 		// both renderings; identical bytes here, because this arm's guard makes the
-		// interval positive (so FallbackLabel renders interval.String()) and floor is
+		// interval positive (so the label renders interval.String()) and floor is
 		// already watch.MarkerRefreshFloor(interval).
 		attrs := append(watch.CoverageAttrs(interval),
 			"remediation", "set FALLBACK_SCAN_HOURS at or below the floor's hours if the cadence should be yours, or leave it as is: coverage is unaffected")

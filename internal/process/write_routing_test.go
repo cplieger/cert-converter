@@ -109,12 +109,9 @@ func TestRestartCanClearWrite_enumerates_the_unclearable_classes(t *testing.T) {
 		"EROFS is not clearable: a mount option outlives the process": {err: syscall.EROFS, want: false},
 		"ENOSPC is not clearable: the volume is still full":           {err: syscall.ENOSPC, want: false},
 		"EDQUOT is not clearable: the quota is still exhausted":       {err: syscall.EDQUOT, want: false},
-		"ENOTDIR is not clearable: a file at a directory path outlives the process": {
-			err: &fs.PathError{Op: "mkdir", Path: "blocked", Err: syscall.ENOTDIR}, want: false,
-		},
-		"EIO is reported clearable, the loud direction": {err: syscall.EIO, want: true},
-		"a symlink refusal is reported clearable":       {err: errors.New("atomicfile: target is a symlink"), want: true},
-		"an unrecognised error is reported clearable":   {err: errors.New("boom"), want: true},
+		"EIO is reported clearable, the loud direction":               {err: syscall.EIO, want: true},
+		"a symlink refusal is reported clearable":                     {err: errors.New("atomicfile: target is a symlink"), want: true},
+		"an unrecognised error is reported clearable":                 {err: errors.New("boom"), want: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -447,6 +444,52 @@ func TestScannerRun_when_the_output_parent_cannot_be_pinned(t *testing.T) {
 	if got, _ := readBundle(t, pfxPath); !bytes.Equal(got, current) {
 		t.Errorf("Run(symlinked output sub-directory) left %d bytes at the output path, want the %d it"+
 			" found: a refused write must not touch the bundle in place", len(got), len(current))
+	}
+}
+
+// TestScannerRun_when_a_file_blocks_the_mirrored_output_directory pins the routing for the
+// one-level mirrored layout: a regular file occupying /output/<dir>, where the pair lives at
+// /input/<dir>/<name>.crt. Root.MkdirAll reports EEXIST there, not ENOTDIR, so a classifier
+// keyed on the errno alone left this -- the canonical mirrored shape -- counting a conversion
+// failure on every scan over a layout no restart changes.
+// Runs serially: it swaps slog.Default().
+func TestScannerRun_when_a_file_blocks_the_mirrored_output_directory(t *testing.T) {
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
+	inputSub := filepath.Join(certsRoot, "sub")
+	if err := os.Mkdir(inputSub, pfxDirMode); err != nil {
+		t.Fatalf("setup: Mkdir(input sub): %v", err)
+	}
+	writePair(t, inputSub, "chain", chainPEM, keyPEM)
+	// A regular file where the mirrored output directory has to be created.
+	if err := os.WriteFile(filepath.Join(outRoot, "sub"), []byte("blocker"), pfxFileMode); err != nil {
+		t.Fatalf("setup: WriteFile(blocker): %v", err)
+	}
+
+	logs := captureLogs(t)
+	res, err := New(&Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+	}).Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run(file blocking the mirrored output directory) = error %v, want nil: an /output"+
+			" layout is not a scan-level failure", err)
+	}
+	if res.Unwritable != 1 || res.Failed != 0 || res.Converted != 0 {
+		t.Errorf("Run(file blocking the mirrored output directory) = %+v, want Unwritable 1 Failed 0"+
+			" Converted 0: no restart removes the file, so this must not flip health", res)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, unreplaceableBundleMsg); got != 1 {
+		t.Errorf("Run(file blocking the mirrored output directory) logged %q at WARN %d times, want 1:"+
+			" neutral is not silent: %q", unreplaceableBundleMsg, got, logs.Messages())
+	}
+	// And it names the LAYOUT cause, not the volume: nothing here is about free space.
+	if got, ok := logs.AttrValue(unreplaceableBundleMsg, "remediation"); !ok || got != outputPinRemediation {
+		t.Errorf("Run(file blocking the mirrored output directory) %q remediation = %v (present %v),"+
+			" want %q", unreplaceableBundleMsg, got, ok, outputPinRemediation)
 	}
 }
 
