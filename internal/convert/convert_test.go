@@ -1191,3 +1191,49 @@ func TestParsePrivateKey_names_the_first_skipped_label_not_the_last(t *testing.T
 		t.Errorf("ParsePrivateKey error = %q, want the later label absent from the diagnostic", err.Error())
 	}
 }
+
+// TestParsePrivateKey_names_the_unreadable_label_not_an_expected_companion pins the
+// preference the failure path applies: the label named is the first one that names NO
+// key format this app reads, not simply the first skipped one. It needs a fixture in
+// which those two DIFFER, which is why the sibling test above cannot stand in for it
+// -- there both blocks are unrelated, so either rule names the same one and reverting
+// the preference leaves the suite green.
+//
+// The scenario is the combined cert+key file this app deliberately supports
+// (isExpectedKeyFilePassenger), with an ssh-keygen-format key block appended. The
+// CERTIFICATE comes FIRST in every file that has one, so naming the first skipped
+// block sends the operator at the one block in the file that is fine.
+func TestParsePrivateKey_names_the_unreadable_label_not_an_expected_companion(t *testing.T) {
+	t.Parallel()
+
+	certPEM, _ := testcerts.GenerateSelfSignedCert(t, "companion", "ecdsa")
+	keyFile := bytes.Join([][]byte{
+		certPEM,
+		pem.EncodeToMemory(&pem.Block{Type: "OPENSSH PRIVATE KEY", Bytes: []byte("opaque")}),
+	}, nil)
+
+	_, err := convert.ParsePrivateKey(keyFile)
+	if err == nil {
+		t.Fatal("ParsePrivateKey(a certificate plus an ssh-keygen-format block) = nil error, want a refusal")
+	}
+	if !strings.Contains(err.Error(), `first "OPENSSH PRIVATE KEY"`) {
+		t.Errorf("ParsePrivateKey error = %q, want it to name the block that names no key format this app reads: the CERTIFICATE is an expected companion of a combined cert+key file and explains nothing", err.Error())
+	}
+	if strings.Contains(err.Error(), "CERTIFICATE") {
+		t.Errorf("ParsePrivateKey error = %q, want the expected companion's label absent: naming it sends the operator at the one block in the file that is fine", err.Error())
+	}
+	if !strings.Contains(err.Error(), "no private key PEM block found") {
+		t.Errorf("ParsePrivateKey error = %q, want the base sentence kept as the prefix so existing log matching is unaffected", err.Error())
+	}
+
+	// EC PARAMETERS is the other expected companion, and it comes first for the same
+	// reason, so the preference must hold for it too.
+	ecFile := bytes.Join([][]byte{
+		pem.EncodeToMemory(&pem.Block{Type: "EC PARAMETERS", Bytes: []byte("opaque")}),
+		pem.EncodeToMemory(&pem.Block{Type: "OPENSSH PRIVATE KEY", Bytes: []byte("opaque")}),
+	}, nil)
+	_, ecErr := convert.ParsePrivateKey(ecFile)
+	if ecErr == nil || !strings.Contains(ecErr.Error(), `first "OPENSSH PRIVATE KEY"`) {
+		t.Errorf("ParsePrivateKey(EC PARAMETERS plus an ssh-keygen-format block) = %v, want it to name the OPENSSH block", ecErr)
+	}
+}

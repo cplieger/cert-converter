@@ -398,9 +398,10 @@ func (st bundleState) upToDate() bool {
 // loud direction — a conversion failure — by construction rather than by omission.
 //
 // contentVerifiedCurrent is deliberately absent, and could not be honoured if it were
-// present: currency is decided on content alone, so convertEntry returns at
-// `if state.upToDate()` (process.go:1356) before the sole call to writeOutcome
-// (process.go:1376). A future write reason that does NOT pass through that content gate
+// present: currency is decided on content alone, so convertEntry returns at its
+// `if state.upToDate()` gate before reaching its sole call to writeOutcome (no line
+// numbers: both statements moved 17 lines in the cycle that wrote this sentence).
+// A future write reason that does NOT pass through that content gate
 // would arrive here as a fact this list does not name and would be counted a conversion
 // failure — the loud direction, which is the point of the shape.
 func (st bundleState) bundleNotProvenWrong() bool {

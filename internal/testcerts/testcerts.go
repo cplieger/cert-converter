@@ -216,6 +216,8 @@ func GenerateChainMaterial(tb testing.TB) ChainMaterial {
 	// Three certificates over ONE key: the original, a renewal already in force,
 	// and a renewal that has not started yet.
 	newLeaf := func(serial int64, cn string, notBefore time.Time) []byte {
+		tb.Helper()
+
 		tmpl := &x509.Certificate{
 			SerialNumber: big.NewInt(serial),
 			Subject:      pkix.Name{CommonName: cn},

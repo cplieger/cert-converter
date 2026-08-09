@@ -357,23 +357,26 @@ func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
 	}
 }
 
-// warnFallbackDisabled warns when the operator's own periodic rescan is gone,
+// warnFallbackDisabled warns when the operator's own periodic rescan never runs,
 // because nothing else in the process reports it: the explicit 0/false opt-out
 // removed it, the configured cadence sits at maxFallbackHours, where a rescan on
 // that cadence never arrives, or the cadence is above the watcher's reconciliation
-// floor, which overrides it. In all three a rescan on the operator's own cadence
-// never arrives, so the three are operationally the same state and each earns the
-// same tradeoff record.
+// floor, which overrides it. In all three the cadence the operator chose never fires,
+// so each earns its own record naming what stands in for it.
 //
-// What actually goes away is the operator's CADENCE, not the app's convergence: the
-// watcher keeps a reconciliation floor in every configuration (internal/watch's
+// What goes away is the operator's CADENCE, not the app's convergence: the watcher
+// keeps a reconciliation floor in every configuration (internal/watch's
 // reconcileFloor), the health marker's freshness deadline is derived from that floor
 // rather than from this value, and the startup line's scan_floor attribute names it.
-// So the tradeoff is latency — a renewal whose fsnotify event never arrived, and an
-// /input watch the kernel dropped silently on an unmount or remount
+// Which way that cuts differs by arm. For the 0/false opt-out and the maxFallbackHours
+// ceiling the tradeoff is LATENCY — a renewal whose fsnotify event never arrived, and
+// an /input watch the kernel dropped silently on an unmount or remount
 // (IN_UNMOUNT/IN_IGNORED, which fsnotify neither reports as an event nor as a closed
 // channel), both wait for that slower reconciliation instead of for the cadence the
-// operator would otherwise have chosen.
+// operator would otherwise have chosen. For a cadence ABOVE the floor there is no added
+// latency at all: safetyNetIntervalFor arms the timer with the smaller of the two, so
+// the floor's walk runs more often than the cadence that was configured, which is why
+// that arm's record reports the override and says coverage is unaffected.
 //
 // Deliberately a warning rather than a detector: whether a day of extra latency on a
 // missed renewal is acceptable is the operator's judgment, and the app cannot infer

@@ -124,9 +124,10 @@ type Watcher struct {
 
 	// maxEntries is how many paths ONE watch-set walk may enumerate before it
 	// stops registering (scanbudget.Default when non-positive). It is INJECTED
-	// exactly as internal/process.Options.MaxScanEntries is: internal/config owns
-	// MAX_SCAN_ENTRIES' name, default, ceiling and repaired-value diagnostics, and
-	// this package stays a leaf that package configures.
+	// exactly as internal/process.Options.MaxScanEntries is: internal/scanbudget owns
+	// MAX_SCAN_ENTRIES' default and ceiling, internal/config owns the variable's name,
+	// its parse and its repaired-value diagnostics, and this package stays a leaf both
+	// of them configure.
 	maxEntries int
 
 	// watchedMu guards watched.

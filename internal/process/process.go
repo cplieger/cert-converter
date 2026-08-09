@@ -547,10 +547,11 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 // logScanOutcome so the "scan aborted before completion" record — the one the
 // README's CertConverterScanAborted rule matches — is emitted for an unusable
 // root too, not only for a walk that aborted at ".". The counts it logs are all
-// zero, which is accurate: nothing was visited. logInputCoverageWarnings
-// self-vetoes on a non-nil walk error, so no coverage WARN is emitted alongside
-// it. The error is returned unchanged so the caller pairs it with a zero
-// ScanResult at the return site.
+// zero, which is accurate: nothing was visited. No coverage WARN accompanies it, on
+// two counts: logInputCoverageWarnings vetoes on every walk error except the typed
+// entry-budget stop, which an unopenable root is not, and every arm it would reach is
+// gated on a non-zero count anyway. The error is returned unchanged so the caller
+// pairs it with a zero ScanResult at the return site.
 func failScan(ctx context.Context, err error) error {
 	logScanOutcome(ctx, &ScanResult{}, err)
 	return err
@@ -805,7 +806,7 @@ type observationLog struct {
 	// loneKeys holds the cert paths this log has already reported as retaining an
 	// output because a sibling KEY is still there while the certificate is gone
 	// (reaper.reapConfirmed). A THIRD set for a third spending schedule: it is cleared
-	// when the pair reads whole again (markWhole) or when the bundle is finally deleted
+	// when the pair reads whole again (markWhole) or when the leftover key disappears
 	// (clearLoneKey), and — unlike `seen` and `whole` — it is deliberately NOT pruned by
 	// forget, whose gate is membership in the scan's cert enumeration. A lone key's
 	// certificate is by definition absent from that enumeration, so pruning it there
@@ -1352,10 +1353,11 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		return failEntry(rel, "conversion failed", err)
 	}
 	writeErr := sw.out.write(ctx, pfxRel, pfxData)
-	// The one derivation, after the write, from the three facts this entry resolved:
-	// what the bundle on disk was, whether its mode was laxer than policy, and how the
-	// write itself ended. Nothing below re-decides it; the logging and the observation
-	// bookkeeping only read the outcome.
+	// The one derivation, after the write, from the two facts this entry resolved: what
+	// the bundle on disk was, and how the write itself ended. The bundle's MODE is not one
+	// of them -- it is reported where it is observed (store.reportLaxBundle) and routes
+	// nothing, which is why bundleState carries only the content fact. Nothing below
+	// re-decides the outcome; the logging and the observation bookkeeping only read it.
 	outcome = writeOutcome(state, writeErr)
 	if writeErr != nil {
 		reportWriteFailure(rel, pfxRel, state, writeErr, outcome)
