@@ -98,11 +98,18 @@ func wrapPKCS8(t *testing.T, pkcs1DER []byte) []byte {
 // the right size satisfy it. rsa.GenerateKey at 16384 bits takes minutes; this
 // takes under a millisecond, which is what keeps the ceiling's accept case in the
 // default test path.
+//
+// The retries are for ONE residual: p and q are random odd numbers, not primes, so
+// roughly one pair in five shares a factor and has no qInv (P(coprime) over odd
+// integers is (6/pi^2)/(1-1/4) ~ 0.81). randomOdd's top-two-bits construction
+// removes the other, larger cause -- an n of 2*bitLen-1 bits, which used to fail
+// ~39% of attempts and made the 8-attempt bound miss about 0.4% of calls.
 func consistentRSAKeyDER(t *testing.T, keyBits int) []byte {
 	t.Helper()
 	one := big.NewInt(1)
 	e := big.NewInt(65537)
-	for attempt := range 8 {
+	const attempts = 16
+	for attempt := range attempts {
 		p := randomOdd(t, keyBits/2)
 		q := randomOdd(t, keyBits/2)
 		n := new(big.Int).Mul(p, q)
@@ -130,11 +137,18 @@ func consistentRSAKeyDER(t *testing.T, keyBits int) []byte {
 		}
 		t.Logf("setup: attempt %d produced a key x509 rejected, retrying", attempt)
 	}
-	t.Fatalf("setup: could not build a %d-bit key x509 accepts in 8 attempts", keyBits)
+	t.Fatalf("setup: could not build a %d-bit key x509 accepts in %d attempts", keyBits, attempts)
 	return nil
 }
 
-// randomOdd returns a random odd integer of exactly bitLen bits.
+// randomOdd returns a random odd integer of exactly bitLen bits whose top TWO bits
+// are set. The second bit is what makes the product of two such numbers exactly
+// 2*bitLen bits: each is >= 3*2^(bitLen-2), so the product is >= 2.25*2^(2*bitLen-2),
+// which is above the 2^(2*bitLen-1) boundary, and both are < 2^bitLen so it stays
+// below 2^(2*bitLen). Setting only the top bit leaves the product's length a coin
+// flip (P(2*bitLen bits) = 2-2*ln2 ~ 0.61), and consistentRSAKeyDER discards a pair
+// of the wrong length -- which is the same construction real RSA keygen uses, and
+// for the same reason.
 func randomOdd(t *testing.T, bitLen int) *big.Int {
 	t.Helper()
 	v, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), uint(bitLen)))
@@ -142,6 +156,7 @@ func randomOdd(t *testing.T, bitLen int) *big.Int {
 		t.Fatalf("setup: rand.Int: %v", err)
 	}
 	v.SetBit(v, bitLen-1, 1)
+	v.SetBit(v, bitLen-2, 1)
 	v.SetBit(v, 0, 1)
 	return v
 }

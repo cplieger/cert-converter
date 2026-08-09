@@ -374,6 +374,20 @@ func TestResyncWatchSet_prunes_a_directory_the_tree_no_longer_has(t *testing.T) 
 	if err := os.RemoveAll(gone); err != nil {
 		t.Fatal(err)
 	}
+	// Drop the now-dangling kernel registration here rather than leaving it to the
+	// rebuild. Deleting a watched directory invalidates its descriptor immediately,
+	// but fsnotify only forgets the PATH when its readEvents goroutine reaches the
+	// IN_IGNORED -- and this watcher's Events channel is unbuffered and undrained,
+	// so that goroutine may still be parked on the root's Remove event. Which side
+	// wins decides whether the rebuild's own Remove sees ErrNonExistentWatch (path
+	// already forgotten) or a raw EINVAL from inotify_rm_watch (path still mapped,
+	// descriptor already invalid), and pruneWatches deliberately keeps a path
+	// charged on any error it cannot read as "the kernel confirmed it is gone".
+	// That made this assertion a coin flip on fsnotify's scheduling. removePath
+	// unmaps before it syscalls, so one Remove from here -- error irrelevant --
+	// makes the rebuild's Remove report ErrNonExistentWatch every time. The KERNEL
+	// side of the rebuild is the sibling test below; this one owns the mirror.
+	_ = watcher.Remove(gone)
 
 	w.resyncWatchSet(t.Context(), watcher, "failed to re-sync the watch set")
 
