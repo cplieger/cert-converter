@@ -454,7 +454,12 @@ func TestNoteUnreadableInput_levels(t *testing.T) {
 // certificate) still need a complete enumeration — which is why the all-orphan shape
 // with a veto present falls through to this notice rather than going silent.
 //
-// An aborted scan stays quiet: a walk that stopped observed an arbitrary prefix.
+// An aborted scan stays quiet — a walk that stopped for an arbitrary reason, or during
+// shutdown, observed a prefix chosen by whatever stopped it. The ENTRY-BUDGET stop is
+// the one exception, because it stopped on the tree's SIZE having read every path it
+// visited: those counts are observations, so they are reported (with the coverage
+// attribute) rather than silenced. TestLogScanOutcome_reports_observed_per_path_counts_when_the_entry_budget_stopped_the_scan
+// owns that case in full.
 // Runs serially: it swaps slog.Default().
 func TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key(t *testing.T) {
 	const wantMsg = "some certificates under the input root are missing their sibling .key"
@@ -476,6 +481,13 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key(t *
 		// unprovable arm hands the case to this one instead of the scan going silent.
 		{nil, "an all-orphan tree with a veto falls through to the per-path notice", ScanResult{Total: 2, Orphan: 2, Unreadable: 1}, true, "2"},
 		{errors.New("permission denied"), "an aborted scan stays quiet", ScanResult{Total: 2, Converted: 1, Orphan: 1}, false, ""},
+		{context.Canceled, "a shutdown-cancelled scan stays quiet", ScanResult{Total: 2, Converted: 1, Orphan: 1}, false, ""},
+		{
+			fmt.Errorf("%w: stopped at 3 entries (a.crt)", errScanBudgetExceeded),
+			"an entry-budget stop reports the missing keys it observed",
+			ScanResult{Total: 2, Converted: 1, Orphan: 1},
+			true, "1",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
@@ -571,5 +583,156 @@ func TestScannerRun_an_unopenable_root_emits_the_scan_outcome_record(t *testing.
 					tc.name, logs.Messages(), aborted)
 			}
 		})
+	}
+}
+
+// TestLogScanOutcome_reports_observed_per_path_counts_when_the_entry_budget_stopped_the_scan
+// pins the whole of the entry-budget exception, which is a narrow one in three separate
+// directions.
+//
+// The condition it fixes: logInputCoverageWarnings used to return on ANY non-nil walk
+// error, so a scan the budget truncated told the operator the tree was too large and
+// nothing else. The certificates it HAD read that were unreadable, or missing their
+// sibling .key, went unnamed — facts proven path by path, silenced by a stop that
+// happened further along the tree.
+//
+// What must stay narrow, and is asserted below:
+//   - Only the budget stop qualifies. A shutdown and an arbitrary walk failure stay
+//     silent (the shutdown case is also pinned in the table above, deliberately
+//     unweakened: emitting WARNs while the container stops is the failure this guards).
+//   - Only the PER-PATH arms are reported. The whole-tree claims ("no certificate pairs
+//     at all", "EVERY certificate lacks its key") stay gated on a complete walk, since a
+//     truncated scan is precisely one that did not see the whole tree — the all-orphan
+//     shape therefore falls through to the "some certificates" arm.
+//   - The counts are labelled as observations via the coverage attribute, so nothing
+//     reads them as whole-tree totals.
+//
+// This test fails when its subject is reverted. Checked by restoring the unconditional
+// `if walkErr != nil { return }`: every assertion in the budget subtests then fails
+// (both arms absent), while the shutdown and arbitrary-abort subtests keep passing —
+// which is what shows the test pins the exception rather than the silence.
+// Runs serially: it swaps slog.Default().
+func TestLogScanOutcome_reports_observed_per_path_counts_when_the_entry_budget_stopped_the_scan(t *testing.T) {
+	const (
+		unreadableMsg = "some /input paths were unreadable and were skipped"
+		orphanMsg     = "some certificates under the input root are missing their sibling .key"
+		emptyTreeMsg  = "no certificate pairs found under the input root"
+		allOrphanMsg  = "every certificate under the input root is missing its sibling .key"
+	)
+	budgetErr := fmt.Errorf("%w: stopped at 3 entries (a.crt)", errScanBudgetExceeded)
+
+	for _, tt := range []struct {
+		walkErr        error
+		name           string
+		result         ScanResult
+		wantUnreadable bool
+		wantOrphan     bool
+	}{
+		{
+			budgetErr, "a budget stop reports both observed per-path counts",
+			ScanResult{Total: 3, Converted: 1, Orphan: 1, Unreadable: 1},
+			true, true,
+		},
+		{
+			budgetErr, "a budget stop reports an observed unreadable path on its own",
+			ScanResult{Total: 2, Converted: 2, Unreadable: 1},
+			true, false,
+		},
+		{
+			// The whole-tree "every certificate" claim is unprovable on a truncated scan,
+			// so the case lands on the per-path arm instead of going silent — the same
+			// fallthrough the enumeration vetoes already take.
+			budgetErr, "an all-orphan budget stop falls through to the per-path arm",
+			ScanResult{Total: 2, Orphan: 2},
+			false, true,
+		},
+		{
+			// Nothing was observed worth naming: the budget WARN is the whole signal.
+			budgetErr, "a budget stop with nothing observed stays quiet",
+			ScanResult{Total: 2, Converted: 2},
+			false, false,
+		},
+		{
+			context.Canceled, "a shutdown stays silent on both arms",
+			ScanResult{Total: 3, Converted: 1, Orphan: 1, Unreadable: 1},
+			false, false,
+		},
+		{
+			errors.New("permission denied"), "an arbitrary walk failure stays silent on both arms",
+			ScanResult{Total: 3, Converted: 1, Orphan: 1, Unreadable: 1},
+			false, false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureLogs(t)
+
+			logScanOutcome(t.Context(), &tt.result, tt.walkErr)
+
+			if got := logs.Contains(unreadableMsg); got != tt.wantUnreadable {
+				t.Errorf("logScanOutcome(%+v, %v) logged %q; unreadable notice present = %v, want %v",
+					tt.result, tt.walkErr, logs.Messages(), got, tt.wantUnreadable)
+			}
+			if got := logs.Contains(orphanMsg); got != tt.wantOrphan {
+				t.Errorf("logScanOutcome(%+v, %v) logged %q; missing-key notice present = %v, want %v",
+					tt.result, tt.walkErr, logs.Messages(), got, tt.wantOrphan)
+			}
+
+			// The whole-tree claims must never appear on a truncated scan, whatever the
+			// counts look like: this scan did not see the whole tree.
+			for _, msg := range []string{emptyTreeMsg, allOrphanMsg} {
+				if logs.Contains(msg) {
+					t.Errorf("logScanOutcome(%+v, %v) logged the whole-tree claim %q: a scan that did not"+
+						" complete cannot make it", tt.result, tt.walkErr, msg)
+				}
+			}
+
+			// Every reported count on a truncated scan is labelled an observation, so it is
+			// not read as a whole-tree total.
+			for _, c := range []struct {
+				msg  string
+				want bool
+			}{{unreadableMsg, tt.wantUnreadable}, {orphanMsg, tt.wantOrphan}} {
+				if !c.want {
+					continue
+				}
+				if logs.CountLevel(slog.LevelWarn, c.msg) != 1 {
+					t.Errorf("logScanOutcome(%+v, %v) did not log %q once at WARN", tt.result, tt.walkErr, c.msg)
+				}
+				if !logs.HasAttr(c.msg, "coverage", budgetTruncatedCoverage) {
+					got, _ := logs.AttrValue(c.msg, "coverage")
+					t.Errorf("logScanOutcome(%+v, %v) logged coverage=%q on %q, want %q: a count from a"+
+						" truncated scan must say it counts only the paths the scan reached",
+						tt.result, tt.walkErr, got, c.msg, budgetTruncatedCoverage)
+				}
+			}
+		})
+	}
+}
+
+// TestLogInputCoverageWarnings_labels_a_complete_scan_without_the_coverage_attribute is
+// the other side of the attribute: on a scan that DID complete, the same per-path counts
+// are whole-tree facts and must carry no truncation label. Without this, the attribute
+// could be emitted unconditionally and the budget test above would still pass, leaving
+// every operator record claiming partial coverage.
+//
+// This test fails when its subject is reverted. Checked by making the coverage attribute
+// unconditional (moving it out of the budgetStopped branch): both assertions then fail.
+// Runs serially: it swaps slog.Default().
+func TestLogInputCoverageWarnings_labels_a_complete_scan_without_the_coverage_attribute(t *testing.T) {
+	logs := captureLogs(t)
+
+	logInputCoverageWarnings(&ScanResult{Total: 3, Converted: 1, Orphan: 1, Unreadable: 1}, nil)
+
+	for _, msg := range []string{
+		"some /input paths were unreadable and were skipped",
+		"some certificates under the input root are missing their sibling .key",
+	} {
+		if !logs.Contains(msg) {
+			t.Fatalf("logInputCoverageWarnings(a completed scan) logged %q, want %q present", logs.Messages(), msg)
+		}
+		if got, ok := logs.AttrValue(msg, "coverage"); ok {
+			t.Errorf("logInputCoverageWarnings(a completed scan) logged coverage=%q on %q, want the"+
+				" attribute absent: a completed scan's counts are whole-tree facts", got, msg)
+		}
 	}
 }
