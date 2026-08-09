@@ -50,11 +50,17 @@ type conversionStatus int
 // statusUnwritable is the /output-side member of the same health-neutral family, and its
 // promise is stated here exactly, because it is the promise health rests on: this app
 // could not replace a bundle at the output path, it never PROVED that bundle wrong, and
-// what refused the replacement is a steady-state condition of the operator's volume that
-// no restart changes (a permission denial, a read-only mount, a full volume, an exhausted
-// quota, an output directory this app cannot pin — a symlinked output tree, or a
-// component another writer replaced — or a regular file occupying a directory
-// component of the output path — restartCanClearWrite enumerates them).
+// the refusal ITSELF said no restart changes what it refused. That last fact is not
+// re-derived anywhere: every refusal of an /output write carries its own classification,
+// assigned by the site that refused (store.write's three refusal sites, via
+// writeRefusalCause), and a site cannot compile without stating one. The classes those
+// sites state are a permission denial, an /output layout this app cannot publish through
+// — a symlinked output tree, a component that is not a directory, a regular file
+// occupying a directory component of the output path, or a component another writer
+// replaced — a read-only mount, a full volume, and an exhausted quota. The single
+// exception, restated at the point of refusal rather than assumed: a raw filesystem errno
+// the failing site itself cannot attribute to any of those is a genuinely transient I/O
+// error, which a restart CAN clear, so it keeps the loud statusFailed.
 //
 // "Never proved it wrong" means this app could not verify the content AT ALL: a bundle
 // above the readable bound, unreadable, un-stat-able, or refused by the codec's preflight.

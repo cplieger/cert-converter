@@ -172,20 +172,24 @@ var writeFileInRoot = atomicfile.WriteFileInRoot
 // directory's identity, and returns a root pinned to the directory it inspected, so
 // naming only the BASENAME through it removes every ancestor from the write's path.
 //
-// A pin this app cannot obtain FAILS the write, and the failure carries
-// errOutputPinRefused so restartCanClearWrite counts it among the steady-state /output
-// conditions no restart clears: for a bundle this app could not verify the entry is
-// health-neutral (the existing file is left in place under the standing WARN), while a
-// bundle it proved stale stays a loud conversion failure, which is the healthcheck
-// contract's own scope. It is deliberately not the /output DIRECTORY-mode question,
-// which stays report-only.
+// A pin this app cannot obtain FAILS the write, and the failure STATES its own
+// classification (refusalOutputLayout) instead of leaving a consumer to infer one from
+// the error value, so it is counted among the steady-state /output conditions no restart
+// clears: for a bundle this app could not verify the entry is health-neutral (the
+// existing file is left in place under the standing WARN), while a bundle it proved stale
+// stays a loud conversion failure, which is the healthcheck contract's own scope. It is
+// deliberately not the /output DIRECTORY-mode question, which stays report-only.
 //
 // The parent directory is created first and separately, because the pin needs a
 // directory that already exists: WithMkdirMode would create it inside the write, which
 // is the step the pin has to precede. MkdirAll runs through the same confined root at
 // the same pfxDirMode the option used (that is literally what the option does), so
 // mode and confinement still cannot drift.
-func (s *store) write(ctx context.Context, rel string, pfx []byte) error {
+//
+// Every failure return here is a writeRefusal, which cannot be constructed without its
+// classification: this function's THREE refusal sites each say what they refused, and a
+// fourth cannot compile without saying it too.
+func (s *store) write(ctx context.Context, rel string, pfx []byte) writeRefusal {
 	if dir := path.Dir(rel); dir != "." {
 		if err := s.root.MkdirAll(dir, pfxDirMode); err != nil {
 			// Named as part of the write, and carrying rel, because the step is invisible
@@ -194,28 +198,31 @@ func (s *store) write(ctx context.Context, rel string, pfx []byte) error {
 			// it belongs to and the path that could not be created.
 			//
 			// A non-directory occupant of a mirrored directory path is the SAME operator
-			// layout state the parent pin refuses one statement later, so it is joined with
-			// the same sentinel rather than left for a caller to re-derive from an errno:
-			// Root.MkdirAll reports EEXIST when the occupant is the LAST component of dir
-			// (mkdirat) and ENOTDIR when it is an earlier one (openat), and both mean a
-			// layout no restart re-reads differently. Anything else here (EROFS, ENOSPC,
-			// EACCES, EIO) keeps its own classification.
-			if errors.Is(err, syscall.EEXIST) || errors.Is(err, syscall.ENOTDIR) {
-				err = errors.Join(err, errOutputPinRefused)
+			// layout state the parent pin refuses one statement later, so this site STATES
+			// that class itself rather than joining a sentinel for a consumer to re-derive
+			// it from: Root.MkdirAll reports EEXIST when the occupant is the LAST component
+			// of dir (mkdirat) and ENOTDIR when it is an earlier one (openat), and both mean
+			// a layout no restart re-reads differently. Anything else here (EROFS, ENOSPC,
+			// EACCES, EIO) states its own answer from its own errno, which is this site's
+			// second job and the only reading of an error the invariant allows: the party
+			// classifying is the party that failed.
+			cause := refusalOutputLayout
+			if !errors.Is(err, syscall.EEXIST) && !errors.Is(err, syscall.ENOTDIR) {
+				cause = classifyWriteErrno(err)
 			}
-			return fmt.Errorf("write pfx: create output directory for %q: %w", rel, err)
+			return refuseWrite(cause, "write pfx: create output directory for %q: %w", rel, err)
 		}
 	}
 	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
 	if err != nil {
-		// Joined with the sentinel so restartCanClearWrite can name this among the
-		// steady-state /output conditions no restart clears: a symlinked output tree is
-		// an operator layout, and a component swapped mid-descent is another writer on
-		// the volume. Neither is process state, and inspect has already classified the
-		// bundle it cannot pin as contentUnverified, so writeOutcome's state gate keeps
-		// a genuinely absent bundle (contentVerifiedStale) loud.
-		return fmt.Errorf("write pfx: pin output directory for %q: %w",
-			rel, errors.Join(err, errOutputPinRefused))
+		// Classified HERE, at the refusal, because only this site knows what it refused: a
+		// symlinked output tree is an operator layout, and a component swapped mid-descent
+		// is another writer on the volume. Neither is process state, so no restart clears
+		// either. inspect has already classified the bundle it cannot pin as
+		// contentUnverified, so writeOutcome's state gate keeps a genuinely absent bundle
+		// (contentVerifiedStale) loud.
+		return refuseWrite(refusalOutputLayout,
+			"write pfx: pin output directory for %q: %w", rel, err)
 	}
 	defer func() { _ = parent.Close() }()
 	if _, err := writeFileInRoot(ctx, parent, base, pfx,
@@ -228,7 +235,9 @@ func (s *store) write(ctx context.Context, rel string, pfx []byte) error {
 		// fails the entry loudly instead of churning it silently forever.
 		atomicfile.WithMaxBytes(maxPFXSize),
 	); err != nil {
-		return fmt.Errorf("write pfx: %w", err)
+		// The bounded atomic write is where the errno classes live, so this site reads its
+		// OWN error to state its own verdict.
+		return refuseWrite(classifyWriteErrno(err), "write pfx: %w", err)
 	}
 	return nil
 }
@@ -659,17 +668,12 @@ func contentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 // the operator's decision, and this app has no action of its own to report or request.
 const laxBundleMsg = "prior pfx is more permissive than policy; leaving its mode as found"
 
-// outputPinRemediation is the operator action behind every /output pin refusal. It
-// names both causes the pin cannot tell apart: a symlinked output tree (a standing
-// misconfiguration) and a path replaced while the scan was running (a co-mounting
+// outputPinRemediation is the operator action behind every /output LAYOUT refusal
+// (refusalOutputLayout). It names the causes those refusals cannot tell apart: a
+// symlinked output tree or a non-directory occupant of a mirrored output path (standing
+// misconfigurations) and a path replaced while the scan was running (a co-mounting
 // writer).
 const outputPinRemediation = "mount the real output directory instead of linking to it, and check /output for paths replaced while the scan was running"
-
-// errOutputPinRefused marks a write refused because rel's parent could not be pinned to
-// the physical directory it names: a symlinked output tree, a component that is not a
-// directory, or one replaced while the descent was running. It is the /output-layout
-// sibling of the errno classes below, which is why restartCanClearWrite names it.
-var errOutputPinRefused = errors.New("output directory could not be pinned")
 
 // laxerThan reports whether perm carries a permission bit policy does not. It is the
 // WHOLE of the mode question for BOTH halves of /output — a bundle measured against
@@ -707,9 +711,10 @@ func (s *store) reportLaxBundle(rel string, perm os.FileMode) {
 
 // isPermissionRefusal reports whether err is the filesystem REFUSING an operation for
 // a permission reason, as opposed to failing it for any other reason. Its consumer is
-// restartCanClearWrite, where a refusal is the first of the classes no restart clears,
-// and unwritableRemediation, which turns the same distinction into the operator
-// remediation (ownership versus volume).
+// classifyWriteErrno, where a refusal is the ownership class — the first of the classes
+// no restart clears, and the one whose remediation is /output ownership rather than the
+// volume. It is a PRODUCER-side helper: a refusal site reading its own error to state
+// its own verdict, never a consumer re-deriving a verdict someone else already stated.
 //
 // fs.ErrPermission is the whole test rather than two errors.Is calls against
 // syscall.EPERM and syscall.EACCES: atomicfile's confined write returns an *fs.PathError
@@ -721,43 +726,172 @@ func isPermissionRefusal(err error) bool {
 	return errors.Is(err, fs.ErrPermission)
 }
 
-// restartCanClearWrite reports whether a FAILED /output write is one a container restart
-// could plausibly clear. That is the only question health has to answer — health means
-// "should an orchestrator restart this container?" — so it is the third fact writeOutcome
-// derives an entry's status from.
+// writeRefusalCause names WHAT refused an /output write, as the site that refused it
+// diagnosed it. It is the classification a writeRefusal CARRIES, and it is the whole of
+// what a consumer is allowed to know: writeOutcome asks restartCanClear, reportWriteFailure
+// asks remediation, and neither one re-examines the error value.
 //
-// It is a property of the ERROR and of nothing else. The previous shape asked the
-// STALENESS CAUSE instead, which is why a rewrite refused for permissions was counted as
-// a conversion failure whenever the bundle happened to be one this app could not read:
-// why the app decided to rewrite says nothing about whether restarting changes the
-// outcome.
+// It replaced restartCanClearWrite, a predicate over the error value whose
+// `default: return true` failed OPEN in the harmful direction. A producer nobody had
+// registered there was silently called clearable, so writeOutcome granted statusFailed,
+// healthyAfterScan dropped the health marker, and an orchestrator restart-looped the
+// container over an /output layout no restart changes — the same mistake statusUnreadable
+// exists to prevent on the /input side. Registering one such producer correctly needed
+// four coordinated edits and got one. Stating the class at the point of refusal removes
+// the coordination entirely: there is nothing for a new refusal site to forget to
+// register, because refuseWrite will not mint a refusal without a cause.
 //
-// The unclearable classes are enumerated, and everything else is clearable — the safe
-// direction, because an error this app cannot attribute to a steady-state condition of
-// the operator's volume might genuinely be gone on the next attempt, and a conversion
-// failure is the loud outcome:
+// This mirrors what the /input side already does. noteUnreadableInput returns the
+// conversionStatus it diagnosed so that "the classification and its diagnostic cannot
+// drift apart"; a refusal here carries its cause for the same reason, on the other mount.
+type writeRefusalCause int
+
+const (
+	// refusalUnclassified is the zero value and is deliberately NOT a cause, like
+	// statusUnset and contentUnresolved. Nothing produces it — refuseWrite takes the cause
+	// as its first parameter — so it exists only so that a value arriving by mistake takes
+	// the same direction as a cause nobody characterised: see restartCanClear.
+	refusalUnclassified writeRefusalCause = iota
+	// refusalOwnership: the filesystem refused the operation for a permission reason
+	// (EACCES / EPERM). A UID does not gain a permission by restarting; only a chown or a
+	// chmod on /output clears it.
+	refusalOwnership
+	// refusalOutputLayout: the SHAPE of the operator's output tree will not take this
+	// bundle at this path — a symlinked output tree, a component that is not a directory,
+	// a non-directory occupant of a mirrored output directory, or a component another
+	// writer replaced mid-descent. A restart re-reads the same layout.
+	refusalOutputLayout
+	// refusalVolume: the volume will not take the bytes (EROFS / ENOSPC / EDQUOT). A
+	// read-only mount is a mount option rather than process state, and a restarted
+	// container writes the same bytes into the same full volume or against the same
+	// exhausted quota.
+	refusalVolume
+	// refusalTransient: the write failed for something that is NOT a steady-state
+	// condition of the operator's volume — a genuinely transient I/O error, a bundle above
+	// maxPFXSize, a symlink at the output name. It is the one cause a restart can
+	// plausibly clear, so it is the one cause that keeps the loud conversion-failure
+	// outcome, and it is only ever stated by a site reading its own error.
+	refusalTransient
+
+	// refusalCauseCount is the enum's LENGTH, not a cause. It is last so that a cause
+	// added above it is covered by construction: the policy test walks [0, refusalCauseCount)
+	// and fails on a member whose two facts nobody stated, which is the enum-side half of
+	// the same guarantee refuseWrite's required parameter gives the refusal sites.
+	refusalCauseCount
+)
+
+// restartCanClear reports whether a container restart could plausibly clear this refusal.
+// That is the only question health has to answer — health means "should an orchestrator
+// restart this container?" — so it is the second fact writeOutcome derives an entry's
+// status from.
 //
-//   - EACCES / EPERM (isPermissionRefusal): a UID does not gain a permission by
-//     restarting. Only a chown or a chmod on /output clears it.
-//   - a pin this app cannot obtain (errOutputPinRefused): a symlinked output tree or a
-//     component another writer replaced; a restart re-reads the same layout.
-//   - EROFS: a read-only mount is a mount option, not process state.
-//   - ENOSPC / EDQUOT: a full volume or an exhausted quota. A restarted container writes
-//     the same bytes into the same full volume.
+// Spelled as an ALLOWLIST of the single cause a restart CAN clear, so a cause added later
+// takes the unclearable direction by construction rather than by omission. That is the
+// exact inverse of the enumeration-with-a-clearable-default this replaced, and
+// deliberately so: the direction that used to be free is the one that restart-loops a
+// container over a state no restart changes.
 //
-// It says nothing about whether the write SHOULD have succeeded: writeOutcome asks this
+// It says nothing about whether the write SHOULD have succeeded. writeOutcome asks this
 // only after establishing that the bundle already on disk is not one this app proved
-// wrong.
-func restartCanClearWrite(err error) bool {
+// wrong, so a renewal this app could not publish stays loud whatever refused it.
+func (c writeRefusalCause) restartCanClear() bool {
+	return c == refusalTransient
+}
+
+// remediation names the operator action that clears this refusal. It is the SECOND
+// consumer of the carried classification, and the reason the cause is an enum rather than
+// a bare clearable bool: what refused decides both facts, so one refusal cannot carry a
+// health verdict and a remediation that disagree, and neither is re-matched against the
+// error a third time.
+//
+// The three axes are ownership, the output tree's own layout, and the volume; an operator
+// sent after the wrong cause reads the WARN as noise. A layout refusal in particular is
+// not a volume condition, so it gets outputPinRemediation exactly as inspect's own
+// per-scan WARN for the same condition already advises.
+func (c writeRefusalCause) remediation() string {
+	switch c {
+	case refusalOutputLayout:
+		return outputPinRemediation
+	case refusalVolume:
+		return outputVolumeRemediation
+	default:
+		// refusalOwnership, plus the two causes that cannot reach here at all —
+		// refusalTransient (only an unclearable refusal is asked for a remediation) and
+		// refusalUnclassified — and any cause added later. /output ownership and
+		// permissions is the broadest of the three actions and the only one worth naming
+		// for a condition nobody has characterised yet.
+		return outputPermRemediation
+	}
+}
+
+// writeRefusal is the error store.write returns when it refuses to publish a bundle: the
+// diagnosis and its classification, minted together at the point of refusal so the two
+// cannot drift apart.
+//
+// It is an INTERFACE with an unexported method, and that is the ENFORCEMENT rather than a
+// convention. A refusal site cannot `return fmt.Errorf(...)` here, because a plain error
+// does not implement cause(); the only value that does is minted by refuseWrite, whose
+// FIRST parameter is the classification. So a fourth refusal site states what it refused
+// or it does not compile, which is the one hard requirement of this shape: adding a site
+// must not be able to silently inherit "clearable".
+//
+// Nothing downstream may infer the class from the error value, and there is no fallback
+// that hands an uncharacterised refusal the clearable verdict (restartCanClear is an
+// allowlist).
+type writeRefusal interface {
+	error
+	// cause is what refused, as the refusing site diagnosed it.
+	cause() writeRefusalCause
+}
+
+// classifiedWriteError is the only implementation of writeRefusal. Unexported with
+// unexported fields, and never built by a composite literal outside refuseWrite, so a
+// refusal that exists at all has a cause somebody stated.
+type classifiedWriteError struct {
+	err          error
+	refusalCause writeRefusalCause
+}
+
+func (r classifiedWriteError) Error() string { return r.err.Error() }
+
+// Unwrap keeps errors.Is/As working THROUGH the refusal, so the wrapped diagnosis an
+// operator reads and the errno a test seam injects both stay reachable. What is no longer
+// reachable is a consumer deriving the health verdict from them.
+//
+// It is load-bearing rather than decorative: reportWriteFailure hands the refusal to
+// failEntry, whose IsShutdown check is errors.Is(err, context.Canceled), so without this
+// method a write cancelled by SIGTERM would log a routine shutdown at ERROR and raise the
+// documented CertConverterConversionFailed alert. That is a bug this repo has already
+// shipped once, from a wrapper missing exactly this method.
+func (r classifiedWriteError) Unwrap() error { return r.err }
+
+func (r classifiedWriteError) cause() writeRefusalCause { return r.refusalCause }
+
+// refuseWrite mints store.write's refusal. The cause is the first parameter and there is
+// no form without it: that is the whole of the guarantee.
+func refuseWrite(cause writeRefusalCause, format string, args ...any) writeRefusal {
+	return classifiedWriteError{err: fmt.Errorf(format, args...), refusalCause: cause}
+}
+
+// classifyWriteErrno is how a refusal site that hands back a RAW filesystem error states
+// its own verdict: the errno classes of the bounded atomic write, plus the residual
+// errnos of the directory creation that are not the layout state that site names itself.
+//
+// Reading an error to classify it is legitimate HERE and nowhere downstream, because the
+// party doing the reading is the party that failed. Its residual arm is refusalTransient,
+// which is the one class a restart can clear — deliberate and scoped to a raw errno from
+// a filesystem syscall, where "not one of the steady-state volume conditions" genuinely
+// does mean "worth another attempt". No LAYOUT condition ever reaches it: those sites
+// state refusalOutputLayout directly, which is what the sentinel-plus-enumeration shape
+// could not guarantee.
+func classifyWriteErrno(err error) writeRefusalCause {
 	switch {
 	case isPermissionRefusal(err):
-		return false
-	case errors.Is(err, errOutputPinRefused):
-		return false
+		return refusalOwnership
 	case errors.Is(err, syscall.EROFS), errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT):
-		return false
+		return refusalVolume
 	default:
-		return true
+		return refusalTransient
 	}
 }
 

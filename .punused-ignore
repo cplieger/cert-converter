@@ -38,3 +38,14 @@ function NewECDSAKey
 function GenerateSelfSignedCert
 function GenerateCertChain
 function GenerateChainMaterial
+
+#
+# classifiedWriteError is store.write's refusal, and its Unwrap is the same
+# invalid-by-construction class as boundedTextError's above: the refusal reaches
+# process.failEntry -> IsShutdown -> errors.Is(err, context.Canceled), which walks the
+# chain through it, so a write cancelled by SIGTERM logs at Debug rather than raising the
+# documented CertConverterConversionFailed alert at ERROR. No caller names Unwrap
+# explicitly because errors.Is does the naming. Pinned by
+# TestStoreWrite_a_refusal_stays_unwrappable_so_a_cancelled_write_reads_as_shutdown.
+# Upstream: bep/punused#3.
+method (classifiedWriteError).Unwrap

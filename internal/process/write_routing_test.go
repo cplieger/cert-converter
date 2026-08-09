@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -33,20 +35,28 @@ import (
 //     operator is being served the wrong bundle.
 //   - contentVerifiedStale NEVER earns it, whatever refused the write. A renewal this app
 //     could not publish has to be loud, which is the README's /output contract.
-//   - The clearability question is asked of the ERROR, not of the reason for the rewrite,
-//     so the errno alone decides the routing once the fact grants neutrality.
+//   - The clearability question is answered by the REFUSAL ITSELF, at the site that
+//     refused, and read here from the carried cause — never re-derived from the error and
+//     never from the reason for the rewrite.
 //
 // The bundle's MODE is deliberately absent from every case: it decides nothing here, and
 // listing it would imply otherwise. contentUnresolved is here as the zero value: the
 // derivation is spelled as an allowlist, so a fact it does not know takes the loud
 // direction rather than silently inheriting neutrality.
+//
+// Every refusal is minted through refuseWrite with the cause the corresponding refusal
+// site states, because that carried cause IS what writeOutcome reads now — the error value
+// it wraps is diagnostic only.
 func TestWriteOutcome_derives_the_status_from_two_independent_facts(t *testing.T) {
 	t.Parallel()
-	refused := &fs.PathError{Op: "openat", Path: "chain.pfx", Err: syscall.EACCES}
-	full := &fs.PathError{Op: "renameat", Path: "chain.pfx", Err: syscall.ENOSPC}
-	brokenIO := &fs.PathError{Op: "renameat", Path: "chain.pfx", Err: syscall.EIO}
+	refused := refuseWrite(refusalOwnership, "write pfx: %w",
+		&fs.PathError{Op: "openat", Path: "chain.pfx", Err: syscall.EACCES})
+	full := refuseWrite(refusalVolume, "write pfx: %w",
+		&fs.PathError{Op: "renameat", Path: "chain.pfx", Err: syscall.ENOSPC})
+	brokenIO := refuseWrite(refusalTransient, "write pfx: %w",
+		&fs.PathError{Op: "renameat", Path: "chain.pfx", Err: syscall.EIO})
 	for name, tc := range map[string]struct {
-		writeErr error
+		writeErr writeRefusal
 		state    bundleState
 		want     conversionStatus
 	}{
@@ -87,39 +97,285 @@ func TestWriteOutcome_derives_the_status_from_two_independent_facts(t *testing.T
 	}
 }
 
-// TestRestartCanClearWrite_enumerates_the_unclearable_classes pins the third fact on its
-// own, because it is the one health ultimately turns on: health answers "should an
-// orchestrator restart this container?", so a write failure a restart cannot clear must
-// never be the reason it restarts.
+// TestWriteRefusal_carries_a_classification_from_every_refusal_site is the invariant this
+// restructuring exists to hold, pinned at the producers: EVERY refusal of an /output write
+// states its own class, at the point of refusal, and store.write's three refusal sites do
+// not agree about anything except being failures.
 //
-// The enumeration direction matters as much as the members. An error this app cannot
-// attribute to a steady-state condition of the operator's volume is reported clearable —
-// the loud direction — so a class nobody thought about flips health instead of being
-// silently forgiven.
-func TestRestartCanClearWrite_enumerates_the_unclearable_classes(t *testing.T) {
-	t.Parallel()
+// It is a table over the SITES rather than over an error-classifying predicate, and that
+// is the whole point. The predicate this replaced (restartCanClearWrite) enumerated error
+// values with a `default: return true`, so a refusal site nobody had registered there was
+// silently called clearable — the health marker dropped on every scan and the container
+// restart-looped over an /output layout no restart changes. A fourth site cannot reach that
+// state now: store.write returns writeRefusal, whose only constructor takes the cause as
+// its first parameter, so a site that states nothing does not compile. This test is the
+// other half — it fails if a site stops carrying the verdict it diagnosed, or starts
+// carrying a different one.
+//
+// Each case drives the REAL store through a real refusal rather than injecting an error, so
+// what is asserted is the class the site actually reaches for on the condition it actually
+// meets. Site 1's residual arm — a MkdirAll failure that is NOT the layout state that site
+// names itself — shares classifyWriteErrno with site 3, so site 3's errno rows below cover
+// the classifier and site 1's own rows cover the layout class it states directly. The suite
+// runs as root, so no fixture here can stage a genuine EACCES; the three volume and
+// ownership rows go through the write seam for the same reason writeFileInRoot is a seam
+// at all.
+//
+// Runs serially: several cases swap the write seam.
+func TestWriteRefusal_carries_a_classification_from_every_refusal_site(t *testing.T) {
 	for name, tc := range map[string]struct {
-		err  error
-		want bool
+		// stage builds the /output condition, and returns the root-relative name the
+		// write is asked to publish to.
+		stage func(t *testing.T, dir string) string
+		// pfx is the bundle offered to the write; nil means a small ordinary one.
+		pfx             []byte
+		want            writeRefusalCause
+		wantClearable   bool
+		wantRemediation string
 	}{
-		"EACCES is not clearable by a restart":                        {err: syscall.EACCES, want: false},
-		"EPERM is not clearable by a restart":                         {err: syscall.EPERM, want: false},
-		"a wrapped permission refusal is not clearable":               {err: &fs.PathError{Err: syscall.EACCES}, want: false},
-		"an fs.ErrPermission a seam injects is not either":            {err: fs.ErrPermission, want: false},
-		"EROFS is not clearable: a mount option outlives the process": {err: syscall.EROFS, want: false},
-		"ENOSPC is not clearable: the volume is still full":           {err: syscall.ENOSPC, want: false},
-		"EDQUOT is not clearable: the quota is still exhausted":       {err: syscall.EDQUOT, want: false},
-		"EIO is reported clearable, the loud direction":               {err: syscall.EIO, want: true},
-		"a symlink refusal is reported clearable":                     {err: errors.New("atomicfile: target is a symlink"), want: true},
-		"an unrecognised error is reported clearable":                 {err: errors.New("boom"), want: true},
+		// Site 1: s.root.MkdirAll. A regular file occupying the LAST component of the
+		// mirrored directory path is EEXIST (mkdirat), and one occupying an EARLIER
+		// component is ENOTDIR (openat). Both are the same operator layout, so the site
+		// states the layout class for both rather than leaving an errno to be matched.
+		"a file occupying the mirrored output directory is a layout refusal": {
+			stage: func(t *testing.T, dir string) string {
+				t.Helper()
+				writeBlocker(t, filepath.Join(dir, "sub"))
+				return filepath.Join("sub", "out.pfx")
+			},
+			want: refusalOutputLayout, wantClearable: false, wantRemediation: outputPinRemediation,
+		},
+		"a file occupying an ancestor of it is the same layout refusal": {
+			stage: func(t *testing.T, dir string) string {
+				t.Helper()
+				writeBlocker(t, filepath.Join(dir, "sub"))
+				return filepath.Join("sub", "nested", "out.pfx")
+			},
+			want: refusalOutputLayout, wantClearable: false, wantRemediation: outputPinRemediation,
+		},
+		// Site 2: atomicfile.OpenParentInRoot. The directory exists and MkdirAll is happy
+		// with it, so only the pin refuses: a symlink inside the root is exactly what
+		// confinement alone permits and the pin does not.
+		"a symlinked output parent is a layout refusal the pin makes": {
+			stage: func(t *testing.T, dir string) string {
+				t.Helper()
+				if err := os.Mkdir(filepath.Join(dir, "real"), pfxDirMode); err != nil {
+					t.Fatalf("setup: Mkdir(real): %v", err)
+				}
+				if err := os.Symlink("real", filepath.Join(dir, "sub")); err != nil {
+					t.Fatalf("setup: Symlink: %v", err)
+				}
+				return filepath.Join("sub", "out.pfx")
+			},
+			want: refusalOutputLayout, wantClearable: false, wantRemediation: outputPinRemediation,
+		},
+		// Site 3: the bounded atomic write, where the errno classes live. A bundle above
+		// maxPFXSize is refused by the cap rather than by the volume, so it is the one
+		// class a restart could plausibly clear and it keeps the loud outcome.
+		"a bundle above the read bound is a transient refusal the write makes": {
+			stage: func(_ *testing.T, _ string) string { return "out.pfx" },
+			pfx:   make([]byte, maxPFXSize+1),
+			want:  refusalTransient, wantClearable: true, wantRemediation: outputPermRemediation,
+		},
+		// Site 3 again, through the seam, because a read-only mount and a full volume
+		// cannot be staged in a directory the suite owns.
+		"a read-only mount is a volume refusal the write makes": {
+			stage: func(t *testing.T, _ string) string {
+				t.Helper()
+				stubWriteRefusal(t, &fs.PathError{Op: "renameat", Path: "out.pfx", Err: syscall.EROFS})
+				return "out.pfx"
+			},
+			want: refusalVolume, wantClearable: false, wantRemediation: outputVolumeRemediation,
+		},
+		"an exhausted quota is a volume refusal too": {
+			stage: func(t *testing.T, _ string) string {
+				t.Helper()
+				stubWriteRefusal(t, &fs.PathError{Op: "renameat", Path: "out.pfx", Err: syscall.EDQUOT})
+				return "out.pfx"
+			},
+			want: refusalVolume, wantClearable: false, wantRemediation: outputVolumeRemediation,
+		},
+		"a permission denial is an ownership refusal the write makes": {
+			stage: func(t *testing.T, _ string) string {
+				t.Helper()
+				stubWriteRefusal(t, &fs.PathError{Op: "openat", Path: "out.pfx", Err: syscall.EACCES})
+				return "out.pfx"
+			},
+			want: refusalOwnership, wantClearable: false, wantRemediation: outputPermRemediation,
+		},
+		// Site 3, one more time, for the class that keeps the LOUD outcome. It is here so the
+		// unclearable rows above cannot pass under a classifier that answers "unclearable"
+		// for everything.
+		"a genuinely transient I/O error keeps the clearable class": {
+			stage: func(t *testing.T, _ string) string {
+				t.Helper()
+				stubWriteRefusal(t, &fs.PathError{Op: "renameat", Path: "out.pfx", Err: syscall.EIO})
+				return "out.pfx"
+			},
+			want: refusalTransient, wantClearable: true, wantRemediation: outputPermRemediation,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			if got := restartCanClearWrite(tc.err); got != tc.want {
-				t.Errorf("restartCanClearWrite(%v) = %v, want %v", tc.err, got, tc.want)
+			dir := t.TempDir()
+			if err := os.Chmod(dir, pfxDirMode); err != nil {
+				t.Fatalf("setup: Chmod(dir): %v", err)
+			}
+			s := newOutputStore(t, dir)
+			rel := tc.stage(t, dir)
+			pfx := tc.pfx
+			if pfx == nil {
+				pfx = []byte("bundle")
+			}
+
+			refusal := s.write(t.Context(), rel, pfx)
+			if refusal == nil {
+				t.Fatalf("store.write(%s) = nil, want a refusal: the fixture staged a condition"+
+					" the write cannot publish through", rel)
+			}
+			if got := refusal.cause(); got != tc.want {
+				t.Errorf("store.write(%s).cause() = %v, want %v: the site that refuses states its own"+
+					" class, and nothing downstream may re-derive it from %v", rel, got, tc.want, refusal)
+			}
+			// The two facts the carried class decides, asserted here rather than only on the
+			// enum, so a site carrying the wrong class cannot pass by being self-consistent.
+			if got := refusal.cause().restartCanClear(); got != tc.wantClearable {
+				t.Errorf("store.write(%s).cause().restartCanClear() = %v, want %v", rel, got, tc.wantClearable)
+			}
+			if got := refusal.cause().remediation(); got != tc.wantRemediation {
+				t.Errorf("store.write(%s).cause().remediation() = %q, want %q: an operator sent after the"+
+					" wrong cause reads the WARN as noise", rel, got, tc.wantRemediation)
+			}
+			// The diagnosis has to survive the classification: the refusal still names the
+			// write step, and the wrapped error is still reachable by errors.Is.
+			if !strings.Contains(refusal.Error(), "write pfx") {
+				t.Errorf("store.write(%s) error = %q, want it to name the write step", rel, refusal.Error())
 			}
 		})
 	}
+}
+
+// TestWriteRefusalCause_states_both_facts_for_every_declared_cause is the enum-side half
+// of the same invariant: a cause added to the enum without stating what it MEANS fails
+// here.
+//
+// refuseWrite's required parameter stops a refusal site from omitting a class; this stops
+// a class from omitting its consequences. The walk is over [0, refusalCauseCount), so a
+// member added above the count sentinel arrives in this table's iteration with no entry
+// and the test fails naming it — which is the only way the two consumers
+// (writeOutcome via restartCanClear, reportWriteFailure via remediation) can be kept from
+// silently answering for a condition nobody characterised.
+//
+// The zero value is included deliberately. It is not a cause and nothing produces it, so
+// what is pinned is the DIRECTION it takes if one ever reaches a consumer: unclearable,
+// the same direction as any unrecognised cause, because the direction that used to be free
+// is the one that restart-loops a container.
+func TestWriteRefusalCause_states_both_facts_for_every_declared_cause(t *testing.T) {
+	t.Parallel()
+	want := map[writeRefusalCause]struct {
+		name        string
+		clearable   bool
+		remediation string
+	}{
+		refusalUnclassified: {"refusalUnclassified", false, outputPermRemediation},
+		refusalOwnership:    {"refusalOwnership", false, outputPermRemediation},
+		refusalOutputLayout: {"refusalOutputLayout", false, outputPinRemediation},
+		refusalVolume:       {"refusalVolume", false, outputVolumeRemediation},
+		refusalTransient:    {"refusalTransient", true, outputPermRemediation},
+	}
+	for c := range refusalCauseCount {
+		tc, ok := want[c]
+		if !ok {
+			t.Errorf("writeRefusalCause(%d) is declared but states neither of its two facts here:"+
+				" a cause added without a restart verdict and a remediation lets writeOutcome and"+
+				" reportWriteFailure answer for a condition nobody characterised", int(c))
+			continue
+		}
+		if got := c.restartCanClear(); got != tc.clearable {
+			t.Errorf("%s.restartCanClear() = %v, want %v", tc.name, got, tc.clearable)
+		}
+		if got := c.remediation(); got != tc.remediation {
+			t.Errorf("%s.remediation() = %q, want %q", tc.name, got, tc.remediation)
+		}
+	}
+	if len(want) != int(refusalCauseCount) {
+		t.Errorf("this table holds %d causes and the enum declares %d: a cause was removed without"+
+			" removing its expectation, so the walk above no longer covers the enum", len(want), refusalCauseCount)
+	}
+	// refusalTransient is the ONE clearable cause, asserted as a property rather than
+	// case by case: restartCanClear is an allowlist precisely so a cause added later is
+	// unclearable by construction, and a switch that grew a second clearable arm would
+	// restore the fail-open direction this shape replaced.
+	for c := range refusalCauseCount {
+		if c.restartCanClear() && c != refusalTransient {
+			t.Errorf("writeRefusalCause(%d).restartCanClear() = true, want only refusalTransient to be"+
+				" clearable: any other clearable cause reopens the restart loop", int(c))
+		}
+	}
+}
+
+// TestStoreWrite_a_refusal_stays_unwrappable_so_a_cancelled_write_reads_as_shutdown pins
+// the one contract the refusal's classification must not cost: errors.Is still walks
+// THROUGH it.
+//
+// reportWriteFailure hands the refusal to failEntry, whose shutdown split is
+// errors.Is(err, context.Canceled). A wrapper that carries a cause but drops Unwrap makes
+// that false, so a write interrupted by SIGTERM logs "conversion failed" at ERROR and
+// raises the documented CertConverterConversionFailed alert on every normal container
+// stop. This repo has already shipped that exact bug once from a wrapper missing Unwrap,
+// which is why the property gets a test rather than a comment — and why
+// (classifiedWriteError).Unwrap is in .punused-ignore rather than deleted as unreferenced.
+//
+// Runs serially: it swaps the write seam.
+func TestStoreWrite_a_refusal_stays_unwrappable_so_a_cancelled_write_reads_as_shutdown(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, pfxDirMode); err != nil {
+		t.Fatalf("setup: Chmod(dir): %v", err)
+	}
+	s := newOutputStore(t, dir)
+	stubWriteRefusal(t, fmt.Errorf("atomicfile: staging the temp: %w", context.Canceled))
+
+	refusal := s.write(t.Context(), "out.pfx", []byte("bundle"))
+	if refusal == nil {
+		t.Fatal("store.write(cancelled) = nil, want a refusal")
+	}
+	if !errors.Is(refusal, context.Canceled) {
+		t.Errorf("errors.Is(store.write(cancelled), context.Canceled) = false, want true: the refusal has"+
+			" to stay unwrappable, or IsShutdown reports a normal SIGTERM as a conversion failure at"+
+			" ERROR and pages an operator. Got %q", refusal.Error())
+	}
+	if !IsShutdown(refusal) {
+		t.Error("IsShutdown(store.write(cancelled)) = false, want true: this is the exact call" +
+			" failEntry makes to choose Debug over ERROR")
+	}
+	// And the classification still travelled: a cancelled write is not one of the volume's
+	// steady-state conditions, so it keeps the loud class.
+	if got := refusal.cause(); got != refusalTransient {
+		t.Errorf("store.write(cancelled).cause() = %v, want refusalTransient", got)
+	}
+}
+
+// writeBlocker plants a regular file at path, so a store.write asked to create a
+// directory there meets the operator layout it cannot publish through.
+func writeBlocker(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("blocker"), pfxFileMode); err != nil {
+		t.Fatalf("setup: WriteFile(blocker): %v", err)
+	}
+}
+
+// stubWriteRefusal makes the bounded atomic write fail with err for the rest of the test.
+// The seam is the only way in for a read-only mount, a full volume and an exhausted quota:
+// the suite owns every directory it creates, and as root nothing refuses it at all.
+// A test using it runs serially.
+func stubWriteRefusal(t *testing.T, err error) {
+	t.Helper()
+	prev := writeFileInRoot
+	writeFileInRoot = func(context.Context, *os.Root, string, []byte,
+		...atomicfile.Option,
+	) (atomicfile.Result, error) {
+		return atomicfile.Result{}, err
+	}
+	t.Cleanup(func() { writeFileInRoot = prev })
 }
 
 // TestStoreInspect_reports_content_it_could_not_verify pins the FACT, at the boundary that

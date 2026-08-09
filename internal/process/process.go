@@ -1418,11 +1418,16 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 // writeOutcome derives one entry's conversionStatus, and it is the ONLY place that
 // derivation happens. Its inputs are the two facts this scan resolved independently:
 // what this app learned about the bundle already on disk (state.content), and — when the
-// write failed — whether a restart could clear that failure (restartCanClearWrite). The
+// write failed — the classification the refusal itself CARRIES (writeRefusal.cause). The
 // bundle's MODE is not one of them: a lax mode is reported and acted on nowhere, so it can
 // neither schedule a write nor reach health. Deriving the status once, after the write, is
 // what replaced threading a staleness cause into the failure handler: each fact arrives
 // unmodified, so a fix to one of them cannot overwrite another on the way here.
+//
+// It reads the carried cause rather than re-examining the error, which is the invariant
+// store.go's writeRefusalCause exists to hold: every refusal of an /output write states
+// its own class at the point of refusal, so no consumer can disagree with the producer and
+// no uncharacterised refusal inherits the clearable verdict.
 //
 // The default is unchanged and stays the loud one: a PFX this app could not write is a
 // conversion failure, counted in ScanResult.Failed, and health goes unhealthy — right,
@@ -1436,19 +1441,20 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 //     because the operator is being served the wrong bundle and that has to be loud (the
 //     README's /output contract). A bundle it compared and MATCHED never reaches here at
 //     all: convertEntry returns at `if state.upToDate()` before the write.
-//  2. No restart can clear what refused the write (restartCanClearWrite): a permission
-//     denial, a read-only mount, a full volume, an exhausted quota.
+//  2. The refusal says no restart can clear it (writeRefusalCause.restartCanClear): a
+//     permission denial, an /output layout, a read-only mount, a full volume, an
+//     exhausted quota.
 //
 // Together those two are exactly the condition health exists to exclude: restarting the
 // container cannot change the outcome, so restarting is the wrong answer and Failed is the
 // wrong count — the same mistake statusUnreadable exists to avoid on the /input side. The
 // condition is not silence: it carries a standing WARN once per scan and it still blocks
 // orphan reaping (ScanResult.conversionsClean).
-func writeOutcome(state bundleState, writeErr error) conversionStatus {
+func writeOutcome(state bundleState, writeErr writeRefusal) conversionStatus {
 	switch {
 	case writeErr == nil:
 		return statusConverted
-	case state.bundleNotProvenWrong() && !restartCanClearWrite(writeErr):
+	case state.bundleNotProvenWrong() && !writeErr.cause().restartCanClear():
 		return statusUnwritable
 	default:
 		return statusFailed
@@ -1479,18 +1485,20 @@ const outputVolumeRemediation = "check /output for free space, a quota and a rea
 // reportWriteFailure logs a failed PFX write in the register the DERIVED outcome calls
 // for. It decides nothing — writeOutcome already did — so the count and the log can never
 // disagree about an entry, which is what the previous shape risked by classifying inside
-// the logger.
+// the logger. The remediation comes from the refusal's own carried cause for the same
+// reason: the site that refused named the operator action, and nothing here re-matches the
+// error to pick one.
 //
 // The WARN is emitted once per bundle per scan, because the entry is written at most once
 // per scan: there is no retry loop behind it.
-func reportWriteFailure(logRel, pfxRel string, err error, outcome conversionStatus) {
+func reportWriteFailure(logRel, pfxRel string, err writeRefusal, outcome conversionStatus) {
 	if outcome == statusUnwritable {
 		// "unverified" is the only content fact that can reach this record:
 		// writeOutcome grants statusUnwritable solely via bundleNotProvenWrong,
 		// whose allowlist is exactly contentUnverified.
 		slog.Warn(unreplaceableBundleMsg,
 			"path", logRel, "output_path", pfxRel, "error", err,
-			"content", "unverified", "remediation", unwritableRemediation(err))
+			"content", "unverified", "remediation", err.cause().remediation())
 		return
 	}
 	// failEntry is called for its LOG: the statusFailed it returns is the same value
@@ -1500,26 +1508,6 @@ func reportWriteFailure(logRel, pfxRel string, err error, outcome conversionStat
 	failEntry(logRel, "conversion failed", err, "output_path", pfxRel,
 		"remediation", "check /output ownership and permissions for the UID in user:, "+
 			"and that no symlink is planted at the output path")
-}
-
-// unwritableRemediation names the operator action that clears a health-neutral write
-// refusal. One axis rather than the two this used to pick over: with only one standing
-// message left, what remains is WHAT REFUSED the replacement — ownership, the output
-// tree's own layout, or the volume — and an operator sent after the wrong cause reads
-// the WARN as noise.
-func unwritableRemediation(err error) string {
-	switch {
-	case isPermissionRefusal(err):
-		return outputPermRemediation
-	case errors.Is(err, errOutputPinRefused):
-		// A refused parent pin is a layout condition, not a volume one: the fix
-		// is the symlinked /output tree or the replaced component the pin named,
-		// so the advice is outputPinRemediation, exactly as inspect's own
-		// per-scan WARN for the same condition already advises.
-		return outputPinRemediation
-	default:
-		return outputVolumeRemediation
-	}
 }
 
 // logConversionObservations surfaces Analyse's non-fatal findings about a pair's

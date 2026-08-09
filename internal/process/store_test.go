@@ -288,9 +288,9 @@ func TestStoreWrite_refuses_a_bundle_larger_than_the_read_bound(t *testing.T) {
 	if string(got) != "prior bundle" {
 		t.Errorf("prior bundle = %q, want %q: the cap is checked before the temp is staged, so a refusal must leave the previous bundle intact", got, "prior bundle")
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
+	entries, listErr := os.ReadDir(dir)
+	if listErr != nil {
+		t.Fatal(listErr)
 	}
 	if len(entries) != 1 {
 		t.Errorf("the output directory holds %d entries, want 1: a refused write must stage no temp file", len(entries))
@@ -1241,7 +1241,11 @@ func TestStoreInspect_classifies_a_read_that_found_nothing_as_verified_stale(t *
 	// Spelled out rather than imported from the production call site: an operator's log
 	// query keys on these words, so a silent rewording must fail here.
 	const unreadableMsg = "cannot read prior pfx; regenerating"
-	refused := &fs.PathError{Op: "openat", Path: "out.pfx", Err: fs.ErrPermission}
+	// The refusal is minted the way store.write mints one, because writeOutcome now reads
+	// the CARRIED class rather than the error: a permission refusal states refusalOwnership
+	// at the site that refused it.
+	refused := refuseWrite(refusalOwnership, "write pfx: %w",
+		&fs.PathError{Op: "openat", Path: "out.pfx", Err: fs.ErrPermission})
 
 	for _, tc := range []struct {
 		name    string
