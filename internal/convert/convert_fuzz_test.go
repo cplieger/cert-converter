@@ -31,7 +31,7 @@ func FuzzParseCertChain(f *testing.F) {
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().Add(time.Hour),
 	}
-	_, validPEM, _ := testcerts.Mint(f, tmpl, &key.PublicKey, nil, key)
+	validPEM, _ := testcerts.Mint(f, tmpl, &key.PublicKey, nil, key)
 	f.Add(validPEM)
 	f.Add([]byte("not a pem"))
 	// A declaration encoding/pem drops silently (BEGIN line, no END) must be
@@ -217,7 +217,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		NotAfter:     time.Now().Add(time.Hour),
 		IsCA:         true,
 	}
-	_, certPEM, _ := testcerts.Mint(f, tmpl, &key.PublicKey, nil, key)
+	certPEM, _ := testcerts.Mint(f, tmpl, &key.PublicKey, nil, key)
 	keyPEM := testcerts.KeyPEM(f, key)
 	f.Add(append(certPEM, keyPEM...))
 
@@ -233,7 +233,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		KeyUsage:              x509.KeyUsageCertSign,
 		BasicConstraintsValid: true,
 	}
-	_, caPEM, caCert := testcerts.Mint(f, caTmpl, &caKey.PublicKey, nil, caKey)
+	caPEM, caCert := testcerts.Mint(f, caTmpl, &caKey.PublicKey, nil, caKey)
 	leafKey := testcerts.NewECDSAKey(f)
 	leafTmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(3),
@@ -241,7 +241,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().Add(time.Hour),
 	}
-	_, leafPEM, _ := testcerts.Mint(f, leafTmpl, &leafKey.PublicKey, caCert, caKey)
+	leafPEM, _ := testcerts.Mint(f, leafTmpl, &leafKey.PublicKey, caCert, caKey)
 	chainSeed := slices.Concat(leafPEM, caPEM, testcerts.KeyPEM(f, leafKey))
 	f.Add(chainSeed)
 

@@ -43,8 +43,8 @@ func TestAnalyse_accepts_a_regenerated_self_signed_certificate(t *testing.T) {
 			KeyUsage:              x509.KeyUsageCertSign,
 		}
 	}
-	_, oldPEM, _ := testcerts.Mint(t, tmpl(60), &key.PublicKey, nil, key)
-	_, newPEM, _ := testcerts.Mint(t, tmpl(61), &key.PublicKey, nil, key)
+	oldPEM, _ := testcerts.Mint(t, tmpl(60), &key.PublicKey, nil, key)
+	newPEM, _ := testcerts.Mint(t, tmpl(61), &key.PublicKey, nil, key)
 
 	got, err := convert.Analyse(t.Context(), concatPEM(oldPEM, newPEM), testcerts.KeyPEM(t, key))
 	if err != nil {
@@ -75,7 +75,7 @@ func TestAnalyse_reports_a_key_that_belongs_to_an_issuer(t *testing.T) {
 	t.Parallel()
 	caKey := testcerts.NewECDSAKey(t)
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
-	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
+	caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(70),
 		Subject:               pkix.Name{CommonName: "Real Issuer CA"},
 		NotBefore:             notBefore,
@@ -86,7 +86,7 @@ func TestAnalyse_reports_a_key_that_belongs_to_an_issuer(t *testing.T) {
 	}, &caKey.PublicKey, nil, caKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(71),
 		Subject:      pkix.Name{CommonName: "issued-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -122,7 +122,7 @@ func TestAnalyse_converts_a_key_shared_by_a_ca_and_its_leaf(t *testing.T) {
 	sharedKey := testcerts.NewECDSAKey(t)
 	leafNotBefore := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
 	caNotBefore := leafNotBefore.Add(time.Hour)
-	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
+	caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(72),
 		Subject:               pkix.Name{CommonName: "Shared Key CA"},
 		NotBefore:             caNotBefore,
@@ -132,7 +132,7 @@ func TestAnalyse_converts_a_key_shared_by_a_ca_and_its_leaf(t *testing.T) {
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &sharedKey.PublicKey, nil, sharedKey)
 
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(73),
 		Subject:      pkix.Name{CommonName: "shared-key-leaf.example.com"},
 		NotBefore:    leafNotBefore,
@@ -188,7 +188,7 @@ func TestAnalyse_reports_the_shared_key_as_reuse_when_the_issuer_match_is_droppe
 	sharedKey := testcerts.NewECDSAKey(t)
 	caNotBefore := time.Now().Add(-3 * time.Hour).Truncate(time.Second)
 	leafNotBefore := caNotBefore.Add(time.Hour)
-	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
+	caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(9000),
 		Subject:               pkix.Name{CommonName: "Reused Key CA"},
 		NotBefore:             caNotBefore,
@@ -198,7 +198,7 @@ func TestAnalyse_reports_the_shared_key_as_reuse_when_the_issuer_match_is_droppe
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &sharedKey.PublicKey, nil, sharedKey)
 
-	_, leafPEM, leafCert := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, leafCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(9001),
 		Subject:      pkix.Name{CommonName: "reused-key-leaf.example.com"},
 		NotBefore:    leafNotBefore,
@@ -249,7 +249,7 @@ func TestAnalyse_reports_both_a_renewal_tie_and_key_reuse(t *testing.T) {
 	t.Parallel()
 	sharedKey := testcerts.NewECDSAKey(t)
 	caNotBefore := time.Now().Add(-4 * time.Hour).Truncate(time.Second)
-	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
+	caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(9100),
 		Subject:               pkix.Name{CommonName: "Renewal Tie CA"},
 		NotBefore:             caNotBefore,
@@ -259,13 +259,13 @@ func TestAnalyse_reports_both_a_renewal_tie_and_key_reuse(t *testing.T) {
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &sharedKey.PublicKey, nil, sharedKey)
 
-	_, oldLeafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	oldLeafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(9101),
 		Subject:      pkix.Name{CommonName: "tie-leaf.example.com"},
 		NotBefore:    caNotBefore.Add(time.Hour),
 		NotAfter:     caNotBefore.Add(48 * time.Hour),
 	}, &sharedKey.PublicKey, caCert, sharedKey)
-	_, newLeafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	newLeafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(9102),
 		Subject:      pkix.Name{CommonName: "tie-leaf.example.com"},
 		NotBefore:    caNotBefore.Add(2 * time.Hour),
@@ -300,7 +300,7 @@ func TestAnalyse_reports_no_key_reuse_when_the_key_file_holds_two_keys(t *testin
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
 	caKey := testcerts.NewECDSAKey(t)
-	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
+	caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(9200),
 		Subject:               pkix.Name{CommonName: "Two Key CA"},
 		NotBefore:             notBefore,
@@ -311,7 +311,7 @@ func TestAnalyse_reports_no_key_reuse_when_the_key_file_holds_two_keys(t *testin
 	}, &caKey.PublicKey, nil, caKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(9201),
 		Subject:      pkix.Name{CommonName: "two-key-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -342,7 +342,7 @@ func TestAnalyse_converts_when_key_file_holds_leaf_and_issuer_keys(t *testing.T)
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
 	caKey := testcerts.NewECDSAKey(t)
-	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
+	caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(74),
 		Subject:               pkix.Name{CommonName: "Separate Key CA"},
 		NotBefore:             notBefore,
@@ -353,7 +353,7 @@ func TestAnalyse_converts_when_key_file_holds_leaf_and_issuer_keys(t *testing.T)
 	}, &caKey.PublicKey, nil, caKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(75),
 		Subject:      pkix.Name{CommonName: "separate-key-leaf.example.com"},
 		NotBefore:    notBefore,

@@ -222,7 +222,14 @@ func TestPollTick_reports_the_standing_degradation_at_warn_with_its_cause(t *tes
 				t.Fatalf("pollTick ran %d scans, want 1: the tick's scan is the only live change detection", scans)
 			}
 
-			rec := requireOneRecord(t, logs, msgScanState)
+			// README's CertConverterChangeDetectionDegraded rule matches the
+			// literal line `change detection scan` plus mode=poll, so the message
+			// is pinned as a LITERAL rather than via msgScanState: a reword of the
+			// shared constant must fail here, not in an operator's Loki rule that
+			// silently stops matching. recordsFor matches the message exactly, so
+			// this pins the whole line; main_test.go pins its alerted messages the
+			// same way.
+			rec := requireOneRecord(t, logs, "change detection scan")
 			if rec.level != slog.LevelWarn {
 				t.Errorf("poll-mode scan logged at %v, want WARN: a standing degradation must stay visible at LOG_LEVEL=warn", rec.level)
 			}

@@ -27,7 +27,7 @@ func BenchmarkConvertPair(b *testing.B) {
 		IsCA:         true,
 		KeyUsage:     x509.KeyUsageCertSign,
 	}
-	_, certPEM, _ := testcerts.Mint(b, tmpl, &key.PublicKey, nil, key)
+	certPEM, _ := testcerts.Mint(b, tmpl, &key.PublicKey, nil, key)
 	keyPEM := testcerts.KeyPEM(b, key)
 
 	root, err := os.OpenRoot(b.TempDir())

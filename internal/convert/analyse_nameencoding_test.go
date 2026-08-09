@@ -29,12 +29,12 @@ func TestAnalyse_drops_a_shared_key_issuer_across_a_name_encoding_difference(t *
 	t.Parallel()
 	sharedKey := testcerts.NewECDSAKey(t)
 	now := time.Now().Truncate(time.Second)
-	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
+	caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(600), Subject: pkix.Name{CommonName: "Shared Encoding CA"},
 		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(48 * time.Hour),
 		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
 	}, &sharedKey.PublicKey, nil, sharedKey)
-	_, leafPEM, leafCert := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, leafCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(601), Subject: pkix.Name{CommonName: "encoding-leaf.example.com"},
 		NotBefore: now.Add(-2 * time.Hour), NotAfter: now.Add(24 * time.Hour),
 	}, &sharedKey.PublicKey, utf8SubjectView(caCert, "Shared Encoding CA"), sharedKey)
@@ -119,7 +119,7 @@ func TestAnalyse_keeps_a_ca_identity_whose_subject_only_matches_an_issuer_name_a
 	t.Parallel()
 	now := time.Now().Truncate(time.Second)
 	caKey := testcerts.NewECDSAKey(t)
-	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
+	caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(700),
 		// O then CN.
 		RawSubject: rawNameOf(t, rdnSequence(
@@ -133,7 +133,7 @@ func TestAnalyse_keeps_a_ca_identity_whose_subject_only_matches_an_issuer_name_a
 	// Signed by the CA's key, but naming an issuer whose RDNs are in the other
 	// order: CN then O.
 	otherKey := testcerts.NewECDSAKey(t)
-	_, otherPEM, otherCert := testcerts.Mint(t, &x509.Certificate{
+	otherPEM, otherCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(701),
 		Subject:      pkix.Name{CommonName: "reordered-leaf.example.com"},
 		NotBefore:    now.Add(-2 * time.Hour), NotAfter: now.Add(24 * time.Hour),
@@ -192,16 +192,16 @@ func TestAnalyse_orders_a_chain_proven_across_a_name_encoding_difference(t *test
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
 	rootKey := testcerts.NewECDSAKey(t)
-	_, rootPEM, rootCert := testcerts.Mint(t, unverifiableCA(800, "Ordered Encoding Root CA", notBefore, notBefore.Add(96*time.Hour)),
+	rootPEM, rootCert := testcerts.Mint(t, unverifiableCA(800, "Ordered Encoding Root CA", notBefore, notBefore.Add(96*time.Hour)),
 		&rootKey.PublicKey, nil, rootKey)
 	upperKey := testcerts.NewECDSAKey(t)
-	_, upperPEM, upperCert := testcerts.Mint(t, unverifiableCA(801, "Ordered Encoding Upper CA", notBefore, notBefore.Add(72*time.Hour)),
+	upperPEM, upperCert := testcerts.Mint(t, unverifiableCA(801, "Ordered Encoding Upper CA", notBefore, notBefore.Add(72*time.Hour)),
 		&upperKey.PublicKey, rootCert, rootKey)
 	lowerKey := testcerts.NewECDSAKey(t)
-	_, lowerPEM, lowerCert := testcerts.Mint(t, unverifiableCA(802, "Ordered Encoding Lower CA", notBefore, notBefore.Add(48*time.Hour)),
+	lowerPEM, lowerCert := testcerts.Mint(t, unverifiableCA(802, "Ordered Encoding Lower CA", notBefore, notBefore.Add(48*time.Hour)),
 		&lowerKey.PublicKey, utf8SubjectView(upperCert, "Ordered Encoding Upper CA"), upperKey)
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(803),
 		Subject:      pkix.Name{CommonName: "ordered-encoding-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -259,17 +259,17 @@ func TestAnalyse_excludes_a_stranger_once_the_encoding_gap_is_proven(t *testing.
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
 	caKey := testcerts.NewECDSAKey(t)
-	_, caPEM, caCert := testcerts.Mint(t, unverifiableCA(830, "Proven Gap CA", notBefore, notBefore.Add(48*time.Hour)),
+	caPEM, caCert := testcerts.Mint(t, unverifiableCA(830, "Proven Gap CA", notBefore, notBefore.Add(48*time.Hour)),
 		&caKey.PublicKey, nil, caKey)
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, leafCert := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, leafCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(831),
 		Subject:      pkix.Name{CommonName: "proven-gap-leaf.example.com"},
 		NotBefore:    notBefore,
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, utf8SubjectView(caCert, "Proven Gap CA"), caKey)
 	strangerKey := testcerts.NewECDSAKey(t)
-	_, strangerPEM, _ := testcerts.Mint(t, unverifiableCA(832, "Unrelated Bystander CA", notBefore, notBefore.Add(240*time.Hour)),
+	strangerPEM, _ := testcerts.Mint(t, unverifiableCA(832, "Unrelated Bystander CA", notBefore, notBefore.Add(240*time.Hour)),
 		&strangerKey.PublicKey, nil, strangerKey)
 
 	if bytes.Equal(leafCert.RawIssuer, caCert.RawSubject) {

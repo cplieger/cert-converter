@@ -39,16 +39,6 @@ type Roots struct {
 	Input, Output *os.Root
 }
 
-// mountSpec is one required volume's inspection: the role its diagnostics carry,
-// the path to inspect, and where its handle lands on success. The table stays
-// private so the all-offender sweep is an implementation detail of Open rather
-// than a shape a caller can build a third role in.
-type mountSpec struct {
-	assign func(*os.Root)
-	role   string
-	path   string
-}
-
 // Open verifies every required mount already exists as a directory and can be
 // opened by the running UID. It reports every offender in one startup attempt and
 // never creates a missing mount in the container's ephemeral layer. Output write
@@ -61,16 +51,17 @@ type mountSpec struct {
 func Open(dirs Paths) (Roots, bool) {
 	var open Roots
 	ready := true
-	for _, spec := range []mountSpec{
-		{role: roleInput, path: dirs.Input, assign: func(root *os.Root) { open.Input = root }},
-		{role: roleOutput, path: dirs.Output, assign: func(root *os.Root) { open.Output = root }},
-	} {
-		root, ok := openMount(spec)
-		if !ok {
-			ready = false
-			continue
-		}
-		spec.assign(root)
+	// Both volumes are inspected before any refusal, so one startup attempt
+	// names every offender.
+	if root, ok := openMount(roleInput, dirs.Input); ok {
+		open.Input = root
+	} else {
+		ready = false
+	}
+	if root, ok := openMount(roleOutput, dirs.Output); ok {
+		open.Output = root
+	} else {
+		ready = false
 	}
 	if !ready {
 		open.Close()
@@ -82,16 +73,16 @@ func Open(dirs Paths) (Roots, bool) {
 // openMount inspects one required volume and returns its confined handle. On
 // refusal it has already logged that offender at ERROR with the remediation its
 // cause calls for, so Open can carry on and name the rest of them.
-func openMount(spec mountSpec) (*os.Root, bool) {
-	fi, statErr := os.Stat(spec.path)
+func openMount(role, path string) (*os.Root, bool) {
+	fi, statErr := os.Stat(path)
 	if statErr == nil && fi.IsDir() {
-		root, openErr := openMountRoot(spec.path)
+		root, openErr := openMountRoot(path)
 		if openErr == nil {
 			return root, true
 		}
 		slog.Error("required volume cannot be opened by this container's user; refusing to start",
-			"role", spec.role, "path", spec.path, "error", openErr,
-			"remediation", "grant the UID in the container's `user:` read access to "+spec.path+
+			"role", role, "path", path, "error", openErr,
+			"remediation", "grant the UID in the container's `user:` read access to "+path+
 				" (chgrp/chmod the host directory), or run the container as a UID that already has it")
 		return nil, false
 	}
@@ -102,8 +93,8 @@ func openMount(spec mountSpec) (*os.Root, bool) {
 		statErr = errors.New("path exists but is not a directory")
 	}
 	slog.Error("required volume is missing or not a directory; refusing to start",
-		"role", spec.role, "path", spec.path, "error", statErr,
-		"remediation", "mount "+spec.path+" into the container before starting it")
+		"role", role, "path", path, "error", statErr,
+		"remediation", "mount "+path+" into the container before starting it")
 	return nil, false
 }
 

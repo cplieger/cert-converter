@@ -109,7 +109,7 @@ func FuzzAnalyse_keeps_the_bundle_internally_consistent(f *testing.F) {
 func fuzzSpareCA(f *testing.F) []byte {
 	key := testcerts.NewECDSAKey(f)
 	now := time.Now()
-	_, caPEM, _ := testcerts.Mint(f, &x509.Certificate{
+	caPEM, _ := testcerts.Mint(f, &x509.Certificate{
 		SerialNumber:          big.NewInt(9001),
 		Subject:               pkix.Name{CommonName: "fuzz-spare-ca.example.com"},
 		NotBefore:             now.Add(-time.Hour),

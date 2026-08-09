@@ -39,7 +39,7 @@ func TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established(t *tes
 	// matches nothing present: the same observable state a signature we cannot
 	// verify produces.
 	absentCAKey := testcerts.NewECDSAKey(t)
-	_, _, absentCACert := testcerts.Mint(t, &x509.Certificate{
+	_, absentCACert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(80),
 		Subject:               pkix.Name{CommonName: "Absent Issuer CA"},
 		NotBefore:             notBefore,
@@ -50,7 +50,7 @@ func TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established(t *tes
 	}, &absentCAKey.PublicKey, nil, absentCAKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(81),
 		Subject:      pkix.Name{CommonName: "orphaned-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -61,7 +61,7 @@ func TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established(t *tes
 	// would have been embedded; it must still be embedded rather than dropped,
 	// because we cannot show it is off the chain.
 	otherKey := testcerts.NewECDSAKey(t)
-	_, otherPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	otherPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(82),
 		Subject:               pkix.Name{CommonName: "Possibly Related CA"},
 		NotBefore:             notBefore,
@@ -115,7 +115,7 @@ func TestAnalyse_still_excludes_an_unrelated_cert_from_a_self_signed_identity(t 
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
 	key := testcerts.NewECDSAKey(t)
-	_, identityPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	identityPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(90),
 		Subject:      pkix.Name{CommonName: "self.example.com"},
 		NotBefore:    notBefore,
@@ -123,7 +123,7 @@ func TestAnalyse_still_excludes_an_unrelated_cert_from_a_self_signed_identity(t 
 	}, &key.PublicKey, nil, key)
 
 	strangerKey := testcerts.NewECDSAKey(t)
-	_, strangerPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	strangerPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(91),
 		Subject:      pkix.Name{CommonName: "stranger.example.com"},
 		NotBefore:    notBefore,
@@ -204,7 +204,7 @@ func TestAnalyse_excludes_a_certificate_that_cannot_issue_certificates(t *testin
 			// The leaf's real issuer is NOT in the bundle, so nothing present can
 			// be proven to be its issuer.
 			absentCAKey := testcerts.NewECDSAKey(t)
-			_, _, absentCACert := testcerts.Mint(t, &x509.Certificate{
+			_, absentCACert := testcerts.Mint(t, &x509.Certificate{
 				SerialNumber:          big.NewInt(400),
 				Subject:               pkix.Name{CommonName: "Absent Encoding CA"},
 				NotBefore:             notBefore,
@@ -215,7 +215,7 @@ func TestAnalyse_excludes_a_certificate_that_cannot_issue_certificates(t *testin
 			}, &absentCAKey.PublicKey, nil, absentCAKey)
 
 			leafKey := testcerts.NewECDSAKey(t)
-			_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+			leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 				SerialNumber: big.NewInt(401),
 				Subject:      pkix.Name{CommonName: "disqualified-issuer-leaf.example.com"},
 				NotBefore:    notBefore,
@@ -233,7 +233,7 @@ func TestAnalyse_excludes_a_certificate_that_cannot_issue_certificates(t *testin
 				NotAfter:     notBefore.Add(48 * time.Hour),
 			}
 			tc.disqualify(decoy)
-			_, decoyPEM, _ := testcerts.Mint(t, decoy, &decoyKey.PublicKey, nil, decoyKey)
+			decoyPEM, _ := testcerts.Mint(t, decoy, &decoyKey.PublicKey, nil, decoyKey)
 
 			got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, decoyPEM), testcerts.KeyPEM(t, leafKey))
 			if err != nil {
@@ -270,19 +270,19 @@ func TestAnalyse_reports_an_unproven_edge_linked_only_by_key_identifier(t *testi
 	absentKey := testcerts.NewECDSAKey(t)
 	absentTemplate := unverifiableCA(870, "Absent AKI Signer", notBefore, notBefore.Add(48*time.Hour))
 	absentTemplate.SubjectKeyId = keyID
-	_, _, absentCert := testcerts.Mint(t, absentTemplate, &absentKey.PublicKey, nil, absentKey)
+	_, absentCert := testcerts.Mint(t, absentTemplate, &absentKey.PublicKey, nil, absentKey)
 
 	decoyKey := testcerts.NewECDSAKey(t)
 	decoyTemplate := unverifiableCA(871, "Different Subject CA", notBefore, notBefore.Add(48*time.Hour))
 	decoyTemplate.SubjectKeyId = keyID
-	_, decoyPEM, decoyCert := testcerts.Mint(t, decoyTemplate, &decoyKey.PublicKey, nil, decoyKey)
+	decoyPEM, decoyCert := testcerts.Mint(t, decoyTemplate, &decoyKey.PublicKey, nil, decoyKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
 	leafTemplate := unverifiableCA(872, "aki-only-leaf.example.com", notBefore, notBefore.Add(24*time.Hour))
 	leafTemplate.IsCA = false
 	leafTemplate.BasicConstraintsValid = false
 	leafTemplate.KeyUsage = 0
-	_, leafPEM, leafCert := testcerts.Mint(t, leafTemplate, &leafKey.PublicKey, absentCert, absentKey)
+	leafPEM, leafCert := testcerts.Mint(t, leafTemplate, &leafKey.PublicKey, absentCert, absentKey)
 
 	if bytes.Equal(leafCert.RawIssuer, decoyCert.RawSubject) {
 		t.Fatal("setup: issuer and subject names match, so the key-identifier-only branch is not reached")
@@ -350,7 +350,7 @@ func TestAnalyse_keeps_a_signing_CA_that_is_not_issuer_eligible(t *testing.T) {
 	// disqualification is the missing basicConstraints RFC 5280 requires of a v3
 	// issuer. This is what `openssl req -x509` produces without CA flags.
 	caKey := testcerts.NewECDSAKey(t)
-	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
+	caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(500),
 		Subject:      pkix.Name{CommonName: "No-BC Internal CA"},
 		NotBefore:    notBefore,
@@ -361,7 +361,7 @@ func TestAnalyse_keeps_a_signing_CA_that_is_not_issuer_eligible(t *testing.T) {
 	}
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(501),
 		Subject:      pkix.Name{CommonName: "no-bc-ca-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -423,7 +423,7 @@ func TestAnalyse_emits_a_compliant_chain_unchanged_and_silently(t *testing.T) {
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
 	rootKey := testcerts.NewECDSAKey(t)
-	_, rootPEM, rootCert := testcerts.Mint(t, &x509.Certificate{
+	rootPEM, rootCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(510),
 		Subject:               pkix.Name{CommonName: "Compliant Root CA"},
 		NotBefore:             notBefore,
@@ -434,7 +434,7 @@ func TestAnalyse_emits_a_compliant_chain_unchanged_and_silently(t *testing.T) {
 	}, &rootKey.PublicKey, nil, rootKey)
 
 	interKey := testcerts.NewECDSAKey(t)
-	_, interPEM, interCert := testcerts.Mint(t, &x509.Certificate{
+	interPEM, interCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(511),
 		Subject:               pkix.Name{CommonName: "Compliant Intermediate CA"},
 		NotBefore:             notBefore,
@@ -445,7 +445,7 @@ func TestAnalyse_emits_a_compliant_chain_unchanged_and_silently(t *testing.T) {
 	}, &interKey.PublicKey, rootCert, rootKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(512),
 		Subject:      pkix.Name{CommonName: "compliant-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -491,17 +491,17 @@ func TestAnalyse_reports_an_unproven_emitted_chain_edge(t *testing.T) {
 
 	// The real signer, absent from the bundle.
 	absentKey := testcerts.NewECDSAKey(t)
-	_, _, absentCert := testcerts.Mint(t, unverifiableCA(840, issuerCN, notBefore, notBefore.Add(240*time.Hour)),
+	_, absentCert := testcerts.Mint(t, unverifiableCA(840, issuerCN, notBefore, notBefore.Add(240*time.Hour)),
 		&absentKey.PublicKey, nil, absentKey)
 
 	// The decoy: same subject, different key, self-signed - so it is a proven root
 	// and the path terminates on it, while its key never signed the leaf.
 	decoyKey := testcerts.NewECDSAKey(t)
-	_, decoyPEM, _ := testcerts.Mint(t, unverifiableCA(841, issuerCN, notBefore, notBefore.Add(240*time.Hour)),
+	decoyPEM, _ := testcerts.Mint(t, unverifiableCA(841, issuerCN, notBefore, notBefore.Add(240*time.Hour)),
 		&decoyKey.PublicKey, nil, decoyKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(842),
 		Subject:      pkix.Name{CommonName: "unproven-edge-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -536,14 +536,14 @@ func TestAnalyse_treats_a_reencoded_self_issued_certificate_as_its_own_root(t *t
 	tmpl := unverifiableCA(860, "Self Encoding Root CA", notBefore, notBefore.Add(48*time.Hour))
 	// Sign against a view of the SAME template whose subject is the UTF8String
 	// encoding, so RawIssuer is a permitted re-encoding of RawSubject.
-	_, selfPEM, selfCert := testcerts.Mint(t, tmpl, &key.PublicKey,
+	selfPEM, selfCert := testcerts.Mint(t, tmpl, &key.PublicKey,
 		utf8SubjectView(tmpl, "Self Encoding Root CA"), key)
 	if bytes.Equal(selfCert.RawSubject, selfCert.RawIssuer) {
 		t.Fatal("setup: subject and issuer encode identically, so the branch under test is not reached")
 	}
 
 	strangerKey := testcerts.NewECDSAKey(t)
-	_, strangerPEM, _ := testcerts.Mint(t, unverifiableCA(861, "Unrelated Bystander CA", notBefore, notBefore.Add(48*time.Hour)),
+	strangerPEM, _ := testcerts.Mint(t, unverifiableCA(861, "Unrelated Bystander CA", notBefore, notBefore.Add(48*time.Hour)),
 		&strangerKey.PublicKey, nil, strangerKey)
 
 	got, err := convert.Analyse(t.Context(), concatPEM(selfPEM, strangerPEM), testcerts.KeyPEM(t, key))
@@ -584,7 +584,7 @@ func TestAnalyse_reports_an_unfinished_chain_with_nothing_left_over(t *testing.T
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
 	caKey := testcerts.NewECDSAKey(t)
-	_, _, caCert := testcerts.Mint(t, &x509.Certificate{
+	_, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(870),
 		Subject:               pkix.Name{CommonName: "Absent Issuing CA"},
 		NotBefore:             notBefore,
@@ -595,7 +595,7 @@ func TestAnalyse_reports_an_unfinished_chain_with_nothing_left_over(t *testing.T
 	}, &caKey.PublicKey, nil, caKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(871),
 		Subject:      pkix.Name{CommonName: "lonely-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -654,7 +654,7 @@ func TestAnalyse_reports_an_unfinished_chain_when_only_the_root_is_absent(t *tes
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
 	rootKey := testcerts.NewECDSAKey(t)
-	_, _, rootCert := testcerts.Mint(t, &x509.Certificate{
+	_, rootCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(872),
 		Subject:               pkix.Name{CommonName: "Absent Root CA"},
 		NotBefore:             notBefore,
@@ -665,7 +665,7 @@ func TestAnalyse_reports_an_unfinished_chain_when_only_the_root_is_absent(t *tes
 	}, &rootKey.PublicKey, nil, rootKey)
 
 	interKey := testcerts.NewECDSAKey(t)
-	_, interPEM, interCert := testcerts.Mint(t, &x509.Certificate{
+	interPEM, interCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(873),
 		Subject:               pkix.Name{CommonName: "Present Intermediate CA"},
 		NotBefore:             notBefore,
@@ -676,7 +676,7 @@ func TestAnalyse_reports_an_unfinished_chain_when_only_the_root_is_absent(t *tes
 	}, &interKey.PublicKey, rootCert, rootKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(874),
 		Subject:      pkix.Name{CommonName: "rootless-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -735,7 +735,7 @@ func TestAnalyse_reports_a_terminus_whose_self_signature_does_not_verify(t *test
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
 	rootKey := testcerts.NewECDSAKey(t)
-	rootDER, _, rootCert := testcerts.Mint(t, &x509.Certificate{
+	_, rootCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(875),
 		Subject:               pkix.Name{CommonName: "legacy-root.example.com"},
 		NotBefore:             notBefore,
@@ -746,7 +746,7 @@ func TestAnalyse_reports_a_terminus_whose_self_signature_does_not_verify(t *test
 	}, &rootKey.PublicKey, nil, rootKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(876),
 		Subject:      pkix.Name{CommonName: "broken-anchor-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -757,7 +757,7 @@ func TestAnalyse_reports_a_terminus_whose_self_signature_does_not_verify(t *test
 	// signature's contents, so the certificate still parses; only CheckSignature over
 	// its own TBS fails, which is exactly the condition isSelfSigned collapses into
 	// "not self-signed".
-	tampered := bytes.Clone(rootDER)
+	tampered := bytes.Clone(rootCert.Raw)
 	at := bytes.Index(tampered, rootCert.Signature)
 	if at < 0 {
 		t.Fatalf("the root's signature was not found in its own DER, so it cannot be tampered with")

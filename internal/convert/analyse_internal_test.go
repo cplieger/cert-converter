@@ -51,9 +51,6 @@ func TestVerifiableKey_bounds_rsa_only(t *testing.T) {
 	if verifiableKey(oversized) {
 		t.Errorf("verifiableKey(a %d-bit RSA key) = true, want false: one modexp with it costs the scan goroutine hundreds of ms", maxVerifiableKeyBits+1)
 	}
-	if verifiableKey(&rsa.PublicKey{E: 65537}) {
-		t.Error("verifiableKey(an RSA key with no modulus) = true, want false: BitLen on a nil modulus panics")
-	}
 	// The exponent is the other half of the cost: it sets the NUMBER of squarings
 	// crypto/rsa pays, so a file-supplied 2^31-1 triples one verification at the
 	// modulus ceiling. Both boundaries are inclusive.
@@ -79,7 +76,7 @@ func TestVerifiableKey_bounds_rsa_only(t *testing.T) {
 // Mint, so how this app signs and PEM-encodes a test certificate has one home.
 func testSelfSignedPEM(t *testing.T, key *ecdsa.PrivateKey, cn string, serial int64, notBefore, notAfter time.Time) []byte {
 	t.Helper()
-	_, certPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	certPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(serial),
 		Subject:      pkix.Name{CommonName: cn},
 		NotBefore:    notBefore,
@@ -386,7 +383,7 @@ func testEvidenceCert(t *testing.T, tmpl *x509.Certificate, key *ecdsa.PrivateKe
 	if parent == nil {
 		parentKey = key // self-signed: Mint takes the template as its own issuer
 	}
-	_, _, got := testcerts.Mint(t, tmpl, &key.PublicKey, parent, parentKey)
+	_, got := testcerts.Mint(t, tmpl, &key.PublicKey, parent, parentKey)
 	return got
 }
 

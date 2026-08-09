@@ -109,9 +109,12 @@ func TestRestartCanClearWrite_enumerates_the_unclearable_classes(t *testing.T) {
 		"EROFS is not clearable: a mount option outlives the process": {err: syscall.EROFS, want: false},
 		"ENOSPC is not clearable: the volume is still full":           {err: syscall.ENOSPC, want: false},
 		"EDQUOT is not clearable: the quota is still exhausted":       {err: syscall.EDQUOT, want: false},
-		"EIO is reported clearable, the loud direction":               {err: syscall.EIO, want: true},
-		"a symlink refusal is reported clearable":                     {err: errors.New("atomicfile: target is a symlink"), want: true},
-		"an unrecognised error is reported clearable":                 {err: errors.New("boom"), want: true},
+		"ENOTDIR is not clearable: a file at a directory path outlives the process": {
+			err: &fs.PathError{Op: "mkdir", Path: "blocked", Err: syscall.ENOTDIR}, want: false,
+		},
+		"EIO is reported clearable, the loud direction": {err: syscall.EIO, want: true},
+		"a symlink refusal is reported clearable":       {err: errors.New("atomicfile: target is a symlink"), want: true},
+		"an unrecognised error is reported clearable":   {err: errors.New("boom"), want: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -431,6 +434,14 @@ func TestScannerRun_when_the_output_parent_cannot_be_pinned(t *testing.T) {
 		t.Errorf("Run(symlinked output sub-directory) logged %q at WARN %d times, want 1: neutral is not"+
 			" silent: %q", unreplaceableBundleMsg, got, logs.Messages())
 	}
+	// And it names the LAYOUT remediation: a pin refusal is not a volume condition, so an
+	// operator sent to check free space, a quota and a read-only mount is sent after a
+	// cause that is not there while the symlinked tree stays as it is.
+	if got, ok := logs.AttrValue(unreplaceableBundleMsg, "remediation"); !ok || got != outputPinRemediation {
+		t.Errorf("Run(symlinked output sub-directory) %q remediation = %v (present %v), want %q: the"+
+			" standing record has to name the cause the pin actually refused",
+			unreplaceableBundleMsg, got, ok, outputPinRemediation)
+	}
 	// The existing bundle an operator may still be serving is left exactly as found, which
 	// is what the WARN promises.
 	if got, _ := readBundle(t, pfxPath); !bytes.Equal(got, current) {
@@ -539,4 +550,77 @@ func mustAnalyse(t *testing.T, certPEM, keyPEM []byte) *convert.Analysis {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
 	return analysis
+}
+
+// TestScannerRun_inspect_cancelled_by_shutdown_is_reported_quietly pins the one
+// producer of the README's second CertConverterConversionFailed matcher, and the
+// quiet direction its alert filter depends on.
+//
+// The alert matches `(conversion failed|failed to inspect existing pfx)` and drops
+// `(shutdown)`, and the README states the dropped variants are logged at DEBUG. The
+// inspect-error arm of convertEntry is the only site that emits "failed to inspect
+// existing pfx", and inspect's only error returns are shutdown races — so if that arm
+// ever stopped routing through failEntry's shutdown split, every SIGTERM that lands
+// mid-inspect would page an operator, with the whole suite green. The message is
+// spelled out here, not read from production, exactly as the health-neutral write
+// tests spell theirs: a reword must fail this test, because it silently kills the
+// documented alert.
+//
+// The final assertion is the durability half: a cancelled inspect must not be read
+// as "stale" on the way out, or every in-flight pair would be rewritten at shutdown
+// with fresh KDF salts and a fresh mtime the documented deployment re-replicates.
+//
+// Runs serially: it swaps slog.Default() and the read seam.
+func TestScannerRun_inspect_cancelled_by_shutdown_is_reported_quietly(t *testing.T) {
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
+	writePair(t, certsRoot, "chain", chainPEM, keyPEM)
+	// A prior bundle on disk, so inspect gets past its classifying Lstat and the
+	// cancellation lands where only the read seam can put it: between the walk's
+	// entry check and inspect's own pre-verdict context check.
+	prior := []byte("prior bundle this scan never proved wrong")
+	pfxPath := filepath.Join(outRoot, "chain.pfx")
+	if err := os.WriteFile(pfxPath, prior, 0o600); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	prevRead := readBoundedInRoot
+	readBoundedInRoot = func(rctx context.Context, _ *os.Root, _ string, _ int64) ([]byte, error) {
+		cancel()
+		return nil, rctx.Err()
+	}
+	t.Cleanup(func() { readBoundedInRoot = prevRead })
+
+	logs := captureLogs(t)
+	res, err := New(&Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+	}).Run(ctx)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run(cancelled during inspect) error = %v, want context.Canceled: without the walk-level"+
+			" cancellation the caller reports a completed scan whose failed count is a shutdown artifact", err)
+	}
+	if res.Failed != 1 {
+		t.Errorf("Run(cancelled during inspect) Failed = %d, want 1: the entry's outcome is recorded, and the"+
+			" returned error is what keeps it from reaching the health marker", res.Failed)
+	}
+	if got := logs.CountLevel(slog.LevelDebug, "failed to inspect existing pfx (shutdown)"); got != 1 {
+		t.Errorf("Run(cancelled during inspect) logged %q at DEBUG %d times, want exactly 1: the README's"+
+			" alert drops the (shutdown) variant, so this wording and level are the operator contract: %q",
+			"failed to inspect existing pfx (shutdown)", got, logs.Messages())
+	}
+	if got := logs.CountLevel(slog.LevelError, "failed to inspect existing pfx"); got != 0 {
+		t.Errorf("Run(cancelled during inspect) logged %q at ERROR %d times, want 0: a routine SIGTERM must"+
+			" not fire CertConverterConversionFailed: %q", "failed to inspect existing pfx", got, logs.Messages())
+	}
+	if got, _ := readBundle(t, pfxPath); !bytes.Equal(got, prior) {
+		t.Errorf("Run(cancelled during inspect) left %d bytes at the output path, want the %d it found: a"+
+			" shutdown is neither current nor stale, so nothing may be rewritten on the way out", len(got), len(prior))
+	}
 }

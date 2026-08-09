@@ -254,6 +254,22 @@ func FallbackLabel(d time.Duration) string {
 	return d.String()
 }
 
+// CoverageAttrs renders the coverage pair every cadence-bearing record
+// carries: fallback_scan (the operator's own rescan cadence, "disabled"
+// when switched off) and scan_floor (the guaranteed reconciliation
+// cadence the health deadline is derived from). One home for the keys,
+// their order and both renderings, so the startup line, config's
+// fallback WARNs and this package's degraded-path records cannot drift.
+func CoverageAttrs(fallback time.Duration) []any {
+	return []any{
+		// fallback_scan answers only "is the operator's own cadence running?", so
+		// FallbackLabel renders a non-positive interval as "disabled"; scan_floor beside
+		// it is what keeps that from reading as "nothing will ever revisit this".
+		"fallback_scan", FallbackLabel(fallback),
+		"scan_floor", MarkerRefreshFloor(fallback).String(),
+	}
+}
+
 // coverageAttrs closes a degraded-path record with the two cadences that answer
 // the one question such a record raises: will anything revisit what was just lost?
 // Both travel together because either alone answers it wrongly — fallback_scan is
@@ -263,12 +279,7 @@ func FallbackLabel(d time.Duration) string {
 // keeps each site's own diagnostics (which path, which error) at the front of the
 // record.
 func (w *Watcher) coverageAttrs(attrs ...any) []any {
-	return append(attrs,
-		// fallback_scan answers only "is the operator's own cadence running?", so
-		// FallbackLabel renders a non-positive interval as "disabled"; scan_floor beside
-		// it is what keeps that from reading as "nothing will ever revisit this".
-		"fallback_scan", FallbackLabel(w.fallback),
-		"scan_floor", w.safetyNetInterval().String())
+	return append(attrs, CoverageAttrs(w.fallback)...)
 }
 
 // safetyNetInterval is this Watcher's periodic safety-net cadence; see
@@ -652,8 +663,7 @@ func (w *Watcher) addWatchDirs(ctx context.Context, watcher *fsnotify.Watcher, r
 // scanbudget.Default when no ceiling was configured: an unbounded walk is not an
 // option, because the tree it enumerates is one this app does not own.
 func (w *Watcher) newWatchSetBudget(root string) *watchSetBudget {
-	budget := &watchSetBudget{max: scanbudget.Effective(w.maxEntries), root: root}
-	return budget
+	return &watchSetBudget{max: scanbudget.Effective(w.maxEntries), root: root}
 }
 
 // watchSetBudget is one walk's entry ceiling: how many paths this traversal may visit,
@@ -805,16 +815,6 @@ func (w *Watcher) watchSetHas(path string) bool {
 	defer w.watchedMu.Unlock()
 	_, ok := w.watched[filepath.Clean(path)]
 	return ok
-}
-
-// watchSetSize reports how many registrations the mirror holds. It is a diagnostic
-// count of the membership cache, not a ceiling anything is read against — the kernel
-// owns the inotify quota (see addWatchDirs). Read under the same lock as watchSetHas,
-// because a Remove/Rename handler can forget a path concurrently.
-func (w *Watcher) watchSetSize() int {
-	w.watchedMu.Lock()
-	defer w.watchedMu.Unlock()
-	return len(w.watched)
 }
 
 // recordWatch notes a registration this package made, so watchSetHas can answer
@@ -1310,7 +1310,8 @@ func (w *Watcher) desiredWatchDirs(ctx context.Context, root string) (map[string
 // for another re-sync. There is no admission ceiling to reach — the kernel refuses an
 // Add once the per-UID inotify quota is spent, and handleWatchAddError reports that,
 // WARNing and skipping below the root so one refused directory cannot abandon the rest
-// of the rebuild (including the root's own watch).
+// of the rebuild (including the root's own watch). The root is re-asserted first, so a
+// freed slot cannot be spent on a descendant while the root stays refused.
 //
 // Cancellable like the walk it replaces, and checked AFTER each registration rather than
 // before: the enumeration — the expensive half, and the one that can block on a stranger's
@@ -1318,7 +1319,22 @@ func (w *Watcher) desiredWatchDirs(ctx context.Context, root string) (map[string
 // already-known directory, and stopping it before it has re-established anything would
 // abandon a registration this rebuild had already removed the stale twin of.
 func (w *Watcher) reassertWatches(ctx context.Context, watcher *fsnotify.Watcher, desired map[string]struct{}) error {
+	// Root first, unconditionally: its refusal is the fatal one
+	// (handleWatchAddError), and this runs right after pruneWatches released
+	// stale slots — under a nearly spent per-UID quota, map order could hand
+	// those freed slots to descendant directories and leave the root, the one
+	// watch a silently-dropped registration (IN_IGNORED on unmount/remount)
+	// most needs restored, refused for another whole re-sync interval.
+	rootPath := filepath.Clean(w.root)
+	if _, ok := desired[rootPath]; ok {
+		if err := w.attachWatch(watcher, w.root, rootPath); err != nil {
+			return err
+		}
+	}
 	for path := range desired {
+		if path == rootPath {
+			continue
+		}
 		if err := w.attachWatch(watcher, w.root, path); err != nil {
 			return err
 		}

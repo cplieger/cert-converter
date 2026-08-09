@@ -39,12 +39,12 @@ func TestAnalyse_prefers_the_certificate_that_actually_signed_the_leaf(t *testin
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign,
 	}
-	_, realPEM, realCert := testcerts.Mint(t, realTmpl, &realKey.PublicKey, nil, realKey)
+	realPEM, realCert := testcerts.Mint(t, realTmpl, &realKey.PublicKey, nil, realKey)
 
 	// Same subject, different key, and a LATER NotAfter so every ranking key below
 	// edge strength would prefer it.
 	impostorKey := testcerts.NewECDSAKey(t)
-	_, impostorPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	impostorPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(101),
 		Subject:               pkix.Name{CommonName: "Contested CA"},
 		NotBefore:             notBefore,
@@ -55,7 +55,7 @@ func TestAnalyse_prefers_the_certificate_that_actually_signed_the_leaf(t *testin
 	}, &impostorKey.PublicKey, nil, impostorKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(102),
 		Subject:      pkix.Name{CommonName: "contested-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -96,7 +96,7 @@ func TestAnalyse_role_check_ignores_an_unverified_claim(t *testing.T) {
 
 	// A perfectly ordinary self-signed identity.
 	idKey := testcerts.NewECDSAKey(t)
-	_, idPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	idPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(110),
 		Subject:      pkix.Name{CommonName: "Claimed Issuer"},
 		NotBefore:    notBefore,
@@ -119,7 +119,7 @@ func TestAnalyse_role_check_ignores_an_unverified_claim(t *testing.T) {
 		NotBefore:    notBefore,
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}
-	_, strangerPEM, _ := testcerts.Mint(t, strangerTmpl, &strangerKey.PublicKey, strangerSelf, strangerKey)
+	strangerPEM, _ := testcerts.Mint(t, strangerTmpl, &strangerKey.PublicKey, strangerSelf, strangerKey)
 
 	got, err := convert.Analyse(t.Context(), concatPEM(idPEM, strangerPEM), testcerts.KeyPEM(t, idKey))
 	if err != nil {
@@ -163,32 +163,32 @@ func TestAnalyse_prefers_the_issuer_whose_route_to_a_root_verifies(t *testing.T)
 
 	// The root that actually signed the good intermediate.
 	realRootKey := testcerts.NewECDSAKey(t)
-	_, realRootPEM, realRootCert := testcerts.Mint(t, ca(200, sharedRootCN, notBefore.Add(240*time.Hour)),
+	realRootPEM, realRootCert := testcerts.Mint(t, ca(200, sharedRootCN, notBefore.Add(240*time.Hour)),
 		&realRootKey.PublicKey, nil, realRootKey)
 
 	// A same-named root holding a DIFFERENT key. Present in the bundle, so a
 	// name-only walk reaches a "root" through it, but it signed nothing here.
 	fakeRootKey := testcerts.NewECDSAKey(t)
-	_, fakeRootPEM, _ := testcerts.Mint(t, ca(201, sharedRootCN, notBefore.Add(240*time.Hour)),
+	fakeRootPEM, _ := testcerts.Mint(t, ca(201, sharedRootCN, notBefore.Add(240*time.Hour)),
 		&fakeRootKey.PublicKey, nil, fakeRootKey)
 
 	// A third same-named root that is NOT in the bundle. It signs the decoy
 	// intermediate, so no included certificate can verify that intermediate.
 	absentRootKey := testcerts.NewECDSAKey(t)
-	_, _, absentRootCert := testcerts.Mint(t, ca(202, sharedRootCN, notBefore.Add(240*time.Hour)),
+	_, absentRootCert := testcerts.Mint(t, ca(202, sharedRootCN, notBefore.Add(240*time.Hour)),
 		&absentRootKey.PublicKey, nil, absentRootKey)
 
 	// One key across both intermediates: that is what makes both of them verify the
 	// leaf, so edge strength at the leaf's own hop cannot separate them.
 	interKey := testcerts.NewECDSAKey(t)
-	_, goodInterPEM, goodInterCert := testcerts.Mint(t, ca(203, sharedInterCN, notBefore.Add(24*time.Hour)),
+	goodInterPEM, goodInterCert := testcerts.Mint(t, ca(203, sharedInterCN, notBefore.Add(24*time.Hour)),
 		&interKey.PublicKey, realRootCert, realRootKey)
 	// The decoy expires LATER, so every ranking key below route strength prefers it.
-	_, decoyInterPEM, _ := testcerts.Mint(t, ca(204, sharedInterCN, notBefore.Add(72*time.Hour)),
+	decoyInterPEM, _ := testcerts.Mint(t, ca(204, sharedInterCN, notBefore.Add(72*time.Hour)),
 		&interKey.PublicKey, absentRootCert, absentRootKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(205),
 		Subject:      pkix.Name{CommonName: "verified-route-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -276,13 +276,13 @@ func TestAnalyse_ranks_verified_issuers_by_validity_then_expiry(t *testing.T) {
 					KeyUsage:              x509.KeyUsageCertSign,
 				}
 			}
-			_, firstPEM, _ := testcerts.Mint(t, issuer(220, tt.firstNotBefore, tt.firstNotAfter),
+			firstPEM, _ := testcerts.Mint(t, issuer(220, tt.firstNotBefore, tt.firstNotAfter),
 				&issuerKey.PublicKey, nil, issuerKey)
-			_, secondPEM, secondCert := testcerts.Mint(t, issuer(221, tt.secondNotBefore, tt.secondNotAfter),
+			secondPEM, secondCert := testcerts.Mint(t, issuer(221, tt.secondNotBefore, tt.secondNotAfter),
 				&issuerKey.PublicKey, nil, issuerKey)
 
 			leafKey := testcerts.NewECDSAKey(t)
-			_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+			leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 				SerialNumber: big.NewInt(222),
 				Subject:      pkix.Name{CommonName: "ranked-issuer-leaf.example.com"},
 				NotBefore:    now.Add(-time.Hour),
@@ -328,35 +328,35 @@ func TestAnalyse_prefers_an_unverified_issuer_with_a_route_to_a_root(t *testing.
 	// different key. The absent one signs the routed candidate, so that candidate's
 	// route to the included root is a NAME match no signature can confirm.
 	fakeRootKey := testcerts.NewECDSAKey(t)
-	_, fakeRootPEM, _ := testcerts.Mint(t, unverifiableCA(300, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
+	fakeRootPEM, _ := testcerts.Mint(t, unverifiableCA(300, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
 		&fakeRootKey.PublicKey, nil, fakeRootKey)
 	absentRootKey := testcerts.NewECDSAKey(t)
-	_, _, absentRootCert := testcerts.Mint(t, unverifiableCA(301, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
+	_, absentRootCert := testcerts.Mint(t, unverifiableCA(301, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
 		&absentRootKey.PublicKey, nil, absentRootKey)
 
 	// The routed candidate: names the included root as its issuer, so it has an
 	// inclusive route to a root.
 	routedKey := testcerts.NewECDSAKey(t)
-	_, routedPEM, _ := testcerts.Mint(t, unverifiableCA(302, contestedCN, notBefore, notBefore.Add(24*time.Hour)),
+	routedPEM, _ := testcerts.Mint(t, unverifiableCA(302, contestedCN, notBefore, notBefore.Add(24*time.Hour)),
 		&routedKey.PublicKey, absentRootCert, absentRootKey)
 
 	// The stranded candidate: names an issuer nothing in the bundle carries, so it
 	// has no route to a root at all -- and it expires later, which is what every
 	// lower-ranked key would reward.
 	absentOtherKey := testcerts.NewECDSAKey(t)
-	_, _, absentOtherCert := testcerts.Mint(t, unverifiableCA(303, "Nobody CA", notBefore, notBefore.Add(240*time.Hour)),
+	_, absentOtherCert := testcerts.Mint(t, unverifiableCA(303, "Nobody CA", notBefore, notBefore.Add(240*time.Hour)),
 		&absentOtherKey.PublicKey, nil, absentOtherKey)
 	strandedKey := testcerts.NewECDSAKey(t)
-	_, strandedPEM, _ := testcerts.Mint(t, unverifiableCA(304, contestedCN, notBefore, notBefore.Add(72*time.Hour)),
+	strandedPEM, _ := testcerts.Mint(t, unverifiableCA(304, contestedCN, notBefore, notBefore.Add(72*time.Hour)),
 		&strandedKey.PublicKey, absentOtherCert, absentOtherKey)
 
 	// The leaf's real signer shares the contested subject and is absent, so neither
 	// candidate verifies the leaf's signature.
 	absentSignerKey := testcerts.NewECDSAKey(t)
-	_, _, absentSignerCert := testcerts.Mint(t, unverifiableCA(305, contestedCN, notBefore, notBefore.Add(240*time.Hour)),
+	_, absentSignerCert := testcerts.Mint(t, unverifiableCA(305, contestedCN, notBefore, notBefore.Add(240*time.Hour)),
 		&absentSignerKey.PublicKey, nil, absentSignerKey)
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(306),
 		Subject:      pkix.Name{CommonName: "inclusive-route-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -403,34 +403,34 @@ func TestAnalyse_prefers_the_shorter_inclusive_route(t *testing.T) {
 	)
 
 	fakeRootKey := testcerts.NewECDSAKey(t)
-	_, fakeRootPEM, _ := testcerts.Mint(t, unverifiableCA(310, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
+	fakeRootPEM, _ := testcerts.Mint(t, unverifiableCA(310, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
 		&fakeRootKey.PublicKey, nil, fakeRootKey)
 	absentRootKey := testcerts.NewECDSAKey(t)
-	_, _, absentRootCert := testcerts.Mint(t, unverifiableCA(311, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
+	_, absentRootCert := testcerts.Mint(t, unverifiableCA(311, sharedRootCN, notBefore, notBefore.Add(240*time.Hour)),
 		&absentRootKey.PublicKey, nil, absentRootKey)
 
 	// One name-hop from the included root.
 	nearKey := testcerts.NewECDSAKey(t)
-	_, nearPEM, _ := testcerts.Mint(t, unverifiableCA(312, contestedCN, notBefore, notBefore.Add(24*time.Hour)),
+	nearPEM, _ := testcerts.Mint(t, unverifiableCA(312, contestedCN, notBefore, notBefore.Add(24*time.Hour)),
 		&nearKey.PublicKey, absentRootCert, absentRootKey)
 
 	// An intermediate one name-hop from the root, and the far candidate below it:
 	// two hops, and a LATER expiry so the NotAfter key would reward it.
 	midKey := testcerts.NewECDSAKey(t)
-	_, midPEM, _ := testcerts.Mint(t, unverifiableCA(313, midCN, notBefore, notBefore.Add(240*time.Hour)),
+	midPEM, _ := testcerts.Mint(t, unverifiableCA(313, midCN, notBefore, notBefore.Add(240*time.Hour)),
 		&midKey.PublicKey, absentRootCert, absentRootKey)
 	absentMidKey := testcerts.NewECDSAKey(t)
-	_, _, absentMidCert := testcerts.Mint(t, unverifiableCA(314, midCN, notBefore, notBefore.Add(240*time.Hour)),
+	_, absentMidCert := testcerts.Mint(t, unverifiableCA(314, midCN, notBefore, notBefore.Add(240*time.Hour)),
 		&absentMidKey.PublicKey, nil, absentMidKey)
 	farKey := testcerts.NewECDSAKey(t)
-	_, farPEM, _ := testcerts.Mint(t, unverifiableCA(315, contestedCN, notBefore, notBefore.Add(72*time.Hour)),
+	farPEM, _ := testcerts.Mint(t, unverifiableCA(315, contestedCN, notBefore, notBefore.Add(72*time.Hour)),
 		&farKey.PublicKey, absentMidCert, absentMidKey)
 
 	absentSignerKey := testcerts.NewECDSAKey(t)
-	_, _, absentSignerCert := testcerts.Mint(t, unverifiableCA(316, contestedCN, notBefore, notBefore.Add(240*time.Hour)),
+	_, absentSignerCert := testcerts.Mint(t, unverifiableCA(316, contestedCN, notBefore, notBefore.Add(240*time.Hour)),
 		&absentSignerKey.PublicKey, nil, absentSignerKey)
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(317),
 		Subject:      pkix.Name{CommonName: "shorter-route-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -480,10 +480,10 @@ func TestAnalyse_keeps_an_unproven_name_match_from_being_promoted(t *testing.T) 
 		notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
 		realKey := testcerts.NewECDSAKey(t)
-		_, realPEM, realCert := testcerts.Mint(t, unverifiableCA(810, "Promoted Encoding CA", notBefore, notBefore.Add(48*time.Hour)),
+		realPEM, realCert := testcerts.Mint(t, unverifiableCA(810, "Promoted Encoding CA", notBefore, notBefore.Add(48*time.Hour)),
 			&realKey.PublicKey, nil, realKey)
 		leafKey := testcerts.NewECDSAKey(t)
-		_, leafPEM, leafCert := testcerts.Mint(t, &x509.Certificate{
+		leafPEM, leafCert := testcerts.Mint(t, &x509.Certificate{
 			SerialNumber: big.NewInt(811),
 			Subject:      pkix.Name{CommonName: "promoted-encoding-leaf.example.com"},
 			NotBefore:    notBefore,
@@ -495,7 +495,7 @@ func TestAnalyse_keeps_an_unproven_name_match_from_being_promoted(t *testing.T) 
 		impostorKey := testcerts.NewECDSAKey(t)
 		impostor := unverifiableCA(812, "", notBefore, notBefore.Add(240*time.Hour))
 		impostor.RawSubject = leafCert.RawIssuer
-		_, impostorPEM, impostorCert := testcerts.Mint(t, impostor, &impostorKey.PublicKey, nil, impostorKey)
+		impostorPEM, impostorCert := testcerts.Mint(t, impostor, &impostorKey.PublicKey, nil, impostorKey)
 
 		if !bytes.Equal(impostorCert.RawSubject, leafCert.RawIssuer) {
 			t.Fatal("setup: the impostor's subject is not the leaf's issuer name byte for byte, so it is not the exact-match candidate under test")
@@ -538,14 +538,14 @@ func TestAnalyse_keeps_an_unproven_name_match_from_being_promoted(t *testing.T) 
 		notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 		sharedKey := testcerts.NewECDSAKey(t)
 
-		_, firstPEM, firstCert := testcerts.Mint(t, unverifiableCA(820, "Regenerated Encoding CA", notBefore, notBefore.Add(48*time.Hour)),
+		firstPEM, firstCert := testcerts.Mint(t, unverifiableCA(820, "Regenerated Encoding CA", notBefore, notBefore.Add(48*time.Hour)),
 			&sharedKey.PublicKey, nil, sharedKey)
 		// Same name, encoded the other permitted way, same key: a regeneration.
 		reissued := unverifiableCA(821, "", notBefore.Add(time.Minute), notBefore.Add(96*time.Hour))
 		reissuedView := utf8SubjectView(firstCert, "Regenerated Encoding CA")
 		reissued.RawSubject = nil
 		reissued.Subject = reissuedView.Subject
-		_, secondPEM, secondCert := testcerts.Mint(t, reissued, &sharedKey.PublicKey, reissuedView, sharedKey)
+		secondPEM, secondCert := testcerts.Mint(t, reissued, &sharedKey.PublicKey, reissuedView, sharedKey)
 
 		if bytes.Equal(firstCert.RawSubject, secondCert.RawSubject) {
 			t.Fatal("setup: both certificates encode the subject identically, so the raw-name exclusion alone would cover this bundle")

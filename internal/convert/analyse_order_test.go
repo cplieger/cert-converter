@@ -23,7 +23,7 @@ func TestAnalyse_selects_the_same_identity_for_indistinguishable_renewals(t *tes
 	t.Parallel()
 	caKey := testcerts.NewECDSAKey(t)
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
-	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
+	caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "Tie CA"},
 		NotBefore:             notBefore,
@@ -43,8 +43,8 @@ func TestAnalyse_selects_the_same_identity_for_indistinguishable_renewals(t *tes
 			NotAfter:     notBefore.Add(24 * time.Hour),
 		}
 	}
-	_, firstPEM, _ := testcerts.Mint(t, leafTmpl(10), &leafKey.PublicKey, caCert, caKey)
-	_, secondPEM, _ := testcerts.Mint(t, leafTmpl(11), &leafKey.PublicKey, caCert, caKey)
+	firstPEM, _ := testcerts.Mint(t, leafTmpl(10), &leafKey.PublicKey, caCert, caKey)
+	secondPEM, _ := testcerts.Mint(t, leafTmpl(11), &leafKey.PublicKey, caCert, caKey)
 
 	assertOrderInvariant(t, "indistinguishable renewals",
 		[][]byte{firstPEM, secondPEM, caPEM}, testcerts.KeyPEM(t, leafKey))
@@ -73,11 +73,11 @@ func TestAnalyse_selects_the_same_parent_for_indistinguishable_issuers(t *testin
 	}
 	// Two self-signed CA certificates: same subject, same key, same NotAfter, so
 	// both are valid issuers of the leaf and neither is semantically preferable.
-	_, caAPEM, caACert := testcerts.Mint(t, caTmpl(20), &caKey.PublicKey, nil, caKey)
-	_, caBPEM, _ := testcerts.Mint(t, caTmpl(21), &caKey.PublicKey, nil, caKey)
+	caAPEM, caACert := testcerts.Mint(t, caTmpl(20), &caKey.PublicKey, nil, caKey)
+	caBPEM, _ := testcerts.Mint(t, caTmpl(21), &caKey.PublicKey, nil, caKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(30),
 		Subject:      pkix.Name{CommonName: "branch-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -114,14 +114,14 @@ func TestAnalyse_handles_a_cross_certification_cycle(t *testing.T) {
 
 	// Root: self-signed under subject "CA-B", holding keyB. This is the cycle's
 	// exit to a trust anchor.
-	_, rootPEM, rootCert := testcerts.Mint(t, caTmpl(40, "CA-B"), &keyB.PublicKey, nil, keyB)
+	rootPEM, rootCert := testcerts.Mint(t, caTmpl(40, "CA-B"), &keyB.PublicKey, nil, keyB)
 	// CA-A, issued by CA-B.
-	_, caAPEM, caACert := testcerts.Mint(t, caTmpl(41, "CA-A"), &keyA.PublicKey, rootCert, keyB)
+	caAPEM, caACert := testcerts.Mint(t, caTmpl(41, "CA-A"), &keyA.PublicKey, rootCert, keyB)
 	// CA-B again, this time issued by CA-A: the second half of the cycle.
-	_, caBPEM, _ := testcerts.Mint(t, caTmpl(42, "CA-B"), &keyB.PublicKey, caACert, keyA)
+	caBPEM, _ := testcerts.Mint(t, caTmpl(42, "CA-B"), &keyB.PublicKey, caACert, keyA)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(50),
 		Subject:      pkix.Name{CommonName: "cycle-leaf.example.com"},
 		NotBefore:    notBefore,

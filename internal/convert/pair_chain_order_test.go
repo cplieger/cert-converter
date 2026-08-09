@@ -39,11 +39,11 @@ func TestEncode_preserves_the_order_of_a_multi_CA_chain(t *testing.T) {
 		}
 	}
 	rootKey := testcerts.NewECDSAKey(t)
-	_, rootPEM, rootCert := testcerts.Mint(t, ca(701, "Chain Order Root"), &rootKey.PublicKey, nil, rootKey)
+	rootPEM, rootCert := testcerts.Mint(t, ca(701, "Chain Order Root"), &rootKey.PublicKey, nil, rootKey)
 	interKey := testcerts.NewECDSAKey(t)
-	_, interPEM, interCert := testcerts.Mint(t, ca(702, "Chain Order Intermediate"), &interKey.PublicKey, rootCert, rootKey)
+	interPEM, interCert := testcerts.Mint(t, ca(702, "Chain Order Intermediate"), &interKey.PublicKey, rootCert, rootKey)
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(703),
 		Subject:      pkix.Name{CommonName: "chain-order-leaf.example.com"},
 		NotBefore:    notBefore,

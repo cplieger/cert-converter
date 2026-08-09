@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 	"time"
 
@@ -165,23 +166,29 @@ func run() int {
 		return 1
 	}
 
-	slog.Info("starting cert watcher",
-		"input", certsRootDir, "output", outputDir,
-		// The whole mount contract is "readable/writable by the UID in user:",
-		// and every downstream permission WARN points at that UID without ever
-		// naming it. compose resolves it from ${PUID:-1000}, so the compose file
-		// may not name it either; the process is the only thing that knows.
-		"uid", os.Getuid(), "gid", os.Getgid(),
-		"password", string(cfg.PasswordStatus),
+	slog.Info("starting cert watcher", slices.Concat(
+		[]any{
+			"input", certsRootDir, "output", outputDir,
+			// The whole mount contract is "readable/writable by the UID in user:",
+			// and every downstream permission WARN points at that UID without ever
+			// naming it. compose resolves it from ${PUID:-1000}, so the compose file
+			// may not name it either; the process is the only thing that knows.
+			"uid", os.Getuid(), "gid", os.Getgid(),
+			"password", string(cfg.PasswordStatus),
+		},
 		// Both cadences, because either alone misreads: fallback_scan is the
 		// operator's own rescan interval and reads "disabled" when they switched it
 		// off, while scan_floor is the cadence the watcher guarantees regardless —
 		// the longest it will go without a full re-assert plus scan, and the value
-		// the health probe's staleness deadline is derived from.
-		"fallback_scan", watch.FallbackLabel(cfg.FallbackInterval),
-		"scan_floor", watch.MarkerRefreshFloor(cfg.FallbackInterval).String(),
-		"encoder", cfg.EncoderName,
-		"output_lifecycle", string(cfg.Lifecycle), "max_scan_entries", cfg.MaxScanEntries)
+		// the health probe's staleness deadline is derived from. Spliced from the
+		// watch package's own renderer so this line and every degraded-path WARN
+		// cannot spell the pair differently.
+		watch.CoverageAttrs(cfg.FallbackInterval),
+		[]any{
+			"encoder", cfg.EncoderName,
+			"output_lifecycle", string(cfg.Lifecycle), "max_scan_entries", cfg.MaxScanEntries,
+		},
+	)...)
 
 	roots, ready := mounts.Open(requiredVolumes)
 	// The handles come back OPEN so the write probe below inspects the same object

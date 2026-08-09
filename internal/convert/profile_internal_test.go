@@ -1788,3 +1788,162 @@ func TestOctetStringBytes_refuses_every_non_primitive_shape(t *testing.T) {
 		t.Error("octetStringBytes copied its input; the point of the helper is that it aliases")
 	}
 }
+
+// TestInspect_routes_every_safe_walk_identifier_through_the_bounded_decoder pins
+// the allocation-bound ROUTING at the five identifier fields the safe walk and the
+// parameter checks decode that no oversized-OID case reaches today: a safe's
+// content type, an encrypted safe's content-encryption algorithm, a shrouded key
+// bag's encryption algorithm, the PBES2 encryption scheme, and the PBMAC1
+// message-authentication scheme. The bound itself is one shared helper (decodeOID)
+// already pinned at the MAC, authSafe, safe-bag-id and nested-PBKDF2 sites; what
+// can regress here is the routing -- a field re-read with a raw asn1.Unmarshal
+// admits the eight-bytes-per-byte identifier allocation on the scan's only
+// goroutine while every existing bound test stays green.
+func TestInspect_routes_every_safe_walk_identifier_through_the_bounded_decoder(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		enc    EncoderType
+		mutate func(*testing.T, *pfxPreamble)
+	}{
+		{
+			name: "a safe's content-type identifier",
+			enc:  EncNameModern2023,
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestAuthenticatedSafe(t, p, oidDataContentType, func(safe *contentInfo) {
+					safe.ContentType = oversizedOID()
+				})
+			},
+		},
+		{
+			name: "an encrypted safe's content-encryption identifier",
+			enc:  EncNameModern2023,
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
+					alg.Algorithm = oversizedOID()
+				})
+			},
+		},
+		{
+			name: "a shrouded key bag's encryption identifier",
+			enc:  EncNameModern2023,
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestShroudedKeyBag(t, p, func(alg *algorithmIdentifier) {
+					alg.Algorithm = oversizedOID()
+				})
+			},
+		},
+		{
+			name: "the PBES2 encryption-scheme identifier",
+			enc:  EncNameModern2023,
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
+					var params pbes2Params
+					testASN1Unmarshal(t, alg.Parameters.FullBytes, &params)
+					params.EncryptionScheme.Algorithm = oversizedOID()
+					alg.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, params)}
+				})
+			},
+		},
+		{
+			name: "the PBMAC1 message-authentication identifier",
+			enc:  EncNameModern2026,
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				var params pbmac1Params
+				testASN1Unmarshal(t, p.MacData.Mac.Algorithm.Parameters.FullBytes, &params)
+				params.MessageAuthScheme.Algorithm = oversizedOID()
+				p.MacData.Mac.Algorithm.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, params)}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pfx, err := Encode(analysis, tc.enc, "pw")
+			if err != nil {
+				t.Fatalf("setup: Encode(%s): %v", tc.enc, err)
+			}
+			if _, err := Inspect(pfx); err != nil {
+				t.Fatalf("setup: Inspect(unmodified %s bundle): %v", tc.enc, err)
+			}
+			var preamble pfxPreamble
+			testASN1Unmarshal(t, pfx, &preamble)
+			tc.mutate(t, &preamble)
+
+			_, err = Inspect(testASN1Marshal(t, preamble))
+			if !errors.Is(err, ErrProfileUnknown) {
+				t.Fatalf("Inspect(oversized %s) = %v, want ErrProfileUnknown", tc.name, err)
+			}
+			if want := "object identifier exceeds"; !strings.Contains(err.Error(), want) {
+				t.Errorf("Inspect(oversized %s) = %v, want the refusal to come from the bounded decoder naming %q",
+					tc.name, err, want)
+			}
+		})
+	}
+}
+
+// TestInspect_refuses_a_bundle_missing_a_required_bag pins the two completeness
+// arms of bundleAlgorithms with their own wording. Both shapes are realistic
+// foreign files at an output path -- a cert-only PKCS#12 truststore has no shrouded
+// key bag, a key-only export has no encrypted certificate safe -- and with either
+// arm deleted the refusal still happens (profileFor rejects a nil identifier), so
+// every existing test stays green while the operator-facing diagnosis degrades
+// from naming the missing bag to a raw nil-triple message.
+func TestInspect_refuses_a_bundle_missing_a_required_bag(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	pfx, err := Encode(analysis, EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name        string
+		wantErrText string
+		mutate      func(*testing.T, []contentInfo) []contentInfo
+	}{
+		{
+			name:        "a cert-only bundle whose key bag is a bag of another kind",
+			wantErrText: "no shrouded private-key bag",
+			mutate: func(t *testing.T, safes []contentInfo) []contentInfo {
+				mutateTestSafeBags(t, &safes[plaintextTestSafeIndex(t, safes)], func(bags []safeBag) []safeBag {
+					filler := bags[testShroudedKeyBagIndex(t, bags)]
+					filler.ID = rawOID(t, oidDataContentType)
+					return []safeBag{filler}
+				})
+				return safes
+			},
+		},
+		{
+			name:        "a key-only bundle with no encrypted certificate safe",
+			wantErrText: "no encrypted certificate bag",
+			mutate: func(t *testing.T, safes []contentInfo) []contentInfo {
+				return []contentInfo{safes[plaintextTestSafeIndex(t, safes)]}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var preamble pfxPreamble
+			testASN1Unmarshal(t, pfx, &preamble)
+			setTestAuthenticatedSafes(t, &preamble, tc.mutate(t, testAuthenticatedSafes(t, &preamble)))
+			got, err := Inspect(testASN1Marshal(t, preamble))
+			if !errors.Is(err, ErrProfileUnknown) {
+				t.Fatalf("Inspect(%s) = (%+v, %v), want ErrProfileUnknown", tc.name, got, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrText) {
+				t.Errorf("Inspect(%s) = %v, want the refusal to come from the completeness arm naming %q, not a later one",
+					tc.name, err, tc.wantErrText)
+			}
+		})
+	}
+}

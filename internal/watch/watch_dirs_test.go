@@ -347,6 +347,17 @@ func TestAddWatchDirs_stops_at_the_entry_budget(t *testing.T) {
 		t.Errorf("budget WARN logged %d times, want exactly 1 per walk (the remainder is unbounded and the operator action is the same for all of it); log = %v",
 			n, logs.Messages())
 	}
+	// README's CertConverterInputTreeTooLarge rule matches this phrase, so it is
+	// pinned as a LITERAL rather than via watchBudgetMsg: a reword of the
+	// constant must fail here, loudly, rather than in an operator's Loki rule
+	// that silently stops matching -- the overrun is health-neutral, so that rule
+	// is the operator's only signal. main_test.go pins its alerted messages the
+	// same way.
+	const alertedPhrase = "holds more entries than one scan will enumerate"
+	if n := logs.CountLevel(slog.LevelWarn, alertedPhrase); n != 1 {
+		t.Errorf("%d WARN records carry the alert-matched phrase %q, want exactly 1: the CertConverterInputTreeTooLarge rule matches that literal; log = %v",
+			n, alertedPhrase, logs.Messages())
+	}
 }
 
 // TestResyncWatchSet_prunes_a_directory_the_tree_no_longer_has pins the
@@ -473,7 +484,7 @@ func TestResyncWatchSet_keeps_the_mirror_charged_when_the_rebuild_is_abandoned(t
 	w := New(root, func(context.Context) {})
 
 	w.resyncWatchSet(t.Context(), watcher, "failed to re-sync the watch set")
-	charged := w.watchSetSize()
+	charged := len(w.watchSetSnapshot())
 	if charged != 2 {
 		t.Fatalf("setup: the mirror holds %d registrations, want 2 (the root and example.com)", charged)
 	}
@@ -484,7 +495,7 @@ func TestResyncWatchSet_keeps_the_mirror_charged_when_the_rebuild_is_abandoned(t
 
 	w.resyncWatchSet(t.Context(), watcher, "failed to re-sync the watch set")
 
-	if got := w.watchSetSize(); got != charged {
+	if got := len(w.watchSetSnapshot()); got != charged {
 		t.Errorf("after an abandoned rebuild the mirror holds %d registrations, want the %d it was charged:"+
 			" a registration the kernel still holds must stay in the mirror, or nothing ever unregisters it"+
 			" and this app keeps a slot of the shared inotify quota it does not use", got, charged)

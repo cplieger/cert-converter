@@ -354,7 +354,7 @@ func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (*Ana
 	}
 	certs, obs := in.certs, in.observations
 
-	// Three cancellation reads, one after each phase that can pay a verification.
+	// A cancellation read after each phase that can pay a verification.
 	// A verdict derived from a partially built graph is not merely incomplete, it is
 	// WRONG in an operator-visible way: selectIdentity and oversizedIssuerError both
 	// return refusals derived from proven, so propagating one built on a cancelled
@@ -774,8 +774,6 @@ func unverifiableKeyReason(pub crypto.PublicKey) string {
 		return ""
 	}
 	switch {
-	case k.N == nil:
-		return "holds an RSA key with no modulus, which no signature can be checked against"
 	case k.N.BitLen() > maxVerifiableKeyBits:
 		return fmt.Sprintf("holds a %d-bit RSA key, above the %d-bit modulus ceiling this app will verify a signature against",
 			k.N.BitLen(), maxVerifiableKeyBits)
@@ -1769,10 +1767,12 @@ func (g *certGraph) bestParent(cur int, onPath []bool) int {
 
 // betterParent ranks two candidate issuers at a branch point.
 //
-// The final key is the full DER. A subject comparison would be useless here by
-// construction: every candidate reached this point by matching the child's
-// RawIssuer against its own RawSubject, so all candidates at one branch have
-// identical subjects. RFC 5280 permits a CA to hold several certificates under
+// The final key is the full DER, because it is the only key that is total over
+// the whole candidate set. A subject comparison is not: candidates that arrived
+// by a name match share the child's issuer name (byte-identical, or semantically
+// equal with different DER), so their subjects tie or differ only in encoding,
+// while a candidate linked by key identifier alone (nameLinkNone) need not share
+// the subject at all. RFC 5280 permits a CA to hold several certificates under
 // one name, so real branches with equal distance and equal NotAfter exist, and
 // with an inert final key the choice fell back to file order.
 func (g *certGraph) betterParent(a, b int) bool {

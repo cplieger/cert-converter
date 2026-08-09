@@ -364,7 +364,7 @@ func TestAnalyse_reports_an_out_of_window_identity_without_refusing_it(t *testin
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			key := testcerts.NewECDSAKey(t)
-			_, certPEM, _ := testcerts.Mint(t, &x509.Certificate{
+			certPEM, _ := testcerts.Mint(t, &x509.Certificate{
 				SerialNumber: big.NewInt(120),
 				Subject:      pkix.Name{CommonName: "window.example.com"},
 				NotBefore:    tc.notBefore,
@@ -392,7 +392,7 @@ func TestAnalyse_reports_no_validity_observation_for_a_current_identity(t *testi
 	t.Parallel()
 	now := time.Now()
 	key := testcerts.NewECDSAKey(t)
-	_, certPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	certPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(121),
 		Subject:      pkix.Name{CommonName: "current.example.com"},
 		NotBefore:    now.Add(-time.Hour),
@@ -421,7 +421,7 @@ func TestAnalyse_reports_an_out_of_window_chain_certificate(t *testing.T) {
 	now := time.Now()
 
 	caKey := testcerts.NewECDSAKey(t)
-	_, caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
+	caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(140),
 		Subject:               pkix.Name{CommonName: "Expired Intermediate"},
 		NotBefore:             now.Add(-72 * time.Hour),
@@ -432,7 +432,7 @@ func TestAnalyse_reports_an_out_of_window_chain_certificate(t *testing.T) {
 	}, &caKey.PublicKey, nil, caKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(141),
 		Subject:      pkix.Name{CommonName: "valid-leaf.example.com"},
 		NotBefore:    now.Add(-time.Hour),

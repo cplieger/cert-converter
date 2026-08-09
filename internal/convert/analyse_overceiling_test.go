@@ -76,7 +76,7 @@ func TestAnalyse_refuses_an_over_ceiling_rsa_issuer(t *testing.T) {
 	// SubjectPublicKeyInfo — and minting it for real would mean generating a
 	// 16k-bit RSA key, which costs minutes.
 	throwawayKey := testcerts.NewECDSAKey(t)
-	_, oversizedPEM, oversizedCert := testcerts.Mint(t, ca(210, notBefore.Add(240*time.Hour)),
+	oversizedPEM, oversizedCert := testcerts.Mint(t, ca(210, notBefore.Add(240*time.Hour)),
 		oversizedRSAPublicKey(oversizedBits), nil, throwawayKey)
 	if k, ok := oversizedCert.PublicKey.(*rsa.PublicKey); !ok || k.N.BitLen() != oversizedBits {
 		t.Fatalf("setup: minted certificate carries a %T, want a %d-bit RSA modulus; x509 no longer parses one that large",
@@ -87,16 +87,16 @@ func TestAnalyse_refuses_an_over_ceiling_rsa_issuer(t *testing.T) {
 	// in zero hops and outranks the oversized certificate on every key left once
 	// neither edge can be verified.
 	decoyKey := testcerts.NewECDSAKey(t)
-	_, decoyPEM, _ := testcerts.Mint(t, ca(211, notBefore.Add(72*time.Hour)), &decoyKey.PublicKey, nil, decoyKey)
+	decoyPEM, _ := testcerts.Mint(t, ca(211, notBefore.Add(72*time.Hour)), &decoyKey.PublicKey, nil, decoyKey)
 
 	// The leaf's real signer shares that subject and is NOT in the bundle, so
 	// neither candidate edge verifies — the state the ceiling produces for a leaf
 	// whose genuine issuer is the oversized one.
 	absentKey := testcerts.NewECDSAKey(t)
-	_, _, absentCACert := testcerts.Mint(t, ca(212, notBefore.Add(240*time.Hour)), &absentKey.PublicKey, nil, absentKey)
+	_, absentCACert := testcerts.Mint(t, ca(212, notBefore.Add(240*time.Hour)), &absentKey.PublicKey, nil, absentKey)
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(213),
 		Subject:      pkix.Name{CommonName: "oversized-issuer-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -110,10 +110,10 @@ func TestAnalyse_refuses_an_over_ceiling_rsa_issuer(t *testing.T) {
 	// chain, which is precisely the substitution the refusal exists to prevent.
 	oversizedNoCA := ca(220, notBefore.Add(240*time.Hour))
 	oversizedNoCA.IsCA = false
-	_, noCAPEM, _ := testcerts.Mint(t, oversizedNoCA, oversizedRSAPublicKey(oversizedBits), nil, throwawayKey)
+	noCAPEM, _ := testcerts.Mint(t, oversizedNoCA, oversizedRSAPublicKey(oversizedBits), nil, throwawayKey)
 	oversizedNoBC := ca(221, notBefore.Add(240*time.Hour))
 	oversizedNoBC.BasicConstraintsValid = false
-	_, noBCPEM, _ := testcerts.Mint(t, oversizedNoBC, oversizedRSAPublicKey(oversizedBits), nil, throwawayKey)
+	noBCPEM, _ := testcerts.Mint(t, oversizedNoBC, oversizedRSAPublicKey(oversizedBits), nil, throwawayKey)
 
 	for _, order := range []struct {
 		name  string
@@ -172,23 +172,23 @@ func TestAnalyse_refuses_an_over_ceiling_issuer_whose_alternative_is_cycle_exclu
 	// A scaffold for C, used only as the issuer template A is minted against: it
 	// carries C's subject and C's key, so A's signature verifies under the C that
 	// ships in the bundle.
-	_, _, scaffoldC := testcerts.Mint(t,
+	_, scaffoldC := testcerts.Mint(t,
 		unverifiableCA(240, cycleCCN, notBefore, notBefore.Add(480*time.Hour)),
 		&keyC.PublicKey, nil, keyC)
 
-	_, cyclePEMA, certA := testcerts.Mint(t,
+	cyclePEMA, certA := testcerts.Mint(t,
 		unverifiableCA(241, cycleACN, notBefore, notBefore.Add(240*time.Hour)),
 		&keyA.PublicKey, scaffoldC, keyC)
 	// C is signed by A, closing the cycle: A's issuer is C's subject and C's issuer
 	// is A's subject, and both signatures verify.
-	_, cyclePEMC, _ := testcerts.Mint(t,
+	cyclePEMC, _ := testcerts.Mint(t,
 		unverifiableCA(242, cycleCCN, notBefore, notBefore.Add(480*time.Hour)),
 		&keyC.PublicKey, certA, keyA)
 
 	// The oversized same-subject decoy for A: a linked candidate parent of the leaf
 	// AND of C, and no signature may ever be checked against it.
 	throwawayKey := testcerts.NewECDSAKey(t)
-	_, oversizedPEM, oversizedCert := testcerts.Mint(t,
+	oversizedPEM, oversizedCert := testcerts.Mint(t,
 		unverifiableCA(243, cycleACN, notBefore, notBefore.Add(720*time.Hour)),
 		oversizedRSAPublicKey(oversizedBits), nil, throwawayKey)
 	if k, ok := oversizedCert.PublicKey.(*rsa.PublicKey); !ok || k.N.BitLen() != oversizedBits {
@@ -196,7 +196,7 @@ func TestAnalyse_refuses_an_over_ceiling_issuer_whose_alternative_is_cycle_exclu
 	}
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(244),
 		Subject:      pkix.Name{CommonName: "cycle-issuer-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -248,7 +248,7 @@ func TestAnalyse_converts_when_a_proven_parent_outranks_an_over_ceiling_namesake
 	// The CA that really signs the leaf, self-signed so it is a root in its own
 	// right and needs no parent of its own.
 	caKey := testcerts.NewECDSAKey(t)
-	_, caPEM, caCert := testcerts.Mint(t,
+	caPEM, caCert := testcerts.Mint(t,
 		unverifiableCA(230, contestedCN, notBefore, notBefore.Add(240*time.Hour)),
 		&caKey.PublicKey, nil, caKey)
 
@@ -256,7 +256,7 @@ func TestAnalyse_converts_when_a_proven_parent_outranks_an_over_ceiling_namesake
 	// because nothing reads it: the ceiling is decided on the modulus in the
 	// SubjectPublicKeyInfo, and minting a real 16k-bit RSA key costs minutes.
 	throwawayKey := testcerts.NewECDSAKey(t)
-	_, oversizedPEM, oversizedCert := testcerts.Mint(t,
+	oversizedPEM, oversizedCert := testcerts.Mint(t,
 		unverifiableCA(231, contestedCN, notBefore, notBefore.Add(480*time.Hour)),
 		oversizedRSAPublicKey(oversizedBits), nil, throwawayKey)
 	if k, ok := oversizedCert.PublicKey.(*rsa.PublicKey); !ok || k.N.BitLen() != oversizedBits {
@@ -264,7 +264,7 @@ func TestAnalyse_converts_when_a_proven_parent_outranks_an_over_ceiling_namesake
 	}
 
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(232),
 		Subject:      pkix.Name{CommonName: "resolvable-issuer-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -327,22 +327,22 @@ func TestAnalyse_converts_when_the_path_enters_a_signed_cycle_at_its_proven_hop(
 	// A scaffold for P, used only as the issuer template C is minted against: it
 	// carries P's subject and P's key, so C's signature verifies under the P that
 	// ships in the bundle.
-	_, _, scaffoldP := testcerts.Mint(t,
+	_, scaffoldP := testcerts.Mint(t,
 		unverifiableCA(250, cyclePCN, notBefore, notBefore.Add(480*time.Hour)),
 		&keyP.PublicKey, nil, keyP)
 
-	_, cyclePEMC, certC := testcerts.Mint(t,
+	cyclePEMC, certC := testcerts.Mint(t,
 		unverifiableCA(251, cycleCCN, notBefore, notBefore.Add(240*time.Hour)),
 		&keyC.PublicKey, scaffoldP, keyP)
 	// P is signed by C, closing the cycle.
-	_, cyclePEMP, _ := testcerts.Mint(t,
+	cyclePEMP, _ := testcerts.Mint(t,
 		unverifiableCA(252, cyclePCN, notBefore, notBefore.Add(480*time.Hour)),
 		&keyP.PublicKey, certC, keyC)
 
 	// The over-ceiling namesake of P: a linked candidate parent of C, and no
 	// signature may ever be checked against it.
 	throwawayKey := testcerts.NewECDSAKey(t)
-	_, oversizedPEM, oversizedCert := testcerts.Mint(t,
+	oversizedPEM, oversizedCert := testcerts.Mint(t,
 		unverifiableCA(253, cyclePCN, notBefore, notBefore.Add(720*time.Hour)),
 		oversizedRSAPublicKey(oversizedBits), nil, throwawayKey)
 	if k, ok := oversizedCert.PublicKey.(*rsa.PublicKey); !ok || k.N.BitLen() != oversizedBits {
@@ -351,7 +351,7 @@ func TestAnalyse_converts_when_the_path_enters_a_signed_cycle_at_its_proven_hop(
 
 	// The leaf is signed by C, so the path ENTERS the cycle at C.
 	leafKey := testcerts.NewECDSAKey(t)
-	_, leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(254),
 		Subject:      pkix.Name{CommonName: "entered-cycle-leaf.example.com"},
 		NotBefore:    notBefore,
@@ -395,7 +395,7 @@ func TestAnalyse_converts_beside_an_over_ceiling_certificate_that_issues_nothing
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 
 	identityKey := testcerts.NewECDSAKey(t)
-	_, identityPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	identityPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber: big.NewInt(214),
 		Subject:      pkix.Name{CommonName: "narrow-refusal.example.com"},
 		NotBefore:    notBefore,
@@ -405,7 +405,7 @@ func TestAnalyse_converts_beside_an_over_ceiling_certificate_that_issues_nothing
 	// Oversized, and unrelated to the identity by name and by key identifier, so it
 	// is a candidate issuer of nothing here.
 	throwawayKey := testcerts.NewECDSAKey(t)
-	_, strangerPEM, _ := testcerts.Mint(t, &x509.Certificate{
+	strangerPEM, _ := testcerts.Mint(t, &x509.Certificate{
 		SerialNumber:          big.NewInt(215),
 		Subject:               pkix.Name{CommonName: "Unrelated Oversized CA"},
 		NotBefore:             notBefore,

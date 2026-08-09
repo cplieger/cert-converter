@@ -803,9 +803,11 @@ type observationLog struct {
 	// differently: forgetPair spends one scan of missing-key grace, which must not
 	// also reset the WARN de-duplication for input bytes that never changed.
 	whole map[string]struct{}
-	// loneKeys holds the cert paths this log has already reported as retaining an
-	// output because a sibling KEY is still there while the certificate is gone
-	// (reaper.reapConfirmed). A THIRD set for a third spending schedule: it is cleared
+	// loneKeys holds the paths this log has already reported for a retained bundle:
+	// the CERT path when a sibling key is still there while the certificate is gone,
+	// and the KEY path when that key could not be inspected at all
+	// (reaper.keyStillPresent keys the two reports on different paths so they retire
+	// independently). A THIRD set for a third spending schedule: it is cleared
 	// when the pair reads whole again (markWhole) or when the leftover key disappears
 	// (clearLoneKey), and — unlike `seen` and `whole` — it is deliberately NOT pruned by
 	// forget, whose gate is membership in the scan's cert enumeration. A lone key's
@@ -894,8 +896,13 @@ func (o *observationLog) markWhole(rel string) {
 	o.whole[rel] = struct{}{}
 	// A pair that reads whole is not a lone key any more, so the next time it becomes
 	// one it is reported again. This is the "per change, not per scan" half of the
-	// lone-key report: the state is remembered until the state itself changes.
+	// lone-key report: the state is remembered until the state itself changes. The
+	// KEY-keyed uninspectable report (keyStillPresent's fail-closed arm) retires here
+	// too: reading the pair whole IS the key path answering, and without this the
+	// entry is stranded once the healed pair leaves the orphan list, silently
+	// suppressing the WARN for a later, genuinely new episode of the condition.
 	o.clearLoneKey(rel)
+	o.clearLoneKey(layout.KeyFor(rel))
 }
 
 // markLoneKey records that rel's bundle is being retained because a sibling key is
@@ -1382,7 +1389,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	// re-decides the outcome; the logging and the observation bookkeeping only read it.
 	outcome = writeOutcome(state, writeErr)
 	if writeErr != nil {
-		reportWriteFailure(rel, pfxRel, state, writeErr, outcome)
+		reportWriteFailure(rel, pfxRel, writeErr, outcome)
 	}
 	if outcome == statusUnwritable {
 		// The bundle on disk is one this app never proved wrong and the refusal is steady
@@ -1424,11 +1431,11 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 //
 //  1. This app never proved the bundle on disk wrong (bundleState.bundleNotProvenWrong):
 //     it could not read the bytes at all. A bundle it DID compare and find stale — a
-//     renewal behind, a rotated password, an absent or non-regular output path — stays a
-//     conversion failure whatever refused the write, because the operator is being served
-//     the wrong bundle and that has to be loud (the README's /output contract). A bundle
-//     it compared and MATCHED never reaches here at all: convertEntry returns at
-//     `if state.upToDate()` before the write.
+//     renewal behind, a rotated password, an encoder-profile change, an absent or
+//     non-regular output path — stays a conversion failure whatever refused the write,
+//     because the operator is being served the wrong bundle and that has to be loud (the
+//     README's /output contract). A bundle it compared and MATCHED never reaches here at
+//     all: convertEntry returns at `if state.upToDate()` before the write.
 //  2. No restart can clear what refused the write (restartCanClearWrite): a permission
 //     denial, a read-only mount, a full volume, an exhausted quota.
 //
@@ -1457,8 +1464,9 @@ func writeOutcome(state bundleState, writeErr error) conversionStatus {
 // bytes because only the mode was wrong, and no such rewrite happens any more: a lax mode
 // is reported and never written over, so the refusal it named cannot arise. It promises
 // nothing about the bytes on disk, deliberately, because nothing compared them. The record
-// carries a `content` attribute naming which fact the app actually had, so an operator
-// reading this line knows what the bundle left in place was.
+// carries a `content` attribute naming the one fact that can reach it — "unverified", the
+// bundleNotProvenWrong allowlist's sole member — so an operator reading this line knows
+// nothing compared the bundle left in place.
 const unreplaceableBundleMsg = "prior pfx could not be replaced and the /output condition that refused the write is not one a restart clears; leaving the existing bundle in place, health is unaffected"
 
 // outputVolumeRemediation is the remediation for a write the VOLUME refused rather than
@@ -1475,11 +1483,14 @@ const outputVolumeRemediation = "check /output for free space, a quota and a rea
 //
 // The WARN is emitted once per bundle per scan, because the entry is written at most once
 // per scan: there is no retry loop behind it.
-func reportWriteFailure(logRel, pfxRel string, state bundleState, err error, outcome conversionStatus) {
+func reportWriteFailure(logRel, pfxRel string, err error, outcome conversionStatus) {
 	if outcome == statusUnwritable {
+		// "unverified" is the only content fact that can reach this record:
+		// writeOutcome grants statusUnwritable solely via bundleNotProvenWrong,
+		// whose allowlist is exactly contentUnverified.
 		slog.Warn(unreplaceableBundleMsg,
 			"path", logRel, "output_path", pfxRel, "error", err,
-			"content", state.content.String(), "remediation", unwritableRemediation(err))
+			"content", "unverified", "remediation", unwritableRemediation(err))
 		return
 	}
 	// failEntry is called for its LOG: the statusFailed it returns is the same value
@@ -1493,13 +1504,22 @@ func reportWriteFailure(logRel, pfxRel string, state bundleState, err error, out
 
 // unwritableRemediation names the operator action that clears a health-neutral write
 // refusal. One axis rather than the two this used to pick over: with only one standing
-// message left, what remains is WHAT REFUSED the replacement — ownership, or the volume —
-// and an operator sent after the wrong cause reads the WARN as noise.
+// message left, what remains is WHAT REFUSED the replacement — ownership, the output
+// tree's own layout, or the volume — and an operator sent after the wrong cause reads
+// the WARN as noise.
 func unwritableRemediation(err error) string {
-	if isPermissionRefusal(err) {
+	switch {
+	case isPermissionRefusal(err):
 		return outputPermRemediation
+	case errors.Is(err, errOutputPinRefused):
+		// A refused parent pin is a layout condition, not a volume one: the fix
+		// is the symlinked /output tree or the replaced component the pin named,
+		// so the advice is outputPinRemediation, exactly as inspect's own
+		// per-scan WARN for the same condition already advises.
+		return outputPinRemediation
+	default:
+		return outputVolumeRemediation
 	}
-	return outputVolumeRemediation
 }
 
 // logConversionObservations surfaces Analyse's non-fatal findings about a pair's

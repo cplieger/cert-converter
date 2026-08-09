@@ -52,7 +52,8 @@ type conversionStatus int
 // could not replace a bundle at the output path, it never PROVED that bundle wrong, and
 // what refused the replacement is a steady-state condition of the operator's volume that
 // no restart changes (a permission denial, a read-only mount, a full volume, an exhausted
-// quota — restartCanClearWrite enumerates them).
+// quota, or an output directory this app cannot pin — a symlinked output tree, or a
+// component another writer replaced — restartCanClearWrite enumerates them).
 //
 // "Never proved it wrong" means this app could not verify the content AT ALL: a bundle
 // above the readable bound, unreadable, un-stat-able, or refused by the codec's preflight.
@@ -63,17 +64,12 @@ type conversionStatus int
 // container unhealthy on every scan over an /output permission state no restart can clear,
 // which is the same restart-loop statusUnreadable exists to prevent on the /input side.
 //
-// A bundle whose bytes this app compared and MATCHED cannot reach this status, because it
-// is never written at all: currency is decided on content alone, so a matching bundle is
-// skipped however lax its mode (bundleState.upToDate). That is what keeps an /output
-// PERMISSION state away from health structurally rather than by routing — a lax mode
-// triggers no write, so there is no refusal to classify.
-//
-// A bundle this app DID compare and find stale is never this status. A renewal behind, a
-// rotated password, an encoder-profile change, an absent or non-regular output path: there
-// the operator is being served the wrong bundle or none, so the failure to write stays
-// statusFailed and still flips health however the write failed. Like the two /input
-// members, this status is health-neutral, reported by its own standing WARN, and it blocks
+// Which write failures take this status instead of statusFailed is derived in exactly
+// one place — writeOutcome, whose doc carries the carve-outs in full. In short: a bundle
+// this app compared and found stale stays statusFailed however the write failed, and a
+// bundle it compared and MATCHED is never written at all (bundleState.upToDate), so a
+// lax mode alone can never produce a refusal to classify. Like the two /input members,
+// this status is health-neutral, reported by its own standing WARN, and it blocks
 // orphan reaping.
 const (
 	statusUnset conversionStatus = iota

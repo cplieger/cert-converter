@@ -407,10 +407,15 @@ func warnFallbackDisabled(interval time.Duration) {
 		// arms with the smaller of the configured cadence and the floor
 		// (watch.safetyNetIntervalFor), so this cadence never fires and the
 		// floor's walk runs instead — more often than the operator asked for.
+		// The pair is rendered by watch.CoverageAttrs, the one home for its keys and
+		// both renderings; identical bytes here, because this arm's guard makes the
+		// interval positive (so FallbackLabel renders interval.String()) and floor is
+		// already watch.MarkerRefreshFloor(interval).
+		attrs := append(watch.CoverageAttrs(interval),
+			"remediation", "set FALLBACK_SCAN_HOURS at or below the floor's hours if the cadence should be yours, or leave it as is: coverage is unaffected")
 		slog.Warn("FALLBACK_SCAN_HOURS is above the watcher's reconciliation floor, so no re-scan will ever run on your configured cadence; "+
 			"the floor's full-tree reconciliation runs instead, more often than the cadence you set",
-			"fallback_scan", interval.String(), "scan_floor", floor.String(),
-			"remediation", "set FALLBACK_SCAN_HOURS at or below the floor's hours if the cadence should be yours, or leave it as is: coverage is unaffected")
+			attrs...)
 		return
 	}
 	if interval > 0 {

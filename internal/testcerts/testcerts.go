@@ -42,8 +42,8 @@ func signCert(tb testing.TB, template, parent *x509.Certificate, pub crypto.Publ
 }
 
 // Mint signs template with parent (a nil parent yields a self-signed certificate
-// whose template is its own issuer) and returns the DER, the PEM encoding and the
-// parsed certificate.
+// whose template is its own issuer) and returns the PEM encoding and the parsed
+// certificate (whose Raw field carries the DER).
 //
 // pub is independent of parentKey so a fixture can carry a key it could not have
 // signed with: an adversarial bundle needs a certificate whose subject key and
@@ -55,18 +55,18 @@ func signCert(tb testing.TB, template, parent *x509.Certificate, pub crypto.Publ
 // re-derive it per file.
 func Mint(tb testing.TB, template *x509.Certificate, pub crypto.PublicKey,
 	parent *x509.Certificate, parentKey crypto.Signer,
-) (der, pemBytes []byte, parsed *x509.Certificate) {
+) (pemBytes []byte, parsed *x509.Certificate) {
 	tb.Helper()
 
 	if parent == nil {
 		parent = template // self-signed: the template is its own issuer
 	}
-	der, pemBytes = signCert(tb, template, parent, pub, parentKey)
+	der, pemBytes := signCert(tb, template, parent, pub, parentKey)
 	parsed, err := x509.ParseCertificate(der)
 	if err != nil {
 		tb.Fatal(err)
 	}
-	return der, pemBytes, parsed
+	return pemBytes, parsed
 }
 
 // KeyPEM marshals key as a PKCS#8 PRIVATE KEY block, the form cert-converter's
@@ -140,7 +140,7 @@ func GenerateCertChain(tb testing.TB) (leafPEM, keyPEM, caPEM, chainPEM []byte) 
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign,
 	}
-	_, caPEM, caCert := Mint(tb, caTemplate, &caKey.PublicKey, nil, caKey)
+	caPEM, caCert := Mint(tb, caTemplate, &caKey.PublicKey, nil, caKey)
 
 	leafKey := NewECDSAKey(tb)
 	leafTemplate := &x509.Certificate{
@@ -206,7 +206,7 @@ func GenerateChainMaterial(tb testing.TB) ChainMaterial {
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign,
 	}
-	_, caPEM, caCert := Mint(tb, caTemplate, &caKey.PublicKey, nil, caKey)
+	caPEM, caCert := Mint(tb, caTemplate, &caKey.PublicKey, nil, caKey)
 
 	leafKey := NewECDSAKey(tb)
 

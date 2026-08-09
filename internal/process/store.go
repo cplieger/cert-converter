@@ -115,7 +115,10 @@ func (s *store) reportLaxDirAt(dir string) {
 	if _, done := s.laxDirsReported[dir]; done {
 		return
 	}
-	fi, err := s.lstat(dir)
+	// Lstat, not Stat: a symlink at a directory name is classified as itself, never
+	// by its target, so a linked directory is skipped rather than reported for a
+	// mode this app did not observe on the real path.
+	fi, err := s.root.Lstat(dir)
 	if err != nil || !fi.IsDir() {
 		// A directory that cannot be stat-ed or is not a directory is reported by the
 		// write path itself; this check adds nothing there.
@@ -217,16 +220,6 @@ func (s *store) write(ctx context.Context, rel string, pfx []byte) error {
 		return fmt.Errorf("write pfx: %w", err)
 	}
 	return nil
-}
-
-// lstat reports on rel inside the output tree WITHOUT following a symlink.
-//
-// Lstat rather than Stat is deliberate: a symlink planted under an output name
-// must not be accepted as a prior PFX, or unrelated content could satisfy the
-// coherence gate. The caller owns what each outcome means, so the raw result is
-// returned rather than a boolean.
-func (s *store) lstat(rel string) (os.FileInfo, error) {
-	return s.root.Lstat(rel)
 }
 
 // --- Stale-temp sweep (store-owned) ---
@@ -357,23 +350,6 @@ const (
 	// on its own it never affects health.
 	contentUnverified
 )
-
-// String names the fact for an operator. The standing WARN for a health-neutral write
-// refusal carries it, because "which of these three did the app actually know?" is the
-// first thing an operator has to establish about a bundle left in place, and one message
-// text cannot carry all three.
-func (c contentState) String() string {
-	switch c {
-	case contentVerifiedCurrent:
-		return "verified-current"
-	case contentVerifiedStale:
-		return "verified-stale"
-	case contentUnverified:
-		return "unverified"
-	default:
-		return "unresolved"
-	}
-}
 
 // bundleState is what one inspection of the output path resolved: what this app knows
 // about the bytes on disk. That is the ONE fact an inspection produces that routes
@@ -728,8 +704,8 @@ func (s *store) reportLaxBundle(rel string, perm os.FileMode) {
 // syscall.EPERM and syscall.EACCES: atomicfile's confined write returns an *fs.PathError
 // wrapping a syscall.Errno, and Errno.Is maps BOTH of those errnos (and only those, of
 // the ones reachable here — EROFS, EINVAL and ENOSPC do not match) onto fs.ErrPermission.
-// Checking the portable sentinel therefore covers both refusals, keeps this file free of
-// a syscall import, and matches an fs.ErrPermission a test seam injects directly.
+// Checking the portable sentinel therefore covers both refusals with one test, and
+// matches an fs.ErrPermission a test seam injects directly.
 func isPermissionRefusal(err error) bool {
 	return errors.Is(err, fs.ErrPermission)
 }
@@ -757,6 +733,9 @@ func isPermissionRefusal(err error) bool {
 //   - EROFS: a read-only mount is a mount option, not process state.
 //   - ENOSPC / EDQUOT: a full volume or an exhausted quota. A restarted container writes
 //     the same bytes into the same full volume.
+//   - ENOTDIR: a regular file occupying a directory component of the output
+//     path (store.write's MkdirAll reports it before the pin can). The same
+//     layout class as a refused pin; a restart re-reads the same volume.
 //
 // It says nothing about whether the write SHOULD have succeeded: writeOutcome asks this
 // only after establishing that the bundle already on disk is not one this app proved
@@ -768,6 +747,13 @@ func restartCanClearWrite(err error) bool {
 	case errors.Is(err, errOutputPinRefused):
 		return false
 	case errors.Is(err, syscall.EROFS), errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT):
+		return false
+	case errors.Is(err, syscall.ENOTDIR):
+		// A regular file occupying a directory component of the output path: the
+		// same operator layout state errOutputPinRefused names ("a component that
+		// is not a directory"), reachable one step earlier from store.write's own
+		// MkdirAll, which runs before the pin exists to refuse it. A restart
+		// re-reads the same layout.
 		return false
 	default:
 		return true

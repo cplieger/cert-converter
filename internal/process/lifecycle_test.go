@@ -17,6 +17,7 @@ import (
 
 	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
@@ -2018,6 +2019,36 @@ func TestObservationLog_keeps_reporting_a_lone_key_once_the_dedup_set_is_full(t 
 	}
 }
 
+// TestObservationLog_retires_the_key_keyed_retention_report_when_the_pair_reads_whole pins
+// the OTHER half of markWhole's retirement, which the cert-keyed case above does not reach:
+// keyStillPresent's fail-closed arm keys its report on the KEY path, and that entry's only
+// other retirement site runs while the bundle is STILL an orphan candidate.
+//
+// So the ordinary healing — the certificate comes back and the pair converts — has to
+// retire it here, or the entry is stranded for the process lifetime and a LATER episode of
+// the same condition (a retained private-key bundle whose key path cannot be inspected)
+// emits nothing at all, which is the invisible state the report exists to prevent.
+func TestObservationLog_retires_the_key_keyed_retention_report_when_the_pair_reads_whole(t *testing.T) {
+	log := newObservationLog(4)
+	key := layout.KeyFor("a.crt")
+
+	if !log.markLoneKey(key) {
+		t.Fatal("markLoneKey(uninspectable key path) = false, want true: the first episode must be reported")
+	}
+	if log.markLoneKey(key) {
+		t.Fatal("markLoneKey(same episode again) = true, want false: the report is deduplicated per change")
+	}
+
+	// The pair converting is the condition healing: reading it whole IS the key path
+	// answering, and it is the only event the healed pair reaches.
+	log.markWhole("a.crt")
+
+	if !log.markLoneKey(key) {
+		t.Error("markLoneKey(a later episode after the pair read whole) = false, want true: a report stranded" +
+			" by the ordinary healing path silences the WARN for a genuinely new condition")
+	}
+}
+
 func TestObservationLog_wholeness_eviction_makes_room_without_touching_the_reserved_path(t *testing.T) {
 	log := newObservationLog(1)
 	// The reachable shape: a.crt is remembered by the SIGNATURE half (note ran for it)
@@ -2625,7 +2656,6 @@ func TestStoreReconcile_names_a_certificate_recheck_it_could_not_make(t *testing
 	deleted, err := newReaper(s, newInputSource(t, in), outputpolicy.LifecycleSync).
 		reconcile(context.Background(), map[string]struct{}{},
 			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
-
 	if err != nil {
 		t.Fatalf("reconcile(uninspectable certificate path) = error %v, want nil", err)
 	}
