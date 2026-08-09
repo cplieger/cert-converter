@@ -497,9 +497,11 @@ func TestResyncWatchSet_keeps_the_mirror_charged_when_the_rebuild_is_abandoned(t
 // because the kernel may still be holding that descriptor and the mirror is this app's
 // only record of it -- dropped from the mirror, no later prune would ever retry the
 // removal. The cost of keeping it is bounded and deliberately the cheap direction: no
-// ceiling is read from this count, and the next re-assert re-Adds every desired path
-// idempotently regardless of what the mirror claims, so a stale entry costs at most one
-// redundant Add. A removal the kernel CONFIRMED (success, or ErrNonExistentWatch) must
+// ceiling is read from this count, and every later prune retries the removal. The next
+// re-assert does not re-Add it -- it Adds only what the preflight wants, and a charged path
+// is by construction absent from that set -- so the residual is that the per-event
+// membership guard skips the subtree re-attach if the path reappears before that re-assert.
+// A removal the kernel CONFIRMED (success, or ErrNonExistentWatch) must
 // be forgotten, or the per-event membership guard would keep skipping the re-attach of a
 // path that is no longer watched.
 // The refusal must also be WARNed once with the path, so the operator can see

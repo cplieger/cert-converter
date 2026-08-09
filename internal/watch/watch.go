@@ -886,10 +886,15 @@ func (w *Watcher) watchSetSnapshot() []string {
 // successful Remove, or ErrNonExistentWatch, which means fsnotify already dropped it
 // with its directory (reported at Debug: expected, not a degradation). Any other Remove
 // error leaves an uncertain descriptor live, so the path stays charged to the mirror and
-// the operator is told which one is stuck. Keeping it charged is the cheap direction: a
-// mirror that claims a path the kernel no longer holds costs at most one redundant
-// idempotent Add on the next re-assert (which re-adds every desired path regardless of
-// the mirror), never a lost slot, because no ceiling is read from this count.
+// the operator is told which one is stuck. Keeping it charged is the cheap direction, and
+// the mirror is what keeps the removal RETRYABLE: a charged path the preflight does not
+// want is re-tried by every later prune, while forgetting it would leave the descriptor
+// live with nothing that ever unregisters it. No ceiling is read from this count, so it
+// costs no slot. The one residual is the per-event fast path: a charged path is by
+// construction absent from desired, so the re-assert below does NOT re-add it, and if the
+// path reappears before the next re-assert, handlePathEvent's membership guard (watchSetHas)
+// skips its subtree re-attach -- the rescan that event schedules is unaffected, and the
+// registration is restored by the re-assert that follows the reappearance.
 func (w *Watcher) pruneWatches(watcher *fsnotify.Watcher, desired map[string]struct{}) {
 	for _, path := range w.watchSetSnapshot() {
 		if _, wanted := desired[path]; wanted {
@@ -1252,7 +1257,8 @@ func (w *Watcher) resyncWatchSet(ctx context.Context, watcher *fsnotify.Watcher,
 	//    this app holds descriptors only for what it is actually watching — and so a
 	//    replacement directory can take the slot a stale registration was holding when the
 	//    per-UID inotify quota is already spent. A removal the kernel refused stays charged
-	//    (pruneWatches), which costs at most a redundant idempotent Add below.
+	//    (pruneWatches) so every later prune retries it; phase 3 below does NOT re-add it,
+	//    because a charged path the preflight does not want is absent from desired.
 	w.pruneWatches(watcher, desired)
 	// 3. RE-ASSERT the preflight's set. Add is idempotent, so this restores exactly what
 	//    was lost, and it re-adds every desired path regardless of what the mirror claims.

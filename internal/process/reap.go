@@ -468,11 +468,22 @@ func (rp *reaper) keyStillPresent(rel, cert string) bool {
 		// Fail closed WITHOUT claiming a key was observed: the lone-key WARN below says
 		// the private key is still in /input, which is a positive fact this Lstat did
 		// not establish. Name the uninspectable path instead, and keep the bundle.
-		slog.Warn(recheckUnreadableMsg,
-			"path", rel, "input", cert, "key", key, "error", err,
-			"remediation", recheckUnreadableRemediation)
+		//
+		// De-duplicated per CHANGE like the lone-key WARN below, and for the same reason:
+		// reportRetainedLoneKeys reaches this arm on every scan in the default warn mode,
+		// so an unreadable /input sub-directory would otherwise re-report every candidate
+		// under it on every fsnotify event and fallback tick. Keyed on the KEY path, which
+		// no cert path can collide with, so the two reports retire independently.
+		if rp.observations.markLoneKey(key) {
+			slog.Warn(recheckUnreadableMsg,
+				"path", rel, "input", cert, "key", key, "error", err,
+				"remediation", recheckUnreadableRemediation)
+		}
 		return true
 	}
+	// The path answered this time, so the uninspectable report is retired whichever way it
+	// answered: a later failure at this name is a NEW condition to name.
+	rp.observations.clearLoneKey(key)
 	if absent {
 		// The retention this report describes no longer holds, so retire it HERE: the
 		// leftover key is gone, and a half-deleted pair at this name later is a NEW
@@ -508,10 +519,9 @@ const loneKeyRetainedMsg = "keeping an output bundle whose certificate is gone b
 // it).
 const loneKeyRemediation = "finish the change under /input: add the matching <name>.crt, or remove the leftover <name>.key so the bundle can be reaped"
 
-// recheckUnreadableMsg is the report for a confirming re-check that could not be made at
-// all: the /input path answered neither "here" nor ENOENT, which is what an unmounted,
-// unreadable or newly permission-changed input tree looks like during the confirmation
-// delay.
+// recheckUnreadableMsg is the report for an /input presence check that could not be made
+// at all: the path answered neither "here" nor ENOENT, which is what an unmounted,
+// unreadable or newly permission-changed input tree looks like.
 //
 // It is its own record rather than a reuse of the two positive ones, because those state
 // facts this failure did not establish — that the certificate came back, or that the
@@ -519,7 +529,13 @@ const loneKeyRemediation = "finish the change under /input: add the matching <na
 // never authorizes deleting key material), so the only thing at stake is whether the
 // operator can tell WHY, and the certificate arm previously said nothing at
 // LOG_LEVEL=warn while the stale bundle stayed on disk.
-const recheckUnreadableMsg = "keeping an output bundle whose /input path could not be re-checked before removal; an unreadable input tree is not proof the bundle is orphaned"
+//
+// The wording names the RETENTION and not a pending removal, because both callers share
+// it: sync's confirming re-check, where a deletion was indeed being considered, and
+// reportRetainedLoneKeys in the report-only modes, where OUTPUT_LIFECYCLE forbids one. An
+// operator diagnosing an unreadable input tree in warn or keep mode must not be told this
+// app was preparing to delete key material.
+const recheckUnreadableMsg = "keeping an output bundle because its /input path could not be inspected; an unreadable input tree is not proof the bundle is orphaned"
 
 // recheckUnreadableRemediation points at the mount rather than at the pair: nothing under
 // /input needs fixing when the tree itself cannot be inspected.

@@ -2506,6 +2506,147 @@ func TestStoreReconcile_lone_key_warn_is_deduplicated_per_change(t *testing.T) {
 	}
 }
 
+// TestStoreReconcile_uninspectable_key_warn_is_deduplicated_per_change pins the OTHER
+// retention record's schedule, which the lone-key test above does not reach: a key path
+// the confined Lstat cannot classify at all.
+//
+// The cadence matters for the same reason its sibling's does, and the condition is the
+// documented steady state rather than an exotic one: an /input sub-directory the scan
+// cannot read is health-neutral by design, its certs are skipped, and every bundle beneath
+// it therefore reads as an orphan candidate on every fsnotify event and every fallback
+// tick. Un-deduplicated, a tree with N such bundles emits N WARNs per scan for as long as
+// the misconfiguration stands.
+//
+// The key is the KEY path, not the certificate's, so this report and the lone-key report
+// retire independently — and the retirement is asserted here, because a report that is
+// never retired is indistinguishable from one that fires once and then goes silent while
+// the condition returns. Serial: it swaps waitBeforeReap and slog.Default.
+func TestStoreReconcile_uninspectable_key_warn_is_deduplicated_per_change(t *testing.T) {
+	out := t.TempDir()
+	if err := os.Mkdir(filepath.Join(out, "blocked"), 0o750); err != nil {
+		t.Fatalf("setup: Mkdir(out blocked): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "blocked", "x.pfx"), []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile(blocked/x.pfx): %v", err)
+	}
+	in := t.TempDir()
+	outside := t.TempDir()
+	link := filepath.Join(in, "blocked")
+	// The key path answers neither "here" nor ENOENT: its parent component is a symlink
+	// out of the input root, which the confined Lstat refuses. Same class as an unmounted
+	// or unreadable sub-tree, and it does not depend on the test's own UID.
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatalf("setup: Symlink: %v", err)
+	}
+	s := newOutputStore(t, out)
+	stubReapWait(t, func(context.Context) error { return nil })
+	logs := captureLogs(t)
+	// One reaper across every scan: the observation log is Scanner-lifetime state, which is
+	// what makes "once per change" expressible at all.
+	rp := newReaper(s, newInputSource(t, in), outputpolicy.LifecycleWarn)
+	rc := &reapContext{result: ScanResult{Total: 1}, walkCompleted: true}
+
+	for range 3 {
+		if _, err := rp.reconcile(context.Background(), map[string]struct{}{}, rc); err != nil {
+			t.Fatalf("reconcile(uninspectable key path) = error %v, want nil", err)
+		}
+	}
+
+	if got := logs.CountLevel(slog.LevelWarn, recheckUnreadableMsg); got != 1 {
+		t.Errorf("three scans of one unchanged uninspectable key path logged %q at WARN %d times, want"+
+			" exactly 1: the default warn mode reaches this arm on every scan: %q",
+			recheckUnreadableMsg, got, logs.Messages())
+	}
+
+	// The path answering at all is the CHANGE that retires the report: a leftover key is a
+	// different condition and gets its own record.
+	if err := os.Remove(link); err != nil {
+		t.Fatalf("setup: Remove(link): %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(in, "blocked"), 0o750); err != nil {
+		t.Fatalf("setup: Mkdir(in blocked): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(in, "blocked", "x.key"), []byte("key"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile(blocked/x.key): %v", err)
+	}
+	if _, err := rp.reconcile(context.Background(), map[string]struct{}{}, rc); err != nil {
+		t.Fatalf("reconcile(readable key path) = error %v, want nil", err)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, loneKeyRetainedMsg); got != 1 {
+		t.Errorf("a key path that became readable logged %q at WARN %d times, want 1: the two records are"+
+			" keyed apart, so neither suppresses the other: %q", loneKeyRetainedMsg, got, logs.Messages())
+	}
+
+	// And the condition returning is a NEW condition to name, not one already reported.
+	if err := os.Remove(filepath.Join(in, "blocked", "x.key")); err != nil {
+		t.Fatalf("setup: Remove(in key): %v", err)
+	}
+	if err := os.Remove(filepath.Join(in, "blocked")); err != nil {
+		t.Fatalf("setup: Remove(in dir): %v", err)
+	}
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatalf("setup: Symlink(again): %v", err)
+	}
+	if _, err := rp.reconcile(context.Background(), map[string]struct{}{}, rc); err != nil {
+		t.Fatalf("reconcile(uninspectable again) = error %v, want nil", err)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, recheckUnreadableMsg); got != 2 {
+		t.Errorf("an uninspectable key path that recurred after answering logged %q at WARN %d times,"+
+			" want 2: the report is deduplicated per change, not for the process lifetime: %q",
+			recheckUnreadableMsg, got, logs.Messages())
+	}
+}
+
+// TestStoreReconcile_names_a_certificate_recheck_it_could_not_make pins the OTHER caller of
+// the same record, on the sync path: a candidate whose CERTIFICATE re-check fails inside
+// the confirmation window must not be reported as "the certificate came back".
+//
+// That INFO states a positive fact — the producer wrote the pair back — and an operator
+// told it while the mount is broken reads a working producer where there is none. At
+// LOG_LEVEL=warn the INFO says nothing at all, so the stale bundle would sit in /output
+// with no record of why. Serial: it swaps waitBeforeReap and slog.Default.
+func TestStoreReconcile_names_a_certificate_recheck_it_could_not_make(t *testing.T) {
+	out := t.TempDir()
+	if err := os.Mkdir(filepath.Join(out, "blocked"), 0o750); err != nil {
+		t.Fatalf("setup: Mkdir(out blocked): %v", err)
+	}
+	pfx := filepath.Join(out, "blocked", "x.pfx")
+	if err := os.WriteFile(pfx, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile(blocked/x.pfx): %v", err)
+	}
+	in := t.TempDir()
+	if err := os.Symlink(t.TempDir(), filepath.Join(in, "blocked")); err != nil {
+		t.Fatalf("setup: Symlink: %v", err)
+	}
+	s := newOutputStore(t, out)
+	stubReapWait(t, func(context.Context) error { return nil })
+	logs := captureLogs(t)
+
+	deleted, err := newReaper(s, newInputSource(t, in), outputpolicy.LifecycleSync).
+		reconcile(context.Background(), map[string]struct{}{},
+			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+
+	if err != nil {
+		t.Fatalf("reconcile(uninspectable certificate path) = error %v, want nil", err)
+	}
+	if deleted != 0 {
+		t.Errorf("reconcile(uninspectable certificate path) deleted = %d, want 0: an unanswerable question"+
+			" never authorizes deleting key material", deleted)
+	}
+	if _, statErr := os.Stat(pfx); statErr != nil {
+		t.Errorf("the bundle was deleted on a re-check that could not be made: %v", statErr)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, recheckUnreadableMsg); got != 1 {
+		t.Errorf("reconcile(uninspectable certificate path) logged %q at WARN %d times, want exactly 1: %q",
+			recheckUnreadableMsg, got, logs.Messages())
+	}
+	const cameBackMsg = "keeping an output bundle whose certificate came back during the confirmation delay"
+	if got := logs.CountLevel(slog.LevelInfo, cameBackMsg); got != 0 {
+		t.Errorf("reconcile(uninspectable certificate path) logged %q at INFO %d times, want 0: a failed"+
+			" re-check is not evidence the producer wrote the pair back: %q", cameBackMsg, got, logs.Messages())
+	}
+}
+
 // TestStoreReconcile_audits_deletions_once_per_scan_at_warn pins the deletion audit
 // record, the app's warn-visible contract for the one destructive action it takes.
 //

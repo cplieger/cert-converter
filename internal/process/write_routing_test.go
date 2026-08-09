@@ -1,6 +1,7 @@
 package process
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io/fs"
@@ -363,6 +364,78 @@ func TestScannerRun_when_an_unverifiable_bundle_cannot_be_rewritten(t *testing.T
 				}
 			}
 		})
+	}
+}
+
+// TestScannerRun_when_the_output_parent_cannot_be_pinned pins the routing for the
+// /output LAYOUT this app cannot publish through: a mirrored path whose parent is a
+// symlink inside the output tree.
+//
+// It is the same class as the errno refusals above and it reaches health the same way, but
+// through a different door: the pin refusal is not an errno, so without
+// errOutputPinRefused it fell into restartCanClearWrite's clearable default and every scan
+// of a symlinked output sub-directory counted a conversion failure — the health marker
+// removed on every cycle over a layout no restart changes, which is the /input symlink
+// restart loop the healthcheck contract already rules out.
+//
+// The bundle already there is up to date, which is what makes the previous outcome plainly
+// wrong: nothing about the operator's certificates is missing or stale, and the file is
+// left exactly as it was found.
+// Runs serially: it swaps slog.Default().
+func TestScannerRun_when_the_output_parent_cannot_be_pinned(t *testing.T) {
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
+	// The pair lives one directory down, so the output path this scan publishes to is
+	// mirrored under a parent component the pin has to descend through.
+	inputSub := filepath.Join(certsRoot, "sub")
+	if err := os.Mkdir(inputSub, pfxDirMode); err != nil {
+		t.Fatalf("setup: Mkdir(input sub): %v", err)
+	}
+	writePair(t, inputSub, "chain", chainPEM, keyPEM)
+	// The real output directory, holding the bundle these very inputs produce...
+	realDir := filepath.Join(outRoot, "real")
+	if err := os.Mkdir(realDir, pfxDirMode); err != nil {
+		t.Fatalf("setup: Mkdir(out real): %v", err)
+	}
+	current, err := convert.Encode(mustAnalyse(t, chainPEM, keyPEM), convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+	pfxPath := filepath.Join(realDir, "chain.pfx")
+	if err := os.WriteFile(pfxPath, current, pfxFileMode); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	// ...and the mirrored name is a relative symlink to it: inside the root, so
+	// confinement alone permits it and only the pin refuses.
+	if err := os.Symlink("real", filepath.Join(outRoot, "sub")); err != nil {
+		t.Fatalf("setup: Symlink: %v", err)
+	}
+
+	logs := captureLogs(t)
+	res, err := New(&Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+	}).Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run(symlinked output sub-directory) = error %v, want nil: an /output layout is not a"+
+			" scan-level failure", err)
+	}
+	if res.Unwritable != 1 || res.Failed != 0 || res.Converted != 0 {
+		t.Errorf("Run(symlinked output sub-directory) = %+v, want Unwritable 1 Failed 0 Converted 0: no"+
+			" restart re-reads a different /output layout, so this must not flip health", res)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, unreplaceableBundleMsg); got != 1 {
+		t.Errorf("Run(symlinked output sub-directory) logged %q at WARN %d times, want 1: neutral is not"+
+			" silent: %q", unreplaceableBundleMsg, got, logs.Messages())
+	}
+	// The existing bundle an operator may still be serving is left exactly as found, which
+	// is what the WARN promises.
+	if got, _ := readBundle(t, pfxPath); !bytes.Equal(got, current) {
+		t.Errorf("Run(symlinked output sub-directory) left %d bytes at the output path, want the %d it"+
+			" found: a refused write must not touch the bundle in place", len(got), len(current))
 	}
 }
 

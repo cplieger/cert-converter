@@ -169,11 +169,13 @@ var writeFileInRoot = atomicfile.WriteFileInRoot
 // directory's identity, and returns a root pinned to the directory it inspected, so
 // naming only the BASENAME through it removes every ancestor from the write's path.
 //
-// A pin this app cannot obtain FAILS the write, which is a conversion failure and
-// flips health, exactly as the leaf-symlink refusal atomicfile already returns does.
-// That is the healthcheck contract's own scope — failing to write a renewed bundle is
-// a real conversion failure — and it is deliberately not the /output DIRECTORY-mode
-// question, which stays report-only.
+// A pin this app cannot obtain FAILS the write, and the failure carries
+// errOutputPinRefused so restartCanClearWrite counts it among the steady-state /output
+// conditions no restart clears: for a bundle this app could not verify the entry is
+// health-neutral (the existing file is left in place under the standing WARN), while a
+// bundle it proved stale stays a loud conversion failure, which is the healthcheck
+// contract's own scope. It is deliberately not the /output DIRECTORY-mode question,
+// which stays report-only.
 //
 // The parent directory is created first and separately, because the pin needs a
 // directory that already exists: WithMkdirMode would create it inside the write, which
@@ -192,7 +194,14 @@ func (s *store) write(ctx context.Context, rel string, pfx []byte) error {
 	}
 	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
 	if err != nil {
-		return fmt.Errorf("write pfx: pin output directory for %q: %w", rel, err)
+		// Joined with the sentinel so restartCanClearWrite can name this among the
+		// steady-state /output conditions no restart clears: a symlinked output tree is
+		// an operator layout, and a component swapped mid-descent is another writer on
+		// the volume. Neither is process state, and inspect has already classified the
+		// bundle it cannot pin as contentUnverified, so writeOutcome's state gate keeps
+		// a genuinely absent bundle (contentVerifiedStale) loud.
+		return fmt.Errorf("write pfx: pin output directory for %q: %w",
+			rel, errors.Join(err, errOutputPinRefused))
 	}
 	defer func() { _ = parent.Close() }()
 	if _, err := writeFileInRoot(ctx, parent, base, pfx,
@@ -301,9 +310,11 @@ func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
 // FILE'S OWN key-derivation iteration counts into PBKDF2, so an unbounded read
 // would let one crafted file spend arbitrary CPU on the scan's only goroutine.
 //
-// The value is convert.MaxBundleBytes, the largest bundle the codec will inspect:
-// the party whose parser allocations scale with the input states the limit, so the
-// read cap here and the preflight's own bounds cannot drift apart.
+// The value is convert.MaxBundleBytes, the size the codec's own allocation bounds are
+// sized against: the party whose parser allocations scale with the input states the
+// limit, so the read cap here and the preflight's own bounds cannot drift apart. The
+// codec no longer re-checks it — this cap and the lstat check below are the only
+// whole-bundle controls — so neither may be removed as redundant.
 const maxPFXSize = convert.MaxBundleBytes
 
 // contentState is what one prior-bundle inspection resolves:
@@ -667,6 +678,12 @@ const laxBundleMsg = "prior pfx is more permissive than policy; leaving its mode
 // writer).
 const outputPinRemediation = "mount the real output directory instead of linking to it, and check /output for paths replaced while the scan was running"
 
+// errOutputPinRefused marks a write refused because rel's parent could not be pinned to
+// the physical directory it names: a symlinked output tree, a component that is not a
+// directory, or one replaced while the descent was running. It is the /output-layout
+// sibling of the errno classes below, which is why restartCanClearWrite names it.
+var errOutputPinRefused = errors.New("output directory could not be pinned")
+
 // laxerThan reports whether perm carries a permission bit policy does not. It is the
 // WHOLE of the mode question for BOTH halves of /output — a bundle measured against
 // pfxFileMode and its ancestor directories against pfxDirMode: set means the mode is
@@ -735,6 +752,8 @@ func isPermissionRefusal(err error) bool {
 //
 //   - EACCES / EPERM (isPermissionRefusal): a UID does not gain a permission by
 //     restarting. Only a chown or a chmod on /output clears it.
+//   - a pin this app cannot obtain (errOutputPinRefused): a symlinked output tree or a
+//     component another writer replaced; a restart re-reads the same layout.
 //   - EROFS: a read-only mount is a mount option, not process state.
 //   - ENOSPC / EDQUOT: a full volume or an exhausted quota. A restarted container writes
 //     the same bytes into the same full volume.
@@ -745,6 +764,8 @@ func isPermissionRefusal(err error) bool {
 func restartCanClearWrite(err error) bool {
 	switch {
 	case isPermissionRefusal(err):
+		return false
+	case errors.Is(err, errOutputPinRefused):
 		return false
 	case errors.Is(err, syscall.EROFS), errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT):
 		return false

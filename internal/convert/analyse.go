@@ -652,13 +652,6 @@ type certGraph struct {
 	// chain whose selected intermediate did not verify under the root beside it,
 	// while the fully proven alternative sat in the same input.
 	provenDistToRoot []int
-	// proofChecks counts the signature verifications proven actually paid for.
-	// Nothing in production reads it: the lazy cost model above is otherwise
-	// unobservable, and an eager regression there is a performance defect no
-	// assertion about Analyse's result can catch. Self-signature checks are not
-	// counted — those are per certificate, one each, bounded by selfSigned. It sits
-	// last because it is the struct's only non-pointer word (govet fieldalignment).
-	proofChecks int
 }
 
 // nameLinkage says how a child's issuer name relates to a candidate parent's subject
@@ -724,8 +717,9 @@ func (e issuanceEvidence) nameOrKeyIDLink() bool {
 }
 
 // linked reports whether anything in this bundle ties the two certificates together
-// at all. It is the gate on the expensive fact: a pair with no name and no key-id
-// relationship has nothing for a signature to confirm, so proven never verifies one.
+// at all. It is the gate on the expensive fact, applied by candidateEdge: a pair with
+// no name and no key-id relationship has nothing for a signature to confirm, so no
+// candidate edge is built for one and proven is never asked about it.
 func (e issuanceEvidence) linked() bool {
 	return !e.keyReuse && e.nameOrKeyIDLink()
 }
@@ -1057,8 +1051,13 @@ func (g *certGraph) unverifiableIssuerRival(child int) error {
 // candidateEdge refuses an unlinked pair before it asks, and it is the only builder
 // of the candidate parents, children and paths every other caller selects from, so
 // every production caller supplies a candidate edge and a file-controlled modexp can
-// never be spent on a pair nothing ties together. A parent key above either
-// verification ceiling IS refused here, which is the cost the ceilings exist to
+// never be spent on a pair nothing ties together. That is a PRECONDITION here, and it
+// carries two cases this method no longer checks for itself: a candidate edge is never
+// a key-reuse pair (issuanceEvidence.linked excludes those) and never a self-pair
+// (edge(i, i) is the zero value, and candidateParents/children omit the node itself),
+// so proven(i, i) would verify a certificate against its own key and answer true. A new
+// caller that does not select from the candidate sets breaks both. A parent key above
+// either verification ceiling IS refused here, which is the cost the ceilings exist to
 // refuse. No refusal elsewhere makes that branch unreachable: candidateEdge and
 // computeDistances ask it while the graph is being BUILT, and oversizedIssuerError runs
 // later still (analyseAt, after identity selection) and refuses only a bundle whose
@@ -1079,7 +1078,6 @@ func (g *certGraph) proven(child, parent int) bool {
 			// negative rather than a missing one.
 			return false
 		}
-		g.proofChecks++
 		got = p.CheckSignature(c.SignatureAlgorithm, c.RawTBSCertificate, c.Signature) == nil
 	}
 	g.proof[key] = got

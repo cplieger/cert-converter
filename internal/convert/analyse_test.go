@@ -965,3 +965,38 @@ func TestAnalyse_names_the_skipped_certificate_file_blocks_when_nothing_matches(
 		t.Errorf("Analyse error = %q, want no skipped-block clause for a certificate file that held nothing else", err.Error())
 	}
 }
+
+// TestAnalyse_names_the_skipped_certificate_file_blocks_when_the_key_will_not_parse
+// pins the fold prepareAnalysisInput applies BEFORE analysisInput exists. On this path
+// neither ObsUnrelatedBlocksSkipped nor noMatchError's clause can report the omitted
+// block, so this sentence is the only signal, and dropping the fold otherwise keeps
+// the whole suite green.
+func TestAnalyse_names_the_skipped_certificate_file_blocks_when_the_key_will_not_parse(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	relabelled := concatPEM(m.LeafPEM, relabelPEM(t, m.CAPEM, "TRUSTED CERTIFICATE"))
+
+	_, err := convert.Analyse(t.Context(), relabelled, []byte("this is not a PEM file"))
+	if err == nil {
+		t.Fatal("Analyse(relabelled CA link + unparseable key) = nil error, want a refusal")
+	}
+	got := err.Error()
+	if !strings.HasPrefix(got, "parse private key: ") {
+		t.Errorf("Analyse error = %q, want the key-parse sentence kept as the prefix so existing log matching is unaffected", got)
+	}
+	for _, want := range []string{"the certificate file also holds 1 block(s)", `"TRUSTED CERTIFICATE"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Analyse error = %q, want it to contain %q: the operator must not have to repair the key before hearing that a certificate-shaped block was left out too", got, want)
+		}
+	}
+
+	// A clean certificate file adds no clause, so the assertion above cannot pass on a
+	// suffix that is appended unconditionally.
+	_, err = convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), []byte("this is not a PEM file"))
+	if err == nil {
+		t.Fatal("Analyse(clean bundle + unparseable key) = nil error, want a refusal")
+	}
+	if strings.Contains(err.Error(), "the certificate file also holds") {
+		t.Errorf("Analyse error = %q, want no skipped-block clause for a certificate file that held nothing else", err.Error())
+	}
+}
