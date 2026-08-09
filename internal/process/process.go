@@ -184,6 +184,13 @@ const scanBudgetRemediation = "check that /input is mounted at the certificate d
 // signal; this line only stops it from also raising the wrong one.
 const scanBudgetSummaryMsg = "scan stopped at the /input entry budget"
 
+// budgetTruncatedCoverage marks a coverage count that came from a scan the entry budget
+// stopped early: the number is what this scan REACHED, not what the tree holds. It is an
+// added ATTRIBUTE rather than a reworded message, because the README publishes those
+// message substrings as Loki matchers (CertConverterInputPathUnreachable keys on the
+// unreadable line), so a record's fields may grow while its wording may not.
+const budgetTruncatedCoverage = "partial: the scan stopped at the /input entry budget, so this counts only the paths it reached"
+
 // Options carries the process-lifetime scan configuration the composition root
 // chooses once at startup: the confined input and output roots, the password
 // embedded in generated PFX files, and the PKCS#12 encoder profile. The encoder
@@ -614,29 +621,50 @@ func logScanOutcome(ctx context.Context, result *ScanResult, walkErr error) {
 // Every message is gated by the evidence THAT message needs, which is the rule this
 // function is organised around rather than a per-arm exception:
 //
-//   - A completed walk (walkErr == nil) is the floor for all of them: an aborted scan
-//     observed an arbitrary prefix of the tree and can claim nothing.
-//   - The unreadable aggregate needs only that floor — it IS the diagnosis for an
-//     incomplete enumeration, so gating it on a complete one would silence it exactly
-//     when it applies. It is also the same condition the composition root applied by
-//     returning early on a scan error.
+//   - A walk that stopped for an ARBITRARY reason claims nothing: it observed a prefix
+//     of the tree chosen by whatever failed, and a shutdown-cancelled walk stopped at an
+//     instant unrelated to the tree's contents. Both stay silent here.
+//   - The ENTRY-BUDGET stop is the exception, and it is a typed one
+//     (errScanBudgetExceeded): the scan stopped because the tree is larger than the
+//     budget, having read every path it visited normally. Its per-path counts are
+//     therefore observations, not casualties of the stop, and they are the counts the
+//     operator most needs — the budget WARN says the tree is too large, and without
+//     these the same operator is not told that specific certificates in the part that
+//     WAS read were unreadable or missing their key. They carry the coverage attribute
+//     so the number reads as "what this scan reached" rather than as a whole-tree total.
 //   - The WHOLE-TREE arms ("no certificate pair at all", "every certificate lacks its
-//     key") need a complete enumeration: no unreadable path, no unresolved symlink,
-//     nothing that vanished mid-scan. Run deliberately continues past an unreadable
-//     sub-path, so a partial enumeration cannot know what lies beneath it, and a cert
-//     (or the key pairing with one) replaced during the walk was not observed whole.
-//     Neither "no pair exists" nor "every certificate" is a claim such a scan can make.
-//   - The PER-PATH arm ("some certificates are missing their sibling .key") needs only
-//     its own count, because that count is proven path by path: the sibling is stat-ed
-//     directly through the confined root and only ENOENT becomes statusOrphan. A hole
-//     elsewhere in the tree cannot make an observed missing key unobserved.
+//     key") need a complete enumeration: a completed walk with no unreadable path, no
+//     unresolved symlink, nothing that vanished mid-scan. Run deliberately continues past
+//     an unreadable sub-path, so a partial enumeration cannot know what lies beneath it,
+//     and a cert (or the key pairing with one) replaced during the walk was not observed
+//     whole. Neither "no pair exists" nor "every certificate" is a claim such a scan can
+//     make — least of all one the budget truncated, which is precisely a scan that did
+//     not see the whole tree.
+//   - The PER-PATH arms (unreadable paths, "some certificates are missing their sibling
+//     .key") need only their own counts, because those are proven path by path: an
+//     unreadable path was refused when this scan touched it, and a sibling key is stat-ed
+//     directly through the confined root with only ENOENT becoming statusOrphan. A hole
+//     elsewhere in the tree — or a budget stop further along it — cannot make an observed
+//     missing key unobserved.
 //
 // Orphan REAPING keeps the full whole-tree gate (reapContext.enumerationClean): a
 // deletion rests on the claim that no input for a bundle exists ANYWHERE in the tree,
 // which is a whole-tree claim, unlike naming the orphans this scan actually saw.
 func logInputCoverageWarnings(result *ScanResult, walkErr error) {
-	if walkErr != nil {
+	// A typed stop reason, not a string match: errScanBudgetExceeded already exists as
+	// its own sentinel precisely so the budget stop can be told from an unreadable root
+	// or a cancellation, and Run wraps it with the entry count rather than replacing it.
+	budgetStopped := errors.Is(walkErr, errScanBudgetExceeded)
+	if walkErr != nil && !budgetStopped {
 		return
+	}
+	// Extra attribute for the truncated case only, appended to the per-path arms. The
+	// MESSAGES are untouched: the README publishes their substrings as Loki matchers
+	// (CertConverterInputPathUnreachable keys on the unreadable line), so the wording is
+	// a contract and only a record's fields may grow.
+	var observed []any
+	if budgetStopped {
+		observed = []any{"coverage", budgetTruncatedCoverage}
 	}
 	if result.Unreadable > 0 {
 		// Message byte-identical to the one the composition root emitted: README's
@@ -645,24 +673,30 @@ func logInputCoverageWarnings(result *ScanResult, walkErr error) {
 		// Health is deliberately unaffected (see main.healthyAfterScan): nothing the
 		// scan merely could not READ is clearable by a restart.
 		slog.Warn("some /input paths were unreadable and were skipped; health is unaffected",
-			"unreadable", result.Unreadable,
-			// inputPermRemediation, not a permission-only hint of its own: the count
-			// aggregates every unreadable shape this package classifies, and only some
-			// of them are permission problems. A directory occupying a <name>.crt path
-			// is a LAYOUT mistake whose per-path Debug line names the right action, so
-			// an aggregate that said only "fix /input permissions or run as a UID that
-			// can read it" sent the operator to re-check permissions that were already
-			// correct. Sharing the package's one /input-side hint keeps the aggregate
-			// and the per-path lines from prescribing two different actions for one
-			// condition.
-			"remediation", inputPermRemediation)
+			append([]any{
+				"unreadable", result.Unreadable,
+				// inputPermRemediation, not a permission-only hint of its own: the count
+				// aggregates every unreadable shape this package classifies, and only some
+				// of them are permission problems. A directory occupying a <name>.crt path
+				// is a LAYOUT mistake whose per-path Debug line names the right action, so
+				// an aggregate that said only "fix /input permissions or run as a UID that
+				// can read it" sent the operator to re-check permissions that were already
+				// correct. Sharing the package's one /input-side hint keeps the aggregate
+				// and the per-path lines from prescribing two different actions for one
+				// condition.
+				"remediation", inputPermRemediation,
+			}, observed...)...)
 	}
 	// Each arm is gated by the evidence IT needs, which is the rule here rather than an
 	// exception: a claim about the WHOLE TREE ("no pair at all", "every certificate")
 	// needs a complete enumeration, while a claim about the PATHS THIS SCAN READ needs
 	// only those paths. Folding the second kind behind the whole-tree gate silenced a
 	// proven fact because of an unrelated hole elsewhere in the tree.
-	fullyEnumerated := result.inputFullyEnumerated()
+	//
+	// walkErr == nil is part of the whole-tree gate rather than of the function's own
+	// entry condition: a budget-truncated scan reaches the arms below, and it is exactly
+	// a scan that cannot speak for the whole tree.
+	fullyEnumerated := walkErr == nil && result.inputFullyEnumerated()
 	switch {
 	case fullyEnumerated && result.Total == 0:
 		// A completed scan that visited no .crt at all is indistinguishable from
@@ -703,8 +737,10 @@ func logInputCoverageWarnings(result *ScanResult, walkErr error) {
 		// stale, with nothing naming it. The per-cert path stays Debug; this is the
 		// once-per-scan aggregate.
 		slog.Warn("some certificates under the input root are missing their sibling .key; those produce no PFX and any existing bundle for them goes stale",
-			"orphan", result.Orphan, "total", result.Total,
-			"remediation", "name each private key <name>.key beside its <name>.crt (Caddy's layout), or remove the certificate from /input")
+			append([]any{
+				"orphan", result.Orphan, "total", result.Total,
+				"remediation", "name each private key <name>.key beside its <name>.crt (Caddy's layout), or remove the certificate from /input",
+			}, observed...)...)
 	}
 }
 
@@ -1366,13 +1402,13 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 }
 
 // writeOutcome derives one entry's conversionStatus, and it is the ONLY place that
-// derivation happens. Its inputs are the three facts this scan resolved independently:
-// what this app learned about the bundle already on disk (state.content), whether its
-// mode was laxer than policy (state.modeLax, the one non-content reason a matching bundle
-// is rewritten at all), and — when the write failed — whether a restart could clear that
-// failure (restartCanClearWrite). Deriving it once, after the write, is what replaced
-// threading a staleness cause into the failure handler: each fact now arrives unmodified,
-// so a fix to one of them cannot overwrite another on the way here.
+// derivation happens. Its inputs are the two facts this scan resolved independently:
+// what this app learned about the bundle already on disk (state.content), and — when the
+// write failed — whether a restart could clear that failure (restartCanClearWrite). The
+// bundle's MODE is not one of them: a lax mode is reported and acted on nowhere, so it can
+// neither schedule a write nor reach health. Deriving the status once, after the write, is
+// what replaced threading a staleness cause into the failure handler: each fact arrives
+// unmodified, so a fix to one of them cannot overwrite another on the way here.
 //
 // The default is unchanged and stays the loud one: a PFX this app could not write is a
 // conversion failure, counted in ScanResult.Failed, and health goes unhealthy — right,
@@ -1404,32 +1440,17 @@ func writeOutcome(state bundleState, writeErr error) conversionStatus {
 	}
 }
 
-// unwritableBundleMsg is the standing WARN for the health-neutral /output shape whose
-// rewrite carried no new bytes: a prior bundle whose bytes were COMPARED and MATCHED,
-// whose mode is laxer than policy, and whose mode-correcting rewrite the volume refused
-// for a permission reason. It promises exactly that — the bytes on disk are the right
-// bytes and only the permission bits are wrong — which is why it is its own message
-// rather than a variant of the general refusal below.
+// unreplaceableBundleMsg is the standing WARN for a health-neutral write refusal: a prior
+// bundle this app could not VERIFY at all (above the readable bound, unreadable,
+// un-stat-able, or refused by the codec's preflight) whose replacing write a steady-state
+// /output condition refused.
 //
-// It no longer names a chmod, because there is none: this app corrects a lax mode only by
-// rewriting the bundle, so a refused rewrite IS the whole failure to report rather than
-// the second of two attempts. Every OTHER health-neutral write refusal — one over content
-// this app could not verify, or one refused by the volume rather than by ownership —
-// carries unreplaceableBundleMsg instead, because widening this text would quietly widen
-// what it promises about the operator's bytes.
-const unwritableBundleMsg = "prior pfx is more permissive than policy and the rewrite that would correct its mode was not permitted; leaving the existing bundle in place, health is unaffected"
-
-// unreplaceableBundleMsg is the standing WARN for every other health-neutral write
-// refusal: a prior bundle this app could not VERIFY at all (above the readable bound,
-// unreadable, un-stat-able, or refused by the codec's preflight) whose replacing write was
-// refused by a steady-state /output condition, and the mode-repair shape above when that
-// refusal is not a permission denial (a full or read-only volume).
-//
-// A separate message rather than a widened unwritableBundleMsg because that one promises
-// the bytes on disk were compared and matched, which is precisely what this one cannot
-// promise. The record carries a `content` attribute naming which fact the app actually
-// had, so an operator reading this line knows whether the bundle left in place was
-// verified or merely unexamined.
+// It is now the ONLY such message. The second one described a rewrite that carried no new
+// bytes because only the mode was wrong, and no such rewrite happens any more: a lax mode
+// is reported and never written over, so the refusal it named cannot arise. It promises
+// nothing about the bytes on disk, deliberately, because nothing compared them. The record
+// carries a `content` attribute naming which fact the app actually had, so an operator
+// reading this line knows what the bundle left in place was.
 const unreplaceableBundleMsg = "prior pfx could not be replaced and the /output condition that refused the write is not one a restart clears; leaving the existing bundle in place, health is unaffected"
 
 // outputVolumeRemediation is the remediation for a write the VOLUME refused rather than
@@ -1448,10 +1469,9 @@ const outputVolumeRemediation = "check /output for free space, a quota and a rea
 // per scan: there is no retry loop behind it.
 func reportWriteFailure(logRel, pfxRel string, state bundleState, err error, outcome conversionStatus) {
 	if outcome == statusUnwritable {
-		msg, remediation := unwritableReport(state, err)
-		slog.Warn(msg,
+		slog.Warn(unreplaceableBundleMsg,
 			"path", logRel, "output_path", pfxRel, "error", err,
-			"content", state.content.String(), "remediation", remediation)
+			"content", state.content.String(), "remediation", unwritableRemediation(err))
 		return
 	}
 	// failEntry is called for its LOG: the statusFailed it returns is the same value
@@ -1463,21 +1483,15 @@ func reportWriteFailure(logRel, pfxRel string, state bundleState, err error, out
 			"and that no symlink is planted at the output path")
 }
 
-// unwritableReport picks the standing WARN for a health-neutral write refusal: which
-// message can honestly describe the bundle being left in place, and which operator action
-// clears the refusal. Two axes, because they are two different questions for the operator
-// — what is on disk, and what refused the replacement — and neither answer implies the
-// other.
-func unwritableReport(state bundleState, err error) (msg, remediation string) {
+// unwritableRemediation names the operator action that clears a health-neutral write
+// refusal. One axis rather than the two this used to pick over: with only one standing
+// message left, what remains is WHAT REFUSED the replacement — ownership, or the volume —
+// and an operator sent after the wrong cause reads the WARN as noise.
+func unwritableRemediation(err error) string {
 	if isPermissionRefusal(err) {
-		remediation = outputPermRemediation
-	} else {
-		remediation = outputVolumeRemediation
+		return outputPermRemediation
 	}
-	if state.modeRepairOnly() && isPermissionRefusal(err) {
-		return unwritableBundleMsg, remediation
-	}
-	return unreplaceableBundleMsg, remediation
+	return outputVolumeRemediation
 }
 
 // logConversionObservations surfaces Analyse's non-fatal findings about a pair's

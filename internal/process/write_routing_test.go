@@ -15,10 +15,10 @@ import (
 	"github.com/cplieger/cert-converter/internal/testcerts"
 )
 
-// TestWriteOutcome_derives_the_status_from_three_independent_facts pins the single place
+// TestWriteOutcome_derives_the_status_from_two_independent_facts pins the single place
 // an entry's outcome is decided, across every combination of the facts it reads.
 //
-// The routing exists in this shape because the previous one carried the three facts
+// The routing exists in this shape because the previous one carried the facts
 // through ONE value: the content comparison, the refused mode repair and the
 // restart-clearability of the write all had to fit in a staleness cause, and every arm
 // that could not verify the content overwrote it. That is what made the health-neutral
@@ -35,10 +35,11 @@ import (
 //   - The clearability question is asked of the ERROR, not of the reason for the rewrite,
 //     so the same errno routes the same way under both facts that grant neutrality.
 //
-// contentUnresolved is here as the zero value: the derivation is spelled as an allowlist,
-// so a fact it does not know takes the loud direction rather than silently inheriting
-// neutrality.
-func TestWriteOutcome_derives_the_status_from_three_independent_facts(t *testing.T) {
+// The bundle's MODE is deliberately absent from every case: it decides nothing here, and
+// listing it would imply otherwise. contentUnresolved is here as the zero value: the
+// derivation is spelled as an allowlist, so a fact it does not know takes the loud
+// direction rather than silently inheriting neutrality.
+func TestWriteOutcome_derives_the_status_from_two_independent_facts(t *testing.T) {
 	t.Parallel()
 	refused := &fs.PathError{Op: "openat", Path: "chain.pfx", Err: syscall.EACCES}
 	full := &fs.PathError{Op: "renameat", Path: "chain.pfx", Err: syscall.ENOSPC}
@@ -54,12 +55,12 @@ func TestWriteOutcome_derives_the_status_from_three_independent_facts(t *testing
 		"a write that landed over an unverifiable prior is a conversion too": {
 			state: bundleState{content: contentUnverified}, writeErr: nil, want: statusConverted,
 		},
-		"a mode-only rewrite refused for permissions is health-neutral": {
-			state:    bundleState{content: contentVerifiedCurrent, modeLax: true},
+		"a content-matched prior whose rewrite is refused for permissions is health-neutral": {
+			state:    bundleState{content: contentVerifiedCurrent},
 			writeErr: refused, want: statusUnwritable,
 		},
-		"a mode-only rewrite refused by a full volume is health-neutral too": {
-			state:    bundleState{content: contentVerifiedCurrent, modeLax: true},
+		"a content-matched prior whose rewrite a full volume refuses is health-neutral too": {
+			state:    bundleState{content: contentVerifiedCurrent},
 			writeErr: full, want: statusUnwritable,
 		},
 		"an unverifiable prior whose rewrite is refused for permissions is health-neutral": {
@@ -71,8 +72,8 @@ func TestWriteOutcome_derives_the_status_from_three_independent_facts(t *testing
 		"an unverifiable prior whose rewrite fails for an unattributable reason fails": {
 			state: bundleState{content: contentUnverified}, writeErr: brokenIO, want: statusFailed,
 		},
-		"a mode-only rewrite that fails for an unattributable reason fails": {
-			state:    bundleState{content: contentVerifiedCurrent, modeLax: true},
+		"a content-matched prior whose rewrite fails for an unattributable reason fails": {
+			state:    bundleState{content: contentVerifiedCurrent},
 			writeErr: brokenIO, want: statusFailed,
 		},
 		"a stale bundle whose rewrite is refused for permissions is still a failure": {
@@ -179,10 +180,6 @@ func TestStoreInspect_reports_content_it_could_not_verify(t *testing.T) {
 				t.Error("inspect(unverifiable prior).upToDate() = true, want false: a bundle this app cannot" +
 					" verify must still be rewritten")
 			}
-			if state.modeRepairOnly() {
-				t.Error("inspect(unverifiable prior).modeRepairOnly() = true, want false: that promise belongs" +
-					" only to content that was compared and matched")
-			}
 		})
 	}
 }
@@ -274,8 +271,6 @@ func TestScannerRun_when_an_unverifiable_bundle_cannot_be_rewritten(t *testing.T
 	// keys on these words, so a silent rename must fail here.
 	const unreplaceableMsg = "prior pfx could not be replaced and the /output condition that refused the write is" +
 		" not one a restart clears; leaving the existing bundle in place, health is unaffected"
-	const unwritableMsg = "prior pfx is more permissive than policy and neither the mode repair nor the replacing" +
-		" write was permitted; leaving the existing bundle in place, health is unaffected"
 	const failedMsg = "conversion failed"
 	for name, tc := range map[string]struct {
 		writeErr        error
@@ -334,17 +329,11 @@ func TestScannerRun_when_an_unverifiable_bundle_cannot_be_rewritten(t *testing.T
 				t.Errorf("Run(unverifiable prior, refused rewrite) = %+v, want Unwritable %d Failed %d Converted 0",
 					res, tc.wantUnwritable, tc.wantFailed)
 			}
-			// The message is asserted by NAME: the health-neutral outcome over content nobody
-			// read must NOT borrow unwritableBundleMsg, whose text promises the bytes on disk
-			// were compared and matched and which the README's alerting section keys on.
-			for msg, want := range map[string]int{
-				unreplaceableMsg: boolCount(tc.wantUnwritable > 0),
-				unwritableMsg:    0,
-			} {
-				if got := logs.CountLevel(slog.LevelWarn, msg); got != want {
-					t.Errorf("Run(unverifiable prior, refused rewrite) logged %q at WARN %d times, want %d: %q",
-						msg, got, want, logs.Messages())
-				}
+			// The message is asserted by NAME: it is the only standing health-neutral WARN
+			// left, and an operator's log query keys on its words.
+			if got := logs.CountLevel(slog.LevelWarn, unreplaceableMsg); got != boolCount(tc.wantUnwritable > 0) {
+				t.Errorf("Run(unverifiable prior, refused rewrite) logged %q at WARN %d times, want %d: %q",
+					unreplaceableMsg, got, boolCount(tc.wantUnwritable > 0), logs.Messages())
 			}
 			if got := logs.CountLevel(slog.LevelError, failedMsg); got != boolCount(tc.wantFailed > 0) {
 				t.Errorf("Run(unverifiable prior, refused rewrite) logged %q at ERROR %d times, want %d: %q",
@@ -439,11 +428,10 @@ func TestScannerRun_a_genuine_conversion_failure_still_flips_health(t *testing.T
 				t.Errorf("Run(unconvertible pair) logged %q at ERROR %d times, want exactly 1: %q",
 					"conversion failed", got, logs.Messages())
 			}
-			for _, msg := range []string{unwritableBundleMsg, unreplaceableMsg} {
-				if got := logs.CountLevel(slog.LevelWarn, msg); got != 0 {
-					t.Errorf("Run(unconvertible pair) logged %q at WARN %d times, want 0: the health-neutral WARNs"+
-						" describe a bundle on disk, and this failure never got that far: %q", msg, got, logs.Messages())
-				}
+			if got := logs.CountLevel(slog.LevelWarn, unreplaceableMsg); got != 0 {
+				t.Errorf("Run(unconvertible pair) logged %q at WARN %d times, want 0: the health-neutral WARN"+
+					" describes a bundle on disk, and this failure never got that far: %q",
+					unreplaceableMsg, got, logs.Messages())
 			}
 		})
 	}

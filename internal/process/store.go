@@ -26,12 +26,14 @@ import (
 // job, not an exact target: a mode the operator made STRICTER (0400) carries no bit
 // beyond it and is left alone, which is what laxerThanPolicy tests.
 //
-// A prior bundle laxer than it is never chmodded in place. It is reported
-// (laxBundleMsg) and then corrected as a side effect of the ordinary atomic rewrite
-// this app already performs, which installs a fresh inode at this mode by construction
-// (store.write's atomicfile.WithMode). So the mode a bundle HAS does reach the currency
-// decision — bundleState.modeLax routes it to that rewrite — but nothing here ever
-// mutates a mode on the operator's volume.
+// A prior bundle laxer than it is REPORTED (laxBundleMsg) and otherwise left exactly as
+// found: no chmod, and no write either. The mode a bundle HAS never reaches the currency
+// decision — currency is a question about content alone — so a bundle whose bytes are
+// already right is skipped however lax its mode, and the mode is corrected only when the
+// bundle is next written for its OWN reasons (a renewal, or content this app could not
+// verify), where the atomic replacement lands a fresh inode at this mode for free
+// (store.write's atomicfile.WithMode). A bundle whose certificate never renews therefore
+// keeps the mode the operator left it with.
 const (
 	pfxFileMode = 0o600
 	pfxDirMode  = 0o750
@@ -363,39 +365,28 @@ func (c contentState) String() string {
 
 // bundleState is what one inspection of the output path resolved, as two INDEPENDENT
 // facts rather than one verdict: what this app knows about the bytes on disk
-// (contentState) and whether the mode on disk is laxer than policy (modeLax). Neither
-// says what should happen next — convertEntry derives that once, after the write, from
-// these two facts plus the write's own outcome (writeOutcome).
+// (contentState) and whether the mode on disk is laxer than policy (modeLax). Only the
+// first one routes anything — convertEntry derives the entry's outcome from it plus the
+// write's own result (writeOutcome); the second is a fact for the operator's log.
 //
 // Cheap to pass by value, and nothing here is mutated after inspect returns.
 type bundleState struct {
 	content contentState
-	// modeLax is the whole of what a permission bit contributes to the decision: the
-	// bundle on disk carries a bit pfxFileMode does not. It replaced a four-valued
-	// mode-repair outcome, because with no chmod there is no repair to have converged,
-	// failed, or been refused — only a mode that needs rewriting or does not.
+	// modeLax records that the bundle on disk carries a bit pfxFileMode does not. It is
+	// REPORTED (reportLaxBundle's WARN) and acts on nothing: it does not make the bundle
+	// out of date, it schedules no write, and it never reaches health. A permission bit
+	// the operator left on their own volume is their choice
+	// (output-dir-write-bit-enforcement, extended to files), and a mode-driven rewrite
+	// could not converge anyway on a mount that forces or ignores permission bits.
 	modeLax bool
 }
 
 // upToDate reports whether the output path needs no write at all: the bytes on disk are
-// already the bundle these inputs produce AND its mode is not laxer than policy. A lax
-// mode is the one non-content reason to rewrite, because the rewrite is the ONLY way
-// this app corrects a mode: store.write installs pfxFileMode on a fresh inode, so
-// routing a lax bundle through the ordinary write path is what fixes it. Skipping the
-// write on content alone would leave a private-key bundle permanently over-permissive.
+// already the bundle these inputs produce. Currency is a question about CONTENT and
+// nothing else — a lax mode is reported and left alone, because this app never writes a
+// bundle in order to change its permissions (see modeLax).
 func (st bundleState) upToDate() bool {
-	return st.content == contentVerifiedCurrent && !st.modeLax
-}
-
-// modeRepairOnly reports the one shape whose rewrite carries no new bytes: the content
-// was compared and matched, and only the mode is laxer than policy. It survives the
-// removal of the chmod mechanism because it still names the distinction health turns on
-// — a rewrite that carries no new bytes and fails leaves the operator exactly the bundle
-// they already had, so it must not flip health, while a failed write of a RENEWED bundle
-// must. It is DERIVED from the two facts rather than remembered by whoever noticed the
-// lax mode first, which is the whole reason they are separate.
-func (st bundleState) modeRepairOnly() bool {
-	return st.content == contentVerifiedCurrent && st.modeLax
+	return st.content == contentVerifiedCurrent
 }
 
 // bundleNotProvenWrong reports whether a failed rewrite leaves the operator with a
@@ -403,6 +394,11 @@ func (st bundleState) modeRepairOnly() bool {
 // not read at all. Spelled as an ALLOWLIST of exactly those two facts, so the zero value
 // and any fact added later take the loud direction — a conversion failure — by
 // construction rather than by omission.
+//
+// The contentVerifiedCurrent arm is defensive rather than live: currency is decided on
+// content alone, so a matching bundle is skipped and never reaches a write. It stays in
+// the allowlist because the statement is true of the FACT independently of what routes
+// there, and narrowing it would make a future non-content write reason silently loud.
 func (st bundleState) bundleNotProvenWrong() bool {
 	return st.content == contentVerifiedCurrent || st.content == contentUnverified
 }
@@ -432,15 +428,14 @@ func (st bundleState) bundleNotProvenWrong() bool {
 // a hard error: it is neither current nor stale, and treating it as stale would rewrite
 // every in-flight pair on the way out.
 //
-// Permission bits never reach the content fact, and are never acted on in place. A
-// bundle laxer than pfxFileMode is REPORTED (laxBundleMsg) and recorded as the second
-// fact; its content is compared as usual. Correcting it is the ordinary write path's job
-// and nothing else's: bundleState.upToDate turns the lax mode into a rewrite, store.write
-// installs pfxFileMode on the fresh inode, and bundleState.modeRepairOnly is what lets
-// the caller say afterwards that this rewrite carried no new bytes. No chmod is
-// attempted, which is the settled shape for both halves of /output — the app warns about
-// a mode it would not have chosen and changes nothing about what is already there
-// (output-dir-write-bit-enforcement, extended to files).
+// Permission bits never reach the content fact, and are never acted on at all. A bundle
+// laxer than pfxFileMode is REPORTED (laxBundleMsg) and recorded as the second fact; its
+// content is compared as usual, and the mode changes nothing about what happens next. No
+// chmod is attempted and no write is scheduled, which is the settled shape for both
+// halves of /output — the app warns about a mode it would not have chosen and changes
+// nothing about what is already there (output-dir-write-bit-enforcement, extended to
+// files). When the bundle is next written for a CONTENT reason, that write's fresh inode
+// carries pfxFileMode.
 func (s *store) inspect(ctx context.Context, rel string, want *convert.Analysis,
 	wantEncoder convert.EncoderType, password string,
 ) (bundleState, error) {
@@ -606,29 +601,28 @@ func contentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 }
 
 // laxBundleMsg is the standing WARN for a prior bundle carrying a permission bit
-// pfxFileMode does not. It names the mode found and the mode this app will install, and
-// it promises nothing else: no chmod is attempted, so there is no repair outcome to
-// report and no operator action to request. The lax mode is corrected as a side effect
-// of the ordinary atomic rewrite the app already performs on this bundle
-// (bundleState.upToDate routes it there), which installs a fresh inode at pfxFileMode
-// by construction — so on a filesystem that stores that mode this fires once and never
-// again, and the operator is told what happened rather than asked to do it. On a mount
-// that forces or ignores permission bits (CIFS/SMB forced mode, NFS squash, vfat fmask)
-// the rewrite succeeds and the stored mode stays lax, so the next scan re-detects the
-// bundle it just wrote and the WARN and the rewrite recur once per scan.
+// pfxFileMode does not. It names the mode found and the mode this app installs on a
+// bundle it writes, and it promises nothing else: the mode on disk is left exactly as
+// found. Nothing is chmodded and no write is triggered, so the condition persists — and
+// the WARN recurs once per scan — until either the operator tightens the mode or the
+// bundle is next written for a CONTENT reason, whose fresh inode carries pfxFileMode.
 //
-// The report-only tone is laxDirMsg's, and deliberately: one principle now covers both
-// halves of /output. For a DIRECTORY the app warns and does nothing
-// (output-dir-write-bit-enforcement); for a FILE it warns and lets its own write path
-// install the mode it wants. Neither half mutates a mode in place, which is the
-// ecosystem consensus — OpenSSH refuses an over-permissive key without chmodding it,
-// certbot warns and requires the operator to act, and certbot's own renewal applies its
-// restrictive mode to the NEW file it writes rather than to the old one.
+// The report-only tone is laxDirMsg's, and deliberately: one principle covers both halves
+// of /output — the app warns about a mode it would not have chosen and changes nothing
+// about what is already there. That is also the ecosystem consensus. OpenSSH refuses an
+// over-permissive private key and never chmods it; certbot warns about an over-permissive
+// credentials file and makes the operator act; certbot's own key RENEWAL applies its
+// restrictive mode to the NEW file it was writing anyway, and never rewrites an unchanged
+// certificate to correct a mode; lego sets no modes at all. Rewriting a bundle in order to
+// correct its mode is what none of them do, and it cannot converge on a mount that forces
+// or ignores permission bits (CIFS/SMB forced mode, NFS squash, vfat fmask): the
+// replacement lands with the same lax mode, so every scan would re-detect the bundle the
+// previous scan wrote, with fresh KDF salts and a fresh mtime re-triggering downstream
+// replication every cycle.
 //
-// Carries no remediation: unlike every other /output WARN, nothing is being asked of the
-// operator. If the correcting rewrite is then REFUSED, that standing condition gets its
-// own WARN with the right remediation (unwritableBundleMsg via unwritableReport).
-const laxBundleMsg = "prior pfx is more permissive than policy; rewriting it at the wanted mode"
+// Carries no remediation attribute: the mode found and the mode wanted are the whole of
+// the operator's decision, and this app has no action of its own to report or request.
+const laxBundleMsg = "prior pfx is more permissive than policy; leaving its mode as found"
 
 // outputPinRemediation is the operator action behind every /output pin refusal. It
 // names both causes the pin cannot tell apart: a symlinked output tree (a standing
@@ -637,8 +631,8 @@ const laxBundleMsg = "prior pfx is more permissive than policy; rewriting it at 
 const outputPinRemediation = "mount the real output directory instead of linking to it, and check /output for paths replaced while the scan was running"
 
 // laxerThanPolicy reports whether perm carries a permission bit pfxFileMode does
-// not. It is the WHOLE of the mode decision now: set means the bundle needs rewriting,
-// nothing more.
+// not. It is the WHOLE of the mode question: set means the mode is REPORTED, and nothing
+// else follows from it.
 //
 // A bitmask test rather than an inequality, because a mode can differ from policy by
 // being STRICTER: 0400 and 0600 carry no extra bit and are left exactly as found, while
@@ -650,16 +644,17 @@ func laxerThanPolicy(perm os.FileMode) bool {
 // reportLaxBundle warns when a prior bundle's mode is laxer than pfxFileMode, and
 // reports that fact to the caller. It is detection and narration only — it opens
 // nothing, pins nothing and mutates nothing, so the mode on disk is left exactly as
-// found and the correction happens in store.write like any other rewrite.
+// found, and nothing downstream acts on the fact either.
 //
-// One WARN per lax bundle per scan, and on a mode-storing filesystem once ever: the fact
-// it reports makes bundleState.upToDate false, so the same scan rewrites the bundle at
-// pfxFileMode and the condition cannot re-trigger. It repeats per scan in two cases.
-// While the correcting write is itself refused — the standing condition an operator does
-// need told about every scan (unwritableReport emits the message that names it). And on a
-// mount that forces or ignores permission bits, where the rewrite SUCCEEDS but the stored
-// mode is still lax, so the correction never converges and every scan reports and rewrites
-// the bundle the previous scan wrote.
+// One WARN per lax bundle per scan, and it recurs on every scan for as long as the mode
+// does: this app changes nothing about the file, so the condition it reports is not one
+// its own scan can clear. That repetition is the intended shape rather than an
+// unconverged loop — the alternative, rewriting the bundle to install pfxFileMode, churns
+// a fresh inode, fresh KDF salts and a fresh mtime on every scan of a mount that forces
+// or ignores permission bits, and re-triggers downstream replication with it. A bundle
+// written for a CONTENT reason lands at pfxFileMode by construction, which is the only
+// way this app ever corrects a mode, so on a mode-storing filesystem the next renewal
+// ends the WARN by itself.
 func (s *store) reportLaxBundle(rel string, perm os.FileMode) bool {
 	if !laxerThanPolicy(perm) {
 		return false
@@ -672,16 +667,15 @@ func (s *store) reportLaxBundle(rel string, perm os.FileMode) bool {
 // isPermissionRefusal reports whether err is the filesystem REFUSING an operation for
 // a permission reason, as opposed to failing it for any other reason. Its consumer is
 // restartCanClearWrite, where a refusal is the first of the classes no restart clears,
-// and unwritableReport, which turns the same distinction into the operator remediation
-// (ownership versus volume).
+// and unwritableRemediation, which turns the same distinction into the operator
+// remediation (ownership versus volume).
 //
 // fs.ErrPermission is the whole test rather than two errors.Is calls against
-// syscall.EPERM and syscall.EACCES: os.Root.Chmod and atomicfile's confined write both
-// return an *fs.PathError wrapping a syscall.Errno, and Errno.Is maps BOTH of those
-// errnos (and only those, of the ones reachable here — EROFS, EINVAL and ENOSPC do not
-// match) onto fs.ErrPermission. Checking the portable sentinel therefore covers both
-// refusals, keeps this file free of a syscall import, and matches an fs.ErrPermission a
-// test seam injects directly.
+// syscall.EPERM and syscall.EACCES: atomicfile's confined write returns an *fs.PathError
+// wrapping a syscall.Errno, and Errno.Is maps BOTH of those errnos (and only those, of
+// the ones reachable here — EROFS, EINVAL and ENOSPC do not match) onto fs.ErrPermission.
+// Checking the portable sentinel therefore covers both refusals, keeps this file free of
+// a syscall import, and matches an fs.ErrPermission a test seam injects directly.
 func isPermissionRefusal(err error) bool {
 	return errors.Is(err, fs.ErrPermission)
 }

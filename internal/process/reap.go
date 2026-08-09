@@ -116,9 +116,9 @@ func (r *reapContext) safeToReap() bool {
 // unreplaceableOnly reports whether the only thing this scan is still trying to repair on
 // the output tree is a REPLACEMENT THE VOLUME REFUSED rather than a failed conversion. The
 // two need different operator advice: a conversion failure is reported as one and can be
-// fixed, while a refused replacement is reported by unwritableBundleMsg or
-// unreplaceableBundleMsg and is cleared on the volume — a chown, free space, a read-write
-// remount — not by fixing a conversion nothing logged.
+// fixed, while a refused replacement is reported by unreplaceableBundleMsg and is cleared
+// on the volume — a chown, free space, a read-write remount — not by fixing a conversion
+// nothing logged.
 func (r *reapContext) unreplaceableOnly() bool {
 	return r.result.Failed == 0 && r.result.Unwritable > 0
 }

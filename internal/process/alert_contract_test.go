@@ -13,8 +13,8 @@ import (
 // captured record against the production const ITSELF -- so a reword changes both sides
 // together, the whole suite stays green, and CertConverterInputTreeTooLarge silently
 // stops matching while the two OUTPUT_LIFECYCLE=sync queries return nothing. The
-// substrings are spelled out here deliberately, exactly as the mode-repair tests spell
-// theirs out, so renaming one has to be done on purpose.
+// substrings are spelled out here deliberately, exactly as the health-neutral write tests
+// spell theirs out, so renaming one has to be done on purpose.
 //
 // Each entry is the substring the README publishes rather than the whole message: the
 // rules match on a phrase, so widening the message around it stays compatible and only

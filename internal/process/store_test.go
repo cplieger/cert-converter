@@ -38,9 +38,10 @@ func newOutputStore(t *testing.T, dir string) *store {
 // read better through this than through two lines of destructuring.
 //
 // The two facts inspect resolves independently — what it learned about the content, and
-// whether the mode repair converged — are asserted directly by the tests that own them
-// (TestStoreInspect_reports_content_it_could_not_verify and the write-routing tests),
-// which is why this helper is allowed to collapse them.
+// whether the mode on disk is laxer than policy — are asserted directly by the tests that
+// own them (TestStoreInspect_reports_content_it_could_not_verify,
+// TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install and the
+// write-routing tests), which is why this helper is allowed to collapse them.
 func inspectCurrent(ctx context.Context, s *store, rel string, want *convert.Analysis,
 	enc convert.EncoderType, password string,
 ) (bool, error) {
@@ -792,39 +793,39 @@ func TestStoreWrite_refuses_a_bundle_whose_parent_is_an_in_root_symlink(t *testi
 	}
 }
 
-// TestScannerRun_rewrites_a_content_current_bundle_whose_mode_is_lax pins the whole of
-// the ratified fix-on-write shape end to end: a bundle whose CONTENT matches what these
-// inputs produce but whose mode carries a bit pfxFileMode does not is REWRITTEN rather
-// than skipped, and the fresh inode the rewrite installs is what corrects the mode.
+// TestScannerRun_reports_but_does_not_rewrite_a_content_current_bundle_whose_mode_is_lax
+// pins the settled report-only shape end to end: a bundle whose CONTENT matches what these
+// inputs produce is SKIPPED however lax its mode, and the mode it was found with survives
+// untouched.
 //
-// It is the load-bearing test for two things a plausible simplification silently breaks.
-// Read bundleState.upToDate as "content matched, so skip the write" and the private-key
-// bundle keeps its lax mode for the life of the deployment with nothing logged after the
-// first scan -- which is exactly the state the retired chmod mechanism existed to prevent,
-// so removing that mechanism without this routing would be a regression rather than a
-// simplification. And the mode must arrive from the WRITE (atomicfile's WithMode on a
-// staged temp, confirmed to survive the rename over a laxer file), never from a chmod on
-// the operator's file: this app does not mutate a mode it finds under /output.
+// Currency is a question about content alone, so a permission bit contributes nothing to
+// it. The WARN is the whole of what a lax mode earns (laxBundleMsg, asserted here as the
+// record that must still fire), which is the ecosystem consensus: OpenSSH refuses an
+// over-permissive private key without chmodding it, certbot warns about an over-permissive
+// credentials file and makes the operator act, certbot's own key renewal applies its
+// restrictive mode to the NEW file it was writing anyway, and lego sets no modes at all.
+// None of them rewrites a file it finds in order to correct a mode.
 //
-// The mode is asserted as a CHANGE (laxer-than-policy before, not-laxer after, and the
-// exact policy mode) rather than only as an absolute, because a filesystem with
-// mount-forced modes stores something else entirely and the property under test is that
-// the app stopped needing to care. The bytes are asserted to have CHANGED too: a rewrite
-// that reused the old inode would pass the mode assertion while proving nothing.
+// This is the load-bearing test for the loop that shape avoids. Route a lax mode into a
+// rewrite and the correction cannot converge on a mount that forces or ignores permission
+// bits (CIFS/SMB forced mode, NFS squash, vfat fmask): the replacement lands with the same
+// lax mode, the next scan re-detects the bundle it just wrote, and every cycle ships fresh
+// KDF salts and a fresh mtime to whatever replicates /output. The assertions that catch
+// that are the byte, mtime and inode identities plus Unchanged across TWO scans -- a test
+// asserting only the resulting mode would stay green while the app churned the file.
+//
+// Every mode here is one the app can still READ (owner rw), so the content fact is
+// genuinely contentVerifiedCurrent. A mode that denies the OWNER a read is a different
+// case with its own test: the app cannot compare bytes it cannot read, so that bundle is
+// rewritten for a CONTENT reason.
 //
 // Serial: it swaps slog.Default().
-func TestScannerRun_rewrites_a_content_current_bundle_whose_mode_is_lax(t *testing.T) {
+func TestScannerRun_reports_but_does_not_rewrite_a_content_current_bundle_whose_mode_is_lax(t *testing.T) {
 	for _, lax := range []os.FileMode{
 		// Group- and world-readable: the realistic shapes, a private key others can read.
 		0o640, 0o644, 0o664,
-		// The family the retired chmod got WRONG (h-f4): perm & pfxFileMode masks 0o244
-		// to 0o200, an owner-write-but-not-read mode the app could not read its own
-		// bundle back through. The rewrite has no target mode to compute, so it installs
-		// pfxFileMode outright and the whole class stops existing.
-		0o244, 0o204,
-		// Masks to 0o000 under that same computation, the family whose special case the
-		// deleted floor existed for.
-		0o044, 0o100,
+		// Owner-only but still laxer than policy: an extra bit is an extra bit.
+		0o700,
 	} {
 		t.Run(lax.String(), func(t *testing.T) {
 			certsRoot := t.TempDir()
@@ -843,7 +844,8 @@ func TestScannerRun_rewrites_a_content_current_bundle_whose_mode_is_lax(t *testi
 			pfxPath := filepath.Join(outRoot, "chain.pfx")
 			before, beforeInfo := readBundle(t, pfxPath)
 
-			// Content untouched, mode loosened: the only reason to rewrite is the mode.
+			// Content untouched, mode loosened: the mode is the only thing that changed, so
+			// any write from here could only be a mode-driven one.
 			if err := os.Chmod(pfxPath, lax); err != nil {
 				t.Fatalf("setup: Chmod(%v): %v", lax, err)
 			}
@@ -851,61 +853,214 @@ func TestScannerRun_rewrites_a_content_current_bundle_whose_mode_is_lax(t *testi
 			if !bytes.Equal(staged, before) {
 				t.Fatalf("setup: Chmod(%v) changed the bundle's bytes, want only the mode touched", lax)
 			}
-			if stored := storedPerm(t, pfxPath); !laxerThanPolicy(stored) {
-				t.Skipf("this filesystem stored %v for a chmod to %v, so there is no lax mode to correct",
-					stored, lax)
+			found := storedPerm(t, pfxPath)
+			if !laxerThanPolicy(found) {
+				t.Skipf("this filesystem stored %v for a chmod to %v, so there is no lax mode to report",
+					found, lax)
 			}
 
+			logs := captureLogs(t)
 			res, err := scanner.Run(t.Context())
 			if err != nil {
 				t.Fatalf("Run(content-current, lax mode) = error %v, want nil", err)
 			}
-			// Converted, not Unchanged: the write is how the mode is corrected, so a scan
-			// that skipped it would report the bundle as needing nothing.
-			if res.Converted != 1 || res.Failed != 0 || res.Unwritable != 0 {
-				t.Errorf("Run(content-current, lax mode) = %+v, want Converted 1 Failed 0 Unwritable 0:"+
-					" a lax mode must route through the ordinary rewrite", res)
+			// Unchanged, not Converted: content decides currency, and this content is current.
+			if res.Unchanged != 1 || res.Converted != 0 || res.Failed != 0 || res.Unwritable != 0 {
+				t.Errorf("Run(content-current, lax mode) = %+v, want Unchanged 1 Converted 0 Failed 0"+
+					" Unwritable 0: a lax mode must not schedule a write", res)
+			}
+			// Reported all the same: the operator is told, and told again every scan, because
+			// nothing this app does will clear the condition.
+			if got := logs.CountLevel(slog.LevelWarn, laxBundleMsg); got != 1 {
+				t.Errorf("Run(content-current, lax mode) logged %q at WARN %d times, want exactly 1: %q",
+					laxBundleMsg, got, logs.Messages())
 			}
 			after, afterInfo := readBundle(t, pfxPath)
-			if perm := afterInfo.Mode().Perm(); laxerThanPolicy(perm) {
-				t.Errorf("Run(content-current, lax mode %v) left mode %v, still laxer than policy %v:"+
-					" the rewrite must install a mode carrying no extra bit",
-					lax, perm, os.FileMode(pfxFileMode))
+			if !bytes.Equal(after, before) {
+				t.Error("Run(content-current, lax mode) changed the bundle's bytes, want them untouched:" +
+					" a permission bit is not a reason to re-encode a private-key bundle")
 			}
-			if perm := afterInfo.Mode().Perm(); perm != pfxFileMode {
-				t.Errorf("Run(content-current, lax mode %v) left mode %v, want %v: the write installs"+
-					" pfxFileMode outright rather than masking the mode it found",
-					lax, perm, os.FileMode(pfxFileMode))
+			if !afterInfo.ModTime().Equal(beforeInfo.ModTime()) {
+				t.Errorf("Run(content-current, lax mode) moved the mtime from %v to %v, want it untouched:"+
+					" a fresh mtime re-triggers whatever replicates /output",
+					beforeInfo.ModTime(), afterInfo.ModTime())
 			}
-			// A fresh inode, which is the mechanism: atomicfile stages a temp at the wanted
-			// mode and renames it over the old file. Same certificates, so the PFX differs
-			// only by its fresh KDF salts -- but it MUST differ, or nothing was rewritten.
-			if bytes.Equal(after, before) {
-				t.Error("Run(content-current, lax mode) left the bundle's bytes identical, want a fresh" +
-					" bundle: the mode is corrected by REPLACING the inode, not by chmodding it")
+			if !os.SameFile(beforeInfo, afterInfo) {
+				t.Error("Run(content-current, lax mode) replaced the inode, want the operator's file left" +
+					" exactly where it was")
 			}
-			if os.SameFile(beforeInfo, afterInfo) {
-				t.Error("Run(content-current, lax mode) kept the same inode, want a replacement: a mode" +
-					" that changed in place means something chmodded the operator's file")
+			if perm := afterInfo.Mode().Perm(); perm != found {
+				t.Errorf("Run(content-current, lax mode) left mode %v, want %v as found: this app changes no"+
+					" mode it finds under /output, by chmod or by rewrite", perm, found)
 			}
 
-			// Once ever, not once per scan: the corrected bundle is at policy, so the next
-			// scan finds nothing lax, skips the write and leaves the bytes alone.
-			settled, settledInfo := readBundle(t, pfxPath)
+			// Steady state rather than convergence, and that is the point: the mode is still
+			// lax, it is reported again, and the bundle is still not touched. A per-scan WARN
+			// over an unchanged file is the cheap outcome; a per-scan REWRITE was not.
 			res, err = scanner.Run(t.Context())
 			if err != nil {
 				t.Fatalf("Run(third scan) = error %v, want nil", err)
 			}
 			if res.Unchanged != 1 || res.Converted != 0 {
-				t.Errorf("Run(third scan) = %+v, want Unchanged 1 Converted 0: a bundle already at policy"+
-					" must not be rewritten again", res)
+				t.Errorf("Run(third scan) = %+v, want Unchanged 1 Converted 0: the second scan must reach"+
+					" the same verdict as the first", res)
+			}
+			if got := logs.CountLevel(slog.LevelWarn, laxBundleMsg); got != 2 {
+				t.Errorf("two scans logged %q at WARN %d times, want 2 (one per scan): the operator keeps"+
+					" being told about a mode only they can change: %q", laxBundleMsg, got, logs.Messages())
 			}
 			final, finalInfo := readBundle(t, pfxPath)
-			if !bytes.Equal(final, settled) || !os.SameFile(settledInfo, finalInfo) {
-				t.Error("Run(third scan) rewrote a bundle already at policy, want it left alone: the" +
-					" one-time cost must not become a per-scan rewrite loop")
+			if !bytes.Equal(final, before) || !os.SameFile(beforeInfo, finalInfo) {
+				t.Error("Run(third scan) rewrote the bundle, want it left alone: reporting a mode must never" +
+					" become a per-scan rewrite loop")
+			}
+			if perm := finalInfo.Mode().Perm(); perm != found {
+				t.Errorf("Run(third scan) left mode %v, want %v as found", perm, found)
 			}
 		})
+	}
+}
+
+// TestScannerRun_a_write_for_its_own_reasons_installs_the_policy_mode pins the other half
+// of the report-only shape: this app DOES correct a lax mode, but only as a side effect of
+// a write it was performing anyway.
+//
+// A renewed certificate over a bundle the operator left at 0644 is replaced because its
+// CONTENT is stale, and the atomic replacement lands a fresh inode at pfxFileMode for free
+// (store.write's atomicfile.WithMode). So the mode a real deployment carries is corrected
+// on its next renewal, with no write that exists only to change permissions -- exactly what
+// certbot's own key renewal does. Its converse is the test above: a bundle whose
+// certificate never renews keeps the mode the operator left it with.
+func TestScannerRun_a_write_for_its_own_reasons_installs_the_policy_mode(t *testing.T) {
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
+	crtPath := filepath.Join(certsRoot, "chain.crt")
+	keyPath := filepath.Join(certsRoot, "chain.key")
+	writePair(t, certsRoot, "chain", chainPEM, keyPEM)
+	scanner := New(&Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+	})
+	if res, err := scanner.Run(t.Context()); err != nil || res.Converted != 1 {
+		t.Fatalf("setup: initial Run = %+v, %v, want Converted 1 and nil", res, err)
+	}
+	pfxPath := filepath.Join(outRoot, "chain.pfx")
+	before, beforeInfo := readBundle(t, pfxPath)
+	if err := os.Chmod(pfxPath, 0o644); err != nil {
+		t.Fatalf("setup: Chmod: %v", err)
+	}
+	found := storedPerm(t, pfxPath)
+	if !laxerThanPolicy(found) {
+		t.Skipf("this filesystem stored %v for a chmod to 0644, so there is no lax mode to correct", found)
+	}
+
+	// The renewal: a different cert/key pair at the same input names, so the write happens
+	// for a content reason and the mode rides along.
+	_, renewedKeyPEM, _, renewedChainPEM := testcerts.GenerateCertChain(t)
+	if err := os.WriteFile(crtPath, renewedChainPEM, 0o644); err != nil {
+		t.Fatalf("setup: rewrite crt: %v", err)
+	}
+	if err := os.WriteFile(keyPath, renewedKeyPEM, 0o600); err != nil {
+		t.Fatalf("setup: rewrite key: %v", err)
+	}
+
+	res, err := scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run(renewed cert over a lax bundle) = error %v, want nil", err)
+	}
+	if res.Converted != 1 || res.Failed != 0 || res.Unwritable != 0 {
+		t.Errorf("Run(renewed cert over a lax bundle) = %+v, want Converted 1 Failed 0 Unwritable 0", res)
+	}
+	after, afterInfo := readBundle(t, pfxPath)
+	if bytes.Equal(after, before) {
+		t.Error("Run(renewed cert) left the bundle's bytes identical, want the renewed bundle: without the" +
+			" write there is no mode to inherit and this test proves nothing")
+	}
+	if os.SameFile(beforeInfo, afterInfo) {
+		t.Error("Run(renewed cert) kept the same inode, want a replacement: the mode arrives with the fresh" +
+			" inode, never from a chmod on the operator's file")
+	}
+	if perm := afterInfo.Mode().Perm(); perm != pfxFileMode {
+		t.Errorf("Run(renewed cert over mode %v) left mode %v, want %v: a write for the bundle's own reasons"+
+			" installs the policy mode outright", found, perm, os.FileMode(pfxFileMode))
+	}
+}
+
+// TestStoreInspect_treats_a_bundle_it_cannot_read_as_unverified_content pins the routing
+// for the mode family that is NOT a mode decision: an app-owned bundle at 0044, 0100, 0244
+// or 0204 cannot be READ by the nonroot runtime at all.
+//
+// That refusal is a CONTENT fact and not a mode one. The app cannot compare bytes it cannot
+// read, so the bundle is contentUnverified and is rewritten for the same reason an
+// oversized or undecodable prior is -- and the replacement lands at pfxFileMode, which is
+// the only way this app ever corrects a mode. The report-only shape above must not be read
+// as "a lax mode is never rewritten": that would be a real regression here, stranding the
+// operator with a bundle nothing can open and no write to replace it.
+//
+// The read is refused through the readBoundedInRoot seam rather than by chmodding the
+// fixture, because the suite runs as uid 0 in some containers and root ignores permission
+// bits: a chmodded fixture would be readable there, resolve to contentVerifiedCurrent, and
+// silently assert the opposite of the case. The mode is still asserted as REPORTED, so the
+// detection half is exercised too.
+// Serial: it swaps slog.Default() and the read seam.
+func TestStoreInspect_treats_a_bundle_it_cannot_read_as_unverified_content(t *testing.T) {
+	outRoot := t.TempDir()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := convert.Analyse(concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	pfxPath := filepath.Join(outRoot, "chain.pfx")
+	if err := os.WriteFile(pfxPath, mustEncode(t, &analysis), 0o600); err != nil {
+		t.Fatalf("setup: write bundle: %v", err)
+	}
+	// Laxer than policy AND unreadable by its owner: the two facts this case couples.
+	if err := os.Chmod(pfxPath, 0o044); err != nil {
+		t.Fatalf("setup: Chmod: %v", err)
+	}
+	found := storedPerm(t, pfxPath)
+	if !laxerThanPolicy(found) {
+		t.Skipf("this filesystem stored %v for a chmod to 0044, so there is no lax mode to report", found)
+	}
+	prevRead := readBoundedInRoot
+	readBoundedInRoot = func(context.Context, *os.Root, string, int64) ([]byte, error) {
+		return nil, &fs.PathError{Op: "openat", Path: "chain.pfx", Err: fs.ErrPermission}
+	}
+	t.Cleanup(func() { readBoundedInRoot = prevRead })
+
+	out := newOutputStore(t, outRoot)
+
+	logs := captureLogs(t)
+	state, err := out.inspect(t.Context(), "chain.pfx", &analysis, convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("inspect(unreadable bundle) = error %v, want nil: an unreadable prior resolves to a fact,"+
+			" not a failed pair", err)
+	}
+	if state.content != contentUnverified {
+		t.Errorf("inspect(unreadable bundle) content = %v, want contentUnverified: nothing compared these"+
+			" bytes, so calling them current or stale claims evidence this app does not have", state.content)
+	}
+	if state.upToDate() {
+		t.Error("inspect(unreadable bundle).upToDate() = true, want false: a bundle this app cannot read is" +
+			" one it cannot prove current, so it is rewritten through the CONTENT path")
+	}
+	if !state.modeLax {
+		t.Error("inspect(unreadable bundle).modeLax = false, want true: detection runs on what the lstat" +
+			" saw, independently of whether the read then succeeded")
+	}
+	if got := logs.CountLevel(slog.LevelWarn, laxBundleMsg); got != 1 {
+		t.Errorf("inspect(unreadable bundle) logged %q at WARN %d times, want exactly 1: %q",
+			laxBundleMsg, got, logs.Messages())
+	}
+	if got := logs.CountLevel(slog.LevelWarn, "cannot read prior pfx; regenerating"); got != 1 {
+		t.Errorf("inspect(unreadable bundle) logged the read refusal %d times, want exactly 1: %q",
+			got, logs.Messages())
+	}
+	if got := storedPerm(t, pfxPath); got != found {
+		t.Errorf("inspect(unreadable bundle) changed the mode to %v, want %v untouched", got, found)
 	}
 }
 
@@ -967,19 +1122,15 @@ func TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install(t
 	if err != nil {
 		t.Fatalf("inspect(lax bundle) = error %v, want nil", err)
 	}
-	// The two facts the WARN accompanies: content matched, mode lax. Together they are
-	// what makes this rewrite a mode-only one, which is what keeps a failed rewrite of it
-	// health-neutral.
+	// The two facts the WARN accompanies: content matched, mode lax. They are INDEPENDENT
+	// now -- the second one routes nothing, which is why the currency answer below is
+	// unaffected by it.
 	if state.content != contentVerifiedCurrent || !state.modeLax {
 		t.Errorf("inspect(lax bundle) = %+v, want contentVerifiedCurrent with modeLax set", state)
 	}
-	if state.upToDate() {
-		t.Error("inspect(lax bundle).upToDate() = true, want false: a lax mode is corrected by the" +
-			" rewrite, so the write must not be skipped")
-	}
-	if !state.modeRepairOnly() {
-		t.Error("inspect(lax bundle).modeRepairOnly() = false, want true: this rewrite carries no new" +
-			" bytes, which is what keeps its failure health-neutral")
+	if !state.upToDate() {
+		t.Error("inspect(lax bundle).upToDate() = false, want true: currency is a question about content" +
+			" alone, so a lax mode must not schedule a write")
 	}
 	if got := logs.CountLevel(slog.LevelWarn, laxBundleMsg); got != 1 {
 		t.Errorf("inspect(lax bundle) logged %q at WARN %d times, want exactly 1: %q",

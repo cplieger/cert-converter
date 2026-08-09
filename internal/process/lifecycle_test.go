@@ -124,8 +124,8 @@ func TestStoreReconcile(t *testing.T) {
 		},
 		{
 			// The /output-side sibling of the conversion-failure rail above: a bundle whose
-			// mode repair AND repairing rewrite were both refused is one this app wanted to
-			// replace and could not, so deleting OTHER bundles on the strength of that same
+			// replacing write was refused is one this app wanted to replace and could not, so
+			// deleting OTHER bundles on the strength of that same
 			// volume is what conversionsClean refuses. Unwritable is health-neutral, which
 			// is exactly why nothing else fails when this rail is dropped.
 			name: "sync refuses when a prior bundle could not be rewritten",
@@ -1036,238 +1036,23 @@ func boolCount(want bool) int {
 	return 0
 }
 
-// TestScannerRun_when_the_repairing_rewrite_is_also_refused splits the outcome of a
-// refused mode repair by WHY its rewrite failed, which is this arm's whole health
-// contract.
-//
-// The sibling test above covers the convergent case: a foreign-owned bundle in a
-// directory this UID CAN write is rewritten on the first scan and goes quiet. But the
-// deployment that leaves a foreign-owned FILE behind plausibly leaves a foreign-owned
-// DIRECTORY too — an operator who changed PUID and left root-owned output behind owns
-// neither — and there the rewrite is refused as well. Counting that as a conversion
-// failure flips health on a condition no restart can clear, i.e. a restart loop in the
-// most likely instance of the very case the mode arm exists to fix. It is the same
-// mistake statusUnreadable exists to prevent on the /input side, where treating a read
-// refusal as a conversion failure once made a symlinked /input restart-loop forever.
-//
-// So a refusal NO RESTART CAN CLEAR is health-neutral: the bundle on disk still holds
-// the right bytes, the operator gets a standing WARN naming the remedy, and the outcome
-// is accounted in ScanResult.Unwritable instead of Failed — which is the field
-// main.healthyAfterScan reads, and TestHealthyAfterScan pins that this shape stays
-// healthy through that real predicate.
-//
-// Which refusals those are is a property of the ERROR CLASS and of nothing else
-// (restartCanClearWrite): a permission denial, a read-only mount, a full volume and an
-// exhausted quota all survive a restart, so restarting is the wrong answer to every one
-// of them. The ENOSPC case is here for that reason and its expectation CHANGED with this
-// routing: it used to count as a conversion failure on the theory that a full volume is
-// not an ownership problem, which is true and beside the point — an orchestrator
-// restarting this container writes the same bytes into the same full volume. A write
-// error this app CANNOT attribute to such a condition (EIO here) stays a conversion
-// failure and still flips health, which is what keeps "a failed PFX write is a
-// conversion failure" the default the README documents.
-//
-// Both messages are load-bearing too: only the mode-only shape carries
-// unwritableBundleMsg, whose text promises the bytes were compared and matched and only
-// the permission bits are wrong. A refusal by the VOLUME cannot make that promise about
-// permissions, so it carries unreplaceableBundleMsg with the volume remediation instead —
-// an operator sent to check ownership over a full disk reads the WARN as noise.
-//
-// The second scan matters as much as the first: the condition is steady state, so the
-// WARN repeats once per scan rather than compounding, and nothing may be deleted or
-// corrupted while it persists.
-//
-// The write seam is the only way in: the suite owns every file it creates (and here runs
-// as root), so no temp directory can refuse it a write. The LAX MODE needs no seam at
-// all — a plain os.Chmod on the bundle is the whole trigger now, because detection is a
-// bitmask test on what the scan lstats and nothing is attempted against the file.
-// Runs serially: it swaps slog.Default() and the write seam.
-func TestScannerRun_when_the_mode_correcting_rewrite_is_refused(t *testing.T) {
-	// Spelled out rather than imported from the production consts: an operator's log
-	// query keys on these words, so a silent rename must fail here.
-	const laxMsg = "prior pfx is more permissive than policy; rewriting it at the wanted mode"
-	const unwritableMsg = "prior pfx is more permissive than policy and the rewrite that would correct its mode" +
-		" was not permitted; leaving the existing bundle in place, health is unaffected"
-	const unreplaceableMsg = "prior pfx could not be replaced and the /output condition that refused the write is" +
-		" not one a restart clears; leaving the existing bundle in place, health is unaffected"
-	const failedMsg = "conversion failed"
-	const ownershipRemediation = "check /output ownership and permissions for the UID in user:"
-	const volumeRemediation = "check /output for free space, a quota and a read-only mount"
-	for _, tc := range []struct {
-		writeErr        error
-		name            string
-		wantNeutralMsg  string
-		wantRemediation string
-		wantUnwritable  int
-		wantFailed      int
-	}{
-		{
-			// The temp cannot be created: /output itself belongs to another UID.
-			name:           "a refused write leaves the bundle in place without flipping health",
-			writeErr:       &fs.PathError{Op: "openat", Path: "chain.pfx", Err: syscall.EACCES},
-			wantUnwritable: 1, wantNeutralMsg: unwritableMsg, wantRemediation: ownershipRemediation,
-		},
-		{
-			// The other refusal errno, for the same reason the sibling test covers both:
-			// only the classification tells them apart from the failures below.
-			name:           "an EPERM refusal of the same write is the same condition",
-			writeErr:       &fs.PathError{Op: "renameat", Path: "chain.pfx", Err: syscall.EPERM},
-			wantUnwritable: 1, wantNeutralMsg: unwritableMsg, wantRemediation: ownershipRemediation,
-		},
-		{
-			// A full volume is not an ownership problem, which is exactly why it carries the
-			// OTHER message — but it is not clearable by a restart either, so it is
-			// health-neutral all the same. This expectation is the one this routing changed.
-			name:           "a full volume is health-neutral under its own message",
-			writeErr:       &fs.PathError{Op: "renameat", Path: "chain.pfx", Err: syscall.ENOSPC},
-			wantUnwritable: 1, wantNeutralMsg: unreplaceableMsg, wantRemediation: volumeRemediation,
-		},
-		{
-			// An I/O error is not attributable to any steady-state condition of the volume,
-			// so the default stands: an unwritten PFX is a conversion failure and health
-			// flips. Without this case every write failure could be made neutral and the
-			// suite would still pass.
-			name:       "a write error this app cannot attribute to the volume is still a conversion failure",
-			writeErr:   &fs.PathError{Op: "renameat", Path: "chain.pfx", Err: syscall.EIO},
-			wantFailed: 1,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			certsRoot := t.TempDir()
-			outRoot := t.TempDir()
-			_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
-			writePair(t, certsRoot, "chain", chainPEM, keyPEM)
-			scanner := New(&Options{
-				CertsRoot: certsRoot,
-				OutRoot:   outRoot,
-				Password:  "pw",
-				Encoder:   convert.EncNameModern2023,
-			})
-			// The first scan runs with the write seam live, so the bundle under test is a
-			// real one this app wrote.
-			if res, err := scanner.Run(t.Context()); err != nil || res.Converted != 1 {
-				t.Fatalf("setup: initial Run = %+v, %v, want Converted 1 and nil", res, err)
-			}
-			pfxPath := filepath.Join(outRoot, "chain.pfx")
-			before, _ := readBundle(t, pfxPath)
-			// Correct bytes, wrong mode: the whole trigger, and no seam needed for it.
-			if err := os.Chmod(pfxPath, 0o644); err != nil {
-				t.Fatalf("setup: Chmod: %v", err)
-			}
-			prevWrite := writeFileInRoot
-			writeFileInRoot = func(context.Context, *os.Root, string, []byte,
-				...atomicfile.Option,
-			) (atomicfile.Result, error) {
-				return atomicfile.Result{}, tc.writeErr
-			}
-			t.Cleanup(func() { writeFileInRoot = prevWrite })
-
-			logs := captureLogs(t)
-			res, err := scanner.Run(t.Context())
-			if err != nil {
-				t.Fatalf("Run(lax mode, refused rewrite) = error %v, want nil: neither outcome is a"+
-					" scan-level failure", err)
-			}
-			if res.Unwritable != tc.wantUnwritable || res.Failed != tc.wantFailed || res.Converted != 0 {
-				t.Errorf("Run(lax mode, refused rewrite) = %+v, want Unwritable %d Failed %d Converted 0",
-					res, tc.wantUnwritable, tc.wantFailed)
-			}
-			// The lax mode is announced either way: it is what schedules the rewrite, so its
-			// absence would mean this test is not exercising the arm at all.
-			if got := logs.CountLevel(slog.LevelWarn, laxMsg); got != 1 {
-				t.Errorf("Run(lax mode, refused rewrite) logged %q at WARN %d times, want exactly 1: %q",
-					laxMsg, got, logs.Messages())
-			}
-			wantUnwritableLines, wantFailedLines := 0, 1
-			if tc.wantUnwritable > 0 {
-				wantUnwritableLines, wantFailedLines = 1, 0
-			}
-			// Once per scan for this bundle, not once per attempt: the entry is written at
-			// most once per scan, and an operator watching a permanently unwritable volume
-			// must not get a line per retry behind it. The message is asserted by NAME, so a
-			// neutral outcome reported under the mode-only promise when the volume was the
-			// refuser fails here.
-			for msg, want := range map[string]int{
-				unwritableMsg:    boolCount(tc.wantNeutralMsg == unwritableMsg),
-				unreplaceableMsg: boolCount(tc.wantNeutralMsg == unreplaceableMsg),
-			} {
-				if got := logs.CountLevel(slog.LevelWarn, msg); got != want {
-					t.Errorf("Run(lax mode, refused rewrite) logged %q at WARN %d times, want %d: %q",
-						msg, got, want, logs.Messages())
-				}
-			}
-			if got := logs.CountLevel(slog.LevelError, failedMsg); got != wantFailedLines {
-				t.Errorf("Run(lax mode, refused rewrite) logged %q at ERROR %d times, want %d: %q",
-					failedMsg, got, wantFailedLines, logs.Messages())
-			}
-			if tc.wantUnwritable > 0 {
-				// The standing WARN has to name the bundle, what this app knew about its
-				// content, and the operator action that clears the refusal — never a restart.
-				for key, want := range map[string]string{
-					"path":        "chain.crt",
-					"output_path": "chain.pfx",
-					"content":     "verified-current",
-					"remediation": tc.wantRemediation,
-				} {
-					if !logs.HasAttr(tc.wantNeutralMsg, key, want) {
-						got, _ := logs.AttrValue(tc.wantNeutralMsg, key)
-						t.Errorf("Run(lax mode, refused rewrite) logged %s=%q, want %q", key, got, want)
-					}
-				}
-			}
-			// Nothing deleted, nothing truncated, nothing half-written: the bundle an
-			// operator is still serving must survive a refused replacement untouched.
-			after, afterInfo := readBundle(t, pfxPath)
-			if !bytes.Equal(after, before) {
-				t.Error("Run(lax mode, refused rewrite) changed the bundle's bytes, want them untouched:" +
-					" a write that never landed must leave the served bundle alone")
-			}
-			if got := afterInfo.Mode().Perm(); got != 0o644 {
-				t.Errorf("Run(lax mode, refused rewrite) left mode %o, want 0644 untouched: the rewrite was"+
-					" refused and this app never chmods a bundle in place, so the mode found must survive", got)
-			}
-
-			// Steady state: the same verdict, the same one line, no compounding and still no
-			// deletion. This is what a restart-looping container would look like instead if
-			// the permission arm were counted as a conversion failure.
-			res, err = scanner.Run(t.Context())
-			if err != nil {
-				t.Fatalf("Run(second scan) = error %v, want nil", err)
-			}
-			if res.Unwritable != tc.wantUnwritable || res.Failed != tc.wantFailed {
-				t.Errorf("Run(second scan) = %+v, want Unwritable %d Failed %d unchanged",
-					res, tc.wantUnwritable, tc.wantFailed)
-			}
-			if tc.wantUnwritable > 0 {
-				if got := logs.CountLevel(slog.LevelWarn, tc.wantNeutralMsg); got != 2*wantUnwritableLines {
-					t.Errorf("two scans logged %q at WARN %d times, want %d (one per scan): %q",
-						tc.wantNeutralMsg, got, 2*wantUnwritableLines, logs.Messages())
-				}
-			}
-			if _, statErr := os.Stat(pfxPath); statErr != nil {
-				t.Errorf("os.Stat(%s) = %v, want the bundle still in place", pfxPath, statErr)
-			}
-		})
-	}
-}
-
 // TestScannerRun_a_stale_bundle_with_a_lax_mode_is_a_conversion_failure pins the boundary
 // of the health-neutral outcome from the other side: neutrality is granted only where this
 // app never PROVED the bundle on disk wrong. A bundle that is a renewal behind was compared
 // and found stale (contentVerifiedStale), so a refused rewrite of it counts in
 // ScanResult.Failed and flips health -- otherwise the operator's PFX holds the previous
 // certificate with a green marker and no alert, which is the condition this boundary exists
-// to prevent. The two sibling tests stage the facts that DO earn neutrality (correct bytes
-// with only a lax mode, and content this app could not verify at all); all three are
-// needed, or any one arm can be deleted silently.
+// to prevent. The sibling test stages the fact that DOES earn neutrality (content this app
+// could not verify at all); both are needed, or either arm can be deleted silently.
 //
 // The lax mode is staged here on purpose, so the ONLY difference from the neutral sibling is
-// the content fact. It proves the mode does not launder a stale bundle into neutrality: a
-// rewrite carrying NEW BYTES is not a mode-only rewrite however lax the mode was.
+// the content fact. It proves the mode does not launder a stale bundle into neutrality, and
+// that it does not launder it into a SKIP either: a lax mode never decides anything, so the
+// stale content still routes this write and still makes its refusal a failure.
 //
 // The write is refused for permissions here on purpose too: it is the errno that earns
-// neutrality under either other fact, so this case proves the CONTENT fact is what refuses
-// it and not the error class.
+// neutrality under the other content fact, so this case proves the CONTENT fact is what
+// refuses it and not the error class.
 //
 // Failed rather than main.healthyAfterScan is asserted because that predicate lives in
 // package main and reads exactly this field (`return r.Failed == 0`), pinned there by
@@ -1335,14 +1120,11 @@ func TestScannerRun_a_stale_bundle_with_a_lax_mode_is_a_conversion_failure(t *te
 		t.Errorf("logged %q at ERROR %d times, want exactly 1: an unwritten renewal is a conversion"+
 			" failure: %q", "conversion failed", got, logs.Messages())
 	}
-	// Neither health-neutral message may appear: a bundle this app compared and found
-	// stale earns no standing WARN in place of the failure, whichever promise the message
-	// would have made about it.
-	for _, msg := range []string{unwritableBundleMsg, unreplaceableBundleMsg} {
-		if got := logs.CountLevel(slog.LevelWarn, msg); got != 0 {
-			t.Errorf("logged %q at WARN %d times, want 0: the health-neutral WARNs belong only to a bundle"+
-				" this app never proved wrong: %q", msg, got, logs.Messages())
-		}
+	// The health-neutral message may not appear: a bundle this app compared and found
+	// stale earns no standing WARN in place of the failure.
+	if got := logs.CountLevel(slog.LevelWarn, unreplaceableBundleMsg); got != 0 {
+		t.Errorf("logged %q at WARN %d times, want 0: the health-neutral WARN belongs only to a bundle"+
+			" this app never proved wrong: %q", unreplaceableBundleMsg, got, logs.Messages())
 	}
 	// Nothing deleted, nothing truncated: the refused write must leave the stale bundle
 	// exactly as it was, so the next scan can try again.
@@ -1841,7 +1623,7 @@ func TestScannerRun_reports_the_reap_count(t *testing.T) {
 // the end-of-scan summary, the pair no other test asserts (unresolved and vanished each
 // have their own). Both are operator signals: removed is how many bundles this scan
 // deleted under OUTPUT_LIFECYCLE=sync, and unwritable is the health-neutral count of
-// bundles whose mode repair the volume refused, deliberately kept out of failed= and
+// bundles whose replacing write the volume refused, deliberately kept out of failed= and
 // unreadable= so each documented alert keeps its own diagnosis. Dropping either
 // attribute leaves a scan that deleted key material, or that left a world-readable
 // private key in place, indistinguishable from a clean one. Serial: it swaps

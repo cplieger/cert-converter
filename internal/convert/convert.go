@@ -177,10 +177,23 @@ func (s *certScan) visit(block *pem.Block) error {
 // walk of its DER: the pre-parse schema shadow it replaces was removed on purpose
 // (class-c1-1) and nothing here re-reads the certificate's structure.
 //
-// 64 KiB is far above anything issued: a real certificate is 1-2 KB, and even a
-// 250-name SAN certificate is under 10 KB, so this refuses an amplification shape
-// rather than a configuration.
-const maxCertDERBytes = 64 << 10
+// The value is CALIBRATED AGAINST maxCertExtensionElements below, and neither may
+// be changed without re-deriving the other. That ceiling declares 4,096 decoded
+// elements legitimate, and 4,096 ordinary DNS names is ~78 KB of DER (measured:
+// 4,096 names of 17 bytes = 78,156 bytes), so a DER ceiling below that refuses the
+// largest shape its own sibling calls legal and leaves one of the two constants
+// unreachable. 64 KiB was exactly that contradiction, and it was not only
+// theoretical: it refused a valid 300-entry SAN certificate at 74,132 bytes, so
+// real large-SAN private-PKI chains that had been converting started failing, and a
+// conversion failure flips health.
+//
+// 256 KiB clears the sibling's ~78 KB largest legal shape with real headroom for
+// large-SAN private PKI (a public-CA leaf is 1-2 KB; 250 SAN entries of 243 bytes
+// measure 61,826 bytes), and it still bounds the parse's transient allocation by a
+// wide margin: the reproduced amplification retained ~534 MB from a 9.43 MB block,
+// so the same shape at 256 KiB retains on the order of 14 MB — comfortably inside
+// a container memory limit.
+const maxCertDERBytes = 256 << 10
 
 // Aggregate ceilings on what ONE parsed certificate may RETAIN for the life of the
 // chain, in both of the shapes x509.ParseCertificate keeps: the extension
@@ -208,6 +221,11 @@ const maxCertDERBytes = 64 << 10
 // the largest SAN list any CA issues (Let's Encrypt caps at 100 names), holding the
 // retained content under ~600 KB per certificate and ~38 MB for a full 64-certificate
 // chain.
+//
+// maxCertExtensionElements is CALIBRATED AGAINST maxCertDERBytes above: 4,096
+// elements as plain DNS names is ~78 KB of DER, so raising this number requires
+// re-deriving that ceiling too, or the size arm refuses the shape this one declares
+// legal before it is ever measured.
 const (
 	maxCertExtensions        = 64
 	maxCertExtensionOIDArcs  = 4096

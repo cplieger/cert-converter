@@ -1097,6 +1097,20 @@ func decodedName(raw []byte) (pkix.RDNSequence, bool) {
 // DeepEqual 3.2ms, so fillEvidence's 64*63 pairs spend 12.9s where the marshal-once
 // form spends 0.65s.
 //
+// Member order inside ONE RDN is deliberately not significant. An RDN is an ASN.1
+// SET, which is unordered by definition, so a multi-valued RDN spelling its
+// attributes CN-then-O and one spelling them O-then-CN are two encodings of the SAME
+// distinguished name, and RFC 5280 gives the encoded order no meaning. encoding/asn1's
+// setEncoder sorts SET members before emitting them, so re-marshalling folds both
+// spellings onto one canonical DER and they compare equal here. That is why this
+// comparison is CANONICAL-DER rather than positional, and it is the intended rule
+// rather than a side effect: the positional decoded comparison it replaced read those
+// two encodings as two different names. What canonicalisation does NOT reorder is the
+// RDNSequence itself — a SEQUENCE, whose order IS significant — so `O=Acme, CN=x` as
+// two separate RDNs stays distinct from `CN=x, O=Acme`, which is the distinction
+// nameLink's doc describes. Both halves are pinned by
+// TestCanonicalName_treats_SET_member_order_as_insignificant.
+//
 // The equivalence is exact for every attribute value the interface decode maps to a
 // concrete Go type (string, int64, bool, []byte, time.Time, BitString, OID):
 // identical values marshal to identical bytes, and different values cannot collide

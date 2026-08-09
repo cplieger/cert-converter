@@ -54,18 +54,20 @@ type conversionStatus int
 // no restart changes (a permission denial, a read-only mount, a full volume, an exhausted
 // quota — restartCanClearWrite enumerates them).
 //
-// "Never proved it wrong" is two facts, not one, and the standing WARN names which of them
-// applied: either the bytes on disk were read, decoded and compared and they MATCHED (the
-// mode-only shape: correct content, a mode laxer than policy, and a refused rewrite of the
-// bundle that would have corrected it — this app never chmods a bundle in place, so that
-// one refused rewrite is the whole failure to report; the "operator changed PUID and left
-// root-owned output behind" deployment), or this app could not verify the content AT ALL (a
-// bundle above the readable bound, unreadable, un-stat-able, or refused by the codec's
-// preflight). The second shape used to be counted in statusFailed, because the two arms
-// that could not read a bundle overwrote the reason the rewrite was scheduled: that pinned
-// the container unhealthy on every scan over an /output permission state no restart can
-// clear, which is the same restart-loop statusUnreadable exists to prevent on the /input
-// side.
+// "Never proved it wrong" means this app could not verify the content AT ALL: a bundle
+// above the readable bound, unreadable, un-stat-able, or refused by the codec's preflight.
+// Nobody compared the bytes, so nothing here claims the operator's bundle is wrong. The
+// realistic deployment behind it is "the operator changed PUID and left root-owned output
+// behind". That shape used to be counted in statusFailed, because the two arms that could
+// not read a bundle overwrote the reason the rewrite was scheduled: that pinned the
+// container unhealthy on every scan over an /output permission state no restart can clear,
+// which is the same restart-loop statusUnreadable exists to prevent on the /input side.
+//
+// A bundle whose bytes this app compared and MATCHED cannot reach this status, because it
+// is never written at all: currency is decided on content alone, so a matching bundle is
+// skipped however lax its mode (bundleState.upToDate). That is what keeps an /output
+// PERMISSION state away from health structurally rather than by routing — a lax mode
+// triggers no write, so there is no refusal to classify.
 //
 // A bundle this app DID compare and find stale is never this status. A renewal behind, a
 // rotated password, an encoder-profile change, an absent or non-regular output path: there
