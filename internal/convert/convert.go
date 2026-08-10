@@ -501,14 +501,25 @@ const maxBlockTypeLogLen = 64
 // that interpolates text taken from a file the app does not control (a certificate
 // subject, a PEM block label) goes through it.
 //
-// The whole composition is runesafe's: SanitizeSingleLineCapped applies the fleet's
+// The whole composition is runesafe's: SanitizeSingleLineBudgeted applies the fleet's
 // shared single-line policy (so the text is safe under any slog handler by
-// construction rather than by matching one handler's escaping), caps the SANITIZED
-// form on a rune boundary — the cap must run after sanitizing, which can GROW the
-// text as an invalid byte becomes the three-byte U+FFFD, and a cut inside a rune
-// would mint exactly the raw 0x80-0x9F tail bytes the sanitizer just removed — and
-// names the cut with the marker this app supplies. Nothing is re-implemented here;
-// the app contributes only the marker and the limit.
+// construction rather than by matching one handler's escaping), pre-caps the RAW
+// bytes on a rune boundary at the limit, sanitizes only that slice, re-caps the
+// growth sanitizing can cause (an invalid byte becomes the three-byte U+FFFD, and a
+// cut inside a rune would mint exactly the raw 0x80-0x9F tail bytes the sanitizer
+// just removed), and names the cut with the marker this app supplies. Nothing is
+// re-implemented here; the app contributes only the marker and the limit.
+//
+// The WORK-bounding primitive, not the output-bounding one (SanitizeSingleLineCapped),
+// and the choice is the bound below: Capped sanitizes ALL of s and budgets the result,
+// so a multi-megabyte PEM label is walked in full to produce a 64-byte diagnostic.
+// Budgeted caps first, so the work is bounded by the limit rather than by the input.
+// The library says so itself — Capped's doc sends "a caller that must never walk a
+// multi-megabyte upstream value in a memory-limited process" to the Budgeted pair.
+// Ratified by the user 2026-08 with the one behaviour change named: text whose RAW
+// form exceeds the limit but whose SANITIZED form would fit under it (many multi-byte
+// unsafe runes collapsing to single-byte spaces) is now cut and marked, where Capped
+// returned it whole and unmarked. Do not swap back to Capped without that trade.
 //
 // The marker (logtext.Marker) is deliberately more explicit than runesafe's own
 // "..." preset, which is why boundLogText passes a marker of its own to the
@@ -532,7 +543,7 @@ const maxBlockTypeLogLen = 64
 // re-deriving it from the marker, which a value legitimately ending in the marker
 // would defeat.
 func boundLogText(s string, limit int) string {
-	text, _ := runesafe.SanitizeSingleLineCapped(s, limit, logtext.Marker)
+	text, _ := runesafe.SanitizeSingleLineBudgeted(s, limit, logtext.Marker)
 	return text
 }
 
@@ -573,7 +584,7 @@ const maxSubjectRenderAttrs = 256
 // attributes handed to pkix's quadratic renderer, and the bytes of the result.
 //
 // The sanitize step still runs AFTER the render (boundLogText ->
-// runesafe.SanitizeSingleLineCapped), which is the order that rule requires: pkix
+// runesafe.SanitizeSingleLineBudgeted), which is the order that rule requires: pkix
 // escapes only the DN metacharacters and leaves control bytes and newlines intact.
 func subjectForLog(c *x509.Certificate) string {
 	return boundLogText(boundedDN(dnSequence(&c.Subject)).String(), maxSubjectLogLen)

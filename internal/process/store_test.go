@@ -42,7 +42,7 @@ func newOutputStore(t *testing.T, dir string) *store {
 // and the mode it reports on the way past by
 // TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install, which is
 // why this helper is allowed to collapse the state to one bool.
-func inspectCurrent(ctx context.Context, s *store, rel string, want *convert.Analysis,
+func inspectCurrent(ctx context.Context, s *store, rel string, want convert.Analysis,
 	enc convert.EncoderType, password string,
 ) (bool, error) {
 	st, err := s.inspect(ctx, rel, want, enc, password)
@@ -334,7 +334,7 @@ func TestStoreInspect_names_a_non_regular_prior_output(t *testing.T) {
 
 			// want is never dereferenced on this arm: the verdict is reached from the
 			// lstat alone, before any bundle is read.
-			current, err := inspectCurrent(t.Context(), s, "out.pfx", nil, convert.EncNameModern2023, "pw")
+			current, err := inspectCurrent(t.Context(), s, "out.pfx", convert.Analysis{}, convert.EncNameModern2023, "pw")
 
 			if err != nil || current {
 				t.Fatalf("inspect(non-regular) = %v, %v, want false, nil: an occupied output path is never a usable prior bundle", current, err)
@@ -411,7 +411,7 @@ func TestStoreInspect_reports_a_lax_output_directory(t *testing.T) {
 			// No bundle is planted: the check is asked before the bundle's own lstat, so
 			// the absent-bundle arm must carry it too — a lax directory is lax whether or
 			// not a prior bundle sits in it. want is never dereferenced on that arm.
-			current, err := inspectCurrent(t.Context(), s, "out.pfx", nil, convert.EncNameModern2023, "pw")
+			current, err := inspectCurrent(t.Context(), s, "out.pfx", convert.Analysis{}, convert.EncNameModern2023, "pw")
 			if err != nil || current {
 				t.Fatalf("inspect(no prior bundle) = %v, %v, want false, nil: a directory mode may never"+
 					" fail the pair, whatever its permissions", current, err)
@@ -469,7 +469,7 @@ func TestStoreInspect_reports_a_lax_output_directory(t *testing.T) {
 		// share a directory and must report once between them, while the nested one is a
 		// different directory and reports on its own.
 		for _, rel := range []string{"a.pfx", "b.pfx", "c.pfx", "nested/d.pfx"} {
-			if _, err := inspectCurrent(t.Context(), s, rel, nil, convert.EncNameModern2023, "pw"); err != nil {
+			if _, err := inspectCurrent(t.Context(), s, rel, convert.Analysis{}, convert.EncNameModern2023, "pw"); err != nil {
 				t.Fatalf("inspect(%s) = error %v, want nil", rel, err)
 			}
 		}
@@ -1283,7 +1283,7 @@ func TestStoreInspect_classifies_a_read_that_found_nothing_as_verified_stale(t *
 			t.Cleanup(func() { readBoundedInRoot = prev })
 
 			logs := captureLogs(t)
-			state, err := s.inspect(t.Context(), "out.pfx", nil, convert.EncNameModern2023, "pw")
+			state, err := s.inspect(t.Context(), "out.pfx", convert.Analysis{}, convert.EncNameModern2023, "pw")
 			if err != nil {
 				t.Fatalf("inspect(read %v) = error %v, want nil: a rewrite is the remedy, not a failed pair",
 					tc.readErr, err)

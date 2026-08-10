@@ -15,8 +15,10 @@ import (
 // job), and a false MISMATCH rewrites a correct bundle on every scan, churning its
 // mtime and re-replicating it downstream forever.
 //
-// The nil cases are not defensive padding: a decode that yielded no leaf, or an
-// analysis that produced none, must report "not current" rather than dereference.
+// The no-leaf case is not defensive padding: the decoded bundle comes from a FILE
+// under /output, so a bundle with no leaf bag is ordinary input and must report
+// "not current" rather than dereference. The analysis side needs no such case —
+// it is a value from Analyse, whose leaf invariant is stated once at the producer.
 //
 // Lives here rather than in main's test file — this is
 // the decoded bundle's own contract. It is reached through export_test.go, like
@@ -59,24 +61,6 @@ func TestDecodedMatchesAnalysis_leaf_guard(t *testing.T) {
 				t.Errorf("MatchesAnalysis = %v, want %v", got, tt.want)
 			}
 		})
-	}
-}
-
-// TestDecodedMatchesAnalysis_nil_analysis_leaf pins the other half of the same
-// guard: an analysis that produced no leaf must report "not current" rather than
-// panic. Separate from the table above because it varies the ANALYSIS, not the
-// decoded bundle.
-func TestDecodedMatchesAnalysis_nil_analysis_leaf(t *testing.T) {
-	t.Parallel()
-	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "leaf.example.com", "ecdsa")
-	analysis, err := convert.Analyse(t.Context(), certPEM, keyPEM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoded := convert.Decoded{Leaf: analysis.Leaf(), Key: analysis.Key(), CACerts: analysis.Chain()}
-
-	if convert.MatchesAnalysis(decoded, &convert.Analysis{}) {
-		t.Error("MatchesAnalysis(empty analysis) = true, want false")
 	}
 }
 

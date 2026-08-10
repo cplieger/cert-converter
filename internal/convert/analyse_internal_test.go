@@ -87,7 +87,7 @@ func testSelfSignedPEM(t *testing.T, key *ecdsa.PrivateKey, cn string, serial in
 
 // testValidityKinds reports the identity-validity observations in a, dropping the
 // chain-shaped ones so a fixture's chain arrangement cannot move the assertion.
-func testValidityKinds(a *Analysis) []ObservationKind {
+func testValidityKinds(a Analysis) []ObservationKind {
 	var kinds []ObservationKind
 	for _, o := range a.observations {
 		if o.Kind == ObsIdentityNotYetValid || o.Kind == ObsIdentityExpired {

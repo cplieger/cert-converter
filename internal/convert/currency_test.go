@@ -208,32 +208,6 @@ func TestCheckCurrency_classifies_every_outcome(t *testing.T) {
 	}
 }
 
-// TestCheckCurrency_refuses_a_nil_wanted_analysis pins the nil-pointer half of the
-// Analysis guard. want is a pointer, so nil is constructible from outside the
-// package, and a valid same-profile bundle reaches the content comparison — which
-// dereferences want. Without the guard the process panics there instead of
-// reporting a bundle that is not what the (absent) inputs produce.
-func TestCheckCurrency_refuses_a_nil_wanted_analysis(t *testing.T) {
-	t.Parallel()
-	m := testcerts.GenerateChainMaterial(t)
-	analysis, err := convert.Analyse(t.Context(), concatPEM(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
-	if err != nil {
-		t.Fatalf("setup: Analyse: %v", err)
-	}
-	good, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
-	if err != nil {
-		t.Fatalf("setup: Encode: %v", err)
-	}
-
-	res := convert.CheckCurrency(good, "pw", nil, convert.EncNameModern2023)
-	if res.Reason != convert.CurrencyContentMismatch {
-		t.Errorf("CheckCurrency(valid bundle, nil want) reason = %q, want %q", res.Reason, convert.CurrencyContentMismatch)
-	}
-	if res.Current() {
-		t.Error("CheckCurrency(valid bundle, nil want).Current() = true, want false: nothing can be current against absent inputs")
-	}
-}
-
 // TestCurrency_zero_value_is_not_current pins the choice of a string reason whose
 // zero value is not a match: a Currency nobody filled in must read as "rewrite
 // it", never as "the file on disk is fine".

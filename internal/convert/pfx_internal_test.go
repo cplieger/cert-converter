@@ -2,6 +2,7 @@ package convert
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -29,7 +30,7 @@ func TestEncode_encode_failure_is_wrapped(t *testing.T) {
 	}
 
 	// A nil private key cannot be marshalled to PKCS#8, so the encoder fails.
-	_, err = Encode(&Analysis{leaf: certs[0], key: nil}, EncNameModern2023, "pw")
+	_, err = Encode(Analysis{leaf: certs[0], key: nil}, EncNameModern2023, "pw")
 	if err == nil {
 		t.Fatal("Encode(nil private key) = nil error, want a wrapped encode error")
 	}
@@ -71,26 +72,49 @@ func TestDecode_bounds_the_library_message(t *testing.T) {
 	}
 }
 
-// TestEncode_refuses_an_analysis_that_did_not_come_from_Analyse pins the leaf guard
-// Encode grew this cycle. The zero Analysis is constructible from outside the package,
-// and without the guard the encoder dereferences the nil *x509.Certificate inside
-// go-pkcs12 (sha1.Sum(certificate.Raw)), killing the process instead of failing one
-// conversion. Delete the guard and no other test in this package notices; the panic
-// comes back.
-func TestEncode_refuses_an_analysis_that_did_not_come_from_Analyse(t *testing.T) {
+// The codec's entry points take an Analysis BY VALUE, which is what removed
+// Encode's and decoded.matchesAnalysis's nil checks: Analyse returns a value, so
+// no nil can arrive and there is no nil arm left to get wrong.
+//
+// These declarations DOCUMENT that invariant rather than assert it, because under
+// this shape it is a compile-level fact and there is nothing a running test can
+// observe: reintroducing a *Analysis parameter on either entry point stops this
+// file compiling, which is the whole of the check. A runtime test could only
+// construct the nil it is claiming cannot exist.
+//
+// The other half of the invariant — that the value Analyse hands back always
+// carries a leaf — is NOT structural (convert.Analysis{} stays constructible) and
+// is stated once as an assertion in analyseAt. TestAnalyse_always_populates_the_leaf
+// below is its witness.
+var (
+	_ func(Analysis, EncoderType, string) ([]byte, error)  = Encode
+	_ func([]byte, string, Analysis, EncoderType) Currency = CheckCurrency
+)
+
+// TestAnalyse_always_populates_the_leaf witnesses the one place the leaf invariant
+// is stated, across the input shapes that reach the producer by a different route:
+// a plain self-signed pair, a leaf-plus-CA chain, and a bundle whose leaf is not
+// the first block. Each returns through analyseAt's assertion, so a future edit
+// that let a leafless value out would panic here rather than inside go-pkcs12's
+// sha1.Sum(certificate.Raw) at conversion time.
+func TestAnalyse_always_populates_the_leaf(t *testing.T) {
 	t.Parallel()
-	for name, a := range map[string]*Analysis{
-		"the zero Analysis": {},
-		"a nil Analysis":    nil,
+	m := testcerts.GenerateChainMaterial(t)
+	selfPEM, selfKeyPEM := testcerts.GenerateSelfSignedCert(t, "leaf-invariant", "ecdsa")
+
+	for name, in := range map[string]struct{ certPEM, keyPEM []byte }{
+		"a self-signed pair":         {selfPEM, selfKeyPEM},
+		"a leaf-first chain":         {slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM},
+		"a chain with the leaf last": {slices.Concat(m.CAPEM, m.LeafPEM), m.LeafKeyPEM},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			_, err := Encode(a, EncNameModern2023, "pw")
-			if err == nil {
-				t.Fatalf("Encode(%s) = nil error, want a refusal rather than a nil-leaf panic in the encoder", name)
+			a, err := Analyse(t.Context(), in.certPEM, in.keyPEM)
+			if err != nil {
+				t.Fatalf("Analyse(%s) = error %v, want a resolved analysis", name, err)
 			}
-			if !strings.Contains(err.Error(), "no leaf certificate") {
-				t.Errorf("Encode(%s) error = %q, want it to name the missing leaf", name, err.Error())
+			if a.leaf == nil {
+				t.Errorf("Analyse(%s) returned an Analysis with no leaf: the codec no longer checks for one", name)
 			}
 		})
 	}

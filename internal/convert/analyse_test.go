@@ -128,7 +128,7 @@ func TestAnalyse_is_invariant_under_input_order(t *testing.T) {
 func assertKeyMatchesLeaf(tb interface {
 	Errorf(string, ...any)
 	Fatalf(string, ...any)
-}, a *convert.Analysis,
+}, a convert.Analysis,
 ) {
 	signer, ok := a.Key().(crypto.Signer)
 	if !ok {

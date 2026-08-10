@@ -38,7 +38,7 @@ type Decoded = decoded
 
 // MatchesAnalysis is the unexported method as a function, because a type alias
 // cannot re-export a method.
-func MatchesAnalysis(d Decoded, a *Analysis) bool { return d.matchesAnalysis(a) }
+func MatchesAnalysis(d Decoded, a Analysis) bool { return d.matchesAnalysis(a) }
 
 // ParsePrivateKey is the single-key convenience the parser's own tests read
 // through. Production uses parsePrivateKeys: identity selection needs every key

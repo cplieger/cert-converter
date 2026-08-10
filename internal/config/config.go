@@ -389,28 +389,28 @@ func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
 // default, which is below the floor, so it remains enabled and silent here
 // (warnFallbackRepaired reports those).
 func warnFallbackDisabled(interval time.Duration) {
-	if interval >= maxFallbackHours*time.Hour {
-		// The ceiling is documented as far beyond any real cadence, so a rescan at it
-		// never arrives: the operator's periodic recovery is inert, exactly as with the
-		// 0/false opt-out, and the watcher's reconciliation floor is what still covers
-		// a missed renewal.
-		slog.Warn("FALLBACK_SCAN_HOURS is at the "+strconv.Itoa(maxFallbackHours)+"h ceiling, so no re-scan will ever run on that cadence; "+
-			"a renewal whose fsnotify event never arrived, and an /input watch silently dropped by an unmount or remount, then wait for the watcher's slower "+
-			"full-tree reconciliation instead (the startup line's scan_floor names it, and the health-marker freshness deadline is derived from it)",
-			"hours", maxFallbackHours,
-			"remediation", "set FALLBACK_SCAN_HOURS to a real cadence (unset it for the 6h default) if a missed renewal should be recovered on your own cadence rather than on the reconciliation floor")
-		return
-	}
 	if floor := watch.MarkerRefreshFloor(interval); interval > floor {
-		// Same state as the ceiling arm above, reached by any cadence between
-		// the reconciliation floor and the clamp: the safety-net timer always
-		// arms with the smaller of the configured cadence and the floor
-		// (watch.safetyNetIntervalFor), so this cadence never fires and the
-		// floor's walk runs instead — more often than the operator asked for.
+		// One record for every cadence the floor overrides, the clamped ceiling
+		// included. There used to be a second arm ahead of this one that named the
+		// ceiling specifically; it was deleted (2026-08, user-ratified) because the
+		// two described ONE state and this one describes it correctly. The subset is
+		// total: parseFallbackInterval clamps every larger value to exactly
+		// maxFallbackHours, and the floor is well below that, so an at-ceiling
+		// interval satisfies this guard too. The ceiling arm's wording was also the
+		// weaker of the two — it borrowed the 0/false arm's "waits for the slower
+		// reconciliation" framing, when at the ceiling the floor's walk runs far MORE
+		// often than the cadence that was configured, which is what this record says.
+		//
+		// The safety-net timer always arms with the smaller of the configured cadence
+		// and the floor (watch.safetyNetIntervalFor), so this cadence never fires.
 		// The pair is rendered by watch.CoverageAttrs, the one home for its keys and
-		// both renderings; identical bytes here, because this arm's guard makes the
-		// interval positive (so the label renders interval.String()) and floor is
-		// already watch.MarkerRefreshFloor(interval).
+		// both renderings; this arm's guard makes the interval positive (so the label
+		// renders interval.String()) and floor is already
+		// watch.MarkerRefreshFloor(interval).
+		//
+		// A value clamped TO the ceiling still gets its own "too large, clamping"
+		// record from warnFallbackRepaired naming max_hours, so that fact is reported
+		// where it belongs and is not this arm's to carry.
 		attrs := append(watch.CoverageAttrs(interval),
 			"remediation", "set FALLBACK_SCAN_HOURS at or below the floor's hours if the cadence should be yours, or leave it as is: coverage is unaffected")
 		slog.Warn("FALLBACK_SCAN_HOURS is above the watcher's reconciliation floor, so no re-scan will ever run on your configured cadence; "+

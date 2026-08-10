@@ -1076,7 +1076,7 @@ func TestStoreInspect_regenerates_an_oversized_prior(t *testing.T) {
 	s := newOutputStore(t, dir)
 
 	logs := captureLogs(t)
-	current, err := inspectCurrent(t.Context(), s, "big.pfx", &convert.Analysis{}, convert.EncNameModern2023, "pw")
+	current, err := inspectCurrent(t.Context(), s, "big.pfx", convert.Analysis{}, convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("inspect(oversized prior) = error %v, want nil: it must resolve to stale, not fail the pair", err)
 	}
@@ -1252,7 +1252,7 @@ func TestStoreInspect_propagates_a_shutdown_instead_of_reporting_stale(t *testin
 }
 
 // mustEncode encodes analysis with the suite's standard profile and password.
-func mustEncode(t *testing.T, analysis *convert.Analysis) []byte {
+func mustEncode(t *testing.T, analysis convert.Analysis) []byte {
 	t.Helper()
 	pfx, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
 	if err != nil {

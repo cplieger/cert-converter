@@ -246,13 +246,27 @@ type Observation struct {
 // Analyse's invariant hold — no caller can swap the leaf, reorder the chain or
 // null the key and hand the result back to Encode or CheckCurrency.
 //
-// Analyse returns a *Analysis and never mutates one afterwards: Encode,
+// Analyse returns an Analysis BY VALUE and never mutates one afterwards: Encode,
 // CheckCurrency and matchesAnalysis all read it and none writes to it, so the
-// value is safe to share and to hand back to the codec unchanged. Callers hold the
-// pointer rather than a copy because the struct is large enough that copying it
-// per call is wasteful (gocritic hugeParam), and because Observations is a pointer
-// method — a value return could not be consumed through the type's own only
-// exported method without being bound to a variable first.
+// value is safe to share and to hand back to the codec unchanged.
+//
+// The value return IS the nil half of the invariant, held by construction rather
+// than by checking: there is no nil *Analysis for a consumer to be handed, so the
+// codec's entry points carry no nil arm and a caller's own Observations() call
+// cannot dereference nothing. The cost is a 96-byte copy per codec call, which
+// gocritic's hugeParam flags and an explained //nolint accepts at each of those
+// sites — a pointer parameter there would reopen exactly the case this shape
+// exists to close, to save a copy that is noise beside a PKCS#12 encode or decode.
+//
+// The LEAF half is not structural and is not pretended to be. The fields are
+// unexported, so no other package can build a populated Analysis, but
+// convert.Analysis{} stays constructible everywhere; a validity flag would only be
+// the same runtime check wearing a type's clothes. It is therefore stated ONCE, as
+// an assertion where analyseAt builds the value, and nowhere else — no consumer
+// re-checks it.
+//
+// Observations keeps a pointer receiver so a caller's addressable value calls it
+// without copying the struct.
 type Analysis struct {
 	// leaf is the end-entity certificate the PFX is built around.
 	leaf *x509.Certificate
@@ -336,7 +350,7 @@ func (a *Analysis) Observations() []Observation {
 // mid-reduction. Everything past this line is a pure function of the input plus
 // that one instant, which is what lets analyseAt reproduce a validity or
 // tie-break decision at an exact moment instead of near it.
-func Analyse(ctx context.Context, certPEM, keyPEM []byte) (*Analysis, error) {
+func Analyse(ctx context.Context, certPEM, keyPEM []byte) (Analysis, error) {
 	return analyseAt(ctx, certPEM, keyPEM, time.Now())
 }
 
@@ -347,10 +361,10 @@ func Analyse(ctx context.Context, certPEM, keyPEM []byte) (*Analysis, error) {
 // surface to hand one in would invite exactly that.
 //
 // ctx carries Analyse's cancellation contract unchanged.
-func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (*Analysis, error) {
+func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (Analysis, error) {
 	in, err := prepareAnalysisInput(certPEM, keyPEM)
 	if err != nil {
-		return nil, err
+		return Analysis{}, err
 	}
 	certs, obs := in.certs, in.observations
 
@@ -362,15 +376,15 @@ func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (*Ana
 	// marker on a container that was only asked to stop.
 	g := newCertGraph(ctx, certs, now)
 	if g.cancelErr != nil {
-		return nil, fmt.Errorf("analyse cancelled: %w", g.cancelErr)
+		return Analysis{}, fmt.Errorf("analyse cancelled: %w", g.cancelErr)
 	}
 
 	identity, tieObs, err := g.selectIdentity(in.signers, in.keyIssues, in.certIssues)
 	if g.cancelErr != nil {
-		return nil, fmt.Errorf("analyse cancelled: %w", g.cancelErr)
+		return Analysis{}, fmt.Errorf("analyse cancelled: %w", g.cancelErr)
 	}
 	if err != nil {
-		return nil, err
+		return Analysis{}, err
 	}
 	obs = append(obs, tieObs...)
 
@@ -387,10 +401,10 @@ func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (*Ana
 	// oversizedIssuerError, which reasons over the graph and holds no input record.
 	path := g.pathFrom(identity.cert)
 	if g.cancelErr != nil {
-		return nil, fmt.Errorf("analyse cancelled: %w", g.cancelErr)
+		return Analysis{}, fmt.Errorf("analyse cancelled: %w", g.cancelErr)
 	}
 	if err := g.oversizedIssuerError(path); err != nil {
-		return nil, errors.New(appendCertIssues(
+		return Analysis{}, errors.New(appendCertIssues(
 			err.Error()+in.keyIssues.suffix(), in.certIssues))
 	}
 
@@ -406,7 +420,7 @@ func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (*Ana
 	// the CA, so the operator lands here and is told to remove certificates from a
 	// bundle that is fine while the unreadable key block goes unmentioned.
 	if g.isIssuer(identity.cert) {
-		return nil, errors.New(appendCertIssues(fmt.Sprintf(
+		return Analysis{}, errors.New(appendCertIssues(fmt.Sprintf(
 			"the private key matches %q, which is an issuer of another certificate in this bundle, not an end-entity certificate; if you meant to export that CA itself, remove the certificates it issued from the bundle%s",
 			subjectForLog(leaf), in.keyIssues.suffix()), in.certIssues))
 	}
@@ -432,16 +446,38 @@ func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (*Ana
 	obs = append(obs, chainIssuerEligibilityObservations(chain)...)
 
 	if g.cancelErr != nil {
-		return nil, fmt.Errorf("analyse cancelled: %w", g.cancelErr)
+		return Analysis{}, fmt.Errorf("analyse cancelled: %w", g.cancelErr)
 	}
 
-	return &Analysis{
+	a := Analysis{
 		leaf:         leaf,
 		chain:        chain,
 		key:          in.signers[identity.key],
 		extra:        extra,
 		observations: obs,
-	}, nil
+	}
+	// The ONE statement of the leaf invariant, at the producer. It replaces the two
+	// consumer checks Encode and decoded.matchesAnalysis used to carry, which is the
+	// whole point: one statement here, none downstream.
+	//
+	// An assertion rather than a returned error because no input reaches it. leaf is
+	// certs[identity.cert]; selectIdentity only ever names an index into that slice,
+	// and prepareAnalysisInput admits only certificates x509.ParseCertificate
+	// returned. A nil here therefore means this function was edited into
+	// incorrectness, not that an operator supplied something odd — assert an internal
+	// invariant, validate untrusted input, and the untrusted PEM bytes were validated
+	// upstream. It is O(1) and it is total: every path that hands a caller an
+	// Analysis passes through this line, which is what makes one statement enough.
+	//
+	// It does NOT make a leafless Analysis unrepresentable, and nothing here pretends
+	// otherwise: the fields are unexported, so no other package can populate one, but
+	// convert.Analysis{} stays constructible. A validity flag would only be the
+	// deleted runtime check wearing a type's clothes, so the honest shape is this
+	// assertion plus the contract on Analysis and on the codec's entry points.
+	if a.leaf == nil {
+		panic("convert: analyseAt built an Analysis with no leaf certificate")
+	}
+	return a, nil
 }
 
 // analysisInput is the parsed, deduplicated bundle analyseAt reasons over, plus

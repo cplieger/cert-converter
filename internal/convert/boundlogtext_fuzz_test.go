@@ -38,7 +38,8 @@ func FuzzBoundLogText_bounded_and_loggable(f *testing.F) {
 	f.Add(strings.Repeat("a", maxSubjectLogLen+1))
 	f.Add(strings.Repeat("\u00e9", 4000))
 	// 258 raw bytes of bidi override that sanitize to 86 spaces: over the limit
-	// before sanitizing, comfortably under it after.
+	// before sanitizing, comfortably under it after. THE class the two library
+	// primitives disagree on — the work-bounding one cuts it on the raw bytes.
 	f.Add(strings.Repeat("\u202e", 86))
 	// 200 invalid bytes that sanitize to 600 bytes of U+FFFD: under the limit
 	// before sanitizing, cut after.
@@ -62,17 +63,22 @@ func FuzzBoundLogText_bounded_and_loggable(f *testing.F) {
 			}
 		}
 
-		// The cut is decided on the SANITIZED form, because that is the text which
-		// reaches the log and the only form whose length the bound can promise
-		// anything about: sanitizing rewrites a multi-byte unsafe rune to a one-byte
-		// space and an invalid byte to three bytes, so the raw length predicts
-		// neither the output length nor whether anything was cut.
+		// BOTH lengths decide, because the primitive is the WORK-bounding one
+		// (SanitizeSingleLineBudgeted, user-ratified 2026-08): it pre-caps the RAW
+		// bytes at the limit and then re-caps the growth sanitizing can cause. So raw
+		// over the limit is cut by the pre-cap even when the sanitized form would have
+		// fitted (a run of bidi overrides collapsing to spaces — the class that made
+		// this a user decision), and raw under the limit can still be cut by the
+		// re-cap when sanitizing GROWS the text (an invalid byte becomes the
+		// three-byte U+FFFD). Asserting on the sanitized length alone was the
+		// output-bounding primitive's contract and is wrong for this one.
 		sanitized := runesafe.SanitizeSingleLine(s)
-		if len(sanitized) <= maxSubjectLogLen {
-			// Text that fits is returned sanitized and otherwise untouched: no marker,
-			// no growth, nothing added. Comparing against the library's own output
-			// makes "boundLogText only sanitizes and caps" the assertion, rather than
-			// re-deriving the cut rule the production code just applied.
+		if len(s) <= maxSubjectLogLen && len(sanitized) <= maxSubjectLogLen {
+			// Text that fits on both counts is returned sanitized and otherwise
+			// untouched: no marker, no growth, nothing added. Comparing against the
+			// library's own output makes "boundLogText only sanitizes and caps" the
+			// assertion, rather than re-deriving the cut rule the production code just
+			// applied.
 			if got != sanitized {
 				t.Fatalf("boundLogText(%d bytes) = %q, want the sanitized form %q unchanged",
 					len(s), got, sanitized)

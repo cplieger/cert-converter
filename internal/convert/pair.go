@@ -17,11 +17,21 @@ import (
 // package is a codec and never learns where its input came from or where its
 // output goes.
 //
+// a is taken BY VALUE, which is what removes the nil case rather than checking
+// for it: Analyse hands back a value, so there is no nil *Analysis to arrive here
+// and no nil arm to write. The leaf invariant is stated once at the producer (see
+// analyseAt's assertion) and is not re-checked here; a zero convert.Analysis{},
+// which stays constructible outside this package, is a programming error and is
+// not defended against — see the Analysis doc for why a validity flag was
+// rejected.
+//
 // The bag order the encoder produces is the order Analysis defines: the leaf's
 // bag first, then its chain nearest-parent-first. That is a contract rather than an
 // implementation detail — PKCS#12 stores an ordered SEQUENCE of bags (RFC 7292
 // §4.2) and decoders read it positionally, go-pkcs12's own DecodeChain included.
-func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
+//
+//nolint:gocritic // hugeParam: Analysis is ~96 bytes and taken by value on purpose. A pointer parameter here would reopen the nil case this shape exists to close, to save a copy that is noise beside a PKCS#12 encode.
+func Encode(a Analysis, encName EncoderType, password string) ([]byte, error) {
 	// Defensive, and deliberately NOT redundant with internal/config's
 	// checkPasswordEncodable: both guards are wanted, and neither is the only line
 	// of defence. config.Load refuses all three unencodable shapes at startup,
@@ -33,16 +43,6 @@ func Encode(a *Analysis, encName EncoderType, password string) ([]byte, error) {
 	// caller, this one holds the codec's own contract for every caller.
 	if err := unencodablePasswordError(password); err != nil {
 		return nil, err
-	}
-
-	// An Analysis is only ever produced by Analyse, which returns an error rather
-	// than an incomplete value — but the zero value is constructible, and handing it
-	// to the encoder dereferences a nil *x509.Certificate inside go-pkcs12
-	// (sha1.Sum(certificate.Raw)), killing the process instead of failing one
-	// conversion. The type's own doc promises a caller cannot null the leaf and hand
-	// the value back here; this is what makes that true.
-	if a == nil || a.leaf == nil {
-		return nil, errors.New("analysed pair carries no leaf certificate, so it did not come from Analyse")
 	}
 
 	_, enc := resolvedProfile(encName)
@@ -168,7 +168,12 @@ func (c Currency) Current() bool { return c.Reason == CurrencyMatch }
 // parse or decode failure is reported as a reason rather than as an error return;
 // the caller owns what a reason is worth and, since CheckCurrency takes no context,
 // owns the shutdown classification too. pfx is never mutated.
-func CheckCurrency(pfx []byte, password string, want *Analysis, wantEncoder EncoderType) Currency {
+//
+// want is taken BY VALUE for the reason Encode's doc gives: Analyse returns a
+// value, so no nil can arrive and no nil arm exists to be got wrong.
+//
+//nolint:gocritic // hugeParam: Analysis is ~96 bytes and taken by value on purpose. A pointer parameter here would reopen the nil case this shape exists to close, to save a copy that is noise beside a PKCS#12 decode.
+func CheckCurrency(pfx []byte, password string, want Analysis, wantEncoder EncoderType) Currency {
 	priorProfile, err := inspect(pfx)
 	if err != nil {
 		return Currency{Reason: CurrencyPreflightFailed, Err: boundedTextError{err}}
@@ -248,8 +253,16 @@ func decode(pfx []byte, password string) (decoded, error) {
 // CheckCurrency's second step, which is why the profile check cannot be forgotten
 // by a caller any more: a PFX_ENCODER change reaches the verdict without anyone
 // having to sequence it.
-func (d decoded) matchesAnalysis(a *Analysis) bool {
-	if a == nil || d.Leaf == nil || a.leaf == nil || !bytes.Equal(d.Leaf.Raw, a.leaf.Raw) {
+//
+// a is a value, so there is no nil analysis arm here: the leaf invariant is stated
+// once where analyseAt builds the value. What IS still checked is d.Leaf, the
+// half that comes from a FILE under /output rather than from Analyse — go-pkcs12
+// hands back whatever the bundle held, so a bundle with no leaf bag is ordinary
+// input and answers "not the bundle these inputs produce".
+//
+//nolint:gocritic // hugeParam: Analysis is ~96 bytes and taken by value on purpose, matching CheckCurrency's parameter it is called with; a pointer would reopen the nil case this shape closes.
+func (d decoded) matchesAnalysis(a Analysis) bool {
+	if d.Leaf == nil || !bytes.Equal(d.Leaf.Raw, a.leaf.Raw) {
 		return false
 	}
 	if len(d.CACerts) != len(a.chain) {

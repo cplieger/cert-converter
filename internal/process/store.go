@@ -449,7 +449,13 @@ func (st bundleState) bundleNotProvenWrong() bool {
 // and changes nothing about what is already there (output-dir-write-bit-enforcement,
 // extended to files). When the bundle is next written for a CONTENT reason, that write's
 // fresh inode carries pfxFileMode.
-func (s *store) inspect(ctx context.Context, rel string, want *convert.Analysis,
+//
+// want is a convert.Analysis value, not a pointer: the codec's producer returns a
+// value, so there is no nil analysis to pass on or to check for at this layer
+// either.
+//
+//nolint:gocritic // hugeParam: convert.Analysis is ~96 bytes and passed by value on purpose; a pointer here would reopen the nil case the codec's value shape closes, to save a copy that is noise beside a PKCS#12 decode.
+func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 	wantEncoder convert.EncoderType, password string,
 ) (bundleState, error) {
 	// Asked before the bundle's own lstat so it covers the absent-bundle arm too: the

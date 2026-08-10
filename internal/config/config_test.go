@@ -599,6 +599,12 @@ func TestLoad_warns_when_the_fallback_cadence_is_above_the_reconciliation_floor(
 	}{
 		{"a cadence well above the floor warns", strconv.Itoa(floorHours * 2), true},
 		{"a cadence one hour above the floor warns", strconv.Itoa(floorHours + 1), true},
+		// The clamped ceiling used to have its OWN record ahead of this arm, describing
+		// the same state less accurately; deleting it (2026-08, user-ratified) is only
+		// safe because the ceiling falls through to here, so pin the fallthrough rather
+		// than trusting the subset argument. maxFallbackHours is the clamp, so this row
+		// is also the largest value Load can produce.
+		{"the clamped ceiling falls through to this record", strconv.Itoa(maxFallbackHours), true},
 		{"a cadence at the floor is silent", strconv.Itoa(floorHours), false},
 		{"a cadence one hour below the floor is silent", strconv.Itoa(floorHours - 1), false},
 		{"the opt-out is reported by its own record", "0", false},

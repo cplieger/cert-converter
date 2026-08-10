@@ -842,7 +842,7 @@ func statSize(t *testing.T, path string) int64 {
 
 // mustAnalyse resolves a pair the way the scanner does, for tests that need the analysis
 // only to ask CheckCurrency whether a written bundle matches it.
-func mustAnalyse(t *testing.T, certPEM, keyPEM []byte) *convert.Analysis {
+func mustAnalyse(t *testing.T, certPEM, keyPEM []byte) convert.Analysis {
 	t.Helper()
 	analysis, err := convert.Analyse(t.Context(), certPEM, keyPEM)
 	if err != nil {

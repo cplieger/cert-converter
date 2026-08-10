@@ -150,7 +150,7 @@ func TestBoundLogText_bounds_and_marks(t *testing.T) {
 }
 
 // TestBoundLogText_is_the_library_primitive_with_this_apps_marker pins that
-// boundLogText adds NOTHING to runesafe.SanitizeSingleLineCapped except this app's
+// boundLogText adds NOTHING to runesafe.SanitizeSingleLineBudgeted except this app's
 // marker and limit. Comparing against the library's own output is the assertion,
 // rather than re-deriving the sanitize-cap-mark rule the production code just
 // delegated: a reintroduced local composition — a second cap, a marker appended
@@ -169,19 +169,26 @@ func TestBoundLogText_is_the_library_primitive_with_this_apps_marker(t *testing.
 		in      string
 		wantCut bool
 	}{
-		"empty":                                    {in: ""},
-		"a subject that fits":                      {in: "CN=plain.example.com"},
-		"a subject at the limit":                   {in: strings.Repeat("a", maxSubjectLogLen)},
-		"a subject one byte over":                  {in: strings.Repeat("a", maxSubjectLogLen+1), wantCut: true},
-		"multi-byte runes cut mid-rune":            {in: strings.Repeat("\u2603", 4000), wantCut: true},
-		"invalid bytes that GROW past the limit":   {in: strings.Repeat("\xff", 200), wantCut: true},
-		"unsafe runes that SHRINK under the limit": {in: strings.Repeat("\u202e", 86)},
+		"empty":                                  {in: ""},
+		"a subject that fits":                    {in: "CN=plain.example.com"},
+		"a subject at the limit":                 {in: strings.Repeat("a", maxSubjectLogLen)},
+		"a subject one byte over":                {in: strings.Repeat("a", maxSubjectLogLen+1), wantCut: true},
+		"multi-byte runes cut mid-rune":          {in: strings.Repeat("\u2603", 4000), wantCut: true},
+		"invalid bytes that GROW past the limit": {in: strings.Repeat("\xff", 200), wantCut: true},
+		// THE input class on which the two library primitives diverge, and the reason
+		// this app is on the work-bounding one (user-ratified 2026-08): 86 unsafe runes
+		// are 258 raw bytes that collapse to 86 sanitized. Capped sanitized all 258 first
+		// and returned the 86 whole and unmarked; Budgeted pre-caps the RAW bytes at the
+		// limit, so this is cut and marked. The whole point of the swap is that the work
+		// is bounded by the limit and not by the input, so wantCut is true BY DESIGN here
+		// — if it ever reads false again, boundLogText went back to Capped.
+		"unsafe runes that SHRINK under the limit": {in: strings.Repeat("\u202e", 86), wantCut: true},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			wantText, wantCut := runesafe.SanitizeSingleLineCapped(tc.in, maxSubjectLogLen, logtext.Marker)
+			wantText, wantCut := runesafe.SanitizeSingleLineBudgeted(tc.in, maxSubjectLogLen, logtext.Marker)
 			got := boundLogText(tc.in, maxSubjectLogLen)
 
 			if got != wantText {
