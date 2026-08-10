@@ -285,6 +285,24 @@ func TestNoMatchError_keeps_the_mismatch_sentence_when_any_certificate_was_compa
 	if got.Error() != want {
 		t.Errorf("noMatchError = %q, want %q", got.Error(), want)
 	}
+
+	// The clause is gated on an INDEX, and index 0 is the position a leaf occupies
+	// in a fullchain, so it is the likeliest place for the uncomparable certificate
+	// to sit. With the gate written as a truth test rather than a non-negative test
+	// the clause silently disappears for exactly that bundle and the operator is
+	// told only that nothing matched, with no certificate named.
+	first := &certGraph{certs: []*x509.Certificate{
+		{Subject: pkix.Name{CommonName: "legacy-dsa.example.com"}, PublicKey: testUncomparablePublicKey{}},
+		{Subject: pkix.Name{CommonName: "comparable.example.com"}, PublicKey: &key.PublicKey},
+	}}
+	gotFirst := first.noMatchError(1, 0, keyDefects{}, skippedBlocks{})
+	if gotFirst == nil {
+		t.Fatal("noMatchError(1, 0, keyDefects{}, skippedBlocks{}) = nil, want the mismatch diagnosis")
+	}
+	if gotFirst.Error() != want {
+		t.Errorf("noMatchError with the uncomparable certificate first = %q, want the same trailing clause %q",
+			gotFirst.Error(), want)
+	}
 }
 
 // TestNoMatchError_says_a_key_x509_could_not_read_was_compared_against_nothing

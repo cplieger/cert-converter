@@ -60,8 +60,10 @@ const MaxInputBytes = 10 << 20
 // parseCertChain decodes all CERTIFICATE PEM blocks from pemBytes, returning
 // them in order. Blocks of any other type (the private key of a combined
 // cert+key file, for instance) are skipped, and the "no certificate" diagnostic
-// names the first skipped block's label (bounded) so a swapped cert/key pair is
-// diagnosable from the message alone. Blocks that are neither a certificate nor
+// names a private-key label when the file holds one and otherwise the first skipped
+// block's label (bounded), so a swapped cert/key pair is diagnosable from the
+// message alone even for the combined `openssl ecparam -genkey` shape, whose
+// EC PARAMETERS companion comes first. Blocks that are neither a certificate nor
 // a private key are additionally returned as the second result, so Analyse can
 // report that they were left out of the bundle instead of dropping them
 // silently. Two kinds of label are exempt from that second result: any private-key
@@ -113,7 +115,18 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, skippedBlocks, error)
 	}
 
 	if len(scan.certs) == 0 {
-		if scan.skipped.count > 0 {
+		// The label named is the private-key one when the file holds it, not simply the
+		// first skipped block: `openssl ecparam -genkey` writes EC PARAMETERS IMMEDIATELY
+		// BEFORE the EC PRIVATE KEY it describes, so a key file supplied as the certificate
+		// file named "EC PARAMETERS" — a companion of the key — while the label that
+		// actually diagnoses the mistake went unmentioned. It is the same preference
+		// noPrivateKeyError applies on the key side, for the same reason. The base sentence
+		// stays the prefix, so log matching on it is unaffected.
+		switch {
+		case scan.keyLabels.count > 0:
+			return nil, skippedBlocks{}, fmt.Errorf("no certificate PEM block found (skipped %d non-certificate PEM block(s), including a %q block: this looks like the private key file rather than the certificate file)",
+				scan.skipped.count, scan.keyLabels.firstTypeForLog())
+		case scan.skipped.count > 0:
 			return nil, skippedBlocks{}, fmt.Errorf("no certificate PEM block found (skipped %d non-certificate PEM block(s), first %q)",
 				scan.skipped.count, scan.skipped.firstTypeForLog())
 		}
@@ -129,11 +142,16 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, skippedBlocks, error)
 // keyScan gives parsePrivateKeys.
 //
 // Field order is chosen for pointer-region packing (govet fieldalignment): the
-// slice leads, then the two skippedBlocks whose string leads them.
+// slice leads, then the three skippedBlocks whose string leads them.
 type certScan struct {
 	certs     []*x509.Certificate
 	skipped   skippedBlocks
 	unrelated skippedBlocks
+	// keyLabels are the private-key blocks the certificate file holds. They are
+	// expected passengers of a combined cert+key file, so they are never `unrelated` —
+	// but in a file that yields NO certificate at all they are the label that names the
+	// mistake, so the "no certificate" diagnostic prefers one of these.
+	keyLabels skippedBlocks
 	// ecKeyPresent says whether the file also holds an EC private key, which is what
 	// makes an EC PARAMETERS block in it an expected companion rather than a stray.
 	// It is a property of the whole file, so parseCertChain settles it before the
@@ -147,6 +165,9 @@ type certScan struct {
 func (s *certScan) visit(block *pem.Block) error {
 	if block.Type != pemTypeCertificate {
 		s.skipped.add(block.Type)
+		if isPrivateKeyLabel(block.Type) {
+			s.keyLabels.add(block.Type)
+		}
 		// Only a label naming neither a certificate nor a key companion is reported;
 		// isExpectedCertFilePassenger owns that set.
 		if !isExpectedCertFilePassenger(block.Type, s.ecKeyPresent) {
@@ -292,12 +313,23 @@ func retainedExtensionElements(c *x509.Certificate) int {
 // so the "a key in the certificate file is expected" rule cannot drift from the
 // parser's own set.
 func isExpectedCertFilePassenger(blockType string, ecKeyPresent bool) bool {
+	if isPrivateKeyLabel(blockType) {
+		return true
+	}
+	return blockType == pemTypeECParameters && ecKeyPresent
+}
+
+// isPrivateKeyLabel reports whether a PEM label names a private-key block, the
+// encrypted spellings included. It is the single home of that set because two rules
+// read it and must not diverge: a key block in the CERTIFICATE file is an expected
+// companion (isExpectedCertFilePassenger above), and it is also the label the "no
+// certificate PEM block found" diagnostic names ahead of the first skipped block,
+// because it is the one that says the operator supplied the key file.
+func isPrivateKeyLabel(blockType string) bool {
 	switch blockType {
 	case pemTypePrivateKey, pemTypeRSAPrivateKey, pemTypeECPrivateKey,
 		pemTypeEncryptedPrivateKey:
 		return true
-	case pemTypeECParameters:
-		return ecKeyPresent
 	}
 	return false
 }
@@ -1504,63 +1536,39 @@ type passwordEncodingIssues struct {
 	EmbeddedNUL bool
 }
 
-// passwordEncodingIssue names one shape, or none.
-type passwordEncodingIssue string
-
-// The password shapes passwordEncodingIssues.primary selects between.
-const (
-	passwordEncodesFine passwordEncodingIssue = ""
-	passwordInvalidUTF8 passwordEncodingIssue = "invalid-utf8" //nolint:gosec // G101 false positive: a shape NAME for a diagnostic, not a credential value.
-	passwordNonBMP      passwordEncodingIssue = "non-bmp"
-	passwordEmbeddedNUL passwordEncodingIssue = "embedded-nul"
-)
-
-// primary reports the shape to name when several hold. The ORDER is the
-// contract: internal/config's startup gate and Encode's codec guard both reach
-// it through ValidatePasswordEncoding, so it lives here once rather than as two
-// switches kept aligned by comment.
-func (i passwordEncodingIssues) primary() passwordEncodingIssue {
+// why says why the PKCS#12 UCS-2 password encoding cannot carry this password
+// intact, or "" when it can. It is the single home of BOTH halves of that rule —
+// which shape to name when a password carries several, and the sentence that names
+// it — because there is exactly one consumer of either (ValidatePasswordEncoding,
+// whose error is all internal/config's startup gate and Encode's codec guard ever
+// read), and stating the precedence as the switch order is what stops the two
+// halves from being kept aligned by comment.
+//
+// A newly recognised shape is one bool field on passwordEncodingIssues plus one arm
+// here. Adding the field and forgetting the arm accepts the password — the same
+// single omission the shape-name indirection this replaced already had at its own
+// primary() arm, whose fail-closed default in explain() only covered the narrower
+// mistake of minting a constant and forgetting its text.
+//
+// Never names the password value; these texts reach the log.
+func (i passwordEncodingIssues) why() string {
 	switch {
 	case i.InvalidUTF8:
-		return passwordInvalidUTF8
-	case i.NonBMP:
-		return passwordNonBMP
-	case i.EmbeddedNUL:
-		return passwordEmbeddedNUL
-	}
-	return passwordEncodesFine
-}
-
-// explain says why a shape cannot survive the PKCS#12 UCS-2 password encoding and
-// what to do about it, or "" for a password that encodes faithfully. It is the
-// single home of that wording: Encode's codec guard and internal/config's startup
-// gate both refuse on a non-empty ValidatePasswordEncoding result, so neither
-// re-enumerates the shapes and a new shape lands once. Never names the password
-// value; these texts reach the log.
-func (s passwordEncodingIssue) explain() string {
-	switch s {
-	case passwordEncodesFine:
-		return ""
-	case passwordInvalidUTF8:
 		return "is not valid UTF-8, so the PKCS#12 UCS-2 password encoding would " +
 			"replace every invalid byte with U+FFFD and protect the bundle with a " +
 			"different, lower-entropy password than the one supplied; supply a text " +
 			"secret (for example base64) instead of raw binary bytes"
-	case passwordNonBMP:
+	case i.NonBMP:
 		return "contains a character outside the Basic Multilingual Plane, which the " +
 			"PKCS#12 UCS-2 password encoding cannot represent, so every encode would " +
 			"fail; choose a password made of BMP characters (ASCII is safest)"
-	case passwordEmbeddedNUL:
+	case i.EmbeddedNUL:
 		return "contains a NUL byte, and PKCS#12 passwords are NUL-terminated, so no " +
 			"consumer that builds the terminated BMPString itself could open the bundle " +
 			"with the password supplied; strip NUL bytes from the secret (a UTF-16 or " +
 			"NUL-padded secret file is the usual cause)"
 	}
-	// Fail CLOSED for a shape this wording does not cover: a non-empty result is a
-	// refusal, so a future recognised shape is refused by both consumers until its
-	// text is added here, instead of being accepted by fallthrough at either.
-	return fmt.Sprintf("carries encoding shape %q, which this app cannot prove the "+
-		"PKCS#12 UCS-2 password encoding carries intact", s)
+	return ""
 }
 
 // inspectPasswordEncoding reports how a PFX password fares under the PKCS#12
@@ -1599,7 +1607,7 @@ func inspectPasswordEncoding(password string) passwordEncodingIssues {
 // and each caller adds its own framing (internal/config wraps it with
 // ErrUnencodablePassword, the codec guard prefixes "pfx password").
 func ValidatePasswordEncoding(password string) error {
-	if why := inspectPasswordEncoding(password).primary().explain(); why != "" {
+	if why := inspectPasswordEncoding(password).why(); why != "" {
 		return errors.New(why)
 	}
 	return nil

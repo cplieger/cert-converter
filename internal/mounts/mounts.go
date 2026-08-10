@@ -1,7 +1,8 @@
 // Package mounts verifies the container's required volumes at startup -- each one
 // exists as a directory the running UID can open -- and probes the output volume
-// for write access, before any scan runs. It is startup-only: the handles it opens
-// are released by Roots.Close, and internal/process opens its own roots per scan.
+// for write access, before any scan runs. It is startup-only: the /input handle is
+// released as soon as it has proved the mount openable, the /output handle is
+// released by Roots.Close, and internal/process opens its own roots per scan.
 package mounts
 
 import (
@@ -30,31 +31,36 @@ const (
 	roleOutput = "output"
 )
 
-// Roots holds the confined handles Open opened to prove each required mount
-// usable. The handle is what any FURTHER check on that mount runs against, so the
-// check inspects the same object the guard inspected instead of re-resolving the
-// path and testing whatever it resolves to the second time. The caller owns them
-// and releases the set with Close.
+// Roots holds the confined handle Open KEPT open past the guard: /output, because the
+// write probe runs against it, so the probe inspects the same object the guard inspected
+// instead of re-resolving the path and testing whatever it resolves to the second time.
+// /input has no such check -- internal/process opens its own root per scan -- so its
+// handle is released inside Open rather than held here with no reader. The caller owns
+// this one and releases it with Close.
 type Roots struct {
-	Input, Output *os.Root
+	Output *os.Root
 }
 
 // Open verifies every required mount already exists as a directory and can be
 // opened by the running UID. It reports every offender in one startup attempt and
 // never creates a missing mount in the container's ephemeral layer. Output write
 // access is checked separately by WarnOutputNotWritable, which runs against the
-// handles returned here.
+// handle returned here.
 //
-// On success it returns both roots open. On refusal it closes everything it
-// opened and returns no handles, so a caller that ignores the returned value on
-// the failure path cannot leak one.
+// On success it returns the /output root open; the /input handle is released here,
+// because nothing further checks that mount at startup. On refusal it closes
+// everything it opened and returns no handles, so a caller that ignores the
+// returned value on the failure path cannot leak one.
 func Open(dirs Paths) (Roots, bool) {
 	var open Roots
 	ready := true
 	// Both volumes are inspected before any refusal, so one startup attempt
 	// names every offender.
+	// The input handle has done its whole job once it proves the mount openable, so it
+	// is released here: nothing further checks /input at startup, and a per-scan read
+	// goes through internal/process's own confined root.
 	if root, ok := openMount(roleInput, dirs.Input); ok {
-		open.Input = root
+		closeRoot(root, roleInput)
 	} else {
 		ready = false
 	}
@@ -73,6 +79,16 @@ func Open(dirs Paths) (Roots, bool) {
 // openMount inspects one required volume and returns its confined handle. On
 // refusal it has already logged that offender at ERROR with the remediation its
 // cause calls for, so Open can carry on and name the rest of them.
+//
+// The Stat-then-IsDir gate is load-bearing and must stay AHEAD of the open, not
+// be folded into the open's error: os.OpenRoot opens the path before it checks
+// the fstat, so a FIFO (or a character device that blocks on open) at this mount
+// path blocks in open(2) forever rather than returning ENOTDIR. Startup has no
+// signal handler yet, so that hangs the container with no record, no health
+// marker and no exit code. os.Stat cannot block on either, which is why the type
+// is decided from it. Both remedies below ARE recoverable from the os.OpenRoot
+// error alone (fs.ErrNotExist, "not a directory"), so the diagnostic argument is
+// not what keeps this Stat here.
 func openMount(role, path string) (*os.Root, bool) {
 	fi, statErr := os.Stat(path)
 	if statErr == nil && fi.IsDir() {
@@ -98,22 +114,23 @@ func openMount(role, path string) (*os.Root, bool) {
 	return nil, false
 }
 
-// Close releases the confined handles Open returned. It tolerates a zero Roots,
-// so the refusal path can defer it unconditionally. A close failure on a handle
-// the process is finished with gives an operator nothing to act on, so it goes to
-// Debug rather than a WARN they would have to triage.
+// Close releases the confined handle Open returned. It tolerates a zero Roots,
+// so the refusal path can defer it unconditionally.
 func (r Roots) Close() {
-	for _, vol := range []struct {
-		root *os.Root
-		role string
-	}{{r.Input, roleInput}, {r.Output, roleOutput}} {
-		if vol.root == nil {
-			continue
-		}
-		if err := vol.root.Close(); err != nil {
-			slog.Debug("failed to close a required volume's handle",
-				"role", vol.role, "path", vol.root.Name(), "error", err)
-		}
+	closeRoot(r.Output, roleOutput)
+}
+
+// closeRoot releases one confined handle. A nil handle is a no-op, so both the refusal
+// path and a zero Roots can call it unconditionally. A close failure on a handle the
+// process is finished with gives an operator nothing to act on, so it goes to Debug
+// rather than a WARN they would have to triage.
+func closeRoot(root *os.Root, role string) {
+	if root == nil {
+		return
+	}
+	if err := root.Close(); err != nil {
+		slog.Debug("failed to close a required volume's handle",
+			"role", role, "path", root.Name(), "error", err)
 	}
 }
 

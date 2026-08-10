@@ -193,7 +193,7 @@ type Options struct {
 	Password  string
 	// MaxScanEntries is how many entries one scan may enumerate in EACH mounted tree
 	// before it refuses that tree (scanbudget.Default when non-positive): the /input
-	// walk (scanWalk.maxEntries) and the /output orphan walk (outputWalk.maxEntries)
+	// walk (scanWalk.budget) and the /output orphan walk (outputWalk.budget)
 	// each get the same ceiling, applied per tree rather than shared, because both are
 	// mounts this app does not own and either one can be made large by whoever can write
 	// to it. It is INJECTED rather than read from internal/config here: that package owns
@@ -265,7 +265,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		password:     s.opts.Password,
 		enc:          s.opts.Encoder,
 		seen:         make(map[string]struct{}),
-		maxEntries:   s.opts.MaxScanEntries,
+		budget:       scanbudget.NewCounter(s.opts.MaxScanEntries),
 	}
 	// Protect the wholeness this walk establishes from the observation log's own
 	// eviction: an eviction's victim is arbitrary, so without this window a pair markWhole
@@ -384,16 +384,12 @@ type scanWalk struct {
 	// one may hide certificates, so `seen` is NOT a complete enumeration of the
 	// input tree afterwards. countResults folds it into ScanResult.Unresolved.
 	unresolved int
-	// entries counts every path this walk has been handed, including directories and
-	// entries it could not read. It is the accounting behind the entry budget: the cap is
-	// about how much of an untrusted tree one scan takes on, so it counts what the walk
-	// TOUCHED rather than what it converted.
-	entries int
-	// maxEntries is this walk's entry budget, injected from Options.MaxScanEntries.
-	// Non-positive means "use scanbudget.Default" (scanbudget.Effective), so a scanWalk
-	// assembled without one — the package's own focused tests do this — is bounded
-	// rather than unbounded.
-	maxEntries int
+	// budget is this walk's entry ceiling and its charge counter, injected from
+	// Options.MaxScanEntries. scanbudget.Counter owns the rule (charge once per
+	// enumerated path, below the error arm) for every walk in this app; the zero value
+	// is bounded, so a scanWalk assembled without one — the package's own focused tests
+	// do this — is still bounded rather than unbounded.
+	budget scanbudget.Counter
 }
 
 // visit is the walk's per-entry callback (atomicfile.WalkDirInRoot). The context is
@@ -451,12 +447,11 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 	// root's failed Stat is the only error visit for an uncharged path, and it returns
 	// without converting anything. Returning an error aborts the walk, which is what
 	// keeps `seen` from being read as a complete enumeration downstream.
-	sw.entries++
-	if budget := scanbudget.Effective(sw.maxEntries); sw.entries > budget {
+	if !sw.budget.Charge() {
 		slog.Warn(scanBudgetMsg,
-			"path", rel, "entries", sw.entries, "limit", budget,
+			"path", rel, "entries", sw.budget.Count(), "limit", sw.budget.Max(),
 			"remediation", scanBudgetRemediation)
-		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.entries, rel)
+		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.budget.Count(), rel)
 	}
 	if d.IsDir() {
 		// A directory occupying a <name>.crt path is a certificate the scan cannot
@@ -1376,7 +1371,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	}
 
 	slog.Debug("converting cert pair", "path", rel)
-	pfxData, err := convert.Encode(analysis, sw.enc, sw.password)
+	pfxData, err := analysis.Encode(sw.enc, sw.password)
 	if err != nil {
 		logConversionObservations(rel, observations)
 		return failEntry(rel, "conversion failed", err)
@@ -1385,7 +1380,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	// The one derivation, after the write, from the two facts this entry resolved: what
 	// the bundle on disk was, and how the write itself ended. The bundle's MODE is not one
 	// of them -- it is reported where it is observed (store.reportLaxBundle) and routes
-	// nothing, which is why bundleState carries only the content fact. Nothing below
+	// nothing, which is why inspect resolves only the content fact. Nothing below
 	// re-decides the outcome; the logging and the observation bookkeeping only read it.
 	outcome = writeOutcome(state, writeErr)
 	if writeErr != nil {
@@ -1417,7 +1412,8 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 
 // writeOutcome derives one entry's conversionStatus, and it is the ONLY place that
 // derivation happens. Its inputs are the two facts this scan resolved independently:
-// what this app learned about the bundle already on disk (state.content), and — when the
+// what this app learned about the bundle already on disk (the contentState inspect
+// resolved), and — when the
 // write failed — the classification the refusal itself CARRIES (writeRefusal.cause). The
 // bundle's MODE is not one of them: a lax mode is reported and acted on nowhere, so it can
 // neither schedule a write nor reach health. Deriving the status once, after the write, is
@@ -1434,7 +1430,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 // because the bundle those inputs produce is not on disk. Two independent things must
 // BOTH hold before the health-neutral outcome is granted instead:
 //
-//  1. This app never proved the bundle on disk wrong (bundleState.bundleNotProvenWrong):
+//  1. This app never proved the bundle on disk wrong (contentState.bundleNotProvenWrong):
 //     it could not read the bytes at all. A bundle it DID compare and find stale — a
 //     renewal behind, a rotated password, an encoder-profile change, an absent or
 //     non-regular output path — stays a conversion failure whatever refused the write,
@@ -1450,7 +1446,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 // wrong count — the same mistake statusUnreadable exists to avoid on the /input side. The
 // condition is not silence: it carries a standing WARN once per scan and it still blocks
 // orphan reaping (ScanResult.conversionsClean).
-func writeOutcome(state bundleState, writeErr writeRefusal) conversionStatus {
+func writeOutcome(state contentState, writeErr writeRefusal) conversionStatus {
 	switch {
 	case writeErr == nil:
 		return statusConverted
@@ -1475,13 +1471,6 @@ func writeOutcome(state bundleState, writeErr writeRefusal) conversionStatus {
 // nothing compared the bundle left in place.
 const unreplaceableBundleMsg = "prior pfx could not be replaced and the /output condition that refused the write is not one a restart clears; leaving the existing bundle in place, health is unaffected"
 
-// outputVolumeRemediation is the remediation for a write the VOLUME refused rather than
-// ownership: this app may write /output, but the filesystem will not take the bytes.
-// Deliberately not outputPermRemediation — chowning /output frees no space and does not
-// remount it read-write, and an operator sent after the wrong cause reads the WARN as
-// noise.
-const outputVolumeRemediation = "check /output for free space, a quota and a read-only mount"
-
 // reportWriteFailure logs a failed PFX write in the register the DERIVED outcome calls
 // for. It decides nothing — writeOutcome already did — so the count and the log can never
 // disagree about an entry, which is what the previous shape risked by classifying inside
@@ -1503,11 +1492,12 @@ func reportWriteFailure(logRel, pfxRel string, err writeRefusal, outcome convers
 	}
 	// failEntry is called for its LOG: the statusFailed it returns is the same value
 	// writeOutcome already derived, and taking it from there keeps one derivation.
-	// The message is unchanged (an operator's log query keys on it); the remediation names
-	// the two steady-state output-side causes.
+	// The message is unchanged (an operator's log query keys on it); the remediation comes
+	// from the refusal's own carried cause, exactly as the health-neutral arm above takes
+	// it, so a full volume or an /output layout that fails LOUDLY no longer sends the
+	// operator after ownership and a planted symlink.
 	failEntry(logRel, "conversion failed", err, "output_path", pfxRel,
-		"remediation", "check /output ownership and permissions for the UID in user:, "+
-			"and that no symlink is planted at the output path")
+		"remediation", err.cause().remediation())
 }
 
 // logConversionObservations surfaces Analyse's non-fatal findings about a pair's

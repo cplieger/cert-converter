@@ -74,7 +74,7 @@ type conversionStatus int
 // Which write failures take this status instead of statusFailed is derived in exactly
 // one place — writeOutcome, whose doc carries the carve-outs in full. In short: a bundle
 // this app compared and found stale stays statusFailed however the write failed, and a
-// bundle it compared and MATCHED is never written at all (bundleState.upToDate), so a
+// bundle it compared and MATCHED is never written at all (contentState.upToDate), so a
 // lax mode alone can never produce a refusal to classify. Like the two /input members,
 // this status is health-neutral, reported by its own standing WARN, and it blocks
 // orphan reaping.

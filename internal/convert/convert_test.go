@@ -882,12 +882,19 @@ func TestInspectPasswordEncoding_classifies_all_unencodable_shapes(t *testing.T)
 		wantNonBMP      bool
 		wantEmbeddedNUL bool
 	}{
-		"empty":               {password: ""},
-		"plain ASCII":         {password: "correct-horse"},
-		"BMP non-ASCII":       {password: "pässwörd-Ω"},
-		"invalid UTF-8":       {password: string([]byte{0xff, 0xfe}) + "tail", wantInvalidUTF8: true},
-		"non-BMP":             {password: "pw-\U0001F600", wantNonBMP: true},
-		"invalid UTF-8 + BMP": {password: string([]byte{0x80}) + "pw", wantInvalidUTF8: true},
+		"empty":         {password: ""},
+		"plain ASCII":   {password: "correct-horse"},
+		"BMP non-ASCII": {password: "pässwörd-Ω"},
+		"invalid UTF-8": {password: string([]byte{0xff, 0xfe}) + "tail", wantInvalidUTF8: true},
+		"non-BMP":       {password: "pw-\U0001F600", wantNonBMP: true},
+		// The BMP boundary itself. U+FFFF is the last BMP code point, so UCS-2
+		// carries it in one code unit and the password is encodable; U+10000 is the
+		// first that needs a surrogate pair. Every other non-BMP fixture here is
+		// U+1F600, ~125,000 code points past the edge, so an off-by-one in the
+		// comparison refuses a legitimate password at startup with nothing failing.
+		"at the BMP ceiling":       {password: "pw-\uFFFF"},
+		"one past the BMP ceiling": {password: "pw-\U00010000", wantNonBMP: true},
+		"invalid UTF-8 + BMP":      {password: string([]byte{0x80}) + "pw", wantInvalidUTF8: true},
 		"invalid UTF-8 + emoji": {
 			password:        string([]byte{0xff}) + "pw-\U0001F600",
 			wantInvalidUTF8: true,
@@ -1088,51 +1095,45 @@ func TestConvertPair_bounds_the_certificate_subject_it_names(t *testing.T) {
 	}
 }
 
-// TestPasswordEncodingIssue_Explain_words_every_shape_once pins the wording both
+// TestPasswordEncodingIssues_Why_words_every_shape_once pins the wording both
 // refusal channels now share: Encode's codec guard and internal/config's startup
 // gate each contribute only a prefix or a sentinel, so this is the single place the
-// shape's meaning and its remediation are asserted. A shape that encodes faithfully
-// must return "" (the presence check both callers make), and an unrecognised shape
-// must fail CLOSED with a non-empty sentence rather than pass as encodable.
-func TestPasswordEncodingIssue_Explain_words_every_shape_once(t *testing.T) {
+// shape's meaning and its remediation are asserted. A password that encodes
+// faithfully must return "" (the presence check both callers make).
+func TestPasswordEncodingIssues_Why_words_every_shape_once(t *testing.T) {
 	t.Parallel()
 	for name, tc := range map[string]struct {
-		shape           convert.PasswordEncodingIssue
+		shape           convert.PasswordEncodingIssues
 		wantShape       string
 		wantRemediation string
 	}{
 		"invalid UTF-8": {
-			shape:           convert.PasswordInvalidUTF8,
+			shape:           convert.PasswordEncodingIssues{InvalidUTF8: true},
 			wantShape:       "not valid UTF-8",
 			wantRemediation: "supply a text secret",
 		},
 		"non-BMP": {
-			shape:           convert.PasswordNonBMP,
+			shape:           convert.PasswordEncodingIssues{NonBMP: true},
 			wantShape:       "outside the Basic Multilingual Plane",
 			wantRemediation: "choose a password made of BMP characters",
 		},
 		"embedded NUL": {
-			shape:           convert.PasswordEmbeddedNUL,
+			shape:           convert.PasswordEncodingIssues{EmbeddedNUL: true},
 			wantShape:       "contains a NUL byte",
 			wantRemediation: "strip NUL bytes from the secret",
-		},
-		"unrecognised shape fails closed": {
-			shape:           convert.PasswordEncodingIssue("future-shape"),
-			wantShape:       "future-shape",
-			wantRemediation: "cannot prove",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			got := tc.shape.Explain()
+			got := tc.shape.Why()
 			if !strings.Contains(got, tc.wantShape) || !strings.Contains(got, tc.wantRemediation) {
-				t.Errorf("%q.Explain() = %q, want the shape %q and the remediation %q",
+				t.Errorf("%+v.Why() = %q, want the shape %q and the remediation %q",
 					tc.shape, got, tc.wantShape, tc.wantRemediation)
 			}
 		})
 	}
 
-	if got := convert.PasswordEncodesFine.Explain(); got != "" {
+	if got := (convert.PasswordEncodingIssues{}).Why(); got != "" {
 		t.Errorf("PasswordEncodesFine.Explain() = %q, want \"\": both callers treat a non-empty result as a refusal", got)
 	}
 }

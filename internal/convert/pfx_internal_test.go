@@ -30,7 +30,8 @@ func TestEncode_encode_failure_is_wrapped(t *testing.T) {
 	}
 
 	// A nil private key cannot be marshalled to PKCS#8, so the encoder fails.
-	_, err = Encode(Analysis{leaf: certs[0], key: nil}, EncNameModern2023, "pw")
+	broken := Analysis{leaf: certs[0], key: nil}
+	_, err = broken.Encode(EncNameModern2023, "pw")
 	if err == nil {
 		t.Fatal("Encode(nil private key) = nil error, want a wrapped encode error")
 	}
@@ -54,7 +55,7 @@ func TestDecode_bounds_the_library_message(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(analysis, EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -72,23 +73,29 @@ func TestDecode_bounds_the_library_message(t *testing.T) {
 	}
 }
 
-// The codec's entry points take an Analysis BY VALUE, which is what removed
-// Encode's and decoded.matchesAnalysis's nil checks: Analyse returns a value, so
-// no nil can arrive and there is no nil arm left to get wrong.
+// The codec's entry points are METHODS on Analysis with VALUE receivers, and that
+// is what removed Encode's and decoded.matchesAnalysis's nil checks: Analyse hands
+// back a value and a value receiver cannot be nil, so there is no nil to check.
+// Addressability does not enter into it — a value receiver is callable on a
+// non-addressable value too, which is why this shape needs none of the local
+// bindings a pointer receiver would force at a composite literal or a call return.
 //
-// These declarations DOCUMENT that invariant rather than assert it, because under
-// this shape it is a compile-level fact and there is nothing a running test can
-// observe: reintroducing a *Analysis parameter on either entry point stops this
-// file compiling, which is the whole of the check. A runtime test could only
-// construct the nil it is claiming cannot exist.
+// These declarations DOCUMENT that shape rather than assert it, because under it
+// the shape is a compile-level fact and there is nothing a running test can
+// observe: turning either entry point into a free function, or moving either
+// receiver to a POINTER, stops this file compiling, which is the whole of the
+// check. A pointer receiver is the specific regression to catch — it makes
+// `var a *Analysis; a.Encode(...)` compile again, which is the nil this shape
+// exists to make unrepresentable. A runtime test could only construct the nil it
+// is claiming cannot exist.
 //
 // The other half of the invariant — that the value Analyse hands back always
 // carries a leaf — is NOT structural (convert.Analysis{} stays constructible) and
 // is stated once as an assertion in analyseAt. TestAnalyse_always_populates_the_leaf
 // below is its witness.
 var (
-	_ func(Analysis, EncoderType, string) ([]byte, error)  = Encode
-	_ func([]byte, string, Analysis, EncoderType) Currency = CheckCurrency
+	_ func(Analysis, EncoderType, string) ([]byte, error)  = Analysis.Encode
+	_ func(Analysis, []byte, string, EncoderType) Currency = Analysis.CheckCurrency
 )
 
 // TestAnalyse_always_populates_the_leaf witnesses the one place the leaf invariant

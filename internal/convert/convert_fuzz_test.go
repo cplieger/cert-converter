@@ -373,7 +373,7 @@ func FuzzInspect_boundedProfile(f *testing.F) {
 		convert.EncNameLegacyDES,
 		convert.EncNameLegacyRC2,
 	} {
-		pfx, encErr := convert.Encode(analysis, enc, "pw")
+		pfx, encErr := analysis.Encode(enc, "pw")
 		if encErr != nil {
 			f.Fatalf("setup: Encode(%s): %v", enc, encErr)
 		}

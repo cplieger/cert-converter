@@ -15,6 +15,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/mounts"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/process"
+	"github.com/cplieger/cert-converter/internal/scancadence"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/health"
@@ -364,7 +365,7 @@ func TestDispatchArgs_arms_the_marker_lease(t *testing.T) {
 	// Three reconciliation floors: the watcher's own guarantee rather than a
 	// configured value, so it is derived from the same function main arms the probe
 	// with.
-	reconcileLease := 3 * watch.MarkerRefreshFloor(0)
+	reconcileLease := 3 * scancadence.Effective(0)
 
 	for _, tc := range []struct {
 		name          string

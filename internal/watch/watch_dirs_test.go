@@ -179,7 +179,7 @@ func TestVisitWatchPath_applies_the_walk_error_policy(t *testing.T) {
 			}
 			w := New(root, func(context.Context) {}, WithFallback(tc.fallback))
 
-			err := w.visitWatchPath(t.Context(), nil, &watchSetBudget{max: scanbudget.Default, root: root}, path, nil, walkErr)
+			err := w.visitWatchPath(t.Context(), nil, &watchSetBudget{budget: scanbudget.NewCounter(scanbudget.Default), root: root}, path, nil, walkErr)
 
 			if tc.wantFatal {
 				if !errors.Is(err, walkErr) {
@@ -211,7 +211,7 @@ func TestVisitWatchPath_reports_shutdown_ahead_of_a_walk_error(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := w.visitWatchPath(ctx, nil, &watchSetBudget{max: scanbudget.Default, root: root}, filepath.Join(root, "example.com"), nil, errors.New("permission denied"))
+	err := w.visitWatchPath(ctx, nil, &watchSetBudget{budget: scanbudget.NewCounter(scanbudget.Default), root: root}, filepath.Join(root, "example.com"), nil, errors.New("permission denied"))
 
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("visitWatchPath(cancelled ctx, walkErr) = %v, want context.Canceled: shutdown outranks the walk error so Run treats it as a clean stop", err)
@@ -562,5 +562,71 @@ func TestPruneWatches_keeps_a_refused_removal_charged_to_the_mirror(t *testing.T
 	}
 	if got, ok := logs.AttrValue(msg, "error"); !ok || got != refused.Error() {
 		t.Errorf("WARN %q error = %q (present %v), want %q", msg, got, ok, refused.Error())
+	}
+}
+
+// TestResyncWatchSet_removes_stale_registrations_before_it_re_asserts pins the
+// ORDER of the rebuild's second and third phases, which every other
+// resyncWatchSet test is blind to: remove what the preflight no longer wants
+// BEFORE re-asserting what it does. The reason is the shared per-UID
+// fs.inotify.max_user_watches quota: with it already spent, the Add for a
+// replacement directory is refused unless the stale registration this rebuild is
+// about to drop anyway has released its slot first, and a refused Add below the
+// root is WARN-and-skip, so the new certificate directory stays unwatched until a
+// later re-assert -- renewals under it are then detected only by the periodic
+// rescan, and never with FALLBACK_SCAN_HOURS=0.
+//
+// Swapping the two phases leaves the final watch set identical (Add is idempotent
+// and the removal still happens), which is why the sibling tests here cannot see
+// the order at all. The oracle is the live registration set AT THE MOMENT of the
+// removal, read through the removeWatch seam: the desired set contains one
+// directory that is NOT yet registered, so it can only be present there if the
+// re-assert already ran.
+//
+// The driver is the same reachable producer the sibling uses: a tree larger than
+// the walk's entry budget, where a new early-sorting domain pushes the tail out of
+// the next walk while it still exists on disk.
+// Not parallel: it swaps the removeWatch seam and the process-global slog default.
+func TestResyncWatchSet_removes_stale_registrations_before_it_re_asserts(t *testing.T) {
+	capture.Default(t)
+	watcher := newTestWatcher(t)
+	root := t.TempDir()
+	tail := filepath.Join(root, "z.example.com")
+	if err := os.MkdirAll(tail, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	w := New(root, func(context.Context) {}, WithMaxEntries(2))
+
+	w.resyncWatchSet(t.Context(), watcher, "failed to re-sync the watch set")
+	if !slices.Contains(watcher.WatchList(), tail) {
+		t.Fatalf("setup: watch list = %v, want %q registered by the first walk", watcher.WatchList(), tail)
+	}
+
+	// The rebuild now wants `early` registered and `tail` removed.
+	early := filepath.Join(root, "a.example.com")
+	if err := os.MkdirAll(early, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	var atRemoval []string
+	prev := removeWatch
+	removeWatch = func(fw *fsnotify.Watcher, path string) error {
+		if path == tail {
+			atRemoval = fw.WatchList()
+		}
+		return prev(fw, path)
+	}
+	t.Cleanup(func() { removeWatch = prev })
+
+	w.resyncWatchSet(t.Context(), watcher, "failed to re-sync the watch set")
+
+	if atRemoval == nil {
+		t.Fatalf("the rebuild never removed %q; this test needs the state where the preflight drops a live registration", tail)
+	}
+	if slices.Contains(atRemoval, early) {
+		t.Errorf("the rebuild had already registered %q when it removed the stale %q (live registration set at the removal = %v):"+
+			" the remove phase must run FIRST, or with the per-UID inotify quota spent the Add for the replacement directory is refused"+
+			" by a registration this rebuild was about to drop anyway, and that directory stays unwatched until a later re-assert",
+			early, tail, atRemoval)
 	}
 }

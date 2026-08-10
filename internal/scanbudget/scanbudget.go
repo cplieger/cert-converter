@@ -31,3 +31,39 @@ func Effective(n int) int {
 	}
 	return Default
 }
+
+// Counter charges one walk's enumerated entries against a budget. It is the ONE
+// implementation of the MAX_SCAN_ENTRIES enforcement rule, so the app's walks cannot
+// disagree about what the operator's number means.
+//
+// Charge exactly once per ENUMERATED path — what the walk TOUCHED, not what it kept —
+// and charge AFTER the walk's error arm. A tree walk reports a directory it could not
+// finish reading through the callback for that directory's OWN path, which its parent
+// already charged, so charging above the error arm counts one path twice and enforces the
+// operator's ceiling below its configured value. internal/process's two walks honour
+// this; internal/watch's watch-set walk still charges before its error arm.
+//
+// The zero value is usable and bounded: a Counter assembled field by field, which this
+// repo's focused tests do, resolves its ceiling to Default rather than to zero.
+type Counter struct {
+	max     int
+	entries int
+}
+
+// NewCounter resolves an injected budget once: non-positive means Default.
+func NewCounter(limit int) Counter {
+	return Counter{max: Effective(limit)}
+}
+
+// Charge counts one enumerated path and reports whether it is within budget.
+func (c *Counter) Charge() bool {
+	c.entries++
+	return c.entries <= c.Max()
+}
+
+// Count is how many paths have been charged so far, for the refusing walk's own
+// diagnostic; each walk words that record for its own tree.
+func (c *Counter) Count() int { return c.entries }
+
+// Max is the resolved ceiling. It re-resolves so a zero-value Counter is bounded.
+func (c *Counter) Max() int { return Effective(c.max) }

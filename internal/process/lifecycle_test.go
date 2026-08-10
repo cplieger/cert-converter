@@ -781,7 +781,7 @@ func TestStoreInspect_rewrites_on_an_encoder_change(t *testing.T) {
 	dir := t.TempDir()
 	s := newOutputStore(t, dir)
 
-	written, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
+	written, err := analysis.Encode(convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -941,11 +941,11 @@ func TestStoreRemoveOrphan_spares_non_regular_candidate_and_continues(t *testing
 	logs := captureLogs(t)
 	s := newOutputStore(t, dir)
 
-	if removed := s.removeOrphan("stuck.pfx"); removed {
-		t.Errorf("removeOrphan(non-regular candidate) = true, want false: a directory is not a bundle this app wrote")
+	if got := s.removeOrphan("stuck.pfx"); got != reapAttemptRefused {
+		t.Errorf("removeOrphan(non-regular candidate) = %d, want reapAttemptRefused: a directory is not a bundle this app wrote", got)
 	}
-	if removed := s.removeOrphan("reapable.pfx"); !removed {
-		t.Errorf("removeOrphan(regular candidate) = false, want true: a regular orphan must still go")
+	if got := s.removeOrphan("reapable.pfx"); got != reapAttemptRemoved {
+		t.Errorf("removeOrphan(regular candidate) = %d, want reapAttemptRemoved: a regular orphan must still go", got)
 	}
 	if _, statErr := os.Stat(reapable); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Errorf("os.Stat(reapable.pfx) = %v, want fs.ErrNotExist", statErr)
@@ -978,7 +978,7 @@ func TestStoreInspect_rewrites_after_a_password_rotation(t *testing.T) {
 	}
 	s := newOutputStore(t, t.TempDir())
 
-	written, err := convert.Encode(analysis, convert.EncNameModern2023, "old-password")
+	written, err := analysis.Encode(convert.EncNameModern2023, "old-password")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1015,7 +1015,7 @@ func TestStoreInspect_treats_an_undecodable_prior_as_stale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	full, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
+	full, err := analysis.Encode(convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1254,7 +1254,7 @@ func TestStoreInspect_propagates_a_shutdown_instead_of_reporting_stale(t *testin
 // mustEncode encodes analysis with the suite's standard profile and password.
 func mustEncode(t *testing.T, analysis convert.Analysis) []byte {
 	t.Helper()
-	pfx, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1752,9 +1752,9 @@ func TestScanWalk_streams_directories_larger_than_one_read_batch(t *testing.T) {
 		t.Fatalf("WalkDirInRoot(a tree spanning several read batches) = %v, want nil", walkErr)
 	}
 	// The root, every flat entry, the nested directory, and everything inside it.
-	if want := 1 + flat + 1 + deep; sw.entries != want {
+	if want := 1 + flat + 1 + deep; sw.budget.Count() != want {
 		t.Errorf("the walk visited %d entries, want %d: a batched read must reach every entry of every directory exactly once",
-			sw.entries, want)
+			sw.budget.Count(), want)
 	}
 	if sw.unreadable != 0 || sw.unresolved != 0 || sw.vanished != 0 {
 		t.Errorf("the walk reported unreadable=%d unresolved=%d vanished=%d on a clean tree, want zeros",
@@ -1798,10 +1798,10 @@ func TestScanWalk_charges_an_unreadable_directory_once(t *testing.T) {
 	}
 	// The root and the blocked directory: two enumerated paths, two charges. The open
 	// failure visit for "blocked" must add nothing.
-	if want := 2; sw.entries != want {
+	if want := 2; sw.budget.Count() != want {
 		t.Errorf("the walk charged %d entries, want %d: a directory the walk cannot open is"+
 			" reported through visit for a path its parent already charged, so charging there"+
-			" enforces MAX_SCAN_ENTRIES below its configured value", sw.entries, want)
+			" enforces MAX_SCAN_ENTRIES below its configured value", sw.budget.Count(), want)
 	}
 	if sw.unreadable != 1 {
 		t.Errorf("the walk reported unreadable=%d, want 1", sw.unreadable)

@@ -156,7 +156,7 @@ func TestInspect_rejects_an_oversized_safe_bag_identifier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(analysis, EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestInspect_rejects_excessive_iterations_in_every_derivation_location(t *te
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			pfx, err := Encode(analysis, tc.enc, "pw")
+			pfx, err := analysis.Encode(tc.enc, "pw")
 			if err != nil {
 				t.Fatalf("setup: Encode(%s): %v", tc.enc, err)
 			}
@@ -428,7 +428,7 @@ func TestInspect_rejects_more_than_one_shrouded_key_bag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(analysis, EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -492,7 +492,7 @@ func TestInspect_rejects_a_non_v3_pfx_version(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(analysis, EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -520,7 +520,7 @@ func TestInspect_rejects_a_non_zero_encrypted_safe_version(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(analysis, EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -651,7 +651,7 @@ func TestInspect_rejects_a_weaker_pbes2_cipher(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(analysis, EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -790,7 +790,7 @@ func TestInspect_rejects_a_weaker_nested_modern_algorithm(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			pfx, err := Encode(analysis, tc.enc, "pw")
+			pfx, err := analysis.Encode(tc.enc, "pw")
 			if err != nil {
 				t.Fatalf("setup: Encode(%s): %v", tc.enc, err)
 			}
@@ -956,7 +956,7 @@ func TestInspect_rejects_salts_one_byte_below_profile_floor(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			pfx, err := Encode(analysis, tc.enc, "pw")
+			pfx, err := analysis.Encode(tc.enc, "pw")
 			if err != nil {
 				t.Fatalf("setup: Encode(%s): %v", tc.enc, err)
 			}
@@ -1067,7 +1067,7 @@ func TestInspect_rejects_more_safe_bags_than_it_admits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(analysis, EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1133,7 +1133,7 @@ func TestInspect_rejects_a_non_positive_iteration_count(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(analysis, EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1173,7 +1173,7 @@ func TestInspect_rejects_trailing_bytes_after_the_authSafe_content(t *testing.T)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(analysis, EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1205,7 +1205,7 @@ func TestBundleAlgorithms_rejects_wrong_auth_safe_type(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(analysis, EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1384,7 +1384,7 @@ func TestInspect_rejects_malformed_sequence_framing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(analysis, EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1489,7 +1489,7 @@ func TestInspect_rejects_a_malformed_element_in_a_bounded_sequence(t *testing.T)
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(analysis, EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1587,7 +1587,7 @@ func TestInspect_rejects_an_unusable_MAC_identifier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(analysis, EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1735,7 +1735,7 @@ func TestInspect_rejects_iterations_one_below_profile_floor(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			pfx, err := Encode(analysis, tc.enc, "pw")
+			pfx, err := analysis.Encode(tc.enc, "pw")
 			if err != nil {
 				t.Fatalf("setup: Encode(%s): %v", tc.enc, err)
 			}
@@ -1864,7 +1864,7 @@ func TestInspect_routes_every_safe_walk_identifier_through_the_bounded_decoder(t
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			pfx, err := Encode(analysis, tc.enc, "pw")
+			pfx, err := analysis.Encode(tc.enc, "pw")
 			if err != nil {
 				t.Fatalf("setup: Encode(%s): %v", tc.enc, err)
 			}
@@ -1901,7 +1901,7 @@ func TestInspect_refuses_a_bundle_missing_a_required_bag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := Encode(analysis, EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1942,6 +1942,90 @@ func TestInspect_refuses_a_bundle_missing_a_required_bag(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.wantErrText) {
 				t.Errorf("Inspect(%s) = %v, want the refusal to come from the completeness arm naming %q, not a later one",
+					tc.name, err, tc.wantErrText)
+			}
+		})
+	}
+}
+
+// TestInspect_refuses_a_triple_no_profile_emits pins the profile-triple refusal on
+// real bundle bytes, at the one arm of inspect that no other case reaches:
+// profileFor's verdict travelling back out of the preflight.
+//
+// TestProfileFor_requires_all_three_algorithms asserts the mapping in isolation, and
+// every other Inspect case is refused by an earlier guard, so with the preflight no
+// longer consulting the triple on the parse path the whole package stays green.
+// FuzzInspect_boundedProfile cannot catch it either: its acceptance invariant is
+// "the reported profile is one of the four", and a mixed bundle reported as
+// modern2023 satisfies that.
+//
+// Both cases are the ones this package's own docs name as the reason the identity is
+// three-dimensional. A modern MAC and modern certificates over a 3DES-wrapped key is
+// not a bundle any profile emits, and reporting it as modern2023 leaves a weakly
+// protected private key on disk indefinitely, because nothing rewrites a bundle the
+// preflight called ours. An unknown MAC algorithm is the coupling checkMACIterations
+// documents: it hands a MAC it does not recognise the WEAKEST floor (one iteration
+// over an 8-octet salt) and is safe only because profileFor refuses any MAC outside
+// the profiles table later in inspect, before anything derives.
+//
+// Each case asserts profileFor's own wording, because ErrProfileUnknown alone cannot
+// say which arm refused and both mutations are one field away from an accepted
+// bundle.
+func TestInspect_refuses_a_triple_no_profile_emits(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	// sha512 is a digest go-pkcs12 can MAC with and no profile emits.
+	sha512 := asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 3}
+
+	for _, tc := range []struct {
+		name        string
+		wantErrText string
+		mutate      func(*testing.T, *pfxPreamble)
+	}{
+		{
+			name:        "a modern MAC and modern certificates over a 3DES-wrapped key",
+			wantErrText: "key encryption 1.2.840.113549.1.12.1.3",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestShroudedKeyBag(t, p, func(alg *algorithmIdentifier) {
+					alg.Algorithm = rawOID(t, oidPBEWithSHAAnd3KeyTripleDESCBC)
+					alg.Parameters = asn1.RawValue{FullBytes: testASN1Marshal(t, legacyPBEParams{
+						Salt:       testOctetString(t, bytes.Repeat([]byte{0x01}, minLegacySaltBytes)),
+						Iterations: minKDFIterations,
+					})}
+				})
+			},
+		},
+		{
+			name:        "a MAC algorithm no profile emits",
+			wantErrText: "mac 2.16.840.1.101.3.4.2.3",
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				p.MacData.Mac.Algorithm.Algorithm = rawOID(t, sha512)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pfx, err := analysis.Encode(EncNameModern2023, "pw")
+			if err != nil {
+				t.Fatalf("setup: Encode: %v", err)
+			}
+			if _, err := Inspect(pfx); err != nil {
+				t.Fatalf("setup: Inspect(unmodified modern2023 bundle) = %v, want nil", err)
+			}
+			var preamble pfxPreamble
+			testASN1Unmarshal(t, pfx, &preamble)
+			tc.mutate(t, &preamble)
+
+			got, err := Inspect(testASN1Marshal(t, preamble))
+			if !errors.Is(err, ErrProfileUnknown) {
+				t.Fatalf("Inspect(%s) = (%+v, %v), want ErrProfileUnknown", tc.name, got, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrText) {
+				t.Errorf("Inspect(%s) = %v, want the refusal to come from the profile-triple arm naming %q",
 					tc.name, err, tc.wantErrText)
 			}
 		})

@@ -33,7 +33,7 @@ func newOutputStore(t *testing.T, dir string) *store {
 }
 
 // inspectCurrent asks store.inspect the DERIVED question most currency tests care about:
-// does the bundle on disk need no write at all (bundleState.upToDate)? Those tests are
+// does the bundle on disk need no write at all (contentState.upToDate)? Those tests are
 // about what a scan does with an output file, not about the shape of the fact set, so they
 // read better through this than through two lines of destructuring.
 //
@@ -547,11 +547,11 @@ func TestStoreRemoveOrphan_reports_vanished_candidate_and_continues(t *testing.T
 	s := newOutputStore(t, dir)
 	logs := captureLogs(t)
 
-	if removed := s.removeOrphan("vanished.pfx"); removed {
-		t.Errorf("removeOrphan(missing candidate) = true, want false: there was nothing to unlink")
+	if got := s.removeOrphan("vanished.pfx"); got != reapAttemptVanished {
+		t.Errorf("removeOrphan(missing candidate) = %d, want reapAttemptVanished: there was nothing to unlink", got)
 	}
-	if removed := s.removeOrphan("reapable.pfx"); !removed {
-		t.Errorf("removeOrphan(regular candidate) = false, want true: the vanished candidate must not stop the reap")
+	if got := s.removeOrphan("reapable.pfx"); got != reapAttemptRemoved {
+		t.Errorf("removeOrphan(regular candidate) = %d, want reapAttemptRemoved: the vanished candidate must not stop the reap", got)
 	}
 	if _, statErr := os.Stat(reapable); !os.IsNotExist(statErr) {
 		t.Errorf("os.Stat(reapable.pfx) = %v, want a not-exist error: the vanished first candidate must not stop the reap", statErr)
@@ -604,9 +604,9 @@ func TestStoreRemoveOrphan_leaves_a_candidate_it_cannot_recheck(t *testing.T) {
 	s := &store{root: root}
 	logs := captureLogs(t)
 
-	if removed := s.removeOrphan(strings.Repeat("a", 300) + ".pfx"); removed {
-		t.Errorf("removeOrphan(uninspectable candidate) = true, want false: a candidate this app cannot" +
-			" re-check is skipped, never unlinked")
+	if got := s.removeOrphan(strings.Repeat("a", 300) + ".pfx"); got != reapAttemptRefused {
+		t.Errorf("removeOrphan(uninspectable candidate) = %d, want reapAttemptRefused: a candidate this app cannot"+
+			" re-check is skipped, never unlinked", got)
 	}
 	if _, statErr := os.Stat(bundle); statErr != nil {
 		t.Errorf("the bundle was deleted after a re-check this app could not make: %v: doubt about the"+
@@ -663,8 +663,8 @@ func TestStoreRemoveOrphan_reports_a_vanished_nested_candidate_as_a_race(t *test
 	}
 	logs := captureLogs(t)
 
-	if removed := s.removeOrphan("ca1/gone.pfx"); removed {
-		t.Errorf("removeOrphan(vanished nested candidate) = true, want false: the ancestor is gone")
+	if got := s.removeOrphan("ca1/gone.pfx"); got != reapAttemptVanished {
+		t.Errorf("removeOrphan(vanished nested candidate) = %d, want reapAttemptVanished: the ancestor is gone", got)
 	}
 	if got := logs.CountLevel(slog.LevelDebug, vanishedMsg); got != 1 {
 		t.Errorf("removeOrphan(vanished nested candidate) logged %q at DEBUG %d times, want exactly 1: %q",
@@ -1039,9 +1039,9 @@ func TestStoreInspect_treats_a_bundle_it_cannot_read_as_unverified_content(t *te
 		t.Fatalf("inspect(unreadable bundle) = error %v, want nil: an unreadable prior resolves to a fact,"+
 			" not a failed pair", err)
 	}
-	if state.content != contentUnverified {
+	if state != contentUnverified {
 		t.Errorf("inspect(unreadable bundle) content = %v, want contentUnverified: nothing compared these"+
-			" bytes, so calling them current or stale claims evidence this app does not have", state.content)
+			" bytes, so calling them current or stale claims evidence this app does not have", state)
 	}
 	if state.upToDate() {
 		t.Error("inspect(unreadable bundle).upToDate() = true, want false: a bundle this app cannot read is" +
@@ -1096,7 +1096,7 @@ func TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install(t
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -1120,7 +1120,7 @@ func TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install(t
 	}
 	// The content fact the WARN accompanies. The mode is reported and routes nothing,
 	// which is why the currency answer below is unaffected by it.
-	if state.content != contentVerifiedCurrent {
+	if state != contentVerifiedCurrent {
 		t.Errorf("inspect(lax bundle) = %+v, want contentVerifiedCurrent", state)
 	}
 	if !state.upToDate() {
@@ -1200,9 +1200,9 @@ func TestStoreRemoveOrphan_reports_a_refused_unlink_and_keeps_the_candidate(t *t
 	s := newOutputStore(t, dir)
 	logs := captureLogs(t)
 
-	if removed := s.removeOrphan("ca1/gone.pfx"); removed {
-		t.Error("removeOrphan(refused unlink) = true, want false: a bundle still on disk must" +
-			" not be counted as removed, audited as deleted, or have its lone-key report retired")
+	if got := s.removeOrphan("ca1/gone.pfx"); got != reapAttemptRefused {
+		t.Errorf("removeOrphan(refused unlink) = %d, want reapAttemptRefused: a bundle still on disk must"+
+			" not be counted as removed, audited as deleted, or have its lone-key report retired", got)
 	}
 	if _, statErr := os.Stat(bundle); statErr != nil {
 		t.Errorf("the bundle is gone after a refused unlink: %v", statErr)
@@ -1288,8 +1288,8 @@ func TestStoreInspect_classifies_a_read_that_found_nothing_as_verified_stale(t *
 				t.Fatalf("inspect(read %v) = error %v, want nil: a rewrite is the remedy, not a failed pair",
 					tc.readErr, err)
 			}
-			if state.content != tc.want {
-				t.Errorf("inspect(read %v).content = %v, want %v", tc.readErr, state.content, tc.want)
+			if state != tc.want {
+				t.Errorf("inspect(read %v) = %v, want %v", tc.readErr, state, tc.want)
 			}
 			if state.upToDate() {
 				t.Error("inspect(a bundle it could not read).upToDate() = true, want false: a bundle" +
@@ -1298,7 +1298,7 @@ func TestStoreInspect_classifies_a_read_that_found_nothing_as_verified_stale(t *
 			if got := writeOutcome(state, refused); got != tc.outcome {
 				t.Errorf("writeOutcome(%v, refused) = %v, want %v: an absent or non-regular output path"+
 					" stays a conversion failure however the write failed, while a bundle this app could"+
-					" not verify at all is health-neutral", state.content, got, tc.outcome)
+					" not verify at all is health-neutral", state, got, tc.outcome)
 			}
 			if got := logs.CountLevel(slog.LevelWarn, unreadableMsg); got != 1 {
 				t.Errorf("inspect(read %v) logged %q at WARN %d times, want exactly 1: %q",

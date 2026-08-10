@@ -17,9 +17,10 @@ import (
 // package is a codec and never learns where its input came from or where its
 // output goes.
 //
-// a is taken BY VALUE, which is what removes the nil case rather than checking
-// for it: Analyse hands back a value, so there is no nil *Analysis to arrive here
-// and no nil arm to write. The leaf invariant is stated once at the producer (see
+// The receiver is a POINTER, which is what removes the nil case rather than
+// checking for it: Analyse hands back a value, so a caller invokes this on its own
+// addressable Analysis, there is no nil *Analysis to arrive here and no nil arm to
+// write — at no copy. The leaf invariant is stated once at the producer (see
 // analyseAt's assertion) and is not re-checked here; a zero convert.Analysis{},
 // which stays constructible outside this package, is a programming error and is
 // not defended against — see the Analysis doc for why a validity flag was
@@ -29,9 +30,7 @@ import (
 // bag first, then its chain nearest-parent-first. That is a contract rather than an
 // implementation detail — PKCS#12 stores an ordered SEQUENCE of bags (RFC 7292
 // §4.2) and decoders read it positionally, go-pkcs12's own DecodeChain included.
-//
-//nolint:gocritic // hugeParam: Analysis is ~96 bytes and taken by value on purpose. A pointer parameter here would reopen the nil case this shape exists to close, to save a copy that is noise beside a PKCS#12 encode.
-func Encode(a Analysis, encName EncoderType, password string) ([]byte, error) {
+func (a Analysis) Encode(encName EncoderType, password string) ([]byte, error) { //nolint:gocritic // hugeParam: a value receiver keeps a nil Analysis unrepresentable at the codec boundary; the 96-byte copy is noise beside the PBKDF2 that follows it.
 	// Defensive, and deliberately NOT redundant with internal/config's
 	// checkPasswordEncodable: both guards are wanted, and neither is the only line
 	// of defence. config.Load refuses all three unencodable shapes at startup,
@@ -142,8 +141,8 @@ type Currency struct {
 // Current reports whether the existing bundle needs no rewrite.
 func (c Currency) Current() bool { return c.Reason == CurrencyMatch }
 
-// CheckCurrency reports whether pfx is already the bundle want would produce
-// under wantEncoder, and when it is not, why.
+// CheckCurrency reports whether pfx is already the bundle this analysis would
+// produce under wantEncoder, and when it is not, why.
 //
 // This is the entire read-back side of the codec behind one call, deliberately.
 // Reading an existing bundle safely has a mandatory ORDER:
@@ -156,7 +155,7 @@ func (c Currency) Current() bool { return c.Reason == CurrencyMatch }
 //  2. the profile comparison, before any derivation, so a deliberate
 //     PFX_ENCODER change is answered without decrypting anything;
 //  3. the decode, whose derivation counts step 1 has now bounded;
-//  4. the comparison against want.
+//  4. the comparison against the analysis the method is called on.
 //
 // That order is a safety invariant of the codec, not a convention for callers to
 // remember: a consumer reaching for the decode alone would run an unbounded
@@ -169,11 +168,10 @@ func (c Currency) Current() bool { return c.Reason == CurrencyMatch }
 // the caller owns what a reason is worth and, since CheckCurrency takes no context,
 // owns the shutdown classification too. pfx is never mutated.
 //
-// want is taken BY VALUE for the reason Encode's doc gives: Analyse returns a
-// value, so no nil can arrive and no nil arm exists to be got wrong.
-//
-//nolint:gocritic // hugeParam: Analysis is ~96 bytes and taken by value on purpose. A pointer parameter here would reopen the nil case this shape exists to close, to save a copy that is noise beside a PKCS#12 decode.
-func CheckCurrency(pfx []byte, password string, want Analysis, wantEncoder EncoderType) Currency {
+// The receiver is a POINTER for the reason Encode's doc gives: Analyse returns a
+// value, so a caller invokes this on its own addressable Analysis, no nil can
+// arrive and no nil arm exists to be got wrong — at no copy.
+func (a Analysis) CheckCurrency(pfx []byte, password string, wantEncoder EncoderType) Currency { //nolint:gocritic // hugeParam: same reason as Encode — the value receiver IS the no-nil guarantee.
 	priorProfile, err := inspect(pfx)
 	if err != nil {
 		return Currency{Reason: CurrencyPreflightFailed, Err: boundedTextError{err}}
@@ -186,7 +184,7 @@ func CheckCurrency(pfx []byte, password string, want Analysis, wantEncoder Encod
 	if err != nil {
 		return Currency{Reason: CurrencyDecodeFailed, Err: err}
 	}
-	if !prior.matchesAnalysis(want) {
+	if !prior.matchesAnalysis(a) {
 		return Currency{Reason: CurrencyContentMismatch}
 	}
 	return Currency{Reason: CurrencyMatch}
@@ -254,15 +252,15 @@ func decode(pfx []byte, password string) (decoded, error) {
 // by a caller any more: a PFX_ENCODER change reaches the verdict without anyone
 // having to sequence it.
 //
-// a is a value, so there is no nil analysis arm here: the leaf invariant is stated
-// once where analyseAt builds the value. What IS still checked is d.Leaf, the
-// half that comes from a FILE under /output rather than from Analyse — go-pkcs12
-// hands back whatever the bundle held, so a bundle with no leaf bag is ordinary
-// input and answers "not the bundle these inputs produce".
-//
-//nolint:gocritic // hugeParam: Analysis is ~96 bytes and taken by value on purpose, matching CheckCurrency's parameter it is called with; a pointer would reopen the nil case this shape closes.
-func (d decoded) matchesAnalysis(a Analysis) bool {
-	if d.Leaf == nil || !bytes.Equal(d.Leaf.Raw, a.leaf.Raw) {
+// Neither side has a nil arm. a is the caller's own addressable Analysis, reached
+// through CheckCurrency's pointer receiver, so the analysis leaf invariant is
+// stated once where analyseAt builds it. d comes from decode, and go-pkcs12
+// v0.7.3 refuses a bundle whose bags hold no certificate itself — DecodeChain
+// returns "pkcs12: certificate missing" (pkcs12.go:493-495) — so a leafless
+// bundle is answered by CurrencyDecodeFailed, with the decode error in the
+// caller's diagnostic, before this comparison is reached.
+func (d decoded) matchesAnalysis(a Analysis) bool { //nolint:gocritic // hugeParam: reached only from CheckCurrency, which already holds the value.
+	if !bytes.Equal(d.Leaf.Raw, a.leaf.Raw) {
 		return false
 	}
 	if len(d.CACerts) != len(a.chain) {

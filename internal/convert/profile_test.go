@@ -38,7 +38,7 @@ func TestInspect_identifies_every_profile_we_emit(t *testing.T) {
 	} {
 		t.Run(string(want), func(t *testing.T) {
 			t.Parallel()
-			pfx, err := convert.Encode(analysis, want, "pw")
+			pfx, err := analysis.Encode(want, "pw")
 			if err != nil {
 				t.Fatalf("Encode(%s) = %v, want nil", want, err)
 			}
@@ -69,7 +69,7 @@ func TestInspect_refuses_a_bundle_with_appended_bytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	good, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
+	good, err := analysis.Encode(convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}

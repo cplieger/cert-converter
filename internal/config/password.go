@@ -426,23 +426,24 @@ func logPasswordDelivery(source envx.SecretSource, password string, status Passw
 			slog.Info("PFX password configured", "source", passwordChannel(source))
 		}
 	}
+	// A blank value is skipped: warnPasswordStrength already reports it, with the
+	// remediation that helps (set a real password, or rewrite the secret without the
+	// invisible runes) rather than one per-rune-shape record about a value that
+	// carries nothing else — including the surrounding-whitespace record below, which
+	// a whitespace-only password would otherwise draw on top of it.
+	if blank {
+		return
+	}
 	// Channel-agnostic on purpose: envx delivers the configured value verbatim on
 	// BOTH channels (a secret file loses at most one trailing line ending and
 	// nothing else), so edge whitespace is part of the password however it arrived.
 	// While this was gated on the env channel, a padded PFX_PASSWORD_FILE wrote
 	// bundles protected by a password nobody can reproduce from the secret's visible
 	// contents, with health green and no diagnostic at all.
-	if !blank && password != strings.TrimSpace(password) {
+	if password != strings.TrimSpace(password) {
 		slog.Warn("the PFX password has leading or trailing whitespace, which is part of the password embedded in every PFX file",
 			"source", passwordChannel(source),
 			"remediation", "remove the surrounding whitespace, or keep it deliberately and reproduce it exactly wherever the .pfx is opened (stray quotes in an env file, or an editor padding the mounted secret, are the usual causes)")
-	}
-	// A blank value is skipped: warnPasswordStrength already reports it, with the
-	// remediation that helps (set a real password, or rewrite the secret without the
-	// invisible runes) rather than one per-rune-shape record about a value that
-	// carries nothing else.
-	if blank {
-		return
 	}
 	warnPasswordCharacters(source, password)
 }

@@ -14,7 +14,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
-	"github.com/cplieger/cert-converter/internal/watch"
+	"github.com/cplieger/cert-converter/internal/scancadence"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -578,7 +578,7 @@ func TestLoad_warns_when_the_fallback_rescan_is_disabled(t *testing.T) {
 //
 // The BOUNDARY matters as much as the band. At exactly the floor the two clocks coincide
 // and the cadence is still the operator's, so the record must stay silent there — the arm
-// reaches that by arithmetic (safetyNetIntervalFor returns the cadence itself, so
+// reaches that by arithmetic (scancadence.Effective returns the cadence itself, so
 // interval > floor is false) rather than by an explicit case, which is why widening its
 // `>` to `>=` would tell an operator running the floor's own cadence that it never runs
 // and leave every other test in this package green.
@@ -589,7 +589,7 @@ func TestLoad_warns_when_the_fallback_cadence_is_above_the_reconciliation_floor(
 
 	// Derived, not hardcoded: the assertion is about this arm's relation to the floor, so
 	// a floor move must not silently turn the boundary row into an in-band one.
-	floor := watch.MarkerRefreshFloor(365 * 24 * time.Hour)
+	floor := scancadence.Effective(365 * 24 * time.Hour)
 	floorHours := int(floor / time.Hour)
 
 	for _, tc := range []struct {

@@ -330,9 +330,9 @@ func TestOutputWalkVisit_stops_the_orphan_walk_once_the_scan_is_cancelled(t *tes
 		t.Errorf("visit(cancelled scan) collected %v, want no candidate: a bundle enumerated after the"+
 			" shutdown was observed must not be reported as an orphan or reaped", w.found)
 	}
-	if w.entries != 0 {
+	if w.budget.Count() != 0 {
 		t.Errorf("visit(cancelled scan) charged %d entries, want 0: the cancellation is answered before"+
-			" the budget accounting", w.entries)
+			" the budget accounting", w.budget.Count())
 	}
 }
 

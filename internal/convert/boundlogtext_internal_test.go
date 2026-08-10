@@ -5,7 +5,6 @@ import (
 	"encoding/asn1"
 	"encoding/pem"
 	"errors"
-	"log/slog"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -27,8 +26,8 @@ import (
 // no gain. Delegating widens the policy to the whole unsafe set, which is the
 // accepted cost of a sanitizer that is correct under either handler rather than
 // under the one currently wired up. Which class each handler emits raw is recorded
-// per row in the table below, and asserted end-to-end by
-// TestBoundLogText_output_is_safe_under_either_slog_handler.
+// per row in the table below, and the exact expected value is what pins it: a rune
+// that survived would show up as a difference here whichever handler is wired up.
 //
 // Every fixture is well under maxSubjectLogLen, so this also pins the asymmetry
 // the function once carried: it sanitized only the text it had just truncated, and
@@ -76,49 +75,6 @@ func TestBoundLogText_applies_the_runesafe_single_line_policy(t *testing.T) {
 				t.Errorf("boundLogText(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
-	}
-}
-
-// TestBoundLogText_output_is_safe_under_either_slog_handler is the evidence behind
-// the reason for delegating, asserted rather than asserted-in-prose. Each rune here
-// reaches at least one of the two handlers RAW — DEL both of them, C1 and
-// Bidi_Control the JSON one — so before delegation the policy was correct only
-// because JSONHandler is unreachable. Both handlers are exercised, so the day
-// slogx.Setup is given Format: slogx.JSON this test still holds and no widening of
-// this package is a prerequisite.
-func TestBoundLogText_output_is_safe_under_either_slog_handler(t *testing.T) {
-	t.Parallel()
-
-	handlers := map[string]func(*bytes.Buffer) slog.Handler{
-		"TextHandler": func(b *bytes.Buffer) slog.Handler { return slog.NewTextHandler(b, nil) },
-		"JSONHandler": func(b *bytes.Buffer) slog.Handler { return slog.NewJSONHandler(b, nil) },
-	}
-	runes := map[string]string{
-		"DEL":                     "\u007f",
-		"C1 escape introducer":    "\u009b",
-		"bidi right-to-left over": "\u202e",
-		"bidi isolate":            "\u2066",
-		"arabic letter mark":      "\u061c",
-		"line separator":          "\u2028",
-		"paragraph separator":     "\u2029",
-		"newline":                 "\n",
-	}
-
-	for handlerName, newHandler := range handlers {
-		for name, r := range runes {
-			t.Run(handlerName+"/"+name, func(t *testing.T) {
-				t.Parallel()
-				var buf bytes.Buffer
-				slog.New(newHandler(&buf)).
-					Info("x", "detail", boundLogText("a"+r+"b", maxSubjectLogLen))
-				// Trim the record terminator: every slog line ends with a real newline,
-				// which would otherwise satisfy the newline case against the value.
-				out := strings.TrimSuffix(buf.String(), "\n")
-				if strings.Contains(out, r) {
-					t.Errorf("%s emitted %q raw in %q; boundLogText must sanitize it first", handlerName, r, out)
-				}
-			})
-		}
 	}
 }
 

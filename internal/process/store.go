@@ -197,18 +197,39 @@ func (s *store) write(ctx context.Context, rel string, pfx []byte) writeRefusal 
 			// the write is now this call's, and the diagnosis has to keep naming the write
 			// it belongs to and the path that could not be created.
 			//
-			// A non-directory occupant of a mirrored directory path is the SAME operator
-			// layout state the parent pin refuses one statement later, so this site STATES
-			// that class itself rather than joining a sentinel for a consumer to re-derive
-			// it from: Root.MkdirAll reports EEXIST when the occupant is the LAST component
-			// of dir (mkdirat) and ENOTDIR when it is an earlier one (openat), and both mean
-			// a layout no restart re-reads differently. Anything else here (EROFS, ENOSPC,
-			// EACCES, EIO) states its own answer from its own errno, which is this site's
-			// second job and the only reading of an error the invariant allows: the party
-			// classifying is the party that failed.
-			cause := refusalOutputLayout
-			if !errors.Is(err, syscall.EEXIST) && !errors.Is(err, syscall.ENOTDIR) {
-				cause = classifyWriteErrno(err)
+			// This site reads its own error to state its own verdict, which is the only
+			// reading of an error the invariant allows: the party classifying is the party
+			// that failed. The errno classes it shares with the write (ownership for
+			// EACCES/EPERM, the volume for EROFS/ENOSPC/EDQUOT) come from
+			// classifyWriteErrno; everything else it cannot attribute to one of those is
+			// the SHAPE of the operator's output tree, so the residual here is
+			// refusalOutputLayout rather than the write's refusalTransient.
+			//
+			// That residual is what makes the class right for the two failures no sentinel
+			// can name. Root.MkdirAll reports EEXIST for a non-directory occupying the LAST
+			// component of dir (mkdirat) and ENOTDIR for one occupying an earlier component
+			// (openat) — both matchable, both layout. But an in-root symlink component whose
+			// target LEAVES the root is refused by the confinement itself, and os.Root
+			// reports that as "path escapes from parent", matching none of fs.ErrPermission,
+			// fs.ErrNotExist, fs.ErrInvalid, syscall.ELOOP or the two errnos above — the same
+			// unmatchable refusal noteUnreadableInput records on /input, and the same reason
+			// it treats every non-ENOENT read failure alike. A symlink LOOP at an
+			// intermediate component is ELOOP. Both are steady-state /output layouts no
+			// restart re-reads differently, and both used to inherit the write's clearable
+			// residual, which dropped the health marker and restart-looped the container over
+			// a symlinked output tree — the mistake output-write-refusal-classification-home
+			// exists to close, and the answer the pin one statement later already gives for
+			// the same misconfiguration at depth 1.
+			//
+			// A genuinely transient EIO on the directory create is swept into the layout
+			// class by this residual, which is the deliberate direction: no restart fixes it
+			// either, the standing WARN still fires once per scan, orphan reaping is still
+			// vetoed (conversionsClean), and the loud outcome is preserved exactly where it
+			// matters — a bundle this app PROVED stale stays statusFailed whatever the cause,
+			// because writeOutcome gates the health-neutral arm on bundleNotProvenWrong.
+			cause := classifyWriteErrno(err)
+			if cause == refusalTransient {
+				cause = refusalOutputLayout
 			}
 			return refuseWrite(cause, "write pfx: create output directory for %q: %w", rel, err)
 		}
@@ -371,32 +392,19 @@ const (
 	contentUnverified
 )
 
-// bundleState is what one inspection of the output path resolved: what this app knows
-// about the bytes on disk. That is the ONE fact an inspection produces that routes
-// anything — convertEntry derives the entry's outcome from it plus the write's own
-// result (writeOutcome).
-//
-// The mode on disk is deliberately NOT carried here. A bundle laxer than pfxFileMode is
-// REPORTED where it is observed (reportLaxBundle's WARN) and acts on nothing: it does
-// not make the bundle out of date, it schedules no write, and it never reaches health
-// (output-dir-write-bit-enforcement, extended to files). Carrying the fact past its own
-// WARN would hand every future reader of writeOutcome a routing input that routes
-// nothing.
-//
-// A struct rather than a bare contentState so upToDate and bundleNotProvenWrong stay
-// the named questions convertEntry asks of one inspection.
-//
-// Cheap to pass by value, and nothing here is mutated after inspect returns.
-type bundleState struct {
-	content contentState
-}
-
 // upToDate reports whether the output path needs no write at all: the bytes on disk are
 // already the bundle these inputs produce. Currency is a question about CONTENT and
 // nothing else — a lax mode is reported and left alone, because this app never writes a
 // bundle in order to change its permissions (see reportLaxBundle).
-func (st bundleState) upToDate() bool {
-	return st.content == contentVerifiedCurrent
+//
+// The mode on disk is deliberately NOT one of these facts. A bundle laxer than
+// pfxFileMode is REPORTED where it is observed (reportLaxBundle's WARN) and acts on
+// nothing: it does not make the bundle out of date, it schedules no write, and it never
+// reaches health (output-dir-write-bit-enforcement, extended to files). Carrying the
+// fact past its own WARN would hand every future reader of writeOutcome a routing input
+// that routes nothing.
+func (c contentState) upToDate() bool {
+	return c == contentVerifiedCurrent
 }
 
 // bundleNotProvenWrong reports whether a failed rewrite leaves the operator with a
@@ -411,8 +419,8 @@ func (st bundleState) upToDate() bool {
 // A future write reason that does NOT pass through that content gate
 // would arrive here as a fact this list does not name and would be counted a conversion
 // failure — the loud direction, which is the point of the shape.
-func (st bundleState) bundleNotProvenWrong() bool {
-	return st.content == contentUnverified
+func (c contentState) bundleNotProvenWrong() bool {
+	return c == contentUnverified
 }
 
 // inspect resolves what this app knows about the output at rel, by READING it rather
@@ -457,7 +465,7 @@ func (st bundleState) bundleNotProvenWrong() bool {
 //nolint:gocritic // hugeParam: convert.Analysis is ~96 bytes and passed by value on purpose; a pointer here would reopen the nil case the codec's value shape closes, to save a copy that is noise beside a PKCS#12 decode.
 func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 	wantEncoder convert.EncoderType, password string,
-) (bundleState, error) {
+) (contentState, error) {
 	// Asked before the bundle's own lstat so it covers the absent-bundle arm too: the
 	// directory is lax whether or not a prior bundle sits in it. Report-only, so it
 	// never changes the currency answer, the write, the reap or health — see
@@ -482,7 +490,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		// Nothing on disk is the strongest form of "not the bundle these inputs produce":
 		// there is no copy for a consumer to read, so a rewrite that fails here is a
 		// conversion failure whatever refused it.
-		return bundleState{content: contentVerifiedStale}, nil
+		return contentVerifiedStale, nil
 	case err != nil:
 		// A pin this app cannot obtain — a symlinked output tree, a component it may not
 		// traverse, a directory replaced mid-descent — is "I cannot tell what is on disk",
@@ -491,7 +499,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		slog.Warn("cannot stat prior pfx; regenerating",
 			"path", rel, "error", err,
 			"remediation", outputPinRemediation)
-		return bundleState{content: contentUnverified}, nil
+		return contentUnverified, nil
 	}
 	defer func() { _ = parent.Close() }()
 
@@ -501,7 +509,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		// Nothing on disk is the strongest form of "not the bundle these inputs produce":
 		// there is no copy for a consumer to read, so a rewrite that fails here is a
 		// conversion failure whatever refused it.
-		return bundleState{content: contentVerifiedStale}, nil
+		return contentVerifiedStale, nil
 	case err != nil:
 		// Degrade rather than fail the pair. This question is only "is the file on disk
 		// already the bundle these inputs produce?", and "I cannot tell" answers it: treat
@@ -515,7 +523,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		slog.Warn("cannot stat prior pfx; regenerating",
 			"path", rel, "error", err,
 			"remediation", outputPermRemediation)
-		return bundleState{content: contentUnverified}, nil
+		return contentUnverified, nil
 	case !fi.Mode().IsRegular():
 		// A directory, symlink or device node at the output name is not a usable
 		// prior bundle, and a symlink must never be followed here or unrelated
@@ -537,7 +545,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		slog.Warn("prior output path is not a regular file; regenerating",
 			"path", rel, "mode", fi.Mode().String(),
 			"remediation", "remove whatever occupies the output path; this app writes only regular files there")
-		return bundleState{content: contentVerifiedStale}, nil
+		return contentVerifiedStale, nil
 	}
 
 	// The mode report. It runs before every return below so a bundle this app keeps and
@@ -550,7 +558,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 	if fi.Size() > maxPFXSize {
 		slog.Warn("prior pfx exceeds the readable bound; regenerating",
 			"path", rel, "size", fi.Size(), "limit", maxPFXSize)
-		return bundleState{content: contentUnverified}, nil
+		return contentUnverified, nil
 	}
 
 	prior, err := readBoundedInRoot(ctx, parent, base, maxPFXSize)
@@ -563,7 +571,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 			// and wrapping that alone made IsShutdown false and logged a routine
 			// shutdown at ERROR. The decode-failure gate below already wraps ctx.Err()
 			// for the same reason; joining keeps the read error for diagnosis.
-			return bundleState{}, fmt.Errorf("read prior pfx: %w", errors.Join(ctxErr, err))
+			return contentUnresolved, fmt.Errorf("read prior pfx: %w", errors.Join(ctxErr, err))
 		}
 		// An ENOENT or a non-regular occupant here is not "cannot tell": the read looked
 		// and VERIFIED the path holds no usable prior bundle, the same two facts the lstat
@@ -582,7 +590,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		slog.Warn("cannot read prior pfx; regenerating",
 			"path", rel, "error", err,
 			"remediation", outputPermRemediation)
-		return bundleState{content: content}, nil
+		return content, nil
 	}
 
 	// CheckCurrency owns the mandatory preflight -> profile -> decode -> content
@@ -595,9 +603,9 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 	// an encryptedData safe, and a deadline is not the answer there either: it
 	// would bound how long this caller waits, not the work done. See
 	// internal/convert profile.go maxKDFIterations.
-	res := convert.CheckCurrency(prior, password, want, wantEncoder)
+	res := want.CheckCurrency(prior, password, wantEncoder)
 	content, err := contentFromCurrency(ctx, rel, res, wantEncoder)
-	return bundleState{content: content}, err
+	return content, err
 }
 
 // contentFromCurrency turns a convert.Currency outcome into a content fact: what each
@@ -675,11 +683,36 @@ func contentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 const laxBundleMsg = "prior pfx is more permissive than policy; leaving its mode as found"
 
 // outputPinRemediation is the operator action behind every /output LAYOUT refusal
-// (refusalOutputLayout). It names the causes those refusals cannot tell apart: a
-// symlinked output tree or a non-directory occupant of a mirrored output path (standing
-// misconfigurations) and a path replaced while the scan was running (a co-mounting
-// writer).
-const outputPinRemediation = "mount the real output directory instead of linking to it, and check /output for paths replaced while the scan was running"
+// (refusalOutputLayout). It names all THREE causes those refusals cannot tell apart, in
+// the order an operator can check them: a non-directory occupant of a mirrored output
+// directory path, a symlinked output tree (both standing misconfigurations), and a path
+// replaced while the scan was running (a co-mounting writer).
+//
+// The occupant is named FIRST because it is the one cause nothing else in the record
+// hints at. On that route there is no prior bundle at the output path at all — a regular
+// file at /output/<dir> makes /output/<dir>/<name>.pfx unreachable — so
+// unreplaceableBundleMsg's "leaving the existing bundle in place" describes a file that is
+// not there, and an operator reading only the remediation is sent after a symlink and a
+// mid-scan replacement that are both absent. Health is green on that route by design (the
+// settled output-write-refusal-classification-home decision), which makes this WARN the
+// only signal that the certificate is producing no PFX at all.
+const outputPinRemediation = "remove whatever occupies the /output directory path named in the error (this app publishes only through real directories), mount the real output directory instead of linking to it, and check /output for paths replaced while the scan was running"
+
+// outputVolumeRemediation is the remediation for a write the VOLUME refused rather than
+// ownership: this app may write /output, but the filesystem will not take the bytes.
+// Deliberately not outputPermRemediation — chowning /output frees no space and does not
+// remount it read-write, and an operator sent after the wrong cause reads the WARN as
+// noise.
+const outputVolumeRemediation = "check /output for free space, a quota and a read-only mount"
+
+// outputTransientRemediation is the operator action behind a refusal whose own site could
+// not attribute it to ownership, to the output tree's layout or to the volume
+// (refusalTransient): a raw filesystem I/O error, a symlink planted at the output name, or
+// a bundle the write cap refused. It is the advice the loud conversion-failure record
+// carried as a literal before every register asked the cause, composed from
+// outputPermRemediation so the two cannot drift.
+const outputTransientRemediation = outputPermRemediation +
+	", and that no symlink is planted at the output path"
 
 // laxerThan reports whether perm carries a permission bit policy does not. It is the
 // WHOLE of the mode question for BOTH halves of /output — a bundle measured against
@@ -713,23 +746,6 @@ func (s *store) reportLaxBundle(rel string, perm os.FileMode) {
 	}
 	slog.Warn(laxBundleMsg,
 		"path", rel, "mode", perm.String(), "want", os.FileMode(pfxFileMode).String())
-}
-
-// isPermissionRefusal reports whether err is the filesystem REFUSING an operation for
-// a permission reason, as opposed to failing it for any other reason. Its consumer is
-// classifyWriteErrno, where a refusal is the ownership class — the first of the classes
-// no restart clears, and the one whose remediation is /output ownership rather than the
-// volume. It is a PRODUCER-side helper: a refusal site reading its own error to state
-// its own verdict, never a consumer re-deriving a verdict someone else already stated.
-//
-// fs.ErrPermission is the whole test rather than two errors.Is calls against
-// syscall.EPERM and syscall.EACCES: atomicfile's confined write returns an *fs.PathError
-// wrapping a syscall.Errno, and Errno.Is maps BOTH of those errnos (and only those, of
-// the ones reachable here — EROFS, EINVAL and ENOSPC do not match) onto fs.ErrPermission.
-// Checking the portable sentinel therefore covers both refusals with one test, and
-// matches an fs.ErrPermission a test seam injects directly.
-func isPermissionRefusal(err error) bool {
-	return errors.Is(err, fs.ErrPermission)
 }
 
 // writeRefusalCause names WHAT refused an /output write, as the site that refused it
@@ -810,22 +826,30 @@ func (c writeRefusalCause) restartCanClear() bool {
 // health verdict and a remediation that disagree, and neither is re-matched against the
 // error a third time.
 //
-// The three axes are ownership, the output tree's own layout, and the volume; an operator
-// sent after the wrong cause reads the WARN as noise. A layout refusal in particular is
-// not a volume condition, so it gets outputPinRemediation exactly as inspect's own
-// per-scan WARN for the same condition already advises.
+// The four axes are ownership, the output tree's own layout, the volume, and a refusal its
+// own site could not attribute to any of those; an operator sent after the wrong cause
+// reads the WARN as noise. A layout refusal in particular is not a volume condition, so it
+// gets outputPinRemediation exactly as inspect's own per-scan WARN for the same condition
+// already advises.
+//
+// refusalTransient has its own answer rather than falling through, because BOTH registers
+// ask this: the health-neutral WARN never sees a clearable cause, but the loud
+// conversion-failure record does — that is the only cause it can carry alongside the three
+// unclearable ones — and its members (an I/O error, a symlink at the output name, a bundle
+// over the write cap) are not an ownership problem.
 func (c writeRefusalCause) remediation() string {
 	switch c {
 	case refusalOutputLayout:
 		return outputPinRemediation
 	case refusalVolume:
 		return outputVolumeRemediation
+	case refusalTransient:
+		return outputTransientRemediation
 	default:
-		// refusalOwnership, plus the two causes that cannot reach here at all —
-		// refusalTransient (only an unclearable refusal is asked for a remediation) and
-		// refusalUnclassified — and any cause added later. /output ownership and
-		// permissions is the broadest of the three actions and the only one worth naming
-		// for a condition nobody has characterised yet.
+		// refusalOwnership, plus refusalUnclassified, which nothing produces — and any
+		// cause added later. /output ownership and permissions is the broadest of the four
+		// actions and the only one worth naming for a condition nobody has characterised
+		// yet.
 		return outputPermRemediation
 	}
 }
@@ -892,7 +916,13 @@ func refuseWrite(cause writeRefusalCause, format string, args ...any) writeRefus
 // could not guarantee.
 func classifyWriteErrno(err error) writeRefusalCause {
 	switch {
-	case isPermissionRefusal(err):
+	// fs.ErrPermission is the whole test rather than two errors.Is calls against
+	// syscall.EPERM and syscall.EACCES: atomicfile's confined write returns an
+	// *fs.PathError wrapping a syscall.Errno, and Errno.Is maps BOTH of those errnos
+	// (and only those, of the ones reachable here — the EROFS, ENOSPC and EDQUOT below
+	// do not match) onto fs.ErrPermission. The portable sentinel therefore covers both
+	// refusals with one test, and matches an fs.ErrPermission a test seam injects.
+	case errors.Is(err, fs.ErrPermission):
 		return refusalOwnership
 	case errors.Is(err, syscall.EROFS), errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT):
 		return refusalVolume
@@ -947,8 +977,24 @@ var readBoundedInRoot = atomicfile.ReadBoundedInRoot
 // private-key material, and it had already drifted once when each mount enumerated
 // itself.
 func (s *store) listOutputs(ctx context.Context) (found []string, safe bool, err error) {
-	walk := outputWalk{ctx: ctx, maxEntries: s.maxEntries}
+	walk := outputWalk{ctx: ctx, budget: scanbudget.NewCounter(s.maxEntries)}
 	if err := atomicfile.WalkDirInRoot(ctx, s.root, walk.visit); err != nil {
+		// The ENTRY-BUDGET stop is the one abort whose per-path counts are OBSERVATIONS
+		// rather than casualties of the stop: every path this walk was handed, it
+		// classified normally, and the stop reason is typed (errOutputBudgetExceeded)
+		// rather than inferred. So both aggregates still hold, and they are the two an
+		// operator most needs - they name the conditions that will keep reaping off after
+		// MAX_SCAN_ENTRIES is raised, and their per-path lines are Debug-only. This is
+		// logInputCoverageWarnings' errScanBudgetExceeded exception applied to the other
+		// tree. No partial-coverage attribute is needed here, unlike the /input side: both
+		// messages say "some output paths", which reads honestly as a floor, where
+		// /input's arms make whole-tree claims ("no certificate pairs found") that a
+		// truncated scan cannot make. Every OTHER abort - an unreadable /output root, a
+		// cancellation - stopped for a reason unrelated to the tree's contents, so its
+		// partial counts claim nothing and stay silent.
+		if errors.Is(err, errOutputBudgetExceeded) {
+			s.logOrphanWalkOutcome(walk.unreadable, walk.symlinked)
+		}
 		return nil, false, fmt.Errorf("walk output tree: %w", err)
 	}
 	s.logOrphanWalkOutcome(walk.unreadable, walk.symlinked)
@@ -1000,15 +1046,11 @@ type outputWalk struct {
 	found      []string
 	unreadable int
 	symlinked  int
-	// entries counts every path this walk has been handed, including directories and
-	// entries it could not read, for the same reason scanWalk.entries does: the cap is
-	// about how much of an untrusted tree one scan takes on, so it counts what the walk
-	// TOUCHED rather than what it kept as a candidate. Counting only layout.IsOutput
-	// names would let a flat set of ignored names walk past the bound for free.
-	entries int
-	// maxEntries is this walk's injected budget; non-positive means scanbudget.Default
-	// (scanbudget.Effective), so a walk assembled without one is still bounded.
-	maxEntries int
+	// budget is this walk's entry ceiling and its charge counter, on the same
+	// scanbudget.Counter every walk in this app uses. Counting only layout.IsOutput names
+	// would let a flat set of ignored names walk past the bound for free, so the counter
+	// is charged for every enumerated path.
+	budget scanbudget.Counter
 }
 
 // visit is listOutputs' walk callback: one entry, one verdict.
@@ -1043,9 +1085,8 @@ func (w *outputWalk) visit(rel string, d fs.DirEntry, err error) error {
 	// Returning an error aborts the walk, and listOutputs then discards every candidate
 	// it had collected: a partial enumeration cannot prove anything orphaned, and the
 	// alternative — reaping on a prefix of the tree — deletes live bundles.
-	w.entries++
-	if budget := scanbudget.Effective(w.maxEntries); w.entries > budget {
-		return fmt.Errorf("%w: stopped at %d entries (%s)", errOutputBudgetExceeded, w.entries, rel)
+	if !w.budget.Charge() {
+		return fmt.Errorf("%w: stopped at %d entries (%s)", errOutputBudgetExceeded, w.budget.Count(), rel)
 	}
 	// A symlink anywhere in the output tree makes this walk and the WRITE path
 	// disagree about where a bundle lives: writes resolve through *os.Root,
@@ -1102,8 +1143,31 @@ func (s *store) logOrphanWalkOutcome(unreadable, symlinked int) {
 // taken before the confirmation delay, so this is the same rule applied at unlink time.
 const pinRedirectedMsg = "could not pin the output directory of an orphaned bundle; leaving it in place"
 
+// reapAttempt is what one confirmed candidate's removal resolved. Three values rather than
+// a bool because the two non-deletions need different reporting: a bundle that vanished
+// under the deferral is the ordinary producer race (Debug, nothing to aggregate), while a
+// refusal is an /output condition the operator has to act on and the only one that must
+// reach a per-scan record.
+//
+// reapAttemptRefused is the ZERO value on purpose, like statusUnset, contentUnresolved and
+// refusalUnclassified: a value arriving by mistake reports a spurious refusal, never a
+// bundle still on disk audited as deleted.
+type reapAttempt int
+
+const (
+	reapAttemptRefused reapAttempt = iota
+	reapAttemptVanished
+	reapAttemptRemoved
+)
+
+// removalRefusedMsg is the once-per-scan record for confirmed orphans this app was refused
+// permission to unlink. A const for the reason reapAuditMsg is one: it is the line an
+// operator correlates with a sync deployment that has stopped reconciling, and the only
+// default-level signal for that state that carries a COUNT.
+const removalRefusedMsg = "some orphaned output bundles could not be removed; /output is not reconciling with /input"
+
 // removeOrphan re-checks one confirmed orphan and unlinks it through a PINNED parent
-// root, reporting whether it was deleted.
+// root, reporting how the attempt resolved (see reapAttempt).
 //
 // The parent root is what makes the unlink safe, and it is atomicfile's descent
 // (OpenParentInRoot) because the hazard is a property of *os.Root rather than of this
@@ -1119,7 +1183,7 @@ const pinRedirectedMsg = "could not pin the output directory of an orphaned bund
 //
 // What stays here is this app's policy: which failures are transient races and which are
 // operator-actionable, and what an operator is told about each.
-func (s *store) removeOrphan(rel string) bool {
+func (s *store) removeOrphan(rel string) reapAttempt {
 	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -1130,11 +1194,11 @@ func (s *store) removeOrphan(rel string) bool {
 			// symlink remediation on the WARN below would send an operator looking for
 			// a misconfiguration that is not there.
 			slog.Debug("orphaned output vanished before removal", "path", rel)
-			return false
+			return reapAttemptVanished
 		}
 		slog.Warn(pinRedirectedMsg, "path", rel, "error", err,
 			"remediation", outputPinRemediation)
-		return false
+		return reapAttemptRefused
 	}
 	defer func() { _ = parent.Close() }()
 	// The walk classified this entry up to reapDeferral ago, and only a REGULAR
@@ -1152,26 +1216,26 @@ func (s *store) removeOrphan(rel string) bool {
 	switch {
 	case errors.Is(statErr, fs.ErrNotExist):
 		slog.Debug("orphaned output vanished before removal", "path", rel)
-		return false
+		return reapAttemptVanished
 	case statErr != nil:
 		slog.Warn("could not re-check an orphaned output before removing it; leaving it in place",
 			"path", rel, "error", statErr, "remediation", outputPermRemediation)
-		return false
+		return reapAttemptRefused
 	case !fi.Mode().IsRegular():
 		slog.Warn("orphaned output path is not a regular file; leaving it in place",
 			"path", rel, "mode", fi.Mode().String(),
 			"remediation", "remove whatever occupies the output path by hand; this app deletes only the regular files it writes")
-		return false
+		return reapAttemptRefused
 	}
 	if err := parent.Remove(base); err != nil {
 		slog.Warn("could not remove orphaned output", "path", rel, "error", err,
 			"remediation", outputPermRemediation)
-		return false
+		return reapAttemptRefused
 	}
 	// Every deletion is named. The once-per-scan audit record (reapAuditMsg) is the
 	// warn-visible contract for that; this per-path line is the complete, unbounded
 	// list for a reader who asked for detail, so it sits at Debug rather than repeating
 	// the audit at the default level once per path.
 	slog.Debug("removed orphaned output whose input is gone", "path", rel)
-	return true
+	return reapAttemptRemoved
 }

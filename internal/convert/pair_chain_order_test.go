@@ -59,7 +59,7 @@ func TestEncode_preserves_the_order_of_a_multi_CA_chain(t *testing.T) {
 		t.Fatalf("setup: Analyse chain = %v, want %v nearest-parent-first", got, want)
 	}
 
-	pfx, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("Encode = error %v, want nil", err)
 	}
@@ -77,7 +77,7 @@ func TestEncode_preserves_the_order_of_a_multi_CA_chain(t *testing.T) {
 				i, got[i], want[i])
 		}
 	}
-	if res := convert.CheckCurrency(pfx, "pw", analysis, convert.EncNameModern2023); !res.Current() {
+	if res := analysis.CheckCurrency(pfx, "pw", convert.EncNameModern2023); !res.Current() {
 		t.Errorf("CheckCurrency(the bundle Encode just wrote) = %q, want a match: a chain order the round trip does not preserve makes every scan rewrite the file",
 			res.Reason)
 	}

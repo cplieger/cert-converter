@@ -253,10 +253,10 @@ type Observation struct {
 // The value return IS the nil half of the invariant, held by construction rather
 // than by checking: there is no nil *Analysis for a consumer to be handed, so the
 // codec's entry points carry no nil arm and a caller's own Observations() call
-// cannot dereference nothing. The cost is a 96-byte copy per codec call, which
-// gocritic's hugeParam flags and an explained //nolint accepts at each of those
-// sites — a pointer parameter there would reopen exactly the case this shape
-// exists to close, to save a copy that is noise beside a PKCS#12 encode or decode.
+// cannot dereference nothing. Those entry points are METHODS on Analysis rather
+// than free functions taking it by value, so the invariant costs neither a copy
+// nor a lint suppression: a pointer receiver invoked on the caller's addressable
+// value copies nothing and still admits no nil.
 //
 // The LEAF half is not structural and is not pretended to be. The fields are
 // unexported, so no other package can build a populated Analysis, but
@@ -305,10 +305,17 @@ type Analysis struct {
 // discovered. The slice is a copy, so a caller may keep, sort or filter it
 // without disturbing the analysis it came from.
 //
-// This is the whole of Analysis's exported surface, because it is the whole of
-// what a consumer outside this package does with an Analysis: report what was
-// noticed, then hand the value back to Encode or CheckCurrency unchanged.
-func (a *Analysis) Observations() []Observation {
+// Observations, Encode and CheckCurrency are the whole of Analysis's exported
+// surface, and they are METHODS rather than free functions taking the value:
+// a pointer receiver on the caller's addressable value copies nothing and
+// still admits no nil, so the invariant costs neither a copy nor a nolint.
+// The receiver is a VALUE, like every other operation on an Analysis: the type is
+// immutable once Analyse returns it and has exactly one producer, which is when Go
+// says value receivers. gocritic's hugeParam fires on the 96-byte copy; its premise
+// (copying is hot here) is false at two calls per certificate per scan, immediately
+// before PKCS#12 crypto, and a POINTER receiver would make a nil receiver
+// representable again — which is the invariant this shape exists to hold.
+func (a Analysis) Observations() []Observation { //nolint:gocritic // hugeParam: see above; a value receiver is the invariant.
 	return slices.Clone(a.observations)
 }
 
@@ -2014,7 +2021,8 @@ func (g *certGraph) terminusObservation(terminal int, extra, kept []*x509.Certif
 	leftovers := ""
 	switch {
 	case len(kept) > 0:
-		leftovers = fmt.Sprintf("; %d of the remaining %d certificate(s) were kept rather than dropped", len(kept), len(extra))
+		leftovers = fmt.Sprintf("; %d of the remaining %d certificate(s) were kept rather than dropped and are in the bundle: %s",
+			len(kept), len(extra), subjectsForLog(kept))
 	case len(extra) > 0:
 		leftovers = "; none of the remaining certificate(s) could be kept as chain material"
 	}
@@ -2077,11 +2085,18 @@ func validityObservations(leaf *x509.Certificate, now time.Time) []Observation {
 // outside their validity window at now. Never an error, for the same reason an
 // out-of-window identity is not: this package converts, it does not validate.
 //
-// It is reported because betterParent already ranks a currently valid issuer
-// ahead of an expired one, so an out-of-window certificate reaching the emitted
-// chain means no valid alternative existed in the bundle. That is precisely the
-// case where the operator has to act, and it is the one the leaf-only
-// validityObservations cannot see.
+// It is reported because a consumer validating the chain will reject it, no other
+// signal names which link is at fault, and the leaf-only validityObservations cannot
+// see it. For a hop on the DISCOVERED path it additionally means no valid
+// alternative existed in the bundle: betterParent ranks a currently valid issuer
+// ahead of an expired one, so an expired hop was the best the bundle offered.
+//
+// That inference does NOT extend to the additive fallback tail. assembleChain
+// appends every issuer-eligible leftover in INPUT order and canIssueCertificates
+// reads extensions only, never validity, so an expired certificate reaches the chain
+// there with no ranking behind it; the ObsChainUnverified (or
+// ObsChainAnchorUnverifiable) emitted beside it is what says its relationship to the
+// identity was never established at all.
 func chainValidityObservations(chain []*x509.Certificate, now time.Time) []Observation {
 	var obs []Observation
 	for i, c := range chain {

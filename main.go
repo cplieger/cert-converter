@@ -15,6 +15,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/config"
 	"github.com/cplieger/cert-converter/internal/mounts"
 	"github.com/cplieger/cert-converter/internal/process"
+	"github.com/cplieger/cert-converter/internal/scancadence"
 	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/health"
 	"github.com/cplieger/slogx"
@@ -85,7 +86,7 @@ func dispatchArgs(args []string) int {
 		// The periodic safety-net scan is the marker's guaranteed refresh floor
 		// (fs events refresh it sooner), so a marker older than 3 of those
 		// intervals means the watch loop is wedged and a restart fixes it.
-		// watch.MarkerRefreshFloor is what converts the configured cadence into
+		// scancadence.Effective is what converts the configured cadence into
 		// that floor: FALLBACK_SCAN_HOURS=0/false removes the operator's own
 		// cadence, NOT the reconciliation floor the watcher falls back to, so the
 		// deadline is armed in every configuration — on the default 6h cadence it
@@ -99,7 +100,7 @@ func dispatchArgs(args []string) int {
 		// RunProbe exits the process, so this never falls through to the
 		// watcher below.
 		runProbe(health.DefaultPath,
-			health.WithMaxAge(3*watch.MarkerRefreshFloor(config.FallbackInterval())))
+			health.WithMaxAge(3*scancadence.Effective(config.FallbackInterval())))
 		return continueToWatcher // unreachable in production; runProbe exits
 	default:
 		// Refuse rather than fall through: falling through reaches
@@ -183,7 +184,7 @@ func run() int {
 		// the health probe's staleness deadline is derived from. Spliced from the
 		// watch package's own renderer so this line and every degraded-path WARN
 		// cannot spell the pair differently.
-		watch.CoverageAttrs(cfg.FallbackInterval),
+		scancadence.CoverageAttrs(cfg.FallbackInterval),
 		[]any{
 			"encoder", cfg.EncoderName,
 			"output_lifecycle", string(cfg.Lifecycle), "max_scan_entries", cfg.MaxScanEntries,

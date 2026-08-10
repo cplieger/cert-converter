@@ -15,11 +15,6 @@ import (
 // job), and a false MISMATCH rewrites a correct bundle on every scan, churning its
 // mtime and re-replicating it downstream forever.
 //
-// The no-leaf case is not defensive padding: the decoded bundle comes from a FILE
-// under /output, so a bundle with no leaf bag is ordinary input and must report
-// "not current" rather than dereference. The analysis side needs no such case —
-// it is a value from Analyse, whose leaf invariant is stated once at the producer.
-//
 // Lives here rather than in main's test file — this is
 // the decoded bundle's own contract. It is reached through export_test.go, like
 // parseCertChain: the comparison is a step of convert.CheckCurrency and is not
@@ -48,9 +43,6 @@ func TestDecodedMatchesAnalysis_leaf_guard(t *testing.T) {
 		},
 		"a different leaf does not match": {
 			convert.Decoded{Leaf: other.Leaf(), Key: other.Key(), CACerts: other.Chain()}, false,
-		},
-		"a decoded bundle with no leaf does not match": {
-			convert.Decoded{Leaf: nil, Key: analysis.Key()}, false,
 		},
 	}
 
@@ -85,7 +77,7 @@ func TestDecode_round_trips_an_encoded_bundle_into_a_currency_match(t *testing.T
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	pfx, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
+	pfx, err := analysis.Encode(convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}

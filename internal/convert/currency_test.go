@@ -59,11 +59,11 @@ func TestCheckCurrency_runs_the_preflight_and_profile_check_before_the_decode(t 
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	good, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
+	good, err := analysis.Encode(convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
-	if res := convert.CheckCurrency(good, "pw", analysis, convert.EncNameModern2023); !res.Current() {
+	if res := analysis.CheckCurrency(good, "pw", convert.EncNameModern2023); !res.Current() {
 		t.Fatalf("setup: CheckCurrency(the bundle just encoded) = %q, want a match", res.Reason)
 	}
 
@@ -88,7 +88,7 @@ func TestCheckCurrency_runs_the_preflight_and_profile_check_before_the_decode(t 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			res := convert.CheckCurrency(tt.pfx, tt.password, analysis, tt.wantEncoder)
+			res := analysis.CheckCurrency(tt.pfx, tt.password, tt.wantEncoder)
 			if res.Reason != tt.wantReason {
 				t.Errorf("CheckCurrency reason = %q, want %q: the read-back steps ran out of order",
 					res.Reason, tt.wantReason)
@@ -112,12 +112,12 @@ func TestCheckCurrency_preflight_refusal_is_the_bounded_one(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	good, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
+	good, err := analysis.Encode(convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
 
-	res := convert.CheckCurrency(hugeKDFIterations(t, good), "pw", analysis, convert.EncNameModern2023)
+	res := analysis.CheckCurrency(hugeKDFIterations(t, good), "pw", convert.EncNameModern2023)
 	if res.Reason != convert.CurrencyPreflightFailed {
 		t.Fatalf("CheckCurrency reason = %q, want %q", res.Reason, convert.CurrencyPreflightFailed)
 	}
@@ -139,7 +139,7 @@ func TestCheckCurrency_classifies_every_outcome(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse: %v", err)
 	}
-	good, err := convert.Encode(analysis, convert.EncNameModern2023, "pw")
+	good, err := analysis.Encode(convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestCheckCurrency_classifies_every_outcome(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: Analyse(stranger): %v", err)
 	}
-	strangerPFX, err := convert.Encode(stranger, convert.EncNameModern2023, "pw")
+	strangerPFX, err := stranger.Encode(convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode(stranger): %v", err)
 	}
@@ -188,7 +188,7 @@ func TestCheckCurrency_classifies_every_outcome(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			before := bytes.Clone(tt.pfx)
-			res := convert.CheckCurrency(tt.pfx, tt.password, analysis, tt.wantEncoder)
+			res := analysis.CheckCurrency(tt.pfx, tt.password, tt.wantEncoder)
 			if res.Reason != tt.wantReason {
 				t.Errorf("CheckCurrency reason = %q, want %q", res.Reason, tt.wantReason)
 			}
@@ -233,11 +233,11 @@ func TestCheckCurrency_resolves_an_unknown_encoder_name_the_way_Encode_does(t *t
 	}
 
 	const unknown = convert.EncoderType("modern2024")
-	pfx, err := convert.Encode(analysis, unknown, "pw")
+	pfx, err := analysis.Encode(unknown, "pw")
 	if err != nil {
 		t.Fatalf("Encode(unknown encoder name) = error %v, want the modern2023 fallback to succeed", err)
 	}
-	if res := convert.CheckCurrency(pfx, "pw", analysis, unknown); !res.Current() {
+	if res := analysis.CheckCurrency(pfx, "pw", unknown); !res.Current() {
 		t.Errorf("CheckCurrency(the bundle Encode just wrote for %q) = %q, want a match",
 			unknown, res.Reason)
 	}

@@ -69,10 +69,9 @@ func TestConvertPair_password_guard_agrees_with_the_pkcs12_encoder(t *testing.T)
 		_, err := convertPairInRoot(rt.Context(), certPEM, keyPEM, root, "out.pfx", password, convert.EncNameModern2023)
 
 		// The shape the message must name when a password carries several.
-		// Deliberately an INDEPENDENT restatement of the precedence, not a
-		// switch on issues.Primary(): internal/config's startup gate already
-		// selects on Primary, so this is the only test pinning NonBMP over
-		// EmbeddedNUL. Deriving it from Primary would leave that step unpinned.
+		// Deliberately an INDEPENDENT restatement of the precedence, not a call to
+		// issues.Why(): nothing outside this package ever selects on a shape, so
+		// this switch is the only pin on NonBMP outranking EmbeddedNUL.
 		var wantShape string
 		switch {
 		case issues.InvalidUTF8:

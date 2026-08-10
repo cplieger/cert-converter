@@ -23,6 +23,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
+	"github.com/cplieger/cert-converter/internal/scancadence"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -61,7 +62,7 @@ func (e *LostError) Error() string { return "change detection lost: " + e.Cause 
 // 0/false, and with the routine rescan enabled neither ends the watch (a removed
 // root watch is re-attached in place by resyncWatchSet). Both are LATENCY judgments
 // rather than dead ends now that the reconciliation floor covers every mode
-// (reconcileFloor): each names a state where a restart restores real-time detection
+// (scancadence.Floor): each names a state where a restart restores real-time detection
 // in seconds and the alternative is a wholly unwatched tree until the floor comes
 // due, and each is argued at its own site (handleRootWatchLoss,
 // pollLoopWithUpgrade). A dead fsnotify channel is not a misconfiguration, so it has
@@ -149,7 +150,7 @@ func WithDebounce(d time.Duration) Option {
 
 // WithFallback sets the periodic poll/fallback interval. Zero or a negative duration
 // disables the ROUTINE rescan: in fsnotify mode the safety-net timer then runs on the
-// reconciliation floor instead (reconcileFloor — slower, and never removable, so
+// reconciliation floor instead (scancadence.Floor — slower, and never removable, so
 // eventual convergence does not depend on this setting), and in poll mode there is no
 // operator-chosen interval at all, so Run reports a *LostError rather than run with
 // neither an fsnotify watch nor a cadence its operator asked for.
@@ -174,103 +175,6 @@ const watchBudgetMsg = "the /input tree holds more entries than one scan will en
 // pointed at the wrong tree, or a legitimately large certificate directory.
 const watchBudgetRemediation = "check that /input is mounted at the certificate directory and holds nothing else, or raise MAX_SCAN_ENTRIES if the tree is legitimately this large"
 
-// reconcileFloor is the longest this app will go without a FULL reconciliation of
-// the input tree — a whole-tree watch-set re-assert followed by a certificate scan
-// — in ANY configuration, including FALLBACK_SCAN_HOURS=0/false.
-//
-// It is a floor, not a cadence: every scan re-arms the timer that enforces it,
-// exactly as the configured fallback interval is re-armed, so a deployment whose
-// fsnotify events arrive normally never pays for a reconciliation walk at all. Only
-// a process that has gone a whole floor without scanning reaches it.
-//
-// Why it exists. fsnotify events are a LATENCY optimisation here, not the liveness
-// mechanism: one walk's enumeration is deliberately BOUNDED (addWatchDirs caps how many
-// paths a walk visits, because the tree it enumerates is one this app does not own), so
-// a tree larger than that budget is watched only in part; the kernel refuses a
-// registration outright once the per-UID inotify quota is spent; the kernel discards
-// watches without emitting an event at all (IN_UNMOUNT/IN_IGNORED); and a descriptor
-// the kernel refused is only recovered by a re-assert. An app that notices change
-// ONLY through events therefore has states in which it converts nothing indefinitely.
-// This floor is what makes eventual convergence a property of the app rather than of
-// its configuration, and it is what gives the health marker a guaranteed refresh
-// cadence in every mode (MarkerRefreshFloor), so a wedged loop can be restarted even
-// with the routine rescan switched off.
-//
-// Why 24h and not the documented 6h default. An operator who sets
-// FALLBACK_SCAN_HOURS=0 is escaping periodic full walks — usually because /input is a
-// network mount where they are expensive — so re-enabling the default cadence under
-// another name would overrule the choice this setting exists to offer. The floor costs
-// them ONE walk per day of inactivity, a quarter of the default cadence's, and the
-// certificate timescale is what makes a day cheap: an ACME issuer renews a 90-day
-// certificate about 30 days before it expires (Caddy at two thirds of the lifetime),
-// so a renewal whose event was lost has weeks of slack before anything downstream
-// serves an expired chain, and a day of added latency spends a rounding error of it.
-const reconcileFloor = 24 * time.Hour
-
-// safetyNetIntervalFor reports the periodic safety-net scan's interval for a
-// configured fallback value: the operator's cadence while they chose one below the
-// floor, and the reconciliation floor otherwise — which covers the 0/false opt-out,
-// a negative value, and a cadence above the floor (including the 10-year ceiling
-// internal/config clamps to, at which no rescan would ever have arrived).
-//
-// One timer serves both, because they are the same mechanism — a full re-assert plus
-// a full scan — differing only in who chose the number. safetyNetTrigger reports which
-// one did, so the two never become indistinguishable in the log.
-func safetyNetIntervalFor(fallback time.Duration) time.Duration {
-	if fallback > 0 && fallback < reconcileFloor {
-		return fallback
-	}
-	return reconcileFloor
-}
-
-// MarkerRefreshFloor reports how often the health marker is guaranteed to be
-// refreshed under a given FALLBACK_SCAN_HOURS interval (non-positive = the
-// 0/false opt-out). Every safety-net scan calls the caller's onChange, and that is
-// what writes the marker, so this is the cadence a probe staleness deadline must be
-// derived from — the composition root's `health` subcommand arms
-// health.WithMaxAge from it.
-//
-// It lives here rather than in internal/config because the number is this package's
-// timer policy and not a configured value: config owns FALLBACK_SCAN_HOURS' name,
-// default, ceiling and diagnostics, and this package deliberately does not import it.
-func MarkerRefreshFloor(fallback time.Duration) time.Duration {
-	return safetyNetIntervalFor(fallback)
-}
-
-// fallbackLabel renders a periodic-rescan interval for an operator-facing log
-// record. A non-positive interval is reported as "disabled" rather than as a
-// bare "0s": that value is the operator's confirmation that
-// FALLBACK_SCAN_HOURS=0/false took effect, i.e. that no ROUTINE rescan runs on
-// their cadence. It does NOT mean nothing rescans — the reconciliation floor
-// still does, and the probe's staleness deadline is derived from that floor
-// (MarkerRefreshFloor), which is why every record carrying this label also
-// carries scan_floor. It is unexported because CoverageAttrs is the one home for
-// the pair: the composition root, internal/config and this package's
-// degraded-path WARNs all render fallback_scan through that, never by calling
-// this directly.
-func fallbackLabel(d time.Duration) string {
-	if d <= 0 {
-		return "disabled"
-	}
-	return d.String()
-}
-
-// CoverageAttrs renders the coverage pair every cadence-bearing record
-// carries: fallback_scan (the operator's own rescan cadence, "disabled"
-// when switched off) and scan_floor (the guaranteed reconciliation
-// cadence the health deadline is derived from). One home for the keys,
-// their order and both renderings, so the startup line, config's
-// fallback WARNs and this package's degraded-path records cannot drift.
-func CoverageAttrs(fallback time.Duration) []any {
-	return []any{
-		// fallback_scan answers only "is the operator's own cadence running?", so
-		// fallbackLabel renders a non-positive interval as "disabled"; scan_floor beside
-		// it is what keeps that from reading as "nothing will ever revisit this".
-		"fallback_scan", fallbackLabel(fallback),
-		"scan_floor", MarkerRefreshFloor(fallback).String(),
-	}
-}
-
 // coverageAttrs closes a degraded-path record with the two cadences that answer
 // the one question such a record raises: will anything revisit what was just lost?
 // Both travel together because either alone answers it wrongly — fallback_scan is
@@ -280,13 +184,13 @@ func CoverageAttrs(fallback time.Duration) []any {
 // keeps each site's own diagnostics (which path, which error) at the front of the
 // record.
 func (w *Watcher) coverageAttrs(attrs ...any) []any {
-	return append(attrs, CoverageAttrs(w.fallback)...)
+	return append(attrs, scancadence.CoverageAttrs(w.fallback)...)
 }
 
 // safetyNetInterval is this Watcher's periodic safety-net cadence; see
-// safetyNetIntervalFor for the rule and reconcileFloor for why a floor exists.
+// scancadence.Effective for the rule and scancadence.Floor for why a floor exists.
 func (w *Watcher) safetyNetInterval() time.Duration {
-	return safetyNetIntervalFor(w.fallback)
+	return scancadence.Effective(w.fallback)
 }
 
 // safetyNetTrigger names the clock behind one safety-net scan for its mode record:
@@ -294,10 +198,10 @@ func (w *Watcher) safetyNetInterval() time.Duration {
 // Keeping the two apart in the log is what lets an operator confirm that
 // FALLBACK_SCAN_HOURS=0 took effect while still seeing the floor's walk happen.
 //
-// Derived from safetyNetIntervalFor rather than re-spelling its boundary: the scan
+// Derived from scancadence.Effective rather than re-spelling its boundary: the scan
 // runs on the operator's clock exactly when the effective interval IS the configured
-// fallback (at fallback == reconcileFloor the two clocks coincide and the operator's
-// name wins, which is what the old "<=" spelling encoded by hand).
+// fallback (at fallback == scancadence.Floor the two clocks coincide and the operator's
+// name wins).
 func (w *Watcher) safetyNetTrigger() string {
 	if w.safetyNetInterval() == w.fallback {
 		return triggerFallback
@@ -355,7 +259,7 @@ const (
 	triggerAttach    = "attach"    // watch mode's post-attach scan (scanThenWatch)
 	triggerEvent     = "event"     // a debounced fsnotify event
 	triggerFallback  = "fallback"  // the safety-net rescan on the operator's FALLBACK_SCAN_HOURS cadence
-	triggerReconcile = "reconcile" // the safety-net rescan on the reconciliation floor (reconcileFloor)
+	triggerReconcile = "reconcile" // the safety-net rescan on the reconciliation floor (scancadence.Floor)
 	triggerStartup   = "startup"   // poll mode's initial scan
 	triggerPoll      = "poll"      // a poll-mode tick scan
 )
@@ -389,10 +293,6 @@ func (w *Watcher) logModeEntry(ctx context.Context, mode, previous detectionMode
 // scan every FALLBACK_SCAN_HOURS is a WARN) while a healthy one adds no warnings
 // at all (its scans report at Info).
 //
-// It replaces this package's previous per-scan announcements rather than joining
-// them: two records per scan would double the log volume of the healthy path and
-// leave the mode discoverable in only one of them.
-//
 // Every record carries the coverage pair (fallback_scan, scan_floor), so one
 // vocabulary answers "what cadence is this process on?" on every record this
 // package emits. The one record where scan_floor describes a cadence no walk
@@ -414,8 +314,13 @@ func (w *Watcher) logScanState(ctx context.Context, mode detectionMode, trigger 
 // by (see the dead-change-detection path in pollLoopWithUpgrade). A nil callback is a
 // wiring bug and should panic at the first scan rather than run indefinitely.
 func New(root string, onChange func(ctx context.Context), opts ...Option) *Watcher {
+	// Cleaned here so the field can only ever hold a canonical path: the
+	// root-vs-descendant severity policy (handleWatchAddError, classifyWatchEntry,
+	// validateWatchRootEntry) is raw string equality against it, and a trailing
+	// slash or a "./" prefix would make a refused registration of the ROOT compare
+	// unequal and be downgraded to a skipped WARN.
 	w := &Watcher{
-		root:     root,
+		root:     filepath.Clean(root),
 		onChange: onChange,
 	}
 	for _, o := range opts {
@@ -435,9 +340,10 @@ func New(root string, onChange func(ctx context.Context), opts ...Option) *Watch
 // other: watch mode returns only the terminal answer (shutdown, or the watcher
 // died), while poll mode returns either that same terminal answer or an
 // upgraded watcher — and by then it has already released its own ticker, so no
-// poll-mode resource outlives the mode. The supervisor below therefore picks a
-// mode per round: a watcher in hand means watch mode, no watcher means poll
-// until it hands one back. Everything that happens once a watch set exists
+// poll-mode resource outlives the mode. The supervisor below therefore runs at
+// most one of each: no watcher means poll mode until it hands one back, and watch
+// mode is terminal, so there is no round that returns to polling. Everything that
+// happens once a watch set exists
 // (dump the set, scan with it live, run the watch loop, close the watcher) is
 // stated once, in watchMode, for both mode entries; only the arrival RECORD
 // differs per entry, and each entry logs its own.
@@ -456,7 +362,7 @@ func New(root string, onChange func(ctx context.Context), opts ...Option) *Watch
 // detection, and returns nil.
 //
 // Every other state converges without a restart: watch mode's safety-net timer is
-// armed in EVERY configuration (reconcileFloor), so a partial watch set, a
+// armed in EVERY configuration (scancadence.Floor), so a partial watch set, a
 // registration the kernel dropped silently, and a directory past the registration
 // budget are all recovered by a later re-assert rather than left to the next event.
 func (w *Watcher) Run(ctx context.Context) error {
@@ -464,16 +370,14 @@ func (w *Watcher) Run(ctx context.Context) error {
 	if stopped {
 		return nil
 	}
-	for {
-		if watcher != nil {
-			return w.watchMode(ctx, watcher)
-		}
+	if watcher == nil {
 		upgraded, pollErr := w.pollLoopWithUpgrade(ctx)
 		if upgraded == nil {
 			return pollErr // poll mode reached its own terminal answer
 		}
 		watcher = upgraded
 	}
+	return w.watchMode(ctx, watcher)
 }
 
 // attachWatchSet is Run's initial mode selection: it constructs the fsnotify
@@ -664,7 +568,7 @@ func (w *Watcher) addWatchDirs(ctx context.Context, watcher *fsnotify.Watcher, r
 // scanbudget.Default when no ceiling was configured: an unbounded walk is not an
 // option, because the tree it enumerates is one this app does not own.
 func (w *Watcher) newWatchSetBudget(root string) *watchSetBudget {
-	return &watchSetBudget{max: scanbudget.Effective(w.maxEntries), root: root}
+	return &watchSetBudget{budget: scanbudget.NewCounter(w.maxEntries), root: root}
 }
 
 // watchSetBudget is one walk's entry ceiling: how many paths this traversal may visit,
@@ -673,15 +577,18 @@ func (w *Watcher) newWatchSetBudget(root string) *watchSetBudget {
 // to make it so. It carries no bound on the live registration set: the kernel owns the
 // inotify quota (see addWatchDirs).
 type watchSetBudget struct {
-	root    string
-	max     int
-	visited int
+	root string
+	// budget is the shared scanbudget.Counter, so this walk enforces MAX_SCAN_ENTRIES by
+	// the same rule internal/process's two walks do. NOTE: spendEntry is still called
+	// before this walk's error arm (addWatchDirs), which the Counter's doc names as the
+	// double-charge the process walks were corrected for; moving the charge site changes
+	// what the operator's ceiling enforces and is left to a change that owns this package.
+	budget scanbudget.Counter
 }
 
 // spendEntry charges one enumerated path and reports whether it is within budget.
 func (b *watchSetBudget) spendEntry() bool {
-	b.visited++
-	return b.visited <= b.max
+	return b.budget.Charge()
 }
 
 // warnWatchBudget emits the entry-ceiling WARN. Both call sites — the registering walk
@@ -690,7 +597,7 @@ func (b *watchSetBudget) spendEntry() bool {
 // unbounded and the operator action is the same for all of it.
 func (w *Watcher) warnWatchBudget(budget *watchSetBudget) {
 	slog.Warn(watchBudgetMsg, w.coverageAttrs(
-		"root", budget.root, "max_entries", budget.max,
+		"root", budget.root, "max_entries", budget.budget.Max(),
 		"remediation", watchBudgetRemediation)...)
 }
 
@@ -1083,7 +990,7 @@ func (w *Watcher) runWatchLoop(ctx context.Context, watcher *fsnotify.Watcher, s
 // seconds, and the alternative is a tree that is entirely unwatched until the floor
 // comes due. Any other event reports true untouched.
 func (w *Watcher) handleRootWatchLoss(ctx context.Context, watcher *fsnotify.Watcher, st *watchState, event fsnotify.Event) bool {
-	if filepath.Clean(event.Name) != filepath.Clean(w.root) {
+	if filepath.Clean(event.Name) != w.root {
 		return true
 	}
 	if !event.Has(fsnotify.Remove) && !event.Has(fsnotify.Rename) {
@@ -1239,10 +1146,9 @@ func (w *Watcher) handleSafetyNetTick(ctx context.Context, watcher *fsnotify.Wat
 func (w *Watcher) resyncWatchSet(ctx context.Context, watcher *fsnotify.Watcher, warning string) {
 	// A TRANSACTION, in three phases, and the ordering is the whole point: the mirror
 	// describes the registrations the kernel is holding, so it may never be emptied while
-	// the kernel still holds them. Clearing it first (what this did before) left the
-	// descriptors of a walk that then failed at the root live and permanently absent from
-	// the mirror, so nothing would ever unregister them and the per-event fast path would
-	// treat their paths as unwatched.
+	// the kernel still holds them -- a mirror emptied ahead of a walk that then fails at
+	// the root leaves those descriptors live and unclaimed, so nothing ever unregisters
+	// them and the per-event fast path reads their paths as unwatched.
 	//
 	// 1. PREFLIGHT: enumerate what the tree wants, touching neither the watcher nor the
 	//    mirror, so any failure — including cancellation — leaves both exactly as they
@@ -1326,7 +1232,9 @@ func (w *Watcher) reassertWatches(ctx context.Context, watcher *fsnotify.Watcher
 	// those freed slots to descendant directories and leave the root, the one
 	// watch a silently-dropped registration (IN_IGNORED on unmount/remount)
 	// most needs restored, refused for another whole re-sync interval.
-	rootPath := filepath.Clean(w.root)
+	// New cleaned it, and desiredWatchDirs keys the root entry as
+	// filepath.Clean(w.root), so the two already coincide.
+	rootPath := w.root
 	if _, ok := desired[rootPath]; ok {
 		if err := w.attachWatch(watcher, w.root, rootPath); err != nil {
 			return err
@@ -1450,8 +1358,7 @@ func (st *watchState) scheduleRepair() {
 // set is re-asserted now; inside it the re-assert is deferred to the remainder of the
 // interval (scheduleRepair), so a trigger is postponed to a cadence this process chose
 // rather than dropped. Shared by the debounced-scan and event-queue-overflow triggers,
-// which previously each spelled the rule themselves and pointed comments at each other
-// to keep the copies agreeing.
+// so the floor is spelled once for both.
 func (st *watchState) resyncOrDefer(ctx context.Context, watcher *fsnotify.Watcher, warning string) {
 	if time.Since(st.lastResync) >= minPreScanResync {
 		st.resync(ctx, watcher, warning)
@@ -1488,10 +1395,8 @@ func (st *watchState) runDeferredRepair(ctx context.Context, watcher *fsnotify.W
 
 // runDebouncedScan fires the debounced rescan and re-arms the safety-net timer so
 // the periodic interval is measured from the last real scan — which is also what
-// makes the reconciliation floor cost an active deployment nothing. Its per-scan
-// mode record (logScanState, trigger="event") replaces the previous "cert change
-// detected, processing" line: one record per scan, carrying the mode, rather than
-// an announcement that said nothing about the state the process is in.
+// makes the reconciliation floor cost an active deployment nothing. It emits the
+// one per-scan mode record (logScanState, trigger="event").
 //
 // The watch set is re-asserted first, exactly as the safety-net tick does, and for a
 // reason the event-driven recovery cannot cover: the watched mirror only forgets a

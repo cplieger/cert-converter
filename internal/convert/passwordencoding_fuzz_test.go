@@ -32,6 +32,13 @@ func FuzzInspectPasswordEncoding_classifies_every_unencodable_shape(f *testing.F
 	f.Add("pässwörd-Ω")
 	f.Add("\uFFFD")
 	f.Add(string([]byte{0xff, 0xfe}) + "tail")
+	// The BMP boundary, as a durable seed pair: U+FFFF is the last code point UCS-2
+	// carries in one code unit (encodable), U+10000 the first that needs a surrogate
+	// pair (not). Coverage-guided exploration effectively never lands on exactly
+	// U+FFFF, and the weekly run discards its generated corpus, so only a committed
+	// seed pins the comparison.
+	f.Add("pw-\uFFFF")
+	f.Add("pw-\U00010000")
 	f.Add("pw-\U0001F600")
 	f.Add("s3cret\x00")
 	f.Add("s\x00e\x00c\x00")
@@ -63,19 +70,14 @@ func FuzzInspectPasswordEncoding_classifies_every_unencodable_shape(f *testing.F
 				len(password), issues.EmbeddedNUL, want, map[bool]string{true: "carries", false: "carries no"}[want])
 		}
 
-		// Primary must name a shape whenever one was found and none when none was,
-		// or a caller that branches on it (config's startup gate, Encode's guard)
-		// accepts a password the classifier rejected.
-		primary := issues.Primary()
+		// Why must name a shape whenever one was found and none when none was, or
+		// the callers that refuse on a non-empty result (config's startup gate,
+		// Encode's guard) accept a password the classifier rejected.
+		why := issues.Why()
 		clean := issues == convert.PasswordEncodingIssues{}
-		if (primary == convert.PasswordEncodesFine) != clean {
-			t.Fatalf("InspectPasswordEncoding(%d bytes) = %+v with Primary() = %q; a shape must not go unnamed",
-				len(password), issues, primary)
-		}
-		switch primary {
-		case convert.PasswordEncodesFine, convert.PasswordInvalidUTF8, convert.PasswordNonBMP, convert.PasswordEmbeddedNUL:
-		default:
-			t.Fatalf("InspectPasswordEncoding(%d bytes).Primary() = %q, which no caller handles", len(password), primary)
+		if (why == "") != clean {
+			t.Fatalf("InspectPasswordEncoding(%d bytes) = %+v with Why() = %q; a shape must not go unnamed",
+				len(password), issues, why)
 		}
 	})
 }

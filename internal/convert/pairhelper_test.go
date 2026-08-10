@@ -26,7 +26,7 @@ func convertPairInRoot(ctx context.Context, certPEM, keyPEM []byte, root *os.Roo
 	if err != nil {
 		return nil, err
 	}
-	pfx, err := convert.Encode(analysis, enc, password)
+	pfx, err := analysis.Encode(enc, password)
 	if err != nil {
 		return analysis.Observations(), err
 	}

@@ -7,6 +7,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/cplieger/cert-converter/internal/scancadence"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -38,8 +39,8 @@ func TestNewWatchState_arms_the_reconciliation_floor_when_the_fallback_is_disabl
 
 		start := time.Now()
 		fired := <-st.safetyNetTimer.C
-		if elapsed := fired.Sub(start); elapsed != reconcileFloor {
-			t.Errorf("the safety-net timer fired after %v with the fallback disabled, want exactly the %v reconciliation floor", elapsed, reconcileFloor)
+		if elapsed := fired.Sub(start); elapsed != scancadence.Floor {
+			t.Errorf("the safety-net timer fired after %v with the fallback disabled, want exactly the %v reconciliation floor", elapsed, scancadence.Floor)
 		}
 
 		select {
@@ -75,7 +76,7 @@ func TestRunSafetyNetScan_reconciles_and_re_arms_with_the_fallback_disabled(t *t
 			t.Fatalf("the reconciliation tick ran %d scans, want 1: a re-assert without a certificate scan converts nothing and never refreshes the health marker", scans)
 		}
 		next := <-st.safetyNetTimer.C
-		if want := first.Add(reconcileFloor); !next.Equal(want) {
+		if want := first.Add(scancadence.Floor); !next.Equal(want) {
 			t.Errorf("the second reconciliation fired at %v, want %v (the floor must re-arm itself)", next.Sub(start), want.Sub(start))
 		}
 		if scans != 1 {
@@ -88,7 +89,7 @@ func TestRunSafetyNetScan_reconciles_and_re_arms_with_the_fallback_disabled(t *t
 		"mode":          "watch",
 		"trigger":       triggerReconcile,
 		"fallback_scan": "disabled",
-		"scan_floor":    reconcileFloor.String(),
+		"scan_floor":    scancadence.Floor.String(),
 	})
 }
 
@@ -100,7 +101,7 @@ func TestRunSafetyNetScan_reconciles_and_re_arms_with_the_fallback_disabled(t *t
 // internal/config clamps to, at which the old code armed a timer that would never
 // fire in any real container's lifetime).
 //
-// MarkerRefreshFloor is asserted against the same table because main derives the
+// scancadence.Effective is asserted against the same table because main derives the
 // probe's max-age from it: a divergence would either restart a healthy container or
 // arm a deadline the loop cannot meet.
 func TestSafetyNetInterval_never_exceeds_the_reconciliation_floor(t *testing.T) {
@@ -113,19 +114,19 @@ func TestSafetyNetInterval_never_exceeds_the_reconciliation_floor(t *testing.T) 
 		want        time.Duration
 	}{
 		{"the documented default is used as configured", triggerFallback, 6 * time.Hour, 6 * time.Hour},
-		{"the 0/false opt-out falls to the floor", triggerReconcile, 0, reconcileFloor},
-		{"a negative interval falls to the floor", triggerReconcile, -time.Second, reconcileFloor},
-		{"a cadence at the floor is the operator's", triggerFallback, reconcileFloor, reconcileFloor},
-		{"a cadence above the floor is capped", triggerReconcile, 48 * time.Hour, reconcileFloor},
-		{"the config ceiling is capped", triggerReconcile, 87600 * time.Hour, reconcileFloor},
+		{"the 0/false opt-out falls to the floor", triggerReconcile, 0, scancadence.Floor},
+		{"a negative interval falls to the floor", triggerReconcile, -time.Second, scancadence.Floor},
+		{"a cadence at the floor is the operator's", triggerFallback, scancadence.Floor, scancadence.Floor},
+		{"a cadence above the floor is capped", triggerReconcile, 48 * time.Hour, scancadence.Floor},
+		{"the config ceiling is capped", triggerReconcile, 87600 * time.Hour, scancadence.Floor},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := New("/input", func(context.Context) {}, WithFallback(tc.fallback))
 			if got := w.safetyNetInterval(); got != tc.want {
 				t.Errorf("safetyNetInterval() with WithFallback(%v) = %v, want %v", tc.fallback, got, tc.want)
 			}
-			if got := MarkerRefreshFloor(tc.fallback); got != tc.want {
-				t.Errorf("MarkerRefreshFloor(%v) = %v, want %v: the probe's deadline is derived from this and must match the loop's own cadence",
+			if got := scancadence.Effective(tc.fallback); got != tc.want {
+				t.Errorf("scancadence.Effective(%v) = %v, want %v: the probe's deadline is derived from this and must match the loop's own cadence",
 					tc.fallback, got, tc.want)
 			}
 			if got := w.safetyNetTrigger(); got != tc.wantTrigger {

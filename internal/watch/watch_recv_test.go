@@ -72,47 +72,32 @@ func TestHandleEventRecv_arms_the_debounce_only_for_interesting_events(t *testin
 	}
 }
 
-// TestHandleErrorRecv_stops_on_close_and_resyncs_on_overflow pins the error
-// receive: a closed errors channel stops the loop, an event-queue overflow both
-// forces a rescan and re-attaches the watch set (a dropped directory Create
-// would otherwise leave that subtree unwatched for the process's life), and any
-// other watcher error is logged without arming a scan.
-func TestHandleErrorRecv_stops_on_close_and_resyncs_on_overflow(t *testing.T) {
+// TestHandleErrorRecv_closed_channel_stops_the_loop pins the liveness contract of
+// the error receive, the twin of the event arm's: a closed errors channel means the
+// fsnotify watcher is dead, so the receive must name that loss
+// (errErrorsChannelClosed) and watchLoop then returns, restarting the container
+// with a fresh watcher. Returning nil there would spin the loop on a dead channel
+// forever with no change detection and a still-healthy marker.
+//
+// The arm's other two outcomes have focused homes of their own: the overflow's
+// rescan-plus-re-assert is asserted by
+// TestHandleErrorRecv_defers_a_second_overflow_resync_to_the_floor (its first
+// delivery) and TestHandleErrorRecv_keeps_the_loop_running_when_the_overflow_resync_fails,
+// and the benign error's silence by
+// TestHandleErrorRecv_does_not_resync_the_watch_set_for_a_benign_error.
+func TestHandleErrorRecv_closed_channel_stops_the_loop(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)
-	root := t.TempDir()
-	nested := filepath.Join(root, "acme-v02", "example.com")
-	if err := os.MkdirAll(nested, 0o750); err != nil {
-		t.Fatal(err)
-	}
-	w := New(root, func(context.Context) {})
-
+	w := New(t.TempDir(), func(context.Context) {})
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
+
 	if got := w.handleErrorRecv(t.Context(), watcher, st, nil, false); got != errErrorsChannelClosed {
-		t.Errorf("handleErrorRecv(ok=false) = %v, want the errors-channel-closed loss (%v) so watchLoop exits and the process restarts", got, errErrorsChannelClosed)
+		t.Errorf("handleErrorRecv(ok=false) = %v, want the errors-channel-closed loss (%v) so watchLoop exits and the process restarts",
+			got, errErrorsChannelClosed)
 	}
-
-	overflowState := newWatchState(w)
-	t.Cleanup(overflowState.stop)
-	if got := w.handleErrorRecv(t.Context(), watcher, overflowState, fsnotify.ErrEventOverflow, true); got != nil {
-		t.Errorf("handleErrorRecv(ErrEventOverflow) = %v, want nil (an overflow is recoverable, not fatal)", got)
-	}
-	if !overflowState.pending {
-		t.Error("handleErrorRecv(ErrEventOverflow) did not schedule a rescan; a renewal in the dropped events would be missed")
-	}
-	watched := watcher.WatchList()
-	if !slices.Contains(watched, nested) {
-		t.Errorf("handleErrorRecv(ErrEventOverflow) did not re-sync the watch set; %q missing from %v", nested, watched)
-	}
-
-	otherState := newWatchState(w)
-	t.Cleanup(otherState.stop)
-	if got := w.handleErrorRecv(t.Context(), watcher, otherState, errors.New("transient watcher failure"), true); got != nil {
-		t.Errorf("handleErrorRecv(non-overflow error) = %v, want nil (the loop keeps running)", got)
-	}
-	if otherState.pending {
-		t.Error("handleErrorRecv(non-overflow error) scheduled a scan; want the error logged only")
+	if st.pending {
+		t.Error("handleErrorRecv(ok=false) scheduled a scan; a dead watcher must not arm the debounce timer")
 	}
 }
 
@@ -272,6 +257,9 @@ func TestHandleErrorRecv_does_not_resync_the_watch_set_for_a_benign_error(t *tes
 	}
 	if watched := watcher.WatchList(); slices.Contains(watched, late) {
 		t.Errorf("handleErrorRecv(non-overflow error) re-walked the tree and picked up %q; only an event-queue overflow warrants a full re-sync", late)
+	}
+	if st.pending {
+		t.Error("handleErrorRecv(non-overflow error) armed the debounce; a benign watcher error is logged only, and one scan per error would put the /input walk on the watcher's own error rate")
 	}
 }
 

@@ -305,6 +305,14 @@ type encryptedData struct {
 	EncryptedContentInfo encryptedContentInfo
 }
 
+// EncryptedContent is retained but never read, for the reason recorded on
+// digestInfo: it is the largest single field an untrusted bundle controls, so a
+// []byte field here would copy it (go-pkcs12 v0.7.3 declares it that way,
+// pkcs12.go:244). Unlike digestInfo.Digest and encryptedPrivateKeyInfo.EncryptedData
+// it gets NO octetStringBytes shape check, and must not: RFC 5652 tags it
+// [0] IMPLICIT, so it parses as a context-specific element (class 2, tag 0) rather
+// than a universal OCTET STRING, and octetStringBytes would refuse the encrypted
+// safe of every bundle this app writes.
 type encryptedContentInfo struct {
 	ContentType                asn1.RawValue
 	ContentEncryptionAlgorithm algorithmIdentifier
@@ -746,9 +754,8 @@ func checkMACIterations(macOID asn1.ObjectIdentifier, params, macSalt asn1.RawVa
 		minIterations = minKDFIterations
 		minSalt = minPBKDF2SaltBytes
 	}
-	if len(salt) < minSalt {
-		return fmt.Errorf("%w: mac salt is %d octet(s), want at least %d",
-			ErrProfileUnknown, len(salt), minSalt)
+	if saltLenErr := checkSaltLength("mac", salt, minSalt); saltLenErr != nil {
+		return saltLenErr
 	}
 	return checkIterationsRange("mac", macDataIterations, minIterations)
 }
@@ -800,9 +807,8 @@ func decodeProfilePBKDF2(label string, alg *algorithmIdentifier) (pbkdf2Params, 
 	if saltErr != nil {
 		return pbkdf2Params{}, saltErr
 	}
-	if len(salt) < minPBKDF2SaltBytes {
-		return pbkdf2Params{}, fmt.Errorf("%w: %s PBKDF2 salt is %d octet(s), want at least %d",
-			ErrProfileUnknown, label, len(salt), minPBKDF2SaltBytes)
+	if saltLenErr := checkSaltLength(label+" PBKDF2", salt, minPBKDF2SaltBytes); saltLenErr != nil {
+		return pbkdf2Params{}, saltLenErr
 	}
 	if iterErr := checkIterationsRange(label, kdf.Iterations, minKDFIterations); iterErr != nil {
 		return pbkdf2Params{}, iterErr
@@ -908,9 +914,8 @@ func checkEncryptionIterations(algOID asn1.ObjectIdentifier, params asn1.RawValu
 		if saltErr != nil {
 			return saltErr
 		}
-		if len(salt) < minLegacySaltBytes {
-			return fmt.Errorf("%w: pbe salt is %d octet(s), want at least %d",
-				ErrProfileUnknown, len(salt), minLegacySaltBytes)
+		if saltLenErr := checkSaltLength("pbe", salt, minLegacySaltBytes); saltLenErr != nil {
+			return saltLenErr
 		}
 		return checkIterationsRange("pbe", legacy.Iterations, minKDFIterations)
 	}
@@ -927,6 +932,19 @@ func checkIterationsRange(label string, n, minIterations int) error {
 	if n < minIterations || n > maxKDFIterations {
 		return fmt.Errorf("%w: %s iteration count %d outside %d..%d",
 			ErrProfileUnknown, label, n, minIterations, maxKDFIterations)
+	}
+	return nil
+}
+
+// checkSaltLength rejects a derivation salt shorter than the length the profile
+// emits, the salt half of what checkIterationsRange does for a count. what names
+// the derivation for the refusal ("mac", "pbe", "pbes2 PBKDF2"), so the floor
+// comparison and its message have one home rather than one per refusal site; the
+// floors themselves stay per-algorithm at the call sites (see minPBKDF2SaltBytes).
+func checkSaltLength(what string, salt []byte, minBytes int) error {
+	if len(salt) < minBytes {
+		return fmt.Errorf("%w: %s salt is %d octet(s), want at least %d",
+			ErrProfileUnknown, what, len(salt), minBytes)
 	}
 	return nil
 }

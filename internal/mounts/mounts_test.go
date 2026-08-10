@@ -54,13 +54,10 @@ func TestOpen(t *testing.T) {
 				t.Errorf("Open(%+v) = %v, want %v", tc.dirs, got, tc.want)
 			}
 			if tc.want {
-				// Every accepted volume comes back with its confined handle open: that
+				// The accepted /output volume comes back with its confined handle open: that
 				// handle is what the /output write probe runs against, so a guard that
 				// returned the verdict alone would send the probe back to re-resolving
 				// the path it just proved openable.
-				if open.Input == nil {
-					t.Errorf("Open(%+v) returned a nil input root", tc.dirs)
-				}
 				if open.Output == nil {
 					t.Errorf("Open(%+v) returned a nil output root", tc.dirs)
 				}
@@ -72,7 +69,7 @@ func TestOpen(t *testing.T) {
 			// A refusal must hand back nothing: run() returns 1 without looking at the
 			// handles, so any root opened before the offender has to be closed here or
 			// it is leaked for the life of the process.
-			if open.Input != nil || open.Output != nil {
+			if open.Output != nil {
 				t.Errorf("Open(%+v) returned handles on the refusal path, want none", tc.dirs)
 			}
 			const msg = wantVolumeMissingMsg
@@ -151,7 +148,7 @@ func TestOpen_refuses_a_volume_it_cannot_open(t *testing.T) {
 	if ready {
 		t.Fatalf("Open(%q unopenable) = true, want false: starting anyway converts nothing and restart-loops on a condition a restart cannot clear", blocked)
 	}
-	if open.Input != nil || open.Output != nil {
+	if open.Output != nil {
 		t.Error("Open returned handles on the unopenable-volume path, want none: the input handle opened before the offender leaks for the life of the process otherwise")
 	}
 	const msg = "required volume cannot be opened by this container's user; refusing to start"

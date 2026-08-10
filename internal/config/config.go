@@ -12,7 +12,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
-	"github.com/cplieger/cert-converter/internal/watch"
+	"github.com/cplieger/cert-converter/internal/scancadence"
 	"github.com/cplieger/slogx"
 )
 
@@ -132,6 +132,7 @@ func Load() (Config, error) {
 		slog.Warn("unknown PFX_ENCODER, using the default profile",
 			"value", rawEncoder, "using", string(encName), "expected", convert.EncoderNames())
 	}
+	warnLegacyEncoderProtection(encName)
 
 	fallbackInterval, rawFallback, repair := fallbackIntervalFromEnv()
 	warnFallbackRepaired(rawFallback, repair)
@@ -272,7 +273,7 @@ func parseFallbackInterval(v string) (time.Duration, fallbackRepair) {
 func isPositiveOverflow(trimmed string, err error) bool {
 	digits := strings.TrimPrefix(trimmed, "+")
 	return errors.Is(err, strconv.ErrRange) &&
-		digits != "" && strings.Trim(digits, "0123456789") == ""
+		strings.Trim(digits, "0123456789") == ""
 }
 
 // parseMaxScanEntries parses a MAX_SCAN_ENTRIES value into the number of /input
@@ -365,8 +366,8 @@ func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
 // so each earns its own record naming what stands in for it.
 //
 // What goes away is the operator's CADENCE, not the app's convergence: the watcher
-// keeps a reconciliation floor in every configuration (internal/watch's
-// reconcileFloor), the health marker's freshness deadline is derived from that floor
+// keeps a reconciliation floor in every configuration (internal/scancadence's
+// Floor), the health marker's freshness deadline is derived from that floor
 // rather than from this value, and the startup line's scan_floor attribute names it.
 // Which way that cuts differs by arm. For the 0/false opt-out and the maxFallbackHours
 // ceiling the tradeoff is LATENCY — a renewal whose fsnotify event never arrived, and
@@ -374,7 +375,8 @@ func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
 // (IN_UNMOUNT/IN_IGNORED, which fsnotify neither reports as an event nor as a closed
 // channel), both wait for that slower reconciliation instead of for the cadence the
 // operator would otherwise have chosen. For a cadence ABOVE the floor there is no added
-// latency at all: safetyNetIntervalFor arms the timer with the smaller of the two, so
+// latency at all: the watcher arms the timer with the smaller of the two
+// (scancadence.Effective), so
 // the floor's walk runs more often than the cadence that was configured, which is why
 // that arm's record reports the override and says coverage is unaffected.
 //
@@ -384,34 +386,31 @@ func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
 //
 // It keys on the parsed interval: zero for the explicit "0"/"false" opt-out, at the
 // ceiling for a value at or above maxFallbackHours (including one Load's
-// warnFallbackRepaired clamped there), and above watch.MarkerRefreshFloor for a
+// warnFallbackRepaired clamped there), and above scancadence.Effective for a
 // cadence the floor overrides. A repaired blank or invalid value lands on the 6h
 // default, which is below the floor, so it remains enabled and silent here
 // (warnFallbackRepaired reports those).
 func warnFallbackDisabled(interval time.Duration) {
-	if floor := watch.MarkerRefreshFloor(interval); interval > floor {
+	if floor := scancadence.Effective(interval); interval > floor {
 		// One record for every cadence the floor overrides, the clamped ceiling
-		// included. There used to be a second arm ahead of this one that named the
-		// ceiling specifically; it was deleted (2026-08, user-ratified) because the
-		// two described ONE state and this one describes it correctly. The subset is
-		// total: parseFallbackInterval clamps every larger value to exactly
-		// maxFallbackHours, and the floor is well below that, so an at-ceiling
-		// interval satisfies this guard too. The ceiling arm's wording was also the
-		// weaker of the two — it borrowed the 0/false arm's "waits for the slower
-		// reconciliation" framing, when at the ceiling the floor's walk runs far MORE
-		// often than the cadence that was configured, which is what this record says.
+		// included: parseFallbackInterval clamps every larger value to exactly
+		// maxFallbackHours and the floor is well below that, so an at-ceiling interval
+		// satisfies this guard too and needs no arm of its own. At the ceiling the
+		// floor's walk runs far MORE often than the cadence that was configured, which
+		// is what this record says — do not reword it as waiting for a slower
+		// reconciliation, which is the 0/false arm's case, not this one.
 		//
 		// The safety-net timer always arms with the smaller of the configured cadence
-		// and the floor (watch.safetyNetIntervalFor), so this cadence never fires.
-		// The pair is rendered by watch.CoverageAttrs, the one home for its keys and
+		// and the floor (scancadence.Effective), so this cadence never fires.
+		// The pair is rendered by scancadence.CoverageAttrs, the one home for its keys and
 		// both renderings; this arm's guard makes the interval positive (so the label
 		// renders interval.String()) and floor is already
-		// watch.MarkerRefreshFloor(interval).
+		// scancadence.Effective(interval).
 		//
 		// A value clamped TO the ceiling still gets its own "too large, clamping"
 		// record from warnFallbackRepaired naming max_hours, so that fact is reported
 		// where it belongs and is not this arm's to carry.
-		attrs := append(watch.CoverageAttrs(interval),
+		attrs := append(scancadence.CoverageAttrs(interval),
 			"remediation", "set FALLBACK_SCAN_HOURS at or below the floor's hours if the cadence should be yours, or leave it as is: coverage is unaffected")
 		slog.Warn("FALLBACK_SCAN_HOURS is above the watcher's reconciliation floor, so no re-scan will ever run on your configured cadence; "+
 			"the floor's full-tree reconciliation runs instead, more often than the cadence you set",
@@ -423,7 +422,43 @@ func warnFallbackDisabled(interval time.Duration) {
 	}
 	slog.Warn("FALLBACK_SCAN_HOURS is 0/false: no routine periodic re-scan on your own cadence; "+
 		"a renewal whose fsnotify event never arrived, and an /input watch silently dropped by an unmount or remount, "+
-		"wait for the watcher's slower full-tree reconciliation instead (the startup line's scan_floor names it, and the health-marker "+
+		"wait for the watcher's slower full-tree reconciliation instead (this record's scan_floor names it, and the health-marker "+
 		"freshness deadline is derived from it, so a wedged watch loop is still reported unhealthy)",
-		"remediation", "unset FALLBACK_SCAN_HOURS (or set it above 0) if a missed renewal should be recovered on your own cadence rather than on the reconciliation floor")
+		append(scancadence.CoverageAttrs(interval),
+			"remediation", "unset FALLBACK_SCAN_HOURS (or set it above 0) if a missed renewal should be recovered on your own cadence rather than on the reconciliation floor")...)
+}
+
+// warnLegacyEncoderProtection warns when the selected profile is one of the two
+// legacy ones, whose bundles are only nominally protected however strong
+// PFX_PASSWORD is. go-pkcs12's LegacyDES and LegacyRC2 both derive the bundle's
+// MAC key with a SINGLE HMAC-SHA-1 iteration (the modern profiles use 2048), and
+// the MAC is what verifies a password guess, so an offline search over a leaked
+// .pfx costs about one hash per candidate and the 3DES-wrapped private key opens
+// once the password is recovered; legacyrc2 additionally encrypts the certificate
+// bag with a 40-bit RC2 key. Upstream says the same of both encoders: use a
+// throwaway password and protect the file by other means.
+//
+// Emitted even though the operator chose the profile explicitly, for the reason
+// PFX_ALLOW_EMPTY_PASSWORD=true is warned about on every start: the record reports
+// a degraded STATE of what this app writes, not a mistake in the spelling, and it
+// is the only statement of that state — the startup line carries the profile name
+// at INFO, which a LOG_LEVEL=warn deployment (the level the README's alerting
+// section is written for) never sees. It stays out of EncoderName's `known` flag
+// deliberately: that flag reports the parse, this reports the outcome.
+func warnLegacyEncoderProtection(name convert.EncoderType) {
+	if name != convert.EncNameLegacyDES && name != convert.EncNameLegacyRC2 {
+		return
+	}
+	remediation := "use PFX_ENCODER=modern2023 unless the consuming device accepts nothing else; " +
+		"if it does not, keep /output and every copy of it as sensitive as the private keys themselves"
+	if name == convert.EncNameLegacyRC2 {
+		remediation = "use PFX_ENCODER=modern2023, or legacydes if the device needs SHA-1 but not RC2; " +
+			"if it accepts nothing else, keep /output and every copy of it as sensitive as the private keys themselves"
+	}
+	slog.Warn("PFX_ENCODER selects a legacy PKCS#12 profile: its bundles carry a single-iteration "+
+		"HMAC-SHA-1 MAC, so the password embedded in every generated PFX file can be searched "+
+		"offline at about one hash per guess and the private key follows from it",
+		"encoder", string(name),
+		"mac_iterations", 1, "modern_mac_iterations", 2048,
+		"remediation", remediation)
 }

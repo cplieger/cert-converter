@@ -57,35 +57,35 @@ func TestWriteOutcome_derives_the_status_from_two_independent_facts(t *testing.T
 		&fs.PathError{Op: "renameat", Path: "chain.pfx", Err: syscall.EIO})
 	for name, tc := range map[string]struct {
 		writeErr writeRefusal
-		state    bundleState
+		state    contentState
 		want     conversionStatus
 	}{
 		"a write that landed is a conversion whatever the prior bundle was": {
-			state: bundleState{content: contentVerifiedStale}, writeErr: nil, want: statusConverted,
+			state: contentVerifiedStale, writeErr: nil, want: statusConverted,
 		},
 		"a write that landed over an unverifiable prior is a conversion too": {
-			state: bundleState{content: contentUnverified}, writeErr: nil, want: statusConverted,
+			state: contentUnverified, writeErr: nil, want: statusConverted,
 		},
 		"an unverifiable prior whose rewrite is refused for permissions is health-neutral": {
-			state: bundleState{content: contentUnverified}, writeErr: refused, want: statusUnwritable,
+			state: contentUnverified, writeErr: refused, want: statusUnwritable,
 		},
 		"an unverifiable prior whose rewrite a full volume refuses is health-neutral": {
-			state: bundleState{content: contentUnverified}, writeErr: full, want: statusUnwritable,
+			state: contentUnverified, writeErr: full, want: statusUnwritable,
 		},
 		"an unverifiable prior whose rewrite fails for an unattributable reason fails": {
-			state: bundleState{content: contentUnverified}, writeErr: brokenIO, want: statusFailed,
+			state: contentUnverified, writeErr: brokenIO, want: statusFailed,
 		},
 		"a stale bundle whose rewrite is refused for permissions is still a failure": {
-			state: bundleState{content: contentVerifiedStale}, writeErr: refused, want: statusFailed,
+			state: contentVerifiedStale, writeErr: refused, want: statusFailed,
 		},
 		"a stale bundle whose rewrite a full volume refuses is still a failure": {
-			state: bundleState{content: contentVerifiedStale}, writeErr: full, want: statusFailed,
+			state: contentVerifiedStale, writeErr: full, want: statusFailed,
 		},
 		"a stale bundle whose rewrite fails for an unattributable reason is a failure": {
-			state: bundleState{content: contentVerifiedStale}, writeErr: brokenIO, want: statusFailed,
+			state: contentVerifiedStale, writeErr: brokenIO, want: statusFailed,
 		},
 		"an unresolved fact takes the loud direction even under a refusal": {
-			state: bundleState{}, writeErr: refused, want: statusFailed,
+			state: contentUnresolved, writeErr: refused, want: statusFailed,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -175,7 +175,7 @@ func TestWriteRefusal_carries_a_classification_from_every_refusal_site(t *testin
 		"a bundle above the read bound is a transient refusal the write makes": {
 			stage: func(_ *testing.T, _ string) string { return "out.pfx" },
 			pfx:   make([]byte, maxPFXSize+1),
-			want:  refusalTransient, wantClearable: true, wantRemediation: outputPermRemediation,
+			want:  refusalTransient, wantClearable: true, wantRemediation: outputTransientRemediation,
 		},
 		// Site 3 again, through the seam, because a read-only mount and a full volume
 		// cannot be staged in a directory the suite owns.
@@ -212,7 +212,7 @@ func TestWriteRefusal_carries_a_classification_from_every_refusal_site(t *testin
 				stubWriteRefusal(t, &fs.PathError{Op: "renameat", Path: "out.pfx", Err: syscall.EIO})
 				return "out.pfx"
 			},
-			want: refusalTransient, wantClearable: true, wantRemediation: outputPermRemediation,
+			want: refusalTransient, wantClearable: true, wantRemediation: outputTransientRemediation,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -280,7 +280,7 @@ func TestWriteRefusalCause_states_both_facts_for_every_declared_cause(t *testing
 		refusalOwnership:    {"refusalOwnership", false, outputPermRemediation},
 		refusalOutputLayout: {"refusalOutputLayout", false, outputPinRemediation},
 		refusalVolume:       {"refusalVolume", false, outputVolumeRemediation},
-		refusalTransient:    {"refusalTransient", true, outputPermRemediation},
+		refusalTransient:    {"refusalTransient", true, outputTransientRemediation},
 	}
 	for c := range refusalCauseCount {
 		tc, ok := want[c]
@@ -417,9 +417,9 @@ func TestStoreInspect_reports_content_it_could_not_verify(t *testing.T) {
 			if err != nil {
 				t.Fatalf("inspect(unverifiable prior) = error %v, want nil: it must resolve to a fact, not fail the pair", err)
 			}
-			if state.content != contentUnverified {
+			if state != contentUnverified {
 				t.Errorf("inspect(unverifiable prior) content = %v, want contentUnverified: nothing compared these"+
-					" bytes, so calling them stale claims evidence this app does not have", state.content)
+					" bytes, so calling them stale claims evidence this app does not have", state)
 			}
 			if state.upToDate() {
 				t.Error("inspect(unverifiable prior).upToDate() = true, want false: a bundle this app cannot" +
@@ -475,7 +475,8 @@ func TestScannerRun_rewrites_a_bundle_it_could_not_verify(t *testing.T) {
 			// rewriting something unverifiable is that the operator ends up with the bundle
 			// these inputs produce.
 			written, _ := readBundle(t, pfxPath)
-			if got := convert.CheckCurrency(written, "pw", mustAnalyse(t, chainPEM, keyPEM), convert.EncNameModern2023); !got.Current() {
+			want := mustAnalyse(t, chainPEM, keyPEM)
+			if got := want.CheckCurrency(written, "pw", convert.EncNameModern2023); !got.Current() {
 				t.Errorf("Run(unverifiable prior) left a bundle CheckCurrency reports as %v, want a match", got.Reason)
 			}
 			// And the next scan must go quiet, or the app would churn the bundle (fresh KDF
@@ -654,7 +655,8 @@ func TestScannerRun_when_the_output_parent_cannot_be_pinned(t *testing.T) {
 	if err := os.Mkdir(realDir, pfxDirMode); err != nil {
 		t.Fatalf("setup: Mkdir(out real): %v", err)
 	}
-	current, err := convert.Encode(mustAnalyse(t, chainPEM, keyPEM), convert.EncNameModern2023, "pw")
+	analysis := mustAnalyse(t, chainPEM, keyPEM)
+	current, err := analysis.Encode(convert.EncNameModern2023, "pw")
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}

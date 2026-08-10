@@ -343,11 +343,15 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 	}
 
 	var deleted int
-	var removedPaths []string
-	// Emitted from a defer so the audit record covers what was actually deleted on
-	// every exit from this loop, including the shutdown return below: a deletion that
-	// happened must not go unrecorded because the process stopped afterwards.
-	defer func() { logReapAudit(removedPaths) }()
+	var removedPaths, refusedPaths []string
+	// Emitted from a defer so BOTH records cover what actually happened on every exit
+	// from this loop, including the shutdown return below: a deletion that happened must
+	// not go unrecorded because the process stopped afterwards, and neither must a refusal
+	// that leaves /output unreconciled.
+	defer func() {
+		logReapAudit(removedPaths)
+		logReapRefusals(refusedPaths)
+	}()
 	// The index is the remaining-work count's only accurate source: `deleted` counts
 	// UNLINKS, so len(orphaned)-deleted charges every candidate this loop already
 	// examined and legitimately skipped (its certificate came back, its key is still
@@ -395,9 +399,16 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 				"removed", deleted, "remaining", len(orphaned)-i, "error", err)
 			return deleted, err
 		}
-		if rp.out.removeOrphan(rel) {
+		switch rp.out.removeOrphan(rel) {
+		case reapAttemptRemoved:
 			removedPaths = append(removedPaths, rel)
 			deleted++
+		case reapAttemptRefused:
+			refusedPaths = append(refusedPaths, rel)
+		case reapAttemptVanished:
+			// The producer race removeOrphan already named at Debug. Nothing to
+			// aggregate: counting it would report a bundle that is gone as one this
+			// app failed to remove.
 		}
 	}
 	return deleted, nil
@@ -563,6 +574,29 @@ func logReapAudit(removed []string) {
 	slog.Warn(reapAuditMsg,
 		"count", len(removed), "paths", sampleOrphanPaths(removed),
 		"remediation", "expected under OUTPUT_LIFECYCLE=sync; set OUTPUT_LIFECYCLE=warn to have this app report orphans instead of deleting them")
+}
+
+// logReapRefusals emits the failure half of the deletion audit, and nothing at all for a
+// scan that was refused nothing, so sync mode reconciling normally stays quiet exactly as
+// logReapAudit does for a scan that deleted nothing.
+//
+// It exists because the per-candidate refusals removeOrphan logs carry no COUNT and no
+// phrase any documented rule matches, while ScanResult.Removed reports 0 for a scan whose
+// every unlink was refused — the same 0 a scan with nothing to reap reports. Without this
+// record an /output subtree the UID cannot write stops reconciliation permanently, with
+// health green and nothing countable to alert on.
+//
+// It reuses the orphan report's own bounded sample (sampleOrphanPaths: at most
+// maxLoggedOrphans paths within maxLoggedOrphanBytes) so the record cannot grow without
+// limit, and outputPermRemediation because that is the action every recurring shape of this
+// refusal shares.
+func logReapRefusals(refused []string) {
+	if len(refused) == 0 {
+		return
+	}
+	slog.Warn(removalRefusedMsg,
+		"count", len(refused), "paths", sampleOrphanPaths(refused),
+		"remediation", outputPermRemediation)
 }
 
 // reapDeferral is how long reconcile waits, ONCE per scan, between identifying

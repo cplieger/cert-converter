@@ -1,7 +1,6 @@
 package process
 
 import (
-	"context"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -9,7 +8,6 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/slogx/capture"
@@ -354,13 +352,7 @@ func TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unw
 	// is the unverifiable one.
 	pfxPath := filepath.Join(outRoot, "chain.pfx")
 	stageOversizedBundle(t, pfxPath)
-	prevWrite := writeFileInRoot
-	writeFileInRoot = func(context.Context, *os.Root, string, []byte,
-		...atomicfile.Option,
-	) (atomicfile.Result, error) {
-		return atomicfile.Result{}, &fs.PathError{Op: "openat", Path: "chain.pfx", Err: syscall.EACCES}
-	}
-	t.Cleanup(func() { writeFileInRoot = prevWrite })
+	stubWriteRefusal(t, &fs.PathError{Op: "openat", Path: "chain.pfx", Err: syscall.EACCES})
 
 	logs := captureLogs(t)
 	res, err := scanner.Run(t.Context())
