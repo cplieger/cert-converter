@@ -6,6 +6,7 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"math/big"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -43,7 +44,7 @@ func TestAnalyse_abandons_the_analysis_when_the_context_is_cancelled(t *testing.
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("errors.Is(%v, context.Canceled) = false, want true: the caller classifies a shutdown through this wrap", err)
 	}
-	if analysis.Leaf() != nil {
+	if !reflect.DeepEqual(analysis, convert.Analysis{}) {
 		t.Errorf("Analyse(cancelled ctx) returned a populated analysis %v, want the zero value: a verdict from a partially built graph must never be propagated", analysis)
 	}
 }
@@ -147,7 +148,7 @@ func TestAnalyse_cancellation_observed_mid_analysis_never_yields_a_verdict(t *te
 			if !errors.Is(err, context.Canceled) {
 				t.Errorf("errors.Is(%v, context.Canceled) = false, want true: the caller classifies a shutdown through this wrap, and a refusal here logs a bogus conversion failure and flips the health marker on a container that was only asked to stop", err)
 			}
-			if analysis.Leaf() != nil {
+			if !reflect.DeepEqual(analysis, convert.Analysis{}) {
 				t.Errorf("Analyse(cancelled ctx) returned a populated analysis %v, want the zero value", analysis)
 			}
 		})

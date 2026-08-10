@@ -567,12 +567,28 @@ func TestLoad_warns_when_the_fallback_rescan_is_disabled(t *testing.T) {
 				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN carries no remediation naming the variable (logs %v)",
 					tc.raw, logs.Messages())
 			}
+			// The message points at THIS record for the number ("this record's scan_floor
+			// names it"), so the attribute is part of the contract rather than decoration:
+			// in the 0/false + LOG_LEVEL=warn posture this is the only record that carries
+			// the effective reconciliation cadence, the INFO startup line being both
+			// suppressed at that level and emitted after this one.
+			if !logs.HasAttr(optOutWarn, "scan_floor", scancadence.Floor.String()) {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN does not carry scan_floor=%v, the number its own message sends the operator to (logs %v)",
+					tc.raw, scancadence.Floor, logs.Messages())
+			}
+			// "disabled" rather than "0s" is the operator's confirmation that the opt-out
+			// took effect, and it is what keeps scan_floor beside it from reading as the
+			// cadence they configured.
+			if !logs.HasAttr(optOutWarn, "fallback_scan", "disabled") {
+				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN does not report fallback_scan=disabled (logs %v)",
+					tc.raw, logs.Messages())
+			}
 		})
 	}
 }
 
 // TestLoad_warns_when_the_fallback_cadence_is_above_the_reconciliation_floor pins the
-// third arm of warnFallbackDisabled: a cadence the watcher's floor overrides never fires,
+// above-the-floor arm of warnFallbackDisabled: a cadence the floor overrides never fires,
 // so the operator pays more full-tree walks than they configured and this startup record
 // is the only place that says so.
 //
@@ -1094,6 +1110,82 @@ func TestLoad_unknown_encoder_warns_and_falls_back_to_modern2023(t *testing.T) {
 			}
 			if tc.wantWarn && !logs.HasAttr("unknown PFX_ENCODER", "expected", "[modern2023 modern2026 legacydes legacyrc2]") {
 				t.Errorf("Load() with PFX_ENCODER=%q WARN does not list every canonical profile (logs %v)", tc.raw, logs.Messages())
+			}
+		})
+	}
+}
+
+// TestLoad_warns_when_a_legacy_encoder_profile_is_selected pins
+// warnLegacyEncoderProtection. Both legacy profiles produce bundles whose MAC key is
+// derived with ONE HMAC-SHA-1 iteration (go-pkcs12 v0.7.3: LegacyDES and LegacyRC2 set
+// macIterations: 1, Modern2023/Modern2026 set 2048), and the MAC is what verifies a
+// password guess, so this record is the operator's only statement of that state at
+// LOG_LEVEL=warn -- the startup line naming the profile is INFO. The two iteration
+// attrs ARE the actionable content: a dependency bump that moved them, or an edit that
+// dropped one, must fail here rather than leave a record that reads authoritative and
+// says nothing. legacyrc2's own remediation is the only place the app names legacydes
+// as the SHA-1-without-RC2 step down, and it is the branch nothing else reaches.
+// slog.Default is process-global, so this test must not run in parallel with anything
+// that logs.
+func TestLoad_warns_when_a_legacy_encoder_profile_is_selected(t *testing.T) {
+	const legacyWarn = "PFX_ENCODER selects a legacy PKCS#12 profile"
+
+	for _, tc := range []struct {
+		name            string
+		raw             string
+		wantWarn        bool
+		wantEncoder     convert.EncoderType
+		wantRemediation string
+	}{
+		{"legacydes warns", "legacydes", true, convert.EncNameLegacyDES, "unless the consuming device accepts nothing else"},
+		{"the legacy alias warns", "legacy", true, convert.EncNameLegacyDES, "unless the consuming device accepts nothing else"},
+		{"legacyrc2 warns and names legacydes as the step down", "legacyrc2", true, convert.EncNameLegacyRC2, "or legacydes if the device needs SHA-1 but not RC2"},
+		{"modern2023 is silent", "modern2023", false, convert.EncNameModern2023, ""},
+		{"modern2026 is silent", "modern2026", false, convert.EncNameModern2026, ""},
+		{"an unknown value falls back to modern2023 and is silent here", "modern2029", false, convert.EncNameModern2023, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolatePasswordFile(t)
+			t.Setenv("PFX_PASSWORD", "pw")
+			t.Setenv("PFX_ENCODER", tc.raw)
+
+			logs := capture.Default(t)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() with PFX_ENCODER=%q = %v, want nil", tc.raw, err)
+			}
+			if cfg.EncoderName != tc.wantEncoder {
+				t.Fatalf("Load() with PFX_ENCODER=%q EncoderName = %q, want %q", tc.raw, cfg.EncoderName, tc.wantEncoder)
+			}
+			warned := logs.CountLevel(slog.LevelWarn, legacyWarn) > 0
+			if warned != tc.wantWarn {
+				t.Errorf("Load() with PFX_ENCODER=%q warned about legacy protection = %v, want %v (logs %v)",
+					tc.raw, warned, tc.wantWarn, logs.Messages())
+			}
+			if !tc.wantWarn {
+				return
+			}
+			if logs.CountLevel(slog.LevelWarn, legacyWarn) != 1 {
+				t.Errorf("Load() with PFX_ENCODER=%q logged %d legacy-profile records, want exactly 1 per process start (logs %v)",
+					tc.raw, logs.CountLevel(slog.LevelWarn, legacyWarn), logs.Messages())
+			}
+			if !logs.HasAttr(legacyWarn, "encoder", string(tc.wantEncoder)) {
+				t.Errorf("Load() with PFX_ENCODER=%q WARN does not name the effective profile %q (logs %v)",
+					tc.raw, tc.wantEncoder, logs.Messages())
+			}
+			// The pair is the record's whole quantitative claim: without it the operator is
+			// asked to take "only nominally protected" on faith, and a dependency bump that
+			// moved either number would go unnoticed.
+			if !logs.HasAttr(legacyWarn, "mac_iterations", "1") {
+				t.Errorf("Load() with PFX_ENCODER=%q WARN does not carry mac_iterations=1 (logs %v)", tc.raw, logs.Messages())
+			}
+			if !logs.HasAttr(legacyWarn, "modern_mac_iterations", "2048") {
+				t.Errorf("Load() with PFX_ENCODER=%q WARN does not carry modern_mac_iterations=2048, so the 1 above has nothing to be read against (logs %v)",
+					tc.raw, logs.Messages())
+			}
+			if !logs.AttrContains(legacyWarn, "remediation", tc.wantRemediation) {
+				t.Errorf("Load() with PFX_ENCODER=%q remediation does not name %q (logs %v)", tc.raw, tc.wantRemediation, logs.Messages())
 			}
 		})
 	}

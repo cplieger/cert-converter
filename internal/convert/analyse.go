@@ -253,10 +253,14 @@ type Observation struct {
 // The value return IS the nil half of the invariant, held by construction rather
 // than by checking: there is no nil *Analysis for a consumer to be handed, so the
 // codec's entry points carry no nil arm and a caller's own Observations() call
-// cannot dereference nothing. Those entry points are METHODS on Analysis rather
-// than free functions taking it by value, so the invariant costs neither a copy
-// nor a lint suppression: a pointer receiver invoked on the caller's addressable
-// value copies nothing and still admits no nil.
+// cannot dereference nothing. Those entry points are METHODS on Analysis with VALUE
+// receivers, which is what makes the guarantee structural: a value receiver cannot
+// be nil, and `var a *Analysis; a.Encode(...)` does not compile. The cost is a
+// 96-byte copy per call, which gocritic's hugeParam flags and an explained
+// //nolint accepts at each site (Observations, Encode, CheckCurrency,
+// matchesAnalysis, and store.inspect's want parameter) — a pointer receiver there
+// would reopen exactly the nil case this shape exists to close, to save a copy
+// that is noise beside a PKCS#12 encode or decode.
 //
 // The LEAF half is not structural and is not pretended to be. The fields are
 // unexported, so no other package can build a populated Analysis, but
@@ -265,8 +269,9 @@ type Observation struct {
 // an assertion where analyseAt builds the value, and nowhere else — no consumer
 // re-checks it.
 //
-// Observations keeps a pointer receiver so a caller's addressable value calls it
-// without copying the struct.
+// Observations takes a VALUE receiver like every other operation on an Analysis, so
+// the no-nil guarantee is the same one at every entry point; see its own doc for the
+// hugeParam trade.
 type Analysis struct {
 	// leaf is the end-entity certificate the PFX is built around.
 	leaf *x509.Certificate
@@ -306,9 +311,8 @@ type Analysis struct {
 // without disturbing the analysis it came from.
 //
 // Observations, Encode and CheckCurrency are the whole of Analysis's exported
-// surface, and they are METHODS rather than free functions taking the value:
-// a pointer receiver on the caller's addressable value copies nothing and
-// still admits no nil, so the invariant costs neither a copy nor a nolint.
+// surface, and they are METHODS rather than free functions taking the value, so the
+// no-nil guarantee lives in the receiver instead of in a nil arm at each call.
 // The receiver is a VALUE, like every other operation on an Analysis: the type is
 // immutable once Analyse returns it and has exactly one producer, which is when Go
 // says value receivers. gocritic's hugeParam fires on the 96-byte copy; its premise

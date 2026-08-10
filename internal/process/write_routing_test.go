@@ -556,13 +556,7 @@ func TestScannerRun_when_an_unverifiable_bundle_cannot_be_rewritten(t *testing.T
 				Password:  "pw",
 				Encoder:   convert.EncNameModern2023,
 			})
-			prevWrite := writeFileInRoot
-			writeFileInRoot = func(context.Context, *os.Root, string, []byte,
-				...atomicfile.Option,
-			) (atomicfile.Result, error) {
-				return atomicfile.Result{}, tc.writeErr
-			}
-			t.Cleanup(func() { writeFileInRoot = prevWrite })
+			stubWriteRefusal(t, tc.writeErr)
 			sizeBefore := statSize(t, pfxPath)
 
 			logs := captureLogs(t)

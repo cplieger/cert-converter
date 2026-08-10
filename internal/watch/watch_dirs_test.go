@@ -573,8 +573,9 @@ func TestPruneWatches_keeps_a_refused_removal_charged_to_the_mirror(t *testing.T
 // replacement directory is refused unless the stale registration this rebuild is
 // about to drop anyway has released its slot first, and a refused Add below the
 // root is WARN-and-skip, so the new certificate directory stays unwatched until a
-// later re-assert -- renewals under it are then detected only by the periodic
-// rescan, and never with FALLBACK_SCAN_HOURS=0.
+// later re-assert -- renewals under it are then detected only by a full rescan:
+// on the configured fallback cadence, or on the 24h reconciliation floor when
+// FALLBACK_SCAN_HOURS=0.
 //
 // Swapping the two phases leaves the final watch set identical (Add is idempotent
 // and the removal still happens), which is why the sibling tests here cannot see

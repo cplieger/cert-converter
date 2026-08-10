@@ -1159,13 +1159,7 @@ func TestScannerRun_a_stale_bundle_with_a_lax_mode_is_a_conversion_failure(t *te
 	if err := os.Chmod(pfxPath, 0o644); err != nil {
 		t.Fatalf("setup: Chmod: %v", err)
 	}
-	prevWrite := writeFileInRoot
-	writeFileInRoot = func(context.Context, *os.Root, string, []byte,
-		...atomicfile.Option,
-	) (atomicfile.Result, error) {
-		return atomicfile.Result{}, &fs.PathError{Op: "openat", Path: "chain.pfx", Err: syscall.EACCES}
-	}
-	t.Cleanup(func() { writeFileInRoot = prevWrite })
+	stubWriteRefusal(t, &fs.PathError{Op: "openat", Path: "chain.pfx", Err: syscall.EACCES})
 
 	logs := captureLogs(t)
 	res, err := scanner.Run(t.Context())
@@ -1185,6 +1179,16 @@ func TestScannerRun_a_stale_bundle_with_a_lax_mode_is_a_conversion_failure(t *te
 	if got := logs.CountLevel(slog.LevelError, "conversion failed"); got != 1 {
 		t.Errorf("logged %q at ERROR %d times, want exactly 1: an unwritten renewal is a conversion"+
 			" failure: %q", "conversion failed", got, logs.Messages())
+	}
+	// The LOUD register takes its remediation from the refusal's own carried cause, exactly
+	// as the health-neutral one does. Asserted here because this is the only test that
+	// reaches that arm with a cause other than refusalTransient, whose remediation is
+	// byte-identical to the composed literal the rewiring replaced -- so without this line a
+	// revert to that literal passes the whole suite.
+	if got, ok := logs.AttrValue("conversion failed", "remediation"); !ok || got != outputPermRemediation {
+		t.Errorf("the conversion-failure record remediation = %q (present %v), want %q: an EACCES"+
+			" refusal is an ownership condition, and a loud record naming free space or a planted"+
+			" symlink instead sends the operator after the wrong cause", got, ok, outputPermRemediation)
 	}
 	// The health-neutral message may not appear: a bundle this app compared and found
 	// stale earns no standing WARN in place of the failure.
@@ -2730,6 +2734,12 @@ func TestStoreReconcile_audits_deletions_once_per_scan_at_warn(t *testing.T) {
 		t.Errorf("the per-path deletion detail logged %d times at DEBUG, want 2: the audit record"+
 			" collapses the default-level report, it does not remove the detail", got)
 	}
+	// Nothing was refused, so the refusal half of the pair must stay silent, exactly as the
+	// audit record does for a scan that deleted nothing.
+	if got := logs.CountLevel(slog.LevelWarn, removalRefusedMsg); got != 0 {
+		t.Errorf("a scan whose every unlink succeeded logged %q at WARN %d times, want 0: %q",
+			removalRefusedMsg, got, logs.Messages())
+	}
 }
 
 // TestStoreReconcile_no_audit_record_when_nothing_was_deleted is the other half of that
@@ -2762,6 +2772,51 @@ func TestStoreReconcile_no_audit_record_when_nothing_was_deleted(t *testing.T) {
 	}
 	if got := logs.CountLevel(slog.LevelWarn, reapAuditMsg); got != 0 {
 		t.Errorf("a scan that deleted nothing logged %q %d times at WARN, want 0: %q",
+			reapAuditMsg, got, logs.Messages())
+	}
+}
+
+// TestReapConfirmed_reports_refused_removals_once_per_scan_at_warn is the failure half of
+// the deletion audit. ScanResult.Removed reports 0 for a scan whose every unlink was refused
+// -- the same 0 a scan with nothing to reap reports -- so this record is the only countable
+// signal that OUTPUT_LIFECYCLE=sync has stopped reconciling.
+//
+// The candidate is a DIRECTORY at an output name rather than a write-denied parent: the suite
+// runs as uid 0, where directory permissions are ignored and the sibling permission-based
+// fixture skips. reapConfirmed is driven directly so the walk's own candidate rules are not
+// part of the fixture. Serial: it swaps waitBeforeReap and slog.Default.
+func TestReapConfirmed_reports_refused_removals_once_per_scan_at_warn(t *testing.T) {
+	out := t.TempDir()
+	if err := os.Mkdir(filepath.Join(out, "stuck.pfx"), 0o750); err != nil {
+		t.Fatalf("setup: Mkdir(stuck.pfx): %v", err)
+	}
+	stubReapWait(t, func(context.Context) error { return nil })
+	logs := captureLogs(t)
+
+	deleted, err := newReaper(newOutputStore(t, out), newInputSource(t, t.TempDir()),
+		outputpolicy.LifecycleSync).reapConfirmed(context.Background(), []string{"stuck.pfx"})
+
+	if err != nil {
+		t.Fatalf("reapConfirmed(refused candidate) = error %v, want nil: a refusal is not a scan failure", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("reapConfirmed(refused candidate) deleted = %d, want 0", deleted)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, removalRefusedMsg); got != 1 {
+		t.Errorf("a scan whose only unlink was refused logged %q at WARN %d times, want exactly 1: it"+
+			" is the only countable signal that /output stopped reconciling: %q",
+			removalRefusedMsg, got, logs.Messages())
+	}
+	if !logs.HasAttr(removalRefusedMsg, "count", "1") {
+		got, _ := logs.AttrValue(removalRefusedMsg, "count")
+		t.Errorf("the refusal record count = %q, want %q: the count is what an operator alerts on", got, "1")
+	}
+	if paths, ok := logs.AttrValue(removalRefusedMsg, "paths"); !ok || !strings.Contains(paths, "stuck.pfx") {
+		t.Errorf("the refusal record paths = %q (present %v), want it to name stuck.pfx", paths, ok)
+	}
+	// A refusal is not a deletion: the audit record for the destructive action must stay silent.
+	if got := logs.CountLevel(slog.LevelWarn, reapAuditMsg); got != 0 {
+		t.Errorf("a scan that deleted nothing logged %q at WARN %d times, want 0: %q",
 			reapAuditMsg, got, logs.Messages())
 	}
 }

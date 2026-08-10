@@ -360,35 +360,36 @@ func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
 
 // warnFallbackDisabled warns when the operator's own periodic rescan never runs,
 // because nothing else in the process reports it: the explicit 0/false opt-out
-// removed it, the configured cadence sits at maxFallbackHours, where a rescan on
-// that cadence never arrives, or the cadence is above the watcher's reconciliation
-// floor, which overrides it. In all three the cadence the operator chose never fires,
-// so each earns its own record naming what stands in for it.
+// removed it, or the cadence is above the watcher's reconciliation floor, which
+// overrides it — a value at or clamped to maxFallbackHours included, since the
+// ceiling is far above the floor. In both the cadence the operator chose never
+// fires, so each earns its own record naming what stands in for it.
 //
 // What goes away is the operator's CADENCE, not the app's convergence: the watcher
 // keeps a reconciliation floor in every configuration (internal/scancadence's
-// Floor), the health marker's freshness deadline is derived from that floor
-// rather than from this value, and the startup line's scan_floor attribute names it.
-// Which way that cuts differs by arm. For the 0/false opt-out and the maxFallbackHours
-// ceiling the tradeoff is LATENCY — a renewal whose fsnotify event never arrived, and
-// an /input watch the kernel dropped silently on an unmount or remount
-// (IN_UNMOUNT/IN_IGNORED, which fsnotify neither reports as an event nor as a closed
-// channel), both wait for that slower reconciliation instead of for the cadence the
-// operator would otherwise have chosen. For a cadence ABOVE the floor there is no added
-// latency at all: the watcher arms the timer with the smaller of the two
-// (scancadence.Effective), so
-// the floor's walk runs more often than the cadence that was configured, which is why
-// that arm's record reports the override and says coverage is unaffected.
+// Floor), the health marker's freshness deadline is derived from that floor rather
+// than from this value, and BOTH records below carry it as scan_floor
+// (scancadence.CoverageAttrs) rather than leaving it to the INFO startup line a
+// LOG_LEVEL=warn deployment never sees.
+// Which way that cuts differs by arm. For the 0/false opt-out the tradeoff is
+// LATENCY — a renewal whose fsnotify event never arrived, and an /input watch the
+// kernel dropped silently on an unmount or remount (IN_UNMOUNT/IN_IGNORED, which
+// fsnotify neither reports as an event nor as a closed channel), both wait for that
+// slower reconciliation instead of for the cadence the operator would otherwise have
+// chosen. For a cadence ABOVE the floor, the maxFallbackHours ceiling included, there
+// is no added latency at all: the watcher arms the timer with the smaller of the two
+// (scancadence.Effective), so the floor's walk runs MORE often than the cadence that
+// was configured, which is why that arm's record reports the override and says
+// coverage is unaffected.
 //
 // Deliberately a warning rather than a detector: whether a day of extra latency on a
 // missed renewal is acceptable is the operator's judgment, and the app cannot infer
 // it. A wedged loop IS now detected, by the marker deadline.
 //
-// It keys on the parsed interval: zero for the explicit "0"/"false" opt-out, at the
-// ceiling for a value at or above maxFallbackHours (including one Load's
-// warnFallbackRepaired clamped there), and above scancadence.Effective for a
-// cadence the floor overrides. A repaired blank or invalid value lands on the 6h
-// default, which is below the floor, so it remains enabled and silent here
+// It keys on the parsed interval: above scancadence.Floor for a cadence the floor
+// overrides, which is where a value at or clamped to maxFallbackHours lands too, and
+// zero for the explicit "0"/"false" opt-out. A repaired blank or invalid value lands
+// on the 6h default, which is below the floor, so it remains enabled and silent here
 // (warnFallbackRepaired reports those).
 func warnFallbackDisabled(interval time.Duration) {
 	if floor := scancadence.Effective(interval); interval > floor {

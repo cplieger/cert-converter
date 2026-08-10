@@ -44,10 +44,10 @@ const Marker = "...(truncated)"
 //
 // The marker is appended AFTER the cut, so a truncated value exceeds limit by the
 // marker's own length: the bound exists to stop a multi-kilobyte record, not to hit
-// the budget exactly. runesafe's Capped pair makes the opposite choice (the marker is
-// charged against the cap); this one stays as it is because its caller composes a
-// further elision suffix of its own after the cut, and its budget was set against
-// this placement.
+// the budget exactly. Every runesafe primitive that takes a caller's marker makes the
+// opposite choice, the Budgeted pair above included (the marker is charged against the
+// cap); this one stays as it is because its caller composes a further elision suffix of
+// its own after the cut, and its budget was set against this placement.
 func Cap(s string, limit int) string {
 	if len(s) <= limit {
 		return s

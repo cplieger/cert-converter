@@ -17,10 +17,12 @@ import (
 // package is a codec and never learns where its input came from or where its
 // output goes.
 //
-// The receiver is a POINTER, which is what removes the nil case rather than
-// checking for it: Analyse hands back a value, so a caller invokes this on its own
-// addressable Analysis, there is no nil *Analysis to arrive here and no nil arm to
-// write — at no copy. The leaf invariant is stated once at the producer (see
+// The receiver is a VALUE, which is what removes the nil case rather than
+// checking for it: Analyse hands back a value and the receiver copies it, so there
+// is no nil *Analysis to arrive here and no nil arm to write. The 96-byte copy is
+// the price of that guarantee and is noise beside the PKCS#12 crypto that follows
+// it, which is what the suppression below records. The leaf invariant is stated
+// once at the producer (see
 // analyseAt's assertion) and is not re-checked here; a zero convert.Analysis{},
 // which stays constructible outside this package, is a programming error and is
 // not defended against — see the Analysis doc for why a validity flag was
@@ -168,9 +170,9 @@ func (c Currency) Current() bool { return c.Reason == CurrencyMatch }
 // the caller owns what a reason is worth and, since CheckCurrency takes no context,
 // owns the shutdown classification too. pfx is never mutated.
 //
-// The receiver is a POINTER for the reason Encode's doc gives: Analyse returns a
-// value, so a caller invokes this on its own addressable Analysis, no nil can
-// arrive and no nil arm exists to be got wrong — at no copy.
+// The receiver is a VALUE for the reason Encode's doc gives: Analyse returns a
+// value and the receiver copies it, so no nil can arrive and no nil arm exists to
+// be got wrong; the copy is the price, and the suppression below records it.
 func (a Analysis) CheckCurrency(pfx []byte, password string, wantEncoder EncoderType) Currency { //nolint:gocritic // hugeParam: same reason as Encode — the value receiver IS the no-nil guarantee.
 	priorProfile, err := inspect(pfx)
 	if err != nil {
@@ -252,9 +254,9 @@ func decode(pfx []byte, password string) (decoded, error) {
 // by a caller any more: a PFX_ENCODER change reaches the verdict without anyone
 // having to sequence it.
 //
-// Neither side has a nil arm. a is the caller's own addressable Analysis, reached
-// through CheckCurrency's pointer receiver, so the analysis leaf invariant is
-// stated once where analyseAt builds it. d comes from decode, and go-pkcs12
+// Neither side has a nil arm. a is a value, reached through CheckCurrency's own
+// value receiver, so the analysis leaf invariant is stated once where analyseAt
+// builds it. d comes from decode, and go-pkcs12
 // v0.7.3 refuses a bundle whose bags hold no certificate itself — DecodeChain
 // returns "pkcs12: certificate missing" (pkcs12.go:493-495) — so a leafless
 // bundle is answered by CurrencyDecodeFailed, with the decode error in the

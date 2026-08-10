@@ -58,9 +58,13 @@ type conversionStatus int
 // — a symlinked output tree, a component that is not a directory, a regular file
 // occupying a directory component of the output path, or a component another writer
 // replaced — a read-only mount, a full volume, and an exhausted quota. The single
-// exception, restated at the point of refusal rather than assumed: a raw filesystem errno
-// the failing site itself cannot attribute to any of those is a genuinely transient I/O
-// error, which a restart CAN clear, so it keeps the loud statusFailed.
+// exception is stated only by the bounded atomic write reading its own error: a raw
+// filesystem errno THAT site cannot attribute to any of those is a genuinely transient
+// I/O error, which a restart CAN clear, so it keeps the loud statusFailed. The two
+// directory steps (create and pin) deliberately take the other direction with their
+// residuals — an errno they cannot attribute is the shape of the operator's output tree
+// (refusalOutputLayout), so even a transient EIO there is restart-unclearable by
+// construction; store.write's MkdirAll arm documents why.
 //
 // "Never proved it wrong" means this app could not verify the content AT ALL: a bundle
 // above the readable bound, unreadable, un-stat-able, or refused by the codec's preflight.

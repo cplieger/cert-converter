@@ -1134,7 +1134,7 @@ func TestPasswordEncodingIssues_Why_words_every_shape_once(t *testing.T) {
 	}
 
 	if got := (convert.PasswordEncodingIssues{}).Why(); got != "" {
-		t.Errorf("PasswordEncodesFine.Explain() = %q, want \"\": both callers treat a non-empty result as a refusal", got)
+		t.Errorf("(PasswordEncodingIssues{}).Why() = %q, want \"\": both callers treat a non-empty result as a refusal", got)
 	}
 }
 
@@ -1165,6 +1165,40 @@ func TestParseCertChain_names_the_first_skipped_label_not_the_last(t *testing.T)
 	}
 	if strings.Contains(err.Error(), "TRUSTED CERTIFICATE") {
 		t.Errorf("ParseCertChain error = %q, want the later label absent from the diagnostic", err.Error())
+	}
+}
+
+// TestParseCertChain_names_the_key_label_ahead_of_an_earlier_companion pins the
+// preference parseCertChain applies when the certificate file yields no certificate at
+// all: name the PRIVATE-KEY label, not simply the first skipped one. `openssl ecparam
+// -genkey` writes EC PARAMETERS immediately BEFORE the key it describes, so on the
+// commonest "I mounted the key as the .crt" mistake the first skipped label is a
+// companion of the key and says nothing about the mistake. Nothing else pins it: the
+// key-only case asserts the skipped COUNT alone, and the first-label case uses
+// "OPENSSH PRIVATE KEY", which isPrivateKeyLabel deliberately excludes, so deleting the
+// preference arm leaves the whole package green while the operator is pointed at the
+// wrong file again.
+func TestParseCertChain_names_the_key_label_ahead_of_an_earlier_companion(t *testing.T) {
+	t.Parallel()
+	_, keyPEM := testcerts.GenerateSelfSignedCert(t, "ecparam-genkey", "ecdsa")
+
+	certFile := bytes.Join([][]byte{
+		pem.EncodeToMemory(&pem.Block{Type: "EC PARAMETERS", Bytes: []byte("opaque")}),
+		keyPEM,
+	}, nil)
+
+	_, err := convert.ParseCertChain(certFile)
+	if err == nil {
+		t.Fatal("ParseCertChain(EC PARAMETERS plus a private key) = nil error, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "this looks like the private key file rather than the certificate file") {
+		t.Errorf("ParseCertChain error = %q, want it to say the file looks like the key file", err.Error())
+	}
+	if !strings.Contains(err.Error(), `"PRIVATE KEY"`) {
+		t.Errorf("ParseCertChain error = %q, want it to name the private-key label", err.Error())
+	}
+	if strings.Contains(err.Error(), "EC PARAMETERS") {
+		t.Errorf("ParseCertChain error = %q, want the EC PARAMETERS companion NOT named: it is the label that says nothing about the mistake", err.Error())
 	}
 }
 

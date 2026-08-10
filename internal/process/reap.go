@@ -588,15 +588,18 @@ func logReapAudit(removed []string) {
 //
 // It reuses the orphan report's own bounded sample (sampleOrphanPaths: at most
 // maxLoggedOrphans paths within maxLoggedOrphanBytes) so the record cannot grow without
-// limit, and outputPermRemediation because that is the action every recurring shape of this
-// refusal shares.
+// limit. Its remediation is deliberately cause-NEUTRAL: refusedPaths collects three
+// unrelated shapes (a permission denial, an OpenParentInRoot layout refusal, and a
+// non-regular occupant at an output name), each of which already logged its own
+// cause-specific action per path, so naming any one of them here would send the operator
+// after the wrong cause for the other two.
 func logReapRefusals(refused []string) {
 	if len(refused) == 0 {
 		return
 	}
 	slog.Warn(removalRefusedMsg,
 		"count", len(refused), "paths", sampleOrphanPaths(refused),
-		"remediation", outputPermRemediation)
+		"remediation", "review the per-path WARN records from this scan and repair the reported /output layout, non-regular occupant, or permissions")
 }
 
 // reapDeferral is how long reconcile waits, ONCE per scan, between identifying
