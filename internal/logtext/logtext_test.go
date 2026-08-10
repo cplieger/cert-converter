@@ -60,7 +60,7 @@ func TestCap_backs_the_cut_off_to_a_rune_start(t *testing.T) {
 // not drift on the wording: internal/process caps its orphan path sample with Cap
 // (unsanitized on purpose — /input is the operator's own tree and the paths are their
 // query key), and internal/convert hands the same const to
-// runesafe.SanitizeSingleLineCapped for certificate-derived text.
+// runesafe.SanitizeSingleLineBudgeted for certificate-derived text.
 //
 // What the two do NOT share is where the marker's bytes are charged, and that is
 // asserted rather than left implicit: Cap appends it after the cut (its caller
@@ -80,16 +80,16 @@ func TestMarker_names_the_cut_in_both_paths(t *testing.T) {
 			limit, len(capped), want)
 	}
 
-	sanitized, cut := runesafe.SanitizeSingleLineCapped(long, limit, logtext.Marker)
+	sanitized, cut := runesafe.SanitizeSingleLineBudgeted(long, limit, logtext.Marker)
 	if !cut {
-		t.Errorf("SanitizeSingleLineCapped(200 bytes, %d) reported no cut, want one", limit)
+		t.Errorf("SanitizeSingleLineBudgeted(200 bytes, %d) reported no cut, want one", limit)
 	}
 	if !strings.HasSuffix(sanitized, logtext.Marker) {
-		t.Errorf("SanitizeSingleLineCapped(200 bytes, %d) = %q, want the SAME marker %q as Cap: one condition, one vocabulary",
+		t.Errorf("SanitizeSingleLineBudgeted(200 bytes, %d) = %q, want the SAME marker %q as Cap: one condition, one vocabulary",
 			limit, sanitized, logtext.Marker)
 	}
 	if len(sanitized) > limit {
-		t.Errorf("SanitizeSingleLineCapped(200 bytes, %d) is %d bytes, want at most the limit: that path charges the marker against it",
+		t.Errorf("SanitizeSingleLineBudgeted(200 bytes, %d) is %d bytes, want at most the limit: that path charges the marker against it",
 			limit, len(sanitized))
 	}
 }
