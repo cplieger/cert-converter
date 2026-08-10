@@ -456,10 +456,6 @@ func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (Anal
 	obs = append(obs, chainValidityObservations(chain, now)...)
 	obs = append(obs, chainIssuerEligibilityObservations(chain)...)
 
-	if g.cancelErr != nil {
-		return Analysis{}, fmt.Errorf("analyse cancelled: %w", g.cancelErr)
-	}
-
 	a := Analysis{
 		leaf:         leaf,
 		chain:        chain,

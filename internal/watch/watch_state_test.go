@@ -93,7 +93,7 @@ func TestRunSafetyNetScan_reconciles_and_re_arms_with_the_fallback_disabled(t *t
 	})
 }
 
-// TestSafetyNetInterval_never_exceeds_the_reconciliation_floor pins the one rule
+// TestSafetyNetCadence_never_exceeds_the_reconciliation_floor pins the one rule
 // behind both the loop's cadence and the health probe's staleness deadline: the
 // operator's FALLBACK_SCAN_HOURS cadence is used as configured while it is below
 // the floor, and the floor covers every other case — the 0/false opt-out, a
@@ -101,10 +101,11 @@ func TestRunSafetyNetScan_reconciles_and_re_arms_with_the_fallback_disabled(t *t
 // internal/config clamps to, at which the old code armed a timer that would never
 // fire in any real container's lifetime).
 //
-// scancadence.Effective is asserted against the same table because main derives the
-// probe's max-age from it: a divergence would either restart a healthy container or
-// arm a deadline the loop cannot meet.
-func TestSafetyNetInterval_never_exceeds_the_reconciliation_floor(t *testing.T) {
+// scancadence.Effective is asserted directly because it IS the rule: main derives
+// the probe's max-age from it and this package's timers arm from it, so one table
+// covers both. safetyNetTrigger is asserted beside it because it is the only thing
+// this package still derives from that cadence — which clock the mode record names.
+func TestSafetyNetCadence_never_exceeds_the_reconciliation_floor(t *testing.T) {
 	t.Parallel()
 	// Strings first, then the durations: govet fieldalignment reads this table too.
 	for _, tc := range []struct {
@@ -122,9 +123,6 @@ func TestSafetyNetInterval_never_exceeds_the_reconciliation_floor(t *testing.T) 
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := New("/input", func(context.Context) {}, WithFallback(tc.fallback))
-			if got := w.safetyNetInterval(); got != tc.want {
-				t.Errorf("safetyNetInterval() with WithFallback(%v) = %v, want %v", tc.fallback, got, tc.want)
-			}
 			if got := scancadence.Effective(tc.fallback); got != tc.want {
 				t.Errorf("scancadence.Effective(%v) = %v, want %v: the probe's deadline is derived from this and must match the loop's own cadence",
 					tc.fallback, got, tc.want)
@@ -259,8 +257,10 @@ func (c liveForNCtx) Err() error {
 // deleted and a shutdown landing mid-re-sync would still start a full /input
 // scan whose ScanResult drives the health marker on the way out.
 //
-// live: 2 is runDebouncedScan's own Err() sequence on this tree: the entry
-// guard, then one visitWatchPath call for the (empty) root, then the guard under
+// live: 3 is runDebouncedScan's own Err() sequence on this tree: the entry
+// guard, then the two observations one walk entry makes for the (empty) root —
+// the budget admission gate (exceedsEntryBudget, which honours cancellation
+// before charging) and classifyWatchEntry's own guard — then the guard under
 // test. So the re-sync runs to completion and only the scan is suppressed, which
 // is what the watch-list assertion distinguishes from an early entry-guard
 // return.
@@ -275,7 +275,7 @@ func TestRunDebouncedScan_skips_the_scan_when_shutdown_cut_the_resync_short(t *t
 	st.scheduleScan()
 
 	calls := 0
-	ctx := liveForNCtx{Context: context.Background(), calls: &calls, live: 2}
+	ctx := liveForNCtx{Context: context.Background(), calls: &calls, live: 3}
 
 	st.runDebouncedScan(ctx, watcher)
 

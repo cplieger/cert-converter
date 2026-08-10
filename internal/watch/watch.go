@@ -187,12 +187,6 @@ func (w *Watcher) coverageAttrs(attrs ...any) []any {
 	return append(attrs, scancadence.CoverageAttrs(w.fallback)...)
 }
 
-// safetyNetInterval is this Watcher's periodic safety-net cadence; see
-// scancadence.Effective for the rule and scancadence.Floor for why a floor exists.
-func (w *Watcher) safetyNetInterval() time.Duration {
-	return scancadence.Effective(w.fallback)
-}
-
 // safetyNetTrigger names the clock behind one safety-net scan for its mode record:
 // the operator's configured cadence, or the reconciliation floor standing in for it.
 // Keeping the two apart in the log is what lets an operator confirm that
@@ -203,7 +197,7 @@ func (w *Watcher) safetyNetInterval() time.Duration {
 // fallback (at fallback == scancadence.Floor the two clocks coincide and the operator's
 // name wins).
 func (w *Watcher) safetyNetTrigger() string {
-	if w.safetyNetInterval() == w.fallback {
+	if scancadence.Effective(w.fallback) == w.fallback {
 		return triggerFallback
 	}
 	return triggerReconcile
@@ -556,7 +550,11 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 func (w *Watcher) addWatchDirs(ctx context.Context, watcher *fsnotify.Watcher, root string) error {
 	budget := w.newWatchSetBudget(root)
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		if !budget.spendEntry() {
+		exceeded, err := budget.exceedsEntryBudget(ctx, walkErr)
+		if err != nil {
+			return err
+		}
+		if exceeded {
 			w.warnWatchBudget(budget)
 			return fs.SkipAll
 		}
@@ -579,16 +577,33 @@ func (w *Watcher) newWatchSetBudget(root string) *watchSetBudget {
 type watchSetBudget struct {
 	root string
 	// budget is the shared scanbudget.Counter, so this walk enforces MAX_SCAN_ENTRIES by
-	// the same rule internal/process's two walks do. NOTE: spendEntry is still called
-	// before this walk's error arm (addWatchDirs), which the Counter's doc names as the
-	// double-charge the process walks were corrected for; moving the charge site changes
-	// what the operator's ceiling enforces and is left to a change that owns this package.
+	// the same rule internal/process's two walks do, including the Counter's charge-after-
+	// the-error-arm rule: exceedsEntryBudget is the one admission gate both watch-set
+	// walks call, so a directory WalkDir reports twice (once as an entry, once to deliver
+	// its read error) is charged once and the operator's ceiling means the same number in
+	// every walk this app runs.
 	budget scanbudget.Counter
 }
 
-// spendEntry charges one enumerated path and reports whether it is within budget.
-func (b *watchSetBudget) spendEntry() bool {
-	return b.budget.Charge()
+// exceedsEntryBudget admits one WalkDir callback: it honours cancellation first, then
+// charges the shared Counter for a NORMAL callback only, and reports whether the walk
+// has run out of budget.
+//
+// Charging after the error arm is scanbudget.Counter's documented rule, and this is
+// where the watch-set walks obey it. filepath.WalkDir delivers a directory it could not
+// read through a SECOND callback for that directory's own path — the one the parent
+// already charged — so charging above the error arm counts one pathname twice and stops
+// both walks below the operator's configured MAX_SCAN_ENTRIES. Cancellation stays first
+// so a shutdown arriving exactly at the ceiling propagates ctx.Err() rather than
+// emitting the budget WARN and reporting the tree as truncated.
+func (b *watchSetBudget) exceedsEntryBudget(ctx context.Context, walkErr error) (bool, error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
+	if walkErr != nil {
+		return false, nil // WalkDir is repeating the directory to report its read error.
+	}
+	return !b.budget.Charge(), nil
 }
 
 // warnWatchBudget emits the entry-ceiling WARN. Both call sites — the registering walk
@@ -1192,7 +1207,11 @@ func (w *Watcher) desiredWatchDirs(ctx context.Context, root string) (map[string
 	budget := w.newWatchSetBudget(root)
 	desired := make(map[string]struct{})
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		if !budget.spendEntry() {
+		exceeded, err := budget.exceedsEntryBudget(ctx, walkErr)
+		if err != nil {
+			return err
+		}
+		if exceeded {
 			w.warnWatchBudget(budget)
 			return fs.SkipAll
 		}
@@ -1292,7 +1311,7 @@ type watchState struct {
 // The safety-net timer is armed UNCONDITIONALLY, which is the whole of this
 // package's liveness guarantee: FALLBACK_SCAN_HOURS=0/false removes the operator's
 // own cadence, not the reconciliation floor that stands in for it
-// (safetyNetInterval), so there is no configuration in which the loop holds no
+// (scancadence.Effective), so there is no configuration in which the loop holds no
 // clock at all and change detection depends purely on fsnotify events arriving.
 func newWatchState(w *Watcher) *watchState {
 	st := &watchState{w: w}
@@ -1300,7 +1319,7 @@ func newWatchState(w *Watcher) *watchState {
 	st.debounceTimer.Stop()
 	st.repairTimer = time.NewTimer(minPreScanResync)
 	st.repairTimer.Stop()
-	st.safetyNetTimer = time.NewTimer(w.safetyNetInterval())
+	st.safetyNetTimer = time.NewTimer(scancadence.Effective(w.fallback))
 	return st
 }
 
@@ -1432,7 +1451,7 @@ func (st *watchState) runDebouncedScan(ctx context.Context, watcher *fsnotify.Wa
 	}
 	st.w.logScanState(ctx, modeWatch, triggerEvent)
 	st.w.onChange(ctx)
-	st.safetyNetTimer.Reset(st.w.safetyNetInterval())
+	st.safetyNetTimer.Reset(scancadence.Effective(st.w.fallback))
 }
 
 // runSafetyNetScan fires the periodic safety-net rescan and re-arms its timer. Its
@@ -1443,7 +1462,7 @@ func (st *watchState) runDebouncedScan(ctx context.Context, watcher *fsnotify.Wa
 func (st *watchState) runSafetyNetScan(ctx context.Context) {
 	st.w.logScanState(ctx, modeWatch, st.w.safetyNetTrigger())
 	st.w.onChange(ctx)
-	st.safetyNetTimer.Reset(st.w.safetyNetInterval())
+	st.safetyNetTimer.Reset(scancadence.Effective(st.w.fallback))
 }
 
 // handleWatcherError reacts to an fsnotify error: an event-queue overflow
@@ -1533,7 +1552,7 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) (upgraded *fsnotify.W
 // rather than firing for watch mode's whole lifetime into a receiver nobody
 // selects on, with its Stop deferred until process exit.
 func (w *Watcher) pollUntilUpgrade(ctx context.Context) *fsnotify.Watcher {
-	ticker := time.NewTicker(w.safetyNetInterval())
+	ticker := time.NewTicker(scancadence.Effective(w.fallback))
 	defer ticker.Stop()
 
 	for {
@@ -1580,7 +1599,7 @@ func (w *Watcher) pollTick(ctx context.Context) (upgraded *fsnotify.Watcher, sto
 	if ctx.Err() != nil {
 		return nil, true
 	}
-	slog.Debug("poll tick", "interval", w.safetyNetInterval())
+	slog.Debug("poll tick", "interval", scancadence.Effective(w.fallback))
 	fw, stage, attachErr := w.tryAttachWatchSet(ctx)
 	switch stage {
 	case stageStopped:

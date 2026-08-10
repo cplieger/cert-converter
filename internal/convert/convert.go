@@ -622,9 +622,12 @@ func subjectForLog(c *x509.Certificate) string {
 	return boundLogText(boundedDN(dnSequence(&c.Subject)).String(), maxSubjectLogLen)
 }
 
-// dnSequence returns the RDNSequence pkix.Name.String() renders, mirroring that
-// method's own construction so the bounded render below is byte-identical to the
-// unbounded one it replaces.
+// dnSequence returns the RDNSequence pkix.Name.String() renders for a
+// PARSER-PRODUCED name, mirroring that method's own construction so the bounded
+// render below is byte-identical to the unbounded one it replaces. Every name that
+// reaches it originates in x509.ParseCertificate, which populates Names and
+// documents that it does not populate ExtraNames, so String()'s other arm — the
+// caller-composed ExtraNames one — has no population here and is not mirrored.
 //
 // The mirror is load-bearing and Name.ToRDNSequence() is NOT a substitute for it:
 // ToRDNSequence reports only the nine attribute types pkix keeps in named fields,
@@ -639,18 +642,16 @@ func subjectForLog(c *x509.Certificate) string {
 // skipped arc set below is pkix's, and it is the set ToRDNSequence already covers.
 func dnSequence(n *pkix.Name) pkix.RDNSequence {
 	var rdns pkix.RDNSequence
-	if n.ExtraNames == nil {
-		for _, atv := range n.Names {
-			t := atv.Type
-			if len(t) == 4 && t[0] == 2 && t[1] == 5 && t[2] == 4 {
-				switch t[3] {
-				case 3, 5, 6, 7, 8, 9, 10, 11, 17:
-					// Already carried by a named field, so ToRDNSequence emits it.
-					continue
-				}
+	for _, atv := range n.Names {
+		t := atv.Type
+		if len(t) == 4 && t[0] == 2 && t[1] == 5 && t[2] == 4 {
+			switch t[3] {
+			case 3, 5, 6, 7, 8, 9, 10, 11, 17:
+				// Already carried by a named field, so ToRDNSequence emits it.
+				continue
 			}
-			rdns = append(rdns, []pkix.AttributeTypeAndValue{atv})
 		}
+		rdns = append(rdns, []pkix.AttributeTypeAndValue{atv})
 	}
 	return append(rdns, n.ToRDNSequence()...)
 }

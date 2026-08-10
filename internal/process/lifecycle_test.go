@@ -2795,7 +2795,6 @@ func TestReapConfirmed_reports_refused_removals_once_per_scan_at_warn(t *testing
 
 	deleted, err := newReaper(newOutputStore(t, out), newInputSource(t, t.TempDir()),
 		outputpolicy.LifecycleSync).reapConfirmed(context.Background(), []string{"stuck.pfx"})
-
 	if err != nil {
 		t.Fatalf("reapConfirmed(refused candidate) = error %v, want nil: a refusal is not a scan failure", err)
 	}

@@ -11,8 +11,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/cplieger/atomicfile/v2"
 )
 
 // TestSourcePathVanished_reports_an_unclassifiable_path_as_steady_state pins
@@ -97,56 +95,12 @@ func TestSourceReadBounded(t *testing.T) {
 			t.Fatal(err)
 		}
 		s := newInputSource(t, dir)
-		data, err := s.readBoundedLimit(t.Context(), "in.pem", 1024)
+		data, err := s.readBounded(t.Context(), "in.pem")
 		if err != nil {
-			t.Fatalf("source.readBoundedLimit: %v", err)
+			t.Fatalf("source.readBounded: %v", err)
 		}
 		if !bytes.Equal(data, []byte("hello")) {
 			t.Errorf("got %q, want %q", data, "hello")
-		}
-	})
-
-	// maxFileSize (10 MB) is the documented /input bound, and readBoundedLimit's limit
-	// parameter exists so that boundary is testable without a 10 MB fixture per case.
-	// The bound is INCLUSIVE: a file exactly at the limit must read whole, or a
-	// certificate at the documented maximum becomes a conversion failure that flips
-	// health -- which a fixture well over the limit can never see.
-	t.Run("reads a file exactly at the limit", func(t *testing.T) {
-		t.Parallel()
-		const limit = 1024
-		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "exact.pem"), make([]byte, limit), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		s := newInputSource(t, dir)
-
-		data, err := s.readBoundedLimit(t.Context(), "exact.pem", limit)
-		if err != nil {
-			t.Fatalf("source.readBoundedLimit(file of exactly %d bytes, limit %d) = error %v, want the file read whole: the bound is inclusive",
-				limit, limit, err)
-		}
-		if len(data) != limit {
-			t.Errorf("source.readBoundedLimit(file of exactly %d bytes) read %d bytes, want %d", limit, len(data), limit)
-		}
-	})
-
-	t.Run("refuses a file one byte over the limit", func(t *testing.T) {
-		t.Parallel()
-		const limit = 1024
-		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "big.pem"), make([]byte, limit+1), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		s := newInputSource(t, dir)
-
-		// errors.Is on atomicfile's sentinel, not a bare non-nil, for the same reason
-		// the missing-file case below argues: a read that failed for any OTHER reason (a
-		// rejected path, a file that vanished, a non-regular file) satisfies non-nil
-		// while proving nothing about the size bound -- and the bound is what stops one
-		// oversized input from spending the scan's only goroutine.
-		if _, err := s.readBoundedLimit(t.Context(), "big.pem", limit); !errors.Is(err, atomicfile.ErrFileTooLarge) {
-			t.Errorf("source.readBoundedLimit(file of %d bytes, limit %d) error = %v, want it to satisfy errors.Is(err, atomicfile.ErrFileTooLarge)",
-				limit+1, limit, err)
 		}
 	})
 
@@ -161,9 +115,9 @@ func TestSourceReadBounded(t *testing.T) {
 		// vanished cert down the Warn arm and back into the alerted unreadable count,
 		// which is the false page the vanished classification exists to prevent -- and
 		// a bare non-nil assertion cannot see it.
-		_, err := s.readBoundedLimit(t.Context(), "missing.pem", 1024)
+		_, err := s.readBounded(t.Context(), "missing.pem")
 		if !errors.Is(err, fs.ErrNotExist) {
-			t.Errorf("source.readBoundedLimit(nonexistent file) error = %v, want it to satisfy errors.Is(err, fs.ErrNotExist)", err)
+			t.Errorf("source.readBounded(nonexistent file) error = %v, want it to satisfy errors.Is(err, fs.ErrNotExist)", err)
 		}
 	})
 
@@ -183,8 +137,8 @@ func TestSourceReadBounded(t *testing.T) {
 			t.Fatal(err)
 		}
 		s := newInputSource(t, dir)
-		if _, err := s.readBoundedLimit(t.Context(), "leak.pem", 1024); err == nil {
-			t.Fatal("source.readBoundedLimit followed a symlink escaping the root; want a confinement error")
+		if _, err := s.readBounded(t.Context(), "leak.pem"); err == nil {
+			t.Fatal("source.readBounded followed a symlink escaping the root; want a confinement error")
 		}
 	})
 
@@ -203,12 +157,12 @@ func TestSourceReadBounded(t *testing.T) {
 		}
 		s := newInputSource(t, dir)
 
-		data, err := s.readBoundedLimit(t.Context(), "../secret.pem", 1024)
+		data, err := s.readBounded(t.Context(), "../secret.pem")
 		if err == nil {
-			t.Fatalf("source.readBoundedLimit(%q) read %d bytes; want a confinement error", "../secret.pem", len(data))
+			t.Fatalf("source.readBounded(%q) read %d bytes; want a confinement error", "../secret.pem", len(data))
 		}
 		if bytes.Contains(data, []byte("top secret")) {
-			t.Error("source.readBoundedLimit returned content from outside the root")
+			t.Error("source.readBounded returned content from outside the root")
 		}
 	})
 
@@ -228,20 +182,20 @@ func TestSourceReadBounded(t *testing.T) {
 
 		done := make(chan error, 1)
 		go func() {
-			_, readErr := s.readBoundedLimit(t.Context(), "evil.crt", 1024)
+			_, readErr := s.readBounded(t.Context(), "evil.crt")
 			done <- readErr
 		}()
 		select {
 		case readErr := <-done:
 			if readErr == nil {
-				t.Fatal("source.readBoundedLimit read a FIFO; want a not-a-regular-file error")
+				t.Fatal("source.readBounded read a FIFO; want a not-a-regular-file error")
 			}
 			if !strings.Contains(readErr.Error(), "not a regular file") {
-				t.Errorf("source.readBoundedLimit(FIFO) error = %q, want it to mention %q",
+				t.Errorf("source.readBounded(FIFO) error = %q, want it to mention %q",
 					readErr.Error(), "not a regular file")
 			}
 		case <-time.After(10 * time.Second):
-			t.Fatal("source.readBoundedLimit blocked on a FIFO; the O_NONBLOCK open regressed")
+			t.Fatal("source.readBounded blocked on a FIFO; the O_NONBLOCK open regressed")
 		}
 	})
 }

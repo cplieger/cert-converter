@@ -184,7 +184,10 @@ var writeFileInRoot = atomicfile.WriteFileInRoot
 // directory that already exists: WithMkdirMode would create it inside the write, which
 // is the step the pin has to precede. MkdirAll runs through the same confined root at
 // the same pfxDirMode the option used (that is literally what the option does), so
-// mode and confinement still cannot drift.
+// mode and confinement still cannot drift. That mode is a REQUEST though, not a
+// guarantee: an inheritable ACL can store something wider, so the created directory's
+// real mode is OBSERVED right after the call (reportLaxDir) rather than assumed from
+// the request — the one directory inspect's earlier scan could not have seen.
 //
 // Every failure return here is a writeRefusal, which cannot be constructed without its
 // classification: this function's THREE refusal sites each say what they refused, and a
@@ -233,6 +236,16 @@ func (s *store) write(ctx context.Context, rel string, pfx []byte) writeRefusal 
 			}
 			return refuseWrite(cause, "write pfx: create output directory for %q: %w", rel, err)
 		}
+		// MkdirAll's mode is a REQUEST, not the mode on disk: an inheritable ACL can
+		// widen it (0770 on such a dataset), so the directory now holding a
+		// private-key bundle is observed after creation rather than assumed. inspect
+		// reported the ancestors it could stat, but this directory did not exist then,
+		// so its pre-create Lstat failed and it was never inserted into the per-scan
+		// map — this call is the only place the created mode is ever seen, and without
+		// it a widened new directory goes undiagnosed until some later scan. Report-only
+		// like every other laxDirMsg site: no chmod, no refusal, no health or reap
+		// effect, and the per-scan map still suppresses the ancestors inspect covered.
+		s.reportLaxDir(rel)
 	}
 	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
 	if err != nil {
@@ -939,7 +952,7 @@ func classifyWriteErrno(err error) writeRefusalCause {
 // stats the OPEN HANDLE rather than the path — closing the window between
 // inspect's lstat and this open on a volume other containers write to. Those
 // are the same three guarantees the input side already delegates in
-// source.readBoundedLimit. inspect passes it the parent root it pinned plus the
+// source.readBounded. inspect passes it the parent root it pinned plus the
 // BASENAME, so no ancestor component takes part in this resolution either.
 //
 // It is indirected through a package var for the same reason writeFileInRoot is: the

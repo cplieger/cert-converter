@@ -102,19 +102,13 @@ func (s *source) pathAbsent(rel string) (bool, error) {
 // redirect the read outside it (Go 1.24+ *os.Root). Only regular files are read,
 // so a named pipe, device node or socket planted in the watched tree cannot stall
 // the scan.
-func (s *source) readBounded(ctx context.Context, rel string) ([]byte, error) {
-	return s.readBoundedLimit(ctx, rel, maxFileSize)
-}
-
-// readBoundedLimit is readBounded with an explicit cap. Production always uses
-// maxFileSize; the parameter exists so the size-cap boundary itself is testable
-// without writing a 10 MB fixture per case.
 //
 // atomicfile owns the confined read: it opens through the root non-blocking (so a
 // FIFO planted in the watched tree is rejected rather than wedging the scan's only
 // goroutine), requires a regular file, and stats the open handle rather than the
 // path. Delegating the sequence keeps the read and write boundaries on the same
-// atomicfile guarantees.
-func (s *source) readBoundedLimit(ctx context.Context, rel string, limit int64) ([]byte, error) {
-	return atomicfile.ReadBoundedInRoot(ctx, s.root, rel, limit)
+// atomicfile guarantees, and leaves this package one read method whose cap is the
+// documented /input bound — nothing here or in a test picks a different one.
+func (s *source) readBounded(ctx context.Context, rel string) ([]byte, error) {
+	return atomicfile.ReadBoundedInRoot(ctx, s.root, rel, maxFileSize)
 }

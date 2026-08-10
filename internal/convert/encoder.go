@@ -22,11 +22,8 @@ const (
 // profile is one row of the encoder-profile contract: the app-owned name, the
 // spellings accepted for it, the go-pkcs12 encoder it selects, and the (MAC,
 // certificate-encryption, key-encryption) algorithm triple that encoder emits.
-// One row per profile so the forward mapping (name -> encoder) and the reverse one
-// (algorithm triple -> name, profileFor) cannot disagree: adding a profile here is
-// the single edit, where previously the same knowledge lived in three
-// hand-maintained switches and a missed one made Inspect reject this app's own
-// output.
+// Keeping both directions in this table prevents the name-to-encoder and
+// algorithm-triple-to-name mappings from drifting apart.
 //
 // The modern2023 row's empty-string alias is not a spelling an operator types: it is the
 // UNSET PFX_ENCODER case, and it is what keeps internal/config's
@@ -103,13 +100,13 @@ func EncoderNames() []EncoderType {
 // write side and the read-back side must agree about an unrecognized name — with
 // each side searching the table itself, Encode could write a modern2023 bundle
 // while CheckCurrency compared the file against the name it was handed, reporting
-// profile-mismatch on every scan and rewriting the bundle forever. Both values are
-// returned together so a caller cannot take one side's answer from a different row.
-func resolvedProfile(name EncoderType) (EncoderType, *pkcs12.Encoder) {
+// profile-mismatch on every scan and rewriting the bundle forever. Returning the
+// row keeps its name and encoder inseparable.
+func resolvedProfile(name EncoderType) profile {
 	for _, p := range profiles {
 		if p.name == name {
-			return p.name, p.encoder
+			return p
 		}
 	}
-	return defaultProfile.name, defaultProfile.encoder
+	return defaultProfile
 }

@@ -40,8 +40,8 @@ func Effective(n int) int {
 // and charge AFTER the walk's error arm. A tree walk reports a directory it could not
 // finish reading through the callback for that directory's OWN path, which its parent
 // already charged, so charging above the error arm counts one path twice and enforces the
-// operator's ceiling below its configured value. internal/process's two walks honour
-// this; internal/watch's watch-set walk still charges before its error arm.
+// operator's ceiling below its configured value. Every walk in this app honours this:
+// internal/process's two walks and internal/watch's two watch-set walks.
 //
 // The zero value is usable and bounded: a Counter assembled field by field, which this
 // repo's focused tests do, resolves its ceiling to Default rather than to zero.
