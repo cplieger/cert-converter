@@ -2813,6 +2813,20 @@ func TestReapConfirmed_reports_refused_removals_once_per_scan_at_warn(t *testing
 	if paths, ok := logs.AttrValue(removalRefusedMsg, "paths"); !ok || !strings.Contains(paths, "stuck.pfx") {
 		t.Errorf("the refusal record paths = %q (present %v), want it to name stuck.pfx", paths, ok)
 	}
+	// The aggregate's remediation must stay cause-NEUTRAL. refusedPaths mixes a
+	// permission denial, an OpenParentInRoot layout refusal and a non-regular occupant
+	// (this fixture), each of which already logged its own action per path, so naming any
+	// one cause here sends the operator after the wrong one for the other two.
+	if got, ok := logs.AttrValue(removalRefusedMsg, "remediation"); !ok || got == outputPermRemediation {
+		t.Errorf("the refusal record remediation = %q (present %v), want a cause-neutral hint rather than %q:"+
+			" this scan's refusal was a non-regular occupant, which ownership and permissions do not explain",
+			got, ok, outputPermRemediation)
+	}
+	if !logs.AttrContains(removalRefusedMsg, "remediation", "per-path") {
+		got, _ := logs.AttrValue(removalRefusedMsg, "remediation")
+		t.Errorf("the refusal record remediation = %q, want it to send the operator to the per-path WARN"+
+			" records, which are the only place the cause-specific action is stated", got)
+	}
 	// A refusal is not a deletion: the audit record for the destructive action must stay silent.
 	if got := logs.CountLevel(slog.LevelWarn, reapAuditMsg); got != 0 {
 		t.Errorf("a scan that deleted nothing logged %q at WARN %d times, want 0: %q",

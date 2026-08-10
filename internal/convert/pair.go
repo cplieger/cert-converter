@@ -25,7 +25,7 @@ import (
 // bag first, then its chain nearest-parent-first. That is a contract rather than an
 // implementation detail — PKCS#12 stores an ordered SEQUENCE of bags (RFC 7292
 // §4.2) and decoders read it positionally, go-pkcs12's own DecodeChain included.
-func (a Analysis) Encode(encName EncoderType, password string) ([]byte, error) { //nolint:gocritic // hugeParam: a value receiver keeps a nil Analysis unrepresentable at the codec boundary; the 96-byte copy is noise beside the PBKDF2 that follows it.
+func (a Analysis) Encode(encName EncoderType, password string) ([]byte, error) { //nolint:gocritic // hugeParam: the value Analyse hands back cannot be nil, so this body needs no nil arm; the 96-byte copy is noise beside the PBKDF2 that follows it.
 	// Defensive, and deliberately NOT redundant with internal/config's
 	// checkPasswordEncodable: both guards are wanted, and neither is the only line
 	// of defence. config.Load refuses all three unencodable shapes at startup,
@@ -163,9 +163,9 @@ func (c Currency) Current() bool { return c.Reason == CurrencyMatch }
 // the caller owns what a reason is worth and, since CheckCurrency takes no context,
 // owns the shutdown classification too. pfx is never mutated.
 //
-// The value receiver preserves Encode's non-nil codec boundary; its copy is
+// The value receiver keeps Encode's codec body free of a nil arm; its copy is
 // negligible beside PKCS#12 decoding.
-func (a Analysis) CheckCurrency(pfx []byte, password string, wantEncoder EncoderType) Currency { //nolint:gocritic // hugeParam: same reason as Encode — the value receiver IS the no-nil guarantee.
+func (a Analysis) CheckCurrency(pfx []byte, password string, wantEncoder EncoderType) Currency { //nolint:gocritic // hugeParam: same reason as Encode — the value Analyse hands back cannot be nil, so this body needs no nil arm.
 	priorProfile, err := inspect(pfx)
 	if err != nil {
 		return Currency{Reason: CurrencyPreflightFailed, Err: boundedTextError{err}}

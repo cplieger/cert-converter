@@ -1121,10 +1121,13 @@ func TestLoad_unknown_encoder_warns_and_falls_back_to_modern2023(t *testing.T) {
 // macIterations: 1, Modern2023/Modern2026 set 2048), and the MAC is what verifies a
 // password guess, so this record is the operator's only statement of that state at
 // LOG_LEVEL=warn -- the startup line naming the profile is INFO. The two iteration
-// attrs ARE the actionable content: a dependency bump that moved them, or an edit that
-// dropped one, must fail here rather than leave a record that reads authoritative and
-// says nothing. legacyrc2's own remediation is the only place the app names legacydes
-// as the SHA-1-without-RC2 step down, and it is the branch nothing else reaches.
+// attrs ARE the actionable content, and an edit that drops or changes either one fails
+// here. A go-pkcs12 bump that moved the library's own macIterations does NOT: both
+// numbers are literals in warnLegacyEncoderProtection and nothing in this package reads
+// them from the encoder, so that guard would have to live in internal/convert, over an
+// encoded bundle's MacData.Iterations. legacyrc2's own remediation is the only place
+// the app names legacydes as the SHA-1-without-RC2 step down, and it is the branch
+// nothing else reaches.
 // slog.Default is process-global, so this test must not run in parallel with anything
 // that logs.
 func TestLoad_warns_when_a_legacy_encoder_profile_is_selected(t *testing.T) {

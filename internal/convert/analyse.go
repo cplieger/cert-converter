@@ -254,9 +254,11 @@ type Observation struct {
 // than by checking: there is no nil *Analysis for a consumer to be handed, so the
 // codec's entry points carry no nil arm and a caller's own Observations() call
 // cannot dereference nothing. Those entry points are METHODS on Analysis with VALUE
-// receivers, which is what makes the guarantee structural: a value receiver cannot
-// be nil, and `var a *Analysis; a.Encode(...)` does not compile. The cost is a
-// 96-byte copy per call, which gocritic's hugeParam flags and an explained
+// receivers, which is what makes the guarantee structural: the value a consumer is
+// handed cannot be nil, so no entry point needs a nil arm. A pointer receiver is the
+// regression to catch, and pfx_internal_test.go's method-expression assertions are
+// what catch it: moving either receiver to a pointer stops that file compiling. The
+// cost is a 96-byte copy per call, which gocritic's hugeParam flags and an explained
 // //nolint accepts at each site (Observations, Encode, CheckCurrency,
 // matchesAnalysis, and store.inspect's want parameter) — a pointer receiver there
 // would reopen exactly the nil case this shape exists to close, to save a copy
@@ -266,8 +268,9 @@ type Observation struct {
 // unexported, so no other package can build a populated Analysis, but
 // convert.Analysis{} stays constructible everywhere; a validity flag would only be
 // the same runtime check wearing a type's clothes. It is therefore stated ONCE, as
-// an assertion where analyseAt builds the value, and nowhere else — no consumer
-// re-checks it.
+// an invariant check where analyseAt builds the value, which RETURNS an error rather
+// than asserting (the user-ratified shape — see that statement's own comment for
+// why), and nowhere else — no consumer re-checks it.
 //
 // Observations takes a VALUE receiver like every other operation on an Analysis, so
 // the no-nil guarantee is the same one at every entry point; see its own doc for the
@@ -317,9 +320,9 @@ type Analysis struct {
 // immutable once Analyse returns it and has exactly one producer, which is when Go
 // says value receivers. gocritic's hugeParam fires on the 96-byte copy; its premise
 // (copying is hot here) is false at two calls per certificate per scan, immediately
-// before PKCS#12 crypto, and a POINTER receiver would make a nil receiver
-// representable again — which is the invariant this shape exists to hold.
-func (a Analysis) Observations() []Observation { //nolint:gocritic // hugeParam: see above; a value receiver is the invariant.
+// before PKCS#12 crypto, and a POINTER receiver would let a caller reach these entry
+// points through a nil *Analysis, reopening exactly the nil case this shape closes.
+func (a Analysis) Observations() []Observation { //nolint:gocritic // hugeParam: see above; the value shape is what removes the nil arm.
 	return slices.Clone(a.observations)
 }
 

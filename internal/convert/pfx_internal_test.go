@@ -84,9 +84,9 @@ func TestDecode_bounds_the_library_message(t *testing.T) {
 // the shape is a compile-level fact and there is nothing a running test can
 // observe: turning either entry point into a free function, or moving either
 // receiver to a POINTER, stops this file compiling, which is the whole of the
-// check. A pointer receiver is the specific regression to catch — it makes
-// `var a *Analysis; a.Encode(...)` compile again, which is the nil this shape
-// exists to make unrepresentable. A runtime test could only construct the nil it
+// check. A pointer receiver is the specific regression to catch: it would let a
+// caller reach these entry points through a *Analysis, reopening the nil this shape
+// exists to keep out of the codec. A runtime test could only construct the nil it
 // is claiming cannot exist.
 //
 // The other half of the invariant — that the value Analyse hands back always
@@ -101,9 +101,10 @@ var (
 // TestAnalyse_always_populates_the_leaf witnesses the one place the leaf invariant
 // is stated, across the input shapes that reach the producer by a different route:
 // a plain self-signed pair, a leaf-plus-CA chain, and a bundle whose leaf is not
-// the first block. Each returns through analyseAt's assertion, so a future edit
-// that let a leafless value out would panic here rather than inside go-pkcs12's
-// sha1.Sum(certificate.Raw) at conversion time.
+// the first block. Each returns through analyseAt's invariant check, so a future edit
+// that let a leafless value out fails here — on the error Analyse returns — rather
+// than nil-dereferencing inside go-pkcs12's sha1.Sum(certificate.Raw) at conversion
+// time.
 func TestAnalyse_always_populates_the_leaf(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)

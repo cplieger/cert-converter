@@ -51,6 +51,13 @@ func TestAddWatchDirs_walk_error_does_not_spend_budget_twice(t *testing.T) {
 	if err := os.Chmod(unreadable, 0); err != nil {
 		t.Fatal(err)
 	}
+	// Without a real ReadDir failure there is no second callback for a.example.com, the
+	// three-path budget covers the tree either way, and the assertions below would pass
+	// against the double-charge they exist to catch.
+	if _, err := os.ReadDir(unreadable); err == nil {
+		t.Fatalf("os.ReadDir(%q) succeeded as uid %d: the fixture must be unreadable or this test cannot observe the walk-error callback",
+			unreadable, os.Geteuid())
+	}
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
