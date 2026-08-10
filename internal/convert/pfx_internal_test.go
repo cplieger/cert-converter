@@ -91,7 +91,7 @@ func TestDecode_bounds_the_library_message(t *testing.T) {
 //
 // The other half of the invariant — that the value Analyse hands back always
 // carries a leaf — is NOT structural (convert.Analysis{} stays constructible) and
-// is stated once as an assertion in analyseAt. TestAnalyse_always_populates_the_leaf
+// is stated once as an ERROR RETURN in analyseAt. TestAnalyse_always_populates_the_leaf
 // below is its witness.
 var (
 	_ func(Analysis, EncoderType, string) ([]byte, error)  = Analysis.Encode

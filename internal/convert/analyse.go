@@ -471,22 +471,41 @@ func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (Anal
 	// consumer checks Encode and decoded.matchesAnalysis used to carry, which is the
 	// whole point: one statement here, none downstream.
 	//
-	// An assertion rather than a returned error because no input reaches it. leaf is
-	// certs[identity.cert]; selectIdentity only ever names an index into that slice,
-	// and prepareAnalysisInput admits only certificates x509.ParseCertificate
-	// returned. A nil here therefore means this function was edited into
-	// incorrectness, not that an operator supplied something odd — assert an internal
-	// invariant, validate untrusted input, and the untrusted PEM bytes were validated
-	// upstream. It is O(1) and it is total: every path that hands a caller an
-	// Analysis passes through this line, which is what makes one statement enough.
+	// No input reaches it: leaf is certs[identity.cert], selectIdentity only ever
+	// names an index into that slice, and prepareAnalysisInput admits only
+	// certificates x509.ParseCertificate returned. A nil here therefore means this
+	// function was edited into incorrectness, not that an operator supplied something
+	// odd. It is O(1) and it is total: every path that hands a caller an Analysis
+	// passes through this line, which is what makes one statement enough.
+	//
+	// An ERROR and not a panic, which is the user-ratified shape (2026-08) and the
+	// go.md rule this package lives under: library code returns errors and the
+	// composition root decides fatality. The reachable alternatives are both worse.
+	// A panic here is the only one in the app's production tree, runs on the
+	// goroutine the scan walk owns, and has no recover anywhere, so a future breach
+	// would exit the process and — under the shipped restart policy — restart into
+	// the same /input and do it again, bypassing ScanResult and healthyAfterScan
+	// entirely; that inverts the contract every other failure in this app honours,
+	// where a bad pair costs ONE failed conversion and recovers on the next scan.
+	// Deleting the statement is no better: a leafless Analysis then reaches
+	// go-pkcs12's sha1.Sum(certificate.Raw) and nil-dereferences there, which is the
+	// same crash with an unreadable message and no statement of the invariant left.
+	// Returning the error keeps the invariant stated once, here, and lets convertEntry
+	// report it like any other conversion failure.
+	//
+	// The message names this as an internal invariant so an operator reading
+	// "conversion failed" can tell it is a bug in the app rather than something wrong
+	// with their certificate.
 	//
 	// It does NOT make a leafless Analysis unrepresentable, and nothing here pretends
 	// otherwise: the fields are unexported, so no other package can populate one, but
 	// convert.Analysis{} stays constructible. A validity flag would only be the
 	// deleted runtime check wearing a type's clothes, so the honest shape is this
-	// assertion plus the contract on Analysis and on the codec's entry points.
+	// check plus the contract on Analysis and on the codec's entry points.
 	if a.leaf == nil {
-		panic("convert: analyseAt built an Analysis with no leaf certificate")
+		return Analysis{}, errors.New(
+			"convert: internal invariant violated: analyseAt selected no leaf certificate " +
+				"(this is a defect in cert-converter, not a problem with the input)")
 	}
 	return a, nil
 }
