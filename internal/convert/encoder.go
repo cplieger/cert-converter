@@ -37,24 +37,33 @@ const (
 // 3DES-encrypted key is NOT a bundle any profile here emits. Recording only the
 // first two would report such a mixed bundle as modern2023 and leave a weakly
 // protected private key on disk.
+//
+// macIterations is recorded rather than derived from macOID for the same
+// single-home reason: ProtectionOf used to infer the count from the algorithm
+// name, which is a second protection mapping beside this table. A row whose MAC
+// algorithm is new but whose derivation is nominal would escape the warning, and a
+// SHA-1 row with a real iteration count would draw a false one. Positional literals
+// mean a row added here cannot compile without stating its count.
 type profile struct {
-	name       EncoderType
-	aliases    []string
-	encoder    *pkcs12.Encoder
-	macOID     asn1.ObjectIdentifier
-	certEncOID asn1.ObjectIdentifier
-	keyEncOID  asn1.ObjectIdentifier
+	name          EncoderType
+	aliases       []string
+	encoder       *pkcs12.Encoder
+	macOID        asn1.ObjectIdentifier
+	certEncOID    asn1.ObjectIdentifier
+	keyEncOID     asn1.ObjectIdentifier
+	macIterations int
 }
 
 // profiles is the one home of the encoder-profile contract. The OID values it
 // names are declared in profile.go beside the rest of the preflight's OIDs. The
 // triples match the pinned go-pkcs12 v0.7.3 encoders (pkcs12.go:96-188), whose
-// macAlgorithm/certAlgorithm/keyAlgorithm fields these three columns mirror.
+// macAlgorithm/certAlgorithm/keyAlgorithm fields these three columns mirror, and
+// the trailing count is the iteration count that encoder's MAC derives with.
 var profiles = []profile{
-	{EncNameModern2023, []string{"", "modern"}, pkcs12.Modern2023, oidSHA256, oidPBES2, oidPBES2},
-	{EncNameModern2026, nil, pkcs12.Modern2026, oidPBMAC1, oidPBES2, oidPBES2},
-	{EncNameLegacyDES, []string{"legacy"}, pkcs12.LegacyDES, oidSHA1, oidPBEWithSHAAnd3KeyTripleDESCBC, oidPBEWithSHAAnd3KeyTripleDESCBC},
-	{EncNameLegacyRC2, nil, pkcs12.LegacyRC2, oidSHA1, oidPBEWithSHAAnd40BitRC2CBC, oidPBEWithSHAAnd3KeyTripleDESCBC},
+	{EncNameModern2023, []string{"", "modern"}, pkcs12.Modern2023, oidSHA256, oidPBES2, oidPBES2, minKDFIterations},
+	{EncNameModern2026, nil, pkcs12.Modern2026, oidPBMAC1, oidPBES2, oidPBES2, minKDFIterations},
+	{EncNameLegacyDES, []string{"legacy"}, pkcs12.LegacyDES, oidSHA1, oidPBEWithSHAAnd3KeyTripleDESCBC, oidPBEWithSHAAnd3KeyTripleDESCBC, minLegacyMACIterations},
+	{EncNameLegacyRC2, nil, pkcs12.LegacyRC2, oidSHA1, oidPBEWithSHAAnd40BitRC2CBC, oidPBEWithSHAAnd3KeyTripleDESCBC, minLegacyMACIterations},
 }
 
 // EncoderName normalizes a raw PFX_ENCODER value to one of the known encoder
@@ -66,7 +75,10 @@ var profiles = []profile{
 // unrecognized value falls back to modern2023 with known false.
 func EncoderName(raw string) (name EncoderType, known bool) {
 	v := strings.ToLower(strings.TrimSpace(raw))
-	for _, p := range profiles {
+	// Indexed rather than ranged by value: a profile row is over gocritic's copy
+	// threshold, and nothing here needs a copy.
+	for i := range profiles {
+		p := &profiles[i]
 		if v == string(p.name) || slices.Contains(p.aliases, v) {
 			return p.name, true
 		}
@@ -88,8 +100,8 @@ var defaultProfile = profiles[0]
 // diagnostic — the same split EncoderName already documents for the warning.
 func EncoderNames() []EncoderType {
 	names := make([]EncoderType, 0, len(profiles))
-	for _, p := range profiles {
-		names = append(names, p.name)
+	for i := range profiles {
+		names = append(names, profiles[i].name)
 	}
 	return names
 }
@@ -121,14 +133,9 @@ type Protection struct {
 // bundle that is actually written can never describe different profiles.
 func ProtectionOf(name EncoderType) Protection {
 	p := resolvedProfile(name)
-	legacyMAC := p.macOID.Equal(oidSHA1)
-	iterations := ModernMACIterations
-	if legacyMAC {
-		iterations = minLegacyMACIterations
-	}
 	return Protection{
-		MACIterations:  iterations,
-		NominalOnly:    legacyMAC,
+		MACIterations:  p.macIterations,
+		NominalOnly:    p.macIterations == minLegacyMACIterations,
 		WeakCertCipher: p.certEncOID.Equal(oidPBEWithSHAAnd40BitRC2CBC),
 	}
 }
@@ -142,9 +149,9 @@ func ProtectionOf(name EncoderType) Protection {
 // profile-mismatch on every scan and rewriting the bundle forever. Returning the
 // row keeps its name and encoder inseparable.
 func resolvedProfile(name EncoderType) profile {
-	for _, p := range profiles {
-		if p.name == name {
-			return p
+	for i := range profiles {
+		if profiles[i].name == name {
+			return profiles[i]
 		}
 	}
 	return defaultProfile

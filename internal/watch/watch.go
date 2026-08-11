@@ -1016,6 +1016,21 @@ func (w *Watcher) handlePathEvent(
 		return true // already watched: nothing to re-attach, the debounced rescan covers content
 	}
 	if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
+		// The same vanished-path rule classifyWatchEntry's walk-error arm and
+		// handleWatchAddError already apply, and the one this function's own Lstat arm
+		// above applies to a vanished event path: a directory created and removed again
+		// before its subtree could be walked leaves nothing to renew, so the WARN's
+		// consequence clause is false and neither action watchAddRemediation names
+		// applies to it — the directory is gone, so nothing is unreadable and no inotify
+		// slot was ever requested. Both producers reach here as ErrNotExist:
+		// walkWatchDirs' own os.Lstat/os.OpenRoot of the walk root, and the root arm of
+		// classifyWatchEntry, which returns walkErr above its own ErrNotExist check
+		// because the root's refusal is the fatal one.
+		if errors.Is(addErr, fs.ErrNotExist) {
+			slog.Debug("directory disappeared before its subtree could be watched",
+				"path", logtext.Path(event.Name), "error", logtext.Path(addErr.Error()))
+			return true
+		}
 		slog.Warn(addWarning,
 			w.coverageAttrs("path", logtext.Path(event.Name), "error", logtext.Path(addErr.Error()),
 				"remediation", watchAddRemediation)...)

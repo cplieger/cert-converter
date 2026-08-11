@@ -35,11 +35,26 @@ func TestCap_leaves_text_within_the_limit_alone(t *testing.T) {
 // that order (sanitize, then cap). Folding sanitizing into Cap would move the marker's
 // budget, which is the placement internal/process's elision suffix was sized against —
 // so the separation has to be asserted, not left to a comment.
+//
+// It drives the CUT path, not only the early return: a control rune sits inside the
+// retained prefix and the whole result is compared byte for byte. An input at the limit
+// asserts nothing here, because an implementation that sanitized only the text it cut
+// would satisfy it.
 func TestCap_does_not_sanitize(t *testing.T) {
 	t.Parallel()
-	const s = "a\nb"
-	if got := logtext.Cap(s, len(s)); got != s {
-		t.Errorf("Cap(%q, %d) = %q, want it unchanged: Cap bounds text, Path is what rewrites it", s, len(s), got)
+	for _, tc := range []struct {
+		name  string
+		in    string
+		limit int
+		want  string
+	}{
+		{"within the limit", "a\nb", 3, "a\nb"},
+		{"cut, with the control rune inside the kept prefix", "a\nbc", 3, "a\nb" + logtext.Marker},
+	} {
+		if got := logtext.Cap(tc.in, tc.limit); got != tc.want {
+			t.Errorf("Cap(%q, %d) = %q, want %q (%s): Cap bounds text, Path is what rewrites it",
+				tc.in, tc.limit, got, tc.want, tc.name)
+		}
 	}
 }
 
@@ -99,8 +114,8 @@ func TestPath_rewrites_the_unsafe_classes_and_leaves_ordinary_names_alone(t *tes
 		in   string
 		want string
 	}{
-		{"LF forges a record boundary", "a\nb.crt", "a b.crt"},
-		{"CR forges a record boundary", "a\rb.crt", "a b.crt"},
+		{"LF would split a record in a sink that emits it raw", "a\nb.crt", "a b.crt"},
+		{"CR would split a record in a sink that emits it raw", "a\rb.crt", "a b.crt"},
 		{"C0 control", "a\x01b.crt", "a b.crt"},
 		{"DEL", "a\x7fb.crt", "a b.crt"},
 		{"C1 control introduces a terminal escape", "a\u0085b.crt", "a b.crt"},
@@ -114,9 +129,11 @@ func TestPath_rewrites_the_unsafe_classes_and_leaves_ordinary_names_alone(t *tes
 	}
 
 	// Invalid UTF-8 becomes U+FFFD, so no attribute can carry a partial rune whose tail
-	// bytes read as C1 controls on a non-UTF-8 terminal.
-	if got := logtext.Path("a\xffb.crt"); !utf8.ValidString(got) {
-		t.Errorf("Path(invalid UTF-8) = %q, which is not valid UTF-8", got)
+	// bytes read as C1 controls on a non-UTF-8 terminal. Compared exactly rather than
+	// merely validated: dropping the bad byte, or substituting any other valid rune,
+	// would satisfy a validity-only check while losing the fact that a byte was there.
+	if got, want := logtext.Path("a\xffb.crt"), "a\ufffdb.crt"; got != want {
+		t.Errorf("Path(invalid UTF-8) = %q, want %q: the bad byte is REPLACED, not dropped", got, want)
 	}
 }
 

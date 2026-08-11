@@ -18,13 +18,13 @@ import (
 // full record (main.go appends "; refusing to start").
 const wantVolumeMissingMsg = "required volume is missing or not a directory"
 
-// TestOpen pins the startup volume guard, the one decision in run()
+// TestVerify pins the startup volume guard, the one decision in run()
 // that decides between a single actionable refusal and an endless
 // restart-unhealthy loop: every required mount must already exist AND be a
 // directory, EVERY offender is named at ERROR with its role and a
 // remediation, and a fully-mounted pair starts silently. Serial: it swaps
 // slog.Default().
-func TestOpen(t *testing.T) {
+func TestVerify(t *testing.T) {
 	existingDir := t.TempDir()
 	regularFile := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(regularFile, nil, 0o600); err != nil {
@@ -86,11 +86,11 @@ func TestOpen(t *testing.T) {
 	}
 }
 
-// TestOpen_names_every_missing_volume pins the whole point of the
+// TestVerify_names_every_missing_volume pins the whole point of the
 // all-offenders sweep: an operator who omitted the volumes block entirely has
 // both mounts missing, and a report naming only /input costs a restart to
 // discover /output. Serial: it swaps slog.Default().
-func TestOpen_names_every_missing_volume(t *testing.T) {
+func TestVerify_names_every_missing_volume(t *testing.T) {
 	absentInput := filepath.Join(t.TempDir(), "absent-input")
 	absentOutput := filepath.Join(t.TempDir(), "absent-output")
 
@@ -111,14 +111,14 @@ func TestOpen_names_every_missing_volume(t *testing.T) {
 	}
 }
 
-// TestOpen_refuses_a_volume_it_cannot_open pins the third refusal leg of
+// TestVerify_refuses_a_volume_it_cannot_open pins the third refusal leg of
 // the startup guard, the one whose remediation differs from the other two: a
 // mount that EXISTS as a directory but cannot be opened by the running UID is a
 // permissions problem on the host directory, so the operator must be told to
 // grant that UID access, not to mount a path they already mounted.
 // Serial (no t.Parallel): it swaps the openMountRoot package var and
 // slog.Default().
-func TestOpen_refuses_a_volume_it_cannot_open(t *testing.T) {
+func TestVerify_refuses_a_volume_it_cannot_open(t *testing.T) {
 	existing, blocked := t.TempDir(), t.TempDir()
 
 	prev := openMountRoot
@@ -154,6 +154,28 @@ func TestOpen_refuses_a_volume_it_cannot_open(t *testing.T) {
 	if n := logs.Count(wantVolumeMissingMsg); n != 0 {
 		t.Errorf("an unopenable mount produced %d %q records, want 0: that wording tells the operator to mount a path they already mounted (logs %v)",
 			n, wantVolumeMissingMsg, logs.Messages())
+	}
+}
+
+// TestVerify_runs_the_output_write_probe pins the wiring the guard's collapse created:
+// the write probe used to be a second call main made against the handle Open returned,
+// and it is now a statement inside Verify, so no caller can observe that it still
+// happens. Without this case, deleting that call leaves the suite green — the success
+// row above asserts silence, which is what a Verify that never probes also produces.
+// Serial (no t.Parallel): it swaps the probeOutputWritable package var and slog.Default().
+func TestVerify_runs_the_output_write_probe(t *testing.T) {
+	dir := t.TempDir()
+	stubOutputProbe(t, atomicfile.ProbeResult{
+		Dir: dir, Stage: atomicfile.ProbeStageCreate, Err: fs.ErrPermission,
+	}, nil)
+	logs := capture.Default(t)
+
+	if !Verify(Paths{Input: dir, Output: dir}) {
+		t.Fatalf("Verify(%q) = false, want true: no probe outcome may fail startup", dir)
+	}
+	if n := logs.CountLevel(slog.LevelWarn, wantOutputNotWritableMsg); n != 1 {
+		t.Errorf("Verify logged %d %q WARN records, want 1: the write probe is no longer wired into the"+
+			" startup guard (logs %v)", n, wantOutputNotWritableMsg, logs.Messages())
 	}
 }
 

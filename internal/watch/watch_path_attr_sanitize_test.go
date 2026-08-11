@@ -2,6 +2,7 @@ package watch
 
 import (
 	"context"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -106,6 +107,23 @@ func TestWatchRecords_sanitize_walk_supplied_names_in_log_attributes(t *testing.
 	if !logs.HasAttr("fs event", "path", wantSanitized) {
 		t.Errorf("fs-event paths = %q, want the hostile event path sanitized to %q",
 			logs.AttrValuesExact("fs event", "path"), wantSanitized)
+	}
+
+	// One filesystem-ERROR record too. The two records above are success-path ones, so
+	// with only those the batch sweep below never sees an `error` attribute: every
+	// logtext.Path(err.Error()) in this package could be removed and this test would
+	// stay green, which is the one-site-only adoption it exists to prevent. An
+	// *fs.PathError carries the walk-supplied path inside its own text, and it is the
+	// shape os.Root and the walk actually mint.
+	const unwatchableMsg = "skipping unwatchable path; renewals under it require a full rescan"
+	walkErr := &fs.PathError{Op: "open", Path: hostileDir, Err: fs.ErrPermission}
+	relevant, classifyErr := w.classifyWatchEntry(t.Context(), root, hostileDir, nil, walkErr)
+	if classifyErr != nil || relevant {
+		t.Fatalf("classifyWatchEntry(path error) = (%v, %v), want (false, nil)", relevant, classifyErr)
+	}
+	if !logs.HasAttr(unwatchableMsg, "error", logtext.Path(walkErr.Error())) {
+		t.Errorf("unwatchable-path error was not sanitized: values = %q",
+			logs.AttrValuesExact(unwatchableMsg, "error"))
 	}
 
 	assertNoUnsafeRunesInWatchAttributes(t, logs)

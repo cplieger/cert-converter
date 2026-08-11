@@ -12,7 +12,8 @@
 // What that rests on is NOT the escaping of the handler installed today: slogx builds a
 // slog.NewTextHandler for this app (main.go's slogx.Setup takes the zero Format), and
 // that handler quotes any value holding a control or non-printing rune, so an
-// unsanitized CR arrives as `\n` and a bidi mark as `\u200e`, on one line — including
+// unsanitized LF arrives as `\n`, a CR as `\r`, and a bidi mark as `\u200e`, on one line
+// — including
 // the raw name inside an *fs.PathError logged as an `error` attribute beside a sanitized
 // `path`, which is what every refusal in internal/mounts does. The gate covers what that
 // escaping does not: slog's JSONHandler emits bidi controls and C1 introducers RAW, an
@@ -53,11 +54,12 @@ const Marker = "...(truncated)"
 //
 // The classification is runesafe's, not this package's: C0 controls, DEL, C1 controls
 // (U+0080-U+009F), the whole Unicode Bidi_Control set, and the U+2028/U+2029 line
-// separators, each replaced by a space, with invalid UTF-8 becoming U+FFFD. CR/LF and
-// the bidi controls are the two classes that would split or reorder a record in a sink
-// that emits them raw — slog's JSONHandler does; its TextHandler quotes the whole value
-// instead, which is safe and unreadable — and hand-rolling the ranges here is exactly
-// the drift runesafe exists to prevent.
+// separators, each replaced by a space, with invalid UTF-8 becoming U+FFFD. The bidi
+// controls and the C1 introducers are the classes slog's JSONHandler emits RAW, so those
+// are what reorder or corrupt a rendered record here; CR/LF would split a record in a
+// sink that emits them raw, which neither slog handler is — both escape them, and
+// TextHandler quotes the whole value, safe and unreadable. Hand-rolling the ranges here
+// is exactly the drift runesafe exists to prevent.
 //
 // Apply it AT THE LOG CALL and nowhere else. A sanitized value used for a lookup, a
 // join, a stat or a map key is a bug: the two trees are addressed by their real bytes,

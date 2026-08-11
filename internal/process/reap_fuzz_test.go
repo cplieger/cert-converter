@@ -1,6 +1,7 @@
 package process
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"unicode"
@@ -63,7 +64,14 @@ func FuzzSampleOrphanPaths_singleLineBoundedSample(f *testing.F) {
 		if !utf8.ValidString(got) {
 			t.Fatalf("sampleOrphanPaths(%q) = %q: invalid UTF-8", paths, got)
 		}
-		if maxLen := maxLoggedOrphanBytes + len(logtext.Marker) + len(" (+999999 more)"); len(got) > maxLen {
+		// The elision notice is appended after the cut and its width grows with the
+		// count, so the allowance is computed from this input's own count rather than
+		// hardcoding a digit ceiling a large-enough fuzz input would exceed.
+		elided := ""
+		if len(paths) > maxLoggedOrphans {
+			elided = fmt.Sprintf(" (+%d more)", len(paths)-maxLoggedOrphans)
+		}
+		if maxLen := maxLoggedOrphanBytes + len(logtext.Marker) + len(elided); len(got) > maxLen {
 			t.Fatalf("sampleOrphanPaths(%d names, %d raw bytes) rendered %d bytes, want at most %d: the cut must count the SANITIZED bytes, which invalid UTF-8 grows",
 				len(paths), len(joined), len(got), maxLen)
 		}

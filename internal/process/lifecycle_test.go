@@ -520,10 +520,11 @@ func (c cancelAfterNChecks) Err() error {
 // while the candidate's sibling key is being re-checked, after the guard at the top of
 // the loop has already passed.
 //
-// live: 1 is reapConfirmed's own Err() sequence for one candidate with the deferral's
-// wait stubbed out: the guard after the certificate re-check, and then the guard under
-// test. So the earlier guard cannot answer for this one, and deleting the guard makes
-// the reap unlink the bundle — which every assertion below then fails on.
+// live: 3 is reapConfirmed's own Err() sequence for one candidate with the deferral's
+// wait stubbed out: the pre-pass's per-candidate check and its after-the-loop check,
+// then the loop's guard after the certificate re-check, and then the guard under test.
+// So no earlier guard can answer for this one, and deleting the guard makes the reap
+// unlink the bundle — which every assertion below then fails on.
 // Serial: it swaps the package's reap-wait var.
 func TestReapConfirmed_cancelled_context_stops_before_deletion(t *testing.T) {
 	dir := t.TempDir()
@@ -534,7 +535,7 @@ func TestReapConfirmed_cancelled_context_stops_before_deletion(t *testing.T) {
 	s := newOutputStore(t, dir)
 	stubReapWait(t, func(context.Context) error { return nil })
 	calls := 0
-	ctx := cancelAfterNChecks{Context: t.Context(), calls: &calls, live: 1}
+	ctx := cancelAfterNChecks{Context: t.Context(), calls: &calls, live: 3}
 
 	deleted, err := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
 		reapConfirmed(ctx, []string{"orphan.pfx"})
@@ -583,10 +584,11 @@ func TestReapConfirmed_shutdown_reports_the_candidates_it_has_not_reached(t *tes
 		t.Fatal(err)
 	}
 	stubReapWait(t, func(context.Context) error { return nil })
-	// The loop's Err() sequence: back's top-of-loop guard, gone's top-of-loop guard, then
-	// gone's pre-unlink guard, which is the one under test.
+	// The Err() sequence: the pre-pass's two per-candidate checks and its
+	// after-the-loop check, then back's top-of-loop guard, gone's top-of-loop guard, and
+	// finally gone's pre-unlink guard, which is the one under test.
 	calls := 0
-	ctx := cancelAfterNChecks{Context: t.Context(), calls: &calls, live: 2}
+	ctx := cancelAfterNChecks{Context: t.Context(), calls: &calls, live: 5}
 
 	deleted, err := newReaper(newOutputStore(t, out), newInputSource(t, in), outputpolicy.LifecycleSync).
 		reapConfirmed(ctx, []string{"back.pfx", "gone.pfx"})
@@ -630,8 +632,9 @@ func TestReapConfirmed_shutdown_reports_the_candidates_it_has_not_reached(t *tes
 // The fixture makes the two arithmetics differ: candidate one is examined and skipped
 // because its certificate came back, so at candidate two's top-of-loop guard `deleted`
 // is still 0 while `i` is 1 -- len(orphaned)-i is 1, len(orphaned)-deleted is 2.
-// live: 1 is the loop's own Err() sequence: back's top-of-loop guard, then gone's,
-// which is the one under test.
+// live: 4 is the Err() sequence: the pre-pass's two per-candidate checks and its
+// after-the-loop check, then back's top-of-loop guard, then gone's, which is the one
+// under test.
 // Serial: it swaps the package's reap-wait var and slog's default.
 func TestReapConfirmed_shutdown_at_the_recheck_reports_the_candidates_it_has_not_reached(t *testing.T) {
 	const msg = "orphan removal interrupted by shutdown during the confirming re-check"
@@ -651,7 +654,7 @@ func TestReapConfirmed_shutdown_at_the_recheck_reports_the_candidates_it_has_not
 	}
 	stubReapWait(t, func(context.Context) error { return nil })
 	calls := 0
-	ctx := cancelAfterNChecks{Context: t.Context(), calls: &calls, live: 1}
+	ctx := cancelAfterNChecks{Context: t.Context(), calls: &calls, live: 4}
 
 	deleted, err := newReaper(newOutputStore(t, out), newInputSource(t, in), outputpolicy.LifecycleSync).
 		reapConfirmed(ctx, []string{"back.pfx", "gone.pfx"})
@@ -676,6 +679,105 @@ func TestReapConfirmed_shutdown_at_the_recheck_reports_the_candidates_it_has_not
 		if _, statErr := os.Stat(filepath.Join(out, name)); statErr != nil {
 			t.Errorf("%s was deleted after the shutdown was observed: %v", name, statErr)
 		}
+	}
+}
+
+// TestReapConfirmed_pre_pass_confirms_the_certificate_before_reading_a_key pins the ORDER
+// of the two questions reapConfirmed's pre-pass asks, which is the whole reason that
+// pre-pass has its own helper rather than reusing reportRetainedKeys.
+//
+// The scan's input enumeration is already stale by the time the reap runs, so a
+// certificate can have RETURNED between the enumeration and the pre-pass. A key-first
+// pre-pass reads that restored pair as a half-deleted one: it emits loneKeyRetainedMsg —
+// which asserts the certificate is GONE, and it is not — and drops the candidate, so the
+// accurate "certificate came back during the confirmation delay" INFO can never fire for
+// it. The operator is told the wrong thing about a healthy pair, and the one record that
+// says the delay did its job goes missing.
+//
+// The fixture is that ordering exactly: both halves of the pair are under /input while
+// the bundle is still in the batch, which is what a certificate restored after the
+// enumeration looks like from here.
+// Serial: it swaps the package's reap-wait var and slog's default.
+func TestReapConfirmed_pre_pass_confirms_the_certificate_before_reading_a_key(t *testing.T) {
+	logs := captureLogs(t)
+	out, in := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(out, "back.pfx"), []byte("pfx"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The restored pair: the certificate came back, and its sibling key never left.
+	cert := layout.CertForOutput("back.pfx")
+	for _, name := range []string{cert, layout.KeyFor(cert)} {
+		if err := os.WriteFile(filepath.Join(in, name), []byte("pem"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stubReapWait(t, func(context.Context) error { return nil })
+
+	deleted, err := newReaper(newOutputStore(t, out), newInputSource(t, in), outputpolicy.LifecycleSync).
+		reapConfirmed(t.Context(), []string{"back.pfx"})
+	if err != nil {
+		t.Fatalf("reapConfirmed = error %v, want nil: a certificate that came back is the ordinary"+
+			" producer transaction this delay exists for, not a failure", err)
+	}
+	if deleted != 0 {
+		t.Errorf("reapConfirmed deleted = %d, want 0: the certificate is back", deleted)
+	}
+	if got := logs.CountExact(loneKeyRetainedMsg); got != 0 {
+		t.Errorf("reapConfirmed logged %q %d times, want 0: that record asserts the certificate is gone,"+
+			" and this one came back: %q", loneKeyRetainedMsg, got, logs.Messages())
+	}
+	const backMsg = "keeping an output bundle whose certificate came back during the confirmation delay"
+	if got := logs.CountExact(backMsg); got != 1 {
+		t.Errorf("reapConfirmed logged %q %d times, want exactly 1: it is the only trace that the delay"+
+			" did its job: %q", backMsg, got, logs.Messages())
+	}
+	if _, statErr := os.Stat(filepath.Join(out, "back.pfx")); statErr != nil {
+		t.Errorf("back.pfx was deleted while its certificate was present: %v", statErr)
+	}
+}
+
+// TestReapConfirmed_returns_cancellation_when_the_pre_pass_empties_the_batch pins that a
+// batch the pre-pass filters down to nothing during a shutdown reaches the caller as an
+// INTERRUPTED reap rather than a completed one.
+//
+// The empty-batch return sits ahead of waitBeforeReap and of every ctx.Err() guard in the
+// loop, so until the pre-pass checked cancellation itself, a shutdown over a fully
+// retained batch returned (0, nil) and the caller classified an interrupted scan as clean
+// and complete — against reapConfirmed's own contract that a cancellation is returned. The
+// per-candidate placement of that check matters too: a shutdown must not pay for one Lstat
+// per orphan before it is noticed.
+// Serial: it swaps slog's default.
+func TestReapConfirmed_returns_cancellation_when_the_pre_pass_empties_the_batch(t *testing.T) {
+	logs := captureLogs(t)
+	out, in := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(out, "gone.pfx"), []byte("pfx"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The half-deleted pair the pre-pass filters out: the certificate is gone and its key
+	// is not, so without the cancellation check the batch is empty at the return below.
+	key := layout.KeyFor(layout.CertForOutput("gone.pfx"))
+	if err := os.WriteFile(filepath.Join(in, key), []byte("key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	deleted, err := newReaper(newOutputStore(t, out), newInputSource(t, in), outputpolicy.LifecycleSync).
+		reapConfirmed(ctx, []string{"gone.pfx"})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("reapConfirmed(cancelled over a fully retained batch) error = %v, want context.Canceled:"+
+			" an interrupted reap reported as a complete one leaves the scan marked clean", err)
+	}
+	if deleted != 0 {
+		t.Errorf("reapConfirmed deleted = %d, want 0", deleted)
+	}
+	const abandoned = "orphan removal abandoned during shutdown before the confirming re-check"
+	if got := logs.CountExact(abandoned); got != 1 {
+		t.Errorf("reapConfirmed logged %q %d times, want exactly 1: %q", abandoned, got, logs.Messages())
+	}
+	if _, statErr := os.Stat(filepath.Join(out, "gone.pfx")); statErr != nil {
+		t.Errorf("gone.pfx was deleted after the shutdown was observed: %v", statErr)
 	}
 }
 
@@ -2145,14 +2247,15 @@ func TestObservationLog_eviction_spares_the_wholeness_the_active_scan_establishe
 // TestObservationLog_signature_eviction_spares_the_wholeness_the_active_scan_established
 // is the SIGNATURE arm of the protection the test above pins on the wholeness arm.
 //
-// reserve has two eviction entry points and each consults canEvict for itself: the
-// signature-half reservation takes its victim from `seen` and drops that victim's wholeness
-// with it (dropWholeness), while the wholeness-half reservation takes a victim that actually
-// holds wholeness. The test above drives markWhole only, which leaves `seen` empty, so the
-// signature-half reservation is never entered there -- deleting canEvict's consultation
-// from the shared eviction therefore keeps the whole suite
-// green while a pair THIS walk read whole loses the evidence noteMissingKey classifies a
-// replaced private key against. The scan then reads a key being replaced as an ordinary
+// reserve has two eviction entry points and both route through ONE shared eviction
+// (evictFrom), whose canEvict consultation the wholeness arm above already pins — its
+// protected-half subtest reserves at the ceiling with the active pair as the only
+// candidate, so an unguarded eviction fails it deterministically. What THIS arm pins is
+// the signature-half entry point the test above never enters (it drives markWhole only,
+// which leaves `seen` empty): reserveSeen making room in `seen` for a note-driven pair
+// must spare the wholeness of a pair the active walk read whole — the evidence
+// noteMissingKey classifies a replaced private key against. Were it spent, the scan
+// would read a key being replaced as an ordinary
 // orphan, which vetoes nothing, and unrelated bundles are deleted on an enumeration it can
 // no longer defend.
 //
@@ -2844,9 +2947,10 @@ func TestReapConfirmed_reports_refused_removals_once_per_scan_at_warn(t *testing
 // destructive action it takes.
 //
 // The fixture deletes candidate one and observes the cancellation at candidate two's
-// re-check guard. live: 2 is reapConfirmed's own Err() sequence with the wait stubbed:
-// one.pfx's top-of-loop guard, one.pfx's pre-unlink guard, then two.pfx's top-of-loop
-// guard, which is the one that fires. The shutdown record must also report removed=1;
+// re-check guard. live: 5 is reapConfirmed's own Err() sequence with the wait stubbed:
+// the pre-pass's two per-candidate checks and its after-the-loop check, then one.pfx's
+// top-of-loop guard, one.pfx's pre-unlink guard, then two.pfx's top-of-loop guard, which
+// is the one that fires. The shutdown record must also report removed=1;
 // every existing shutdown case asserts removed="0", so the deleted-something half of
 // that attribute was unpinned too.
 // Serial: it swaps the package's reap-wait var and slog's default.
@@ -2860,7 +2964,7 @@ func TestReapConfirmed_audits_deletions_made_before_a_shutdown(t *testing.T) {
 	}
 	stubReapWait(t, func(context.Context) error { return nil })
 	calls := 0
-	ctx := cancelAfterNChecks{Context: t.Context(), calls: &calls, live: 2}
+	ctx := cancelAfterNChecks{Context: t.Context(), calls: &calls, live: 5}
 
 	deleted, err := newReaper(newOutputStore(t, out), newInputSource(t, t.TempDir()),
 		outputpolicy.LifecycleSync).reapConfirmed(ctx, []string{"one.pfx", "two.pfx"})

@@ -696,7 +696,10 @@ func boundedKeyBagEncryption(bag *safeBag) (asn1.ObjectIdentifier, error) {
 // from one that keeps a modern MAC and modern certificates over a 3DES-wrapped
 // private key.
 func profileFor(macAlg, certAlg, keyAlg asn1.ObjectIdentifier) (EncoderType, error) {
-	for _, p := range profiles {
+	// Indexed rather than ranged by value: a profile row is over gocritic's copy
+	// threshold, and nothing here needs a copy.
+	for i := range profiles {
+		p := &profiles[i]
 		if macAlg.Equal(p.macOID) && certAlg.Equal(p.certEncOID) && keyAlg.Equal(p.keyEncOID) {
 			return p.name, nil
 		}

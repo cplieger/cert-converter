@@ -293,6 +293,57 @@ func TestOutputWalkVisit_an_unreadable_path_vetoes_the_reap(t *testing.T) {
 	assertDebugOnly(t, logs, wantMsg, "locked/tls.pfx")
 }
 
+// TestOutputWalkVisit_a_vanished_path_does_not_veto_the_reap is the negative twin of the
+// test above, and the ONE witness for the /output half of the producer race: an ENOENT
+// below the root is a path removed under the walk -- by an operator following this app's
+// own "remove them from the output volume by hand" advice, or any other writer on a mount
+// this app does not own -- not a path this scan could not READ.
+//
+// Both halves matter and neither is asserted anywhere else. It must not raise
+// w.unreadable, because that counter is what carries reapDisabledPhrase into the
+// documented CertConverterOrphanRemovalDisabled alert with a remediation that sends the
+// operator after /output ownership, for an ordinary removal; and it must not stop the
+// enumeration, because the surviving bundles are still candidates. The asymmetry with the
+// /input side (scan_walk_test.go's vanished arm, which DOES veto) is deliberate: a missing
+// /input path leaves a hole in `seen` and can make a live bundle read as an orphan, while
+// a missing /output path is simply absent from w.found and a candidate never enumerated is
+// never reaped.
+// Runs serially: it swaps slog.Default().
+func TestOutputWalkVisit_a_vanished_path_does_not_veto_the_reap(t *testing.T) {
+	// Spelled out rather than imported from the production call site: an operator's
+	// log query keys on these words, so a silent rewording must fail here.
+	const wantMsg = "skipping output path that vanished during the orphan walk"
+
+	dir := t.TempDir()
+	bundle := filepath.Join(dir, "live.pfx")
+	if err := os.WriteFile(bundle, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	logs := captureLogs(t)
+	w := &outputWalk{}
+
+	if err := w.visit(t.Context(), "example.com/tls.pfx", nil, fs.ErrNotExist); err != nil {
+		t.Fatalf("visit(vanished output path) = %v, want nil so the rest of the tree is still walked", err)
+	}
+	if w.unreadable != 0 {
+		t.Errorf("unreadable = %d, want 0: a path removed under the walk is not a path this scan could not"+
+			" READ, and counting it disables orphan removal for the whole scan and fires the documented"+
+			" alert with an /output ownership remediation for an ordinary deletion", w.unreadable)
+	}
+	if w.symlinked != 0 {
+		t.Errorf("symlinked = %d, want 0: the vanish arm must not reach the other veto either", w.symlinked)
+	}
+
+	if err := w.visit(t.Context(), "live.pfx", dirEntryOf(t, bundle), nil); err != nil {
+		t.Fatalf("visit(readable bundle) = %v, want nil", err)
+	}
+	if len(w.found) != 1 || w.found[0] != "live.pfx" {
+		t.Errorf("found = %v, want [live.pfx]: a vanished path must not stop the enumeration", w.found)
+	}
+
+	assertDebugOnly(t, logs, wantMsg, "example.com/tls.pfx")
+}
+
 // TestOutputWalkVisit_stops_the_orphan_walk_once_the_scan_is_cancelled pins the orphan
 // walk's PER-ENTRY cancellation guard, the one contract of visit nothing else reaches.
 //

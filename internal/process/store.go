@@ -1126,9 +1126,11 @@ func (w *outputWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err e
 	// it had collected: a partial enumeration cannot prove anything orphaned, and the
 	// alternative — reaping on a prefix of the tree — deletes live bundles.
 	if !w.budget.Charge() {
-		// The stopping path reaches the reap's `error` attribute through this wrap, so it
-		// goes through the same log-boundary gate the attributes do.
-		return fmt.Errorf("%w: stopped at %d entries (%s)", errOutputBudgetExceeded, w.budget.Count(), logtext.Path(rel))
+		// The returned error stays RAW, the same rule as its /input twin (l-p1): the
+		// stopping path is sanitized where reconcile EMITS it as the budget WARN's
+		// `error` attribute, so sanitizing has one home and a caller inspecting this
+		// error still sees the path the walk actually stopped at.
+		return fmt.Errorf("%w: stopped at %d entries (%s)", errOutputBudgetExceeded, w.budget.Count(), rel)
 	}
 	// A symlink anywhere in the output tree makes this walk and the WRITE path
 	// disagree about where a bundle lives: writes resolve through *os.Root,

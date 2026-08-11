@@ -477,9 +477,11 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		slog.Warn(scanBudgetMsg,
 			"path", logtext.Path(rel), "entries", sw.budget.Count(), "limit", sw.budget.Max(),
 			"remediation", scanbudget.InputRemediation)
-		// The stopping path is named in the error too, and that error is emitted as the
-		// scan summary's `error` attribute, so it goes through the same gate.
-		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.budget.Count(), logtext.Path(rel))
+		// The returned error stays RAW, the rule for every error this app hands back
+		// (l-p1): the stopping path is sanitized where the record is EMITTED, by
+		// logScanOutcome's `error` attribute, so the app has one gate home and a caller
+		// inspecting this error still sees the path the walk actually stopped at.
+		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.budget.Count(), rel)
 	}
 	if d.IsDir() {
 		// A directory occupying a <name>.crt path is a certificate the scan cannot
