@@ -92,7 +92,7 @@ var summaryAttrs = []struct {
 // the strength of that same volume is exactly what the Failed veto refuses. Health
 // deliberately does NOT ask this question; it asks Failed alone
 // (main.healthyAfterScan), because a restart can clear one and never the other.
-// Pointer receiver like its two siblings below: ScanResult reached gocritic's
+// Pointer receiver like its siblings below: ScanResult reached gocritic's
 // hugeParam threshold when Unwritable was added, and a read-only predicate is the
 // wrong place to copy 80 bytes.
 func (r *ScanResult) conversionsClean() bool {
@@ -116,6 +116,18 @@ func (r *ScanResult) durablyEnumerated() bool {
 // cannot be added to one of them and missed in the other.
 func (r *ScanResult) inputFullyEnumerated() bool {
 	return r.durablyEnumerated() && r.Vanished == 0
+}
+
+// unreplaceableOnly reports whether the only conversionsClean member this scan is
+// still failing is a REPLACEMENT THE VOLUME REFUSED rather than a failed conversion.
+// The two need different operator advice: a conversion failure is reported as one and
+// can be fixed, while a refused replacement is reported by unreplaceableBundleMsg and
+// is cleared on the volume — a chown, free space, a read-write remount — not by fixing
+// a conversion nothing logged. It lives beside conversionsClean because it re-spells
+// that veto's member set ("every member except Unwritable is zero"), so a member added
+// there must be weighed here in the same edit. Pointer receiver like its siblings.
+func (r *ScanResult) unreplaceableOnly() bool {
+	return r.Failed == 0 && r.Unwritable > 0
 }
 
 // The per-scan entry budget bounds how many /input entries ONE scan enumerates. Its

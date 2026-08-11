@@ -316,6 +316,7 @@ func New(root string, onChange func(ctx context.Context), opts ...Option) *Watch
 	w := &Watcher{
 		root:     filepath.Clean(root),
 		onChange: onChange,
+		watched:  make(map[string]struct{}),
 	}
 	for _, o := range opts {
 		o(w)
@@ -523,7 +524,7 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 // ancestor can extend registrations into the replacement target and consume
 // watch descriptors, but it still cannot make the app read or convert content
 // outside the root. Every path this package registers is derived from
-// filepath.WalkDir over the root (visitWatchPath is the only watcher.Add site) or
+// filepath.WalkDir over the root (attachWatch is the only watcher.Add site) or
 // from an event fsnotify named under a path already registered, so a registration
 // cannot carry an out-of-root name and cannot compound; a registration that
 // escaped through a swapped ancestor still carries an in-root name, so this
@@ -548,6 +549,20 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 // registrations. Callers must treat a ctx error as shutdown rather than a watch
 // failure (no WARN, no fallback to polling, no follow-up scan).
 func (w *Watcher) addWatchDirs(ctx context.Context, watcher *fsnotify.Watcher, root string) error {
+	return w.walkWatchDirs(ctx, root, func(path string) error {
+		return w.attachWatch(watcher, root, path)
+	})
+}
+
+// walkWatchDirs is the ONE traversal both watch-set walks run: the per-walk
+// entry budget, its WARN-and-stop, and the shared per-entry policy
+// (classifyWatchEntry) are applied here, and only what happens to an admitted
+// directory differs per walk -- the registering walk attaches it, the
+// rebuild's preflight collects it. Stating the wiring once is what
+// classifyWatchEntry's doc already promises for the policy itself; this
+// extends it to the budget admission, so a fix to the admission order cannot
+// repair one walk and leave the other reading the tree by a different rule.
+func (w *Watcher) walkWatchDirs(ctx context.Context, root string, register func(path string) error) error {
 	budget := w.newWatchSetBudget(root)
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		exceeded, err := budget.exceedsEntryBudget(ctx, walkErr)
@@ -558,7 +573,11 @@ func (w *Watcher) addWatchDirs(ctx context.Context, watcher *fsnotify.Watcher, r
 			w.warnWatchBudget(budget)
 			return fs.SkipAll
 		}
-		return w.visitWatchPath(ctx, watcher, budget, path, d, walkErr)
+		ok, err := w.classifyWatchEntry(ctx, root, path, d, walkErr)
+		if err != nil || !ok {
+			return err
+		}
+		return register(path)
 	})
 }
 
@@ -616,23 +635,8 @@ func (w *Watcher) warnWatchBudget(budget *watchSetBudget) {
 		"remediation", watchBudgetRemediation)...)
 }
 
-// visitWatchPath handles one entry of addWatchDirs' traversal: it honours
-// cancellation first, then applies the walk-error policy (fatal at the root,
-// warn-and-skip below it), and registers a watch for every directory. Only
-// directories are registered; a regular file is watched through its parent
-// directory.
-func (w *Watcher) visitWatchPath(
-	ctx context.Context, watcher *fsnotify.Watcher, budget *watchSetBudget, path string, d fs.DirEntry, walkErr error,
-) error {
-	register, err := w.classifyWatchEntry(ctx, budget.root, path, d, walkErr)
-	if err != nil || !register {
-		return err
-	}
-	return w.attachWatch(watcher, budget.root, path)
-}
-
 // classifyWatchEntry applies the per-entry policy BOTH watch-set walks share — the
-// event-driven registering walk (visitWatchPath) and the rebuild's preflight
+// event-driven registering walk (addWatchDirs) and the rebuild's preflight
 // enumeration (desiredWatchDirs) — and reports whether the entry is a directory the
 // walk should register: cancellation first, then the walk-error policy (fatal at the
 // root, warn-and-skip below it), then the directory filter. It is one function
@@ -747,9 +751,6 @@ func (w *Watcher) watchSetHas(path string) bool {
 func (w *Watcher) recordWatch(path string) {
 	w.watchedMu.Lock()
 	defer w.watchedMu.Unlock()
-	if w.watched == nil {
-		w.watched = make(map[string]struct{})
-	}
 	w.watched[filepath.Clean(path)] = struct{}{}
 }
 
@@ -1204,26 +1205,12 @@ func (w *Watcher) resyncWatchSet(ctx context.Context, watcher *fsnotify.Watcher,
 // and its mirror untouched, which is what lets resyncWatchSet abandon a rebuild without
 // having already spent or forgotten anything.
 func (w *Watcher) desiredWatchDirs(ctx context.Context, root string) (map[string]struct{}, error) {
-	budget := w.newWatchSetBudget(root)
 	desired := make(map[string]struct{})
-	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		exceeded, err := budget.exceedsEntryBudget(ctx, walkErr)
-		if err != nil {
-			return err
-		}
-		if exceeded {
-			w.warnWatchBudget(budget)
-			return fs.SkipAll
-		}
-		register, err := w.classifyWatchEntry(ctx, root, path, d, walkErr)
-		if err != nil || !register {
-			return err
-		}
+	if err := w.walkWatchDirs(ctx, root, func(path string) error {
 		desired[filepath.Clean(path)] = struct{}{}
 		return nil
-	})
-	if walkErr != nil {
-		return nil, walkErr
+	}); err != nil {
+		return nil, err
 	}
 	return desired, nil
 }
@@ -1251,16 +1238,17 @@ func (w *Watcher) reassertWatches(ctx context.Context, watcher *fsnotify.Watcher
 	// those freed slots to descendant directories and leave the root, the one
 	// watch a silently-dropped registration (IN_IGNORED on unmount/remount)
 	// most needs restored, refused for another whole re-sync interval.
-	// New cleaned it, and desiredWatchDirs keys the root entry as
-	// filepath.Clean(w.root), so the two already coincide.
+	// The root is always in desired: a preflight whose root errored, is not a
+	// directory, or was cut short returns an error instead of a set, and the
+	// entry budget cannot refuse the walk's first entry. New cleaned w.root and
+	// desiredWatchDirs keys the root as filepath.Clean(w.root), so the loop
+	// below skips it by equality.
 	rootPath := w.root
-	if _, ok := desired[rootPath]; ok {
-		if err := w.attachWatch(watcher, w.root, rootPath); err != nil {
-			return err
-		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
+	if err := w.attachWatch(watcher, w.root, rootPath); err != nil {
+		return err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
 	}
 	for path := range desired {
 		if path == rootPath {
@@ -1276,10 +1264,6 @@ func (w *Watcher) reassertWatches(ctx context.Context, watcher *fsnotify.Watcher
 	return nil
 }
 
-// watchState carries the mutable accounting for one watchLoop run: the pending
-// debounce flag and the debounce/safety-net/repair timers. Hoisting the per-event
-// work onto its methods keeps watchLoop's select a flat dispatch table rather than
-// a deeply nested switch.
 // minPreScanResync floors how often a debounced scan may re-assert the WHOLE watch set. The
 // re-assert is O(directories under the root) and re-emits one WARN per unwatchable directory,
 // while its trigger costs a writer one create+delete (handleFsEvent's Remove arm always
@@ -1294,6 +1278,10 @@ func (w *Watcher) reassertWatches(ctx context.Context, watcher *fsnotify.Watcher
 // with the routine rescan disabled, potentially not before the reconciliation floor.
 const minPreScanResync = time.Minute
 
+// watchState carries the mutable accounting for one watchLoop run: the pending
+// debounce flag and the debounce/safety-net/repair timers. Hoisting the per-event
+// work onto its methods keeps watchLoop's select a flat dispatch table rather than
+// a deeply nested switch.
 type watchState struct {
 	w              *Watcher
 	debounceTimer  *time.Timer

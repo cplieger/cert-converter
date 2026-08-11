@@ -990,8 +990,10 @@ var readBoundedInRoot = atomicfile.ReadBoundedInRoot
 // private-key material, and it had already drifted once when each mount enumerated
 // itself.
 func (s *store) listOutputs(ctx context.Context) (found []string, safe bool, err error) {
-	walk := outputWalk{ctx: ctx, budget: scanbudget.NewCounter(s.maxEntries)}
-	if err := atomicfile.WalkDirInRoot(ctx, s.root, walk.visit); err != nil {
+	walk := outputWalk{budget: scanbudget.NewCounter(s.maxEntries)}
+	if err := atomicfile.WalkDirInRoot(ctx, s.root, func(rel string, d fs.DirEntry, err error) error {
+		return walk.visit(ctx, rel, d, err)
+	}); err != nil {
 		// The ENTRY-BUDGET stop is the one abort whose per-path counts are OBSERVATIONS
 		// rather than casualties of the stop: every path this walk was handed, it
 		// classified normally, and the stop reason is typed (errOutputBudgetExceeded)
@@ -1055,7 +1057,6 @@ const outputBudgetRemediation = "check that /output is mounted at the bundle dir
 // boolean would be a second representation of one invariant that both veto arms would
 // have to keep in step.
 type outputWalk struct {
-	ctx        context.Context
 	found      []string
 	unreadable int
 	symlinked  int
@@ -1066,12 +1067,14 @@ type outputWalk struct {
 	budget scanbudget.Counter
 }
 
-// visit is listOutputs' walk callback: one entry, one verdict.
-func (w *outputWalk) visit(rel string, d fs.DirEntry, err error) error {
+// visit is listOutputs' walk callback: one entry, one verdict. The context arrives as a
+// parameter, exactly as scanWalk.visit's does — one ctx-threading shape for both tree
+// walks.
+func (w *outputWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err error) error {
 	// Same per-entry cancellation contract the input walk and the stale-temp
 	// sweep already honour: this walk runs on the shutdown path, because the
 	// scan is driven synchronously from the watcher's onChange callback.
-	if ctxErr := w.ctx.Err(); ctxErr != nil {
+	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}
 	if err != nil {

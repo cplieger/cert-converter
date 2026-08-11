@@ -719,24 +719,6 @@ type certGraph struct {
 	provenDistToRoot []int
 }
 
-// nameLinkage says how a child's issuer name relates to a candidate parent's subject
-// name, and with what fidelity. The fidelity is kept rather than collapsed to a
-// boolean because the two cases are reached by different work and mean different
-// things to a reader: an exact match is a byte comparison and the ordinary shape of a
-// well-formed bundle, while a semantic match is an ASN.1 decode of both names and the
-// RFC 5280 permitted-encoding case (a leaf naming its issuer as a UTF8String where
-// the CA's subject uses the canonical encoding) that a byte comparison cannot see.
-type nameLinkage uint8
-
-const (
-	// nameLinkNone means the two names are not the same name.
-	nameLinkNone nameLinkage = iota
-	// nameLinkSemantic means the decoded names are equal but their DER differs.
-	nameLinkSemantic
-	// nameLinkExact means the raw DER of the two names is byte-identical.
-	nameLinkExact
-)
-
 // issuanceEvidence is what this bundle can cheaply say about one ordered pair, "did
 // certs[parent] issue certs[child]", as separate facts rather than one verdict. The
 // fourth fact, the signature, is not here: it is the expensive one, so it is asked
@@ -746,8 +728,11 @@ const (
 // candidate parent, who is an issuer, and what the operator is told are decisions,
 // and they are made by the consumers that hold those questions.
 type issuanceEvidence struct {
-	// name is how child's issuer name relates to parent's subject name.
-	name nameLinkage
+	// nameLinked reports that child's issuer name IS parent's subject name, at
+	// either fidelity nameLink accepts: byte-identical DER, or semantically equal
+	// after an ASN.1 decode (the RFC 5280 permitted-encoding case a byte comparison
+	// cannot see).
+	nameLinked bool
 	// keyID reports RFC 5280's Authority Key Identifier on the child matching the
 	// Subject Key Identifier on the parent. A byte comparison rather than a
 	// signature check, so it is algorithm-agnostic and survives a permitted
@@ -778,7 +763,7 @@ type issuanceEvidence struct {
 // self-signed certificate beside the one it replaces would record a mutual
 // issuance edge - the shape keyReuse exists to exclude.
 func (e issuanceEvidence) nameOrKeyIDLink() bool {
-	return e.name != nameLinkNone || e.keyID
+	return e.nameLinked || e.keyID
 }
 
 // linked reports whether anything in this bundle ties the two certificates together
@@ -913,9 +898,9 @@ func (g *certGraph) fillEvidence() {
 				continue
 			}
 			e := issuanceEvidence{
-				name:     g.nameLink(child, parent),
-				keyID:    g.keyIDLink(child, parent),
-				eligible: eligible[parent],
+				nameLinked: g.nameLink(child, parent),
+				keyID:      g.keyIDLink(child, parent),
+				eligible:   eligible[parent],
 			}
 			// Only a pair something already links can be excluded as key reuse, and
 			// the exclusion costs a public-key comparison, so it is asked last.
@@ -934,8 +919,10 @@ func (g *certGraph) edge(child, parent int) issuanceEvidence {
 	return g.evidence[child*len(g.certs)+parent]
 }
 
-// nameLink classifies certs[child]'s issuer name against certs[parent]'s subject
-// name, preferring the byte comparison so an ordinary bundle never pays a decode.
+// nameLink reports whether certs[child]'s issuer name IS certs[parent]'s subject
+// name, preferring the byte comparison so an ordinary bundle never pays a decode. A
+// byte-identical DER and a name that is only semantically equal both answer true;
+// the RFC 5280 permitted-encoding difference is not a different answer.
 //
 // "Semantically equal" is the ASN.1-decoded name, NOT pkix.Name: crypto/x509
 // documents pkix.Name as an approximation of a distinguished name and says accurate
@@ -950,16 +937,13 @@ func (g *certGraph) edge(child, parent int) issuanceEvidence {
 //
 // A name that cannot be decoded or re-encoded matches nothing: an unreadable name is
 // compared against no other name rather than against everything.
-func (g *certGraph) nameLink(child, parent int) nameLinkage {
+func (g *certGraph) nameLink(child, parent int) bool {
 	if bytes.Equal(g.certs[child].RawIssuer, g.certs[parent].RawSubject) {
-		return nameLinkExact
+		return true
 	}
 	childIssuer, issuerOK := g.issuerName(child)
 	parentSubject, subjectOK := g.subjectName(parent)
-	if sameCanonicalName(childIssuer, issuerOK, parentSubject, subjectOK) {
-		return nameLinkSemantic
-	}
-	return nameLinkNone
+	return sameCanonicalName(childIssuer, issuerOK, parentSubject, subjectOK)
 }
 
 // keyIDLink reports RFC 5280's Authority Key Identifier on the child matching the
@@ -1836,7 +1820,7 @@ func (g *certGraph) bestParent(cur int, onPath []bool) int {
 // the whole candidate set. A subject comparison is not: candidates that arrived
 // by a name match share the child's issuer name (byte-identical, or semantically
 // equal with different DER), so their subjects tie or differ only in encoding,
-// while a candidate linked by key identifier alone (nameLinkNone) need not share
+// while a candidate linked by key identifier alone need not share
 // the subject at all. RFC 5280 permits a CA to hold several certificates under
 // one name, so real branches with equal distance and equal NotAfter exist, and
 // with an inert final key the choice fell back to file order.
@@ -2152,7 +2136,7 @@ func (g *certGraph) unprovenPathObservations(path []int) []Observation {
 		// name comparison, so a hop can rest on the authority key identifier alone -
 		// naming the issuer name there sends the operator to the wrong field.
 		linkage := "matches the issuer name of"
-		if g.edge(child, parent).name == nameLinkNone {
+		if !g.edge(child, parent).nameLinked {
 			linkage = "carries the subject key identifier named as the authority key identifier of"
 		}
 		obs = append(obs, Observation{

@@ -2833,3 +2833,102 @@ func TestReapConfirmed_reports_refused_removals_once_per_scan_at_warn(t *testing
 			reapAuditMsg, got, logs.Messages())
 	}
 }
+
+// TestReapConfirmed_audits_deletions_made_before_a_shutdown pins why the two audit
+// records are emitted from a defer rather than at the loop's normal exit: a deletion
+// that happened must not go unrecorded because the process stopped afterwards. Every
+// other shutdown case in this file deletes nothing, so the defer's whole contract had
+// no red path: a scan interrupted mid-batch would destroy private-key material with no
+// WARN-level trace, and the audit is the app's only warn-visible record of the one
+// destructive action it takes.
+//
+// The fixture deletes candidate one and observes the cancellation at candidate two's
+// re-check guard. live: 2 is reapConfirmed's own Err() sequence with the wait stubbed:
+// one.pfx's top-of-loop guard, one.pfx's pre-unlink guard, then two.pfx's top-of-loop
+// guard, which is the one that fires. The shutdown record must also report removed=1;
+// every existing shutdown case asserts removed="0", so the deleted-something half of
+// that attribute was unpinned too.
+// Serial: it swaps the package's reap-wait var and slog's default.
+func TestReapConfirmed_audits_deletions_made_before_a_shutdown(t *testing.T) {
+	logs := captureLogs(t)
+	out := t.TempDir()
+	for _, name := range []string{"one.pfx", "two.pfx"} {
+		if err := os.WriteFile(filepath.Join(out, name), []byte("pfx"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stubReapWait(t, func(context.Context) error { return nil })
+	calls := 0
+	ctx := cancelAfterNChecks{Context: t.Context(), calls: &calls, live: 2}
+
+	deleted, err := newReaper(newOutputStore(t, out), newInputSource(t, t.TempDir()),
+		outputpolicy.LifecycleSync).reapConfirmed(ctx, []string{"one.pfx", "two.pfx"})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("reapConfirmed(cancelled after the first unlink) error = %v, want context.Canceled", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("reapConfirmed(cancelled after the first unlink) deleted = %d, want 1", deleted)
+	}
+	if _, statErr := os.Stat(filepath.Join(out, "one.pfx")); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("os.Stat(one.pfx) = %v, want fs.ErrNotExist: the first candidate's unlink preceded the shutdown", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(out, "two.pfx")); statErr != nil {
+		t.Errorf("two.pfx was deleted after the shutdown was observed: %v", statErr)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, reapAuditMsg); got != 1 {
+		t.Fatalf("an interrupted scan that deleted one bundle logged %q at WARN %d times, want exactly 1:"+
+			" the audit must cover every exit from the loop, the shutdown return included: %q",
+			reapAuditMsg, got, logs.Messages())
+	}
+	if paths, ok := logs.AttrValue(reapAuditMsg, "paths"); !ok || !strings.Contains(paths, "one.pfx") ||
+		strings.Contains(paths, "two.pfx") {
+		t.Errorf("the audit record paths = %q, want it to name one.pfx and not two.pfx: it reports what"+
+			" actually happened, not the batch", paths)
+	}
+	if !logs.HasAttr(reapAuditMsg, "count", "1") {
+		got, _ := logs.AttrValue(reapAuditMsg, "count")
+		t.Errorf("the audit record count = %q, want %q", got, "1")
+	}
+	const msg = "orphan removal interrupted by shutdown during the confirming re-check"
+	if got, ok := logs.AttrValueExact(msg, "removed"); !ok || got != "1" {
+		t.Errorf("the shutdown record logged removed=%q, want \"1\": a deletion that happened must be"+
+			" counted, not only audited", got)
+	}
+}
+
+// TestStoreReconcile_keep_is_silent_with_orphans_present pins the half of the README's
+// OUTPUT_LIFECYCLE contract the mode table cannot see: "keep is silent and never
+// deletes". The table case asserts only the non-deletion half, so routing keep through
+// the report path -- where resolveReap's default arm names it "reported only
+// (OUTPUT_LIFECYCLE=keep)" and the orphan WARN fires on every scan -- keeps the whole
+// suite green while the documented silent mode becomes a per-scan WARN stream. Total
+// silence also pins keep's early return ahead of the output walk: a keep-mode scan
+// does not enumerate /output at all.
+// Serial: captureLogs swaps the process-global slog.Default.
+func TestStoreReconcile_keep_is_silent_with_orphans_present(t *testing.T) {
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, "orphan.pfx")
+	if err := os.WriteFile(orphan, []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
+	}
+	logs := captureLogs(t)
+	s := newOutputStore(t, dir)
+
+	deleted, err := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleKeep).
+		reconcile(context.Background(), map[string]struct{}{},
+			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+	if err != nil {
+		t.Fatalf("reconcile(keep, one orphan) = error %v, want nil", err)
+	}
+	if deleted != 0 {
+		t.Errorf("reconcile(keep, one orphan) deleted = %d, want 0", deleted)
+	}
+	if _, statErr := os.Stat(orphan); statErr != nil {
+		t.Errorf("keep mode deleted a bundle: %v", statErr)
+	}
+	if logs.Len() != 0 {
+		t.Errorf("reconcile(keep, one orphan) logged %q, want nothing at all: the README promises keep"+
+			" is silent", logs.Messages())
+	}
+}

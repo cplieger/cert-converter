@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/slogx/capture"
 	"github.com/fsnotify/fsnotify"
 )
@@ -138,7 +137,7 @@ func assertNoSkipWarn(t *testing.T, logs *capture.Recorder, msg string) {
 	}
 }
 
-// TestVisitWatchPath_applies_the_walk_error_policy pins the per-entry half of
+// TestClassifyWatchEntry_applies_the_walk_error_policy pins the per-entry half of
 // addWatchDirs' walk-error contract, at the level where the walk error is an
 // ARGUMENT rather than something a test has to provoke from the filesystem: the
 // helper accepts the failure as an argument so the policy is deterministic even
@@ -153,10 +152,11 @@ func assertNoSkipWarn(t *testing.T, logs *capture.Recorder, msg string) {
 // will not be noticed at all until a restart -- the difference between a
 // cosmetic and an actionable log line.
 //
-// The nil watcher is deliberate: neither branch may register a watch, so a
-// change that started touching the watcher here panics instead of passing.
+// The classifier registers nothing itself: it only reports whether the entry is
+// a directory the walk should register, so neither branch here can attach a
+// watch.
 // Not parallel: it swaps the process-global slog default.
-func TestVisitWatchPath_applies_the_walk_error_policy(t *testing.T) {
+func TestClassifyWatchEntry_applies_the_walk_error_policy(t *testing.T) {
 	walkErr := errors.New("permission denied")
 
 	for _, tc := range []struct {
@@ -179,42 +179,42 @@ func TestVisitWatchPath_applies_the_walk_error_policy(t *testing.T) {
 			}
 			w := New(root, func(context.Context) {}, WithFallback(tc.fallback))
 
-			err := w.visitWatchPath(t.Context(), nil, &watchSetBudget{budget: scanbudget.NewCounter(scanbudget.Default), root: root}, path, nil, walkErr)
+			_, err := w.classifyWatchEntry(t.Context(), root, path, nil, walkErr)
 
 			if tc.wantFatal {
 				if !errors.Is(err, walkErr) {
-					t.Errorf("visitWatchPath(root, walkErr) = %v, want the walk error unchanged so Run falls back to polling", err)
+					t.Errorf("classifyWatchEntry(root, walkErr) = %v, want the walk error unchanged so Run falls back to polling", err)
 				}
 				assertNoSkipWarn(t, logs, warnUnwatchablePath)
 				return
 			}
 			if err != nil {
-				t.Errorf("visitWatchPath(child, walkErr) = %v, want nil so the rest of the tree is still watched", err)
+				t.Errorf("classifyWatchEntry(child, walkErr) = %v, want nil so the rest of the tree is still watched", err)
 			}
 			assertSkipWarn(t, logs, warnUnwatchablePath, path, tc.wantFallback, walkErr)
 		})
 	}
 }
 
-// TestVisitWatchPath_reports_shutdown_ahead_of_a_walk_error pins the ordering
-// inside visitWatchPath: cancellation is checked BEFORE the walk error. That
+// TestClassifyWatchEntry_reports_shutdown_ahead_of_a_walk_error pins the ordering
+// inside classifyWatchEntry: cancellation is checked BEFORE the walk error. That
 // ordering is a real contract, not an accident of layout -- callers must treat a
 // ctx error as shutdown (no WARN, no fallback to polling, no follow-up scan),
 // and a shutdown arriving while the walk is already failing on some sub-path
 // would otherwise be reported as a watch degradation and send Run into polling
 // on its way out.
 // Not parallel: it swaps the process-global slog default.
-func TestVisitWatchPath_reports_shutdown_ahead_of_a_walk_error(t *testing.T) {
+func TestClassifyWatchEntry_reports_shutdown_ahead_of_a_walk_error(t *testing.T) {
 	logs := capture.Default(t)
 	root := t.TempDir()
 	w := New(root, func(context.Context) {}, WithFallback(6*time.Hour))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := w.visitWatchPath(ctx, nil, &watchSetBudget{budget: scanbudget.NewCounter(scanbudget.Default), root: root}, filepath.Join(root, "example.com"), nil, errors.New("permission denied"))
+	_, err := w.classifyWatchEntry(ctx, root, filepath.Join(root, "example.com"), nil, errors.New("permission denied"))
 
 	if !errors.Is(err, context.Canceled) {
-		t.Errorf("visitWatchPath(cancelled ctx, walkErr) = %v, want context.Canceled: shutdown outranks the walk error so Run treats it as a clean stop", err)
+		t.Errorf("classifyWatchEntry(cancelled ctx, walkErr) = %v, want context.Canceled: shutdown outranks the walk error so Run treats it as a clean stop", err)
 	}
 	assertNoSkipWarn(t, logs, warnUnwatchablePath)
 }

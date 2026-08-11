@@ -265,9 +265,9 @@ func TestOutputWalkVisit_an_unreadable_path_vetoes_the_reap(t *testing.T) {
 		t.Fatalf("setup: WriteFile: %v", err)
 	}
 	logs := captureLogs(t)
-	w := &outputWalk{ctx: t.Context()}
+	w := &outputWalk{}
 
-	if err := w.visit("locked/tls.pfx", nil, errors.New("permission denied")); err != nil {
+	if err := w.visit(t.Context(), "locked/tls.pfx", nil, errors.New("permission denied")); err != nil {
 		t.Fatalf("visit(unreadable output sub-path) = %v, want nil so the rest of the tree is still walked", err)
 	}
 	if w.unreadable != 1 {
@@ -279,7 +279,7 @@ func TestOutputWalkVisit_an_unreadable_path_vetoes_the_reap(t *testing.T) {
 		t.Errorf("found = %v, want empty: a path the walk could not read is not a deletion candidate", w.found)
 	}
 
-	if err := w.visit("live.pfx", dirEntryOf(t, bundle), nil); err != nil {
+	if err := w.visit(t.Context(), "live.pfx", dirEntryOf(t, bundle), nil); err != nil {
 		t.Fatalf("visit(readable bundle) = %v, want nil", err)
 	}
 	if len(w.found) != 1 || w.found[0] != "live.pfx" {
@@ -319,9 +319,9 @@ func TestOutputWalkVisit_stops_the_orphan_walk_once_the_scan_is_cancelled(t *tes
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	w := &outputWalk{ctx: ctx}
+	w := &outputWalk{}
 
-	err := w.visit("live.pfx", dirEntryOf(t, bundle), nil)
+	err := w.visit(ctx, "live.pfx", dirEntryOf(t, bundle), nil)
 
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("visit(cancelled scan) = %v, want context.Canceled so the walk abandons the tree", err)
@@ -493,5 +493,35 @@ func TestStoreListOutputs_enumerates_a_tree_inside_the_budget(t *testing.T) {
 	if len(found) != 1 || found[0] != "a.pfx" {
 		t.Errorf("listOutputs(a tree exactly at the budget) found %v, want [a.pfx]: only this app's own"+
 			" output shape is a candidate", found)
+	}
+}
+
+// TestLogIncompleteInputEnumeration_evicted_evidence_outranks_a_renewal pins the arm
+// precedence logIncompleteInputEnumeration's own comment calls load-bearing: a scan
+// that saw a renewal AND lost wholeness evidence is not "only a renewal", so
+// vanishedOnly composes evidenceComplete precisely to self-veto here and the evicted
+// arm below it still wins. Drop that term (or reorder the arms) and this condition --
+// which recurs on every scan for as long as the tree out-sizes the observation log --
+// is reported as the transient Debug line, losing the only remediation the operator
+// gets and the reapDisabledPhrase record the documented
+// CertConverterOrphanRemovalDisabled alert matches. The existing evicted-evidence
+// cases carry no Vanished count, so nothing else fails when the composition is lost.
+//
+// Runs serially: it swaps slog.Default().
+func TestLogIncompleteInputEnumeration_evicted_evidence_outranks_a_renewal(t *testing.T) {
+	logs := captureLogs(t)
+
+	logIncompleteInputEnumeration(&reapContext{
+		result: ScanResult{Total: 2, Vanished: 1}, walkCompleted: true, evidenceEvicted: 1,
+	})
+
+	if got := logs.CountLevel(slog.LevelWarn, evictedEvidenceMsg); got != 1 {
+		t.Fatalf("logIncompleteInputEnumeration(vanished cert + evicted evidence) logged %q, want %q once"+
+			" at WARN: a transient renewal must not silence the evidence-loss report", logs.Messages(), evictedEvidenceMsg)
+	}
+	const dbg = "skipping orphan reconciliation; input files were replaced during the scan"
+	if got := logs.CountLevel(slog.LevelDebug, dbg); got != 0 {
+		t.Errorf("logIncompleteInputEnumeration(vanished cert + evicted evidence) logged %q at DEBUG %d"+
+			" times, want 0: the scan did not lose reaping to the renewal alone", dbg, got)
 	}
 }

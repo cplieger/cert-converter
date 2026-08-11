@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cplieger/atomicfile/v2"
+	"github.com/cplieger/cert-converter/internal/convert"
 )
 
 // TestSourcePathVanished_reports_an_unclassifiable_path_as_steady_state pins
@@ -201,7 +202,7 @@ func TestSourceReadBounded(t *testing.T) {
 		}
 	})
 
-	t.Run("refuses a file above the app's own maxFileSize", func(t *testing.T) {
+	t.Run("refuses a file above the documented /input cap", func(t *testing.T) {
 		t.Parallel()
 		// The app-owned half of the read contract: readBounded takes no limit
 		// parameter, so the only thing pinning the documented /input cap to the
@@ -209,14 +210,14 @@ func TestSourceReadBounded(t *testing.T) {
 		// limit passes every other subtest here.
 		//
 		// Sparse: Truncate sets the SIZE atomicfile stats off the open handle without
-		// allocating maxFileSize bytes, so the refusal is observed for the cost of an
+		// allocating convert.MaxInputBytes bytes, so the refusal is observed for the cost of an
 		// empty file. The exact-boundary semantics belong to atomicfile's own suite.
 		dir := t.TempDir()
 		f, err := os.Create(filepath.Join(dir, "huge.pem"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := f.Truncate(maxFileSize + 1); err != nil {
+		if err := f.Truncate(convert.MaxInputBytes + 1); err != nil {
 			f.Close()
 			t.Fatal(err)
 		}
@@ -228,8 +229,8 @@ func TestSourceReadBounded(t *testing.T) {
 		data, err := s.readBounded(t.Context(), "huge.pem")
 		if !errors.Is(err, atomicfile.ErrFileTooLarge) {
 			t.Errorf("source.readBounded(a %d-byte file) = %d bytes, error %v; want it to satisfy"+
-				" errors.Is(err, atomicfile.ErrFileTooLarge): the production call must apply maxFileSize (%d)",
-				maxFileSize+1, len(data), err, maxFileSize)
+				" errors.Is(err, atomicfile.ErrFileTooLarge): the production call must apply convert.MaxInputBytes (%d)",
+				convert.MaxInputBytes+1, len(data), err, convert.MaxInputBytes)
 		}
 	})
 }

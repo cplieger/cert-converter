@@ -50,9 +50,11 @@ type Counter struct {
 	entries int
 }
 
-// NewCounter resolves an injected budget once: non-positive means Default.
+// NewCounter builds a Counter over an injected budget. Resolution is Max's: it treats
+// non-positive as Default on every read, so a Counter built here and a zero-value one
+// are bounded by the same single rule.
 func NewCounter(limit int) Counter {
-	return Counter{max: Effective(limit)}
+	return Counter{max: limit}
 }
 
 // Charge counts one enumerated path and reports whether it is within budget.
@@ -65,5 +67,7 @@ func (c *Counter) Charge() bool {
 // diagnostic; each walk words that record for its own tree.
 func (c *Counter) Count() int { return c.entries }
 
-// Max is the resolved ceiling. It re-resolves so a zero-value Counter is bounded.
+// Max is the resolved ceiling: non-positive means Default (Effective). It is the ONE
+// site that resolves, so a zero-value Counter and a NewCounter one are bounded by the
+// same rule.
 func (c *Counter) Max() int { return Effective(c.max) }

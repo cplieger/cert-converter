@@ -77,12 +77,19 @@ func (r *reapContext) walkEnumerationComplete() bool {
 
 // enumerationClean reports whether nothing PREVENTED the walk from enumerating the
 // whole input tree, and nothing spent the in-process evidence this scan's own
-// classifications rest on. It is the shared half of two decisions that differ by one
-// term: enumeratedInput adds result.Total > 0 (an empty tree is clean but gives the
-// output nothing to be compared against), while Scanner.Run's observation-state prune
-// does not. The veto set is ScanResult.inputFullyEnumerated plus evidenceComplete, the
-// same one logInputCoverageWarnings asks, so a new veto dimension cannot be added to one
-// caller and missed in the other.
+// classifications rest on. Both consumers are in this file: enumeratedInput adds
+// result.Total > 0 (an empty tree is clean but gives the output nothing to be
+// compared against), and logIncompleteInputEnumeration uses it to tell "nothing to
+// compare" from a failed enumeration. Scanner.Run's observation-state prune
+// deliberately does NOT compose it: the prune gates on walkEnumerationComplete
+// alone, because an eviction does not make the enumeration partial, and gating the
+// prune on evidence would let ceiling pressure disable the one mechanism that
+// relieves it (the prune's own comment in process.go carries that rationale). Only
+// the WALK half is a shared spelling: ScanResult.inputFullyEnumerated is the same
+// question logInputCoverageWarnings asks, so a new walk-coverage dimension cannot be
+// added to one asker and missed in the other. The evidence half is this file's own;
+// logInputCoverageWarnings never sees it (it takes only the ScanResult and the walk
+// error, and the evicted-evidence WARN is logIncompleteInputEnumeration's).
 func (r *reapContext) enumerationClean() bool {
 	return r.walkEnumerationComplete() && r.evidenceComplete()
 }
@@ -105,22 +112,6 @@ func (r *reapContext) vanishedOnly() bool {
 // reached reads as an orphan.
 func (r *reapContext) enumeratedInput() bool {
 	return r.enumerationClean() && r.result.Total > 0
-}
-
-// safeToReap reports whether the input enumeration is complete enough, and this
-// scan's own output work clean enough, to justify deleting anything.
-func (r *reapContext) safeToReap() bool {
-	return r.enumeratedInput() && r.result.conversionsClean()
-}
-
-// unreplaceableOnly reports whether the only thing this scan is still trying to repair on
-// the output tree is a REPLACEMENT THE VOLUME REFUSED rather than a failed conversion. The
-// two need different operator advice: a conversion failure is reported as one and can be
-// fixed, while a refused replacement is reported by unreplaceableBundleMsg and is cleared
-// on the volume — a chown, free space, a read-write remount — not by fixing a conversion
-// nothing logged.
-func (r *reapContext) unreplaceableOnly() bool {
-	return r.result.Failed == 0 && r.result.Unwritable > 0
 }
 
 // reapDisabledPhrase is the substring the README's CertConverterOrphanRemovalDisabled Loki
@@ -256,8 +247,11 @@ func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *r
 		return 0, nil
 	}
 
-	reapable := rc.safeToReap() && walkSafe
-	d := resolveReap(rp.mode, reapable, walkSafe, rc.unreplaceableOnly())
+	// The enumeration half of the reap-safety question was already answered by the
+	// !rc.enumeratedInput() return at the top of this function; what is left to ask
+	// is whether this scan's own output work was clean.
+	reapable := rc.result.conversionsClean() && walkSafe
+	d := resolveReap(rp.mode, reapable, walkSafe, rc.result.unreplaceableOnly())
 	if !d.reap {
 		msg := "output bundles have no matching input"
 		// In sync mode reaching this line means orphan removal is OFF for this scan,
@@ -759,7 +753,7 @@ type reapDecision struct {
 // above, so every arm below is a scan that keeps its candidates.
 func resolveReap(mode outputpolicy.Lifecycle, reapable, walkSafe, refusalOnly bool) reapDecision {
 	// reapable already carries walkSafe: reconcile computes it as
-	// `rc.safeToReap() && walkSafe` at the single call site, so an untrustworthy output
+	// `rc.result.conversionsClean() && walkSafe` at the single call site, so an untrustworthy output
 	// walk has already forced it false. walkSafe stays a parameter because the narration
 	// below distinguishes it from the other vetoes.
 	if mode == outputpolicy.LifecycleSync && reapable {

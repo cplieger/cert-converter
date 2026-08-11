@@ -10,17 +10,6 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 )
 
-// maxFileSize is the maximum size of an input certificate or key file (10 MB).
-//
-// It is convert.MaxInputBytes, the cap that package's acceptance bounds are
-// calibrated against, so raising it lands in the diff beside the bounds it
-// invalidates rather than silently invalidating them from here. This package owns
-// ENFORCEMENT — reading an untrusted file under a cap is a property of the
-// FILESYSTEM boundary, not of the PEM codec, which is handed bytes and never
-// learns where they came from — while the number itself lives where the reasoning
-// that depends on it lives.
-const maxFileSize = convert.MaxInputBytes
-
 // source owns every read of the input tree.
 //
 // It is the single owner of input filesystem policy: the confined root, the
@@ -97,11 +86,13 @@ func (s *source) pathAbsent(rel string) (bool, error) {
 	return false, nil
 }
 
-// readBounded opens rel within the input tree and reads it under maxFileSize,
-// confining the read to that tree: a symlink or ".." component in rel can never
-// redirect the read outside it (Go 1.24+ *os.Root). Only regular files are read,
-// so a named pipe, device node or socket planted in the watched tree cannot stall
-// the scan.
+// readBounded opens rel within the input tree and reads it under
+// convert.MaxInputBytes (10 MB) — the cap internal/convert's acceptance bounds are
+// calibrated against, stated there so raising it lands in the diff beside the bounds
+// it invalidates — confining the read to that tree: a symlink or ".." component in rel
+// can never redirect the read outside it (Go 1.24+ *os.Root). Only regular files are
+// read, so a named pipe, device node or socket planted in the watched tree cannot
+// stall the scan.
 //
 // atomicfile owns the confined read: it opens through the root non-blocking (so a
 // FIFO planted in the watched tree is rejected rather than wedging the scan's only
@@ -110,5 +101,5 @@ func (s *source) pathAbsent(rel string) (bool, error) {
 // atomicfile guarantees, and leaves this package one read method whose cap is the
 // documented /input bound — nothing here or in a test picks a different one.
 func (s *source) readBounded(ctx context.Context, rel string) ([]byte, error) {
-	return atomicfile.ReadBoundedInRoot(ctx, s.root, rel, maxFileSize)
+	return atomicfile.ReadBoundedInRoot(ctx, s.root, rel, convert.MaxInputBytes)
 }

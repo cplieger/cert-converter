@@ -516,18 +516,18 @@ func TestNameLink_separates_a_re_encoded_name_from_a_reordered_one(t *testing.T)
 	for _, tc := range []struct {
 		name  string
 		child int
-		want  nameLinkage
+		want  bool
 	}{
-		{"byte-identical issuer name", 1, nameLinkExact},
-		{"same name, other DirectoryString encoding", 2, nameLinkSemantic},
-		{"same attribute values in a different RDN order", 3, nameLinkNone},
+		{"byte-identical issuer name", 1, true},
+		{"same name, other DirectoryString encoding", 2, true},
+		{"same attribute values in a different RDN order", 3, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := g.nameLink(tc.child, caIdx); got != tc.want {
-				t.Errorf("nameLink(%s) = %d, want %d", tc.name, got, tc.want)
+				t.Errorf("nameLink(%s) = %t, want %t", tc.name, got, tc.want)
 			}
-			if got := g.edge(tc.child, caIdx).linked(); got != (tc.want != nameLinkNone) {
-				t.Errorf("edge(%s).linked() = %t, want %t", tc.name, got, tc.want != nameLinkNone)
+			if got := g.edge(tc.child, caIdx).linked(); got != tc.want {
+				t.Errorf("edge(%s).linked() = %t, want %t", tc.name, got, tc.want)
 			}
 		})
 	}
@@ -571,12 +571,12 @@ func TestNameLink_refuses_a_name_it_cannot_decode(t *testing.T) {
 		name          string
 		childIssuer   []byte
 		parentSubject []byte
-		want          nameLinkage
+		want          bool
 	}{
-		{"neither name decodes", notASequence, trailingByte, nameLinkNone},
-		{"the child's issuer name does not decode", notASequence, decodable, nameLinkNone},
-		{"the parent's subject name does not decode", decodable, trailingByte, nameLinkNone},
-		{"undecodable but byte-identical names still match exactly", notASequence, notASequence, nameLinkExact},
+		{"neither name decodes", notASequence, trailingByte, false},
+		{"the child's issuer name does not decode", notASequence, decodable, false},
+		{"the parent's subject name does not decode", decodable, trailingByte, false},
+		{"undecodable but byte-identical names still match exactly", notASequence, notASequence, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -589,7 +589,7 @@ func TestNameLink_refuses_a_name_it_cannot_decode(t *testing.T) {
 				canonicalIssuers:  make([]canonicalDN, 2),
 			}
 			if got := g.nameLink(0, 1); got != tc.want {
-				t.Errorf("nameLink(child issuer %x, parent subject %x) = %d, want %d",
+				t.Errorf("nameLink(child issuer %x, parent subject %x) = %t, want %t",
 					tc.childIssuer, tc.parentSubject, got, tc.want)
 			}
 		})

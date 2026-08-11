@@ -268,10 +268,10 @@ func TestSETMemberOrder_is_one_rule_across_all_three_name_consumers(t *testing.T
 			t.Fatalf("setup: %s — the two names are byte-identical, so this case would pass"+
 				" through the raw-bytes fast path", tc.name)
 		}
-		if got := g.nameLink(tc.child, tc.parent); got != nameLinkSemantic {
-			t.Errorf("nameLink(%d, %d) [%s] = %v, want nameLinkSemantic: the child's issuer name is"+
+		if !g.nameLink(tc.child, tc.parent) {
+			t.Errorf("nameLink(%d, %d) [%s] = false, want true: the child's issuer name is"+
 				" the parent's subject name with the SET members in the other order",
-				tc.child, tc.parent, tc.name, got)
+				tc.child, tc.parent, tc.name)
 		}
 	}
 

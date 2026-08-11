@@ -114,8 +114,22 @@ func runWalkErrorBudgetHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The child needs a temp and coverage-output home it can write: it runs as
+	// uid 65534, while the inherited TMPDIR and GOCOVERDIR are routinely
+	// writable only by the invoking user (go test -coverprofile points
+	// GOCOVERDIR at a 0700 build directory). A coverage-instrumented child
+	// that cannot emit its counters exits non-zero AFTER its assertions print
+	// PASS, which this helper would misread as a test failure.
+	scratch := filepath.Join(helperDir, "scratch")
+	if err := os.Mkdir(scratch, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(scratch, 0o777); err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.Command(helperPath, "-test.run=^"+t.Name()+"$")
-	cmd.Env = append(os.Environ(), walkErrorBudgetHelper+"=1")
+	cmd.Env = append(os.Environ(), walkErrorBudgetHelper+"=1",
+		"TMPDIR="+scratch, "GOCOVERDIR="+scratch)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65534, Gid: 65534}}
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("unprivileged helper failed: %v\n%s", err, output)
