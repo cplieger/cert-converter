@@ -616,10 +616,10 @@ type identityMatch struct {
 // certificate is from a self-signed root present in the bundle.
 //
 // "Did certs[parent] issue certs[child]" is deliberately NOT a boolean here. It is
-// four independent facts per ordered pair (issuanceEvidence): how the names line up
-// and with what fidelity, whether the key identifiers line up, whether parent's key
-// provably produced child's signature, and whether parent's own extensions permit it
-// to issue certificates at all. One boolean forces every consumer to accept some
+// four independent facts per ordered pair (issuanceEvidence): whether the names line
+// up, whether the key identifiers line up, whether parent's key provably produced
+// child's signature, and whether parent's own extensions permit it to issue
+// certificates at all. One boolean forces every consumer to accept some
 // other consumer's choice of which evidence counts, which is exactly how a second
 // issuance predicate once grew beside this graph: the app could PROVE a CA issued the
 // leaf while selecting the identity and still fail to place that proven edge in the

@@ -625,10 +625,10 @@ func (b *watchSetBudget) exceedsEntryBudget(ctx context.Context, walkErr error) 
 	return !b.budget.Charge(), nil
 }
 
-// warnWatchBudget emits the entry-ceiling WARN. Both call sites — the registering walk
-// and the rebuild's preflight enumeration — return fs.SkipAll in the same frame, which
-// stops that walk, so one budget produces exactly one record: the remainder is
-// unbounded and the operator action is the same for all of it.
+// warnWatchBudget emits the entry-ceiling WARN. walkWatchDirs returns fs.SkipAll
+// in the same frame for both the registering walk and the rebuild's preflight,
+// stopping that traversal, so one budget produces exactly one record: the
+// remainder is unbounded and the operator action is the same for all of it.
 func (w *Watcher) warnWatchBudget(budget *watchSetBudget) {
 	slog.Warn(watchBudgetMsg, w.coverageAttrs(
 		"root", budget.root, "max_entries", budget.budget.Max(),
