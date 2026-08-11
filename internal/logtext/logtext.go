@@ -8,9 +8,16 @@
 // image: a stranger points /input and /output at whatever they like, so every name
 // this app enumerates — a directory entry under /input, a bundle under /output, a path
 // an fsnotify event names, a mount path an operator configured — is chosen by a party
-// this app knows nothing about. A name holding CR or LF forges a record boundary in
-// the plain-text handler this app configures, and a Unicode bidi control reorders what
-// an operator reads, so Path rewrites that set AT THE EMIT BOUNDARY. Sanitizing is
+// this app knows nothing about, so Path rewrites the unsafe set AT THE EMIT BOUNDARY.
+// What that rests on is NOT the escaping of the handler installed today: slogx builds a
+// slog.NewTextHandler for this app (main.go's slogx.Setup takes the zero Format), and
+// that handler quotes any value holding a control or non-printing rune, so an
+// unsanitized CR arrives as `\n` and a bidi mark as `\u200e`, on one line — including
+// the raw name inside an *fs.PathError logged as an `error` attribute beside a sanitized
+// `path`, which is what every refusal in internal/mounts does. The gate covers what that
+// escaping does not: slog's JSONHandler emits bidi controls and C1 introducers RAW, an
+// escaped `\u200e` is legible to no operator, and a consumer that unquotes a logfmt
+// value recovers the original bytes. Sanitizing is
 // byte-identical for an ordinary name — every ASCII path, every domain-derived bundle
 // name — so an operator's log query keys are unchanged; only the spellings that could
 // reorder or split a record move. Values used for a filesystem DECISION (an open, a
@@ -46,11 +53,11 @@ const Marker = "...(truncated)"
 //
 // The classification is runesafe's, not this package's: C0 controls, DEL, C1 controls
 // (U+0080-U+009F), the whole Unicode Bidi_Control set, and the U+2028/U+2029 line
-// separators, each replaced by a space, with invalid UTF-8 becoming U+FFFD. Two of
-// those classes are what make an untrusted name a record-integrity problem rather
-// than a cosmetic one — CR/LF forge a record boundary in a single-line sink, and a
-// bidi control reorders the rendered line — and hand-rolling the ranges here is
-// exactly the drift runesafe exists to prevent.
+// separators, each replaced by a space, with invalid UTF-8 becoming U+FFFD. CR/LF and
+// the bidi controls are the two classes that would split or reorder a record in a sink
+// that emits them raw — slog's JSONHandler does; its TextHandler quotes the whole value
+// instead, which is safe and unreadable — and hand-rolling the ranges here is exactly
+// the drift runesafe exists to prevent.
 //
 // Apply it AT THE LOG CALL and nowhere else. A sanitized value used for a lookup, a
 // join, a stat or a map key is a bug: the two trees are addressed by their real bytes,

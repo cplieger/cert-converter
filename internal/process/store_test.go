@@ -119,28 +119,31 @@ func TestStoreReconcile_reports_an_output_tree_it_cannot_enumerate(t *testing.T)
 // report never advises a setting that is already in effect, and that it names the
 // condition actually holding the reap back. In sync mode the report branch is
 // reachable two ways (reconcile returns early unless the input enumeration is
-// complete, so !reapable there means conversionsClean() is false): a failed
-// conversion, or a replacement the output volume refused, which logs no conversion
-// failure at all and is cleared on the volume rather than by fixing a conversion.
+// complete, so the result carries either a failed conversion or a refused
+// replacement): a failed conversion, or a replacement the output volume refused,
+// which logs no conversion failure at all and is cleared on the volume rather than
+// by fixing a conversion.
 func TestStoreOrphanReportRemediation_advice_matches_the_mode(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name        string
-		mode        outputpolicy.Lifecycle
-		walkSafe    bool
-		refusalOnly bool
-		wantHas     string
-		wantLacks   string
+		name      string
+		mode      outputpolicy.Lifecycle
+		result    ScanResult
+		walkSafe  bool
+		wantHas   string
+		wantLacks string
 	}{
 		{
 			name: "sync names the conversion failure, not the mode it is already in",
 			mode: outputpolicy.LifecycleSync, walkSafe: true,
+			result:    ScanResult{Failed: 1},
 			wantHas:   "fix the conversion failure reported above",
 			wantLacks: "OUTPUT_LIFECYCLE=sync",
 		},
 		{
 			name: "sync names the refused replacement, not a conversion failure",
-			mode: outputpolicy.LifecycleSync, walkSafe: true, refusalOnly: true,
+			mode: outputpolicy.LifecycleSync, walkSafe: true,
+			result:    ScanResult{Unwritable: 1},
 			wantHas:   "no refused replacement",
 			wantLacks: "fix the conversion failure reported above",
 		},
@@ -155,9 +158,23 @@ func TestStoreOrphanReportRemediation_advice_matches_the_mode(t *testing.T) {
 			wantHas:   "do not remove anything from this list yet",
 			wantLacks: "OUTPUT_LIFECYCLE=sync",
 		},
+		{
+			// Both vetoes at once, which one /output permission state produces: a volume
+			// that refuses a replacing write can equally refuse to enumerate a subtree.
+			// The untrustworthy LIST has to win, because the refusal arm's wording
+			// promises removal on the next clean scan and invites a manual deletion --
+			// advice that destroys key material when the list holds live bundles, which
+			// is exactly what an unsafe output walk cannot rule out. Without this case
+			// the two arms can be reordered with the whole suite green.
+			name: "an unwalkable output tree outranks a refused replacement",
+			mode: outputpolicy.LifecycleSync, walkSafe: false,
+			result:    ScanResult{Unwritable: 1},
+			wantHas:   "do not remove anything from this list yet",
+			wantLacks: "no refused replacement",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := resolveReap(tc.mode, false, tc.walkSafe, tc.refusalOnly).remediation
+			got := resolveReap(tc.mode, &tc.result, tc.walkSafe).remediation
 			if !strings.Contains(got, tc.wantHas) {
 				t.Errorf("resolveReap(%v, %v).remediation = %q, want it to contain %q",
 					tc.mode, tc.walkSafe, got, tc.wantHas)

@@ -1,13 +1,21 @@
 // Package watch provides filesystem watching with fsnotify and poll fallback.
 //
-// Paths here are AMBIENT, unlike every /input and /output touch in
-// internal/process, which goes through an *os.Root. The invariant that keeps
-// that safe: this package reads no file CONTENT, so a future read of a watched
+// Paths this package REGISTERS are ambient, because inotify registers a pathname
+// rather than a directory handle, so there is no root-confined equivalent of
+// watcher.Add. The ENUMERATION that finds them is confined: walkWatchDirs opens
+// the walk root as an *os.Root and streams it through
+// atomicfile.WalkDirInRoot, the same primitive internal/process's two walks over
+// the same trees use. The invariant that keeps the ambient registration safe:
+// this package reads no file CONTENT, so a future read of a watched
 // file MUST go through internal/process's confined root
 // (source.readBounded, i.e. atomicfile.ReadBoundedInRoot) and never through a
 // path built here. See
-// addWatchDirs for why no confined equivalent exists and what the residual
-// exposure is.
+// addWatchDirs for what the residual exposure of an ambient registration is.
+//
+// An ERROR is a filesystem-derived string too: the filesystem returns
+// *fs.PathError and fsnotify interpolates the path, so every "error" attribute
+// whose value can carry a name from the tree is emitted as
+// logtext.Path(err.Error()), the same gate the sibling "path" attribute uses.
 package watch
 
 import (
@@ -21,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
@@ -170,11 +179,7 @@ func WithMaxEntries(n int) Option {
 // detection under the unwalked remainder) for the same reason the scan's own
 // budget WARN does, and it reuses that WARN's matched phrase so one alert rule
 // covers both walks over the same tree.
-const watchBudgetMsg = "the /input tree holds more entries than one scan will enumerate; stopping the watch-set walk, so directories past the budget are unwatched and renewals under them are covered only by the periodic rescan, health is unaffected"
-
-// watchBudgetRemediation names both ways out, exactly as the scan's does: a mount
-// pointed at the wrong tree, or a legitimately large certificate directory.
-const watchBudgetRemediation = "check that /input is mounted at the certificate directory and holds nothing else, or raise MAX_SCAN_ENTRIES if the tree is legitimately this large"
+const watchBudgetMsg = scanbudget.InputTreeTooLarge + "; stopping the watch-set walk, so directories past the budget are unwatched and renewals under them are covered only by the periodic rescan, health is unaffected"
 
 // coverageAttrs closes a degraded-path record with the two cadences that answer
 // the one question such a record raises: will anything revisit what was just lost?
@@ -517,29 +522,34 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 // is, so one mis-permissioned certificate directory cannot cost the whole tree
 // its real-time watch.
 //
-// The ambient-path divergence the package comment points here for is deliberate
-// and bounded: inotify registration takes a path,
+// The ambient-path divergence the package comment points here for is the
+// REGISTRATION's alone, and it is deliberate and bounded: inotify registration
+// takes a path,
 // not a directory handle, so there is no root-confined equivalent of
-// watcher.Add, and nothing in this package reads file CONTENT — filepath.WalkDir
-// stats with Lstat and does not intentionally descend a symlinked directory,
+// watcher.Add, and nothing in this package reads file CONTENT — the enumeration
+// runs through atomicfile.WalkDirInRoot over an *os.Root, which never
+// constructs an ambient name and never descends a symlinked directory,
 // while handleFsEvent's os.Lstat also skips a symlink visible at inspection.
 // The ambient path can still be swapped before watcher.Add; fsnotify does not
 // request IN_DONT_FOLLOW, so that race can attach to the replacement target.
 // This remains bounded with respect to file content and conversion: this
 // package reads no content, and conversion triggered by an event runs only
 // through internal/process's root-confined scan. Watch maintenance itself stays
-// ambient: a Create event can Lstat and WalkDir beneath event.Name, so a raced
+// ambient: a Create event can Lstat and walk beneath event.Name, so a raced
 // ancestor can extend registrations into the replacement target and consume
 // watch descriptors, but it still cannot make the app read or convert content
 // outside the root. Every path this package registers is derived from
-// filepath.WalkDir over the root (attachWatch is the only watcher.Add site) or
+// the confined walk over the root (attachWatch is the only watcher.Add site) or
 // from an event fsnotify named under a path already registered, so a registration
 // cannot carry an out-of-root name and cannot compound; a registration that
 // escaped through a swapped ancestor still carries an in-root name, so this
 // residual (watch descriptors, never content) stands as described above.
 //
 // The entry ceiling is ONE bound: every walk is capped at maxEntries entries, which
-// bounds one traversal's cost over a tree this app does not own. It is not a bound on
+// bounds one traversal's cost over a tree this app does not own — and, because the
+// enumeration streams fixed-size ReadDir batches (atomicfile.WalkDirInRoot), that
+// ceiling bounds the walk's MEMORY and not only the number of entries it visits.
+// It is not a bound on
 // the LIVE registration set, and this package deliberately does not impose one — the
 // kernel owns fs.inotify.max_user_watches, it is the only party that knows the real
 // state of that resource, and it already refuses the registration when the per-UID
@@ -571,16 +581,63 @@ func (w *Watcher) addWatchDirs(ctx context.Context, watcher *fsnotify.Watcher, r
 // extends it to the budget admission, so a fix to the admission order cannot
 // repair one walk and leave the other reading the tree by a different rule.
 func (w *Watcher) walkWatchDirs(ctx context.Context, root string, register func(path string) error) error {
-	budget := w.newWatchSetBudget(root)
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		exceeded, err := budget.exceedsEntryBudget(ctx, walkErr)
+	// A cancelled walk does no filesystem work, which is what the two syscalls
+	// below would otherwise cost on the shutdown path.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	// Cleaned once, so the ambient names the callback rebuilds and every
+	// `path == root` comparison below it (classifyWatchEntry, handleWatchAddError,
+	// validateWatchRootEntry) are made against one spelling. The mirror already
+	// cleans every path it records (recordWatch, watchSetHas).
+	root = filepath.Clean(root)
+	// The root's OWN entry is Lstat'ed HERE, and this is the one thing the confined
+	// walk cannot express: os.OpenRoot resolves its root, so a symlinked or
+	// non-directory /input would arrive at the callback as a resolved directory and
+	// the two fatal refusals validateWatchRootEntry words would never fire -- the
+	// exec-away case that leaves Run logging "fsnotify active" over an empty watch
+	// set while the scan keeps the health marker green. filepath.WalkDir got this
+	// for free by Lstat-ing its starting point.
+	fi, statErr := os.Lstat(root)
+	if statErr != nil {
+		return statErr // a root that cannot be inspected is fatal, as it is today
+	}
+	if !fi.IsDir() {
+		return w.validateWatchRootEntry(root, fs.FileInfoToDirEntry(fi))
+	}
+	handle, openErr := os.OpenRoot(root)
+	if openErr != nil {
+		return openErr
+	}
+	defer func() { _ = handle.Close() }()
+	// One Counter per walk, so the operator's ceiling bounds one traversal
+	// (scanbudget.Default when nothing was configured): an unbounded walk is not an
+	// option, because the tree it enumerates is one this app does not own.
+	budget := scanbudget.NewCounter(w.maxEntries)
+	// atomicfile owns the traversal mechanics, exactly as internal/process's two
+	// walks over the same trees do: fixed 256-entry ReadDir batches, so
+	// MAX_SCAN_ENTRIES bounds this walk's MEMORY and not only its entry count; one
+	// directory handle open at a time; and O_DIRECTORY|O_NONBLOCK, so a directory
+	// replaced by a FIFO between the readdir that classified it and the descent is
+	// refused with ENOTDIR instead of blocking this goroutine in open(2) forever.
+	// The per-entry policy stays here, which is the same split process.visit keeps.
+	return atomicfile.WalkDirInRoot(ctx, handle, func(rel string, d fs.DirEntry, walkErr error) error {
+		// fsnotify registers a PATHNAME, not a directory handle (see addWatchDirs),
+		// so the ambient name is rebuilt for the registration and the diagnostics;
+		// the enumeration itself no longer constructs one.
+		path := filepath.Join(root, rel)
+		exceeded, err := exceedsEntryBudget(ctx, &budget, walkErr)
 		if err != nil {
 			return err
 		}
 		if exceeded {
-			w.warnWatchBudget(budget)
+			w.warnWatchBudget(root, &budget)
 			return fs.SkipAll
 		}
+		// d is nil on this walk's error arm (atomicfile reports a directory it could
+		// not open or finish for that directory's OWN path with d nil).
+		// classifyWatchEntry returns from its walkErr arm before it reads d, which is
+		// what keeps that safe.
 		ok, err := w.classifyWatchEntry(ctx, root, path, d, walkErr)
 		if err != nil || !ok {
 			return err
@@ -589,58 +646,36 @@ func (w *Watcher) walkWatchDirs(ctx context.Context, root string, register func(
 	})
 }
 
-// newWatchSetBudget resolves one walk's entry ceiling, falling back to
-// scanbudget.Default when no ceiling was configured: an unbounded walk is not an
-// option, because the tree it enumerates is one this app does not own.
-func (w *Watcher) newWatchSetBudget(root string) *watchSetBudget {
-	return &watchSetBudget{budget: scanbudget.NewCounter(w.maxEntries), root: root}
-}
-
-// watchSetBudget is one walk's entry ceiling: how many paths this traversal may visit,
-// and the root it is walking (which the ceiling's WARN names). Reaching the ceiling
-// stops the walk, so that WARN is once-per-walk by construction and needs no state here
-// to make it so. It carries no bound on the live registration set: the kernel owns the
-// inotify quota (see addWatchDirs).
-type watchSetBudget struct {
-	root string
-	// budget is the shared scanbudget.Counter, so this walk enforces MAX_SCAN_ENTRIES by
-	// the same rule internal/process's two walks do, including the Counter's charge-after-
-	// the-error-arm rule: exceedsEntryBudget is the one admission gate both watch-set
-	// walks call, so a directory WalkDir reports twice (once as an entry, once to deliver
-	// its read error) is charged once and the operator's ceiling means the same number in
-	// every walk this app runs.
-	budget scanbudget.Counter
-}
-
-// exceedsEntryBudget admits one WalkDir callback: it honours cancellation first, then
+// exceedsEntryBudget admits one walk callback: it honours cancellation first, then
 // charges the shared Counter for a NORMAL callback only, and reports whether the walk
 // has run out of budget.
 //
 // Charging after the error arm is scanbudget.Counter's documented rule, and this is
-// where the watch-set walks obey it. filepath.WalkDir delivers a directory it could not
-// read through a SECOND callback for that directory's own path — the one the parent
+// where the watch-set walks obey it. atomicfile.WalkDirInRoot delivers a directory it
+// could not read through a SECOND callback for that directory's own path — the one the
+// parent
 // already charged — so charging above the error arm counts one pathname twice and stops
 // both walks below the operator's configured MAX_SCAN_ENTRIES. Cancellation stays first
 // so a shutdown arriving exactly at the ceiling propagates ctx.Err() rather than
 // emitting the budget WARN and reporting the tree as truncated.
-func (b *watchSetBudget) exceedsEntryBudget(ctx context.Context, walkErr error) (bool, error) {
+func exceedsEntryBudget(ctx context.Context, budget *scanbudget.Counter, walkErr error) (bool, error) {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return false, ctxErr
 	}
 	if walkErr != nil {
-		return false, nil // WalkDir is repeating the directory to report its read error.
+		return false, nil // The walk is repeating the directory to report its read error.
 	}
-	return !b.budget.Charge(), nil
+	return !budget.Charge(), nil
 }
 
 // warnWatchBudget emits the entry-ceiling WARN. walkWatchDirs returns fs.SkipAll
 // in the same frame for both the registering walk and the rebuild's preflight,
 // stopping that traversal, so one budget produces exactly one record: the
 // remainder is unbounded and the operator action is the same for all of it.
-func (w *Watcher) warnWatchBudget(budget *watchSetBudget) {
+func (w *Watcher) warnWatchBudget(root string, budget *scanbudget.Counter) {
 	slog.Warn(watchBudgetMsg, w.coverageAttrs(
-		"root", logtext.Path(budget.root), "max_entries", budget.budget.Max(),
-		"remediation", watchBudgetRemediation)...)
+		"root", logtext.Path(root), "max_entries", budget.Max(),
+		"remediation", scanbudget.InputRemediation)...)
 }
 
 // classifyWatchEntry applies the per-entry policy BOTH watch-set walks share — the
@@ -660,12 +695,26 @@ func (w *Watcher) classifyWatchEntry(
 		if path == root {
 			return false, walkErr
 		}
+		// A path that disappeared mid-walk is known to be GONE, not unwatchable:
+		// the walk lists a directory from its parent's ReadDir and only
+		// discovers the deletion when it tries to read it, so an ordinary removal
+		// under a churning /input arrives here as ENOENT. Nothing is left under it
+		// to renew, so the WARN's consequence clause is false, and neither of its
+		// operator actions applies. Same rule handlePathEvent's Lstat arm already
+		// applies to a vanished event path, and pruneWatches to a registration the
+		// kernel confirmed is gone. The Remove/Rename event fsnotify delivers for
+		// the same deletion is what schedules the rescan.
+		if errors.Is(walkErr, fs.ErrNotExist) {
+			slog.Debug("path disappeared during the watch-set walk",
+				"path", logtext.Path(path), "error", logtext.Path(walkErr.Error()))
+			return false, nil
+		}
 		slog.Warn("skipping unwatchable path; renewals under it require a full rescan",
-			w.coverageAttrs("path", logtext.Path(path), "error", walkErr)...)
+			w.coverageAttrs("path", logtext.Path(path), "error", logtext.Path(walkErr.Error()))...)
 		return false, nil
 	}
 	if !d.IsDir() {
-		return false, validateWatchRootEntry(root, path, d)
+		return false, w.validateWatchRootEntry(path, d)
 	}
 	return true, nil
 }
@@ -683,23 +732,34 @@ func (w *Watcher) attachWatch(watcher *fsnotify.Watcher, root, path string) erro
 	return nil
 }
 
-// validateWatchRootEntry applies the non-directory policy: a regular file below
-// the root is simply not registered (it is watched through its parent), but a
-// non-directory ROOT is fatal, not a skip.
+// validateWatchRootEntry applies the non-directory policy for the WATCHER's own
+// root: a regular file anywhere else is simply not registered (it is watched
+// through its parent), but a non-directory /input is fatal, not a skip.
 //
-// filepath.WalkDir Lstats its root and does not follow it, so a bind-mounted file
+// Keyed on w.root rather than on the walk's root, because both messages below
+// describe the MOUNT and prescribe a mount-level remediation. handlePathEvent
+// walks an event's own path as a walk root (addWatchDirs' root parameter), so a
+// directory that stopped being one between that handler's Lstat and the walk's
+// would otherwise be reported as "watch root ... is a symlink" with an
+// unachievable "bind-mount the target directory at /input/example.com" - a wrong
+// operator signal about an untrusted name, interpolated raw into an error that is
+// then emitted as a log attribute. Such an entry has nothing left to register, so
+// it is skipped exactly like the regular file it now is; the rescan the event
+// already scheduled still covers its content.
+//
+// The walk Lstats its root and does not follow it, so a bind-mounted file
 // or a symlinked /input walks exactly one non-directory entry, registers no
 // watches, and would otherwise return nil - leaving Run to log "fsnotify active"
 // with an empty watch set and park in a loop no event can reach, while the scan
 // (os.OpenRoot DOES follow a symlinked root) keeps the health marker green.
 // Reporting it lets Run degrade to polling, or return a *LostError when the
 // fallback is disabled too.
-func validateWatchRootEntry(root, path string, d fs.DirEntry) error {
-	if path != root {
+func (w *Watcher) validateWatchRootEntry(path string, d fs.DirEntry) error {
+	if path != w.root {
 		return nil
 	}
 	if d.Type()&fs.ModeSymlink != 0 {
-		return fmt.Errorf("watch root %q is a symlink; the watch-set walk Lstats the root and does not descend it, so no directory under the target would be watched - bind-mount the target directory at %s instead", path, path)
+		return fmt.Errorf("watch root %q is a symlink; the watch-set walk Lstats the root and does not descend it, so no directory under the target would be watched - bind-mount the target directory at %q instead", path, path)
 	}
 	return fmt.Errorf("watch root %q is not a directory", path)
 }
@@ -715,6 +775,17 @@ func validateWatchRootEntry(root, path string, d fs.DirEntry) error {
 func (w *Watcher) handleWatchAddError(root, path string, addErr error) error {
 	if path == root {
 		return addErr
+	}
+	// Same vanished-path rule as classifyWatchEntry's walk-error arm: a directory
+	// the preflight enumerated and that was deleted before reassertWatches got to
+	// it fails with ENOENT, which is neither of the two conditions
+	// watchAddRemediation names. Reporting it as an unwatchable directory sends the
+	// operator to chmod a path that no longer exists, or to raise
+	// fs.inotify.max_user_watches that was never exhausted.
+	if errors.Is(addErr, fs.ErrNotExist) {
+		slog.Debug("directory disappeared before its watch was registered",
+			"path", logtext.Path(path), "error", addErr)
+		return nil
 	}
 	slog.Warn("skipping unwatchable directory; renewals under it require a full rescan",
 		w.coverageAttrs("path", logtext.Path(path), "error", addErr,
@@ -835,10 +906,10 @@ func (w *Watcher) pruneWatches(watcher *fsnotify.Watcher, desired map[string]str
 		if err := removeWatch(watcher, path); err != nil {
 			if !errors.Is(err, fsnotify.ErrNonExistentWatch) {
 				slog.Warn("failed to unregister a stale fsnotify watch; it stays charged to the live watch set",
-					w.coverageAttrs("path", logtext.Path(path), "error", err)...)
+					w.coverageAttrs("path", logtext.Path(path), "error", logtext.Path(err.Error()))...)
 				continue
 			}
-			slog.Debug("stale fsnotify registration already gone", "path", logtext.Path(path), "error", err)
+			slog.Debug("stale fsnotify registration already gone", "path", logtext.Path(path), "error", logtext.Path(err.Error()))
 		}
 		w.forgetWatch(path)
 	}
@@ -935,7 +1006,7 @@ func (w *Watcher) handlePathEvent(
 		// record names (fallback_scan and scan_floor), which is a state an operator
 		// must be able to see.
 		slog.Warn(classifyWarning,
-			w.coverageAttrs("path", logtext.Path(event.Name), "error", err)...)
+			w.coverageAttrs("path", logtext.Path(event.Name), "error", logtext.Path(err.Error()))...)
 		return true
 	}
 	if !info.IsDir() {
@@ -946,7 +1017,8 @@ func (w *Watcher) handlePathEvent(
 	}
 	if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
 		slog.Warn(addWarning,
-			w.coverageAttrs("path", logtext.Path(event.Name), "error", addErr)...)
+			w.coverageAttrs("path", logtext.Path(event.Name), "error", logtext.Path(addErr.Error()),
+				"remediation", watchAddRemediation)...)
 	}
 	return true
 }

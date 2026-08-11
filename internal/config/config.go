@@ -35,11 +35,6 @@ const maxFallbackHours = 87600
 // numbers for their own walks and neither of them may import this package. What stays
 // here is what config DOES with them: parsing the operator's raw value, clamping it, and
 // naming a repaired one in a warning.
-//
-// There is deliberately NO disable value (no "0"/"false" spelling, unlike
-// FALLBACK_SCAN_HOURS): disabling the budget would reopen the single-scan memory/CPU
-// exhaustion path the ceiling exists to close, so a zero or negative value is treated as
-// unusable input and falls back to scanbudget.Default.
 
 // scanEntriesRepair reports whether parsing accepted, defaulted, or clamped the
 // configured MAX_SCAN_ENTRIES. Parsing stays silent because maxScanEntriesFromEnv is
@@ -447,12 +442,18 @@ func warnFallbackDisabled(interval time.Duration) {
 // section is written for) never sees. It stays out of EncoderName's `known` flag
 // deliberately: that flag reports the parse, this reports the outcome.
 func warnLegacyEncoderProtection(name convert.EncoderType) {
-	if name != convert.EncNameLegacyDES && name != convert.EncNameLegacyRC2 {
+	// Which profiles are weak, and by how much, is internal/convert's profile
+	// table to answer: it owns the (MAC, cert, key) algorithm triple, so a profile
+	// added there arrives here already classified instead of needing a second
+	// enumeration that would silently omit it. What stays here is the operator
+	// wording and the decision to warn on every start.
+	prot := convert.ProtectionOf(name)
+	if !prot.NominalOnly {
 		return
 	}
 	remediation := "use PFX_ENCODER=modern2023 unless the consuming device accepts nothing else; " +
 		"if it does not, keep /output and every copy of it as sensitive as the private keys themselves"
-	if name == convert.EncNameLegacyRC2 {
+	if prot.WeakCertCipher {
 		remediation = "use PFX_ENCODER=modern2023, or legacydes if the device needs SHA-1 but not RC2; " +
 			"if it accepts nothing else, keep /output and every copy of it as sensitive as the private keys themselves"
 	}
@@ -460,6 +461,6 @@ func warnLegacyEncoderProtection(name convert.EncoderType) {
 		"HMAC-SHA-1 MAC, so the password embedded in every generated PFX file can be searched "+
 		"offline at about one hash per guess and the private key follows from it",
 		"encoder", string(name),
-		"mac_iterations", 1, "modern_mac_iterations", 2048,
+		"mac_iterations", prot.MACIterations, "modern_mac_iterations", convert.ModernMACIterations,
 		"remediation", remediation)
 }

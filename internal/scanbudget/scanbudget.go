@@ -23,6 +23,25 @@ const Default = 10_000
 // restore an effectively unbounded walk.
 const Ceiling = 200_000
 
+// AlertedPhrase is the substring the README publishes as CertConverterInputTreeTooLarge's whole
+// matcher. It lives with the knob it is about because BOTH walks over /input carry it — the scan
+// walk (internal/process) and the watch-set walk (internal/watch) — and the exclusion it implies
+// is app-wide: no other condition's message may contain it, or that condition fires the /input rule
+// and hands the operator the /input remediation for the wrong mount. Held in either enforcing
+// package, the other had to spell it again and each could only assert the invariant over its own
+// messages.
+const AlertedPhrase = "holds more entries than one scan will enumerate"
+
+// InputTreeTooLarge is the leading clause every /input budget-stop message opens with; each walk
+// appends what IT stopped doing.
+const InputTreeTooLarge = "the /input tree " + AlertedPhrase
+
+// InputRemediation is the operator action for an /input budget stop, naming both ways out: a mount
+// pointed at the wrong tree, or a legitimately large certificate directory. ONE string because both
+// /input walks stop for the same reason and ask for the same thing. A walk over a DIFFERENT tree
+// words its own (internal/process's /output orphan walk), which is why this one names /input.
+const InputRemediation = "check that /input is mounted at the certificate directory and holds nothing else, or raise MAX_SCAN_ENTRIES if the tree is legitimately this large"
+
 // Effective resolves an injected budget: non-positive means Default, so a walk assembled
 // field by field without one is bounded rather than unbounded.
 func Effective(n int) int {

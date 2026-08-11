@@ -1,4 +1,21 @@
 // Package process provides the certificate scanning and conversion orchestration.
+//
+// An ERROR is a filesystem-derived string too: the filesystem returns *fs.PathError
+// and atomicfile interpolates the path it refused, so every "error" attribute whose
+// value can carry a name from either mounted tree is emitted as
+// logtext.Path(err.Error()), the same gate the sibling "path" attribute uses, and the
+// same one internal/watch applies to its own error attributes. What that buys is NOT
+// the prevention of a forged record: the handler this app installs (slogx.Setup's
+// TextHandler) quotes a value holding a control or bidi rune, so an unsanitized CR
+// already arrives as `\n` on one line. It buys handler-independence — slog's
+// JSONHandler emits a bidi override RAW, and one can reorder the path an operator
+// reads — and a legible single-line attribute for any sink that unquotes a logfmt
+// value. The error VALUE stays raw for errors.Is/errors.As and for every return path;
+// the gate is at the log call and nowhere upstream of it.
+//
+// The two convert.Currency errors store.go logs are deliberately NOT gated here:
+// their text is codec- and certificate-derived, which internal/convert bounds at its
+// own boundary, and a second gate over it would split one vocabulary in two.
 package process
 
 import (
@@ -7,7 +24,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"iter"
 	"log/slog"
+	"maps"
 	"os"
 
 	"github.com/cplieger/atomicfile/v2"
@@ -167,13 +186,7 @@ var errScanBudgetExceeded = errors.New("input tree exceeds the per-scan entry bu
 // scanBudgetMsg is the operator-facing half of that abort. It names the health
 // consequence for the same reason the unreadable aggregate does: "stopping this scan"
 // otherwise reads as a failure an operator would expect a restart to clear.
-const scanBudgetMsg = "the /input tree holds more entries than one scan will enumerate; stopping this scan without converting or removing anything further, health is unaffected"
-
-// scanBudgetRemediation is that WARN's operator action. It names BOTH ways out,
-// because the budget cannot tell them apart: a mount pointed at the wrong tree (the
-// tripwire this bound exists for) and a legitimately large certificate directory that
-// simply needs a higher ceiling.
-const scanBudgetRemediation = "check that /input is mounted at the certificate directory and holds nothing else, or raise MAX_SCAN_ENTRIES if the tree is legitimately this large"
+const scanBudgetMsg = scanbudget.InputTreeTooLarge + "; stopping this scan without converting or removing anything further, health is unaffected"
 
 // scanBudgetSummaryMsg is the end-of-scan summary line for a walk the entry budget
 // stopped. It is deliberately NOT "scan aborted before completion": that message is
@@ -435,7 +448,7 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		// points at /input permissions, for a directory that is merely being
 		// replaced. Health-neutral and reap-vetoing either way.
 		if errors.Is(err, fs.ErrNotExist) {
-			slog.Debug("skipping path that vanished during the scan", "path", logtext.Path(rel), "error", err)
+			slog.Debug("skipping path that vanished during the scan", "path", logtext.Path(rel), "error", logtext.Path(err.Error()))
 			sw.vanished++
 			return nil
 		}
@@ -447,7 +460,7 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		// aggregate into the log forever for a condition the operator already knows
 		// about. The aggregate Warn in logInputCoverageWarnings carries the signal and
 		// the remediation hint; LOG_LEVEL=debug names the individual paths.
-		slog.Debug("skipping unreadable path", "path", logtext.Path(rel), "error", err)
+		slog.Debug("skipping unreadable path", "path", logtext.Path(rel), "error", logtext.Path(err.Error()))
 		sw.unreadable++
 		return nil
 	}
@@ -463,7 +476,7 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 	if !sw.budget.Charge() {
 		slog.Warn(scanBudgetMsg,
 			"path", logtext.Path(rel), "entries", sw.budget.Count(), "limit", sw.budget.Max(),
-			"remediation", scanBudgetRemediation)
+			"remediation", scanbudget.InputRemediation)
 		// The stopping path is named in the error too, and that error is emitted as the
 		// scan summary's `error` attribute, so it goes through the same gate.
 		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.budget.Count(), logtext.Path(rel))
@@ -541,7 +554,7 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 		// will not appear in `seen`.
 		sw.unresolved++
 		slog.Warn("skipping symlink that could not be resolved through the input root; anything it points to, including certificates under a linked directory, is not scanned",
-			"path", logtext.Path(rel), "error", err,
+			"path", logtext.Path(rel), "error", logtext.Path(err.Error()),
 			"remediation", "mount that certificate path into /input directly instead of linking to it, or fix the permissions on the link target")
 	case err == nil && fi.IsDir():
 		// The target is inside the root, so the walk reaches those
@@ -587,7 +600,10 @@ func logScanOutcome(ctx context.Context, result *ScanResult, walkErr error) {
 	}
 	attrs := make([]any, 0, 2+2*len(summaryAttrs))
 	if walkErr != nil {
-		attrs = append(attrs, "error", walkErr)
+		// The walk error names a path in two shapes — an *fs.PathError from the
+		// filesystem, and the entry-budget stop's own wrap — so the summary's error
+		// attribute passes the same gate its count attributes' sibling `path` does.
+		attrs = append(attrs, "error", logtext.Path(walkErr.Error()))
 	}
 	for _, a := range summaryAttrs {
 		attrs = append(attrs, a.name, a.of(result))
@@ -758,7 +774,7 @@ func IsShutdown(err error) bool {
 // itself, so a failed entry leaves the previous bundle (or nothing) at the output
 // path and the next scan reaches the same verdict and retries the pair.
 func failEntry(logPath, msg string, err error, extra ...any) conversionStatus {
-	attrs := append([]any{"path", logtext.Path(logPath), "error", err}, extra...)
+	attrs := append([]any{"path", logtext.Path(logPath), "error", logtext.Path(err.Error())}, extra...)
 	if IsShutdown(err) {
 		slog.Debug(msg+" (shutdown)", attrs...)
 	} else {
@@ -1016,7 +1032,7 @@ func (o *observationLog) maxObservedPairs() int {
 // never get as far as note or record (a failed analysis, encode or write), and such a
 // pair never occupies a `seen` slot at all. Evicting a signature for it would spend an
 // unrelated pair's de-duplication — that pair re-emits its observation WARN on a later
-// scan — and, worse, evictOne drops its victim's wholeness with it, so a mark-only pair
+// scan — and, worse, an eviction drops its victim's wholeness with it, so a mark-only pair
 // could cost a reap veto for a slot it never used. Each half now makes room only when it
 // is about to be populated: reserveSeen is note and record's own reservation, made
 // immediately before they assign the signature.
@@ -1030,13 +1046,9 @@ func (o *observationLog) maxObservedPairs() int {
 // every wholeness entry dropped is COUNTED (evictedWholeness) and Scanner.Run turns the
 // count into a reap veto for that scan: the reap gate fails closed on the loss instead
 // of reading it as proof.
-//
-// The victim is arbitrary (map iteration order) rather than least-recently-used: every
-// entry is worth exactly one deduplicated WARN, so ordering machinery would buy nothing
-// at a bound this size.
 func (o *observationLog) reserveWhole(rel string) {
 	if _, known := o.whole[rel]; !known && len(o.whole) >= o.maxObservedPairs() {
-		o.evictWholeness()
+		o.evictFrom(maps.Keys(o.whole))
 	}
 }
 
@@ -1045,52 +1057,50 @@ func (o *observationLog) reserveWhole(rel string) {
 // eviction it may perform is charged to the pair that actually takes the slot.
 //
 // The path is already protected in activeWhole by the markWhole these callers run first,
-// and evictOne hunts victims only in a map that does not contain rel, so this
-// reservation can never take the path it is making room for.
+// and this reservation hunts victims only in a map that does not contain rel, so it can
+// never take the path it is making room for.
 func (o *observationLog) reserveSeen(rel string) {
 	if _, known := o.seen[rel]; !known && len(o.seen) >= o.maxObservedPairs() {
-		o.evictOne()
+		o.evictFrom(maps.Keys(o.seen))
 	}
 }
 
-// evictOne drops one remembered pair from BOTH halves, never a pair this scan already
-// read whole (canEvict); the reserved path is excluded by reserveSeen's own membership
-// gate, which only hunts victims in a map that does not contain it. So an eviction can
-// never leave the two halves out of step and can never spend evidence the active scan
-// established. It is the SIGNATURE half's eviction, so it takes its victim from `seen`,
-// and it normally finds one: reserveSeen calls it only when len(seen) >= maxObservedPairs()
-// (never 0, since the fallback is scanbudget.Default) and only for a path that is
-// absent from `seen`, while the paths protected for the active scan are a strict subset
-// of the entries charged to that same scan-entry ceiling. If every candidate IS
-// protected, the log holds one entry over the ceiling for the rest of the walk rather
-// than dropping evidence the scan is about to need. A
-// wholeness-only entry — what a pair that read whole and then failed analysis, encoding
-// or its write leaves behind — is evicted by evictWholeness, which markWhole's own
-// reservation calls.
-func (o *observationLog) evictOne() {
-	for victim := range o.seen {
-		if !o.canEvict(victim) {
-			continue
-		}
-		delete(o.seen, victim)
-		o.dropWholeness(victim)
-		return
-	}
-}
-
-// evictWholeness makes room in the WHOLENESS half specifically, dropping a victim that
-// actually holds wholeness and dropping that victim's signature with it so the two
-// halves stay in step. Like evictOne it skips any pair the active scan read whole
-// (canEvict); the reserved path is excluded by reserveWhole's membership gate.
+// evictFrom drops one remembered pair from BOTH halves, taking its victim from
+// candidates — the half that is full — and never a pair this scan already read whole
+// (canEvict). So an eviction can never leave the two halves out of step and can never
+// spend evidence the active scan established.
 //
-// evictOne cannot serve this call: its signature-first victim may hold no wholeness at
-// all (a pair forgetPair spent, which keeps its signature), and then the half that was
-// full is not reduced — so `whole` grows past the ceiling while an unrelated pair's
-// de-duplication is spent for nothing and re-emits its observation WARN on the next
-// scan. Every drop here is counted by dropWholeness, which is what makes the reap veto
-// fail closed on a loss that previously went unrecorded.
-func (o *observationLog) evictWholeness() {
-	for victim := range o.whole {
+// Which half supplies the candidates is the caller's, and it matters: reserveSeen hunts
+// in `seen` because that is the half it is about to populate, and reserveWhole hunts in
+// `whole` for the same reason. A victim taken from `seen` may hold no wholeness at all (a
+// pair forgetPair spent, which keeps its signature), so reserving in the wholeness half
+// off a signature-first victim would leave `whole` over the ceiling while spending an
+// unrelated pair's de-duplication for nothing — that pair re-emits its observation WARN
+// on the next scan. Passing the half in is what makes the two reservations one rule
+// instead of two bodies that have to agree.
+//
+// Neither reservation can pick the path it is making room for: each hunts only in a map
+// that does not already contain it (their own membership gate), and markWhole protects
+// the path in activeWhole first.
+//
+// It normally finds a victim — a reservation only calls it at
+// len(half) >= maxObservedPairs(), never 0 since the fallback is scanbudget.Default, and
+// the paths protected for the active scan are a strict subset of the entries charged to
+// that same scan-entry ceiling. If every candidate IS protected, the log holds one entry
+// over the ceiling for the rest of the walk rather than dropping evidence the scan is
+// about to need.
+//
+// Eviction spends the signature freely — the evicted pair re-emits its observation WARN
+// once, and no currency decision reads this log at all, since store.inspect derives
+// currency from the bundle on disk. What it must NOT spend silently is the WHOLENESS
+// evidence: every drop goes through dropWholeness, which counts it, and Scanner.Run turns
+// the count into that scan's reap veto.
+//
+// The victim is arbitrary (map iteration order) rather than least-recently-used: every
+// entry is worth exactly one deduplicated WARN, so ordering machinery would buy nothing
+// at a bound this size.
+func (o *observationLog) evictFrom(candidates iter.Seq[string]) {
+	for victim := range candidates {
 		if !o.canEvict(victim) {
 			continue
 		}
@@ -1101,7 +1111,7 @@ func (o *observationLog) evictWholeness() {
 }
 
 // dropWholeness removes one path's wholeness evidence and counts the loss when there
-// was any to lose. Counting here rather than at the two call sites above is what makes
+// was any to lose. Counting here rather than at evictFrom's call site is what makes
 // the accounting exact: the signature half is evicted alongside paths the wholeness half
 // never held, and counting those would veto a reap for evidence that never existed.
 func (o *observationLog) dropWholeness(rel string) {
@@ -1208,7 +1218,7 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 		// diagnostic, so it is statusUnreadable, the same outcome the two bounded
 		// reads below produce for the same class of condition. Health-neutral either
 		// way; the message is unchanged because an alert rule keys on it.
-		slog.Warn("skipping cert: cannot stat sibling key", "path", logtext.Path(rel), "error", statErr,
+		slog.Warn("skipping cert: cannot stat sibling key", "path", logtext.Path(rel), "error", logtext.Path(statErr.Error()),
 			"remediation", inputPermRemediation)
 		return pairInputs{}, statusUnreadable
 	}
@@ -1313,15 +1323,15 @@ func (sw *scanWalk) noteUnreadableInput(logRel, inputRel, what string, err error
 		// A cancelled read is the shutdown itself, not an unreadable path: the WARN
 		// below is the message the README recommends alerting on, so emitting it for
 		// a normal SIGTERM would page an operator for a mount that is fine.
-		slog.Debug("skipping cert: "+what+" read interrupted by shutdown", "path", logtext.Path(logRel), "error", err)
+		slog.Debug("skipping cert: "+what+" read interrupted by shutdown", "path", logtext.Path(logRel), "error", logtext.Path(err.Error()))
 		return statusUnreadable
 	}
 	if errors.Is(err, fs.ErrNotExist) && sw.src.pathVanished(inputRel) {
-		slog.Debug("skipping cert: "+what+" vanished during the scan", "path", logtext.Path(logRel), "error", err)
+		slog.Debug("skipping cert: "+what+" vanished during the scan", "path", logtext.Path(logRel), "error", logtext.Path(err.Error()))
 		return statusVanished
 	}
 	slog.Warn("skipping cert: cannot read "+what,
-		"path", logtext.Path(logRel), "error", err,
+		"path", logtext.Path(logRel), "error", logtext.Path(err.Error()),
 		"remediation", inputPermRemediation)
 	return statusUnreadable
 }
@@ -1366,14 +1376,18 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	observations := analysis.Observations()
 	state, err := sw.out.inspect(ctx, pfxRel, analysis, sw.enc, sw.password)
 	if err != nil {
-		// A cancellation, and nothing else: inspect resolves every "I cannot tell what
-		// is on disk" outcome (an unreadable, oversized, non-regular or undecodable
-		// bundle, a lax directory) into a content FACT itself, and its only two error
-		// returns are the prior-bundle read that raced a cancellation and
-		// contentFromCurrency's pre-verdict context check. failEntry logs it at Debug,
-		// and visit's post-conversion context check turns it into the walk-level
-		// cancellation the caller reports, so this entry's statusFailed never reaches the
-		// health marker.
+		// A cancellation, and nothing else: inspect resolves every question about the bytes
+		// on disk into a content FACT itself — contentUnverified for the ones it could not
+		// compare (a bundle it could not stat or pin, one above the readable bound, a read
+		// failure that settles nothing, a refused preflight) and contentVerifiedStale for
+		// the ones it could (nothing there, a non-regular occupant, a profile mismatch, a
+		// bundle that will not decode with the configured password). A lax MODE is on
+		// neither list: it is reported where it is observed and reaches no fact at all. So
+		// inspect's only two error returns are the prior-bundle read that raced a
+		// cancellation and contentFromCurrency's pre-verdict context check. failEntry logs
+		// it at Debug, and visit's post-conversion context check turns it into the
+		// walk-level cancellation the caller reports, so this entry's statusFailed never
+		// reaches the health marker.
 		return failEntry(rel, "failed to inspect existing pfx", err)
 	}
 	if state.upToDate() {
@@ -1501,7 +1515,7 @@ func reportWriteFailure(logRel, pfxRel string, err writeRefusal, outcome convers
 		// writeOutcome grants statusUnwritable solely via bundleNotProvenWrong,
 		// whose allowlist is exactly contentUnverified.
 		slog.Warn(unreplaceableBundleMsg,
-			"path", logtext.Path(logRel), "output_path", logtext.Path(pfxRel), "error", err,
+			"path", logtext.Path(logRel), "output_path", logtext.Path(pfxRel), "error", logtext.Path(err.Error()),
 			"content", "unverified", "remediation", err.cause().remediation())
 		return
 	}

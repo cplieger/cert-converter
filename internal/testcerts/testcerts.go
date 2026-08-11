@@ -3,7 +3,8 @@
 //
 // It remains app-local because callers need returned private keys, selectable key
 // types, non-CA leaves, and full chains; httpx/certtest intentionally exposes a
-// fixed P-256 CA without its private key. The sole Ed25519 case builds its key directly.
+// fixed P-256 CA without its private key. Ed25519 callers want a private key rather
+// than a cert/key pair, so they build the key directly and need nothing from here.
 package testcerts
 
 import (

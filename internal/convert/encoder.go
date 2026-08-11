@@ -94,6 +94,45 @@ func EncoderNames() []EncoderType {
 	return names
 }
 
+// ModernMACIterations is the KDF iteration count the modern profiles derive their
+// MAC with, and the baseline a legacy-profile warning is read against. Named here
+// rather than restated by a caller so the number a diagnostic prints and the floor
+// the decode preflight enforces cannot drift.
+const ModernMACIterations = minKDFIterations
+
+// Protection reports what one profile's bundles do to protect the embedded
+// password and the private key. It exists so a caller that must WARN about a weak
+// PFX_ENCODER choice does not re-enumerate which profiles are weak: this package
+// owns the profile table, so the table answers it and a row added there cannot
+// escape the warning.
+type Protection struct {
+	// MACIterations is the iteration count this profile's MAC derives with.
+	MACIterations int
+	// NominalOnly reports a profile whose MAC derives with a single iteration, so an
+	// offline password search over a leaked bundle costs about one hash per guess.
+	NominalOnly bool
+	// WeakCertCipher reports a profile that encrypts the certificate bag with 40-bit
+	// RC2, which is a second, independent weakness on top of the MAC.
+	WeakCertCipher bool
+}
+
+// ProtectionOf reports the protection facts for an encoder name, resolving an
+// unrecognized name exactly as Encode does (resolvedProfile), so a warning and the
+// bundle that is actually written can never describe different profiles.
+func ProtectionOf(name EncoderType) Protection {
+	p := resolvedProfile(name)
+	legacyMAC := p.macOID.Equal(oidSHA1)
+	iterations := ModernMACIterations
+	if legacyMAC {
+		iterations = minLegacyMACIterations
+	}
+	return Protection{
+		MACIterations:  iterations,
+		NominalOnly:    legacyMAC,
+		WeakCertCipher: p.certEncOID.Equal(oidPBEWithSHAAnd40BitRC2CBC),
+	}
+}
+
 // resolvedProfile resolves an EncoderType to the profile row it selects: the
 // matching row when this package knows the name, and the modern2023 row
 // otherwise. It is the ONE home of the matching-and-fallback rule, because the

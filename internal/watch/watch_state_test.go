@@ -257,13 +257,16 @@ func (c liveForNCtx) Err() error {
 // deleted and a shutdown landing mid-re-sync would still start a full /input
 // scan whose ScanResult drives the health marker on the way out.
 //
-// live: 3 is runDebouncedScan's own Err() sequence on this tree: the entry
-// guard, then the two observations one walk entry makes for the (empty) root —
-// the budget admission gate (exceedsEntryBudget, which honours cancellation
-// before charging) and classifyWatchEntry's own guard — then the guard under
-// test. So the re-sync runs to completion and only the scan is suppressed, which
-// is what the watch-list assertion distinguishes from an early entry-guard
-// return.
+// live: 6 is runDebouncedScan's own Err() sequence on this tree: the entry
+// guard, then the four observations the confined walk makes over the (empty)
+// root — walkWatchDirs' own pre-walk guard, atomicfile.WalkDirInRoot's
+// already-cancelled check, then the two the single root callback makes (the
+// budget admission gate, exceedsEntryBudget, which honours cancellation before
+// charging, and classifyWatchEntry's own guard) — then the one
+// WalkDirInRoot makes before reading the root's entries. Cancellation therefore
+// lands on reassertWatches' post-root check, so the root's watch is
+// re-established and only the scan is suppressed, which is what the watch-list
+// assertion distinguishes from an early entry-guard return.
 func TestRunDebouncedScan_skips_the_scan_when_shutdown_cut_the_resync_short(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)
@@ -275,7 +278,7 @@ func TestRunDebouncedScan_skips_the_scan_when_shutdown_cut_the_resync_short(t *t
 	st.scheduleScan()
 
 	calls := 0
-	ctx := liveForNCtx{Context: context.Background(), calls: &calls, live: 3}
+	ctx := liveForNCtx{Context: context.Background(), calls: &calls, live: 6}
 
 	st.runDebouncedScan(ctx, watcher)
 

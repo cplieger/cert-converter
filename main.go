@@ -62,10 +62,15 @@ func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *hea
 // runProbe is a seam: health.RunProbe exits the process, so tests replace it.
 var runProbe = health.RunProbe
 
-// requiredVolumes is the mount set run() refuses to start without, and the
-// second seam in the same style as runProbe: the production value is the two
-// fixed container paths, and tests point it at temp directories so the refusal
-// itself can be exercised without a /input and /output on the test host.
+// requiredVolumes is the ONE statement of this container's mount set: the paths
+// the startup guard proves openable, and the same paths the scanner, the watcher
+// and the startup line then use. It is a seam in the same style as runProbe — the
+// production value is the two fixed container paths, and tests point it at temp
+// directories so the refusal itself can be exercised without a /input and /output
+// on the test host — and it is read rather than the consts everywhere downstream,
+// so a substitution cannot redirect the guard while leaving the scan and the watch
+// pointed at the real /input and /output. The consts above are its only other
+// reader.
 var requiredVolumes = mounts.Paths{
 	Input:  certsRootDir,
 	Output: outputDir,
@@ -173,7 +178,7 @@ func run() int {
 			// Through the same log-boundary gate every other path attribute in this app
 			// uses, so the rule has no exception to remember: one helper for every
 			// filesystem-derived attribute, wherever the value came from.
-			"input", logtext.Path(certsRootDir), "output", logtext.Path(outputDir),
+			"input", logtext.Path(requiredVolumes.Input), "output", logtext.Path(requiredVolumes.Output),
 			// The whole mount contract is "readable/writable by the UID in user:",
 			// and every downstream permission WARN points at that UID without ever
 			// naming it. compose resolves it from ${PUID:-1000}, so the compose file
@@ -195,26 +200,20 @@ func run() int {
 		},
 	)...)
 
-	roots, ready := mounts.Open(requiredVolumes)
-	// The handles come back OPEN so the write probe below inspects the same object
-	// this guard proved openable instead of re-resolving /output. Deferred rather
-	// than closed after the probe so a later return cannot skip it; Open returns no
-	// handles on the refusal path, where Close is a no-op.
-	defer roots.Close()
-	if !ready {
+	// Verify owns the handles it opens: it proves both volumes openable, probes
+	// /output for write access through the handle it just proved, and releases both
+	// before returning. Nothing downstream needs one -- internal/process opens its
+	// own confined roots per scan -- so no handle crosses this boundary.
+	if !mounts.Verify(requiredVolumes) {
 		return 1
 	}
-	// The probe runs against the guard's own output handle, deliberately not the
-	// outputDir const: a test that substitutes requiredVolumes and lets the guard
-	// pass must not have the write probe fall through to the real /output.
-	mounts.WarnOutputNotWritable(roots.Output)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	scanner := process.New(&process.Options{
-		CertsRoot: certsRootDir,
-		OutRoot:   outputDir,
+		CertsRoot: requiredVolumes.Input,
+		OutRoot:   requiredVolumes.Output,
 		Password:  cfg.Password,
 		Encoder:   cfg.EncoderName,
 		Lifecycle: cfg.Lifecycle,
@@ -235,7 +234,7 @@ func run() int {
 	// must run AFTER the watch set is attached so an event landing during the scan
 	// is not missed — a sequencing constraint main cannot honour from outside, and
 	// a scan here would double every start's /input scans and marker writes.
-	w := watch.New(certsRootDir, runAndSetHealth,
+	w := watch.New(requiredVolumes.Input, runAndSetHealth,
 		watch.WithDebounce(watchDebounce),
 		watch.WithFallback(cfg.FallbackInterval),
 		// Same MAX_SCAN_ENTRIES budget the scanner gets: both walks cross the same

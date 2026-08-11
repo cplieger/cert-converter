@@ -322,9 +322,9 @@ func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
 		if IsShutdown(walkErr) {
 			// Shutdown, not an operator-actionable cleanup failure; the input
 			// walk's own context check reports the cancellation to the caller.
-			slog.Debug("stale temp cleanup cancelled during shutdown", "dir", logDir, "error", walkErr)
+			slog.Debug("stale temp cleanup cancelled during shutdown", "dir", logDir, "error", logtext.Path(walkErr.Error()))
 		} else {
-			slog.Warn("stale temp cleanup failed", "dir", logDir, "error", walkErr,
+			slog.Warn("stale temp cleanup failed", "dir", logDir, "error", logtext.Path(walkErr.Error()),
 				"remediation", outputPermRemediation)
 		}
 	}
@@ -514,7 +514,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		// the same fact as a stat failure, and it degrades the same way rather than
 		// failing the pair. The remediation names the pin's own two causes.
 		slog.Warn("cannot stat prior pfx; regenerating",
-			"path", logtext.Path(rel), "error", err,
+			"path", logtext.Path(rel), "error", logtext.Path(err.Error()),
 			"remediation", outputPinRemediation)
 		return contentUnverified, nil
 	}
@@ -538,7 +538,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		// the honest signal. Consistent with the oversized case below, which already
 		// regenerates.
 		slog.Warn("cannot stat prior pfx; regenerating",
-			"path", logtext.Path(rel), "error", err,
+			"path", logtext.Path(rel), "error", logtext.Path(err.Error()),
 			"remediation", outputPermRemediation)
 		return contentUnverified, nil
 	case !fi.Mode().IsRegular():
@@ -605,7 +605,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 			content = contentVerifiedStale
 		}
 		slog.Warn("cannot read prior pfx; regenerating",
-			"path", logtext.Path(rel), "error", err,
+			"path", logtext.Path(rel), "error", logtext.Path(err.Error()),
 			"remediation", outputPermRemediation)
 		return content, nil
 	}
@@ -1046,7 +1046,7 @@ var errOutputBudgetExceeded = errors.New("output tree exceeds the per-scan entry
 const outputBudgetMsg = reapDisabledPhrase + ": the /output tree holds more bundles than one output walk will enumerate, so no output can be proven orphaned; health is unaffected"
 
 // outputBudgetRemediation is that WARN's operator action, naming both ways out exactly
-// as scanBudgetRemediation does for /input.
+// as scanbudget.InputRemediation does for /input.
 const outputBudgetRemediation = "check that /output is mounted at the bundle directory and holds nothing else, or raise MAX_SCAN_ENTRIES if the tree is legitimately this large"
 
 // outputWalk is listOutputs' visitor state: the candidate list plus the two
@@ -1085,11 +1085,31 @@ func (w *outputWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err e
 		if rel == "." {
 			return err
 		}
+		// An ENOENT below the root is the /output half of the producer race the input
+		// walk already carves out (scanWalk.visit's fs.ErrNotExist arm). Only real
+		// directories are ever ReadDir-ed, so the only way a path this walk just
+		// enumerated answers ENOENT is that it was removed under the walk — an
+		// operator following this app's own "remove them from the output volume by
+		// hand" advice, or any other writer on a mount this app does not own. It is
+		// not a path this scan could not READ, so it must not raise the aggregate
+		// whose remediation sends the operator after /output ownership, and must not
+		// carry reapDisabledPhrase into the documented alert for an ordinary removal.
+		//
+		// Unlike the /input side it also does not veto the reap, and the asymmetry is
+		// the point: a missing /input path leaves a hole in `seen`, which can make a
+		// live bundle read as an orphan, while a missing /output path is simply absent
+		// from w.found — and a candidate that was never enumerated is never reaped, so
+		// the omission can only ever reap LESS.
+		if errors.Is(err, fs.ErrNotExist) {
+			slog.Debug("skipping output path that vanished during the orphan walk",
+				"path", logtext.Path(rel), "error", logtext.Path(err.Error()))
+			return nil
+		}
 		// Debug per path, one aggregate Warn from logOrphanWalkOutcome: the same
 		// two-level contract the input walk and the stale-temp sweep use. This recurs
 		// on every scan for a persistent misconfiguration, so naming each path at the
 		// default level is a permanent log stream for a condition already reported.
-		slog.Debug("skipping unreadable output path while looking for orphans", "path", logtext.Path(rel), "error", err)
+		slog.Debug("skipping unreadable output path while looking for orphans", "path", logtext.Path(rel), "error", logtext.Path(err.Error()))
 		w.unreadable++
 		return nil
 	}
@@ -1222,7 +1242,7 @@ func (s *store) removeOrphan(rel string) reapAttempt {
 			slog.Debug("orphaned output vanished before removal", "path", logRel)
 			return reapAttemptVanished
 		}
-		slog.Warn(pinRedirectedMsg, "path", logRel, "error", err,
+		slog.Warn(pinRedirectedMsg, "path", logRel, "error", logtext.Path(err.Error()),
 			"remediation", outputPinRemediation)
 		return reapAttemptRefused
 	}
@@ -1245,7 +1265,7 @@ func (s *store) removeOrphan(rel string) reapAttempt {
 		return reapAttemptVanished
 	case statErr != nil:
 		slog.Warn("could not re-check an orphaned output before removing it; leaving it in place",
-			"path", logRel, "error", statErr, "remediation", outputPermRemediation)
+			"path", logRel, "error", logtext.Path(statErr.Error()), "remediation", outputPermRemediation)
 		return reapAttemptRefused
 	case !fi.Mode().IsRegular():
 		slog.Warn("orphaned output path is not a regular file; leaving it in place",
@@ -1254,7 +1274,7 @@ func (s *store) removeOrphan(rel string) reapAttempt {
 		return reapAttemptRefused
 	}
 	if err := parent.Remove(base); err != nil {
-		slog.Warn("could not remove orphaned output", "path", logRel, "error", err,
+		slog.Warn("could not remove orphaned output", "path", logRel, "error", logtext.Path(err.Error()),
 			"remediation", outputPermRemediation)
 		return reapAttemptRefused
 	}

@@ -13,7 +13,7 @@ import (
 	"github.com/cplieger/slogx/capture"
 )
 
-// wantVolumeMissingMsg is the ERROR substring Open must log for a mount
+// wantVolumeMissingMsg is the ERROR substring Verify must log for a mount
 // that is absent or is not a directory. One copy, matched as a substring of the
 // full record (main.go appends "; refusing to start").
 const wantVolumeMissingMsg = "required volume is missing or not a directory"
@@ -36,59 +36,51 @@ func TestOpen(t *testing.T) {
 		name       string
 		wantRole   string
 		wantErrSub string
+		wantRemedy string
 		dirs       Paths
 		want       bool
 	}{
-		{"both mounted", "", "", Paths{Input: existingDir, Output: existingDir}, true},
-		{"missing input", "input", "no such file", Paths{Input: absent, Output: existingDir}, false},
-		{"missing output", "output", "no such file", Paths{Input: existingDir, Output: absent}, false},
-		{"input is a regular file", "input", "path exists but is not a directory", Paths{Input: regularFile, Output: existingDir}, false},
-		{"output is a regular file", "output", "path exists but is not a directory", Paths{Input: existingDir, Output: regularFile}, false},
+		{"both mounted", "", "", "", Paths{Input: existingDir, Output: existingDir}, true},
+		{"missing input", "input", "no such file", "mount ", Paths{Input: absent, Output: existingDir}, false},
+		{"missing output", "output", "no such file", "mount ", Paths{Input: existingDir, Output: absent}, false},
+		{"input is a regular file", "input", "path exists but is not a directory", "point that volume's source at a directory", Paths{Input: regularFile, Output: existingDir}, false},
+		{"output is a regular file", "output", "path exists but is not a directory", "point that volume's source at a directory", Paths{Input: existingDir, Output: regularFile}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
 
-			open, got := Open(tc.dirs)
-			t.Cleanup(open.Close)
+			got := Verify(tc.dirs)
 			if got != tc.want {
-				t.Errorf("Open(%+v) = %v, want %v", tc.dirs, got, tc.want)
+				t.Errorf("Verify(%+v) = %v, want %v", tc.dirs, got, tc.want)
 			}
 			if tc.want {
-				// The accepted /output volume comes back with its confined handle open: that
-				// handle is what the /output write probe runs against, so a guard that
-				// returned the verdict alone would send the probe back to re-resolving
-				// the path it just proved openable.
-				if open.Output == nil {
-					t.Errorf("Open(%+v) returned a nil output root", tc.dirs)
-				}
 				if logs.Len() != 0 {
-					t.Errorf("Open(%+v) logged %v, want silence when every volume is mounted", tc.dirs, logs.Messages())
+					t.Errorf("Verify(%+v) logged %v, want silence when every volume is mounted", tc.dirs, logs.Messages())
 				}
 				return
 			}
-			// A refusal must hand back nothing: run() returns 1 without looking at the
-			// handles, so any root opened before the offender has to be closed here or
-			// it is leaked for the life of the process.
-			if open.Output != nil {
-				t.Errorf("Open(%+v) returned handles on the refusal path, want none", tc.dirs)
-			}
 			const msg = wantVolumeMissingMsg
 			if n := logs.CountLevel(slog.LevelError, msg); n != 1 {
-				t.Fatalf("Open(%+v) logged %d ERROR records matching %q, want exactly 1 (logs %v)",
+				t.Fatalf("Verify(%+v) logged %d ERROR records matching %q, want exactly 1 (logs %v)",
 					tc.dirs, n, msg, logs.Messages())
 			}
 			if !logs.AttrContains(msg, "role", tc.wantRole) {
-				t.Errorf("Open(%+v) ERROR does not name role %q (logs %v)", tc.dirs, tc.wantRole, logs.Messages())
+				t.Errorf("Verify(%+v) ERROR does not name role %q (logs %v)", tc.dirs, tc.wantRole, logs.Messages())
 			}
-			if !logs.AttrContains(msg, "remediation", "mount ") {
-				t.Errorf("Open(%+v) ERROR is missing an actionable remediation attr (logs %v)", tc.dirs, logs.Messages())
+			// The two causes need different REMEDIES as well as different causes: an
+			// absent path is a missing mount, while a path that exists and is not a
+			// directory is a mount whose SOURCE is the wrong kind of object, so repeating
+			// the mount-it advice would send the operator to redo what they already did.
+			if !logs.AttrContains(msg, "remediation", tc.wantRemedy) {
+				t.Errorf("Verify(%+v) ERROR remediation does not name the action this cause calls for (%q) (logs %v)",
+					tc.dirs, tc.wantRemedy, logs.Messages())
 			}
 			// The two causes need different remedies — a missing mount versus a
 			// bind-mounted FILE — so the error attr must distinguish them. It
 			// carried error=<nil> for the non-directory case before the
 			// substitution in openMount, which is unactionable.
 			if !logs.AttrContains(msg, "error", tc.wantErrSub) {
-				t.Errorf("Open(%+v) ERROR attr does not name the cause %q (logs %v)", tc.dirs, tc.wantErrSub, logs.Messages())
+				t.Errorf("Verify(%+v) ERROR attr does not name the cause %q (logs %v)", tc.dirs, tc.wantErrSub, logs.Messages())
 			}
 		})
 	}
@@ -104,17 +96,17 @@ func TestOpen_names_every_missing_volume(t *testing.T) {
 
 	logs := capture.Default(t)
 
-	if _, ready := Open(Paths{Input: absentInput, Output: absentOutput}); ready {
-		t.Fatal("Open(both absent) = true, want false")
+	if ready := Verify(Paths{Input: absentInput, Output: absentOutput}); ready {
+		t.Fatal("Verify(both absent) = true, want false")
 	}
 	const msg = wantVolumeMissingMsg
 	if n := logs.CountLevel(slog.LevelError, msg); n != 2 {
-		t.Fatalf("Open(both absent) logged %d ERROR records matching %q, want 2 so one start attempt names the whole misconfiguration (logs %v)",
+		t.Fatalf("Verify(both absent) logged %d ERROR records matching %q, want 2 so one start attempt names the whole misconfiguration (logs %v)",
 			n, msg, logs.Messages())
 	}
 	for _, role := range []string{"input", "output"} {
 		if !logs.AttrContains(msg, "role", role) {
-			t.Errorf("Open(both absent) ERROR set does not name role %q (logs %v)", role, logs.Messages())
+			t.Errorf("Verify(both absent) ERROR set does not name role %q (logs %v)", role, logs.Messages())
 		}
 	}
 }
@@ -123,9 +115,7 @@ func TestOpen_names_every_missing_volume(t *testing.T) {
 // the startup guard, the one whose remediation differs from the other two: a
 // mount that EXISTS as a directory but cannot be opened by the running UID is a
 // permissions problem on the host directory, so the operator must be told to
-// grant that UID access, not to mount a path they already mounted. The refusal
-// also has to hand back no handles, because run() returns 1 without reading
-// them.
+// grant that UID access, not to mount a path they already mounted.
 // Serial (no t.Parallel): it swaps the openMountRoot package var and
 // slog.Default().
 func TestOpen_refuses_a_volume_it_cannot_open(t *testing.T) {
@@ -142,18 +132,14 @@ func TestOpen_refuses_a_volume_it_cannot_open(t *testing.T) {
 
 	logs := capture.Default(t)
 
-	open, ready := Open(Paths{Input: existing, Output: blocked})
-	t.Cleanup(open.Close)
+	ready := Verify(Paths{Input: existing, Output: blocked})
 
 	if ready {
-		t.Fatalf("Open(%q unopenable) = true, want false: starting anyway converts nothing and restart-loops on a condition a restart cannot clear", blocked)
-	}
-	if open.Output != nil {
-		t.Error("Open returned handles on the unopenable-volume path, want none: the input handle opened before the offender leaks for the life of the process otherwise")
+		t.Fatalf("Verify(%q unopenable) = true, want false: starting anyway converts nothing and restart-loops on a condition a restart cannot clear", blocked)
 	}
 	const msg = "required volume cannot be opened by this container's user; refusing to start"
 	if n := logs.CountLevel(slog.LevelError, msg); n != 1 {
-		t.Fatalf("Open(%q unopenable) logged %d ERROR records matching %q, want exactly 1 (logs %v)",
+		t.Fatalf("Verify(%q unopenable) logged %d ERROR records matching %q, want exactly 1 (logs %v)",
 			blocked, n, msg, logs.Messages())
 	}
 	if !logs.HasAttr(msg, "role", "output") {
@@ -165,15 +151,14 @@ func TestOpen_refuses_a_volume_it_cannot_open(t *testing.T) {
 	if !logs.AttrContains(msg, "remediation", "grant the UID") {
 		t.Errorf("the refusal gives no ownership remediation, so a permission problem reads as a missing mount (logs %v)", logs.Messages())
 	}
-	const mountMsg = "required volume is missing or not a directory"
-	if n := logs.Count(mountMsg); n != 0 {
+	if n := logs.Count(wantVolumeMissingMsg); n != 0 {
 		t.Errorf("an unopenable mount produced %d %q records, want 0: that wording tells the operator to mount a path they already mounted (logs %v)",
-			n, mountMsg, logs.Messages())
+			n, wantVolumeMissingMsg, logs.Messages())
 	}
 }
 
 // TestWarnOutputNotWritable_reports_failed_probe pins the startup probe's only
-// output: Open proves /output is a directory this UID can OPEN, so this
+// output: the volume guard proves /output is a directory this UID can OPEN, so this
 // WARN is the sole immediate signal that it cannot be WRITTEN. A scan whose
 // bundles are all current writes nothing and still reports healthy, so without
 // this record the misconfiguration surfaces only at the next renewal.
@@ -201,26 +186,26 @@ func TestWarnOutputNotWritable_reports_failed_probe(t *testing.T) {
 	}
 	logs := capture.Default(t)
 
-	WarnOutputNotWritable(root)
+	warnOutputNotWritable(root)
 
 	const msg = wantOutputNotWritableMsg
 	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
-		t.Fatalf("WarnOutputNotWritable(%q) logged %d WARN records matching %q, want 1 (logs %v)",
+		t.Fatalf("warnOutputNotWritable(%q) logged %d WARN records matching %q, want 1 (logs %v)",
 			blocked, n, msg, logs.Messages())
 	}
 	if !logs.HasAttr(msg, "path", blocked) {
-		t.Errorf("WarnOutputNotWritable(%q) did not identify the unusable output path (logs %v)",
+		t.Errorf("warnOutputNotWritable(%q) did not identify the unusable output path (logs %v)",
 			blocked, logs.Messages())
 	}
 	if !logs.AttrContains(msg, "remediation", "chown the host directory") {
-		t.Errorf("WarnOutputNotWritable(%q) gave no ownership remediation (logs %v)",
+		t.Errorf("warnOutputNotWritable(%q) gave no ownership remediation (logs %v)",
 			blocked, logs.Messages())
 	}
 	// The stage is what tells an operator WHICH refusal they are looking at, now
 	// that the probe walks the whole create/write/flush/close/unlink ladder instead
 	// of the create alone.
 	if !logs.HasAttr(msg, "stage", atomicfile.ProbeStageCreate.String()) {
-		t.Errorf("WarnOutputNotWritable(%q) does not name the failing probe stage (logs %v)",
+		t.Errorf("warnOutputNotWritable(%q) does not name the failing probe stage (logs %v)",
 			blocked, logs.Messages())
 	}
 }
@@ -251,8 +236,8 @@ func stubOutputProbe(t *testing.T, res atomicfile.ProbeResult, err error) {
 // whole outcome ladder onto the operator's warnings, and the two properties that
 // make the probe warn-and-continue:
 //
-//   - No probe outcome fails startup. WarnOutputNotWritable returns nothing (a
-//     compile-time property of its call site in run()), and no leg emits an ERROR
+//   - No probe outcome fails startup. warnOutputNotWritable returns nothing (a
+//     compile-time property of its call site in Verify), and no leg emits an ERROR
 //     record, the level this app reserves for the conditions it refuses to start on.
 //   - The refusal and the two teardown failures stay THREE distinguishable
 //     records. Folding the close and remove outcomes into the create warning hides
@@ -388,32 +373,32 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 			stubOutputProbe(t, tc.res, tc.probeErr)
 			logs := capture.Default(t)
 
-			WarnOutputNotWritable(root)
+			warnOutputNotWritable(root)
 
 			if got := logs.Len(); got != tc.wantRecords {
-				t.Fatalf("WarnOutputNotWritable logged %d records, want %d (logs %v)",
+				t.Fatalf("warnOutputNotWritable logged %d records, want %d (logs %v)",
 					got, tc.wantRecords, logs.Messages())
 			}
 			if got := logs.CountLevel(slog.LevelWarn, ""); got != tc.wantWarns {
-				t.Errorf("WarnOutputNotWritable logged %d WARN records, want %d (logs %v)",
+				t.Errorf("warnOutputNotWritable logged %d WARN records, want %d (logs %v)",
 					got, tc.wantWarns, logs.Messages())
 			}
 			if got := logs.CountLevel(slog.LevelError, ""); got != 0 {
-				t.Errorf("WarnOutputNotWritable logged %d ERROR records, want 0: a probe outcome must never read as a refusal to start (logs %v)",
+				t.Errorf("warnOutputNotWritable logged %d ERROR records, want 0: a probe outcome must never read as a refusal to start (logs %v)",
 					got, logs.Messages())
 			}
 			if tc.wantMsg != "" && logs.CountLevel(slog.LevelWarn, tc.wantMsg) != 1 {
-				t.Fatalf("WarnOutputNotWritable did not emit the %q WARN (logs %v)", tc.wantMsg, logs.Messages())
+				t.Fatalf("warnOutputNotWritable did not emit the %q WARN (logs %v)", tc.wantMsg, logs.Messages())
 			}
 			for key, want := range tc.wantAttrs {
 				if !logs.HasAttr(tc.wantMsg, key, want) {
-					t.Errorf("WarnOutputNotWritable %q record: attr %q = %q, want %q (logs %v)",
+					t.Errorf("warnOutputNotWritable %q record: attr %q = %q, want %q (logs %v)",
 						tc.wantMsg, key, attrOrMissing(logs, tc.wantMsg, key), want, logs.Messages())
 				}
 			}
 			if tc.wantAbsent != "" {
 				if got, ok := logs.AttrValue(tc.wantMsg, tc.wantAbsent); ok {
-					t.Errorf("WarnOutputNotWritable %q record carries attr %q = %q, want it absent",
+					t.Errorf("warnOutputNotWritable %q record carries attr %q = %q, want it absent",
 						tc.wantMsg, tc.wantAbsent, got)
 				}
 			}

@@ -2,7 +2,8 @@
 // exists as a directory the running UID can open -- and probes the output volume
 // for write access, before any scan runs. It is startup-only: the /input handle is
 // released as soon as it has proved the mount openable, the /output handle is
-// released by Roots.Close, and internal/process opens its own roots per scan.
+// released inside Verify once the write probe has run, and internal/process opens
+// its own roots per scan.
 package mounts
 
 import (
@@ -32,54 +33,50 @@ const (
 	roleOutput = "output"
 )
 
-// Roots holds the confined handle Open KEPT open past the guard: /output, because the
-// write probe runs against it, so the probe inspects the same object the guard inspected
-// instead of re-resolving the path and testing whatever it resolves to the second time.
-// /input has no such check -- internal/process opens its own root per scan -- so its
-// handle is released inside Open rather than held here with no reader. The caller owns
-// this one and releases it with Close.
-type Roots struct {
-	Output *os.Root
-}
-
-// Open verifies every required mount already exists as a directory and can be
-// opened by the running UID. It reports every offender in one startup attempt and
-// never creates a missing mount in the container's ephemeral layer. Output write
-// access is checked separately by WarnOutputNotWritable, which runs against the
-// handle returned here.
+// Verify checks that every required mount already exists as a directory the
+// running UID can open, and probes /output for write access through the handle it
+// just proved openable. It reports every offender in one startup attempt and never
+// creates a missing mount in the container's ephemeral layer.
 //
-// On success it returns the /output root open; the /input handle is released here,
-// because nothing further checks that mount at startup. On refusal it closes
-// everything it opened and returns no handles, so a caller that ignores the
-// returned value on the failure path cannot leak one.
-func Open(dirs Paths) (Roots, bool) {
-	var open Roots
+// No handle leaves this call. Each one has done its whole job once it has proved
+// its mount openable -- and, for /output, once the write probe has run against it
+// -- so a caller cannot leak one on any path, and nothing downstream has to hold a
+// lifetime it has no use for: internal/process opens its own confined root per
+// scan.
+func Verify(dirs Paths) bool {
 	ready := true
 	// Both volumes are inspected before any refusal, so one startup attempt
 	// names every offender.
-	// The input handle has done its whole job once it proves the mount openable, so it
-	// is released here: nothing further checks /input at startup, and a per-scan read
-	// goes through internal/process's own confined root.
+	// Each handle has done its whole job once it proves the mount openable, and the
+	// /output one once the write probe has run against it, so neither leaves this
+	// function: nothing else checks a mount at startup, and a per-scan read goes
+	// through internal/process's own confined root.
 	if root, ok := openMount(roleInput, dirs.Input); ok {
 		closeRoot(root, roleInput)
 	} else {
 		ready = false
 	}
-	if root, ok := openMount(roleOutput, dirs.Output); ok {
-		open.Output = root
+	output, ok := openMount(roleOutput, dirs.Output)
+	if ok {
+		// Deferred, so the refusal path below cannot leak a handle opened before the
+		// offender was found.
+		defer closeRoot(output, roleOutput)
 	} else {
 		ready = false
 	}
 	if !ready {
-		open.Close()
-		return Roots{}, false
+		return false
 	}
-	return open, true
+	// Against the guard's OWN handle, so the probe inspects the object the guard
+	// inspected instead of re-resolving the path; keeping the handle inside this
+	// function is what makes that the only possible arrangement.
+	warnOutputNotWritable(output)
+	return true
 }
 
 // openMount inspects one required volume and returns its confined handle. On
 // refusal it has already logged that offender at ERROR with the remediation its
-// cause calls for, so Open can carry on and name the rest of them.
+// cause calls for, so Verify can carry on and name the rest of them.
 //
 // The Stat-then-IsDir gate is load-bearing and must stay AHEAD of the open, not
 // be folded into the open's error: os.OpenRoot opens the path before it checks
@@ -102,32 +99,40 @@ func openMount(role, path string) (*os.Root, bool) {
 		if openErr == nil {
 			return root, true
 		}
+		// The access the remediation names is the access the VOLUME needs, not the
+		// access this open happened to need: an operator acts on it once, and granting
+		// /output read-only clears this refusal only to fail the write probe and every
+		// bundle on the next start. The README's Volumes table states the same split.
+		access := "read access"
+		if role == roleOutput {
+			access = "read and write access"
+		}
 		slog.Error("required volume cannot be opened by this container's user; refusing to start",
 			"role", role, "path", logPath, "error", openErr,
-			"remediation", "grant the UID in the container's `user:` read access to "+logPath+
+			"remediation", "grant the UID in the container's `user:` "+access+" to "+logPath+
 				" (chgrp/chmod the host directory), or run the container as a UID that already has it")
 		return nil, false
 	}
+	// The two causes take two remedies, chosen here beside the cause rather than
+	// left to the operator to infer from the error text.
+	remediation := "mount " + logPath + " into the container before starting it"
 	if statErr == nil {
-		// os.Stat succeeded, so the path exists as a file, FIFO or device. The
-		// synthesised cause is what separates the two remedies: an absent path is a
-		// missing mount, a non-directory is a bind-mounted FILE.
+		// os.Stat succeeded, so the path exists as a file, FIFO or device: the volume
+		// IS mounted and its SOURCE is the wrong kind of object, so repeating the
+		// missing-mount advice tells the operator to do what they already did.
 		statErr = errors.New("path exists but is not a directory")
+		remediation = "something is already mounted at " + logPath +
+			" and it is not a directory (a bind-mounted file, FIFO or device): point that " +
+			"volume's source at a directory on the host"
 	}
 	slog.Error("required volume is missing or not a directory; refusing to start",
 		"role", role, "path", logPath, "error", statErr,
-		"remediation", "mount "+logPath+" into the container before starting it")
+		"remediation", remediation)
 	return nil, false
 }
 
-// Close releases the confined handle Open returned. It tolerates a zero Roots,
-// so the refusal path can defer it unconditionally.
-func (r Roots) Close() {
-	closeRoot(r.Output, roleOutput)
-}
-
-// closeRoot releases one confined handle. A nil handle is a no-op, so both the refusal
-// path and a zero Roots can call it unconditionally. A close failure on a handle the
+// closeRoot releases one confined handle. A nil handle is a no-op, so a refusal path
+// can defer it unconditionally. A close failure on a handle the
 // process is finished with gives an operator nothing to act on, so it goes to Debug
 // rather than a WARN they would have to triage.
 func closeRoot(root *os.Root, role string) {
@@ -140,7 +145,7 @@ func closeRoot(root *os.Root, role string) {
 	}
 }
 
-// probeOutputWritable is the writability probe WarnOutputNotWritable runs, and a
+// probeOutputWritable is the writability probe warnOutputNotWritable runs, and a
 // package-var seam in the same style as main's runProbe and requiredVolumes. It
 // exists because atomicfile reports a stage failure in its ProbeResult rather than
 // as an error, and most of those stages cannot be staged on a temp directory: a
@@ -162,7 +167,7 @@ const staleTempRemediation = "the unlink that would have removed it was just ref
 	"stale-temp sweep (the same unlink through the same handle) can only reclaim it once that refusal is gone: " +
 	"check that the UID in user: owns the output volume's host directory and that the mount is not read-only"
 
-// WarnOutputNotWritable probes output write access under the running UID, through
+// warnOutputNotWritable probes output write access under the running UID, through
 // the same confined handle the volume guard already proved openable. It warns
 // rather than refusing startup because host ownership can be repaired while the
 // process runs; later scans retain their normal health semantics. No probe outcome
@@ -174,7 +179,7 @@ const staleTempRemediation = "the unlink that would have removed it was just ref
 // refused the write outright is a permissions problem on the mount, while one that
 // accepted and flushed the bytes and then failed teardown will write bundles
 // fine and has only left a file behind.
-func WarnOutputNotWritable(root *os.Root) {
+func warnOutputNotWritable(root *os.Root) {
 	// context.Background rather than a cancellable context: the probe checks ctx
 	// once before it creates anything, and its stages are single filesystem calls
 	// the OS does not make interruptible, so a context could not shorten a wedged
@@ -193,7 +198,7 @@ func WarnOutputNotWritable(root *os.Root) {
 		// startup line already states the path and the UID. A record here would print
 		// on every container start and dilute the three warnings below.
 	case !res.Writable():
-		warnOutputRefusedWrite(root, res)
+		warnOutputRefusedWrite(res)
 	default:
 		warnOutputProbeTeardown(res)
 	}
@@ -217,10 +222,13 @@ const outputNotWritableMsg = "the output volume is not writable by the running U
 // The two legs spell their attrs out instead of sharing a built slice: every other
 // diagnostic in this file is an inline slog call, and goconst counts a key repeated
 // inside a composite literal while ignoring one passed as a call argument.
-func warnOutputRefusedWrite(root *os.Root, res atomicfile.ProbeResult) {
-	// One sanitized rendering of the volume's own name, reused by both remediations
-	// below: the remediation is log text like any attribute (logtext.Path).
-	logRoot := logtext.Path(root.Name())
+func warnOutputRefusedWrite(res atomicfile.ProbeResult) {
+	// One sanitized rendering of the probed volume, reused by the remediation and by both
+	// records' path attribute: the remediation is log text like any attribute (logtext.Path).
+	// res.Dir is atomicfile's own note of the directory it probed (root.Name() joined with the
+	// probed name), so this record has ONE source for the volume path rather than two that
+	// could print different spellings of it.
+	logRoot := logtext.Path(res.Dir)
 	// Same root cause as internal/process's outputPermRemediation (store.go), stated
 	// as the startup action: at this point nothing has been written yet, so the
 	// operator is pointed at the host directory rather than at a bundle.
@@ -240,13 +248,13 @@ func warnOutputRefusedWrite(root *os.Root, res atomicfile.ProbeResult) {
 		// Reachable when the write or the flush failed AND the follow-up unlink failed
 		// too: the volume is unusable and is still holding the probe file.
 		slog.Warn(outputNotWritableMsg,
-			"role", roleOutput, "path", logtext.Path(res.Dir), "stage", res.Stage.String(), "error", res.Err,
+			"role", roleOutput, "path", logRoot, "stage", res.Stage.String(), "error", res.Err,
 			"uid", os.Getuid(), "gid", os.Getgid(), "remediation", remediation,
 			"leaked_probe", logtext.Path(probePath(res)), "cleanup", staleTempRemediation)
 		return
 	}
 	slog.Warn(outputNotWritableMsg,
-		"role", roleOutput, "path", logtext.Path(res.Dir), "stage", res.Stage.String(), "error", res.Err,
+		"role", roleOutput, "path", logRoot, "stage", res.Stage.String(), "error", res.Err,
 		"uid", os.Getuid(), "gid", os.Getgid(), "remediation", remediation)
 }
 

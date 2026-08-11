@@ -249,9 +249,9 @@ func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *r
 
 	// The enumeration half of the reap-safety question was already answered by the
 	// !rc.enumeratedInput() return at the top of this function; what is left to ask
-	// is whether this scan's own output work was clean.
-	reapable := rc.result.conversionsClean() && walkSafe
-	d := resolveReap(rp.mode, reapable, walkSafe, rc.result.unreplaceableOnly())
+	// is whether this scan's own output work was clean, which resolveReap reads off
+	// the result itself.
+	d := resolveReap(rp.mode, &rc.result, walkSafe)
 	if !d.reap {
 		msg := "output bundles have no matching input"
 		// In sync mode reaching this line means orphan removal is OFF for this scan,
@@ -269,7 +269,14 @@ func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *r
 			"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),
 			"action", d.inaction,
 			"remediation", d.remediation)
-		rp.reportRetainedLoneKeys(orphaned, walkSafe)
+		// The retention REPORTS are the point of this call; the surviving candidates are
+		// not, because OUTPUT_LIFECYCLE forbids a deletion in this arm. An OUTPUT walk that
+		// could not enumerate the tree is not passed at all, for the same reason resolveReap
+		// withholds its delete advice on it: that candidate list can hold live bundles, so
+		// naming one of them as a half-deleted pair would be a wrong diagnosis.
+		if walkSafe {
+			rp.withoutRetainedKeys(orphaned)
+		}
 		return 0, nil
 	}
 
@@ -325,14 +332,27 @@ func orphansOf(outputs []string, seen map[string]struct{}) []string {
 // is returned to the caller, which is what keeps an interrupted scan from being reported
 // as complete.
 func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, error) {
+	// The key veto is asked BEFORE the window as well as inside it, and a batch it
+	// empties is neither announced nor waited for. A bundle whose sibling private key is
+	// still under /input is kept INDEFINITELY by design, so without this pre-pass every
+	// later scan blocks the Scanner's only goroutine for reapDeferral, announces a
+	// re-check, and deletes nothing — while the retention WARN that would explain the
+	// pause is de-duplicated per CHANGE, so from the second scan on the announcement has
+	// no outcome record at all. The veto is still asked again per candidate after the
+	// window: a key written DURING it is exactly the producer transaction the delay
+	// exists for, so this pre-pass may only ever REMOVE candidates, never authorise one.
+	candidates := rp.withoutRetainedKeys(orphaned)
+	if len(candidates) == 0 {
+		return 0, nil
+	}
 	slog.Info(reapRecheckMsg,
-		"count", len(orphaned), "recheck_in", reapDeferral.String())
+		"count", len(candidates), "recheck_in", reapDeferral.String())
 	if err := waitBeforeReap(ctx, reapDeferral); err != nil {
 		// Shutdown inside the window: delete nothing further. Debug like the other
 		// interrupted paths here, because the error itself is returned and the caller
 		// reports the cancellation.
 		slog.Debug("orphan removal abandoned during shutdown before the confirming re-check",
-			"candidates", len(orphaned), "error", err)
+			"candidates", len(candidates), "error", err)
 		return 0, err
 	}
 
@@ -352,12 +372,12 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 	// there, or removeOrphan refused) to the work still outstanding. Both shutdown
 	// guards below abandon the loop BEFORE candidate i's unlink, so the candidates that
 	// remain are i and everything after it.
-	for i, rel := range orphaned {
+	for i, rel := range candidates {
 		cert := layout.CertForOutput(rel)
 		absent, absentErr := rp.src.pathAbsent(cert)
 		if err := ctx.Err(); err != nil {
 			slog.Debug("orphan removal interrupted by shutdown during the confirming re-check",
-				"removed", deleted, "remaining", len(orphaned)-i, "error", err)
+				"removed", deleted, "remaining", len(candidates)-i, "error", err)
 			return deleted, err
 		}
 		if absentErr != nil {
@@ -366,8 +386,13 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 			// here: reporting an uninspectable /input as "the certificate came back"
 			// tells the operator the producer is working when the mount is not, and at
 			// LOG_LEVEL=warn it reports nothing at all while the stale bundle stays.
+			// The error is a *fs.PathError minted by os.Root, so it carries the candidate
+			// path RAW — the one log-boundary string this app does not interpolate itself.
+			// Gated here rather than at construction for that reason; the two entry-budget
+			// wraps this app DOES author sanitize inside the wrap instead.
 			slog.Warn(recheckUnreadableMsg,
-				"path", logtext.Path(rel), "input", logtext.Path(cert), "error", absentErr,
+				"path", logtext.Path(rel), "input", logtext.Path(cert),
+				"error", logtext.Path(absentErr.Error()),
 				"remediation", recheckUnreadableRemediation)
 			continue
 		}
@@ -381,16 +406,15 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 		if rp.keyStillPresent(rel, cert) {
 			continue
 		}
-		// The shutdown guard the removal helper used to own, inlined at the only place
-		// it ever ran: a cancellation between candidates must delete no further key
-		// material and must be reported, so the caller classifies the scan as a
-		// shutdown rather than a clean reap. It stays immediately before the unlink,
-		// because cancellation can arrive during keyStillPresent. Same attributes and
-		// same remaining-work arithmetic as its sibling guard above — two records for
-		// one condition in one loop must not disagree about what they are counting.
+		// A cancellation between candidates must delete no further key material and must
+		// be reported, so the caller classifies the scan as a shutdown rather than a clean
+		// reap. It stays immediately before the unlink, because cancellation can arrive
+		// during keyStillPresent. Same attributes and same remaining-work arithmetic as
+		// its sibling guard above — two records for one condition in one loop must not
+		// disagree about what they are counting.
 		if err := ctx.Err(); err != nil {
 			slog.Debug("orphan removal interrupted by shutdown",
-				"removed", deleted, "remaining", len(orphaned)-i, "error", err)
+				"removed", deleted, "remaining", len(candidates)-i, "error", err)
 			return deleted, err
 		}
 		switch rp.out.removeOrphan(rel) {
@@ -408,29 +432,36 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 	return deleted, nil
 }
 
-// reportRetainedLoneKeys names, on a scan that REPORTS orphans instead of deleting
-// them, every candidate the sync path would refuse to delete because the certificate's
-// sibling private key is still under /input.
+// withoutRetainedKeys drops from a candidate list every bundle the sync path would
+// refuse to delete because the certificate's sibling private key is still under /input,
+// and reports each retention on the way (keyStillPresent owns the record).
 //
-// Without it this app's own promise — "a bundle whose <name>.key is still there is kept
-// and reported by its own WARN" (README, OUTPUT_LIFECYCLE) — holds only under
-// OUTPUT_LIFECYCLE=sync, so the DEFAULT warn mode reports the bundle as an ordinary
-// orphan and its remediation offers sync, which would not delete it either. The report
-// is de-duplicated per CHANGE by the same observation-log set the reap path uses, so it
-// does not repeat on every fsnotify event and fallback tick.
+// Both callers need the REPORTS and only one needs the survivors. reconcile's
+// report-only arm calls it for the reports alone: without them this app's own promise —
+// "a bundle whose <name>.key is still there is kept and reported by its own WARN"
+// (README, OUTPUT_LIFECYCLE) — would hold only under OUTPUT_LIFECYCLE=sync, so the
+// DEFAULT warn mode would report the bundle as an ordinary orphan whose remediation
+// offers sync, which would not delete it either. reapConfirmed calls it for both, which
+// is what keeps a batch of nothing but retained pairs from costing the announcement and
+// the deferral on every scan for as long as the operator leaves the pair half-deleted.
+// The report is de-duplicated per CHANGE by the observation log, so it does not repeat
+// on every fsnotify event and fallback tick.
 //
-// An OUTPUT walk that could not enumerate the tree is skipped for the same reason
-// resolveReap withholds its delete advice on it: that candidate list can
-// hold live bundles, so naming one of them as a half-deleted pair would be a wrong
-// diagnosis. On a trustworthy list the input enumeration was proven complete, so every
-// candidate's certificate really is gone and the only open question is the key.
-func (rp *reaper) reportRetainedLoneKeys(orphaned []string, walkSafe bool) {
-	if !walkSafe {
-		return
-	}
+// An OUTPUT walk that could not enumerate the tree is never passed here (reconcile
+// gates on walkSafe) for the same reason resolveReap withholds its delete advice on it:
+// that candidate list can hold live bundles, so naming one of them as a half-deleted
+// pair would be a wrong diagnosis. On a trustworthy list the input enumeration was
+// proven complete, so every candidate's certificate really is gone and the only open
+// question is the key.
+func (rp *reaper) withoutRetainedKeys(orphaned []string) []string {
+	var candidates []string
 	for _, rel := range orphaned {
-		_ = rp.keyStillPresent(rel, layout.CertForOutput(rel))
+		if rp.keyStillPresent(rel, layout.CertForOutput(rel)) {
+			continue
+		}
+		candidates = append(candidates, rel)
 	}
+	return candidates
 }
 
 // keyStillPresent vetoes one confirmed candidate's deletion because the sibling PRIVATE
@@ -475,13 +506,14 @@ func (rp *reaper) keyStillPresent(rel, cert string) bool {
 		// not establish. Name the uninspectable path instead, and keep the bundle.
 		//
 		// De-duplicated per CHANGE like the lone-key WARN below, and for the same reason:
-		// reportRetainedLoneKeys reaches this arm on every scan in the default warn mode,
+		// withoutRetainedKeys reaches this arm on every scan in the default warn mode,
 		// so an unreadable /input sub-directory would otherwise re-report every candidate
 		// under it on every fsnotify event and fallback tick. Keyed on the KEY path, which
 		// no cert path can collide with, so the two reports retire independently.
 		if rp.observations.markLoneKey(key) {
 			slog.Warn(recheckUnreadableMsg,
-				"path", logtext.Path(rel), "input", logtext.Path(cert), "key", logtext.Path(key), "error", err,
+				"path", logtext.Path(rel), "input", logtext.Path(cert), "key", logtext.Path(key),
+				"error", logtext.Path(err.Error()),
 				"remediation", recheckUnreadableRemediation)
 		}
 		return true
@@ -537,7 +569,7 @@ const loneKeyRemediation = "finish the change under /input: add the matching <na
 //
 // The wording names the RETENTION and not a pending removal, because both callers share
 // it: sync's confirming re-check, where a deletion was indeed being considered, and
-// reportRetainedLoneKeys in the report-only modes, where OUTPUT_LIFECYCLE forbids one. An
+// withoutRetainedKeys in the report-only modes, where OUTPUT_LIFECYCLE forbids one. An
 // operator diagnosing an unreadable input tree in warn or keep mode must not be told this
 // app was preparing to delete key material.
 const recheckUnreadableMsg = "keeping an output bundle because its /input path could not be inspected; an unreadable input tree is not proof the bundle is orphaned"
@@ -753,14 +785,17 @@ type reapDecision struct {
 // which a mode that never removes anything cannot deliver, and the advice must not
 // offer a setting that is already in effect.
 //
-// The sync arms need no separate reapable term: a sync scan that is reapable returns
+// The sync arms need no separate reapable term: a sync scan that may reap returns
 // above, so every arm below is a scan that keeps its candidates.
-func resolveReap(mode outputpolicy.Lifecycle, reapable, walkSafe, refusalOnly bool) reapDecision {
-	// reapable already carries walkSafe: reconcile computes it as
-	// `rc.result.conversionsClean() && walkSafe` at the single call site, so an untrustworthy output
-	// walk has already forced it false. walkSafe stays a parameter because the narration
-	// below distinguishes it from the other vetoes.
-	if mode == outputpolicy.LifecycleSync && reapable {
+//
+// It reads the two scan-side vetoes off the result rather than taking them
+// pre-derived, the same shape logScanOutcome and logInputCoverageWarnings already
+// take: three adjacent bools let a caller transpose walkSafe with the conversion
+// veto and still compile, and that transposition reaps on a scan that could not
+// prove its candidates orphaned. walkSafe stays a parameter because it belongs to
+// the OUTPUT walk rather than to the scan's own counters.
+func resolveReap(mode outputpolicy.Lifecycle, result *ScanResult, walkSafe bool) reapDecision {
+	if mode == outputpolicy.LifecycleSync && walkSafe && result.conversionsClean() {
 		return reapDecision{reap: true}
 	}
 	switch {
@@ -769,7 +804,7 @@ func resolveReap(mode outputpolicy.Lifecycle, reapable, walkSafe, refusalOnly bo
 			inaction:    "kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle",
 			remediation: "do not remove anything from this list yet: fix the /output warnings above, then re-check it on a scan that reports no disabled orphan removal",
 		}
-	case mode == outputpolicy.LifecycleSync && refusalOnly:
+	case mode == outputpolicy.LifecycleSync && result.unreplaceableOnly():
 		return reapDecision{
 			inaction:    "kept: the output volume refused to let this app replace a prior bundle on this scan, so nothing is removed until a scan with no refused replacement",
 			remediation: "this app removes them itself on the next scan with no failed conversion and no refused replacement: fix the /output condition named in the warning above, or remove these from the output volume by hand",

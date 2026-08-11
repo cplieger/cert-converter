@@ -2057,7 +2057,7 @@ func TestObservationLog_wholeness_eviction_makes_room_without_touching_the_reser
 	log := newObservationLog(1)
 	// The reachable shape: a.crt is remembered by the SIGNATURE half (note ran for it)
 	// while its wholeness entry is gone, and the wholeness half is already full.
-	// reserve routes this through evictWholeness, which must evict the OTHER pair,
+	// reserve routes this through the wholeness-half reservation, which must evict the OTHER pair,
 	// keep the reserved path's signature entry, hold the half at its ceiling, and
 	// count the drop as this scan's reap veto. (The `victim == keep` guards themselves
 	// are unreachable from reserve, whose preconditions exclude the reserved path from
@@ -2145,11 +2145,12 @@ func TestObservationLog_eviction_spares_the_wholeness_the_active_scan_establishe
 // TestObservationLog_signature_eviction_spares_the_wholeness_the_active_scan_established
 // is the SIGNATURE arm of the protection the test above pins on the wholeness arm.
 //
-// reserve has two eviction entry points and each consults canEvict for itself: evictOne
-// takes its victim from `seen` and drops that victim's wholeness with it (dropWholeness),
-// while evictWholeness takes a victim that actually holds wholeness. The test above drives
-// markWhole only, which leaves `seen` empty, so evictOne is never entered there --
-// deleting canEvict's consultation from evictOne alone therefore keeps the whole suite
+// reserve has two eviction entry points and each consults canEvict for itself: the
+// signature-half reservation takes its victim from `seen` and drops that victim's wholeness
+// with it (dropWholeness), while the wholeness-half reservation takes a victim that actually
+// holds wholeness. The test above drives markWhole only, which leaves `seen` empty, so the
+// signature-half reservation is never entered there -- deleting canEvict's consultation
+// from the shared eviction therefore keeps the whole suite
 // green while a pair THIS walk read whole loses the evidence noteMissingKey classifies a
 // replaced private key against. The scan then reads a key being replaced as an ordinary
 // orphan, which vetoes nothing, and unrelated bundles are deleted on an enumeration it can

@@ -58,9 +58,14 @@ type conversionStatus int
 // — a symlinked output tree, a component that is not a directory, a regular file
 // occupying a directory component of the output path, or a component another writer
 // replaced — a read-only mount, a full volume, and an exhausted quota. The single
-// exception is stated only by the bounded atomic write reading its own error: a raw
-// filesystem errno THAT site cannot attribute to any of those is a genuinely transient
-// I/O error, which a restart CAN clear, so it keeps the loud statusFailed. The two
+// exception is stated only by the bounded atomic write reading its own error: anything
+// THAT site cannot attribute to one of those classes becomes refusalTransient, and that
+// class keeps the loud statusFailed. Its members are enumerated in ONE place, its own doc
+// in store.go — a genuinely transient I/O error, a symlink at the output name, a bundle
+// above the write cap — and only the first is restart-clearable in its own right; for the
+// other two inspect has already classified the bundle before the cause is ever read (a
+// non-regular occupant at the output name is contentVerifiedStale, and this app never
+// emits a bundle over the cap), so writeOutcome's state gate decides them. The two
 // directory steps (create and pin) deliberately take the other direction with their
 // residuals — an errno they cannot attribute is the shape of the operator's output tree
 // (refusalOutputLayout), so even a transient EIO there is restart-unclearable by
