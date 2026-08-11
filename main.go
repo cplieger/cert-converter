@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/config"
+	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/mounts"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/scancadence"
@@ -169,7 +170,10 @@ func run() int {
 
 	slog.Info("starting cert watcher", slices.Concat(
 		[]any{
-			"input", certsRootDir, "output", outputDir,
+			// Through the same log-boundary gate every other path attribute in this app
+			// uses, so the rule has no exception to remember: one helper for every
+			// filesystem-derived attribute, wherever the value came from.
+			"input", logtext.Path(certsRootDir), "output", logtext.Path(outputDir),
 			// The whole mount contract is "readable/writable by the UID in user:",
 			// and every downstream permission WARN points at that UID without ever
 			// naming it. compose resolves it from ${PUID:-1000}, so the compose file

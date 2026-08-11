@@ -14,6 +14,7 @@ import (
 	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
+	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 )
 
@@ -133,7 +134,7 @@ func (s *store) reportLaxDirAt(dir string) {
 		// step produces; the root is named alongside it, as logOrphanWalkOutcome does for
 		// its own directory-level records.
 		slog.Warn(laxDirMsg,
-			"path", dir, "dir", s.root.Name(),
+			"path", logtext.Path(dir), "dir", logtext.Path(s.root.Name()),
 			"mode", perm.String(), "want", os.FileMode(pfxDirMode).String(),
 			"remediation", outputPermRemediation)
 	}
@@ -314,13 +315,16 @@ func (s *store) sweepStaleTemps(ctx context.Context) {
 // misconfigurations that let stale atomic-write artifacts accumulate unnoticed,
 // so they carry a remediation hint at the default log level.
 func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
+	// One sanitized rendering of the output root's name for every record below
+	// (logtext.Path); the handle itself is unaffected.
+	logDir := logtext.Path(s.root.Name())
 	if walkErr != nil {
 		if IsShutdown(walkErr) {
 			// Shutdown, not an operator-actionable cleanup failure; the input
 			// walk's own context check reports the cancellation to the caller.
-			slog.Debug("stale temp cleanup cancelled during shutdown", "dir", s.root.Name(), "error", walkErr)
+			slog.Debug("stale temp cleanup cancelled during shutdown", "dir", logDir, "error", walkErr)
 		} else {
-			slog.Warn("stale temp cleanup failed", "dir", s.root.Name(), "error", walkErr,
+			slog.Warn("stale temp cleanup failed", "dir", logDir, "error", walkErr,
 				"remediation", outputPermRemediation)
 		}
 	}
@@ -328,15 +332,15 @@ func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
 		// A reclaimed orphan is evidence of an earlier interrupted write (a
 		// crash or a kill between temp-write and rename), so it belongs in the
 		// default-level log rather than only under LOG_LEVEL=debug.
-		slog.Info("reaped stale temp files", "dir", s.root.Name(), "count", res.Removed)
+		slog.Info("reaped stale temp files", "dir", logDir, "count", res.Removed)
 	}
 	if res.Failed > 0 {
-		slog.Warn("some stale output temps could not be inspected or removed", "dir", s.root.Name(),
+		slog.Warn("some stale output temps could not be inspected or removed", "dir", logDir,
 			"count", res.Failed, "remediation", outputPermRemediation)
 	}
 	if res.Unreadable > 0 {
 		slog.Warn("some output paths could not be inspected during stale temp cleanup",
-			"dir", s.root.Name(), "count", res.Unreadable, "remediation", outputPermRemediation)
+			"dir", logDir, "count", res.Unreadable, "remediation", outputPermRemediation)
 	}
 }
 
@@ -510,7 +514,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		// the same fact as a stat failure, and it degrades the same way rather than
 		// failing the pair. The remediation names the pin's own two causes.
 		slog.Warn("cannot stat prior pfx; regenerating",
-			"path", rel, "error", err,
+			"path", logtext.Path(rel), "error", err,
 			"remediation", outputPinRemediation)
 		return contentUnverified, nil
 	}
@@ -534,7 +538,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		// the honest signal. Consistent with the oversized case below, which already
 		// regenerates.
 		slog.Warn("cannot stat prior pfx; regenerating",
-			"path", rel, "error", err,
+			"path", logtext.Path(rel), "error", err,
 			"remediation", outputPermRemediation)
 		return contentUnverified, nil
 	case !fi.Mode().IsRegular():
@@ -556,7 +560,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		// redirection attempt on a private-key-bearing file, and the confined root
 		// refusing it should not be the only trace.
 		slog.Warn("prior output path is not a regular file; regenerating",
-			"path", rel, "mode", fi.Mode().String(),
+			"path", logtext.Path(rel), "mode", fi.Mode().String(),
 			"remediation", "remove whatever occupies the output path; this app writes only regular files there")
 		return contentVerifiedStale, nil
 	}
@@ -570,7 +574,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 
 	if fi.Size() > maxPFXSize {
 		slog.Warn("prior pfx exceeds the readable bound; regenerating",
-			"path", rel, "size", fi.Size(), "limit", maxPFXSize)
+			"path", logtext.Path(rel), "size", fi.Size(), "limit", maxPFXSize)
 		return contentUnverified, nil
 	}
 
@@ -601,7 +605,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 			content = contentVerifiedStale
 		}
 		slog.Warn("cannot read prior pfx; regenerating",
-			"path", rel, "error", err,
+			"path", logtext.Path(rel), "error", err,
 			"remediation", outputPermRemediation)
 		return content, nil
 	}
@@ -643,7 +647,7 @@ func contentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 		// are outside what this app will spend CPU on, or one whose structure it will not
 		// parse. Nothing about the bytes was compared, so this is the unverified fact and
 		// not a claim that the operator's bundle is wrong.
-		slog.Debug("prior pfx failed preflight; regenerating", "path", rel, "error", res.Err)
+		slog.Debug("prior pfx failed preflight; regenerating", "path", logtext.Path(rel), "error", res.Err)
 		return contentUnverified, nil
 	case convert.CurrencyProfileMismatch:
 		// A deliberate PFX_ENCODER change. Without this the switch would rewrite
@@ -651,7 +655,7 @@ func contentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 		// its old algorithms indefinitely while the startup log announced the new
 		// profile.
 		slog.Info("prior pfx uses a different encoder profile; regenerating",
-			"path", rel, "found", string(res.Profile), "configured", string(wantEncoder))
+			"path", logtext.Path(rel), "found", string(res.Profile), "configured", string(wantEncoder))
 		return contentVerifiedStale, nil
 	case convert.CurrencyDecodeFailed:
 		// Expected and non-fatal: a rotated password, a truncated file, a foreign file at
@@ -659,7 +663,7 @@ func contentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 		// the bundle will not open with the configured password — which is the password
 		// every consumer of this output uses, so what is on disk is not a usable copy of
 		// the bundle these inputs produce.
-		slog.Debug("prior pfx did not decode; regenerating", "path", rel, "error", res.Err)
+		slog.Debug("prior pfx did not decode; regenerating", "path", logtext.Path(rel), "error", res.Err)
 		return contentVerifiedStale, nil
 	default:
 		// A match, or a plain content mismatch: the ordinary renewed-certificate
@@ -758,7 +762,7 @@ func (s *store) reportLaxBundle(rel string, perm os.FileMode) {
 		return
 	}
 	slog.Warn(laxBundleMsg,
-		"path", rel, "mode", perm.String(), "want", os.FileMode(pfxFileMode).String())
+		"path", logtext.Path(rel), "mode", perm.String(), "want", os.FileMode(pfxFileMode).String())
 }
 
 // writeRefusalCause names WHAT refused an /output write, as the site that refused it
@@ -1085,7 +1089,7 @@ func (w *outputWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err e
 		// two-level contract the input walk and the stale-temp sweep use. This recurs
 		// on every scan for a persistent misconfiguration, so naming each path at the
 		// default level is a permanent log stream for a condition already reported.
-		slog.Debug("skipping unreadable output path while looking for orphans", "path", rel, "error", err)
+		slog.Debug("skipping unreadable output path while looking for orphans", "path", logtext.Path(rel), "error", err)
 		w.unreadable++
 		return nil
 	}
@@ -1102,7 +1106,9 @@ func (w *outputWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err e
 	// it had collected: a partial enumeration cannot prove anything orphaned, and the
 	// alternative — reaping on a prefix of the tree — deletes live bundles.
 	if !w.budget.Charge() {
-		return fmt.Errorf("%w: stopped at %d entries (%s)", errOutputBudgetExceeded, w.budget.Count(), rel)
+		// The stopping path reaches the reap's `error` attribute through this wrap, so it
+		// goes through the same log-boundary gate the attributes do.
+		return fmt.Errorf("%w: stopped at %d entries (%s)", errOutputBudgetExceeded, w.budget.Count(), logtext.Path(rel))
 	}
 	// A symlink anywhere in the output tree makes this walk and the WRITE path
 	// disagree about where a bundle lives: writes resolve through *os.Root,
@@ -1115,7 +1121,7 @@ func (w *outputWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err e
 	// scan that created it. Refuse to reap rather than try to reconcile two
 	// namespaces.
 	if d.Type()&fs.ModeSymlink != 0 {
-		slog.Debug("output tree contains a symlink; "+reapDisabledPhrase, "path", rel)
+		slog.Debug("output tree contains a symlink; "+reapDisabledPhrase, "path", logtext.Path(rel))
 		w.symlinked++
 		return nil
 	}
@@ -1140,14 +1146,15 @@ func (w *outputWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err e
 // would silently stop reaping and look identical to a tree with nothing to reap. The
 // individual paths stay at Debug.
 func (s *store) logOrphanWalkOutcome(unreadable, symlinked int) {
+	logDir := logtext.Path(s.root.Name())
 	if unreadable > 0 {
 		slog.Warn("some output paths could not be read while looking for orphans; "+reapDisabledPhrase,
-			"dir", s.root.Name(), "count", unreadable,
+			"dir", logDir, "count", unreadable,
 			"remediation", outputPermRemediation)
 	}
 	if symlinked > 0 {
 		slog.Warn("output tree contains symlinks; "+reapDisabledPhrase+" because writes and the orphan walk resolve paths differently",
-			"dir", s.root.Name(), "count", symlinked,
+			"dir", logDir, "count", symlinked,
 			"remediation", "mount the real output directory instead of linking to it")
 	}
 }
@@ -1200,6 +1207,9 @@ const removalRefusedMsg = "some orphaned output bundles could not be removed; /o
 // What stays here is this app's policy: which failures are transient races and which are
 // operator-actionable, and what an operator is told about each.
 func (s *store) removeOrphan(rel string) reapAttempt {
+	// One sanitized rendering for every record this attempt can emit (logtext.Path);
+	// `rel` itself stays raw for the pin and the unlink below.
+	logRel := logtext.Path(rel)
 	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -1209,10 +1219,10 @@ func (s *store) removeOrphan(rel string) reapAttempt {
 			// disappearance the flat layout reports from Lstat directly — and the
 			// symlink remediation on the WARN below would send an operator looking for
 			// a misconfiguration that is not there.
-			slog.Debug("orphaned output vanished before removal", "path", rel)
+			slog.Debug("orphaned output vanished before removal", "path", logRel)
 			return reapAttemptVanished
 		}
-		slog.Warn(pinRedirectedMsg, "path", rel, "error", err,
+		slog.Warn(pinRedirectedMsg, "path", logRel, "error", err,
 			"remediation", outputPinRemediation)
 		return reapAttemptRefused
 	}
@@ -1231,20 +1241,20 @@ func (s *store) removeOrphan(rel string) reapAttempt {
 	fi, statErr := parent.Lstat(base)
 	switch {
 	case errors.Is(statErr, fs.ErrNotExist):
-		slog.Debug("orphaned output vanished before removal", "path", rel)
+		slog.Debug("orphaned output vanished before removal", "path", logRel)
 		return reapAttemptVanished
 	case statErr != nil:
 		slog.Warn("could not re-check an orphaned output before removing it; leaving it in place",
-			"path", rel, "error", statErr, "remediation", outputPermRemediation)
+			"path", logRel, "error", statErr, "remediation", outputPermRemediation)
 		return reapAttemptRefused
 	case !fi.Mode().IsRegular():
 		slog.Warn("orphaned output path is not a regular file; leaving it in place",
-			"path", rel, "mode", fi.Mode().String(),
+			"path", logRel, "mode", fi.Mode().String(),
 			"remediation", "remove whatever occupies the output path by hand; this app deletes only the regular files it writes")
 		return reapAttemptRefused
 	}
 	if err := parent.Remove(base); err != nil {
-		slog.Warn("could not remove orphaned output", "path", rel, "error", err,
+		slog.Warn("could not remove orphaned output", "path", logRel, "error", err,
 			"remediation", outputPermRemediation)
 		return reapAttemptRefused
 	}
@@ -1252,6 +1262,6 @@ func (s *store) removeOrphan(rel string) reapAttempt {
 	// warn-visible contract for that; this per-path line is the complete, unbounded
 	// list for a reader who asked for detail, so it sits at Debug rather than repeating
 	// the audit at the default level once per path.
-	slog.Debug("removed orphaned output whose input is gone", "path", rel)
+	slog.Debug("removed orphaned output whose input is gone", "path", logRel)
 	return reapAttemptRemoved
 }

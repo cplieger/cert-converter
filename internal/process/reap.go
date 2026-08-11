@@ -233,12 +233,12 @@ func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *r
 			// carrying reapDisabledPhrase so the standing alert still fires: a budget that
 			// bit silently would look exactly like an /output with nothing to reap.
 			slog.Warn(outputBudgetMsg,
-				"error", err, "dir", rp.out.root.Name(),
+				"error", err, "dir", logtext.Path(rp.out.root.Name()),
 				"remediation", outputBudgetRemediation)
 			return 0, nil
 		}
 		slog.Warn("could not enumerate output orphans; "+reapDisabledPhrase,
-			"error", err, "dir", rp.out.root.Name(),
+			"error", err, "dir", logtext.Path(rp.out.root.Name()),
 			"remediation", outputPermRemediation)
 		return 0, nil
 	}
@@ -367,7 +367,7 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 			// tells the operator the producer is working when the mount is not, and at
 			// LOG_LEVEL=warn it reports nothing at all while the stale bundle stays.
 			slog.Warn(recheckUnreadableMsg,
-				"path", rel, "input", cert, "error", absentErr,
+				"path", logtext.Path(rel), "input", logtext.Path(cert), "error", absentErr,
 				"remediation", recheckUnreadableRemediation)
 			continue
 		}
@@ -375,7 +375,7 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 			// Named at the default level: this is the deletion this app decided NOT to
 			// make, and it is the only trace that the delay did its job.
 			slog.Info("keeping an output bundle whose certificate came back during the confirmation delay",
-				"path", rel, "input", cert)
+				"path", logtext.Path(rel), "input", logtext.Path(cert))
 			continue
 		}
 		if rp.keyStillPresent(rel, cert) {
@@ -481,7 +481,7 @@ func (rp *reaper) keyStillPresent(rel, cert string) bool {
 		// no cert path can collide with, so the two reports retire independently.
 		if rp.observations.markLoneKey(key) {
 			slog.Warn(recheckUnreadableMsg,
-				"path", rel, "input", cert, "key", key, "error", err,
+				"path", logtext.Path(rel), "input", logtext.Path(cert), "key", logtext.Path(key), "error", err,
 				"remediation", recheckUnreadableRemediation)
 		}
 		return true
@@ -506,7 +506,7 @@ func (rp *reaper) keyStillPresent(rel, cert string) bool {
 	// the thing that then deletes the bundle.
 	if rp.observations.markLoneKey(cert) {
 		slog.Warn(loneKeyRetainedMsg,
-			"path", rel, "input", cert, "key", key,
+			"path", logtext.Path(rel), "input", logtext.Path(cert), "key", logtext.Path(key),
 			"remediation", loneKeyRemediation)
 	}
 	return true
@@ -681,12 +681,16 @@ const maxLoggedOrphanBytes = 4096
 //
 // The byte cut runs on the JOINED sample (that is what the budget is about) through
 // logtext.Cap, which backs the cut off to a rune start so a multi-byte name is
-// never cut into a partial rune. Paths are NOT sanitized: these are /output-walk names
-// this app itself wrote, mirroring the operator's own /input tree, and they are the
-// operator's query key for which bundles were reported (the settled
-// path-attribute-runesafe-adoption decision). A hostile name a co-writer plants on a
-// permissive /output mount is covered without sanitizing — slog's handlers escape
-// non-printing runes, and such a writer can already replace bundles outright.
+// never cut into a partial rune. The sample is SANITIZED first and cut second
+// (logtext.Path, then logtext.Cap), and that order is the whole reason the two steps
+// are separate calls rather than one sanitize-and-cap primitive: /output is untrusted
+// — this is a public image, so a co-writer on that mount chooses the names this walk
+// enumerates, and a name holding CR/LF or a bidi control would forge or reorder a
+// record here. Sanitizing is byte-identical for an ordinary bundle name, so the
+// operator's query key for which bundles were reported is unchanged. A capped
+// sanitizing primitive would charge its marker AGAINST the limit instead of appending
+// it, and this function's own elision suffix below was budgeted against Cap's
+// placement.
 //
 // Both suffixes are appended AFTER the cut, so a truncated sample exceeds the budget
 // by their own length: the bound exists to stop a multi-kilobyte record, not to hit
@@ -700,7 +704,7 @@ func sampleOrphanPaths(paths []string) string {
 		elided = fmt.Sprintf(" (+%d more)", len(paths)-maxLoggedOrphans)
 	}
 	rendered := strings.Join(sample, ",")
-	return logtext.Cap(rendered, maxLoggedOrphanBytes) + elided
+	return logtext.Cap(logtext.Path(rendered), maxLoggedOrphanBytes) + elided
 }
 
 // reapDecision is the whole OUTPUT_LIFECYCLE decision for one scan: whether this

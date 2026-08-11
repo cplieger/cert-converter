@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/layout"
+	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/cert-converter/internal/scancadence"
 	"github.com/fsnotify/fsnotify"
@@ -475,7 +476,14 @@ func (w *Watcher) watchMode(ctx context.Context, watcher *fsnotify.Watcher) erro
 // an operator needs to diagnose an INCOMPLETE watch set — a subdirectory whose
 // watcher.Add failed, whose renewals are then covered only by the fallback rescan.
 func logWatchSet(watcher *fsnotify.Watcher) {
-	slog.Debug("fsnotify watch set", "directories", watcher.WatchList())
+	// Every name here came from the /input walk, so each one is sanitized for the log
+	// (logtext.Path); the registered paths themselves are untouched.
+	dirs := watcher.WatchList()
+	logged := make([]string, len(dirs))
+	for i, dir := range dirs {
+		logged[i] = logtext.Path(dir)
+	}
+	slog.Debug("fsnotify watch set", "directories", logged)
 }
 
 // scanThenWatch scans once with the watch set already live and then runs the
@@ -631,7 +639,7 @@ func (b *watchSetBudget) exceedsEntryBudget(ctx context.Context, walkErr error) 
 // remainder is unbounded and the operator action is the same for all of it.
 func (w *Watcher) warnWatchBudget(budget *watchSetBudget) {
 	slog.Warn(watchBudgetMsg, w.coverageAttrs(
-		"root", budget.root, "max_entries", budget.budget.Max(),
+		"root", logtext.Path(budget.root), "max_entries", budget.budget.Max(),
 		"remediation", watchBudgetRemediation)...)
 }
 
@@ -653,7 +661,7 @@ func (w *Watcher) classifyWatchEntry(
 			return false, walkErr
 		}
 		slog.Warn("skipping unwatchable path; renewals under it require a full rescan",
-			w.coverageAttrs("path", path, "error", walkErr)...)
+			w.coverageAttrs("path", logtext.Path(path), "error", walkErr)...)
 		return false, nil
 	}
 	if !d.IsDir() {
@@ -709,7 +717,7 @@ func (w *Watcher) handleWatchAddError(root, path string, addErr error) error {
 		return addErr
 	}
 	slog.Warn("skipping unwatchable directory; renewals under it require a full rescan",
-		w.coverageAttrs("path", path, "error", addErr,
+		w.coverageAttrs("path", logtext.Path(path), "error", addErr,
 			"remediation", watchAddRemediation)...)
 	return nil
 }
@@ -827,10 +835,10 @@ func (w *Watcher) pruneWatches(watcher *fsnotify.Watcher, desired map[string]str
 		if err := removeWatch(watcher, path); err != nil {
 			if !errors.Is(err, fsnotify.ErrNonExistentWatch) {
 				slog.Warn("failed to unregister a stale fsnotify watch; it stays charged to the live watch set",
-					w.coverageAttrs("path", path, "error", err)...)
+					w.coverageAttrs("path", logtext.Path(path), "error", err)...)
 				continue
 			}
-			slog.Debug("stale fsnotify registration already gone", "path", path, "error", err)
+			slog.Debug("stale fsnotify registration already gone", "path", logtext.Path(path), "error", err)
 		}
 		w.forgetWatch(path)
 	}
@@ -843,7 +851,7 @@ func (w *Watcher) pruneWatches(watcher *fsnotify.Watcher, desired map[string]str
 // no longer be inspected. Create and Chmod delegate path classification and
 // directory reattachment to handlePathEvent; Write only rescans cert/key paths.
 func (w *Watcher) handleFsEvent(ctx context.Context, watcher *fsnotify.Watcher, event fsnotify.Event) bool {
-	slog.Debug("fs event", "op", event.Op.String(), "path", event.Name)
+	slog.Debug("fs event", "op", event.Op.String(), "path", logtext.Path(event.Name))
 	switch {
 	case event.Has(fsnotify.Create):
 		// A newly created directory joins the watch set (and triggers a rescan,
@@ -927,7 +935,7 @@ func (w *Watcher) handlePathEvent(
 		// record names (fallback_scan and scan_floor), which is a state an operator
 		// must be able to see.
 		slog.Warn(classifyWarning,
-			w.coverageAttrs("path", event.Name, "error", err)...)
+			w.coverageAttrs("path", logtext.Path(event.Name), "error", err)...)
 		return true
 	}
 	if !info.IsDir() {
@@ -938,7 +946,7 @@ func (w *Watcher) handlePathEvent(
 	}
 	if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
 		slog.Warn(addWarning,
-			w.coverageAttrs("path", event.Name, "error", addErr)...)
+			w.coverageAttrs("path", logtext.Path(event.Name), "error", addErr)...)
 	}
 	return true
 }
@@ -1018,7 +1026,7 @@ func (w *Watcher) handleRootWatchLoss(ctx context.Context, watcher *fsnotify.Wat
 	// A root that is genuinely gone surfaces as the WARN below plus the scan error
 	// the debounced rescan reports.
 	slog.Warn("fsnotify root watch lost; re-attaching the watch set, renewals until it succeeds are covered only by the periodic rescan",
-		w.coverageAttrs("root", w.root, "op", event.Op.String())...)
+		w.coverageAttrs("root", logtext.Path(w.root), "op", event.Op.String())...)
 	st.resync(ctx, watcher,
 		"failed to re-attach the watch set after the root watch was lost; renewals are covered only by the periodic rescan")
 	return true
@@ -1172,7 +1180,7 @@ func (w *Watcher) resyncWatchSet(ctx context.Context, watcher *fsnotify.Watcher,
 	desired, walkErr := w.desiredWatchDirs(ctx, w.root)
 	if walkErr != nil {
 		if ctx.Err() == nil {
-			slog.Warn(warning, w.coverageAttrs("root", w.root, "error", walkErr)...)
+			slog.Warn(warning, w.coverageAttrs("root", logtext.Path(w.root), "error", walkErr)...)
 		}
 		return
 	}
@@ -1187,7 +1195,7 @@ func (w *Watcher) resyncWatchSet(ctx context.Context, watcher *fsnotify.Watcher,
 	//    was lost, and it re-adds every desired path regardless of what the mirror claims.
 	if addErr := w.reassertWatches(ctx, watcher, desired); addErr != nil {
 		if ctx.Err() == nil {
-			slog.Warn(warning, w.coverageAttrs("root", w.root, "error", addErr)...)
+			slog.Warn(warning, w.coverageAttrs("root", logtext.Path(w.root), "error", addErr)...)
 		}
 		return
 	}
@@ -1461,12 +1469,12 @@ func (st *watchState) runSafetyNetScan(ctx context.Context) {
 func (st *watchState) handleWatcherError(err error) bool {
 	if errors.Is(err, fsnotify.ErrEventOverflow) {
 		slog.Warn("fsnotify event queue overflowed; events were dropped, forcing a rescan to recover any missed renewal",
-			st.w.coverageAttrs("root", st.w.root, "error", err)...)
+			st.w.coverageAttrs("root", logtext.Path(st.w.root), "error", err)...)
 		st.scheduleScan()
 		return true
 	}
 	slog.Warn("watcher error; the watch loop continues and a change missed because of it is covered only by the periodic fallback rescan",
-		st.w.coverageAttrs("root", st.w.root, "error", err)...)
+		st.w.coverageAttrs("root", logtext.Path(st.w.root), "error", err)...)
 	return false
 }
 

@@ -30,6 +30,19 @@ func TestCap_leaves_text_within_the_limit_alone(t *testing.T) {
 	}
 }
 
+// TestCap_does_not_sanitize pins the split this package is organised around: Cap
+// bounds and marks, Path rewrites, and the ONE caller that needs both composes them in
+// that order (sanitize, then cap). Folding sanitizing into Cap would move the marker's
+// budget, which is the placement internal/process's elision suffix was sized against —
+// so the separation has to be asserted, not left to a comment.
+func TestCap_does_not_sanitize(t *testing.T) {
+	t.Parallel()
+	const s = "a\nb"
+	if got := logtext.Cap(s, len(s)); got != s {
+		t.Errorf("Cap(%q, %d) = %q, want it unchanged: Cap bounds text, Path is what rewrites it", s, len(s), got)
+	}
+}
+
 // TestCap_backs_the_cut_off_to_a_rune_start pins the rune-boundary backoff: a cut
 // inside a multi-byte rune would mint the partial-UTF-8 tail the app's sanitizing
 // exists to remove. The limit deliberately falls mid-rune (3-byte runes, limit 8).
@@ -55,11 +68,64 @@ func TestCap_backs_the_cut_off_to_a_rune_start(t *testing.T) {
 	}
 }
 
+// TestPath_rewrites_the_unsafe_classes_and_leaves_ordinary_names_alone pins the gate
+// every filesystem-derived log attribute in this app passes through, from the leaf's own
+// side. The wiring — that the walk's emit sites actually reach it — is pinned end to end
+// by internal/process's TestScannerRun_sanitizes_walk_supplied_names_in_log_attributes;
+// this is the policy half.
+//
+// Both halves of the decision are asserted, because either one alone permits a wrong
+// implementation: a hostile name must be REWRITTEN (an escaper or a truncator would
+// satisfy "no unsafe rune survives" while changing every ordinary value too), and an
+// ordinary name must come back BYTE-IDENTICAL (which is why adopting the gate moved no
+// operator's existing log query key).
+func TestPath_rewrites_the_unsafe_classes_and_leaves_ordinary_names_alone(t *testing.T) {
+	t.Parallel()
+
+	// Ordinary names: every shape /input and /output actually hold. None may change.
+	for _, s := range []string{
+		"", "example.com.crt", "example.com.pfx", "sub/dir/wildcard_example.com.pfx",
+		"héllo.crt", "日本語.pfx", ".", "a b.crt",
+	} {
+		if got := logtext.Path(s); got != s {
+			t.Errorf("Path(%q) = %q, want it byte-identical: an ordinary name is an operator's query key", s, got)
+		}
+	}
+
+	// One case per class the policy names, so a hand-rolled subset (the drift runesafe
+	// exists to prevent) fails here rather than in a later cycle.
+	for _, tc := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"LF forges a record boundary", "a\nb.crt", "a b.crt"},
+		{"CR forges a record boundary", "a\rb.crt", "a b.crt"},
+		{"C0 control", "a\x01b.crt", "a b.crt"},
+		{"DEL", "a\x7fb.crt", "a b.crt"},
+		{"C1 control introduces a terminal escape", "a\u0085b.crt", "a b.crt"},
+		{"bidi control reorders the line", "a\u202eb.crt", "a b.crt"},
+		{"line separator", "a\u2028b.crt", "a b.crt"},
+		{"paragraph separator", "a\u2029b.crt", "a b.crt"},
+	} {
+		if got := logtext.Path(tc.in); got != tc.want {
+			t.Errorf("Path(%q) = %q, want %q (%s)", tc.in, got, tc.want, tc.name)
+		}
+	}
+
+	// Invalid UTF-8 becomes U+FFFD, so no attribute can carry a partial rune whose tail
+	// bytes read as C1 controls on a non-UTF-8 terminal.
+	if got := logtext.Path("a\xffb.crt"); !utf8.ValidString(got) {
+		t.Errorf("Path(invalid UTF-8) = %q, which is not valid UTF-8", got)
+	}
+}
+
 // TestMarker_names_the_cut_in_both_paths pins the sharing this package exists for,
 // from the shared leaf's own side. Two consumers bound text with this marker and must
 // not drift on the wording: internal/process caps its orphan path sample with Cap
-// (unsanitized on purpose — /input is the operator's own tree and the paths are their
-// query key), and internal/convert hands the same const to
+// (after sanitizing it with Path — Cap is the non-sanitizing half of that pair
+// because its caller composes a further elision suffix budgeted against Cap's marker
+// placement), and internal/convert hands the same const to
 // runesafe.SanitizeSingleLineBudgeted for certificate-derived text.
 //
 // What the two do NOT share is where the marker's bytes are charged, and that is

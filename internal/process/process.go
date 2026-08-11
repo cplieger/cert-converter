@@ -13,6 +13,7 @@ import (
 	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
+	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 )
@@ -434,7 +435,7 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		// points at /input permissions, for a directory that is merely being
 		// replaced. Health-neutral and reap-vetoing either way.
 		if errors.Is(err, fs.ErrNotExist) {
-			slog.Debug("skipping path that vanished during the scan", "path", rel, "error", err)
+			slog.Debug("skipping path that vanished during the scan", "path", logtext.Path(rel), "error", err)
 			sw.vanished++
 			return nil
 		}
@@ -446,7 +447,7 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		// aggregate into the log forever for a condition the operator already knows
 		// about. The aggregate Warn in logInputCoverageWarnings carries the signal and
 		// the remediation hint; LOG_LEVEL=debug names the individual paths.
-		slog.Debug("skipping unreadable path", "path", rel, "error", err)
+		slog.Debug("skipping unreadable path", "path", logtext.Path(rel), "error", err)
 		sw.unreadable++
 		return nil
 	}
@@ -461,9 +462,11 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 	// keeps `seen` from being read as a complete enumeration downstream.
 	if !sw.budget.Charge() {
 		slog.Warn(scanBudgetMsg,
-			"path", rel, "entries", sw.budget.Count(), "limit", sw.budget.Max(),
+			"path", logtext.Path(rel), "entries", sw.budget.Count(), "limit", sw.budget.Max(),
 			"remediation", scanBudgetRemediation)
-		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.budget.Count(), rel)
+		// The stopping path is named in the error too, and that error is emitted as the
+		// scan summary's `error` attribute, so it goes through the same gate.
+		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.budget.Count(), logtext.Path(rel))
 	}
 	if d.IsDir() {
 		// A directory occupying a <name>.crt path is a certificate the scan cannot
@@ -481,7 +484,7 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		// that two-level contract as Warn for one condition.
 		if layout.IsCert(rel) {
 			slog.Debug("skipping cert: certificate path is a directory",
-				"path", rel,
+				"path", logtext.Path(rel),
 				"remediation", "replace the directory with a regular <name>.crt file")
 			sw.unreadable++
 		}
@@ -538,12 +541,12 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 		// will not appear in `seen`.
 		sw.unresolved++
 		slog.Warn("skipping symlink that could not be resolved through the input root; anything it points to, including certificates under a linked directory, is not scanned",
-			"path", rel, "error", err,
+			"path", logtext.Path(rel), "error", err,
 			"remediation", "mount that certificate path into /input directly instead of linking to it, or fix the permissions on the link target")
 	case err == nil && fi.IsDir():
 		// The target is inside the root, so the walk reaches those
 		// certificates through the real directory; nothing is missed.
-		slog.Debug("skipping symlinked directory; its target is walked directly", "path", rel)
+		slog.Debug("skipping symlinked directory; its target is walked directly", "path", logtext.Path(rel))
 	}
 }
 
@@ -755,7 +758,7 @@ func IsShutdown(err error) bool {
 // itself, so a failed entry leaves the previous bundle (or nothing) at the output
 // path and the next scan reaches the same verdict and retries the pair.
 func failEntry(logPath, msg string, err error, extra ...any) conversionStatus {
-	attrs := append([]any{"path", logPath, "error", err}, extra...)
+	attrs := append([]any{"path", logtext.Path(logPath), "error", err}, extra...)
 	if IsShutdown(err) {
 		slog.Debug(msg+" (shutdown)", attrs...)
 	} else {
@@ -1205,7 +1208,7 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 		// diagnostic, so it is statusUnreadable, the same outcome the two bounded
 		// reads below produce for the same class of condition. Health-neutral either
 		// way; the message is unchanged because an alert rule keys on it.
-		slog.Warn("skipping cert: cannot stat sibling key", "path", rel, "error", statErr,
+		slog.Warn("skipping cert: cannot stat sibling key", "path", logtext.Path(rel), "error", statErr,
 			"remediation", inputPermRemediation)
 		return pairInputs{}, statusUnreadable
 	}
@@ -1263,11 +1266,11 @@ func (sw *scanWalk) noteMissingKey(rel, keyRel string) conversionStatus {
 		// Byte-identical to the read side's vanish line for the same condition on the
 		// same pair, so an operator correlating one renewal does not meet two
 		// vocabularies for it.
-		slog.Debug("skipping cert: private key vanished during the scan", "path", rel)
+		slog.Debug("skipping cert: private key vanished during the scan", "path", logtext.Path(rel))
 		return statusVanished
 	}
 	// A genuine orphan: the certificate has no sibling key at all.
-	slog.Debug("skipping cert without matching key", "path", rel)
+	slog.Debug("skipping cert without matching key", "path", logtext.Path(rel))
 	return statusOrphan
 }
 
@@ -1310,15 +1313,15 @@ func (sw *scanWalk) noteUnreadableInput(logRel, inputRel, what string, err error
 		// A cancelled read is the shutdown itself, not an unreadable path: the WARN
 		// below is the message the README recommends alerting on, so emitting it for
 		// a normal SIGTERM would page an operator for a mount that is fine.
-		slog.Debug("skipping cert: "+what+" read interrupted by shutdown", "path", logRel, "error", err)
+		slog.Debug("skipping cert: "+what+" read interrupted by shutdown", "path", logtext.Path(logRel), "error", err)
 		return statusUnreadable
 	}
 	if errors.Is(err, fs.ErrNotExist) && sw.src.pathVanished(inputRel) {
-		slog.Debug("skipping cert: "+what+" vanished during the scan", "path", logRel, "error", err)
+		slog.Debug("skipping cert: "+what+" vanished during the scan", "path", logtext.Path(logRel), "error", err)
 		return statusVanished
 	}
 	slog.Warn("skipping cert: cannot read "+what,
-		"path", logRel, "error", err,
+		"path", logtext.Path(logRel), "error", err,
 		"remediation", inputPermRemediation)
 	return statusUnreadable
 }
@@ -1378,11 +1381,11 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		// edit still has to be named once even though the bundle on disk stays
 		// correct; observationLog.note owns that once-per-change rule.
 		sw.observations.note(rel, fingerprint, observations)
-		slog.Debug("skipping unchanged cert pair", "path", rel)
+		slog.Debug("skipping unchanged cert pair", "path", logtext.Path(rel))
 		return statusUnchanged
 	}
 
-	slog.Debug("converting cert pair", "path", rel)
+	slog.Debug("converting cert pair", "path", logtext.Path(rel))
 	pfxData, err := analysis.Encode(sw.enc, sw.password)
 	if err != nil {
 		logConversionObservations(rel, observations)
@@ -1418,7 +1421,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	}
 	sw.observations.record(rel, fingerprint, observations)
 
-	slog.Info("wrote pfx", "path", pfxRel)
+	slog.Info("wrote pfx", "path", logtext.Path(pfxRel))
 	return outcome
 }
 
@@ -1498,7 +1501,7 @@ func reportWriteFailure(logRel, pfxRel string, err writeRefusal, outcome convers
 		// writeOutcome grants statusUnwritable solely via bundleNotProvenWrong,
 		// whose allowlist is exactly contentUnverified.
 		slog.Warn(unreplaceableBundleMsg,
-			"path", logRel, "output_path", pfxRel, "error", err,
+			"path", logtext.Path(logRel), "output_path", logtext.Path(pfxRel), "error", err,
 			"content", "unverified", "remediation", err.cause().remediation())
 		return
 	}
@@ -1508,7 +1511,7 @@ func reportWriteFailure(logRel, pfxRel string, err writeRefusal, outcome convers
 	// from the refusal's own carried cause, exactly as the health-neutral arm above takes
 	// it, so a full volume or an /output layout that fails LOUDLY no longer sends the
 	// operator after ownership and a planted symlink.
-	failEntry(logRel, "conversion failed", err, "output_path", pfxRel,
+	failEntry(logRel, "conversion failed", err, "output_path", logtext.Path(pfxRel),
 		"remediation", err.cause().remediation())
 }
 
@@ -1536,7 +1539,7 @@ func reportWriteFailure(logRel, pfxRel string, err writeRefusal, outcome convers
 // Detail is already bounded by convert, so it needs no further truncation here.
 func logConversionObservations(rel string, observations []convert.Observation) {
 	for _, o := range observations {
-		attrs := []any{"path", rel, "kind", string(o.Kind), "detail", o.Detail}
+		attrs := []any{"path", logtext.Path(rel), "kind", string(o.Kind), "detail", o.Detail}
 		switch o.Kind.Class() {
 		case convert.ObservationClassQuiet:
 			slog.Debug("cert input observation", attrs...)

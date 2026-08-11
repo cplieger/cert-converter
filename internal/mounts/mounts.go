@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 
 	"github.com/cplieger/atomicfile/v2"
+	"github.com/cplieger/cert-converter/internal/logtext"
 )
 
 // Paths is the required mount set. This product mounts exactly two volumes, so
@@ -90,6 +91,11 @@ func Open(dirs Paths) (Roots, bool) {
 // error alone (fs.ErrNotExist, "not a directory"), so the diagnostic argument is
 // not what keeps this Stat here.
 func openMount(role, path string) (*os.Root, bool) {
+	// One sanitized rendering, reused by the attribute and by the remediation that
+	// names the same mount: both are log text, and a mount path holding CR/LF or a bidi
+	// control must not reach either (logtext.Path). `path` itself stays RAW below — the
+	// Stat and the open address the real filesystem.
+	logPath := logtext.Path(path)
 	fi, statErr := os.Stat(path)
 	if statErr == nil && fi.IsDir() {
 		root, openErr := openMountRoot(path)
@@ -97,8 +103,8 @@ func openMount(role, path string) (*os.Root, bool) {
 			return root, true
 		}
 		slog.Error("required volume cannot be opened by this container's user; refusing to start",
-			"role", role, "path", path, "error", openErr,
-			"remediation", "grant the UID in the container's `user:` read access to "+path+
+			"role", role, "path", logPath, "error", openErr,
+			"remediation", "grant the UID in the container's `user:` read access to "+logPath+
 				" (chgrp/chmod the host directory), or run the container as a UID that already has it")
 		return nil, false
 	}
@@ -109,8 +115,8 @@ func openMount(role, path string) (*os.Root, bool) {
 		statErr = errors.New("path exists but is not a directory")
 	}
 	slog.Error("required volume is missing or not a directory; refusing to start",
-		"role", role, "path", path, "error", statErr,
-		"remediation", "mount "+path+" into the container before starting it")
+		"role", role, "path", logPath, "error", statErr,
+		"remediation", "mount "+logPath+" into the container before starting it")
 	return nil, false
 }
 
@@ -130,7 +136,7 @@ func closeRoot(root *os.Root, role string) {
 	}
 	if err := root.Close(); err != nil {
 		slog.Debug("failed to close a required volume's handle",
-			"role", role, "path", root.Name(), "error", err)
+			"role", role, "path", logtext.Path(root.Name()), "error", err)
 	}
 }
 
@@ -181,7 +187,7 @@ func WarnOutputNotWritable(root *os.Root) {
 		// condition. Nothing is known about /output either way, so this must NOT
 		// print the not-writable diagnosis an operator would act on.
 		slog.Debug("the output write probe could not be attempted",
-			"role", roleOutput, "path", root.Name(), "error", err)
+			"role", roleOutput, "path", logtext.Path(root.Name()), "error", err)
 	case res.OK():
 		// Deliberately silent: /output being usable is the expected case, and main's
 		// startup line already states the path and the UID. A record here would print
@@ -212,10 +218,13 @@ const outputNotWritableMsg = "the output volume is not writable by the running U
 // diagnostic in this file is an inline slog call, and goconst counts a key repeated
 // inside a composite literal while ignoring one passed as a call argument.
 func warnOutputRefusedWrite(root *os.Root, res atomicfile.ProbeResult) {
+	// One sanitized rendering of the volume's own name, reused by both remediations
+	// below: the remediation is log text like any attribute (logtext.Path).
+	logRoot := logtext.Path(root.Name())
 	// Same root cause as internal/process's outputPermRemediation (store.go), stated
 	// as the startup action: at this point nothing has been written yet, so the
 	// operator is pointed at the host directory rather than at a bundle.
-	remediation := "chown the host directory mounted at " + root.Name() +
+	remediation := "chown the host directory mounted at " + logRoot +
 		" to the UID in user: (and check the mount is not read-only)"
 	// A create refusal is an ownership/read-only/missing-mount condition, which the
 	// chown advice above fits. A write or sync refusal is not: the directory entry was
@@ -225,19 +234,19 @@ func warnOutputRefusedWrite(root *os.Root, res atomicfile.ProbeResult) {
 	// whose ownership is already correct costs them the whole diagnosis.
 	if res.Stage == atomicfile.ProbeStageWrite || res.Stage == atomicfile.ProbeStageSync {
 		remediation = "the directory entry was accepted and the data was not, so this is not an ownership problem: " +
-			"check free space and any quota on the filesystem backing " + root.Name()
+			"check free space and any quota on the filesystem backing " + logRoot
 	}
 	if res.Leaked {
 		// Reachable when the write or the flush failed AND the follow-up unlink failed
 		// too: the volume is unusable and is still holding the probe file.
 		slog.Warn(outputNotWritableMsg,
-			"role", roleOutput, "path", res.Dir, "stage", res.Stage.String(), "error", res.Err,
+			"role", roleOutput, "path", logtext.Path(res.Dir), "stage", res.Stage.String(), "error", res.Err,
 			"uid", os.Getuid(), "gid", os.Getgid(), "remediation", remediation,
-			"leaked_probe", probePath(res), "cleanup", staleTempRemediation)
+			"leaked_probe", logtext.Path(probePath(res)), "cleanup", staleTempRemediation)
 		return
 	}
 	slog.Warn(outputNotWritableMsg,
-		"role", roleOutput, "path", res.Dir, "stage", res.Stage.String(), "error", res.Err,
+		"role", roleOutput, "path", logtext.Path(res.Dir), "stage", res.Stage.String(), "error", res.Err,
 		"uid", os.Getuid(), "gid", os.Getgid(), "remediation", remediation)
 }
 
@@ -255,11 +264,11 @@ func warnOutputProbeTeardown(res atomicfile.ProbeResult) {
 		msg = "failed to close the output write probe"
 	}
 	if res.Leaked {
-		slog.Warn(msg, "path", probePath(res), "stage", res.Stage.String(), "error", res.Err,
+		slog.Warn(msg, "path", logtext.Path(probePath(res)), "stage", res.Stage.String(), "error", res.Err,
 			"remediation", staleTempRemediation)
 		return
 	}
-	slog.Warn(msg, "path", probePath(res), "stage", res.Stage.String(), "error", res.Err)
+	slog.Warn(msg, "path", logtext.Path(probePath(res)), "stage", res.Stage.String(), "error", res.Err)
 }
 
 // probePath is the probe file's full path for a diagnostic, as the hand-rolled
