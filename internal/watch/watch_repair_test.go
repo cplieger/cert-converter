@@ -73,7 +73,7 @@ func TestWatchLoop_runs_the_repair_the_reassert_floor_deferred(t *testing.T) {
 	st.lastResync = time.Now().Add(-minPreScanResync)
 	st.repairTimer.Reset(0)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- w.runWatchLoop(ctx, watcher, st) }()
 

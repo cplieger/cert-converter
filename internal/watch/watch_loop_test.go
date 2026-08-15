@@ -30,7 +30,7 @@ func TestWatchLoop_converts_a_real_cert_write_through_the_debounce(t *testing.T)
 		t.Fatalf("setup: addWatchDirs = %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- w.watchLoop(ctx, watcher) }()
 
@@ -195,7 +195,7 @@ func TestWatchLoop_runs_the_periodic_fallback_scan_without_any_event(t *testing.
 		t.Fatalf("setup: addWatchDirs = %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- w.watchLoop(ctx, watcher) }()
 

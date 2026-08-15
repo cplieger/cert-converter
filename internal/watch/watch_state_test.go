@@ -278,7 +278,7 @@ func TestRunDebouncedScan_skips_the_scan_when_shutdown_cut_the_resync_short(t *t
 	st.scheduleScan()
 
 	calls := 0
-	ctx := liveForNCtx{Context: context.Background(), calls: &calls, live: 6}
+	ctx := liveForNCtx{Context: t.Context(), calls: &calls, live: 6}
 
 	st.runDebouncedScan(ctx, watcher)
 

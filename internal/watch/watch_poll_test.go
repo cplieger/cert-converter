@@ -177,7 +177,7 @@ func TestPollTick_treats_shutdown_during_the_watch_set_rebuild_as_a_stop(t *test
 	}
 	scans := 0
 	w := New(root, func(context.Context) { scans++ }, WithFallback(time.Hour))
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	prev := newFSWatcher
 	t.Cleanup(func() { newFSWatcher = prev })
@@ -214,7 +214,7 @@ func TestPollTick_treats_shutdown_during_the_watch_set_rebuild_as_a_stop(t *test
 func TestPollLoopWithUpgrade_returns_when_a_shutdown_interrupts_a_poll_tick(t *testing.T) {
 	prev := newFSWatcher
 	t.Cleanup(func() { newFSWatcher = prev })
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	newFSWatcher = func() (*fsnotify.Watcher, error) {
 		cancel() // the shutdown lands during the tick's upgrade attempt
@@ -359,7 +359,7 @@ func TestPollTick_does_no_work_when_the_ctx_is_already_cancelled(t *testing.T) {
 // false critical change-detection-dead alert on a graceful stop.
 func TestPollLoopWithUpgrade_treats_shutdown_during_the_initial_scan_as_a_clean_stop(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	scans := 0
 	// No WithFallback: the dead-change-detection configuration, where a live ctx
 	// after the initial scan returns a *LostError.
@@ -399,7 +399,7 @@ func TestPollLoopWithUpgrade_returns_on_shutdown_while_polling(t *testing.T) {
 
 	scans := make(chan struct{}, 4)
 	w := New(t.TempDir(), func(context.Context) { scans <- struct{}{} }, WithFallback(time.Hour))
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := runPollLoop(ctx, w)
 
 	select {

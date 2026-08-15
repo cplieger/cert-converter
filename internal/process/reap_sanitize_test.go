@@ -1,7 +1,6 @@
 package process
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -53,7 +52,7 @@ func TestStoreReconcile_sanitizes_output_derived_names_in_log_attributes(t *test
 
 	logs := captureLogs(t)
 	deleted, err := newReaper(newOutputStore(t, outDir), newInputSource(t, inDir), outputpolicy.LifecycleWarn).
-		reconcile(context.Background(), map[string]struct{}{}, &reapContext{
+		reconcile(t.Context(), map[string]struct{}{}, &reapContext{
 			result: ScanResult{Total: 1}, walkCompleted: true,
 		})
 	if err != nil {

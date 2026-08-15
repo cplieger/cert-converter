@@ -175,7 +175,7 @@ func TestStoreReconcile(t *testing.T) {
 			seen := map[string]struct{}{"live.crt": {}}
 
 			got, err := newReaper(s, newInputSource(t, t.TempDir()), tc.mode).
-				reconcile(context.Background(), seen, tc.rc)
+				reconcile(t.Context(), seen, tc.rc)
 			if err != nil {
 				t.Errorf("reconcile = error %v, want nil: only a cancelled scan reports one", err)
 			}
@@ -215,7 +215,7 @@ func TestStoreReconcile_warn_mode_reports_report_only_despite_a_conversion_failu
 	s := newOutputStore(t, dir)
 
 	deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleWarn).
-		reconcile(context.Background(), map[string]struct{}{},
+		reconcile(t.Context(), map[string]struct{}{},
 			&reapContext{result: ScanResult{Total: 1, Failed: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Fatalf("reconcile(warn, one failed conversion) = error %v, want nil", reconcileErr)
@@ -251,7 +251,7 @@ func TestStoreReconcile_unsafe_output_walk_never_advises_deletion(t *testing.T) 
 	s := newOutputStore(t, dir)
 
 	deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
-		reconcile(context.Background(), map[string]struct{}{},
+		reconcile(t.Context(), map[string]struct{}{},
 			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Fatalf("reconcile(unsafe output walk) = error %v, want nil", reconcileErr)
@@ -288,7 +288,7 @@ func TestStoreReconcile_vanished_input_is_reported_at_debug_not_as_a_mount_warni
 	s := newOutputStore(t, dir)
 
 	deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
-		reconcile(context.Background(), map[string]struct{}{},
+		reconcile(t.Context(), map[string]struct{}{},
 			&reapContext{result: ScanResult{Total: 1, Vanished: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Fatalf("reconcile(vanished input) = error %v, want nil", reconcileErr)
@@ -470,7 +470,7 @@ func TestStoreReconcile_oversized_orphan_sample_keeps_the_count(t *testing.T) {
 	s := newOutputStore(t, dir)
 
 	deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleWarn).
-		reconcile(context.Background(), map[string]struct{}{},
+		reconcile(t.Context(), map[string]struct{}{},
 			&reapContext{result: ScanResult{Total: maxLoggedOrphans}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Fatalf("reconcile(%d oversized orphan names) = error %v, want nil", maxLoggedOrphans, reconcileErr)
@@ -942,7 +942,7 @@ func TestStoreReconcile_sync_spares_a_nested_live_bundle(t *testing.T) {
 	seen := map[string]struct{}{filepath.Join("acme-v02", "example.com", "live.crt"): {}}
 
 	got, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
-		reconcile(context.Background(), seen, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+		reconcile(t.Context(), seen, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Errorf("reconcile(nested output tree) = error %v, want nil", reconcileErr)
 	}
@@ -1537,7 +1537,7 @@ func TestWaitForReapDeferral(t *testing.T) {
 
 	t.Run("an elapsed delay returns nil", func(t *testing.T) {
 		t.Parallel()
-		if err := waitForReapDeferral(context.Background(), time.Millisecond); err != nil {
+		if err := waitForReapDeferral(t.Context(), time.Millisecond); err != nil {
 			t.Errorf("waitForReapDeferral(elapsed delay) = %v, want nil", err)
 		}
 	})
@@ -1574,7 +1574,7 @@ func TestStoreReconcile_spares_an_orphan_whose_certificate_returns_during_the_re
 	logs := captureLogs(t)
 
 	deleted, reconcileErr := newReaper(s, newInputSource(t, in), outputpolicy.LifecycleSync).
-		reconcile(context.Background(), map[string]struct{}{},
+		reconcile(t.Context(), map[string]struct{}{},
 			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 
 	if reconcileErr != nil {
@@ -1625,7 +1625,7 @@ func TestStoreReconcile_shutdown_during_the_recheck_abandons_the_reap(t *testing
 	// A context that is live when the candidates are identified and cancelled inside
 	// the window, which is the only arrangement the earlier shutdown guards cannot
 	// already catch.
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 	stubReapWait(t, func(ctx context.Context) error {
 		cancel()
@@ -1687,7 +1687,7 @@ func TestStoreReconcile_defers_once_per_batch(t *testing.T) {
 			})
 
 			deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
-				reconcile(context.Background(), map[string]struct{}{},
+				reconcile(t.Context(), map[string]struct{}{},
 					&reapContext{result: ScanResult{Total: tc.total}, walkCompleted: true})
 
 			if reconcileErr != nil {
@@ -1730,7 +1730,7 @@ func TestScannerRun_reports_a_shutdown_that_arrives_during_reconciliation(t *tes
 	})
 	// Live for the whole walk and cancelled inside the confirmation window: the only
 	// arrangement in which the walk succeeds and reconciliation does not.
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 	stubReapWait(t, func(ctx context.Context) error {
 		cancel()
@@ -2447,7 +2447,7 @@ func TestStoreReconcile_rechecks_each_candidate_immediately_before_its_own_delet
 	logs := captureLogs(t)
 
 	deleted, reconcileErr := newReaper(s, newInputSource(t, in), outputpolicy.LifecycleSync).
-		reconcile(context.Background(), map[string]struct{}{},
+		reconcile(t.Context(), map[string]struct{}{},
 			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 
 	if reconcileErr != nil {
@@ -2517,7 +2517,7 @@ func TestStoreReconcile_keeps_a_bundle_whose_private_key_is_still_present(t *tes
 	logs := captureLogs(t)
 
 	deleted, reconcileErr := newReaper(s, newInputSource(t, in), outputpolicy.LifecycleSync).
-		reconcile(context.Background(), map[string]struct{}{},
+		reconcile(t.Context(), map[string]struct{}{},
 			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 
 	if reconcileErr != nil {
@@ -2578,7 +2578,7 @@ func TestStoreReconcile_lone_key_veto_reads_any_occupant_as_a_key(t *testing.T) 
 	logs := captureLogs(t)
 
 	deleted, reconcileErr := newReaper(s, newInputSource(t, in), outputpolicy.LifecycleSync).
-		reconcile(context.Background(), map[string]struct{}{},
+		reconcile(t.Context(), map[string]struct{}{},
 			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 
 	if reconcileErr != nil {
@@ -2622,7 +2622,7 @@ func TestStoreReconcile_lone_key_warn_is_deduplicated_per_change(t *testing.T) {
 	rc := &reapContext{result: ScanResult{Total: 1}, walkCompleted: true}
 
 	for range 3 {
-		if _, err := rp.reconcile(context.Background(), map[string]struct{}{}, rc); err != nil {
+		if _, err := rp.reconcile(t.Context(), map[string]struct{}{}, rc); err != nil {
 			t.Fatalf("reconcile(lone key) = error %v, want nil", err)
 		}
 	}
@@ -2635,7 +2635,7 @@ func TestStoreReconcile_lone_key_warn_is_deduplicated_per_change(t *testing.T) {
 	// The pair reading whole again is the CHANGE that retires the report, so the next time
 	// it loses its certificate the operator is told again.
 	rp.observations.markWhole("half.crt")
-	if _, err := rp.reconcile(context.Background(), map[string]struct{}{}, rc); err != nil {
+	if _, err := rp.reconcile(t.Context(), map[string]struct{}{}, rc); err != nil {
 		t.Fatalf("reconcile(lone key after the pair read whole) = error %v, want nil", err)
 	}
 	if got := logs.CountLevel(slog.LevelWarn, loneKeyRetainedMsg); got != 2 {
@@ -2686,7 +2686,7 @@ func TestStoreReconcile_uninspectable_key_warn_is_deduplicated_per_change(t *tes
 	rc := &reapContext{result: ScanResult{Total: 1}, walkCompleted: true}
 
 	for range 3 {
-		if _, err := rp.reconcile(context.Background(), map[string]struct{}{}, rc); err != nil {
+		if _, err := rp.reconcile(t.Context(), map[string]struct{}{}, rc); err != nil {
 			t.Fatalf("reconcile(uninspectable key path) = error %v, want nil", err)
 		}
 	}
@@ -2708,7 +2708,7 @@ func TestStoreReconcile_uninspectable_key_warn_is_deduplicated_per_change(t *tes
 	if err := os.WriteFile(filepath.Join(in, "blocked", "x.key"), []byte("key"), 0o600); err != nil {
 		t.Fatalf("setup: WriteFile(blocked/x.key): %v", err)
 	}
-	if _, err := rp.reconcile(context.Background(), map[string]struct{}{}, rc); err != nil {
+	if _, err := rp.reconcile(t.Context(), map[string]struct{}{}, rc); err != nil {
 		t.Fatalf("reconcile(readable key path) = error %v, want nil", err)
 	}
 	if got := logs.CountLevel(slog.LevelWarn, loneKeyRetainedMsg); got != 1 {
@@ -2726,7 +2726,7 @@ func TestStoreReconcile_uninspectable_key_warn_is_deduplicated_per_change(t *tes
 	if err := os.Symlink(outside, link); err != nil {
 		t.Fatalf("setup: Symlink(again): %v", err)
 	}
-	if _, err := rp.reconcile(context.Background(), map[string]struct{}{}, rc); err != nil {
+	if _, err := rp.reconcile(t.Context(), map[string]struct{}{}, rc); err != nil {
 		t.Fatalf("reconcile(uninspectable again) = error %v, want nil", err)
 	}
 	if got := logs.CountLevel(slog.LevelWarn, recheckUnreadableMsg); got != 2 {
@@ -2762,7 +2762,7 @@ func TestStoreReconcile_names_a_certificate_recheck_it_could_not_make(t *testing
 	logs := captureLogs(t)
 
 	deleted, err := newReaper(s, newInputSource(t, in), outputpolicy.LifecycleSync).
-		reconcile(context.Background(), map[string]struct{}{},
+		reconcile(t.Context(), map[string]struct{}{},
 			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 	if err != nil {
 		t.Fatalf("reconcile(uninspectable certificate path) = error %v, want nil", err)
@@ -2807,7 +2807,7 @@ func TestStoreReconcile_audits_deletions_once_per_scan_at_warn(t *testing.T) {
 	logs := captureLogs(t)
 
 	deleted, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
-		reconcile(context.Background(), map[string]struct{}{},
+		reconcile(t.Context(), map[string]struct{}{},
 			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 
 	if reconcileErr != nil {
@@ -2865,7 +2865,7 @@ func TestStoreReconcile_no_audit_record_when_nothing_was_deleted(t *testing.T) {
 	logs := captureLogs(t)
 
 	deleted, reconcileErr := newReaper(newOutputStore(t, out), newInputSource(t, in), outputpolicy.LifecycleSync).
-		reconcile(context.Background(), map[string]struct{}{},
+		reconcile(t.Context(), map[string]struct{}{},
 			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 
 	if reconcileErr != nil {
@@ -2898,7 +2898,7 @@ func TestReapConfirmed_reports_refused_removals_once_per_scan_at_warn(t *testing
 	logs := captureLogs(t)
 
 	deleted, err := newReaper(newOutputStore(t, out), newInputSource(t, t.TempDir()),
-		outputpolicy.LifecycleSync).reapConfirmed(context.Background(), []string{"stuck.pfx"})
+		outputpolicy.LifecycleSync).reapConfirmed(t.Context(), []string{"stuck.pfx"})
 	if err != nil {
 		t.Fatalf("reapConfirmed(refused candidate) = error %v, want nil: a refusal is not a scan failure", err)
 	}
@@ -3021,7 +3021,7 @@ func TestStoreReconcile_keep_is_silent_with_orphans_present(t *testing.T) {
 	s := newOutputStore(t, dir)
 
 	deleted, err := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleKeep).
-		reconcile(context.Background(), map[string]struct{}{},
+		reconcile(t.Context(), map[string]struct{}{},
 			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 	if err != nil {
 		t.Fatalf("reconcile(keep, one orphan) = error %v, want nil", err)

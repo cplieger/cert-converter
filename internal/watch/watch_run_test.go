@@ -33,7 +33,7 @@ func TestRun_scans_once_with_the_watch_set_live(t *testing.T) {
 	// below is a duplicate startup scan rather than a fallback tick.
 	w := New(root, func(context.Context) { scans <- struct{}{} }, WithDebounce(20*time.Millisecond))
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- w.Run(ctx) }()
 
@@ -145,7 +145,7 @@ func TestRun_upgrades_from_poll_to_watch_and_keeps_detecting_events(t *testing.T
 		}
 	}, WithDebounce(10*time.Millisecond), WithFallback(20*time.Millisecond))
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- w.Run(ctx) }()
 
@@ -261,7 +261,7 @@ func TestWatchMode_states_the_post_watch_set_sequence_once(t *testing.T) {
 			w := New(root, func(context.Context) { scans <- struct{}{} },
 				WithDebounce(20*time.Millisecond), WithFallback(time.Hour))
 
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := context.WithCancel(t.Context())
 			watcher := tc.acquire(ctx, t, w)
 			if n := len(scans); n != tc.wantBefore {
 				cancel()

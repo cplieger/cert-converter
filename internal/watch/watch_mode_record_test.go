@@ -330,7 +330,7 @@ func TestWatchModeScans_report_watch_mode_at_info(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			scans := 0
 
