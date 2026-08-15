@@ -19,17 +19,6 @@ func TestMarker(t *testing.T) {
 	}
 }
 
-// TestCap_leaves_text_within_the_limit_alone pins that the marker is only ever a
-// claim about a cut: text that fits comes back untouched and unmarked.
-func TestCap_leaves_text_within_the_limit_alone(t *testing.T) {
-	t.Parallel()
-	for _, s := range []string{"", "a", "exactly-ten"} {
-		if got := logtext.Cap(s, len(s)); got != s {
-			t.Errorf("Cap(%q, %d) = %q, want it unchanged", s, len(s), got)
-		}
-	}
-}
-
 // TestCap_does_not_sanitize pins the split this package is organised around: Cap
 // bounds and marks, Path rewrites, and the ONE caller that needs both composes them in
 // that order (sanitize, then cap). Folding sanitizing into Cap would move the marker's

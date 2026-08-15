@@ -32,17 +32,12 @@ const (
 const watchDebounce = 2 * time.Second
 
 // healthyAfterScan reports whether a completed scan should keep the container
-// healthy. Only conversion failures clear health; input coverage gaps and output
-// bundles the volume refused to let this app replace are permissions/layout
-// conditions a restart cannot fix. The pointer avoids copying ScanResult and is
-// never mutated.
+// healthy.
 func healthyAfterScan(r *process.ScanResult) bool {
 	return r.Failed == 0
 }
 
-// scanAndSetHealth runs one scan and updates the marker. Shutdown cancellation
-// leaves the prior marker untouched; any other scan error clears it. Scanner
-// owns input-coverage diagnostics; this composition root logs terminal errors.
+// scanAndSetHealth runs one scan and updates the marker.
 func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *health.Marker) {
 	result, err := scanner.Run(ctx)
 	if err != nil {
@@ -64,13 +59,7 @@ var runProbe = health.RunProbe
 
 // requiredVolumes is the ONE statement of this container's mount set: the paths
 // the startup guard proves openable, and the same paths the scanner, the watcher
-// and the startup line then use. It is a seam in the same style as runProbe — the
-// production value is the two fixed container paths, and tests point it at temp
-// directories so the refusal itself can be exercised without a /input and /output
-// on the test host — and it is read rather than the consts everywhere downstream,
-// so a substitution cannot redirect the guard while leaving the scan and the watch
-// pointed at the real /input and /output. The consts above are its only other
-// reader.
+// and the startup line then use.
 var requiredVolumes = mounts.Paths{
 	Input:  certsRootDir,
 	Output: outputDir,
@@ -79,10 +68,7 @@ var requiredVolumes = mounts.Paths{
 const healthSubcommand = "health"
 
 // dispatchArgs runs the health probe when argv requests it and REJECTS an
-// unrecognized argument. It returns the process exit code, or
-// continueToWatcher when argv asks for the watcher. Returning rather than
-// calling os.Exit keeps the decision testable and keeps every exit on one path
-// through run().
+// unrecognized argument.
 func dispatchArgs(args []string) int {
 	if len(args) <= 1 {
 		return continueToWatcher
@@ -92,19 +78,6 @@ func dispatchArgs(args []string) int {
 		// The periodic safety-net scan is the marker's guaranteed refresh floor
 		// (fs events refresh it sooner), so a marker older than 3 of those
 		// intervals means the watch loop is wedged and a restart fixes it.
-		// scancadence.Effective is what converts the configured cadence into
-		// that floor: FALLBACK_SCAN_HOURS=0/false removes the operator's own
-		// cadence, NOT the reconciliation floor the watcher falls back to, so the
-		// deadline is armed in every configuration — on the default 6h cadence it
-		// is 18h, and with the routine rescan disabled it is 3 reconciliation
-		// floors. A cadence above the floor is capped by the same call, so the
-		// config package's 10-year ceiling no longer produces a deadline that can
-		// never expire.
-		// config.FallbackInterval is deliberately silent — a misconfigured or
-		// above-ceiling value is diagnosed once at startup by config.Load, not
-		// here, where Docker's healthcheck would reprint it every 30s forever.
-		// RunProbe exits the process, so this never falls through to the
-		// watcher below.
 		runProbe(health.DefaultPath,
 			health.WithMaxAge(3*scancadence.Effective(config.FallbackInterval())))
 		return continueToWatcher // unreachable in production; runProbe exits
@@ -112,9 +85,6 @@ func dispatchArgs(args []string) int {
 		// Refuse rather than fall through: falling through reaches
 		// marker.Set(false) in run(), which UNLINKS the resident watcher's health
 		// marker, and then starts a second watcher over the same /input and /output.
-		// The ENTRYPOINT takes no arguments, so a mistyped HEALTHCHECK override
-		// (`healthz`, `--health`) or a stray `docker exec ... status` is a mistake,
-		// and a usage error is the honest response.
 		if args[1] != healthSubcommand {
 			// Names the unrecognized token even when extra operands follow it: the
 			// token IS the mistake, and reporting only the operands hides it.
@@ -128,8 +98,7 @@ func dispatchArgs(args []string) int {
 	}
 }
 
-// dispatchArgs sentinels. continueToWatcher is deliberately negative so it can
-// never collide with a real exit code.
+// dispatchArgs sentinels.
 const (
 	continueToWatcher = -1
 	exitUsage         = 2
@@ -153,16 +122,13 @@ func run() int {
 	// Diagnosed only on the watcher path, below the argv dispatch: the health
 	// subcommand re-reads LOG_LEVEL on every probe (roughly every 30s under the
 	// image's HEALTHCHECK), so warning before dispatchArgs turned a
-	// once-per-process-start startup line into one on every healthcheck. The
-	// wording lives in config, which owns the variable; config.FallbackInterval
-	// is silent for the same reason and config.Load owns that setting's WARNs.
+	// once-per-process-start startup line into one on every healthcheck.
 	config.WarnInvalidLogLevel()
 
 	// Clear any marker left by a previous run BEFORE the first failure exit:
 	// /tmp/.healthy lives in the container's writable layer and survives a
 	// restart, so an early return here would leave a stale healthy marker for a
-	// process that never validated its configuration. The health subcommand has
-	// already exited by this point, so the probe is unaffected.
+	// process that never validated its configuration.
 	marker := health.NewMarker(health.DefaultPath)
 	marker.Set(false)
 	defer marker.Cleanup()
@@ -181,8 +147,7 @@ func run() int {
 			"input", logtext.Path(requiredVolumes.Input), "output", logtext.Path(requiredVolumes.Output),
 			// The whole mount contract is "readable/writable by the UID in user:",
 			// and every downstream permission WARN points at that UID without ever
-			// naming it. compose resolves it from ${PUID:-1000}, so the compose file
-			// may not name it either; the process is the only thing that knows.
+			// naming it.
 			"uid", os.Getuid(), "gid", os.Getgid(),
 			"password", string(cfg.PasswordStatus),
 		},
@@ -190,9 +155,7 @@ func run() int {
 		// operator's own rescan interval and reads "disabled" when they switched it
 		// off, while scan_floor is the cadence the watcher guarantees regardless —
 		// the longest it will go without a full re-assert plus scan, and the value
-		// the health probe's staleness deadline is derived from. Spliced from the
-		// watch package's own renderer so this line and every degraded-path WARN
-		// cannot spell the pair differently.
+		// the health probe's staleness deadline is derived from.
 		scancadence.CoverageAttrs(cfg.FallbackInterval),
 		[]any{
 			"encoder", cfg.EncoderName,
@@ -202,8 +165,7 @@ func run() int {
 
 	// Verify owns the handles it opens: it proves both volumes openable, probes
 	// /output for write access through the handle it just proved, and releases both
-	// before returning. Nothing downstream needs one -- internal/process opens its
-	// own confined roots per scan -- so no handle crosses this boundary.
+	// before returning.
 	if !mounts.Verify(requiredVolumes) {
 		return 1
 	}
@@ -230,10 +192,7 @@ func run() int {
 		scanAndSetHealth(ctx, scanner, marker)
 	}
 
-	// No scan here: w.Run owns the first scan in both modes. In fsnotify mode it
-	// must run AFTER the watch set is attached so an event landing during the scan
-	// is not missed — a sequencing constraint main cannot honour from outside, and
-	// a scan here would double every start's /input scans and marker writes.
+	// No scan here: w.Run owns the first scan in both modes.
 	w := watch.New(requiredVolumes.Input, runAndSetHealth,
 		watch.WithDebounce(watchDebounce),
 		watch.WithFallback(cfg.FallbackInterval),
@@ -246,18 +205,6 @@ func run() int {
 
 // reportWatchExit turns the watcher's single exit into the process's exit code,
 // and is the SINGLE place the app announces that change detection is dead.
-//
-// That announcement is main's to make because main is what ACTS on the
-// condition: it exits non-zero so the orchestrator restarts the container.
-// internal/watch returns the condition (a *watch.LostError naming which loss
-// occurred, plus the operator action where one exists) and logs nothing about
-// it, so the wording cannot drift across the package boundary — the
-// CertConverterChangeDetectionDead alert matches the message below and nothing
-// else. Exactly one ERROR record per dead-detection event.
-//
-// A nil error is a shutdown: it reports the cause at Info and exits 0, and must
-// never mention dead change detection, or a SIGTERM would fire that critical
-// alert.
 func reportWatchExit(ctx context.Context, runErr error) int {
 	if runErr == nil {
 		slog.Info("shutting down", "reason", context.Cause(ctx))
@@ -265,9 +212,6 @@ func reportWatchExit(ctx context.Context, runErr error) int {
 	}
 	// Run reported that change detection ended for a reason other than
 	// shutdown: the fsnotify watch is gone and only a restart can recover it.
-	// Exit non-zero so restart: on-failure deployments restart too; the
-	// deferred marker.Cleanup drops the marker on the way out, so a probe
-	// cannot report healthy after this point.
 	attrs := []any{"error", runErr}
 	var lost *watch.LostError
 	if errors.As(runErr, &lost) && lost.Remediation != "" {

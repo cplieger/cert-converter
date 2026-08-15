@@ -1,10 +1,5 @@
 // Package testcerts provides key-type-aware cert/key pairs and signing chains for
 // cert-converter tests.
-//
-// It remains app-local because callers need returned private keys, selectable key
-// types, non-CA leaves, and full chains; httpx/certtest intentionally exposes a
-// fixed P-256 CA without its private key. Ed25519 callers want a private key rather
-// than a cert/key pair, so they build the key directly and need nothing from here.
 package testcerts
 
 import (
@@ -45,15 +40,6 @@ func signCert(tb testing.TB, template, parent *x509.Certificate, pub crypto.Publ
 // Mint signs template with parent (a nil parent yields a self-signed certificate
 // whose template is its own issuer) and returns the PEM encoding and the parsed
 // certificate (whose Raw field carries the DER).
-//
-// pub is independent of parentKey so a fixture can carry a key it could not have
-// signed with: an adversarial bundle needs a certificate whose subject key and
-// signing key are unrelated. It sits beside template rather than in
-// x509.CreateCertificate's position because the subject's key is part of the
-// certificate being described, which is the order every caller in this repo
-// already reads. It is the template-level primitive the fixed-shape generators
-// below are built from, exported because the app's test suites otherwise
-// re-derive it per file.
 func Mint(tb testing.TB, template *x509.Certificate, pub crypto.PublicKey,
 	parent *x509.Certificate, parentKey crypto.Signer,
 ) (pemBytes []byte, parsed *x509.Certificate) {
@@ -127,7 +113,6 @@ func GenerateSelfSignedCert(tb testing.TB, cn, keyType string) (certPEM, keyPEM 
 }
 
 // GenerateCertChain creates a CA + leaf certificate chain.
-// Returns leaf PEM, key PEM, CA PEM, and the full chain (leaf + CA).
 func GenerateCertChain(tb testing.TB) (leafPEM, keyPEM, caPEM, chainPEM []byte) {
 	tb.Helper()
 
@@ -154,11 +139,7 @@ func GenerateCertChain(tb testing.TB) (leafPEM, keyPEM, caPEM, chainPEM []byte) 
 
 	keyPEM = KeyPEM(tb, leafKey)
 
-	// Concatenate leaf + CA into the chain. Build via append on a nil
-	// slice rather than make([]byte, 0, len(a)+len(b)): the explicit
-	// len+len capacity expression trips CodeQL's
-	// go/allocation-size-overflow rule (it can't prove the sum doesn't
-	// wrap), and append grows the backing array safely on its own.
+	// Concatenate leaf + CA into the chain.
 	chainPEM = append(chainPEM, leafPEM...)
 	chainPEM = append(chainPEM, caPEM...)
 	return leafPEM, keyPEM, caPEM, chainPEM
@@ -167,11 +148,6 @@ func GenerateCertChain(tb testing.TB) (leafPEM, keyPEM, caPEM, chainPEM []byte) 
 // ChainMaterial carries every piece of a generated CA -> leaf chain that a test
 // needs to assemble an adversarial bundle: each certificate's PEM, each private
 // key's PEM, and two alternative leaves reusing the leaf's key.
-//
-// GenerateCertChain deliberately exposes only the leaf's key, which is right for
-// the happy path but cannot express the cases identity selection has to get
-// right: a bundle whose supplied key belongs to the ISSUER, or one holding a
-// renewed certificate that reuses its predecessor's key.
 type ChainMaterial struct {
 	// CAPEM is the self-signed CA that issued LeafPEM.
 	CAPEM []byte
@@ -185,9 +161,7 @@ type ChainMaterial struct {
 	// RenewedPEM is a second end-entity certificate reusing LeafKeyPEM with a
 	// later NotBefore, both currently valid: the renewed-certificate tie.
 	RenewedPEM []byte
-	// FutureRenewedPEM reuses LeafKeyPEM with a NotBefore in the FUTURE. It has
-	// the latest NotBefore of the three, so a tie-break that ranked on NotBefore
-	// alone would select a certificate no consumer will accept yet.
+	// FutureRenewedPEM reuses LeafKeyPEM with a NotBefore in the FUTURE.
 	FutureRenewedPEM []byte
 }
 

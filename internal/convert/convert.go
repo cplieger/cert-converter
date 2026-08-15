@@ -34,53 +34,20 @@ const (
 
 // --- Certificate chain parsing ---
 
-// maxChainCerts bounds how many CERTIFICATE blocks one input file may declare. A
-// real chain is a leaf plus a handful of issuers; the bound exists because
-// Analyse's graph work is superlinear in the certificate count (all-pairs
-// candidate edges, and a path walk that verifies up to n^2/2 signatures), so one
-// file inside the reader's MaxInputBytes cap could otherwise hold ~19,000 certificates
-// and spend hours of CPU plus gigabytes of adjacency state on the scan's only
-// goroutine.
+// maxChainCerts bounds how many CERTIFICATE blocks one input file may declare.
 const maxChainCerts = 64
 
 // maxKeyBlocks bounds how many private-key blocks one key file may declare.
-// Rotation appends a second key; nothing legitimate appends thousands, and every
-// extra key multiplies identity matching.
 const maxKeyBlocks = 16
 
 // MaxInputBytes is the largest certificate or key file this package's acceptance
 // bounds are calibrated against: maxChainCerts, maxKeyBlocks, maxRSAPrimeFactors
 // and the log-text bounds are each sized from the worst case a file this large can
-// hold, and the measured costs in their comments assume it. The reader enforces it
-// (internal/process reads every input under this cap), so the number lives here
-// where the reasoning that depends on it lives: raising the cap has to be a change
-// to this constant, which lands in the diff beside the bounds it invalidates.
+// hold, and the measured costs in their comments assume it.
 const MaxInputBytes = 10 << 20
 
 // parseCertChain decodes all CERTIFICATE PEM blocks from pemBytes, returning
-// them in order. Blocks of any other type (the private key of a combined
-// cert+key file, for instance) are skipped, and the "no certificate" diagnostic
-// names a private-key label when the file holds one and otherwise the first skipped
-// block's label (bounded), so a swapped cert/key pair is diagnosable from the
-// message alone even for the combined `openssl ecparam -genkey` shape, whose
-// EC PARAMETERS companion comes first. Blocks that are neither a certificate nor
-// a private key are additionally returned as the second result, so Analyse can
-// report that they were left out of the bundle instead of dropping them
-// silently. Two kinds of label are exempt from that second result: any private-key
-// label, including the encrypted one (a combined cert+key file is a supported input),
-// and EC PARAMETERS, but only in a file that also holds the EC private key it
-// describes (what `openssl ecparam -genkey` writes as one combined bundle). Both are
-// expected companions rather than something left out by mistake;
-// isExpectedCertFilePassenger owns that set. It returns an error if no CERTIFICATE
-// block is present, and also if any CERTIFICATE block holds DER
-// that x509 cannot parse: a partially decodable chain is rejected outright
-// rather than silently truncated, because a PFX built from a truncated chain
-// fails validation obscurely at the consumer instead of here.
-//
-// It is unexported because Analyse owns the invariants a caller could otherwise
-// bypass: the cert/key match and the leaf/chain split. Publishing the
-// lower-level parser would offer a second contract around them with no
-// production consumer. The package's own tests reach it through export_test.go.
+// them in order.
 func parseCertChain(pemBytes []byte) ([]*x509.Certificate, skippedBlocks, error) {
 	declaredCertBlocks := countDeclaredBlocks(pemBytes, certBeginMarker)
 	if declaredCertBlocks > maxChainCerts {
@@ -93,8 +60,7 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, skippedBlocks, error)
 	// key is a property of the file as a whole and is settled BEFORE the blocks are
 	// classified in order (the parameters block precedes the key it describes, and
 	// the report names the FIRST unrelated label, so the answer cannot be deferred
-	// to the end of the drain). The pre-scan is gated on the label being declared at
-	// all, so an ordinary bundle pays one line scan and no second decode.
+	// to the end of the drain).
 	if countDeclaredBlocks(pemBytes, pemBeginMarker(pemTypeECParameters)) > 0 {
 		scan.ecKeyPresent = holdsECPrivateKey(pemBytes)
 	}
@@ -119,9 +85,7 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, skippedBlocks, error)
 		// first skipped block: `openssl ecparam -genkey` writes EC PARAMETERS IMMEDIATELY
 		// BEFORE the EC PRIVATE KEY it describes, so a key file supplied as the certificate
 		// file named "EC PARAMETERS" — a companion of the key — while the label that
-		// actually diagnoses the mistake went unmentioned. It is the same preference
-		// noPrivateKeyError applies on the key side, for the same reason. The base sentence
-		// stays the prefix, so log matching on it is unaffected.
+		// actually diagnoses the mistake went unmentioned.
 		switch {
 		case scan.keyLabels.count > 0:
 			return nil, skippedBlocks{}, fmt.Errorf("no certificate PEM block found (skipped %d non-certificate PEM block(s), including a %q block: this looks like the private key file rather than the certificate file)",
@@ -137,31 +101,19 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, skippedBlocks, error)
 
 // certScan accumulates what one pass over a certificate file's PEM blocks
 // learned: the parsed chain, plus the skipped-block evidence the "no certificate"
-// diagnostic and the unrelated-passenger report need. Hoisting the loop body onto
-// it keeps parseCertChain a bounds -> drain -> validate sequence, the same shape
-// keyScan gives parsePrivateKeys.
-//
-// Field order is chosen for pointer-region packing (govet fieldalignment): the
-// slice leads, then the three skippedBlocks whose string leads them.
+// diagnostic and the unrelated-passenger report need.
 type certScan struct {
 	certs     []*x509.Certificate
 	skipped   skippedBlocks
 	unrelated skippedBlocks
-	// keyLabels are the private-key blocks the certificate file holds. They are
-	// expected passengers of a combined cert+key file, so they are never `unrelated` —
-	// but in a file that yields NO certificate at all they are the label that names the
-	// mistake, so the "no certificate" diagnostic prefers one of these.
+	// keyLabels are the private-key blocks the certificate file holds.
 	keyLabels skippedBlocks
 	// ecKeyPresent says whether the file also holds an EC private key, which is what
 	// makes an EC PARAMETERS block in it an expected companion rather than a stray.
-	// It is a property of the whole file, so parseCertChain settles it before the
-	// drain rather than the visit loop discovering it.
 	ecKeyPresent bool
 }
 
-// visit classifies one PEM block, applying the parser's per-block rules. The
-// error it returns is the chain-rejecting one: unparseable certificate DER ends
-// the scan rather than truncating the chain.
+// visit classifies one PEM block, applying the parser's per-block rules.
 func (s *certScan) visit(block *pem.Block) error {
 	if block.Type != pemTypeCertificate {
 		s.skipped.add(block.Type)
@@ -191,32 +143,7 @@ func (s *certScan) visit(block *pem.Block) error {
 }
 
 // maxCertDERBytes bounds one CERTIFICATE block's DER before x509.ParseCertificate
-// sees it. It is the TRANSIENT half of the retention policy below, and it exists
-// because a post-parse ceiling structurally cannot bound the parse's own
-// allocation: measured on go1.26.5, a 6.96 MB DER carrying one subjectAltName
-// extension of 3,650,000 empty uniformResourceIdentifier names allocates 534 MB
-// inside ParseCertificate, so a refusal read off the parsed certificate fires only
-// once the cost has already been paid. This is a LENGTH check on the block, not a
-// walk of its DER: the pre-parse schema shadow it replaces was removed on purpose
-// (class-c1-1) and nothing here re-reads the certificate's structure.
-//
-// The value is CALIBRATED AGAINST maxCertExtensionElements below, and neither may
-// be changed without re-deriving the other. That ceiling declares 4,096 decoded
-// elements legitimate, and 4,096 ordinary DNS names is ~78 KB of DER (measured:
-// 4,096 names of 17 bytes = 78,156 bytes), so a DER ceiling below that refuses the
-// largest shape its own sibling calls legal and leaves one of the two constants
-// unreachable. 64 KiB was exactly that contradiction, and it was not only
-// theoretical: it refused a valid 300-entry SAN certificate at 74,132 bytes, so
-// real large-SAN private-PKI chains that had been converting started failing, and a
-// conversion failure flips health.
-//
-// 256 KiB clears the sibling's ~78 KB largest legal shape with real headroom for
-// large-SAN private PKI (a public-CA leaf is 1-2 KB; 250 SAN entries of 243 bytes
-// measure 61,826 bytes), and it still bounds the parse's transient allocation by a
-// wide margin: the reproduced amplification retained ~534 MB from a 6.96 MB DER
-// block (the 9.43 MB PEM file that carries it), i.e. ~77 bytes retained per DER
-// byte, so the same shape at 256 KiB retains ~19 MB — comfortably inside a
-// container memory limit.
+// sees it.
 const maxCertDERBytes = 256 << 10
 
 // Aggregate ceilings on what ONE parsed certificate may RETAIN for the life of the
@@ -225,33 +152,7 @@ const maxCertDERBytes = 256 << 10
 // maxCertDERBytes): the extension
 // IDENTIFIERS (one int per identifier arc, held in Certificate.Extensions) and the
 // decoded extension CONTENT (one freshly allocated Go value per encoded name,
-// identifier or URI, held in the typed fields the parser fills). Inside the 10 MB
-// MaxInputBytes cap a crafted block could otherwise retain tens of megabytes of
-// live []int and hundreds of megabytes of decoded content per certificate. The
-// bound is this app's own resource policy, not an X.509 validity rule.
-//
-// It is measured POST-parse, off the parsed certificate, by design (the class-c1-1
-// decision, 2026-08): the pre-parse DER walk this replaces shadowed crypto/x509's
-// schema, shared one exhaustible element budget across sites — a ~12 KB issuer
-// name could spend it and skip the measurement entirely, and exhaustion was
-// indistinguishable from malformed DER — and its per-identifier ceiling never
-// bounded the aggregate a 10 MB block can pack anyway. A bound read off the parsed
-// certificate cannot be starved and needs no schema shadowing, and refusing here
-// releases the parsed certificate instead of retaining it with the chain. What it
-// cannot reach is the parse's OWN transient allocation, which is why
-// maxCertDERBytes above bounds that separately.
-//
-// All three numbers are far above anything legitimate: a real certificate carries
-// around ten extensions of around ten arcs each, so 64 extensions and 4096 total
-// arcs (~32 KiB retained) pass every real chain, and 4096 decoded elements is ~16x
-// the largest SAN list any CA issues (Let's Encrypt caps at 100 names), holding the
-// retained content under ~600 KB per certificate and ~38 MB for a full 64-certificate
-// chain.
-//
-// maxCertExtensionElements is CALIBRATED AGAINST maxCertDERBytes above: 4,096
-// elements as plain DNS names is ~78 KB of DER, so raising this number requires
-// re-deriving that ceiling too, or the size arm refuses the shape this one declares
-// legal before it is ever measured.
+// identifier or URI, held in the typed fields the parser fills).
 const (
 	maxCertExtensions        = 64
 	maxCertExtensionOIDArcs  = 4096
@@ -260,10 +161,7 @@ const (
 
 // oversizedParsedCertificateError refuses a parsed certificate whose extension
 // identifiers or decoded extension content exceed the aggregate retention ceilings
-// above. The refusal counts as a conversion failure exactly as an unparseable block
-// does — the chain is rejected and the failure flips health — and the message names
-// the ceiling so an operator can tell this app's own resource policy from an X.509
-// error.
+// above.
 func oversizedParsedCertificateError(c *x509.Certificate) error {
 	if len(c.Extensions) > maxCertExtensions {
 		return fmt.Errorf("certificate carries %d extensions, above the %d this app accepts (this app's own ceiling on what a parsed chain may retain, not an X.509 limit)",
@@ -285,9 +183,7 @@ func oversizedParsedCertificateError(c *x509.Certificate) error {
 }
 
 // retainedExtensionElements counts the decoded extension content the parser kept on
-// c. Every field here is a slice x509 grows one element per encoded GeneralName,
-// policy, OID or URI, so the count is what the ceiling is expressed in rather than
-// any one field's meaning.
+// c.
 func retainedExtensionElements(c *x509.Certificate) int {
 	return len(c.DNSNames) + len(c.EmailAddresses) + len(c.IPAddresses) + len(c.URIs) +
 		len(c.UnknownExtKeyUsage) + len(c.ExtKeyUsage) + len(c.PolicyIdentifiers) +
@@ -300,18 +196,7 @@ func retainedExtensionElements(c *x509.Certificate) int {
 
 // isExpectedCertFilePassenger reports whether a non-certificate PEM label in the
 // CERTIFICATE file is an expected companion rather than something the operator meant
-// this app to read as a certificate. The private-key labels are the combined cert+key
-// file (a supported input). EC PARAMETERS is what `openssl ecparam -genkey` writes
-// immediately before the EC PRIVATE KEY it describes, so it is expected only when
-// ecKeyPresent says this same file carries that key — the mirror of
-// isExpectedKeyFilePassenger for the combined bundle, without extending the silence
-// to a certificate file whose matching key is separate or is not an EC key at all.
-// That narrowing is the difference between "these parameters belong to the key beside
-// them" and "the label alone excuses the block": in the latter case the parameters
-// really were left out of the bundle, and ObsUnrelatedBlocksSkipped is the only thing
-// that says so. It reads the same pemType* constants keyBeginMarkers is built from,
-// so the "a key in the certificate file is expected" rule cannot drift from the
-// parser's own set.
+// this app to read as a certificate.
 func isExpectedCertFilePassenger(blockType string, ecKeyPresent bool) bool {
 	if isPrivateKeyLabel(blockType) {
 		return true
@@ -320,11 +205,7 @@ func isExpectedCertFilePassenger(blockType string, ecKeyPresent bool) bool {
 }
 
 // isPrivateKeyLabel reports whether a PEM label names a private-key block, the
-// encrypted spellings included. It is the single home of that set because two rules
-// read it and must not diverge: a key block in the CERTIFICATE file is an expected
-// companion (isExpectedCertFilePassenger above), and it is also the label the "no
-// certificate PEM block found" diagnostic names ahead of the first skipped block,
-// because it is the one that says the operator supplied the key file.
+// encrypted spellings included.
 func isPrivateKeyLabel(blockType string) bool {
 	switch blockType {
 	case pemTypePrivateKey, pemTypeRSAPrivateKey, pemTypeECPrivateKey,
@@ -336,17 +217,7 @@ func isPrivateKeyLabel(blockType string) bool {
 
 // holdsECPrivateKey reports whether pemBytes carries an EC private key: a SEC1
 // "EC PRIVATE KEY" block, or a PKCS#8 "PRIVATE KEY" block whose
-// AlgorithmIdentifier names id-ecPublicKey. Both spellings occur in a combined
-// `openssl ecparam -genkey` bundle depending on whether the key was converted to
-// PKCS#8 afterwards, and only the second needs to look past the label.
-//
-// It reads the PKCS#8 algorithm OID rather than parsing the key, for the reason
-// oversizedRSAKeyError documents: parsing a file-supplied private key runs RSA
-// precomputation inside crypto/x509 before anything can reject it, and this
-// question is asked about a CERTIFICATE file whose key blocks are otherwise never
-// offered to a parser. Walking the DER header costs bytes, not milliseconds, and an
-// encrypted or malformed key answers "no" — unproven rather than disproven, which
-// is the safe direction here: an unproven companion is reported, not hidden.
+// AlgorithmIdentifier names id-ecPublicKey.
 func holdsECPrivateKey(pemBytes []byte) bool {
 	for {
 		var block *pem.Block
@@ -371,18 +242,7 @@ var ecPublicKeyOID = asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}
 
 // pkcs8HoldsECKey reports whether PKCS#8 PrivateKeyInfo DER declares an EC key,
 // reading only the AlgorithmIdentifier's OID: SEQUENCE { INTEGER version, SEQUENCE
-// { OBJECT IDENTIFIER algorithm, ... }, OCTET STRING privateKey }. It shares
-// scanRSAKeyEnvelope's asn1.RawValue walk, so nothing is decoded beyond the
-// tag-length headers and the OID itself, and anything it cannot read is false.
-//
-// The identifier is decoded through decodeOID, so the package's untrusted-OID bound
-// (maxOIDBytes) applies here too: encoding/asn1 allocates one int per encoded byte
-// when it decodes into an asn1.ObjectIdentifier, so a near-limit PEM devoting its
-// DER to one syntactically valid identifier could otherwise spend tens of megabytes
-// of heap merely to answer "no" — on the scan's only goroutine, for a CERTIFICATE
-// file's companion-block question. An oversized identifier answers false, which is
-// the same safe direction as every other shape this walk cannot read: the block is
-// reported rather than silently treated as the EC key's companion.
+// { OBJECT IDENTIFIER algorithm, ...
 func pkcs8HoldsECKey(der []byte) bool {
 	oid, _, ok := pkcs8AlgorithmOID(der)
 	if !ok {
@@ -394,9 +254,7 @@ func pkcs8HoldsECKey(der []byte) bool {
 
 // pkcs8Fields returns a PKCS#8 PrivateKeyInfo's AlgorithmIdentifier element and the
 // DER that follows it (whose first element is the privateKey OCTET STRING), and false
-// for anything that is not that shape. It is the single home of the envelope's header
-// walk — outer SEQUENCE, version INTEGER, algorithm SEQUENCE — so the two pre-parse
-// guards built on it cannot come to disagree about what counts as a PKCS#8 key.
+// for anything that is not that shape.
 func pkcs8Fields(der []byte) (algorithm asn1.RawValue, afterAlgorithm []byte, ok bool) {
 	outer, _, ok := asn1ElementWithTag(der, asn1.TagSequence)
 	if !ok {
@@ -416,9 +274,7 @@ func pkcs8Fields(der []byte) (algorithm asn1.RawValue, afterAlgorithm []byte, ok
 // pkcs8AlgorithmOID returns the retained (undecoded) algorithm OID element of
 // PKCS#8 PrivateKeyInfo DER, together with the DER that follows it INSIDE the same
 // AlgorithmIdentifier (its optional parameters field), and false for anything that is
-// not that shape. It is the one reader of that field: every caller needs a length
-// before anything decodes it, so each element is handed back undecoded for the same
-// reason profile.go retains every untrusted identifier as an asn1.RawValue.
+// not that shape.
 func pkcs8AlgorithmOID(der []byte) (oid asn1.RawValue, parameters []byte, ok bool) {
 	algorithm, _, ok := pkcs8Fields(der)
 	if !ok {
@@ -433,11 +289,7 @@ func pkcs8AlgorithmOID(der []byte) (oid asn1.RawValue, parameters []byte, ok boo
 
 // isExpectedKeyFilePassenger reports whether a non-key PEM label in the KEY file is
 // an expected companion of the key rather than something the operator meant this app
-// to read as one. Two of them, and both are silent on purpose: a CERTIFICATE block is
-// the combined cert+key file (the mirror of parseCertChain's private-key rule), and an
-// EC PARAMETERS block is what `openssl ecparam -genkey` writes immediately before the
-// EC PRIVATE KEY it describes, so reporting it would WARN about a healthy file on
-// every scan.
+// to read as one.
 func isExpectedKeyFilePassenger(blockType string) bool {
 	switch blockType {
 	case pemTypeCertificate, pemTypeECParameters:
@@ -449,9 +301,7 @@ func isExpectedKeyFilePassenger(blockType string) bool {
 // --- PEM declaration counting (shared by both parsers) ---
 
 // pemBeginMarker builds the PEM declaration line that opens a block of the
-// given type, exactly as encoding/pem writes it. Deriving the markers from the
-// pemType* constants keeps them in lockstep with the block types the decode
-// loops switch on (and keeps literal PEM key headers out of the source).
+// given type, exactly as encoding/pem writes it.
 func pemBeginMarker(blockType string) []byte {
 	return []byte("-----BEGIN " + blockType + "-----")
 }
@@ -473,15 +323,7 @@ var keyBeginMarkers = [][]byte{
 // recognises them: a marker declares a block only when it occupies a complete
 // line, so the same text embedded in surrounding prose (which pem.Decode
 // ignores entirely) is not counted and cannot make a valid chain look
-// malformed. Line endings are normalised the way pem's getLine does — the line
-// terminator, then at most ONE trailing carriage return, then trailing spaces
-// and tabs — so CRLF input counts identically and a line pem does NOT accept as
-// a declaration (a doubled "\r\r", or a "\r" followed by a space) is not
-// counted either. One deliberate divergence: getLine strips the carriage return
-// only on a newline-terminated line, while this strips it on an unterminated
-// final line too, so a file whose last line is "-----BEGIN CERTIFICATE-----\r"
-// still counts as a declaration and is reported as a truncated chain instead of
-// being silently ignored.
+// malformed.
 func countDeclaredBlocks(pemBytes []byte, markers ...[]byte) int {
 	var n int
 	for line := range bytes.Lines(pemBytes) {
@@ -499,9 +341,7 @@ func countDeclaredBlocks(pemBytes []byte, markers ...[]byte) int {
 
 // skippedBlocks accumulates the PEM blocks a parser passed over: how many, and
 // the label of the first one, which is what a diagnostic names so an operator
-// learns WHAT the file held rather than only that something was skipped. Both
-// parsers share it, so the "remember the first label" rule lives in one place
-// and cannot drift between them.
+// learns WHAT the file held rather than only that something was skipped.
 type skippedBlocks struct {
 	firstType string
 	count     int
@@ -522,124 +362,32 @@ func (s *skippedBlocks) firstTypeForLog() string {
 	return boundLogText(s.firstType, maxBlockTypeLogLen)
 }
 
-// maxBlockTypeLogLen bounds the PEM block label a parse diagnostic names. A PEM
-// type line is arbitrary operator-supplied text bounded only by the caller's
-// MaxInputBytes input read bound, so
-// it is truncated before it reaches the log.
+// maxBlockTypeLogLen bounds the PEM block label a parse diagnostic names.
 const maxBlockTypeLogLen = 64
 
 // boundLogText makes input-derived text safe and bounded for a log-bound
-// diagnostic. It is the single home for that rule: every diagnostic in this package
-// that interpolates text taken from a file the app does not control (a certificate
-// subject, a PEM block label) goes through it.
-//
-// The whole composition is runesafe's: SanitizeSingleLineBudgeted applies the fleet's
-// shared single-line policy (so the text is safe under any slog handler by
-// construction rather than by matching one handler's escaping), pre-caps the RAW
-// bytes on a rune boundary at the limit, sanitizes only that slice, re-caps the
-// growth sanitizing can cause (an invalid byte becomes the three-byte U+FFFD, and a
-// cut inside a rune would mint exactly the raw 0x80-0x9F tail bytes the sanitizer
-// just removed), and names the cut with the marker this app supplies. Nothing is
-// re-implemented here; the app contributes only the marker and the limit.
-//
-// The WORK-bounding primitive, not the output-bounding one (SanitizeSingleLineCapped),
-// and the choice is the bound below: Capped sanitizes ALL of s and budgets the result,
-// so a multi-megabyte PEM label is walked in full to produce a 64-byte diagnostic.
-// Budgeted caps first, so the work is bounded by the limit rather than by the input.
-// The library says so itself — Capped's doc sends "a caller that must never walk a
-// multi-megabyte upstream value in a memory-limited process" to the Budgeted pair.
-// Ratified by the user 2026-08 with the one behaviour change named: text whose RAW
-// form exceeds the limit but whose SANITIZED form would fit under it (many multi-byte
-// unsafe runes collapsing to single-byte spaces) is now cut and marked, where Capped
-// returned it whole and unmarked. Do not swap back to Capped without that trade.
-//
-// The marker (logtext.Marker) is deliberately more explicit than runesafe's own
-// "..." preset, which is why boundLogText passes a marker of its own to the
-// library's caller-marker primitive; internal/process bounds its orphan path
-// sample with the same shared constant.
-//
-// The bound exists because the source file is capped only by the caller's input read
-// bound (MaxInputBytes), so an unbounded
-// interpolation would put a multi-megabyte line into the log of every scan that
-// retries the pair.
-//
-// The marker is charged AGAINST limit, so the result never exceeds limit at all —
-// where the app's own composition used to append the marker after the cut and run to
-// limit plus the marker's length. The bound exists to stop multi-megabyte lines, so
-// either placement serves it; taking the library's makes limit mean the total, which
-// is the simpler promise to a caller sizing a diagnostic.
-//
-// The cut FACT is discarded deliberately: no diagnostic in this package reports
-// truncation as a separate attribute, and the marker in the text is what an operator
-// reads. A caller that ever needs the fact takes the pair directly rather than
-// re-deriving it from the marker, which a value legitimately ending in the marker
-// would defeat.
+// diagnostic.
 func boundLogText(s string, limit int) string {
 	text, _ := runesafe.SanitizeSingleLineBudgeted(s, limit, logtext.Marker)
 	return text
 }
 
 // maxSubjectLogLen bounds the certificate-controlled subject interpolated into a
-// diagnostic. The subject is parsed out of a PEM file the app does not control
-// and is capped only by the reader's size limit, so an unbounded interpolation
-// puts a multi-megabyte line into the logs of every scan that retries the pair.
+// diagnostic.
 const maxSubjectLogLen = 256
 
 // maxSubjectRenderAttrs bounds how many distinguished-name attributes are handed to
 // pkix.RDNSequence.String() when a certificate subject is rendered for a diagnostic.
-//
-// It exists because that renderer is QUADRATIC in its own output: pkix accumulates
-// with `s += ...` once per attribute (go1.26.5, crypto/x509/pkix/pkix.go), so
-// rendering a whole name and then truncating it costs O(rendered bytes^2). None of
-// this package's retention ceilings bounds a distinguished name — maxCertExtensions,
-// maxCertExtensionOIDArcs and maxCertExtensionElements all measure EXTENSIONS — so a
-// certificate inside maxCertDERBytes may spend its whole DER on subject attributes.
-// Measured on go1.26.5, every shape below reporting zero extensions, zero identifier
-// arcs and zero retained elements, so every existing ceiling waves them through. A
-// subject of attributes pkix keeps in NAMED fields renders in 2.9ms at 1,000
-// attributes, 62ms at 5,000 and 317ms at 11,900 (the most maxCertDERBytes admits);
-// one built from attributes pkix does NOT name (emailAddress, a private arc) is the
-// worse shape, because each renders to a longer hex form: 7.4ms, 257ms and 1,121ms at
-// the same three sizes.
-//
-// 256 is far above anything real (a public-CA subject carries under ten attributes)
-// and is chosen so the bound cannot change what an operator reads: every rendered
-// attribute contributes at least a type name, an "=" and a separator, so 256 of them
-// always overrun maxSubjectLogLen and subjectForLog's cut lands in identical bytes.
-// Verified against the unbounded render over 4 attribute-OID shapes x 5 sizes (1, 4,
-// 1,000, 5,000 and 11,900 attributes): the first 256 bytes are byte-identical in all
-// 20, and the worst render falls from 1,121ms to 1.6ms.
 const maxSubjectRenderAttrs = 256
 
-// subjectForLog renders a certificate's subject for a log-bound diagnostic. It is the
-// package's only door to a certificate-supplied name, and it bounds BOTH axes: the
-// attributes handed to pkix's quadratic renderer, and the bytes of the result.
-//
-// The sanitize step still runs AFTER the render (boundLogText ->
-// runesafe.SanitizeSingleLineBudgeted), which is the order that rule requires: pkix
-// escapes only the DN metacharacters and leaves control bytes and newlines intact.
+// subjectForLog renders a certificate's subject for a log-bound diagnostic.
 func subjectForLog(c *x509.Certificate) string {
 	return boundLogText(boundedDN(dnSequence(&c.Subject)).String(), maxSubjectLogLen)
 }
 
 // dnSequence returns the RDNSequence pkix.Name.String() renders for a
 // PARSER-PRODUCED name, mirroring that method's own construction so the bounded
-// render below is byte-identical to the unbounded one it replaces. Every name that
-// reaches it originates in x509.ParseCertificate, which populates Names and
-// documents that it does not populate ExtraNames, so String()'s other arm — the
-// caller-composed ExtraNames one — has no population here and is not mirrored.
-//
-// The mirror is load-bearing and Name.ToRDNSequence() is NOT a substitute for it:
-// ToRDNSequence reports only the nine attribute types pkix keeps in named fields,
-// whereas String() additionally surfaces every OTHER attribute the parser left in
-// Names, placed at the front of the sequence so it renders at the end of the string.
-// Rendering ToRDNSequence alone therefore DROPS attributes a certificate really
-// carries — measured over 4 OID shapes x 5 sizes, it matched the unbounded render in
-// only 5 of 20 cases, and a subject holding one emailAddress attribute
-// (1.2.840.113549.1.9.1, not a named field) rendered 68 bytes through String() and 29
-// through ToRDNSequence, losing the attribute silently — and it would leave the
-// quadratic path unbounded for exactly the names built out of unrecognised OIDs. The
-// skipped arc set below is pkix's, and it is the set ToRDNSequence already covers.
+// render below is byte-identical to the unbounded one it replaces.
 func dnSequence(n *pkix.Name) pkix.RDNSequence {
 	var rdns pkix.RDNSequence
 	for _, atv := range n.Names {
@@ -658,10 +406,6 @@ func dnSequence(n *pkix.Name) pkix.RDNSequence {
 
 // boundedDN returns the part of seq that pkix.RDNSequence.String() emits FIRST — it
 // walks the sequence in REVERSE — carrying at most maxSubjectRenderAttrs attributes.
-// The trailing RDNs are kept whole and the one the budget runs out inside keeps its
-// LEADING members, because String() emits an RDN's members in forward order. A name
-// holding fewer attributes than the budget is returned unchanged, so no real name is
-// rendered differently at all.
 func boundedDN(seq pkix.RDNSequence) pkix.RDNSequence {
 	budget := maxSubjectRenderAttrs
 	for i, rdn := range slices.Backward(seq) {
@@ -675,16 +419,7 @@ func boundedDN(seq pkix.RDNSequence) pkix.RDNSequence {
 	return seq
 }
 
-// boundedTextError caps the rendered text of an input-derived error. The
-// crypto/x509 parser interpolates certificate-controlled fields into several of
-// its messages with %q (a SAN URI, a name constraint, an extension OID), and
-// x509's PKCS#8 unknown-algorithm message interpolates an OBJECT IDENTIFIER
-// decoded from the key file. Either file is capped only by the caller's input
-// read bound (MaxInputBytes), so the unbounded text would
-// put a multi-megabyte line into the log of every scan that retries the pair.
-// It shares the same bound (maxSubjectLogLen) and the same partial-rune handling
-// as every other certificate-controlled interpolation in this package. Unwrap is
-// kept so errors.Is/As still reach the wrapped error.
+// boundedTextError caps the rendered text of an input-derived error.
 type boundedTextError struct{ err error }
 
 func (e boundedTextError) Error() string { return boundLogText(e.err.Error(), maxSubjectLogLen) }
@@ -694,11 +429,6 @@ func (e boundedTextError) Unwrap() error { return e.err }
 
 // keyScan accumulates what one pass over a key file's PEM blocks learned: the
 // usable keys, plus the evidence noPrivateKeyError needs when there are none.
-// Hoisting the loop body onto it keeps parsePrivateKeys a plain drain loop.
-//
-// Field order is chosen for pointer-region packing (govet fieldalignment), not
-// for narrative order: the two pointer-bearing fields lead, then skippedBlocks
-// whose string leads it, then the scalars.
 type keyScan struct {
 	keys          []crypto.Signer
 	firstParseErr error
@@ -744,32 +474,6 @@ func (s *keyScan) visit(block *pem.Block) {
 // parsePrivateKeys extracts EVERY usable private key from PEM data, in file
 // order, trying PKCS8 first for each block, then falling back to PKCS1 (RSA)
 // and SEC1 (EC).
-//
-// Block selection and DER validation share one loop, so a key file whose first
-// key-labelled block is malformed (or holds an unsupported PKCS#8 key type)
-// still yields a usable key from a later block; the first parse failure is
-// reported only when no block decodes. It distinguishes "no key block at all"
-// from "the only key blocks are encrypted" so the caller surfaces actionable
-// guidance: both a PKCS#8 ENCRYPTED PRIVATE KEY block and a traditional OpenSSL
-// key carrying "Proc-Type: 4,ENCRYPTED" + "DEK-Info" headers hold ciphertext
-// none of the parsers can decode. It also counts the private-key declarations
-// the file carries (the same line-accurate accounting parseCertChain applies to
-// CERTIFICATE blocks) so a key file whose armour encoding/pem silently dropped
-// is diagnosed as damaged rather than as holding no key at all. Unlike the
-// chain, a partially decodable key file is NOT rejected: a usable later block
-// still wins, and the count only enriches the failure message.
-//
-// Returning all of them is what lets identity selection be key-first: with more
-// than one key present, the certificate decides which key is correct, so
-// discarding the later blocks would throw away the evidence. The failure
-// diagnostics are consulted only when NO block yields a key; when one does, the
-// returned keyDefects carries the blocks that did not, so a later identity
-// mismatch can still name the half of the file that is damaged.
-//
-// The result element type is crypto.Signer, not crypto.PrivateKey, because that
-// is what the allowlist below actually admits: every accepted key type exposes a
-// public half, which is what identity matching compares. Naming the narrower type
-// here means no caller has to handle a key that cannot be matched.
 func parsePrivateKeys(pemBytes []byte) ([]crypto.Signer, keyDefects, error) {
 	declaredKeyBlocks := countDeclaredBlocks(pemBytes, keyBeginMarkers...)
 	if declaredKeyBlocks > maxKeyBlocks {
@@ -806,12 +510,7 @@ func parsePrivateKeys(pemBytes []byte) ([]crypto.Signer, keyDefects, error) {
 // reads, falling back to the first skipped label when every skipped block is an
 // expected companion, bounded, so an ssh-keygen-format or otherwise unsupported
 // key file is diagnosable from the message alone), which outranks "no PEM block
-// at all". The last two are further
-// qualified by undecodedKeyBlocks, the number of private-key declarations the
-// file carries that encoding/pem dropped (truncated armour, a corrupt body, or
-// a run-together END/BEGIN line), so a damaged key file is not reported with
-// the same sentence as a file that genuinely holds no key. The base sentence is
-// kept as the prefix so existing log matching is unaffected.
+// at all".
 func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped, unrelated skippedBlocks, undecodedKeyBlocks int) error {
 	switch {
 	case firstParseErr != nil:
@@ -825,8 +524,7 @@ func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped, unrelate
 	// or the EC PARAMETERS companion of the key beside it, and those come FIRST in
 	// every file that has them, so naming the first skipped block pointed the operator
 	// at an expected passenger while the ssh-keygen-format block this clause exists to
-	// diagnose went unmentioned. It is the same preference keyDefects.firstUnreadable
-	// already applies on the success path, so the two diagnoses name the same block.
+	// diagnose went unmentioned.
 	switch {
 	case unrelated.count > 0:
 		msg = fmt.Sprintf("%s (%d of the %d skipped PEM block(s) name no key format this app reads, first %q)",
@@ -842,15 +540,7 @@ func noPrivateKeyError(firstParseErr error, sawEncrypted bool, skipped, unrelate
 }
 
 // parseFailureForLog renders the first key-block parse failure for a diagnostic,
-// or "" when every decoded block parsed. It goes through boundLogText for the same
-// reason every other file-derived interpolation in this package does: the text is
-// built from a key file the app does not control, and this is the package's single
-// gate for that. parsePrivateKeyBlock bounds the WRAPPED parser error at the same
-// limit, but its own sentence is charged against that budget first, so a maximal
-// inner error loses its tail here — the reason's opening survives, which is the part
-// that names the remedy. Routing through the gate keeps the rule "no file-derived
-// text reaches a diagnostic ungated" true by construction rather than by tracing
-// every producer.
+// or "" when every decoded block parsed.
 func parseFailureForLog(err error) string {
 	if err == nil {
 		return ""
@@ -859,25 +549,16 @@ func parseFailureForLog(err error) string {
 }
 
 // keyDefects counts the key blocks that yielded no usable key even though
-// another block did. parsePrivateKeys itself succeeds in that case, so without
-// carrying this out the evidence is discarded exactly when it is needed: a
-// mid-rotation file whose appended key is truncated or of an unsupported type
-// still parses its OLD key, and if the certificate has been renewed the failure
-// the operator then sees is "the key does not match the certificate".
+// another block did.
 type keyDefects struct {
 	// firstUnreadable is the first key-file PEM label that names neither a key
 	// format this app reads nor a certificate, already sanitized and bounded for a
 	// log by skippedBlocks.firstTypeForLog.
 	firstUnreadable string
 	// firstParseFailure is WHY the first key-labelled block's DER was rejected,
-	// sanitized and bounded like every other file-derived text in this package. The
-	// count alone tells an operator that a block is damaged but not what to do about
-	// it; the reason distinguishes truncated armour from an unsupported key type
-	// from an oversized RSA modulus, which are three different remedies.
+	// sanitized and bounded like every other file-derived text in this package.
 	firstParseFailure string
-	// unreadable is how many such blocks the file holds. Counted apart from
-	// unparseable because encoding/pem decoded them fine and no parser was ever
-	// offered them: only the label rules them out.
+	// unreadable is how many such blocks the file holds.
 	unreadable int
 	// unparseable is the number of key-labelled blocks whose DER no parser accepted.
 	unparseable int
@@ -889,9 +570,7 @@ type keyDefects struct {
 }
 
 // suffix names those blocks for a "nothing matches" diagnostic, or returns ""
-// when every declared block became a key. It is appended to the existing
-// sentence rather than folded into it, so log matching on the base message is
-// unaffected.
+// when every declared block became a key.
 func (d keyDefects) suffix() string {
 	details := d.details()
 	if details == "" {
@@ -902,13 +581,6 @@ func (d keyDefects) suffix() string {
 
 // details lists the defective blocks as one clause ("2 could not be parsed, at
 // least one is encrypted"), or returns "" when every declared block became a key.
-//
-// It is the single home of that wording because two diagnostics need it and must
-// not drift: noMatchError's suffix on the hard-failure path, and the
-// unusable-key-blocks observation analyseAt emits when identity selection
-// SUCCEEDED anyway. Every part is a count or a fixed phrase except the unreadable
-// clause's PEM label, which skippedBlocks.firstTypeForLog has already sanitized
-// and bounded, so the text is safe for a log as it stands.
 func (d keyDefects) details() string {
 	var parts []string
 	if d.unparseable > 0 {
@@ -932,11 +604,7 @@ func (d keyDefects) details() string {
 
 // isEncryptedPEMBlock reports whether a traditional OpenSSL private-key block
 // carries encryption headers ("Proc-Type: 4,ENCRYPTED" or "DEK-Info"), whose
-// body is ciphertext the DER parsers cannot decode. Header names are matched
-// case-insensitively (encoding/pem preserves the spelling it was given) and the
-// Proc-Type value is compared case-insensitively ignoring all interior
-// whitespace, so a hand-written "4, ENCRYPTED" or a tab-separated value is
-// still recognised.
+// body is ciphertext the DER parsers cannot decode.
 func isEncryptedPEMBlock(block *pem.Block) bool {
 	for name, value := range block.Headers {
 		switch {
@@ -955,36 +623,6 @@ func isEncryptedPEMBlock(block *pem.Block) bool {
 // oversizedRSAKeyError refuses a private-key block holding an RSA integer larger
 // than maxVerifiableKeyBits or declaring more than maxRSAPrimeFactors prime factors,
 // and reports nil for every block that is not an RSA private-key envelope at all.
-//
-// The two ceilings are asked of the SAME envelope scan, and independently: the
-// factor ceiling is decided from the envelope's shape alone, so it still refuses a
-// key whose integers could not be SIZED. A block whose modulus is zero or negative
-// is malformed, but it is unambiguously an RSA envelope, and the collection of extra
-// prime factors it declares is read from tag-length headers that do not depend on
-// the modulus being readable. Deciding "unmeasurable, therefore nothing to say" —
-// which is what a size-only pre-scan did — left the amplification shape the factor
-// ceiling exists for reachable behind one malformed integer.
-//
-// A consequence, accepted deliberately: for such a block this app's own bounded
-// refusal is now the error the operator sees, where crypto/x509's malformed-key
-// error used to be. The app refuses the file either way; only the wording changes,
-// and it changes towards the diagnostic that names the ceiling and the remedy.
-//
-// It exists because the cost is INSIDE the parser: x509.ParsePKCS8PrivateKey and
-// x509.ParsePKCS1PrivateKey run RSA CRT precomputation and consistency validation
-// on the integers the FILE supplies before either can reject the key, and that
-// work has no context or cancellation path. Measured on go1.26.5, a
-// self-consistent key costs 8.8ms to parse at 16384 bits and 369ms at 131072 bits
-// from a 73 KB block, and other shapes inside the reader's MaxInputBytes cap are far
-// worse; all of it lands on the scan's only goroutine, before convertEntry can
-// emit its per-path diagnostic, where shutdown cannot interrupt it. So the guard
-// cannot inspect a PARSED key — by then the stall has already happened — and runs
-// on the DER instead.
-//
-// The ceiling is maxVerifiableKeyBits, deliberately the same constant analyse.go's
-// signature-verification guard uses rather than a second number: a certificate
-// above it is already refused a signature check, so accepting a private key above
-// it could only produce a bundle this app would not reason about.
 func oversizedRSAKeyError(block *pem.Block) error {
 	scan := scanRSAKeyEnvelope(block.Bytes, 1)
 	if !scan.isRSA {
@@ -1007,17 +645,7 @@ func oversizedRSAKeyError(block *pem.Block) error {
 // maxRSAPrimeFactors caps how many prime factors a private key may declare before
 // the pre-scan refuses it, and it is a SECOND bound with its own reason: the
 // per-integer ceiling above bounds one oversized value, while this bounds MANY
-// small ones. crypto/x509 decodes PKCS#1's optional OtherPrimeInfos into a slice
-// and crypto/rsa's precomputeLegacy then runs one ModInverse per additional prime
-// against a product that grows with each, so cost climbs superlinearly in the
-// element COUNT at a constant few bytes per element. Measured on go1.26.5 with
-// 1024-bit factors: 1,000 entries (12 KB DER) cost 3.0ms and 2.6 MB, 5,000 (61 KB)
-// cost 52ms and 70 MB, 10,000 (127 KB) cost 160ms and 292 MB — all far inside the
-// reader's MaxInputBytes cap, on the scan's only goroutine, with no cancellation path.
-//
-// 64 is far above any real key: multi-prime RSA is rare and practical keys use
-// three or four factors, so this refuses an amplification shape rather than a
-// configuration.
+// small ones.
 const maxRSAPrimeFactors = 64
 
 // maxRSAKeyElements bounds how many top-level elements of a PKCS#1 RSAPrivateKey
@@ -1025,53 +653,24 @@ const maxRSAPrimeFactors = 64
 // itself rather than the key. RFC 8017 A.1.2 declares nine INTEGERs plus the
 // optional otherPrimeInfos SEQUENCE, so eight elements follow the modulus; 16 is
 // generous headroom for a structure some other tool wrote.
-//
-// It exists because the walk is not free: every element costs one asn1.Unmarshal
-// into an asn1.RawValue, so a body of tiny INTEGERs makes the GUARD the expensive
-// operation. Measured on go1.26.5, a 7.86 MB body (the largest DER a 10 MB PEM
-// file yields) holding 2,621,438 three-byte INTEGERs cost the walk 340 ms and
-// 200 MB of transient allocation, while x509.ParsePKCS1PrivateKey rejected the
-// same DER in 60 us; at a full 10 MB DER, 855 ms and 267 MB.
-//
-// Stopping cannot let an expensive shape through: a body with more top-level
-// elements than PKCS#1 declares cannot hide an expensive one past the budget.
-// encoding/asn1 maps a SEQUENCE onto crypto/x509's pkcs1PrivateKey POSITIONALLY, so
-// every integer whose size drives precomputation (N, E, D, P, Q and the three CRT
-// values) is among the eight elements after the modulus, and asn1 TOLERATES extra
-// bytes at the end of a SEQUENCE (measured on go1.26.5: a real key padded with 12
-// trailing INTEGERs still parses) — which means an otherPrimeInfos collection padded
-// past this budget is not matched by the optional field either, and is skipped
-// without cost. It is the same ceiling profile.go's sequenceElements applies to every
-// SEQUENCE OF the preflight walks.
 const maxRSAKeyElements = 16
 
 // rsaKeyPreScan is what the DER-only envelope scan learned about a private-key
 // block: its SHAPE, the prime-factor count that shape declares, and — optionally —
-// the size of the largest integer in it. All three come back from one walk because
-// the refusals they feed must not depend on each other: a size that could not be
-// measured is a missing MEASUREMENT, not a missing envelope, and it must not silence
-// the factor ceiling.
+// the size of the largest integer in it.
 type rsaKeyPreScan struct {
 	// maxBits is the bit length of the largest RSA integer the structure holds —
 	// the modulus, a prime, a CRT value, or any integer inside OtherPrimeInfos.
-	// Meaningless unless sized.
 	maxBits int
 	// factors is how many prime factors the structure declares: two, plus one per
 	// OtherPrimeInfos entry, SATURATED at maxRSAPrimeFactors+1 — past the ceiling the
 	// exact count buys nothing and the counting itself is attacker-controlled work.
-	// Meaningless unless isRSA.
 	factors int
 	// isRSA reports that the block IS an RSA private-key envelope: a PKCS#1
-	// RSAPrivateKey, or a PKCS#8 PrivateKeyInfo wrapping one. False is the FAIL-OPEN
-	// answer for a shape that is not one (a non-RSA key, a truncated or malformed
-	// container) and means the pre-scan decides nothing: the block goes to the
-	// existing parsers with their existing errors.
+	// RSAPrivateKey, or a PKCS#8 PrivateKeyInfo wrapping one.
 	isRSA bool
 	// sized reports that at least one integer in the envelope could be measured, so
-	// maxBits means something. It is INDEPENDENT of isRSA: a malformed envelope
-	// whose every integer is zero, negative or unreadable is still an envelope whose
-	// factor count is known, which is why this is a second flag and not the absence
-	// of the first.
+	// maxBits means something.
 	sized bool
 }
 
@@ -1080,28 +679,6 @@ type rsaKeyPreScan struct {
 // largest INTEGER in it when any integer could be sized — one walk, three answers,
 // because the two refusals oversizedRSAKeyError applies must be able to fire
 // independently.
-//
-// It reads ONLY each element's own tag-length header, through encoding/asn1's
-// RawValue (which slices the content rather than decoding it), and never converts a
-// file-supplied integer to a big.Int, so it costs sub-microseconds on a 32 KB block
-// where the parser costs hundreds of milliseconds.
-//
-// Two shapes carry those integers, and both are handled: a PKCS#1 RSAPrivateKey,
-// whose modulus is the INTEGER after the version INTEGER (with the primes and CRT
-// values after it), and a PKCS#8 PrivateKeyInfo, whose privateKey OCTET STRING
-// (after the version INTEGER and the AlgorithmIdentifier SEQUENCE) wraps that same
-// PKCS#1 structure — hence depth, which admits exactly one level of unwrapping and
-// stops a crafted file from nesting containers indefinitely.
-//
-// It FAILS OPEN on SHAPE by design: an isRSA-false result for anything that is not
-// one of those two envelopes, which covers a non-RSA key (a SEC1 EC key's second
-// element is an OCTET STRING, a PKCS#8 EC or Ed25519 key's inner OCTET STRING is not
-// a PKCS#1 SEQUENCE, and none of them is expensive to parse) and a container it
-// cannot read at all. Measurability is a SEPARATE answer: inside a recognised
-// envelope, an integer this walk cannot size simply does not contribute a size, and
-// the envelope's factor count still stands. The guard's job is to refuse OVERSIZED
-// and OVER-FACTORED keys, not to become a second parser: every other verdict is left
-// to the existing parsers and their existing errors.
 func scanRSAKeyEnvelope(der []byte, depth int) rsaKeyPreScan {
 	outer, _, ok := asn1ElementWithTag(der, asn1.TagSequence)
 	if !ok {
@@ -1119,11 +696,7 @@ func scanRSAKeyEnvelope(der []byte, depth int) rsaKeyPreScan {
 	case isASN1(second, asn1.TagInteger):
 		// PKCS#1 RSAPrivateKey: the modulus follows the version, and the primes,
 		// CRT values and the optional OtherPrimeInfos collection follow the
-		// modulus. crypto/rsa builds a bigmod modulus from p and q (Validate ->
-		// precompute) before it can reject an inconsistent key, so the LARGEST
-		// integer in the structure decides the cost, not the modulus. Measuring
-		// only the modulus let a 710 KB block with a 20-bit modulus and 2-Mbit
-		// "primes" spend 59.8s inside x509.ParsePKCS1PrivateKey.
+		// modulus.
 		return scanRSAPKCS1Body(second, afterSecond)
 	case isASN1(second, asn1.TagSequence):
 		return scanRSAKeyEnvelopePKCS8(afterSecond, depth)
@@ -1134,12 +707,6 @@ func scanRSAKeyEnvelope(der []byte, depth int) rsaKeyPreScan {
 // scanRSAKeyEnvelopePKCS8 scans the PKCS#1 key inside a PKCS#8 PrivateKeyInfo,
 // given the DER after its AlgorithmIdentifier: the privateKey OCTET STRING that
 // follows holds the PKCS#1 structure.
-//
-// depth is the unwrap allowance, and it is a security rule rather than a style
-// one: an exhausted allowance fails open here exactly as it did inline, so a
-// crafted file cannot nest containers indefinitely and make the walk recurse. It
-// fails open on anything else it cannot read, for the reason scanRSAKeyEnvelope
-// documents.
 func scanRSAKeyEnvelopePKCS8(afterAlgorithm []byte, depth int) rsaKeyPreScan {
 	if depth <= 0 {
 		return rsaKeyPreScan{}
@@ -1152,27 +719,7 @@ func scanRSAKeyEnvelopePKCS8(afterAlgorithm []byte, depth int) rsaKeyPreScan {
 }
 
 // scanRSAPKCS1Body scans a PKCS#1 RSAPrivateKey body, given its modulus element and
-// the DER of the elements after it. The envelope is RECOGNISED by the time this is
-// called, so isRSA is true and the factor count starts at the two primes PKCS#1
-// always declares; only the size is conditional.
-//
-// The modulus is folded in like any other integer rather than gating the walk. A
-// modulus that is absent, zero or negative used to abandon the whole scan, and with
-// it the factor count — so a malformed key carrying a huge OtherPrimeInfos
-// collection reached crypto/x509 with both ceilings skipped. Every integer here can
-// only RAISE the measured size, so a value this walk cannot read can never lower the
-// ceiling check.
-//
-// The trailing SEQUENCE, when present, is PKCS#1's optional OtherPrimeInfos: its
-// integers count towards the size and its element count towards the factor total,
-// because that collection is the amplification shape maxRSAPrimeFactors bounds. That
-// count is the only superlinear cost in reach, and it saturates; everything else
-// here is one tag-length header per element.
-//
-// The element count is bounded too (maxRSAKeyElements), because the walk's own
-// per-element cost is what a body of millions of tiny INTEGERs attacks; a body
-// longer than PKCS#1 declares is rejected by encoding/asn1's struct decode in
-// microseconds, so the budget forfeits no refusal that could have mattered.
+// the DER of the elements after it.
 func scanRSAPKCS1Body(modulus asn1.RawValue, rest []byte) rsaKeyPreScan {
 	scan := rsaKeyPreScan{factors: 2, isRSA: true}
 	scan.fold(modulus)
@@ -1190,9 +737,7 @@ func scanRSAPKCS1Body(modulus asn1.RawValue, rest []byte) rsaKeyPreScan {
 		scan.fold(elem)
 		// The factor count SATURATES: once it is one past the ceiling the refusal is
 		// already proven, and every further element measured is attacker-controlled
-		// work bought for a number no caller reads. The size ceiling can only be
-		// raised by an element this loop would keep walking, and a block that already
-		// earns the factor refusal is never reported for its size.
+		// work bought for a number no caller reads.
 		if scan.factors > maxRSAPrimeFactors {
 			break
 		}
@@ -1232,19 +777,7 @@ func (s *rsaKeyPreScan) fold(elem asn1.RawValue) {
 // rsaOtherPrimeInfos walks PKCS#1's OtherPrimeInfos (a SEQUENCE OF
 // OtherPrimeInfo, each SEQUENCE { INTEGER prime, INTEGER exponent, INTEGER
 // coefficient }), reporting how many additional primes it declares and the widest
-// integer inside it. Nothing is decoded here either: each element is measured
-// from its own tag-length header.
-//
-// limit is how many entries are still worth counting — one more than the caller
-// needs to prove its refusal — so the walk stops as soon as the ceiling is exceeded
-// instead of measuring an attacker-sized collection to the end for an exact count
-// nothing reads. A non-positive limit stops immediately.
-//
-// It counts an entry it cannot fully read, and stops at the first element that is
-// not an OtherPrimeInfo, which is the FAIL-CLOSED direction on purpose — the count
-// feeds a refusal, so undercounting a malformed collection is the only mistake
-// with a cost. Undercounting cannot happen from a short read: the walk stops, and
-// the caller refuses on what it already counted.
+// integer inside it.
 func rsaOtherPrimeInfos(body []byte, limit int) (additional, maxBits int) {
 	for len(body) > 0 && additional < limit {
 		info, remaining, ok := asn1ElementWithTag(body, asn1.TagSequence)
@@ -1280,8 +813,7 @@ func otherPrimeInfoBits(info asn1.RawValue) int {
 }
 
 // asn1Element reads one tag-length-value header off b, returning the element and
-// the bytes after it. The RawValue's content is a slice of b, so nothing is
-// decoded and nothing is copied.
+// the bytes after it.
 func asn1Element(b []byte) (asn1.RawValue, []byte, bool) {
 	var v asn1.RawValue
 	rest, err := asn1.Unmarshal(b, &v)
@@ -1291,9 +823,7 @@ func asn1Element(b []byte) (asn1.RawValue, []byte, bool) {
 	return v, rest, true
 }
 
-// isASN1 reports whether v carries the given universal tag. The class check is
-// what keeps a context-specific element (PKCS#8's optional attributes, SEC1's
-// [0] parameters) from being mistaken for the universal tag of the same number.
+// isASN1 reports whether v carries the given universal tag.
 func isASN1(v asn1.RawValue, tag int) bool {
 	return v.Class == asn1.ClassUniversal && v.Tag == tag
 }
@@ -1312,11 +842,7 @@ func asn1ElementWithTag(b []byte, tag int) (asn1.RawValue, []byte, bool) {
 // derIntegerBits reports the bit length of a DER INTEGER's content bytes, and
 // false when the value is not a positive integer whose size means anything: an
 // empty content, a negative value (the leading byte of a two's-complement DER
-// INTEGER has its high bit set), or zero. None of those is a size, so such a value
-// contributes nothing to the envelope scan's measurement — the scan still reports
-// the envelope's shape and factor count, and only the SIZE half of the pre-scan
-// stands down. The sign is read from the FIRST byte, before the
-// 0x00 bytes DER prepends to keep a large positive value positive are stripped.
+// INTEGER has its high bit set), or zero.
 func derIntegerBits(content []byte) (int, bool) {
 	if len(content) == 0 || content[0] >= 0x80 {
 		return 0, false
@@ -1331,17 +857,7 @@ func derIntegerBits(content []byte) (int, bool) {
 }
 
 // parsePrivateKeyBlock decodes a single unencrypted private-key PEM block,
-// trying PKCS8 first, then falling back to PKCS1 (RSA) and SEC1 (EC). A PKCS8
-// container holding a key type cert-converter does not support is rejected with
-// a distinct error rather than reported as unparseable.
-//
-// Every refusal a private-key block earns from its DER alone is applied BEFORE any
-// parser sees the block, because the cost is paid inside the parser itself: an
-// oversized RSA integer, too many RSA prime factors, and an oversized algorithm,
-// parameter or curve identifier; see prohibitiveKeyError.
-//
-// The return type is crypto.Signer: every accepted type implements it, so the
-// caller never has to consider a key whose public half cannot be read.
+// trying PKCS8 first, then falling back to PKCS1 (RSA) and SEC1 (EC).
 func parsePrivateKeyBlock(block *pem.Block) (crypto.Signer, error) {
 	if err := prohibitiveKeyError(block); err != nil {
 		return nil, err
@@ -1387,10 +903,7 @@ func parsePrivateKeyBlock(block *pem.Block) (crypto.Signer, error) {
 // prohibitiveKeyError is every refusal a private-key block earns from its DER
 // alone, before any parser sees it: an RSA integer or prime count whose
 // precomputation would stall the scan, and an algorithm identifier whose decode
-// would allocate megabytes to reject a key. They share a home because they share a
-// reason — each cost is paid INSIDE crypto/x509, where nothing can interrupt it —
-// and because the order they are asked in is not a decision a caller should have to
-// make.
+// would allocate megabytes to reject a key.
 func prohibitiveKeyError(block *pem.Block) error {
 	if err := oversizedRSAKeyError(block); err != nil {
 		return err
@@ -1405,16 +918,6 @@ func prohibitiveKeyError(block *pem.Block) error {
 // identifier — or the parameters identifier beside it in the same
 // AlgorithmIdentifier — is larger than maxOIDBytes, and reports nil for every block
 // that is not that shape.
-//
-// It is the same allocation bound profile.go's decodeOID applies to bundle bytes,
-// applied here because x509.ParsePKCS8PrivateKey decodes that identifier into an
-// asn1.ObjectIdentifier before it can reject an unsupported key: encoding/asn1
-// allocates one int per encoded byte, roughly eight bytes of heap per input byte, so
-// a file inside the reader's MaxInputBytes cap can spend most of its DER on one
-// syntactically valid identifier and drive tens of megabytes of transient
-// allocation merely to be refused — on the scan's only goroutine, with no
-// cancellation path. The refusal is bounded and names the size, like every other
-// pre-parse guard here; every identifier a real key names is 9 bytes or fewer.
 func oversizedKeyAlgorithmOIDError(block *pem.Block) error {
 	oid, parameters, ok := pkcs8AlgorithmOID(block.Bytes)
 	if !ok {
@@ -1426,10 +929,7 @@ func oversizedKeyAlgorithmOIDError(block *pem.Block) error {
 	}
 	// The AlgorithmIdentifier's parameters field is decoded the same way and by the
 	// same call: for an EC key x509 unmarshals it into an asn1.ObjectIdentifier (the
-	// named curve) before it can reject an unknown curve. Only a PRIMITIVE OBJECT
-	// IDENTIFIER reaches that allocation; a compound tag or a SEQUENCE (explicit EC
-	// parameters, RSASSA-PSS parameters) is refused by encoding/asn1 without
-	// allocating, so it is left alone.
+	// named curve) before it can reject an unknown curve.
 	if params, _, paramsOK := asn1ElementWithTag(parameters, asn1.TagOID); paramsOK &&
 		!params.IsCompound && len(params.Bytes) > maxOIDBytes {
 		return fmt.Errorf("private key in a %q block names a %d-byte algorithm parameter identifier, above the %d-byte ceiling this app decodes an identifier at (decoding it would allocate one int per encoded byte before the key could be rejected)",
@@ -1441,13 +941,6 @@ func oversizedKeyAlgorithmOIDError(block *pem.Block) error {
 // oversizedSEC1CurveOIDError refuses a SEC1 ECPrivateKey block whose explicit [0]
 // named-curve identifier is larger than maxOIDBytes, and reports nil for every block
 // that is not that shape.
-//
-// It is the third door on the same call chain as oversizedKeyAlgorithmOIDError:
-// x509.ParseECPrivateKey decodes that identifier into an asn1.ObjectIdentifier (one
-// int per encoded byte) before it can reject an unknown curve, and
-// parsePrivateKeyBlock tries that parser on EVERY block that fails PKCS#8 and PKCS#1,
-// whatever its label. Every curve a real key names is 9 bytes or fewer, so nothing
-// legitimate is newly refused; only the refusal point and its text move.
 func oversizedSEC1CurveOIDError(block *pem.Block) error {
 	size, found := sec1CurveOIDBytes(block.Bytes)
 	if !found || size <= maxOIDBytes {
@@ -1456,10 +949,7 @@ func oversizedSEC1CurveOIDError(block *pem.Block) error {
 		// content to parseECPrivateKey, whose ecPrivateKey struct decodes the explicit
 		// [0] named-curve identifier into an asn1.ObjectIdentifier exactly as the
 		// top-level SEC1 path does — and then DISCARDS it, because the curve named in
-		// the AlgorithmIdentifier wins. Neither the RSA pre-scan (the inner structure's
-		// second element is an OCTET STRING) nor the PKCS#8 identifier bound (which
-		// reads only the AlgorithmIdentifier, whose own identifiers are the ordinary 7
-		// and 8 bytes) sees it, so the fourth door needs this unwrap.
+		// the AlgorithmIdentifier wins.
 		size, found = sec1CurveOIDBytes(pkcs8PrivateKeyDER(block.Bytes))
 	}
 	if !found || size <= maxOIDBytes {
@@ -1471,9 +961,7 @@ func oversizedSEC1CurveOIDError(block *pem.Block) error {
 
 // sec1CurveOIDBytes reports the content length of a SEC1 ECPrivateKey's explicit
 // [0] named-curve identifier — SEQUENCE { INTEGER version, OCTET STRING privateKey,
-// [0] parameters OPTIONAL } — and false for anything that is not that shape. Only
-// the LENGTH comes back, for the reason decodeOID documents: the whole point is to
-// compare it before anything decodes the identifier.
+// [0] parameters OPTIONAL } — and false for anything that is not that shape.
 func sec1CurveOIDBytes(der []byte) (int, bool) {
 	outer, _, ok := asn1ElementWithTag(der, asn1.TagSequence)
 	if !ok {
@@ -1500,9 +988,7 @@ func sec1CurveOIDBytes(der []byte) (int, bool) {
 
 // pkcs8PrivateKeyDER returns the content of a PKCS#8 PrivateKeyInfo's privateKey
 // OCTET STRING — the inner key structure x509 hands to the algorithm's own parser —
-// and nil for anything that is not that shape. It is the sibling of
-// scanRSAKeyEnvelopePKCS8's unwrap and admits exactly one level for the same
-// reason: a crafted file must not be able to make a pre-parse walk recurse.
+// and nil for anything that is not that shape.
 func pkcs8PrivateKeyDER(der []byte) []byte {
 	_, afterAlgorithm, ok := pkcs8Fields(der)
 	if !ok {
@@ -1516,11 +1002,7 @@ func pkcs8PrivateKeyDER(der []byte) []byte {
 }
 
 // passwordEncodingIssues reports the ways a PFX password cannot survive the
-// PKCS#12 BMPString (UCS-2) password encoding (RFC 7292 appendix B.1). It is
-// the single semantic home for that rule, and it stays INTERNAL to this
-// package: ValidatePasswordEncoding is the one verdict published, so
-// internal/config reuses the rule without coupling to the representation the
-// codec classifies with. The zero value means the password encodes faithfully.
+// PKCS#12 BMPString (UCS-2) password encoding (RFC 7292 appendix B.1).
 type passwordEncodingIssues struct {
 	// InvalidUTF8 means the password is not valid UTF-8, so every invalid byte
 	// is encoded as U+FFFD and the PFX ends up protected by a different,
@@ -1538,20 +1020,7 @@ type passwordEncodingIssues struct {
 }
 
 // why says why the PKCS#12 UCS-2 password encoding cannot carry this password
-// intact, or "" when it can. It is the single home of BOTH halves of that rule —
-// which shape to name when a password carries several, and the sentence that names
-// it — because there is exactly one consumer of either (ValidatePasswordEncoding,
-// whose error is all internal/config's startup gate and Encode's codec guard ever
-// read), and stating the precedence as the switch order is what stops the two
-// halves from being kept aligned by comment.
-//
-// A newly recognised shape is one bool field on passwordEncodingIssues plus one arm
-// here. Adding the field and forgetting the arm accepts the password — the same
-// single omission the shape-name indirection this replaced already had at its own
-// primary() arm, whose fail-closed default in explain() only covered the narrower
-// mistake of minting a constant and forgetting its text.
-//
-// Never names the password value; these texts reach the log.
+// intact, or "" when it can.
 func (i passwordEncodingIssues) why() string {
 	switch {
 	case i.InvalidUTF8:
@@ -1573,13 +1042,7 @@ func (i passwordEncodingIssues) why() string {
 }
 
 // inspectPasswordEncoding reports how a PFX password fares under the PKCS#12
-// UCS-2 password encoding. All shapes are computed in one pass so callers do
-// not re-derive the rule: go-pkcs12 rejects a non-BMP password with a message
-// that names neither the password nor the constraint's source, it silently
-// replaces invalid UTF-8 rune-by-rune, and it encodes an interior NUL verbatim
-// into a password format that is itself NUL-terminated. The offending rune or
-// byte is deliberately never reported: it is part of a secret, and the
-// diagnostics built on this query go to the container log.
+// UCS-2 password encoding.
 func inspectPasswordEncoding(password string) passwordEncodingIssues {
 	issues := passwordEncodingIssues{
 		InvalidUTF8: !utf8.ValidString(password),
@@ -1595,18 +1058,7 @@ func inspectPasswordEncoding(password string) passwordEncodingIssues {
 }
 
 // ValidatePasswordEncoding reports why the PKCS#12 UCS-2 password encoding
-// (RFC 7292 appendix B.1) cannot carry password intact, or nil when it can. It is
-// this package's ONLY password-encoding surface: recognition, the precedence
-// between shapes when a password carries several, and the sentence describing the
-// shape all stay unexported, so the sibling package that consumes the verdict
-// cannot drift from the encoder and a newly recognised shape lands here once.
-//
-// The empty password IS encodable and returns nil; whether an empty password may
-// be used is PFX_ALLOW_EMPTY_PASSWORD's decision, not this rule's.
-//
-// Only the SHAPE is named, never the value: the text reaches the container log,
-// and each caller adds its own framing (internal/config wraps it with
-// ErrUnencodablePassword, the codec guard prefixes "pfx password").
+// (RFC 7292 appendix B.1) cannot carry password intact, or nil when it can.
 func ValidatePasswordEncoding(password string) error {
 	if why := inspectPasswordEncoding(password).why(); why != "" {
 		return errors.New(why)

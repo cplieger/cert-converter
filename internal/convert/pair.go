@@ -11,30 +11,10 @@ import (
 )
 
 // Encode produces the PKCS#12 bytes for an analysed certificate/key pair.
-//
-// It is pure: bytes in, bytes out, no filesystem and no *os.Root. The confined
-// atomic write belongs to whoever owns the output tree, internal/process; this
-// package is a codec and never learns where its input came from or where its
-// output goes.
-//
-// The value receiver keeps the codec body free of a nil Analysis. The zero value
-// remains a documented programming error; its 96-byte copy is negligible beside
-// PKCS#12 derivation.
-//
-// The bag order the encoder produces is the order Analysis defines: the leaf's
-// bag first, then its chain nearest-parent-first. That is a contract rather than an
-// implementation detail — PKCS#12 stores an ordered SEQUENCE of bags (RFC 7292
-// §4.2) and decoders read it positionally, go-pkcs12's own DecodeChain included.
 func (a Analysis) Encode(encName EncoderType, password string) ([]byte, error) { //nolint:gocritic // hugeParam: the value Analyse hands back cannot be nil, so this body needs no nil arm; the 96-byte copy is noise beside the PBKDF2 that follows it.
 	// Defensive, and deliberately NOT redundant with internal/config's
 	// checkPasswordEncodable: both guards are wanted, and neither is the only line
-	// of defence. config.Load refuses all three unencodable shapes at startup,
-	// which is what makes this unreachable in production (the password is read once
-	// there, so a rotated PFX_PASSWORD_FILE takes effect only on restart). This
-	// guard refuses the same three shapes because an exported entry point should
-	// not depend on a caller having validated for it. Do not delete either as
-	// duplication: the startup gate fails the container fast for the one production
-	// caller, this one holds the codec's own contract for every caller.
+	// of defence.
 	if err := unencodablePasswordError(password); err != nil {
 		return nil, err
 	}
@@ -49,25 +29,6 @@ func (a Analysis) Encode(encName EncoderType, password string) ([]byte, error) {
 
 // unencodablePasswordError reports why the PKCS#12 UCS-2 password encoding
 // (RFC 7292 appendix B.1) cannot carry password intact, or nil when it can.
-//
-// It refuses every shape the classifier recognises, not just the one go-pkcs12
-// refuses on its own. The two the library accepts are the worse outcomes: it
-// replaces invalid UTF-8 rune-by-rune and encodes an interior NUL verbatim, so in
-// both cases Encode would SUCCEED and write a bundle protected by a different
-// password than the one supplied, with the failure surfacing at whatever later
-// tries to open it.
-//
-// The whole verdict is ValidatePasswordEncoding's — recognition, the precedence
-// between shapes, and the sentence describing the one named — so this guard and
-// internal/config's checkPasswordEncodable name the same shape AND give the same
-// advice for the same password by construction, each contributing only its own
-// framing.
-//
-// Only the SHAPE is named, never the value: these messages reach the container
-// log and the password is a secret. No sentinel wraps them because no caller
-// branches on the kind — the one production path treats any Encode error as a
-// conversion failure, and config.ErrUnencodablePassword (which cannot be reused
-// here anyway: internal/config imports this package) exists for callers of Load.
 func unencodablePasswordError(password string) error {
 	if err := ValidatePasswordEncoding(password); err != nil {
 		return errors.New("pfx password " + err.Error())
@@ -78,35 +39,22 @@ func unencodablePasswordError(password string) error {
 // --- Read-back: the currency check ---
 
 // CurrencyReason names WHY an existing bundle is, or is not, the bundle a set of
-// inputs would produce. It exists because the caller does not just act on the
-// verdict, it narrates it: each value is a distinct diagnosis with its own
-// operator meaning, and flattening them into a bare bool would make a deliberate
-// PFX_ENCODER switch indistinguishable from a corrupt file.
-//
-// The zero value is deliberately not CurrencyMatch, so a Currency nobody filled
-// in reads as "not current" rather than as a match.
+// inputs would produce.
 type CurrencyReason string
 
-// The five outcomes of a currency check. Every one that is not CurrencyMatch
-// means the same ACTION — rewrite the bundle — and a different diagnosis.
+// The five outcomes of a currency check.
 const (
 	// CurrencyMatch: the bundle on disk was written by the wanted encoder profile
 	// and carries exactly the leaf, key and chain these inputs produce.
 	CurrencyMatch CurrencyReason = "match"
 	// CurrencyPreflightFailed: the preflight refused the bytes, so nothing was
-	// decoded. Either the file is not one this app wrote, or it names a
-	// key-derivation iteration count outside the bound. Currency.Err carries the
-	// diagnosis; it wraps ErrProfileUnknown when the refusal came from one of this
-	// app's own profile rules rather than from the DER parser.
+	// decoded.
 	CurrencyPreflightFailed CurrencyReason = "preflight-failed"
 	// CurrencyProfileMismatch: the file is a well-formed bundle from one of this
 	// app's profiles, but not the wanted one — a deliberate PFX_ENCODER change.
-	// Currency.Profile carries the profile the file was written with.
 	CurrencyProfileMismatch CurrencyReason = "profile-mismatch"
 	// CurrencyDecodeFailed: the preflight passed but the bundle did not decode — a
-	// rotated password, a truncated file, a foreign file at that path. These are
-	// not distinguishable from each other (see decode) and need no distinguishing.
-	// Currency.Err carries the bounded decode error.
+	// rotated password, a truncated file, a foreign file at that path.
 	CurrencyDecodeFailed CurrencyReason = "decode-failed"
 	// CurrencyContentMismatch: the bundle decoded and its profile matches, but its
 	// leaf, key or chain is not what these inputs produce — the ordinary "the
@@ -116,17 +64,11 @@ const (
 
 // Currency is the outcome of CheckCurrency: the verdict plus the material the
 // caller needs to explain it.
-//
-// Err is populated for CurrencyPreflightFailed and CurrencyDecodeFailed;
-// Profile is populated only for CurrencyProfileMismatch. On the other reasons
-// those fields are zero. The verdict is derived from Reason by Current() rather
-// than stored, so there is only one thing to get right.
 type Currency struct {
 	// Reason is what the check concluded.
 	Reason CurrencyReason
 	// Err is the underlying failure for CurrencyPreflightFailed and
-	// CurrencyDecodeFailed, for a caller's diagnostic. Both are expected outcomes
-	// rather than faults: the caller's response to either is to rewrite the file.
+	// CurrencyDecodeFailed, for a caller's diagnostic.
 	Err error
 	// Profile is the encoder profile the existing file was written with, set for
 	// CurrencyProfileMismatch so the caller can name found-vs-configured.
@@ -138,33 +80,6 @@ func (c Currency) Current() bool { return c.Reason == CurrencyMatch }
 
 // CheckCurrency reports whether pfx is already the bundle this analysis would
 // produce under wantEncoder, and when it is not, why.
-//
-// This is the entire read-back side of the codec behind one call, deliberately.
-// Reading an existing bundle safely has a mandatory ORDER:
-//
-//  1. the preflight (inspect), FIRST, because it bounds every key-derivation
-//     iteration count the file itself dictates before any of them can reach
-//     PBKDF2, and because it names the encoder profile that decoding cannot
-//     reveal (see profile.go maxKDFIterations for exactly what it can and cannot
-//     see);
-//  2. the profile comparison, before any derivation, so a deliberate
-//     PFX_ENCODER change is answered without decrypting anything;
-//  3. the decode, whose derivation counts step 1 has now bounded;
-//  4. the comparison against the analysis the method is called on.
-//
-// That order is a safety invariant of the codec, not a convention for callers to
-// remember: a consumer reaching for the decode alone would run an unbounded
-// derivation on counts taken from a file under /output. The steps are unexported,
-// so the order is unbypassable - this is the only door, and it always walks them in
-// this sequence, the same rule the package already applies to parseCertChain.
-//
-// Nothing here is fatal. Every non-match outcome means "rewrite the file", so a
-// parse or decode failure is reported as a reason rather than as an error return;
-// the caller owns what a reason is worth and, since CheckCurrency takes no context,
-// owns the shutdown classification too. pfx is never mutated.
-//
-// The value receiver keeps Encode's codec body free of a nil arm; its copy is
-// negligible beside PKCS#12 decoding.
 func (a Analysis) CheckCurrency(pfx []byte, password string, wantEncoder EncoderType) Currency { //nolint:gocritic // hugeParam: same reason as Encode — the value Analyse hands back cannot be nil, so this body needs no nil arm.
 	priorProfile, err := inspect(pfx)
 	if err != nil {
@@ -185,44 +100,16 @@ func (a Analysis) CheckCurrency(pfx []byte, password string, wantEncoder Encoder
 }
 
 // decoded is what a previously written PFX yields when read back.
-//
-// Unexported like the steps that produce and consume it: CheckCurrency is the
-// only way in, so no caller outside this package can hold decoded material
-// without having gone through the preflight first.
 type decoded struct {
 	// Leaf is the end-entity certificate stored in the first bag.
 	Leaf *x509.Certificate
 	// Key is the private key stored alongside it.
 	Key crypto.PrivateKey
-	// CACerts are the remaining certificate bags, in stored order. They are
-	// returned rather than discarded because a currency check that compared only
-	// the leaf and key would report a bundle as up to date after an intermediate
-	// was renewed, a chain was corrected, or a cross-sign was replaced.
+	// CACerts are the remaining certificate bags, in stored order.
 	CACerts []*x509.Certificate
 }
 
 // decode reads a PKCS#12 bundle back into its parts.
-//
-// It exists so the output tree's owner can answer "is the file on disk still the
-// right bundle for these inputs?" by reading the file rather than by remembering
-// what it wrote. Decoding is codec work, so it belongs here; deciding what the
-// answer means belongs to the caller.
-//
-// It is a step of CheckCurrency rather than an entry point of its own, because it
-// must never run before the preflight: the iteration counts it feeds to PBKDF2
-// come from the FILE, and inspect is what bounds them (see profile.go
-// maxKDFIterations).
-//
-// A decode failure is a legitimate, expected outcome — a rotated password, a
-// truncated file, a foreign file at that path — and is NOT diagnosed further. The
-// library's ErrIncorrectPassword also fires on a MAC failure from corruption, so
-// "wrong password" and "damaged file" are not distinguishable, and the caller
-// needs the same response either way: treat the output as stale and rewrite it.
-//
-// The library's own message is bounded before it reaches a caller's log, because
-// two of its decode diagnostics interpolate an OBJECT IDENTIFIER decoded from the
-// bundle (go-pkcs12 v0.7.3: an unhandled safe-bag type, an unknown attribute),
-// and a bundle-controlled OID is bounded only by the file size.
 func decode(pfx []byte, password string) (decoded, error) {
 	key, leaf, caCerts, err := pkcs12.DecodeChain(pfx, password)
 	if err != nil {
@@ -234,20 +121,6 @@ func decode(pfx []byte, password string) (decoded, error) {
 // matchesAnalysis reports whether d is the bundle a would produce: the same
 // end-entity certificate, the same private key, and the same chain in the same
 // order.
-//
-// Order is compared, not just membership, because PKCS#12 stores an ordered
-// SEQUENCE of bags (RFC 7292 §4.2) and decoders read it positionally. A bundle
-// whose chain is correct but differently ordered is not the bundle this app emits
-// today, and rewriting it makes the output match its own contract.
-//
-// Encoder profile is deliberately outside this method because decoded contains
-// only decoded material, not the algorithm identifiers. That comparison is
-// CheckCurrency's second step, which is why the profile check cannot be forgotten
-// by a caller any more: a PFX_ENCODER change reaches the verdict without anyone
-// having to sequence it.
-//
-// decode guarantees d.Leaf is non-nil: go-pkcs12 v0.7.3 returns
-// "pkcs12: certificate missing" before this method can run.
 func (d decoded) matchesAnalysis(a Analysis) bool { //nolint:gocritic // hugeParam: reached only from CheckCurrency, which already holds the value.
 	if !bytes.Equal(d.Leaf.Raw, a.leaf.Raw) {
 		return false
@@ -266,13 +139,6 @@ func (d decoded) matchesAnalysis(a Analysis) bool { //nolint:gocritic // hugePar
 // sameKey reports whether the key read back from a bundle is the key the analysis
 // holds, compared through their public halves: a public half is safe to compare
 // without touching secret material.
-//
-// Only the DECODED key is asserted. go-pkcs12 hands that one back as a bare
-// crypto.PrivateKey, so whether it exposes a public half is a genuine unknown. The
-// analysed key is not: parsePrivateKeys admits only key types that expose one, and
-// Analysis.key records that in its type. Asking the same question of both halves
-// made the compiler's guarantee read as a runtime unknown and hid which side of
-// this comparison is file-supplied.
 func sameKey(decodedKey crypto.PrivateKey, analysed crypto.Signer) bool {
 	signer, ok := decodedKey.(crypto.Signer)
 	if !ok {

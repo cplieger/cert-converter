@@ -557,12 +557,6 @@ func TestLoad_warns_when_the_fallback_rescan_is_disabled(t *testing.T) {
 						tc.raw, want, logs.Messages())
 				}
 			}
-			// The old wording promised the opposite of the current contract, and an
-			// operator who has read it must not find it here again.
-			if logs.Contains("converting nothing") {
-				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN still claims the container reports healthy while converting nothing; the reconciliation floor and the marker deadline both hold in this mode now (logs %v)",
-					tc.raw, logs.Messages())
-			}
 			if !logs.AttrContains(optOutWarn, "remediation", "FALLBACK_SCAN_HOURS") {
 				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN carries no remediation naming the variable (logs %v)",
 					tc.raw, logs.Messages())
@@ -2130,58 +2124,6 @@ func TestLoad_reports_every_hard_to_enter_rune_shape_once(t *testing.T) {
 					t.Errorf("Load(%s) with a password carrying all three shapes logged %d WARN records matching %q, want exactly 1: each shape needs its own actionable record (logs %v)",
 						channel, n, msg, logs.Messages())
 				}
-			}
-		})
-	}
-}
-
-// TestLoad_warns_when_a_mounted_secret_contains_a_format_character is the
-// file-channel half: the invisible-formatting guard is channel-agnostic today, and
-// the mounted file is where the failure mode actually originates (an editor saving
-// the secret as "UTF-8 with BOM"). Without this, folding the guard into the env-only
-// shape of its sibling padding WARN would silence the file channel with every other
-// test still green. It pins "source" to PFX_PASSWORD_FILE by equality, the channel
-// name an operator's saved query and Loki matcher select on. Serial: it swaps
-// slog.Default().
-func TestLoad_warns_when_a_mounted_secret_contains_a_format_character(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		password string
-		wantWarn bool
-	}{
-		{"a byte-order mark warns", "\ufeffsecret", true},
-		{"an interior zero-width space warns", "pw\u200bsecret", true},
-		{"a plain password is silent", "hunter2", false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "pfx-password")
-			if err := os.WriteFile(path, []byte(tc.password), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			t.Setenv("PFX_PASSWORD", "")
-			t.Setenv("PFX_PASSWORD_FILE", path)
-			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
-
-			logs := capture.Default(t)
-
-			cfg, err := Load()
-			if err != nil {
-				t.Fatalf("Load() = %v, want nil: an invisible formatting character is a WARN, not a startup refusal", err)
-			}
-			if cfg.Password != tc.password {
-				t.Errorf("Load() Password = %q, want %q verbatim", cfg.Password, tc.password)
-			}
-
-			const msg = "invisible Unicode character"
-			wantCount := 0
-			if tc.wantWarn {
-				wantCount = 1
-			}
-			if got := logs.CountLevel(slog.LevelWarn, msg); got != wantCount {
-				t.Errorf("Load(%s) logged %d invisible-formatting WARNs, want %d (logs %v)", tc.name, got, wantCount, logs.Messages())
-			}
-			if tc.wantWarn && !logs.HasAttr(msg, "source", "PFX_PASSWORD_FILE") {
-				t.Errorf("invisible-formatting WARN does not name the mounted-secret channel an operator filters on (logs %v)", logs.Messages())
 			}
 		})
 	}

@@ -22,28 +22,6 @@ const (
 // profile is one row of the encoder-profile contract: the app-owned name, the
 // spellings accepted for it, the go-pkcs12 encoder it selects, and the (MAC,
 // certificate-encryption, key-encryption) algorithm triple that encoder emits.
-// Keeping both directions in this table prevents the name-to-encoder and
-// algorithm-triple-to-name mappings from drifting apart.
-//
-// The modern2023 row's empty-string alias is not a spelling an operator types: it is the
-// UNSET PFX_ENCODER case, and it is what keeps internal/config's
-// "unknown PFX_ENCODER" WARN off every default deployment (config.go calls EncoderName
-// with the raw environment value and warns whenever known is false). Do not drop it when
-// aligning the alias sets with the documented spellings.
-//
-// All three algorithms are part of a profile's identity because they vary
-// independently: legacyrc2 encrypts certificates with RC2-40 but its private key
-// with 3DES, so a bundle carrying a modern MAC and PBES2 certificates over a
-// 3DES-encrypted key is NOT a bundle any profile here emits. Recording only the
-// first two would report such a mixed bundle as modern2023 and leave a weakly
-// protected private key on disk.
-//
-// macIterations is recorded rather than derived from macOID for the same
-// single-home reason: ProtectionOf used to infer the count from the algorithm
-// name, which is a second protection mapping beside this table. A row whose MAC
-// algorithm is new but whose derivation is nominal would escape the warning, and a
-// SHA-1 row with a real iteration count would draw a false one. Positional literals
-// mean a row added here cannot compile without stating its count.
 type profile struct {
 	name          EncoderType
 	aliases       []string
@@ -67,12 +45,7 @@ var profiles = []profile{
 }
 
 // EncoderName normalizes a raw PFX_ENCODER value to one of the known encoder
-// names. It owns the normalization rule but not the diagnostic: known reports
-// whether raw matched a recognized spelling, so the caller that read the
-// environment variable is the one that names it in a warning. An empty or
-// whitespace-only value is the unset case and is RECOGNIZED: it returns modern2023
-// with known true, so leaving PFX_ENCODER unset warns about nothing. Any other
-// unrecognized value falls back to modern2023 with known false.
+// names.
 func EncoderName(raw string) (name EncoderType, known bool) {
 	v := strings.ToLower(strings.TrimSpace(raw))
 	// Indexed rather than ranged by value: a profile row is over gocritic's copy
@@ -89,15 +62,11 @@ func EncoderName(raw string) (name EncoderType, known bool) {
 // defaultProfile is the row every unrecognized name resolves to, and the one home
 // of that answer: EncoderName's fallback and resolvedProfile's both read it, so
 // "which profile is the default" is one edit in the table rather than three
-// literals to keep aligned. A partial edit is what would make the write side emit
-// one profile while the read side compared against another — the permanent
-// rewrite loop resolvedProfile exists to prevent.
+// literals to keep aligned.
 var defaultProfile = profiles[0]
 
 // EncoderNames returns the canonical PFX_ENCODER spellings in profile-table
-// order. The profiles table stays the single home of the value domain, while the
-// caller that read the environment variable names the accepted set in its own
-// diagnostic — the same split EncoderName already documents for the warning.
+// order.
 func EncoderNames() []EncoderType {
 	names := make([]EncoderType, 0, len(profiles))
 	for i := range profiles {
@@ -107,16 +76,11 @@ func EncoderNames() []EncoderType {
 }
 
 // ModernMACIterations is the KDF iteration count the modern profiles derive their
-// MAC with, and the baseline a legacy-profile warning is read against. Named here
-// rather than restated by a caller so the number a diagnostic prints and the floor
-// the decode preflight enforces cannot drift.
+// MAC with, and the baseline a legacy-profile warning is read against.
 const ModernMACIterations = minKDFIterations
 
 // Protection reports what one profile's bundles do to protect the embedded
-// password and the private key. It exists so a caller that must WARN about a weak
-// PFX_ENCODER choice does not re-enumerate which profiles are weak: this package
-// owns the profile table, so the table answers it and a row added there cannot
-// escape the warning.
+// password and the private key.
 type Protection struct {
 	// MACIterations is the iteration count this profile's MAC derives with.
 	MACIterations int
@@ -142,12 +106,7 @@ func ProtectionOf(name EncoderType) Protection {
 
 // resolvedProfile resolves an EncoderType to the profile row it selects: the
 // matching row when this package knows the name, and the modern2023 row
-// otherwise. It is the ONE home of the matching-and-fallback rule, because the
-// write side and the read-back side must agree about an unrecognized name — with
-// each side searching the table itself, Encode could write a modern2023 bundle
-// while CheckCurrency compared the file against the name it was handed, reporting
-// profile-mismatch on every scan and rewriting the bundle forever. Returning the
-// row keeps its name and encoder inseparable.
+// otherwise.
 func resolvedProfile(name EncoderType) profile {
 	for i := range profiles {
 		if profiles[i].name == name {

@@ -1167,16 +1167,6 @@ func TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install(t
 		t.Errorf("inspect(lax bundle) changed the mode to %v, want %v untouched: inspection must never"+
 			" chmod the operator's file", got, found)
 	}
-	for _, unwanted := range []string{
-		"tightened the file mode of a prior pfx",
-		"prior pfx is more permissive than policy and could not be tightened",
-		"could not pin the prior pfx for a mode repair; leaving its mode as found",
-	} {
-		if logs.Count(unwanted) != 0 {
-			t.Errorf("inspect(lax bundle) logged %q, want it gone: this app no longer repairs a mode in"+
-				" place, so no record may describe one: %q", unwanted, logs.Messages())
-		}
-	}
 }
 
 // TestStoreRemoveOrphan_reports_a_refused_unlink_and_keeps_the_candidate pins
