@@ -231,12 +231,6 @@ func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (Anal
 		extra:        extra,
 		observations: obs,
 	}
-	// The ONE statement of the leaf invariant, at the producer.
-	if a.leaf == nil {
-		return Analysis{}, errors.New(
-			"convert: internal invariant violated: analyseAt selected no leaf certificate " +
-				"(this is a defect in cert-converter, not a problem with the input)")
-	}
 	return a, nil
 }
 
