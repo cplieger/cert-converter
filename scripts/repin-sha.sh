@@ -29,7 +29,7 @@
 set -eu
 
 usage() {
-  echo "usage: repin-sha.sh <depName> <newVersion> [dockerfile ...]" >&2
+  printf 'usage: repin-sha.sh <depName> <newVersion> [dockerfile ...]\n' >&2
   exit 2
 }
 
@@ -39,6 +39,19 @@ version=$2
 shift 2
 [ -n "$dep" ] && [ -n "$version" ] || usage
 
+# The version is interpolated into the sed EXPRESSION below, and GNU sed's `e`
+# flag and `e` command execute the pattern space as a shell command, so a
+# version carrying `|` and `;` is arbitrary code execution here. It also reaches
+# curl as part of a URL, where `{}`/`[]` trigger curl's own URL globbing.
+# The value is not ours: it is whatever version a third-party datasource
+# reports, so constrain it to the shape a version has before any use.
+case $version in
+  *[!A-Za-z0-9._+~-]*)
+    printf 'repin: refusing version with unexpected characters: %s\n' "$version" >&2
+    exit 1
+    ;;
+esac
+
 version_nov=${version#v}
 
 if [ $# -eq 0 ]; then
@@ -46,19 +59,65 @@ if [ $# -eq 0 ]; then
 fi
 
 tmp=$(mktemp -d)
-# shellcheck disable=SC2064 # expand $tmp now: it must not depend on later state
-trap "rm -rf '$tmp'" EXIT INT TERM
+# staged is the in-place rewrite target beside the Dockerfile, tracked here so
+# the trap can remove it: it lives OUTSIDE $tmp by necessity (a rename must be
+# same-filesystem), so the mktemp -d cleanup cannot reach it, and an interrupt
+# between the copy and the rename would otherwise leave it in the working tree
+# for Renovate to carry into a branch.
+staged=
+cleanup() {
+  rm -rf "$tmp"
+  [ -n "$staged" ] && rm -f "$staged"
+  return 0
+}
+trap cleanup EXIT INT TERM HUP
+
+# resolve_target prints the real path of $1, following symlinks.
+#
+# It matters because the rewrite below commits by RENAME, which must land beside
+# the actual file, and because a Dockerfile reached through a symlink has to be
+# updated at its TARGET rather than replaced by a regular file — silently
+# breaking whatever the symlink was arranged for.
+#
+# Neither realpath nor readlink is in POSIX (realpath arrived only in
+# POSIX.1-2024) and this script is `#!/bin/sh` synced across every repo, so both
+# are probed rather than assumed. With neither available a SYMLINKED Dockerfile
+# fails closed: the rewrite commits by rename, so returning the unresolved path
+# would turn a tracked symlink into a regular file, and a warning does not
+# preserve the arrangement the symlink exists for. An ordinary file still uses
+# the path as given, which needs no resolver.
+resolve_target() {
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$1"
+  elif command -v readlink >/dev/null 2>&1 && readlink -f "$1" >/dev/null 2>&1; then
+    readlink -f "$1"
+  else
+    if [ -L "$1" ]; then
+      printf 'repin: %s: cannot safely update symlink without realpath or readlink -f\n' "$1" >&2
+      return 1
+    fi
+    printf '%s\n' "$1"
+  fi
+}
 
 updated=0
 
 for dockerfile in "$@"; do
   [ -f "$dockerfile" ] || continue
 
+  dockerfile_target=$(resolve_target "$dockerfile") || {
+    printf 'repin: %s: cannot resolve target path\n' "$dockerfile" >&2
+    exit 1
+  }
+
   # Emit "<ARG name> <url template>" for every marker naming this dep. The
   # marker must sit on the line immediately above its ARG so the pairing is
   # unambiguous in a file that carries several pins.
   awk -v dep="$dep" '
 		/^#[[:space:]]*repin:/ {
+			# END reports it: printing here as well would double the message, because
+			# awk runs END on exit and pending_dep is still set.
+			if (pending_dep != "") { exit 3 }
 			d = ""; u = ""
 			for (i = 1; i <= NF; i++) {
 				if ($i ~ /^dep=/) { d = substr($i, 5) }
@@ -72,10 +131,7 @@ for dockerfile in "$@"; do
 			next
 		}
 		pending_dep != "" {
-			if ($0 !~ /^ARG [A-Za-z_][A-Za-z0-9_]*=/) {
-				printf "repin: marker at %s:%d is not followed by an ARG assignment\n", FILENAME, pending_line > "/dev/stderr"
-				exit 3
-			}
+			if ($0 !~ /^ARG [A-Za-z_][A-Za-z0-9_]*=/) { exit 3 }  # END reports it
 			if (pending_dep == dep) {
 				name = $0
 				sub(/^ARG /, "", name)
@@ -85,26 +141,33 @@ for dockerfile in "$@"; do
 			pending_dep = ""
 			next
 		}
-	' "$dockerfile" >"$tmp/pins" || exit $?
+		END {
+			if (pending_dep != "") {
+				printf "repin: marker at %s:%d is not followed by an ARG assignment\n", FILENAME, pending_line > "/dev/stderr"
+				exit 3
+			}
+		}
+	' "$dockerfile_target" >"$tmp/pins" || exit $?
 
   while read -r name url; do
     [ -n "$name" ] || continue
 
-    # Placeholder expansion is a literal substitution on the marker's own
-    # text, so a URL is only ever built from the Dockerfile plus the version
-    # Renovate reports.
+    # A sed replacement is NOT a literal context ('&' re-inserts the match,
+    # '\1' a group, '|' closes the command), so this is safe only because the
+    # version was parsed to [A-Za-z0-9._+~-] at the argument boundary above.
+    # The URL is then built from the Dockerfile marker plus that parsed value.
     resolved=$(printf '%s\n' "$url" \
       | sed -e "s|{version}|$version|g" -e "s|{version_nov}|$version_nov|g")
 
     case $resolved in
       https://*) ;;
       *)
-        echo "repin: $name: refusing non-https URL: $resolved" >&2
+        printf 'repin: %s: refusing non-https URL: %s\n' "$name" "$resolved" >&2
         exit 1
         ;;
     esac
 
-    echo "repin: $dockerfile: $name <- $resolved"
+    printf 'repin: %s: %s <- %s\n' "$dockerfile" "$name" "$resolved"
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
       --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 \
       -fsSL -o "$tmp/artifact" "$resolved"
@@ -113,7 +176,7 @@ for dockerfile in "$@"; do
     case $sha in
       [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
       *)
-        echo "repin: $name: sha256sum produced no digest" >&2
+        printf 'repin: %s: sha256sum produced no digest\n' "$name" >&2
         exit 1
         ;;
     esac
@@ -122,18 +185,39 @@ for dockerfile in "$@"; do
     # file can match; the optional trailing group preserves an inline
     # Renovate anchor comment (ARG X=<sha>  # tool v1.2.3).
     sed -E "s|^(ARG ${name}=)[0-9a-f]{64}([[:space:]].*)?\$|\1${sha}\2|" \
-      "$dockerfile" >"$tmp/rewritten"
+      "$dockerfile_target" >"$tmp/rewritten"
 
     if ! grep -qE "^ARG ${name}=${sha}([[:space:]]|\$)" "$tmp/rewritten"; then
-      echo "repin: $name: no 64-hex pin to rewrite in $dockerfile" >&2
+      printf 'repin: %s: no 64-hex pin to rewrite in %s\n' "$name" "$dockerfile" >&2
       exit 1
     fi
 
-    cat "$tmp/rewritten" >"$dockerfile"
+    # Replace atomically. '>' truncates the target before the first byte lands,
+    # so a killed postUpgradeTask or an ENOSPC leaves a truncated Dockerfile in
+    # the branch Renovate commits. Stage beside the TARGET (the mktemp -d above
+    # is a different filesystem, so a rename out of it cannot work) and rename
+    # over it; copying the original first carries its mode across the replace,
+    # which `cp -p` does portably where `chmod --reference` is GNU-only.
+    #
+    # mktemp, not a name built from $$: it creates the file with O_EXCL under an
+    # unpredictable name, so nothing can be sitting at the path when the copy opens
+    # it -- a $$-derived name is guessable and `rm -f` then `cp -p` reopens by path,
+    # which is a window a symlink planted there turns into a write through it. The
+    # rename still commits, and `cp -p` still carries the original's mode across the
+    # replace (verified: cp -p sets the source's mode on an existing destination),
+    # which is why mktemp's own 0600 does not leak into the committed file. A
+    # leftover matches neither postUpgradeTasks fileFilter (Dockerfile,
+    # **/Dockerfile), so it can never be committed. shell.md, "Temp files and atomic
+    # writes".
+    staged=$(mktemp "$dockerfile_target.repin.XXXXXX")
+    cp -p "$dockerfile_target" "$staged"
+    cat "$tmp/rewritten" >"$staged"
+    mv -f "$staged" "$dockerfile_target"
+    staged= # renamed away: nothing left for the trap to remove
     updated=$((updated + 1))
   done <"$tmp/pins"
 done
 
 if [ "$updated" -eq 0 ]; then
-  echo "repin: no pin declares dep=$dep; nothing to do"
+  printf 'repin: no pin declares dep=%s; nothing to do\n' "$dep"
 fi
