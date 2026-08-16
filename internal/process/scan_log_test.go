@@ -740,4 +740,3 @@ func TestLogScanOutcome_reports_observed_per_path_counts_when_the_entry_budget_s
 		})
 	}
 }
-

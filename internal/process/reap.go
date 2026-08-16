@@ -118,32 +118,38 @@ func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *r
 	// is whether this scan's own output work was clean, which resolveReap reads off
 	// the result itself.
 	if !resolveReap(rp.mode, &rc.result, walkSafe) {
-		msg := "output bundles have no matching input"
-		// In sync mode reaching this line means orphan removal is OFF for this scan,
-		// which is the condition the README's CertConverterOrphanRemovalDisabled rule
-		// matches, and the README's OUTPUT_LIFECYCLE row promises the phrase for every
-		// failed proof term, the conversion-failure and refused-replacement vetoes
-		// included.
-		if rp.mode == outputpolicy.LifecycleSync {
-			msg += "; " + reapDisabledPhrase
-		}
-		inaction, remediation := retentionProse(rp.mode, walkSafe)
-		slog.Warn(msg,
-			"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),
-			"action", inaction,
-			"remediation", remediation)
-		// The retention REPORTS are the whole point of this arm, which is why it deletes
-		// nothing: OUTPUT_LIFECYCLE forbids a deletion here. keyStillPresent owns the
-		// record; its answer has nothing left to gate.
-		if walkSafe {
-			for _, rel := range orphaned {
-				rp.keyStillPresent(rel, layout.CertForOutput(rel))
-			}
-		}
+		rp.reportRetainedOrphans(orphaned, walkSafe)
 		return 0, nil
 	}
 
 	return rp.reapConfirmed(ctx, orphaned)
+}
+
+// reportRetainedOrphans is reconcile's no-deletion arm: the orphans are named and
+// kept, because OUTPUT_LIFECYCLE forbids a deletion for this scan. It deletes
+// nothing, so it returns nothing to act on.
+func (rp *reaper) reportRetainedOrphans(orphaned []string, walkSafe bool) {
+	msg := "output bundles have no matching input"
+	// In sync mode reaching this line means orphan removal is OFF for this scan,
+	// which is the condition the README's CertConverterOrphanRemovalDisabled rule
+	// matches, and the README's OUTPUT_LIFECYCLE row promises the phrase for every
+	// failed proof term, the conversion-failure and refused-replacement vetoes
+	// included.
+	if rp.mode == outputpolicy.LifecycleSync {
+		msg += "; " + reapDisabledPhrase
+	}
+	inaction, remediation := retentionProse(rp.mode, walkSafe)
+	slog.Warn(msg,
+		"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),
+		"action", inaction,
+		"remediation", remediation)
+	// keyStillPresent owns the half-deleted-pair record; with no deletion to gate,
+	// its answer is the report itself.
+	if walkSafe {
+		for _, rel := range orphaned {
+			rp.keyStillPresent(rel, layout.CertForOutput(rel))
+		}
+	}
 }
 
 // orphansOf selects, from the output tree's own enumeration, the bundles whose input

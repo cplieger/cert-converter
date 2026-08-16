@@ -450,7 +450,6 @@ func TestLogIncompleteInputEnumeration_quiet_arms(t *testing.T) {
 				" the only line the operator sees", logs.Messages())
 		}
 	})
-
 }
 
 // TestStoreListOutputs_stops_at_the_output_entry_budget pins the /output entry budget's
@@ -515,4 +514,3 @@ func TestStoreListOutputs_enumerates_a_tree_inside_the_budget(t *testing.T) {
 			" output shape is a candidate", found)
 	}
 }
-
