@@ -55,16 +55,6 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, skippedBlocks, error)
 			declaredCertBlocks, maxChainCerts)
 	}
 	var scan certScan
-	// EC PARAMETERS is an expected passenger only as the companion of the EC key
-	// `openssl ecparam -genkey` writes beside it, so whether this file carries that
-	// key is a property of the file as a whole and is settled BEFORE the blocks are
-	// classified in order (the parameters block precedes the key it describes, and
-	// the report names the FIRST unrelated label, so the answer cannot be deferred
-	// to the end of the drain).
-	if countDeclaredBlocks(pemBytes, pemBeginMarker(pemTypeECParameters)) > 0 {
-		scan.ecKeyPresent = holdsECPrivateKey(pemBytes)
-	}
-
 	for {
 		var block *pem.Block
 		block, pemBytes = pem.Decode(pemBytes)
@@ -108,9 +98,6 @@ type certScan struct {
 	unrelated skippedBlocks
 	// keyLabels are the private-key blocks the certificate file holds.
 	keyLabels skippedBlocks
-	// ecKeyPresent says whether the file also holds an EC private key, which is what
-	// makes an EC PARAMETERS block in it an expected companion rather than a stray.
-	ecKeyPresent bool
 }
 
 // visit classifies one PEM block, applying the parser's per-block rules.
@@ -122,7 +109,7 @@ func (s *certScan) visit(block *pem.Block) error {
 		}
 		// Only a label naming neither a certificate nor a key companion is reported;
 		// isExpectedCertFilePassenger owns that set.
-		if !isExpectedCertFilePassenger(block.Type, s.ecKeyPresent) {
+		if !isExpectedCertFilePassenger(block.Type) {
 			s.unrelated.add(block.Type)
 		}
 		return nil
@@ -197,11 +184,11 @@ func retainedExtensionElements(c *x509.Certificate) int {
 // isExpectedCertFilePassenger reports whether a non-certificate PEM label in the
 // CERTIFICATE file is an expected companion rather than something the operator meant
 // this app to read as a certificate.
-func isExpectedCertFilePassenger(blockType string, ecKeyPresent bool) bool {
+func isExpectedCertFilePassenger(blockType string) bool {
 	if isPrivateKeyLabel(blockType) {
 		return true
 	}
-	return blockType == pemTypeECParameters && ecKeyPresent
+	return blockType == pemTypeECParameters
 }
 
 // isPrivateKeyLabel reports whether a PEM label names a private-key block, the
@@ -213,43 +200,6 @@ func isPrivateKeyLabel(blockType string) bool {
 		return true
 	}
 	return false
-}
-
-// holdsECPrivateKey reports whether pemBytes carries an EC private key: a SEC1
-// "EC PRIVATE KEY" block, or a PKCS#8 "PRIVATE KEY" block whose
-// AlgorithmIdentifier names id-ecPublicKey.
-func holdsECPrivateKey(pemBytes []byte) bool {
-	for {
-		var block *pem.Block
-		block, pemBytes = pem.Decode(pemBytes)
-		if block == nil {
-			return false
-		}
-		switch block.Type {
-		case pemTypeECPrivateKey:
-			return true
-		case pemTypePrivateKey:
-			if pkcs8HoldsECKey(block.Bytes) {
-				return true
-			}
-		}
-	}
-}
-
-// ecPublicKeyOID is id-ecPublicKey (1.2.840.10045.2.1, RFC 5480 2.1.1), the
-// algorithm a PKCS#8 container names when it holds an EC private key.
-var ecPublicKeyOID = asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}
-
-// pkcs8HoldsECKey reports whether PKCS#8 PrivateKeyInfo DER declares an EC key,
-// reading only the AlgorithmIdentifier's OID: SEQUENCE { INTEGER version, SEQUENCE
-// { OBJECT IDENTIFIER algorithm, ...
-func pkcs8HoldsECKey(der []byte) bool {
-	oid, _, ok := pkcs8AlgorithmOID(der)
-	if !ok {
-		return false
-	}
-	parsed, err := decodeOID(oid)
-	return err == nil && parsed.Equal(ecPublicKeyOID)
 }
 
 // pkcs8Fields returns a PKCS#8 PrivateKeyInfo's AlgorithmIdentifier element and the

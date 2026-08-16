@@ -645,8 +645,6 @@ func TestScannerRun_an_unopenable_root_emits_the_scan_outcome_record(t *testing.
 //     at all", "EVERY certificate lacks its key") stay gated on a complete walk, since a
 //     truncated scan is precisely one that did not see the whole tree — the all-orphan
 //     shape therefore falls through to the "some certificates" arm.
-//   - The counts are labelled as observations via the coverage attribute, so nothing
-//     reads them as whole-tree totals.
 //
 // This test fails when its subject is reverted. Checked by restoring the unconditional
 // `if walkErr != nil { return }`: every assertion in the budget subtests then fails
@@ -727,8 +725,7 @@ func TestLogScanOutcome_reports_observed_per_path_counts_when_the_entry_budget_s
 				}
 			}
 
-			// Every reported count on a truncated scan is labelled an observation, so it is
-			// not read as a whole-tree total.
+			// A reported count on a truncated scan is named once, at WARN.
 			for _, c := range []struct {
 				msg  string
 				want bool
@@ -739,41 +736,8 @@ func TestLogScanOutcome_reports_observed_per_path_counts_when_the_entry_budget_s
 				if logs.CountLevel(slog.LevelWarn, c.msg) != 1 {
 					t.Errorf("logScanOutcome(%+v, %v) did not log %q once at WARN", tt.result, tt.walkErr, c.msg)
 				}
-				if !logs.HasAttr(c.msg, "coverage", budgetTruncatedCoverage) {
-					got, _ := logs.AttrValue(c.msg, "coverage")
-					t.Errorf("logScanOutcome(%+v, %v) logged coverage=%q on %q, want %q: a count from a"+
-						" truncated scan must say it counts only the paths the scan reached",
-						tt.result, tt.walkErr, got, c.msg, budgetTruncatedCoverage)
-				}
 			}
 		})
 	}
 }
 
-// TestLogInputCoverageWarnings_labels_a_complete_scan_without_the_coverage_attribute is
-// the other side of the attribute: on a scan that DID complete, the same per-path counts
-// are whole-tree facts and must carry no truncation label. Without this, the attribute
-// could be emitted unconditionally and the budget test above would still pass, leaving
-// every operator record claiming partial coverage.
-//
-// This test fails when its subject is reverted. Checked by making the coverage attribute
-// unconditional (moving it out of the budgetStopped branch): both assertions then fail.
-// Runs serially: it swaps slog.Default().
-func TestLogInputCoverageWarnings_labels_a_complete_scan_without_the_coverage_attribute(t *testing.T) {
-	logs := captureLogs(t)
-
-	logInputCoverageWarnings(&ScanResult{Total: 3, Converted: 1, Orphan: 1, Unreadable: 1}, nil)
-
-	for _, msg := range []string{
-		"some /input paths were unreadable and were skipped",
-		"some certificates under the input root are missing their sibling .key",
-	} {
-		if !logs.Contains(msg) {
-			t.Fatalf("logInputCoverageWarnings(a completed scan) logged %q, want %q present", logs.Messages(), msg)
-		}
-		if got, ok := logs.AttrValue(msg, "coverage"); ok {
-			t.Errorf("logInputCoverageWarnings(a completed scan) logged coverage=%q on %q, want the"+
-				" attribute absent: a completed scan's counts are whole-tree facts", got, msg)
-		}
-	}
-}

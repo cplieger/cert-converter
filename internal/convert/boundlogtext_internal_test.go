@@ -234,7 +234,7 @@ func TestParsePrivateKey_bounds_an_oversized_pkcs8_algorithm_oid(t *testing.T) {
 func TestParsePrivateKey_bounds_an_oversized_pkcs8_parameters_oid(t *testing.T) {
 	t.Parallel()
 	algorithm := asn1.RawValue{Tag: asn1.TagSequence, IsCompound: true, Bytes: append(
-		testASN1Marshal(t, ecPublicKeyOID),
+		testASN1Marshal(t, oidECPublicKey),
 		testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagOID, Bytes: bytes.Repeat([]byte{0x01}, 64<<10)})...)}
 	der := testASN1Marshal(t, struct {
 		Version    int
@@ -307,7 +307,7 @@ func TestParsePrivateKey_bounds_an_oversized_sec1_curve_oid(t *testing.T) {
 func TestParsePrivateKey_bounds_an_oversized_sec1_curve_oid_inside_pkcs8(t *testing.T) {
 	t.Parallel()
 	algorithm := asn1.RawValue{Tag: asn1.TagSequence, IsCompound: true, Bytes: append(
-		testASN1Marshal(t, ecPublicKeyOID),
+		testASN1Marshal(t, oidECPublicKey),
 		testASN1Marshal(t, asn1.ObjectIdentifier{1, 2, 840, 10045, 3, 1, 7})...)}
 	pkcs8WrappingSEC1 := func(t *testing.T, curveOIDBytes int) []byte {
 		t.Helper()

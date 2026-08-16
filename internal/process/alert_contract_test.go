@@ -91,12 +91,6 @@ func TestOperatorLogContract_keeps_the_published_matchers_mutually_exclusive(t *
 			name:    "the /output entry budget does not fire the /input rule",
 			message: outputBudgetMsg,
 		},
-		{
-			// Also a ceiling condition, also reported through reapDisabledPhrase, so the
-			// same wording pull applies to it.
-			name:    "the evicted-wholeness abort does not fire the /input rule",
-			message: evictedEvidenceMsg,
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

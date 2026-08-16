@@ -168,8 +168,15 @@ func TestScannerRun_reports_a_key_replaced_mid_scan_as_transient_then_names_a_ke
 		t.Errorf("Run(key gone from a converted pair) logged %q, want no missing-key aggregate: its remediation tells the operator to rename keys that are correct",
 			logs.Messages())
 	}
-	if got := logs.CountLevel(slog.LevelWarn, ""); got != 0 {
-		t.Errorf("Run(key gone from a converted pair) logged %d WARN records (%q), want none at the default level", got, logs.Messages())
+	// The scan's one default-level record is the reap gate: a certificate replaced
+	// mid-walk leaves the enumeration incomplete, so orphan removal is off for this scan
+	// and says so. Nothing else may reach WARN.
+	const reapDisabled = reapDisabledPhrase + ": the scan did not fully enumerate the input tree, so no output can be proven orphaned"
+	if got := logs.CountLevel(slog.LevelWarn, ""); got != 1 {
+		t.Errorf("Run(key gone from a converted pair) logged %d WARN records (%q), want only the disabled-orphan-removal record at the default level", got, logs.Messages())
+	}
+	if got := logs.CountLevel(slog.LevelWarn, reapDisabled); got != 1 {
+		t.Errorf("Run(key gone from a converted pair) logged %q, want %q once at WARN", logs.Messages(), reapDisabled)
 	}
 	if _, statErr := os.Stat(bundle); statErr != nil {
 		t.Errorf("os.Stat(%q) = %v after the transient scan, want the bundle left in place: its certificate is still under /input, so it is never an orphan candidate",

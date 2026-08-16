@@ -1,7 +1,6 @@
 package process
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 	"unicode"
@@ -29,13 +28,13 @@ import (
 //     handler this app installs; it is what keeps the value safe in a handler that does
 //     not (a JSON handler passes a bidi override through raw) and legible to an operator
 //     who reads the attribute.
-//   - Bounded: the sample never exceeds the budget by more than the marker and the
-//     elision notice, both of which are appended after the cut, and it is always valid
-//     UTF-8.
+//   - Bounded: the sample never exceeds the budget by more than the marker, which is
+//     appended after the cut, and it is always valid UTF-8.
 //
 // Seeds cover the classes deliberately, because the weekly coverage-guided run starts
 // from the committed corpus and never accumulates past it: ordinary names, the two
-// hostile runes, a lone invalid byte, a raw C1 byte, and inputs over each cap.
+// hostile runes, a lone invalid byte, a raw C1 byte, one oversized name and a long
+// list of short ones.
 func FuzzSampleOrphanPaths_singleLineBoundedSample(f *testing.F) {
 	f.Add("example.com/host01/fullchain.pfx")
 	f.Add("a.pfx\x00b.pfx")
@@ -46,7 +45,7 @@ func FuzzSampleOrphanPaths_singleLineBoundedSample(f *testing.F) {
 	// Every byte invalid: sanitizing GROWS this to three bytes per byte, so a cut that
 	// counted the raw bytes would emit three times the budget.
 	f.Add(strings.Repeat("\xff", maxLoggedOrphanBytes))
-	f.Add(strings.Repeat("a.pfx\x00", maxLoggedOrphans+5))
+	f.Add(strings.Repeat("a.pfx\x00", 25))
 
 	f.Fuzz(func(t *testing.T, joined string) {
 		// NUL cannot appear in a filename, so it is the one byte safe to use as the
@@ -64,14 +63,7 @@ func FuzzSampleOrphanPaths_singleLineBoundedSample(f *testing.F) {
 		if !utf8.ValidString(got) {
 			t.Fatalf("sampleOrphanPaths(%q) = %q: invalid UTF-8", paths, got)
 		}
-		// The elision notice is appended after the cut and its width grows with the
-		// count, so the allowance is computed from this input's own count rather than
-		// hardcoding a digit ceiling a large-enough fuzz input would exceed.
-		elided := ""
-		if len(paths) > maxLoggedOrphans {
-			elided = fmt.Sprintf(" (+%d more)", len(paths)-maxLoggedOrphans)
-		}
-		if maxLen := maxLoggedOrphanBytes + len(logtext.Marker) + len(elided); len(got) > maxLen {
+		if maxLen := maxLoggedOrphanBytes + len(logtext.Marker); len(got) > maxLen {
 			t.Fatalf("sampleOrphanPaths(%d names, %d raw bytes) rendered %d bytes, want at most %d: the cut must count the SANITIZED bytes, which invalid UTF-8 grows",
 				len(paths), len(joined), len(got), maxLen)
 		}

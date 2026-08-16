@@ -772,11 +772,9 @@ func sec1ECKeyPEM(tb testing.TB, pkcs8KeyPEM []byte) []byte {
 // knew about EC PARAMETERS, the certificate parser filed it as unrelated and WARNed
 // about a healthy file on every scan.
 //
-// The silence is now conditional on the file carrying the EC key those parameters
-// describe (see the reported-passenger test below), so both spellings of that key
-// are covered here: the PKCS#8 "PRIVATE KEY" block a `openssl pkcs8 -topk8` pass
-// leaves behind, whose EC-ness is only readable from the PKCS#8 algorithm OID, and
-// the SEC1 "EC PRIVATE KEY" block the keygen command itself emits.
+// Both spellings of the key the bundle can carry are covered: the PKCS#8
+// "PRIVATE KEY" block an `openssl pkcs8 -topk8` pass leaves behind, and the SEC1
+// "EC PRIVATE KEY" block the keygen command itself emits.
 func TestAnalyse_reports_no_unrelated_block_observation_for_a_combined_ec_file(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
@@ -796,62 +794,6 @@ func TestAnalyse_reports_no_unrelated_block_observation_for_a_combined_ec_file(t
 			if hasObservation(got.Observations(), convert.ObsUnrelatedBlocksSkipped) {
 				t.Errorf("observations = %v, want no %q for the EC PARAMETERS block riding in the certificate file",
 					got.Observations(), convert.ObsUnrelatedBlocksSkipped)
-			}
-		})
-	}
-}
-
-// TestAnalyse_reports_ec_parameters_the_certificate_file_cannot_account_for is the
-// boundary of that exemption. EC PARAMETERS is silent because it is the companion
-// of the EC key written beside it; a certificate file holding the parameters with no
-// such key beside them has a block that really was left out of the bundle, and
-// ObsUnrelatedBlocksSkipped is the only thing that says so.
-//
-// Exempting the label alone (which is what the exemption first did) suppressed this
-// pre-existing warning for every input below, widening the silence well past the
-// combined bundle it was added for. Both shapes convert either way, so the
-// observation is the entire operator-visible difference.
-func TestAnalyse_reports_ec_parameters_the_certificate_file_cannot_account_for(t *testing.T) {
-	t.Parallel()
-	m := testcerts.GenerateChainMaterial(t)
-	rsaCertPEM, rsaKeyPEM := testcerts.GenerateSelfSignedCert(t, "rsa-leaf.example.com", "rsa")
-
-	for name, tc := range map[string]struct {
-		certFile []byte
-		keyFile  []byte
-	}{
-		// Stray parameters in the chain file while the key is mounted separately: the
-		// motivating combined-file case does not cover it, and nothing in the
-		// certificate file establishes the parameters as a companion of anything.
-		"the matching key is in a separate file": {
-			certFile: concatPEM(m.LeafPEM, ecParametersPEM(), m.CAPEM),
-			keyFile:  m.LeafKeyPEM,
-		},
-		// A combined file whose key is RSA: EC parameters cannot describe it, so they
-		// are a leftover from an earlier key, not a passenger of this one.
-		"the combined file's key is not an EC key": {
-			certFile: concatPEM(rsaCertPEM, ecParametersPEM(), rsaKeyPEM),
-			keyFile:  rsaKeyPEM,
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			got, err := convert.Analyse(t.Context(), tc.certFile, tc.keyFile)
-			if err != nil {
-				t.Fatalf("Analyse(certificate file with stray EC parameters) = %v, want success", err)
-			}
-			var detail string
-			for _, o := range got.Observations() {
-				if o.Kind == convert.ObsUnrelatedBlocksSkipped {
-					detail = o.Detail
-				}
-			}
-			if detail == "" {
-				t.Fatalf("observations = %v, want one of kind %q naming the EC PARAMETERS block",
-					got.Observations(), convert.ObsUnrelatedBlocksSkipped)
-			}
-			if !strings.Contains(detail, "EC PARAMETERS") {
-				t.Errorf("observation detail = %q, want the skipped block's label named", detail)
 			}
 		})
 	}

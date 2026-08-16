@@ -241,9 +241,6 @@ func warnPasswordStrength(status PasswordStatus, channel string, blankFileReport
 		slog.Warn("PFX_PASSWORD is whitespace-only; generated PFX files are protected by that whitespace string, which is effectively no protection",
 			"remediation", "set PFX_PASSWORD to a real value (check for stray quotes or spaces in the env file)")
 	case PasswordInvisibleOnly:
-		// The one record for this shape: an invisible-only password is blank, so
-		// logPasswordDelivery's per-shape rune WARNs are not reached and this line
-		// carries their remediation.
 		slog.Warn("the PFX password consists only of invisible Unicode formatting characters (byte-order mark, zero-width space, or soft hyphen); generated PFX files are protected by a password nobody can reproduce from the secret's visible contents",
 			"source", channel,
 			"remediation", "rewrite the secret without the invisible characters (an editor saving the secret file as \"UTF-8 with BOM\" is the usual cause; printf %s writes the value verbatim)")
@@ -277,9 +274,8 @@ func logPasswordDelivery(source envx.SecretSource, password string, status Passw
 	}
 	// A blank value is skipped: warnPasswordStrength already reports it, with the
 	// remediation that helps (set a real password, or rewrite the secret without the
-	// invisible runes) rather than one per-rune-shape record about a value that
-	// carries nothing else — including the surrounding-whitespace record below, which
-	// a whitespace-only password would otherwise draw on top of it.
+	// invisible runes) rather than the surrounding-whitespace record below, which a
+	// whitespace-only password would otherwise draw on top of it.
 	if blank {
 		return
 	}
@@ -291,39 +287,6 @@ func logPasswordDelivery(source envx.SecretSource, password string, status Passw
 			"source", passwordChannel(source),
 			"remediation", "remove the surrounding whitespace, or keep it deliberately and reproduce it exactly wherever the .pfx is opened (stray quotes in an env file, or an editor padding the mounted secret, are the usual causes)")
 	}
-	warnPasswordCharacters(source, password)
-}
-
-// warnPasswordCharacters reports the hard-to-enter runes that survive every
-// validation guard.
-func warnPasswordCharacters(source envx.SecretSource, password string) {
-	channel := passwordChannel(source)
-	// An INTERIOR control character survives both guards: envx delivers the
-	// configured value verbatim on both channels (a secret file loses at most one
-	// trailing line ending), and PKCS#12 encodes a newline or tab verbatim, so
-	// checkPasswordEncodable accepts it.
-	if strings.ContainsFunc(password, unicode.IsControl) {
-		slog.Warn("the PFX password contains a control character (newline, carriage return, or tab), which is embedded verbatim in every PFX file and cannot be typed into most PKCS#12 consumers",
-			"source", channel,
-			"remediation", "supply the secret on a single line (openssl rand -base64 wraps at 64 columns; add -A) so whatever opens the .pfx can reproduce the password")
-	}
-	// An invisible FORMAT character survives every guard above: it is valid UTF-8,
-	// inside the BMP, not a NUL, not a control character, and not whitespace, so
-	// envx delivers it verbatim and checkPasswordEncodable accepts it.
-	if strings.ContainsFunc(password, isInvisibleRune) {
-		slog.Warn("the PFX password contains an invisible Unicode character (byte-order mark, zero-width space, soft hyphen, or variation selector), which is embedded verbatim in every PFX file and cannot be reproduced from the secret's visible contents",
-			"source", channel,
-			"remediation", "rewrite the secret without the invisible character (an editor saving the secret file as \"UTF-8 with BOM\" is the usual cause; printf %s writes the value verbatim)")
-	}
-	// A non-ASCII SPACE survives every guard above: U+00A0, U+2007 and U+3000 are
-	// Zs, U+2028/U+2029 are Zl/Zp, none of them is Cc or Cf, and neither channel
-	// trims the delivered value, so one is embedded verbatim wherever it sits while
-	// rendering exactly like the ASCII space a consumer retypes.
-	if strings.ContainsFunc(password, isAmbiguousSpaceRune) {
-		slog.Warn("the PFX password contains a non-ASCII space character (no-break space, ideographic space, or line separator), which is embedded verbatim in every PFX file and is indistinguishable from the ordinary space a consumer would type",
-			"source", channel,
-			"remediation", "retype the secret using ordinary ASCII spaces (a value pasted from a rendered document, a PDF, or a word processor is the usual cause)")
-	}
 }
 
 // isInvisibleRune reports whether r renders as nothing at all.
@@ -331,12 +294,4 @@ func isInvisibleRune(r rune) bool {
 	return unicode.Is(unicode.Cf, r) ||
 		unicode.Is(unicode.Variation_Selector, r) ||
 		unicode.Is(unicode.Other_Default_Ignorable_Code_Point, r)
-}
-
-// isAmbiguousSpaceRune reports whether r is a space-like rune other than the ASCII
-// space: a Zs no-break/figure/ideographic space, or a Zl/Zp line or paragraph
-// separator.
-func isAmbiguousSpaceRune(r rune) bool {
-	return r != ' ' && (unicode.Is(unicode.Zs, r) ||
-		unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r))
 }

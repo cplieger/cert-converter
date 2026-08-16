@@ -411,16 +411,14 @@ func TestWalkLogPolicy_quiet_when_nothing_is_wrong(t *testing.T) {
 	}
 }
 
-// TestLogIncompleteInputEnumeration_quiet_arms pins which reasons for skipping
-// orphan reconciliation reach the operator and which stay at DEBUG.
+// TestLogIncompleteInputEnumeration_quiet_arms pins which reason for skipping orphan
+// reconciliation stays at DEBUG and which reaches the operator.
 //
-// The default-level line here is an alert-worthy WARN whose remediation points at
-// the /input mount, so the two arms that must NOT reach it are the contract: a
-// shutdown (every graceful container stop lands mid-scan sooner or later) and a
-// clean walk that simply found no pair yet (a deployment whose first certificate has
-// not been issued, on every scan). Lose either arm and the alert fires with a
-// diagnosis the operator cannot act on. The third case is the converse: a genuinely
-// incomplete enumeration must still reach WARN with its hint.
+// The default-level line here is an alert-worthy WARN whose remediation points at the
+// /input mount, so the one arm that must NOT reach it is the contract: a shutdown, since
+// every graceful container stop lands mid-scan sooner or later, and the alert would fire
+// with a diagnosis the operator cannot act on. The second case is the converse: a
+// genuinely incomplete enumeration must still reach WARN with its hint.
 //
 // Runs serially: it swaps slog.Default().
 func TestLogIncompleteInputEnumeration_quiet_arms(t *testing.T) {
@@ -440,20 +438,6 @@ func TestLogIncompleteInputEnumeration_quiet_arms(t *testing.T) {
 		}
 	})
 
-	t.Run("a clean walk that found no pair is not a mount problem", func(t *testing.T) {
-		logs := captureLogs(t)
-		logIncompleteInputEnumeration(&reapContext{walkCompleted: true})
-		const dbg = "skipping orphan reconciliation; the scan found no certificate pairs to compare the output tree against"
-		if got := logs.CountLevel(slog.LevelWarn, ""); got != 0 {
-			t.Fatalf("logIncompleteInputEnumeration(empty clean tree) logged %d WARN records, want 0: an"+
-				" empty /input is already reported once by the input-coverage warning: %q", got, logs.Messages())
-		}
-		if got := logs.CountLevel(slog.LevelDebug, dbg); got != 1 {
-			t.Errorf("logIncompleteInputEnumeration(empty clean tree) logged %q at DEBUG %d times, want exactly 1: %q",
-				dbg, got, logs.Messages())
-		}
-	})
-
 	t.Run("a genuinely incomplete walk warns with the mount remediation", func(t *testing.T) {
 		logs := captureLogs(t)
 		logIncompleteInputEnumeration(&reapContext{result: ScanResult{Total: 2, Unreadable: 1}, walkCompleted: true})
@@ -467,21 +451,6 @@ func TestLogIncompleteInputEnumeration_quiet_arms(t *testing.T) {
 		}
 	})
 
-	// A renewal during a scan that ALSO hit an unreadable path must not demote the
-	// durable condition to the transient arm: vanishedOnly's Vanished term is only
-	// half of it, and without this case dropping its durable half leaves the suite
-	// green while the /input-mount WARN (and the alert on it) vanishes for as long
-	// as any cert is renewing.
-	t.Run("a vanished cert does not hide an unreadable path", func(t *testing.T) {
-		logs := captureLogs(t)
-		logIncompleteInputEnumeration(&reapContext{
-			result: ScanResult{Total: 2, Unreadable: 1, Vanished: 1}, walkCompleted: true,
-		})
-		if got := logs.CountLevel(slog.LevelWarn, mountWarn); got != 1 {
-			t.Fatalf("logIncompleteInputEnumeration(unreadable path + vanished cert) logged %q, want %q"+
-				" once at WARN: a transient replacement must not silence a durable veto", logs.Messages(), mountWarn)
-		}
-	})
 }
 
 // TestStoreListOutputs_stops_at_the_output_entry_budget pins the /output entry budget's
@@ -547,32 +516,3 @@ func TestStoreListOutputs_enumerates_a_tree_inside_the_budget(t *testing.T) {
 	}
 }
 
-// TestLogIncompleteInputEnumeration_evicted_evidence_outranks_a_renewal pins the arm
-// precedence logIncompleteInputEnumeration's own comment calls load-bearing: a scan
-// that saw a renewal AND lost wholeness evidence is not "only a renewal", so
-// vanishedOnly composes evidenceComplete precisely to self-veto here and the evicted
-// arm below it still wins. Drop that term (or reorder the arms) and this condition --
-// which recurs on every scan for as long as the tree out-sizes the observation log --
-// is reported as the transient Debug line, losing the only remediation the operator
-// gets and the reapDisabledPhrase record the documented
-// CertConverterOrphanRemovalDisabled alert matches. The existing evicted-evidence
-// cases carry no Vanished count, so nothing else fails when the composition is lost.
-//
-// Runs serially: it swaps slog.Default().
-func TestLogIncompleteInputEnumeration_evicted_evidence_outranks_a_renewal(t *testing.T) {
-	logs := captureLogs(t)
-
-	logIncompleteInputEnumeration(&reapContext{
-		result: ScanResult{Total: 2, Vanished: 1}, walkCompleted: true, evidenceEvicted: 1,
-	})
-
-	if got := logs.CountLevel(slog.LevelWarn, evictedEvidenceMsg); got != 1 {
-		t.Fatalf("logIncompleteInputEnumeration(vanished cert + evicted evidence) logged %q, want %q once"+
-			" at WARN: a transient renewal must not silence the evidence-loss report", logs.Messages(), evictedEvidenceMsg)
-	}
-	const dbg = "skipping orphan reconciliation; input files were replaced during the scan"
-	if got := logs.CountLevel(slog.LevelDebug, dbg); got != 0 {
-		t.Errorf("logIncompleteInputEnumeration(vanished cert + evicted evidence) logged %q at DEBUG %d"+
-			" times, want 0: the scan did not lose reaping to the renewal alone", dbg, got)
-	}
-}

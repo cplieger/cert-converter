@@ -76,11 +76,6 @@ const (
 	// ObsIssuerMatchIgnored reports that a supplied key also matched a certificate
 	// that verifiably issued another certificate in this bundle.
 	ObsIssuerMatchIgnored ObservationKind = "issuer-match-ignored"
-	// ObsKeyReusedAcrossCerts reports that one private key in the key file serves
-	// several certificates in this input, at least one of which issued another
-	// certificate here: the operator has a single key acting as both a CA key and an
-	// end-entity key.
-	ObsKeyReusedAcrossCerts ObservationKind = "key-reused-across-certs"
 	// ObsChainEdgeUnprovenIssuer reports a certificate in the EMITTED chain that is
 	// there because its subject matches the issuer name (or the authority key
 	// identifier) of the certificate below it, while NO signature proves it issued
@@ -116,7 +111,7 @@ func (k ObservationKind) Class() ObservationClass {
 		ObsCAAsIdentity, ObsChainUnverified, ObsChainAnchorUnverifiable,
 		ObsIdentityNotYetValid, ObsIdentityExpired,
 		ObsChainCertOutOfWindow, ObsChainCertCannotIssue, ObsUnrelatedBlocksSkipped,
-		ObsUnusableKeyBlocksSkipped, ObsIssuerMatchIgnored, ObsKeyReusedAcrossCerts,
+		ObsUnusableKeyBlocksSkipped, ObsIssuerMatchIgnored,
 		ObsChainEdgeUnprovenIssuer:
 		return ObservationClassWarning
 	}
@@ -826,39 +821,8 @@ func (g *certGraph) dropIssuerMatches(matches []identityMatch) (kept []identityM
 			Detail: fmt.Sprintf("%d certificate(s) matching a supplied key issued another certificate in this bundle, so they are no end-entity identity and were passed over: %s",
 				len(dropped), subjectsForLog(g.certsOf(dropped))),
 		})
-		obs = append(obs, g.keyReuseObservation(kept, dropped)...)
 	}
 	return kept, obs
-}
-
-// keyReuseObservation reports the certificates dropped as issuers that share a
-// private key with one this app kept as an identity candidate, or nothing when the
-// key file simply held both keys (a leaf key beside its CA's key is two keys, not
-// one key doing two jobs).
-func (g *certGraph) keyReuseObservation(kept, dropped []identityMatch) []Observation {
-	sharedKey := func(m identityMatch, others []identityMatch) bool {
-		return slices.ContainsFunc(others, func(o identityMatch) bool { return o.key == m.key })
-	}
-	var reusedIssuers []*x509.Certificate
-	for _, d := range dropped {
-		if sharedKey(d, kept) {
-			reusedIssuers = append(reusedIssuers, g.certs[d.cert])
-		}
-	}
-	if len(reusedIssuers) == 0 {
-		return nil
-	}
-	var alsoMatched int
-	for _, k := range kept {
-		if sharedKey(k, dropped) {
-			alsoMatched++
-		}
-	}
-	return []Observation{{
-		Kind: ObsKeyReusedAcrossCerts,
-		Detail: fmt.Sprintf("one private key is shared by %d certificate(s) in this input and %d of them issued another certificate here (%s); a key serving both a CA and an end-entity certificate means one key compromise affects both, and neither can be replaced without replacing the other",
-			alsoMatched+len(reusedIssuers), len(reusedIssuers), subjectsForLog(reusedIssuers)),
-	}}
 }
 
 // certsOf resolves the certificates a set of matches selected, for a diagnostic

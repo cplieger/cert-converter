@@ -629,7 +629,6 @@ func TestObservationKind_Class_pins_every_declared_kind(t *testing.T) {
 		ObsUnrelatedBlocksSkipped:   ObservationClassWarning,
 		ObsUnusableKeyBlocksSkipped: ObservationClassWarning,
 		ObsIssuerMatchIgnored:       ObservationClassWarning,
-		ObsKeyReusedAcrossCerts:     ObservationClassWarning,
 		ObsChainEdgeUnprovenIssuer:  ObservationClassWarning,
 	}
 

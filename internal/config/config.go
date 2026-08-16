@@ -259,22 +259,8 @@ func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
 
 // warnFallbackDisabled warns when the operator's own periodic rescan never runs,
 // because nothing else in the process reports it: the explicit 0/false opt-out
-// removed it, or the cadence is above the watcher's reconciliation floor, which
-// overrides it — a value at or clamped to maxFallbackHours included, since the
-// ceiling is far above the floor.
+// removed it.
 func warnFallbackDisabled(interval time.Duration) {
-	if floor := scancadence.Effective(interval); interval > floor {
-		// One record for every cadence the floor overrides, the clamped ceiling
-		// included: parseFallbackInterval clamps every larger value to exactly
-		// maxFallbackHours and the floor is well below that, so an at-ceiling interval
-		// satisfies this guard too and needs no arm of its own.
-		attrs := append(scancadence.CoverageAttrs(interval),
-			"remediation", "set FALLBACK_SCAN_HOURS at or below the floor's hours if the cadence should be yours, or leave it as is: coverage is unaffected")
-		slog.Warn("FALLBACK_SCAN_HOURS is above the watcher's reconciliation floor, so no re-scan will ever run on your configured cadence; "+
-			"the floor's full-tree reconciliation runs instead, more often than the cadence you set",
-			attrs...)
-		return
-	}
 	if interval > 0 {
 		return
 	}

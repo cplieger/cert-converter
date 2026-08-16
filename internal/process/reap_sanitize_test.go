@@ -29,7 +29,7 @@ import (
 // the path the record names.
 //
 // Warn mode, the default, is what emits both records in one scan: the orphan report
-// carries the sample, and reportRetainedKeys reaches keyStillPresent for the same
+// carries the sample, and the retention loop reaches keyStillPresent for the same
 // candidate, whose sibling key this fixture leaves in place.
 //
 // Runs serially: it swaps slog.Default().

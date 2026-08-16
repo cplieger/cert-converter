@@ -81,12 +81,6 @@ func (r *ScanResult) inputFullyEnumerated() bool {
 	return r.durablyEnumerated() && r.Vanished == 0
 }
 
-// unreplaceableOnly reports whether the only conversionsClean member this scan is
-// still failing is a REPLACEMENT THE VOLUME REFUSED rather than a failed conversion.
-func (r *ScanResult) unreplaceableOnly() bool {
-	return r.Failed == 0 && r.Unwritable > 0
-}
-
 // The per-scan entry budget bounds how many /input entries ONE scan enumerates.
 
 // errScanBudgetExceeded marks the abort above.
@@ -98,10 +92,6 @@ const scanBudgetMsg = scanbudget.InputTreeTooLarge + "; stopping this scan witho
 // scanBudgetSummaryMsg is the end-of-scan summary line for a walk the entry budget
 // stopped.
 const scanBudgetSummaryMsg = "scan stopped at the /input entry budget"
-
-// budgetTruncatedCoverage marks a coverage count that came from a scan the entry budget
-// stopped early: the number is what this scan REACHED, not what the tree holds.
-const budgetTruncatedCoverage = "partial: the scan stopped at the /input entry budget, so this counts only the paths it reached"
 
 // Options carries the process-lifetime scan configuration the composition root
 // chooses once at startup: the confined input and output roots, the password
@@ -206,7 +196,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	if rc.walkEnumerationComplete() {
 		s.observations.forget(sw.seen)
 	}
-	rp := &reaper{src: sw.src, out: out, mode: s.opts.Lifecycle, observations: s.observations}
+	rp := &reaper{src: sw.src, out: out, mode: s.opts.Lifecycle}
 	removed, reconcileErr := rp.reconcile(ctx, sw.seen, &rc)
 	result.Removed = removed
 	// A shutdown that arrives after the input walk completed cancels reconciliation
@@ -384,23 +374,16 @@ func logInputCoverageWarnings(result *ScanResult, walkErr error) {
 	if walkErr != nil && !budgetStopped {
 		return
 	}
-	// Extra attribute for the truncated case only, appended to the per-path arms.
-	var observed []any
-	if budgetStopped {
-		observed = []any{"coverage", budgetTruncatedCoverage}
-	}
 	if result.Unreadable > 0 {
 		// Message byte-identical to the one the composition root emitted: README's
 		// Alerting section tells an operator at LOG_LEVEL=warn to alert on this exact
 		// line, so its wording is a contract regardless of which package renders it.
 		slog.Warn("some /input paths were unreadable and were skipped; health is unaffected",
-			append([]any{
-				"unreadable", result.Unreadable,
-				// inputPermRemediation, not a permission-only hint of its own: the count
-				// aggregates every unreadable shape this package classifies, and only some
-				// of them are permission problems.
-				"remediation", inputPermRemediation,
-			}, observed...)...)
+			"unreadable", result.Unreadable,
+			// inputPermRemediation, not a permission-only hint of its own: the count
+			// aggregates every unreadable shape this package classifies, and only some
+			// of them are permission problems.
+			"remediation", inputPermRemediation)
 	}
 	// Each arm is gated by the evidence IT needs, which is the rule here rather than an
 	// exception: a claim about the WHOLE TREE ("no pair at all", "every certificate")
@@ -425,10 +408,8 @@ func logInputCoverageWarnings(result *ScanResult, walkErr error) {
 	case result.Orphan > 0:
 		// Some, not all — and the ONE arm here that needs no whole-tree proof.
 		slog.Warn("some certificates under the input root are missing their sibling .key; those produce no PFX and any existing bundle for them goes stale",
-			append([]any{
-				"orphan", result.Orphan, "total", result.Total,
-				"remediation", "name each private key <name>.key beside its <name>.crt (Caddy's layout), or remove the certificate from /input",
-			}, observed...)...)
+			"orphan", result.Orphan, "total", result.Total,
+			"remediation", "name each private key <name>.key beside its <name>.crt (Caddy's layout), or remove the certificate from /input")
 	}
 }
 
@@ -476,12 +457,6 @@ type observationLog struct {
 	seen map[string][sha256.Size]byte
 	// whole holds the paths this process has read as a COMPLETE pair.
 	whole map[string]struct{}
-	// loneKeys holds the paths this log has already reported for a retained bundle:
-	// the CERT path when a sibling key is still there while the certificate is gone,
-	// and the KEY path when that key could not be inspected at all
-	// (reaper.keyStillPresent keys the two reports on different paths so they retire
-	// independently).
-	loneKeys map[string]struct{}
 	// activeWhole holds the paths whose wholeness this SCAN established, and exists
 	// only for the duration of one input walk (beginScan / endScan).
 	activeWhole map[string]struct{}
@@ -493,15 +468,13 @@ type observationLog struct {
 	evictedWholeness int
 }
 
-// newObservationLog builds an empty log whose EACH of three sets — the signatures
-// (seen), the wholeness evidence (whole) and the lone-key reports (loneKeys) — is
-// bounded at maxPairs entries independently, so the log's process-lifetime ceiling is
-// three times maxPairs rather than two.
+// newObservationLog builds an empty log whose EACH of two sets — the signatures
+// (seen) and the wholeness evidence (whole) — is bounded at maxPairs entries
+// independently, so the log's process-lifetime ceiling is twice maxPairs.
 func newObservationLog(maxPairs int) *observationLog {
 	return &observationLog{
 		seen:     make(map[string][sha256.Size]byte),
 		whole:    make(map[string]struct{}),
-		loneKeys: make(map[string]struct{}),
 		maxPairs: maxPairs,
 	}
 }
@@ -533,30 +506,6 @@ func (o *observationLog) markWhole(rel string) {
 	}
 	o.reserveWhole(rel)
 	o.whole[rel] = struct{}{}
-	// A pair that reads whole is not a lone key any more, so the next time it becomes
-	// one it is reported again.
-	o.clearLoneKey(rel)
-	o.clearLoneKey(layout.KeyFor(rel))
-}
-
-// markLoneKey records that rel's bundle is being retained because a sibling key is
-// still present while the certificate is gone, and reports whether that is NEW — i.e.
-// whether the condition has to be logged on this scan.
-func (o *observationLog) markLoneKey(rel string) bool {
-	if _, reported := o.loneKeys[rel]; reported {
-		return false
-	}
-	if len(o.loneKeys) >= o.maxObservedPairs() {
-		return true
-	}
-	o.loneKeys[rel] = struct{}{}
-	return true
-}
-
-// clearLoneKey retires the lone-key report for rel: the pair read whole again, or the
-// leftover key is gone, so the retention this report described no longer holds.
-func (o *observationLog) clearLoneKey(rel string) {
-	delete(o.loneKeys, rel)
 }
 
 // observationSignature identifies both the input bytes and the observations

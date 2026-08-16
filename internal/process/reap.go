@@ -3,7 +3,6 @@ package process
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -15,13 +14,9 @@ import (
 
 // reaper reconciles output bundles with one scan's input enumeration.
 type reaper struct {
-	src *source
-	out *store
-	// observations is the Scanner's process-lifetime observation log, borrowed for the
-	// one thing the reap needs from it: de-duplicating the lone-key retention report
-	// per CHANGE rather than per scan (markLoneKey / clearLoneKey).
-	observations *observationLog
-	mode         outputpolicy.Lifecycle
+	src  *source
+	out  *store
+	mode outputpolicy.Lifecycle
 }
 
 // reapContext is everything the gate needs to decide whether `seen` can be
@@ -41,12 +36,6 @@ type reapContext struct {
 	shutdown bool
 }
 
-// evidenceComplete reports whether this scan still holds every piece of in-process
-// evidence its own classifications depend on.
-func (r *reapContext) evidenceComplete() bool {
-	return r.evidenceEvicted == 0
-}
-
 // walkEnumerationComplete reports whether nothing PREVENTED the walk from observing
 // every /input path: the walk ran to the end and no path was unreadable, unresolved
 // or replaced under it.
@@ -54,75 +43,35 @@ func (r *reapContext) walkEnumerationComplete() bool {
 	return r.walkCompleted && r.result.inputFullyEnumerated()
 }
 
-// enumerationClean reports whether nothing PREVENTED the walk from enumerating the
-// whole input tree, and nothing spent the in-process evidence this scan's own
-// classifications rest on.
-func (r *reapContext) enumerationClean() bool {
-	return r.walkEnumerationComplete() && r.evidenceComplete()
-}
-
-// vanishedOnly reports whether a mid-scan replacement is the ONLY thing that left the
-// enumeration incomplete.
-func (r *reapContext) vanishedOnly() bool {
-	return r.walkCompleted && r.result.durablyEnumerated() && r.evidenceComplete() && r.result.Vanished > 0
-}
-
-// enumeratedInput reports whether `seen` can be trusted as a COMPLETE enumeration
-// of the input tree.
+// enumeratedInput reports whether `seen` can be trusted as a COMPLETE enumeration of
+// the input tree: nothing prevented the walk from observing every /input path, nothing
+// spent the in-process evidence this scan's own classifications rest on, and the walk
+// found a pair to compare the output tree against.
 func (r *reapContext) enumeratedInput() bool {
-	return r.enumerationClean() && r.result.Total > 0
+	return r.walkEnumerationComplete() && r.evidenceEvicted == 0 && r.result.Total > 0
 }
 
 // reapDisabledPhrase is the substring the README's CertConverterOrphanRemovalDisabled Loki
 // rule matches.
 const reapDisabledPhrase = "orphan removal is disabled for this scan"
 
-// evictedEvidenceMsg is the report for a scan that disabled orphan removal because the
-// observation log's ceiling dropped the wholeness evidence noteMissingKey classifies a
-// missing sibling key against.
-const evictedEvidenceMsg = reapDisabledPhrase + ": the observation log dropped the evidence that separates a replaced private key from a missing one, so an orphan cannot be proven"
-
-// evictedEvidenceRemediation is that WARN's operator action, and it deliberately does
-// NOT lead with the pair count.
-const evictedEvidenceRemediation = "clear whatever leaves scans incomplete first - the unreadable-path, " +
-	"unresolved-symlink and entry-budget warnings above - because the observation log only " +
-	"prunes paths that are gone on a scan that fully enumerates /input; if /input legitimately " +
-	"churns certificate paths, raise MAX_SCAN_ENTRIES above the number of distinct paths it has " +
-	"held since this container started, not the number it holds now"
-
 // logIncompleteInputEnumeration reports why orphan reconciliation is skipped when
 // the input enumeration is incomplete.
 func logIncompleteInputEnumeration(rc *reapContext) {
-	switch {
-	case rc.shutdown:
+	if rc.shutdown {
 		slog.Debug("skipping orphan reconciliation; scan cancelled during shutdown")
-	case rc.vanishedOnly():
-		// A renewal replaced a cert between readdir and the read.
-		slog.Debug("skipping orphan reconciliation; input files were replaced during the scan",
-			"vanished", rc.result.Vanished)
-	case !rc.evidenceComplete():
-		// The walk may have enumerated the tree perfectly; what this scan lost is the
-		// in-process memory that separates a key being REPLACED right now from a key
-		// that was never there.
-		slog.Warn(evictedEvidenceMsg,
-			"evidence_evicted", rc.evidenceEvicted,
-			"remediation", evictedEvidenceRemediation)
-	case rc.enumerationClean():
-		// A complete walk that found no pair at all: the enumeration did not fail, there
-		// is simply nothing to compare the output tree against.
-		slog.Debug("skipping orphan reconciliation; the scan found no certificate pairs to compare the output tree against")
-	default:
-		slog.Warn(reapDisabledPhrase+": the scan did not fully enumerate the input tree, so no output can be proven orphaned",
-			"walk_completed", rc.walkCompleted, "unreadable", rc.result.Unreadable,
-			"unresolved", rc.result.Unresolved, "vanished", rc.result.Vanished,
-			"total", rc.result.Total,
-			// Names BOTH ways in, because this arm serves two conditions reapContext cannot
-			// tell apart: a walk that could not read part of the tree (unreadable= is
-			// non-zero and its own WARN is above), and a walk the entry budget stopped
-			// (every count here is zero and the action is the budget, not the mount).
-			"remediation", "check the /input mount and the unreadable-path warnings above; "+
-				"if the scan stopped at the entry budget, raise MAX_SCAN_ENTRIES instead")
+		return
 	}
+	slog.Warn(reapDisabledPhrase+": the scan did not fully enumerate the input tree, so no output can be proven orphaned",
+		"walk_completed", rc.walkCompleted, "unreadable", rc.result.Unreadable,
+		"unresolved", rc.result.Unresolved, "vanished", rc.result.Vanished,
+		"total", rc.result.Total,
+		// Names BOTH ways in, because this arm serves every condition reapContext cannot
+		// tell apart: a walk that could not read part of the tree (unreadable= is
+		// non-zero and its own WARN is above), and a walk the entry budget stopped
+		// (every count here is zero and the action is the budget, not the mount).
+		"remediation", "check the /input mount and the unreadable-path warnings above; "+
+			"if the scan stopped at the entry budget, raise MAX_SCAN_ENTRIES instead")
 }
 
 // reconcile compares the output tree against the input enumeration and, in sync
@@ -168,8 +117,7 @@ func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *r
 	// !rc.enumeratedInput() return at the top of this function; what is left to ask
 	// is whether this scan's own output work was clean, which resolveReap reads off
 	// the result itself.
-	d := resolveReap(rp.mode, &rc.result, walkSafe)
-	if !d.reap {
+	if !resolveReap(rp.mode, &rc.result, walkSafe) {
 		msg := "output bundles have no matching input"
 		// In sync mode reaching this line means orphan removal is OFF for this scan,
 		// which is the condition the README's CertConverterOrphanRemovalDisabled rule
@@ -179,14 +127,18 @@ func (rp *reaper) reconcile(ctx context.Context, seen map[string]struct{}, rc *r
 		if rp.mode == outputpolicy.LifecycleSync {
 			msg += "; " + reapDisabledPhrase
 		}
+		inaction, remediation := retentionProse(rp.mode, walkSafe)
 		slog.Warn(msg,
 			"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),
-			"action", d.inaction,
-			"remediation", d.remediation)
-		// The retention REPORTS are the whole point of this call, which is why it returns
-		// no candidate list: OUTPUT_LIFECYCLE forbids a deletion in this arm.
+			"action", inaction,
+			"remediation", remediation)
+		// The retention REPORTS are the whole point of this arm, which is why it deletes
+		// nothing: OUTPUT_LIFECYCLE forbids a deletion here. keyStillPresent owns the
+		// record; its answer has nothing left to gate.
 		if walkSafe {
-			rp.reportRetainedKeys(orphaned)
+			for _, rel := range orphaned {
+				rp.keyStillPresent(rel, layout.CertForOutput(rel))
+			}
 		}
 		return 0, nil
 	}
@@ -210,31 +162,16 @@ func orphansOf(outputs []string, seen map[string]struct{}) []string {
 // batch, then, per candidate, re-check its INPUT path immediately before deleting that
 // candidate's output.
 func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, error) {
-	// The key veto is asked BEFORE the window as well as inside it, and a batch it
-	// empties is neither announced nor waited for.
-	candidates, prefilterErr := rp.withoutConfirmedLoneKeys(ctx, orphaned)
-	if prefilterErr != nil {
-		// Shutdown inside the pre-pass, answered BEFORE the empty-batch return below: a
-		// batch the pre-pass emptied while cancellation was already active is an
-		// interrupted reap, and returning nil there would let the caller report the scan
-		// as complete. Same Debug record and same reason as the wait path.
-		slog.Debug("orphan removal abandoned during shutdown before the confirming re-check",
-			"candidates", len(orphaned), "error", prefilterErr)
-		return 0, prefilterErr
-	}
-	if len(candidates) == 0 {
-		return 0, nil
-	}
 	slog.Info(reapRecheckMsg,
-		"count", len(candidates), "recheck_in", reapDeferral.String())
+		"count", len(orphaned), "recheck_in", reapDeferral.String())
 	if err := waitBeforeReap(ctx, reapDeferral); err != nil {
 		// Shutdown inside the window: delete nothing further.
 		slog.Debug("orphan removal abandoned during shutdown before the confirming re-check",
-			"candidates", len(candidates), "error", err)
+			"candidates", len(orphaned), "error", err)
 		return 0, err
 	}
 
-	return rp.removeConfirmed(ctx, candidates)
+	return rp.removeConfirmed(ctx, orphaned)
 }
 
 // removeConfirmed is reapConfirmed's post-delay half: the interleaved re-check and unlink
@@ -302,41 +239,6 @@ func (rp *reaper) removeConfirmed(ctx context.Context, candidates []string) (int
 	return deleted, nil
 }
 
-// withoutConfirmedLoneKeys is reapConfirmed's pre-pass: it drops from the batch every
-// candidate whose certificate is confirmed absent RIGHT NOW and whose sibling private key
-// is still under /input, and it returns cancellation as soon as shutdown arrives.
-func (rp *reaper) withoutConfirmedLoneKeys(ctx context.Context, orphaned []string) ([]string, error) {
-	var candidates []string
-	for _, rel := range orphaned {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		cert := layout.CertForOutput(rel)
-		absent, absentErr := rp.src.pathAbsent(cert)
-		if absentErr != nil || !absent {
-			candidates = append(candidates, rel)
-			continue
-		}
-		if rp.keyStillPresent(rel, cert) {
-			continue
-		}
-		candidates = append(candidates, rel)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return candidates, nil
-}
-
-// reportRetainedKeys reports, for every bundle in a candidate list, the retention this
-// app would refuse to delete because the certificate's sibling private key is still under
-// /input (keyStillPresent owns the record).
-func (rp *reaper) reportRetainedKeys(orphaned []string) {
-	for _, rel := range orphaned {
-		rp.keyStillPresent(rel, layout.CertForOutput(rel))
-	}
-}
-
 // keyStillPresent vetoes one confirmed candidate's deletion because the sibling PRIVATE
 // KEY of its certificate is still under /input, and reports the retention.
 func (rp *reaper) keyStillPresent(rel, cert string) bool {
@@ -346,32 +248,18 @@ func (rp *reaper) keyStillPresent(rel, cert string) bool {
 		// Fail closed WITHOUT claiming a key was observed: the lone-key WARN below says
 		// the private key is still in /input, which is a positive fact this Lstat did
 		// not establish.
-		if rp.observations.markLoneKey(key) {
-			slog.Warn(recheckUnreadableMsg,
-				"path", logtext.Path(rel), "input", logtext.Path(cert), "key", logtext.Path(key),
-				"error", logtext.Path(err.Error()),
-				"remediation", recheckUnreadableRemediation)
-		}
+		slog.Warn(recheckUnreadableMsg,
+			"path", logtext.Path(rel), "input", logtext.Path(cert), "key", logtext.Path(key),
+			"error", logtext.Path(err.Error()),
+			"remediation", recheckUnreadableRemediation)
 		return true
 	}
-	// The path answered this time, so the uninspectable report is retired whichever way it
-	// answered: a later failure at this name is a NEW condition to name.
-	rp.observations.clearLoneKey(key)
 	if absent {
-		// The retention this report describes no longer holds, so retire it HERE: the
-		// leftover key is gone, and a half-deleted pair at this name later is a NEW
-		// condition to name.
-		rp.observations.clearLoneKey(cert)
 		return false
 	}
-	// De-duplicated per CHANGE, not per scan: the retention persists for as long as the
-	// operator leaves the pair half-deleted, and this WARN would otherwise repeat on
-	// every fsnotify event and every fallback tick.
-	if rp.observations.markLoneKey(cert) {
-		slog.Warn(loneKeyRetainedMsg,
-			"path", logtext.Path(rel), "input", logtext.Path(cert), "key", logtext.Path(key),
-			"remediation", loneKeyRemediation)
-	}
+	slog.Warn(loneKeyRetainedMsg,
+		"path", logtext.Path(rel), "input", logtext.Path(cert), "key", logtext.Path(key),
+		"remediation", loneKeyRemediation)
 	return true
 }
 
@@ -445,61 +333,32 @@ func waitForReapDeferral(ctx context.Context, d time.Duration) error {
 // reapRecheckMsg is the line that announces the deferral.
 const reapRecheckMsg = "possible orphaned output bundles; re-checking their certificates before deleting anything"
 
-// maxLoggedOrphans caps how many orphan paths one report names.
-const maxLoggedOrphans = 20
-
-// maxLoggedOrphanBytes caps the rendered orphan sample by BYTES, which the item cap
-// above does not do: a root-relative path is itself long enough (nested directories,
-// long domain names) that maxLoggedOrphans of them can still be tens of kilobytes on
-// a WARN that repeats for as long as the orphan exists.
+// maxLoggedOrphanBytes caps the rendered orphan sample by BYTES: a root-relative path
+// is itself long enough (nested directories, long domain names) that a scan's worth of
+// them can be tens of kilobytes on a WARN that repeats for as long as the orphan
+// exists. The scale is not lost to the cut: every record carrying the sample carries a
+// `count` attribute holding the full total.
 const maxLoggedOrphanBytes = 4096
 
-// sampleOrphanPaths renders at most maxLoggedOrphans paths within
-// maxLoggedOrphanBytes, naming how many were elided so the log line stays bounded
-// without hiding the scale.
+// sampleOrphanPaths renders the orphan paths within maxLoggedOrphanBytes, marking a cut
+// sample with logtext.Marker so the log line stays bounded.
 func sampleOrphanPaths(paths []string) string {
-	sample, elided := paths, ""
-	if len(paths) > maxLoggedOrphans {
-		sample = paths[:maxLoggedOrphans]
-		elided = fmt.Sprintf(" (+%d more)", len(paths)-maxLoggedOrphans)
-	}
-	rendered := strings.Join(sample, ",")
-	return logtext.Cap(logtext.Path(rendered), maxLoggedOrphanBytes) + elided
+	return logtext.Cap(logtext.Path(strings.Join(paths, ",")), maxLoggedOrphanBytes)
 }
 
-// reapDecision is the whole OUTPUT_LIFECYCLE decision for one scan: whether this
-// app deletes anything, plus the operator wording that goes with not deleting.
-type reapDecision struct {
-	inaction    string
-	remediation string
-	reap        bool
+// resolveReap reports whether one scan's lifecycle mode and vetoes let this app delete
+// anything.
+func resolveReap(mode outputpolicy.Lifecycle, result *ScanResult, walkSafe bool) bool {
+	return mode == outputpolicy.LifecycleSync && walkSafe && result.conversionsClean()
 }
 
-// resolveReap maps one scan's lifecycle mode and vetoes onto that decision.
-func resolveReap(mode outputpolicy.Lifecycle, result *ScanResult, walkSafe bool) reapDecision {
-	if mode == outputpolicy.LifecycleSync && walkSafe && result.conversionsClean() {
-		return reapDecision{reap: true}
+// retentionProse is the operator wording for a scan that names orphans and deletes
+// none of them: what this app did, and what the operator can do about it.
+func retentionProse(mode outputpolicy.Lifecycle, walkSafe bool) (inaction, remediation string) {
+	if mode == outputpolicy.LifecycleSync || !walkSafe {
+		return "kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle",
+			"do not remove anything from this list yet: fix the /output warnings above, then re-check it on a scan that reports no disabled orphan removal"
 	}
-	switch {
-	case !walkSafe:
-		return reapDecision{
-			inaction:    "kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle",
-			remediation: "do not remove anything from this list yet: fix the /output warnings above, then re-check it on a scan that reports no disabled orphan removal",
-		}
-	case mode == outputpolicy.LifecycleSync && result.unreplaceableOnly():
-		return reapDecision{
-			inaction:    "kept: the output volume refused to let this app replace a prior bundle on this scan, so nothing is removed until a scan with no refused replacement",
-			remediation: "this app removes them itself on the next scan with no failed conversion and no refused replacement: fix the /output condition named in the warning above, or remove these from the output volume by hand",
-		}
-	case mode == outputpolicy.LifecycleSync:
-		return reapDecision{
-			inaction:    "kept: a conversion failed on this scan, so nothing is removed until a scan with no failures",
-			remediation: "this app removes them itself on the next scan with no conversion failures: fix the conversion failure reported above, or remove them from the output volume by hand",
-		}
-	default:
-		return reapDecision{
-			inaction:    "reported only (OUTPUT_LIFECYCLE=" + string(mode) + ")",
-			remediation: "remove them from the output volume, or set OUTPUT_LIFECYCLE=sync to have this app do it",
-		}
-	}
+	return "reported only (OUTPUT_LIFECYCLE=" + string(mode) + ")",
+		"remove them from the output volume, or set OUTPUT_LIFECYCLE=sync to have this app do it"
 }

@@ -1,7 +1,6 @@
 package process
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -11,13 +10,12 @@ import (
 )
 
 // TestSampleOrphanPaths_properties pins the BYTE budget of the orphan report's paths
-// attribute across the whole input space, which the two table tests cannot: they pin
-// three fixed shapes (a realistic sample under the budget, one oversized single path,
-// and a sample over BOTH caps), so a byte cut applied only inside the item cap's
-// branch -- or applied per path instead of to the joined sample -- satisfies all three
-// while letting a sample of fifteen 400-byte paths through whole. reconcile emits that
-// record on every scan for as long as an orphan exists, so the bound is what keeps a
-// permanent multi-kilobyte line out of the log.
+// attribute across the whole input space, which the table test cannot: it pins two fixed
+// shapes (a realistic sample under the budget and one oversized single path), so a byte
+// cut applied per path instead of to the joined sample satisfies both while letting a
+// sample of fifteen 400-byte paths through whole. reconcile emits that record on every
+// scan for as long as an orphan exists, so the bound is what keeps a permanent
+// multi-kilobyte line out of the log.
 //
 // The properties are stated over the SANITIZED join rather than by re-deriving the cut,
 // so they cannot be satisfied by re-implementing the function under test: the sample is
@@ -58,27 +56,18 @@ func TestSampleOrphanPaths_properties(t *testing.T) {
 
 		got := sampleOrphanPaths(paths)
 
-		named, elided := paths, ""
-		if len(paths) > maxLoggedOrphans {
-			named = paths[:maxLoggedOrphans]
-			elided = fmt.Sprintf(" (+%d more)", len(paths)-maxLoggedOrphans)
-		}
-		full := logtext.Path(strings.Join(named, ","))
+		full := logtext.Path(strings.Join(paths, ","))
 
-		if !strings.HasSuffix(got, elided) {
-			rt.Fatalf("sampleOrphanPaths(%d paths) rendered %d bytes not ending in %q: the byte cut dropped the item cap's scale",
-				len(paths), len(got), elided)
-		}
 		if !utf8.ValidString(got) {
 			rt.Fatalf("sampleOrphanPaths(%d paths) rendered invalid UTF-8: a cut split a rune", len(paths))
 		}
-		kept := strings.TrimSuffix(strings.TrimSuffix(got, elided), logtext.Marker)
+		kept := strings.TrimSuffix(got, logtext.Marker)
 		if !strings.HasPrefix(full, kept) {
 			rt.Fatalf("sampleOrphanPaths(%d paths) kept %d bytes that are not a prefix of the sanitized joined sample: a name was rewritten, or the sanitizing gate was skipped",
 				len(paths), len(kept))
 		}
 		if len(full) <= maxLoggedOrphanBytes {
-			if got != full+elided {
+			if got != full {
 				rt.Fatalf("sampleOrphanPaths(%d paths joining to %d sanitized bytes) rendered %d bytes, want the sanitized sample untouched below the budget",
 					len(paths), len(full), len(got))
 			}
@@ -88,7 +77,7 @@ func TestSampleOrphanPaths_properties(t *testing.T) {
 			rt.Fatalf("sampleOrphanPaths(%d paths joining to %d sanitized bytes) rendered %d bytes with no %q marker: a reader cannot tell the list was cut",
 				len(paths), len(full), len(got), logtext.Marker)
 		}
-		if maxLen := maxLoggedOrphanBytes + len(logtext.Marker) + len(elided); len(got) > maxLen {
+		if maxLen := maxLoggedOrphanBytes + len(logtext.Marker); len(got) > maxLen {
 			rt.Fatalf("sampleOrphanPaths(%d paths joining to %d sanitized bytes) rendered %d bytes, want at most %d",
 				len(paths), len(full), len(got), maxLen)
 		}

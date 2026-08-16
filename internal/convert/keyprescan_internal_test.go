@@ -25,6 +25,11 @@ import (
 // says the wrapped privateKey OCTET STRING holds a PKCS#1 RSAPrivateKey.
 var oidRSAEncryption = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}
 
+// oidECPublicKey is id-ecPublicKey (1.2.840.10045.2.1, RFC 5480 2.1.1), the PKCS#8
+// algorithm identifier an EC key names. Nothing in production compares it; it is here
+// so a case can build the container shape x509 routes through parseECPrivateKey.
+var oidECPublicKey = asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}
+
 // pkcs1KeyDER mirrors crypto/x509's own pkcs1PrivateKey so a test can marshal a
 // key of any modulus size without generating one. Field ORDER is the DER contract
 // and must not be reordered.
@@ -791,70 +796,6 @@ func derTestSequence(t *testing.T, elements ...[]byte) []byte {
 	return testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagSequence, IsCompound: true, Bytes: body})
 }
 
-// TestPKCS8HoldsECKey_answers_true_only_for_an_ec_algorithm_identifier pins the
-// FALSE side of the EC PARAMETERS companion rule, which no existing input reaches:
-// the only production caller (holdsECPrivateKey) reaches this function with a
-// PKCS#8 block, every input the suite builds is an EC one, and an
-// `openssl ecparam -genkey` RSA-key file is PKCS#1-labelled, so it never arrives
-// here at all. A walk that answered "yes" for any PKCS#8 container would pass the
-// whole suite today, and the consequence is silent: an `openssl pkcs8 -topk8` RSA
-// key beside a stray EC PARAMETERS block in the certificate file would be treated
-// as that block's companion, so ObsUnrelatedBlocksSkipped -- the only thing
-// telling the operator a block was left out of the bundle -- would never be
-// emitted.
-//
-// The unreadable shapes are the other half of the contract: the walk must FAIL
-// OPEN (answer "no", so the block is reported) on anything it cannot read, rather
-// than grow into a second key parser.
-func TestPKCS8HoldsECKey_answers_true_only_for_an_ec_algorithm_identifier(t *testing.T) {
-	t.Parallel()
-
-	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("setup: rsa.GenerateKey: %v", err)
-	}
-	pkcs8RSA, err := x509.MarshalPKCS8PrivateKey(rsaKey)
-	if err != nil {
-		t.Fatalf("setup: MarshalPKCS8PrivateKey(rsa): %v", err)
-	}
-	version := testASN1Marshal(t, 0)
-	ecOID := testASN1Marshal(t, ecPublicKeyOID)
-
-	cases := map[string]struct {
-		der  []byte
-		want bool
-	}{
-		"a pkcs8 ec key is the companion":           {der: mustMarshalPKCS8EC(t), want: true},
-		"a pkcs8 rsa key is not":                    {der: pkcs8RSA},
-		"a pkcs8 ed25519 key is not":                {der: mustMarshalPKCS8Ed25519(t)},
-		"a sec1 ec key is not a pkcs8 container":    {der: mustMarshalEC(t)},
-		"garbage":                                   {der: []byte("this is not valid DER")},
-		"empty":                                     {der: nil},
-		"not a sequence at all":                     {der: testASN1Marshal(t, 42)},
-		"a first element that is not the version":   {der: derTestSequence(t, derTestSequence(t, ecOID), ecOID)},
-		"nothing after the version":                 {der: derTestSequence(t, version)},
-		"an algorithm identifier that is not a seq": {der: derTestSequence(t, version, version)},
-		"an algorithm identifier holding no oid":    {der: derTestSequence(t, version, derTestSequence(t, version))},
-		"an algorithm oid whose body cannot decode": {der: derTestSequence(t, version, derTestSequence(t, []byte{0x06, 0x01, 0x80}))},
-		"a truncated pkcs8 rsa container":           {der: pkcs8RSA[:16]},
-		"a pkcs8 container naming rsaEncryption":    {der: derTestSequence(t, version, derTestSequence(t, testASN1Marshal(t, oidRSAEncryption)))},
-		// The identifier is decoded through decodeOID, so maxOIDBytes applies here
-		// too: a syntactically valid but oversized identifier must answer false
-		// rather than spend one int per encoded byte to say so.
-		"an algorithm oid above the maxOIDBytes bound": {der: derTestSequence(t, version, derTestSequence(t,
-			testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagOID, Bytes: bytes.Repeat([]byte{0x01}, maxOIDBytes+1)})))},
-	}
-
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			if got := pkcs8HoldsECKey(tc.der); got != tc.want {
-				t.Errorf("pkcs8HoldsECKey(%s) = %v, want %v", name, got, tc.want)
-			}
-		})
-	}
-}
-
 // FuzzScanRSAKeyEnvelope_reports_a_bounded_shape fuzzes the DER-only pre-scan every
 // private-key block passes through before crypto/x509 sees it. The bytes are an
 // operator-supplied file's, bounded only by the caller's 10 MB read cap, and the walk
@@ -1009,7 +950,7 @@ func TestPKCS8PrivateKeyDER_fails_open_on_shapes_that_are_not_a_pkcs8_container(
 	t.Parallel()
 
 	version := testASN1Marshal(t, 0)
-	algorithm := derTestSequence(t, testASN1Marshal(t, ecPublicKeyOID))
+	algorithm := derTestSequence(t, testASN1Marshal(t, oidECPublicKey))
 	innerKey := []byte{0x30, 0x00}
 	inner := testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagOctetString, Bytes: innerKey})
 	contextTagged := func(tag int, body []byte) []byte {
