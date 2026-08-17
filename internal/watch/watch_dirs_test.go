@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/slogx/capture"
 	"github.com/fsnotify/fsnotify"
 )
@@ -60,8 +61,8 @@ func TestAddWatchDirs_watches_whole_subtree_and_fails_on_missing_root(t *testing
 // watch itself is refused (a closed or exhausted watcher). That must propagate
 // as an error, because it is the signal Run uses to fall back to polling; a
 // swallowed failure would leave Run believing fsnotify is active while no watch
-// exists, so renewals would be detected only by the fallback rescan (or not at
-// all when it is disabled).
+// exists, so renewals would be detected only by the periodic rescan (only by the
+// 24h reconciliation floor when the operator's own cadence is disabled).
 func TestAddWatchDirs_fails_when_the_root_watch_cannot_be_added(t *testing.T) {
 	t.Parallel()
 	watcher := newClosedTestWatcher(t)
@@ -92,24 +93,31 @@ func TestAddWatchDirs_reports_shutdown_instead_of_a_watch_failure(t *testing.T) 
 	}
 }
 
-// The two degraded-path WARN messages of the watch-set build, matched as
+// The two degraded-path messages of the watch-set build, matched as
 // substrings so the assertions below scope to the right log site without
 // pinning the whole sentence.
 const (
-	warnUnwatchablePath = "skipping unwatchable path"
-	warnUnwatchableDir  = "skipping unwatchable directory"
+	msgUnwatchablePath = "skipping unwatchable path"
+	msgUnwatchableDir  = "skipping unwatchable directory"
 )
 
-// assertSkipWarn pins one degraded-path WARN by its ATTRIBUTES rather than by
+// assertSkipRecord pins one degraded-path record by its ATTRIBUTES rather than by
 // its rendered text: what the operator needs off these lines is WHICH path was
-// dropped from the watch set, whether the periodic rescan will ever revisit it
-// (fallback_scan -- "disabled" means never, for the life of the process), and
-// the underlying error. Re-wording the sentence therefore stays free; dropping
-// one of those three diagnostics fails.
-func assertSkipWarn(t *testing.T, logs *capture.Recorder, msg, wantPath, wantFallback string, wantErr error) {
+// dropped from the watch set, on which cadence the periodic rescan revisits it
+// (fallback_scan -- "disabled" means their own cadence is off, leaving the 24h
+// reconciliation floor scan_floor states), and the underlying error. Re-wording the
+// sentence therefore stays free; dropping one of those three diagnostics fails.
+//
+// The LEVEL is the caller's, because the two sites differ: the walk-error skip is
+// per-path on a tree a co-writer sizes, so it is Debug and the scan over the same
+// tree publishes the bounded operator-facing half; a refused REGISTRATION stays WARN,
+// because its remediation names the inotify watch quota, which no scan can observe.
+func assertSkipRecord(t *testing.T, logs *capture.Recorder, level slog.Level,
+	msg, wantPath, wantFallback string, wantErr error,
+) {
 	t.Helper()
-	if n := logs.CountLevel(slog.LevelWarn, msg); n != 1 {
-		t.Fatalf("WARN %q logged %d times, want exactly 1; log = %v", msg, n, logs.Messages())
+	if n := logs.CountLevel(level, msg); n != 1 {
+		t.Fatalf("record %q logged %d times at %v, want exactly 1; log = %v", msg, n, level, logs.Messages())
 	}
 	for key, want := range map[string]string{
 		"path":          wantPath,
@@ -118,22 +126,23 @@ func assertSkipWarn(t *testing.T, logs *capture.Recorder, msg, wantPath, wantFal
 	} {
 		got, ok := logs.AttrValue(msg, key)
 		if !ok {
-			t.Errorf("WARN %q carries no %q attribute; an operator cannot act on the skip without it", msg, key)
+			t.Errorf("record %q carries no %q attribute; an operator cannot act on the skip without it", msg, key)
 			continue
 		}
 		if got != want {
-			t.Errorf("WARN %q %s = %q, want %q", msg, key, got, want)
+			t.Errorf("record %q %s = %q, want %q", msg, key, got, want)
 		}
 	}
 }
 
 // assertNoSkipWarn pins the silence of the two FATAL cases: a root failure is
-// returned to Run, which reports the degradation itself, so warning here too
-// would double-log one condition as if two paths had been lost.
+// returned to Run, which reports the degradation itself, so reporting it here too
+// would double-log one condition as if two paths had been lost. Level-agnostic on
+// purpose: the root case must emit NOTHING, at any level.
 func assertNoSkipWarn(t *testing.T, logs *capture.Recorder, msg string) {
 	t.Helper()
-	if n := logs.CountLevel(slog.LevelWarn, msg); n != 0 {
-		t.Errorf("WARN %q logged %d times for a ROOT failure, want 0: the error is returned to Run, which reports the fallback to polling once; log = %v", msg, n, logs.Messages())
+	if n := logs.Count(msg); n != 0 {
+		t.Errorf("record %q logged %d times for a ROOT failure, want 0: the error is returned to Run, which reports the fallback to polling once; log = %v", msg, n, logs.Messages())
 	}
 }
 
@@ -144,13 +153,16 @@ func assertNoSkipWarn(t *testing.T, logs *capture.Recorder, msg string) {
 // when tests run as uid 0.
 //
 // The rule: only the root failing is fatal, because that is the signal Run uses
-// to fall back to polling; a child that cannot be walked is warned about and
+// to fall back to polling; a child that cannot be walked is reported and
 // skipped, so one mis-permissioned certificate directory cannot cost the whole
-// tree its real-time watch. The skip WARN must name the fallback cadence,
+// tree its real-time watch. The skip record must name the fallback cadence,
 // covered here for BOTH configurations: with the rescan enabled the subtree is
-// still picked up every interval, while "disabled" means the renewals under it
-// will not be noticed at all until a restart -- the difference between a
-// cosmetic and an actionable log line.
+// still picked up every interval, while "disabled" means only the 24h
+// reconciliation floor revisits it, so a renewal under it waits for that floor
+// rather than for the operator's shorter interval -- the difference between a
+// cosmetic and an actionable log line. It is a DEBUG record: the watch-set walk
+// visits one path per directory of a tree a co-writer sizes, and the scan over the
+// same tree already publishes the bounded operator-facing half of this condition.
 //
 // The classifier registers nothing itself: it only reports whether the entry is
 // a directory the walk should register, so neither branch here can attach a
@@ -179,44 +191,48 @@ func TestClassifyWatchEntry_applies_the_walk_error_policy(t *testing.T) {
 			}
 			w := New(root, func(context.Context) {}, WithFallback(tc.fallback))
 
-			_, err := w.classifyWatchEntry(t.Context(), root, path, nil, walkErr)
+			_, err := w.classifyWatchEntry(root, path, nil, walkErr)
 
 			if tc.wantFatal {
 				if !errors.Is(err, walkErr) {
 					t.Errorf("classifyWatchEntry(root, walkErr) = %v, want the walk error unchanged so Run falls back to polling", err)
 				}
-				assertNoSkipWarn(t, logs, warnUnwatchablePath)
+				assertNoSkipWarn(t, logs, msgUnwatchablePath)
 				return
 			}
 			if err != nil {
 				t.Errorf("classifyWatchEntry(child, walkErr) = %v, want nil so the rest of the tree is still watched", err)
 			}
-			assertSkipWarn(t, logs, warnUnwatchablePath, path, tc.wantFallback, walkErr)
+			assertSkipRecord(t, logs, slog.LevelDebug, msgUnwatchablePath, path, tc.wantFallback, walkErr)
 		})
 	}
 }
 
-// TestClassifyWatchEntry_reports_shutdown_ahead_of_a_walk_error pins the ordering
-// inside classifyWatchEntry: cancellation is checked BEFORE the walk error. That
-// ordering is a real contract, not an accident of layout -- callers must treat a
-// ctx error as shutdown (no WARN, no fallback to polling, no follow-up scan),
-// and a shutdown arriving while the walk is already failing on some sub-path
-// would otherwise be reported as a watch degradation and send Run into polling
-// on its way out.
-// Not parallel: it swaps the process-global slog default.
-func TestClassifyWatchEntry_reports_shutdown_ahead_of_a_walk_error(t *testing.T) {
-	logs := capture.Default(t)
-	root := t.TempDir()
-	w := New(root, func(context.Context) {}, WithFallback(6*time.Hour))
+// TestExceedsEntryBudget_reports_shutdown_ahead_of_a_walk_error pins the ordering
+// inside the walk's one admission gate: cancellation is answered BEFORE the
+// walk-error arm returns "not exceeded", and before the Counter is charged. That
+// ordering is a real contract, not an accident of layout -- callers must treat a ctx
+// error as shutdown (no WARN, no fallback to polling, no follow-up scan), and a
+// shutdown arriving while the walk is already failing on some sub-path would
+// otherwise be reported as a watch degradation and send Run into polling on its way
+// out.
+func TestExceedsEntryBudget_reports_shutdown_ahead_of_a_walk_error(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
+	budget := scanbudget.NewCounter(1)
 
-	_, err := w.classifyWatchEntry(ctx, root, filepath.Join(root, "example.com"), nil, errors.New("permission denied"))
+	exceeded, err := exceedsEntryBudget(ctx, &budget, errors.New("permission denied"))
 
 	if !errors.Is(err, context.Canceled) {
-		t.Errorf("classifyWatchEntry(cancelled ctx, walkErr) = %v, want context.Canceled: shutdown outranks the walk error so Run treats it as a clean stop", err)
+		t.Errorf("exceedsEntryBudget(cancelled ctx, walkErr) = (%v, %v), want context.Canceled: shutdown outranks the walk error so Run treats it as a clean stop", exceeded, err)
 	}
-	assertNoSkipWarn(t, logs, warnUnwatchablePath)
+	if exceeded {
+		t.Error("exceedsEntryBudget(cancelled ctx) = true, want false: a shutdown is not a tree past its ceiling, and the entry-ceiling WARN must not fire for it")
+	}
+	if n := budget.Count(); n != 0 {
+		t.Errorf("exceedsEntryBudget charged %d entries for a cancelled callback, want 0: a shutdown must spend none of the operator's ceiling", n)
+	}
 }
 
 // TestHandleWatchAddError_classifies_root_and_child_registration_failures pins
@@ -258,13 +274,13 @@ func TestHandleWatchAddError_classifies_root_and_child_registration_failures(t *
 				if !errors.Is(err, addErr) {
 					t.Errorf("handleWatchAddError(root) = %v, want the add error unchanged so Run falls back to polling", err)
 				}
-				assertNoSkipWarn(t, logs, warnUnwatchableDir)
+				assertNoSkipWarn(t, logs, msgUnwatchableDir)
 				return
 			}
 			if err != nil {
 				t.Errorf("handleWatchAddError(child) = %v, want nil so one unwatchable directory does not cost the tree its watch", err)
 			}
-			assertSkipWarn(t, logs, warnUnwatchableDir, path, tc.wantFallback, addErr)
+			assertSkipRecord(t, logs, slog.LevelWarn, msgUnwatchableDir, path, tc.wantFallback, addErr)
 		})
 	}
 }
@@ -346,6 +362,22 @@ func TestAddWatchDirs_stops_at_the_entry_budget(t *testing.T) {
 	if n := logs.CountLevel(slog.LevelWarn, watchBudgetMsg); n != 1 {
 		t.Errorf("budget WARN logged %d times, want exactly 1 per walk (the remainder is unbounded and the operator action is the same for all of it); log = %v",
 			n, logs.Messages())
+	}
+	// root is a t.TempDir() name, for which logtext.Path is byte-identical; the
+	// hostile-name direction is the sanitize oracle's.
+	for key, want := range map[string]string{
+		"root":        root,
+		"max_entries": "2",
+		"remediation": scanbudget.InputRemediation,
+	} {
+		got, ok := logs.AttrValue(watchBudgetMsg, key)
+		if !ok {
+			t.Errorf("budget WARN carries no %q attribute; an operator cannot act on the overrun without it", key)
+			continue
+		}
+		if got != want {
+			t.Errorf("budget WARN %s = %q, want %q", key, got, want)
+		}
 	}
 	// README's CertConverterInputTreeTooLarge rule matches this phrase, so it is
 	// pinned as a LITERAL rather than via watchBudgetMsg: a reword of the

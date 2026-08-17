@@ -17,9 +17,12 @@ const AlertedPhrase = "holds more entries than one scan will enumerate"
 // appends what IT stopped doing.
 const InputTreeTooLarge = "the /input tree " + AlertedPhrase
 
-// InputRemediation is the operator action for an /input budget stop, naming both ways out: a mount
-// pointed at the wrong tree, or a legitimately large certificate directory.
-const InputRemediation = "check that /input is mounted at the certificate directory and holds nothing else, or raise MAX_SCAN_ENTRIES if the tree is legitimately this large"
+// InputRemediation is the operator action for an /input budget stop, naming both ways out —
+// a mount pointed at the wrong tree, or a legitimately large certificate directory — and
+// what the second one costs, because one walk's memory grows with the total LENGTH of the
+// paths it enumerates rather than only with their number: raising the ceiling alone can put
+// the scan over the container's memory limit, which converts nothing at all.
+const InputRemediation = "check that /input is mounted at the certificate directory and holds nothing else; if the tree is legitimately this large, raise MAX_SCAN_ENTRIES and the container's memory limit together, because one scan's memory grows with the total length of the paths it enumerates and not only with their number"
 
 // Effective resolves an injected budget: non-positive means Default, so a walk assembled
 // field by field without one is bounded rather than unbounded.

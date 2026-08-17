@@ -67,7 +67,7 @@ services:
 | `FALLBACK_SCAN_HOURS` | Hours between full directory re-scans, the fallback for fsnotify events missed on network mounts and similar edge cases. Only an explicit `0` or `false` disables it, which turns off re-scans **on your cadence** but not the app's own convergence: the watcher still reconciles the whole tree, and still refreshes the health marker, at least once every 24 hours, so a missed renewal is converted late rather than never and a wedged watcher is now reported unhealthy instead of staying up ([Healthcheck](#healthcheck) has the detail and the one behaviour change this brings to existing `0`/`false` deployments). Startup logs a WARN naming that latency tradeoff. An empty, whitespace, or invalid value uses the 6h default, so a blank never silently disables the safety net; a value above `87600` (10 years) is clamped to that ceiling, and any cadence above 24h is capped at the reconciliation floor in practice. An invalid or clamped value is reported by a WARN at startup only, never by the `health` subcommand, which reads the same setting on every healthcheck. | `6` | No |
 | `PFX_ENCODER` | PFX encoding profile: modern2023 (AES-256-CBC + SHA-256, default), modern2026 (AES-256-CBC + PBMAC1, requires OpenSSL 3.4.0+), legacy (3DES + SHA-1 for older devices), or legacyrc2 (RC2-40 + SHA-1, a last-resort interop escape: a 40-bit RC2 key is brute-forceable, so the private key in such a bundle is protected only nominally; use it when a device accepts nothing else and treat the output as sensitive). `modern` is an alias for `modern2023`, and `legacy` is recorded as `legacydes` in startup logs. See the [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables). | `modern2023` | No |
 | `OUTPUT_LIFECYCLE` | What happens to a `.pfx` whose certificate **and** private key have both been removed from `/input`. `warn` (default) logs the orphan and leaves the file in place; `sync` deletes it so `/output` tracks `/input`, after a short re-check (30 seconds later, once per scan) confirms both are still gone; `keep` is silent and never deletes. A bundle whose `<name>.key` is still there is kept and reported by its own WARN: a half-written or half-deleted pair is not proof the bundle is orphaned. Finish the change under `/input` (add the matching `<name>.crt`, or remove the leftover `<name>.key`) and the next scan reaps it. `sync` only ever removes files matching this app's own output shape, and it refuses to delete anything at all unless the scan proves it enumerated `/input` completely: at least one certificate found, the walk finished within `MAX_SCAN_ENTRIES`, and no unreadable path, unresolvable symlink, or conversion failure. A scan that cannot make that proof logs `orphan removal is disabled for this scan` and reaps nothing, so a broken or empty mount can never be read as "every certificate was deleted". Every scan that does delete something logs a WARN naming the count and a sample of the paths. An unrecognized value logs a WARN and uses `warn`. | `warn` | No |
-| `MAX_SCAN_ENTRIES` | How many `/input` paths one scan enumerates before it stops without converting or removing anything further. The stop is a WARN naming the path it reached, and it leaves health alone, because no restart shrinks the tree; orphan cleanup is skipped for that scan. Raise it if your certificate tree is legitimately larger than the default. An empty, whitespace, invalid, zero, or negative value uses the `10000` default; a value above `200000` is clamped to that ceiling. Either repair is reported by a WARN at startup naming the value you set. There is deliberately no value that disables the budget. | `10000` | No |
+| `MAX_SCAN_ENTRIES` | How many `/input` paths one scan enumerates before it stops without converting or removing anything further. The stop is a WARN naming the path it reached, and it leaves health alone, because no restart shrinks the tree; orphan cleanup is skipped for that scan. If your certificate tree is legitimately larger than the default, raise this **and** the container's memory limit together: one scan's memory grows with the total length of the paths it enumerates and not only with their number, so raising this alone can push the scan past a fixed memory limit, where it is killed and converts nothing at all. Where the memory limit cannot move, the two mitigations that do work are lowering this ceiling and `OUTPUT_LIFECYCLE=keep`, which returns before the output walk and so never builds the `/output` list. An empty, whitespace, invalid, zero, or negative value uses the `10000` default; a value above `200000` is clamped to that ceiling. Either repair is reported by a WARN at startup naming the value you set. There is deliberately no value that disables the budget. | `10000` | No |
 | `LOG_LEVEL` | Minimum log level: `debug`, `info`, `warn`, or `error` (case-insensitive; slog offsets such as `info+2` work). `debug` surfaces per-certificate skip reasons (orphan, unchanged, unreadable subdir), each orphan deletion's own path, and filesystem-event detail. An unrecognized value falls back to `info`. | `info` | No |
 
 ### Volumes
@@ -191,7 +191,10 @@ groups:
             was skipped for that scan. Health is unaffected, because no restart
             shrinks the tree, which makes this rule the only signal. Check that
             /input is mounted at the certificate directory and holds nothing
-            else, or raise MAX_SCAN_ENTRIES.
+            else; if the tree is legitimately this large, raise
+            MAX_SCAN_ENTRIES and the container's memory limit together,
+            because one scan's memory grows with the total length of the paths
+            it enumerates and not only with their number.
       - alert: CertConverterChangeDetectionDegraded
         expr: |
           sum by (container) (count_over_time(
@@ -312,10 +315,9 @@ groups:
           description: >
             This scan could not prove an output bundle is orphaned, so it deleted
             nothing: /input was not fully enumerated, or an /output sub-path could
-            not be read, or the output tree contains a symlink (writes follow it
-            and the orphan walk does not, so a freshly written bundle would read
-            as an orphan), or the tree holds more certificate pairs than
-            MAX_SCAN_ENTRIES lets the app remember. Only relevant with
+            not be read, or the output tree contains a symlink, so the orphan walk
+            could not enumerate all of it, or either tree holds more entries than
+            MAX_SCAN_ENTRIES lets one walk enumerate. Only relevant with
             `OUTPUT_LIFECYCLE=sync`, where it is the difference between "nothing
             to reap" and "reaping is off", otherwise indistinguishable because
             health is unaffected: a `.pfx` whose certificate was removed from

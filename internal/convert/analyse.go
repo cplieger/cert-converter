@@ -36,14 +36,15 @@ const (
 	ObsRenewedCertTie ObservationKind = "renewed-cert-tie"
 	// ObsCAAsIdentity reports that the selected identity asserts IsCA.
 	ObsCAAsIdentity ObservationKind = "ca-as-identity"
-	// ObsChainUnverified reports that no issuer of the certificate the discovered
-	// path ended on could be established from the bundle WHILE certificates were
-	// left over that it could not place.
+	// ObsChainUnverified reports that the discovered path ended without an issuer it
+	// could still place — either none could be established from the bundle, or the
+	// only proven one is already on the path — WHILE certificates were left over
+	// that it could not place.
 	ObsChainUnverified ObservationKind = "chain-unverified"
-	// ObsChainTrustAnchorAbsent reports that the chain terminates at a certificate
-	// whose own issuer is not in the bundle, with nothing left over: every parsed
-	// certificate is on the emitted path and the path simply stops below a trust
-	// anchor.
+	// ObsChainTrustAnchorAbsent reports that no self-signed trust anchor is in the
+	// bundle, with nothing left over: every parsed certificate is on the emitted
+	// path, which either simply stops below an anchor or closed a
+	// cross-certification cycle.
 	ObsChainTrustAnchorAbsent ObservationKind = "chain-trust-anchor-absent"
 	// ObsChainAnchorUnverifiable reports that the chain terminates at a certificate
 	// that names ITSELF as its own issuer while this app could not verify that
@@ -64,14 +65,15 @@ const (
 	// keyCertSign).
 	ObsChainCertCannotIssue ObservationKind = "chain-cert-cannot-issue"
 	// ObsUnrelatedBlocksSkipped reports PEM blocks in the CERTIFICATE file that are
-	// neither a certificate nor a private key — an OpenSSL "TRUSTED CERTIFICATE",
-	// the legacy "X509 CERTIFICATE" alias, a stray CERTIFICATE REQUEST — and were
-	// therefore not part of the bundle.
+	// neither a certificate nor an expected key companion — an OpenSSL "TRUSTED
+	// CERTIFICATE", the legacy "X509 CERTIFICATE" alias, a stray CERTIFICATE
+	// REQUEST — and were therefore not part of the bundle.
 	ObsUnrelatedBlocksSkipped ObservationKind = "unrelated-blocks-skipped"
 	// ObsUnusableKeyBlocksSkipped reports PEM blocks in the KEY file that yielded no
 	// usable key — unparseable DER, armour encoding/pem could not decode, ciphertext,
-	// or a label naming no key format this app reads — while another block did yield
-	// one, so conversion continued.
+	// or a label that names neither a key format this app reads nor an expected
+	// companion of the key — while another block did yield one, so conversion
+	// continued.
 	ObsUnusableKeyBlocksSkipped ObservationKind = "unusable-key-blocks-skipped"
 	// ObsIssuerMatchIgnored reports that a supplied key also matched a certificate
 	// that verifiably issued another certificate in this bundle.
@@ -233,7 +235,8 @@ func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (Anal
 // the observations that describe what parsing had to leave out.
 type analysisInput struct {
 	// certs are the certificates in input order with duplicates removed, and
-	// certAt maps each one back to its block index in the original file.
+	// certAt maps each one back to its index among the file's CERTIFICATE
+	// blocks, duplicates included.
 	certs  []*x509.Certificate
 	certAt []int
 	// signers are the distinct usable private keys, and keyIssues the key blocks
@@ -783,11 +786,10 @@ func (g *certGraph) distancesFromRoots(roots []int, edgeOK func(child, parent in
 // selectIdentity resolves which certificate and key form the identity, matching
 // every key against every certificate rather than against a positional guess.
 func (g *certGraph) selectIdentity(signers []crypto.Signer, keyIssues keyDefects, certIssues skippedBlocks) (identityMatch, []Observation, error) {
-	matches, firstUnverifiable := g.collectMatches(signers)
-	matches, issuerObs := g.dropIssuerMatches(matches)
+	matches, issuerObs := g.dropIssuerMatches(g.collectMatches(signers))
 	switch len(matches) {
 	case 0:
-		return identityMatch{}, nil, g.noMatchError(len(signers), firstUnverifiable, keyIssues, certIssues)
+		return identityMatch{}, nil, g.noMatchError(len(signers), keyIssues, certIssues)
 	case 1:
 		return matches[0], issuerObs, nil
 	default:
@@ -837,34 +839,30 @@ func (g *certGraph) certsOf(matches []identityMatch) []*x509.Certificate {
 
 // collectMatches pairs every key with every certificate whose public half it
 // owns.
-func (g *certGraph) collectMatches(signers []crypto.Signer) (matches []identityMatch, firstUnverifiable int) {
-	firstUnverifiable = -1
+func (g *certGraph) collectMatches(signers []crypto.Signer) []identityMatch {
+	var matches []identityMatch
 	for ki, s := range signers {
 		for ci, c := range g.certs {
-			matched, supported := equalPublicKeys(c.PublicKey, s.Public())
-			if !supported {
-				if firstUnverifiable == -1 {
-					firstUnverifiable = ci
-				}
-				continue
-			}
-			if matched {
+			if matched, supported := equalPublicKeys(c.PublicKey, s.Public()); supported && matched {
 				matches = append(matches, identityMatch{key: ki, cert: ci})
 			}
 		}
 	}
-	return matches, firstUnverifiable
+	return matches
 }
 
 // noMatchError explains that no certificate here belongs to any supplied key,
 // naming an unverifiable key algorithm ahead of a plain mismatch when it is the
 // only explanation left — every certificate uncomparable — and otherwise carrying
 // it as a trailing clause on the mismatch sentence.
-func (g *certGraph) noMatchError(usableKeys, firstUnverifiable int, keyIssues keyDefects, certIssues skippedBlocks) error {
-	uncomparable := 0
-	for _, c := range g.certs {
+func (g *certGraph) noMatchError(usableKeys int, keyIssues keyDefects, certIssues skippedBlocks) error {
+	uncomparable, firstUnverifiable := 0, -1
+	for i, c := range g.certs {
 		if !comparableCertKey(c.PublicKey) {
 			uncomparable++
+			if firstUnverifiable == -1 {
+				firstUnverifiable = i
+			}
 		}
 	}
 	// The specific diagnosis is right only when an uncomparable certificate is the
@@ -933,13 +931,10 @@ func certIssuesSuffix(certIssues skippedBlocks) string {
 
 // resolveAmbiguousMatches rules on more than one (key, certificate) match.
 func (g *certGraph) resolveAmbiguousMatches(matches []identityMatch, keyIssues keyDefects, certIssues skippedBlocks) (identityMatch, []Observation, error) {
-	firstKey := matches[0].key
-	for _, m := range matches[1:] {
-		if m.key != firstKey {
-			return identityMatch{}, nil, errors.New(appendCertIssues(fmt.Sprintf(
-				"the input contains %d distinct certificate/key identities; this app converts one certificate/key pair per output (%s)%s",
-				countDistinctKeys(matches), subjectsForLog(g.certsOf(matches)), keyIssues.suffix()), certIssues))
-		}
+	if distinct := countDistinctKeys(matches); distinct > 1 {
+		return identityMatch{}, nil, errors.New(appendCertIssues(fmt.Sprintf(
+			"the input contains %d distinct certificate/key identities; this app converts one certificate/key pair per output (%s)%s",
+			distinct, subjectsForLog(g.certsOf(matches)), keyIssues.suffix()), certIssues))
 	}
 
 	best := matches[0]
@@ -950,7 +945,7 @@ func (g *certGraph) resolveAmbiguousMatches(matches []identityMatch, keyIssues k
 	}
 	return best, []Observation{{
 		Kind: ObsRenewedCertTie,
-		Detail: fmt.Sprintf("one private key matches %d certificates; selected %q (NotBefore %s)",
+		Detail: fmt.Sprintf("one private key matches %d certificate(s) eligible as the identity; selected %q (NotBefore %s)",
 			len(matches), subjectForLog(g.certs[best.cert]),
 			g.certs[best.cert].NotBefore.UTC().Format(time.RFC3339)),
 	}}, nil
@@ -989,6 +984,19 @@ func (g *certGraph) pathFrom(start int) []int {
 		onPath[best] = true
 		cur = best
 	}
+}
+
+// provenIssuerOnPath returns a certificate already on path whose signature over
+// certs[terminal] is proven, or -1. bestParent excludes such a parent only because a
+// certificate may not appear twice, so a diagnostic that reported its evidence as
+// absent would state the opposite of what the walk proved.
+func (g *certGraph) provenIssuerOnPath(terminal int, path []int) int {
+	for _, p := range g.candidateParents[terminal] {
+		if p != terminal && slices.Contains(path, p) && g.proven(terminal, p) {
+			return p
+		}
+	}
+	return -1
 }
 
 // bestParent picks the next hop from cur, or -1 when the chain ends here.
@@ -1119,7 +1127,9 @@ func (g *certGraph) assembleChain(path []int) (chain, extra []*x509.Certificate,
 	if !g.isSelfSigned(terminal) {
 		kept, disqualified := partitionIssuerEligible(extra)
 		chain = append(chain, kept...)
-		fallbackObs := []Observation{g.terminusObservation(terminal, extra, kept, len(chain))}
+		fallbackObs := []Observation{
+			g.terminusObservation(terminal, g.provenIssuerOnPath(terminal, path), extra, kept, len(chain)),
+		}
 		if len(disqualified) > 0 {
 			fallbackObs = append(fallbackObs, Observation{
 				Kind: ObsExtraCertsExcluded,
@@ -1141,8 +1151,10 @@ func (g *certGraph) assembleChain(path []int) (chain, extra []*x509.Certificate,
 }
 
 // terminusObservation states what became of a chain whose terminus is not proven
-// self-signed.
-func (g *certGraph) terminusObservation(terminal int, extra, kept []*x509.Certificate, chainLen int) Observation {
+// self-signed. provenOnPath is the index of a certificate already on the emitted path
+// that provably signed the terminus, or -1: with one, the walk stopped on a
+// cross-certification cycle rather than on absent evidence.
+func (g *certGraph) terminusObservation(terminal, provenOnPath int, extra, kept []*x509.Certificate, chainLen int) Observation {
 	subject := subjectForLog(g.certs[terminal])
 	leftovers := ""
 	switch {
@@ -1163,6 +1175,13 @@ func (g *certGraph) terminusObservation(terminal int, extra, kept []*x509.Certif
 		}
 	}
 	if len(extra) == 0 {
+		if provenOnPath >= 0 {
+			return Observation{
+				Kind: ObsChainTrustAnchorAbsent,
+				Detail: fmt.Sprintf("the chain ends at %q, whose issuer %q is already in this chain: the two cross-certify each other, so the walk stopped rather than place a certificate twice, and no self-signed trust anchor is in the bundle",
+					subject, subjectForLog(g.certs[provenOnPath])),
+			}
+		}
 		completeness := "every certificate supplied is in the bundle, so nothing was left out"
 		if chainLen == 0 {
 			completeness = "the bundle holds the identity alone and no chain certificates at all, so a consumer that does not already hold the issuer cannot build a path; supply the full chain (Caddy/certbot fullchain.pem) if that was intended"
@@ -1171,6 +1190,13 @@ func (g *certGraph) terminusObservation(terminal int, extra, kept []*x509.Certif
 			Kind: ObsChainTrustAnchorAbsent,
 			Detail: fmt.Sprintf("the chain ends at %q, whose issuer is not in the bundle; %s",
 				subject, completeness),
+		}
+	}
+	if provenOnPath >= 0 {
+		return Observation{
+			Kind: ObsChainUnverified,
+			Detail: fmt.Sprintf("the only proven issuer of %q, %q, is already in this chain (the two cross-certify), so the walk stopped there%s",
+				subject, subjectForLog(g.certs[provenOnPath]), leftovers),
 		}
 	}
 	return Observation{
@@ -1240,7 +1266,7 @@ func (g *certGraph) unprovenPathObservations(path []int) []Observation {
 		obs = append(obs, Observation{
 			Kind: ObsChainEdgeUnprovenIssuer,
 			Detail: fmt.Sprintf(
-				"chain certificate %d, %q, %s %q but no signature here proves it issued that certificate; it was included because nothing in this bundle could be proven to have signed that certificate, so a consumer may be unable to verify the chain",
+				"chain certificate %d, %q, %s %q but no signature here proves it issued that certificate; it was included because no certificate the chain walk could still place proved it signed that certificate, so a consumer may be unable to verify the chain",
 				i, subjectForLog(g.certs[parent]), linkage,
 				subjectForLog(g.certs[child])),
 		})

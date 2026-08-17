@@ -432,11 +432,12 @@ func TestRun_reports_a_watch_mode_loss_to_the_caller(t *testing.T) {
 }
 
 // TestAttachWatchSet_names_the_rescan_cadence_when_it_degrades_to_polling pins
-// the fallback_scan attribute on the two WARNs that announce poll mode. It is
-// the operator's only statement of whether anything will revisit /input while
-// fsnotify is unusable -- "disabled" means nothing does for the life of the
-// process -- and the same attribute is already pinned on this package's other
-// degraded-path WARNs, so only the mode-entry pair could lose it silently.
+// the fallback_scan attribute on the two WARNs that announce poll mode. It states
+// the cadence the OPERATOR configured -- "disabled" means they switched their own
+// cadence off, while the scan_floor attribute beside it states the reconciliation
+// cadence they cannot switch off -- and the same attribute is already pinned on this
+// package's other degraded-path WARNs, so only the mode-entry pair could lose it
+// silently.
 // Not parallel: it swaps the process-global slog default and the newFSWatcher seam.
 func TestAttachWatchSet_names_the_rescan_cadence_when_it_degrades_to_polling(t *testing.T) {
 	for _, tc := range []struct {
@@ -447,9 +448,9 @@ func TestAttachWatchSet_names_the_rescan_cadence_when_it_degrades_to_polling(t *
 		wantFallback string
 	}{
 		{"an unusable fsnotify names the cadence", "fsnotify unavailable, using polling", true, 6 * time.Hour, "6h0m0s"},
-		{"an unusable fsnotify reports a disabled rescan as disabled", "fsnotify unavailable, using polling", true, 0, "disabled"},
+		{"an unusable fsnotify reports a disabled rescan as disabled", "fsnotify unavailable, scanning once before exiting", true, 0, "disabled"},
 		{"an unwatchable root names the cadence", "failed to watch directories, using polling", false, 6 * time.Hour, "6h0m0s"},
-		{"an unwatchable root reports a disabled rescan as disabled", "failed to watch directories, using polling", false, 0, "disabled"},
+		{"an unwatchable root reports a disabled rescan as disabled", "failed to watch directories, scanning once before exiting", false, 0, "disabled"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.unavailable {
@@ -474,7 +475,7 @@ func TestAttachWatchSet_names_the_rescan_cadence_when_it_degrades_to_polling(t *
 			}
 			got, ok := logs.AttrValue(tc.msg, "fallback_scan")
 			if !ok {
-				t.Fatalf("WARN %q carries no fallback_scan attribute; an operator cannot tell whether anything will revisit /input while fsnotify is unusable; log = %v", tc.msg, logs.Messages())
+				t.Fatalf("WARN %q carries no fallback_scan attribute; an operator cannot tell which rescan cadence their configuration is running; log = %v", tc.msg, logs.Messages())
 			}
 			if got != tc.wantFallback {
 				t.Errorf("WARN %q fallback_scan = %q with WithFallback(%v), want %q", tc.msg, got, tc.fallback, tc.wantFallback)
@@ -489,7 +490,7 @@ func TestAttachWatchSet_names_the_rescan_cadence_when_it_degrades_to_polling(t *
 // previous, now-closed watcher must not be reported as watched under the new
 // one. Without the reset the mirror claims a directory is watched that the new
 // watcher never registered, handlePathEvent's membership guard skips the
-// subtree re-walk on the strength of that claim, and every renewal underneath
+// whole-tree re-assert on the strength of that claim, and every renewal underneath
 // it is detected only by the periodic rescan -- never, with the fallback
 // disabled.
 //
@@ -533,15 +534,17 @@ func TestTryAttachWatchSet_rebuilds_the_membership_mirror_for_a_new_watcher(t *t
 	}
 
 	// The consequence: with the stale claim in place, the recreated directory
-	// looks already-watched and its subtree is never walked again.
+	// looks already-watched and the watch set is never re-asserted for it.
 	child := filepath.Join(dir, "nested")
 	if err := os.MkdirAll(child, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	if got := w.handleFsEvent(t.Context(), second, fsnotify.Event{Name: dir, Op: fsnotify.Create}); !got {
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+	if got := w.handleFsEvent(t.Context(), second, st, fsnotify.Event{Name: dir, Op: fsnotify.Create}); !got {
 		t.Error("handleFsEvent(Create of the recreated dir) = false, want true")
 	}
 	if watched := second.WatchList(); !slices.Contains(watched, child) {
-		t.Errorf("watch list = %v, want %q attached: a directory the new watcher never registered must be walked again", watched, child)
+		t.Errorf("watch list = %v, want %q attached: a directory the new watcher never registered must be re-asserted", watched, child)
 	}
 }

@@ -380,7 +380,8 @@ func stubWriteRefusal(t *testing.T, err error) {
 
 // TestStoreInspect_reports_content_it_could_not_verify pins the FACT, at the boundary that
 // resolves it, for the two prior bundles this app cannot compare: one above the readable
-// bound, and one the codec's preflight refuses to look at.
+// bound, and one whose declared key-derivation work the codec's preflight refuses to
+// spend. A file the preflight PROVES foreign is a different fact and is verified stale.
 //
 // Both must report contentUnverified and NOT contentVerifiedStale. The distinction has no
 // visible effect until a rewrite is refused, which is exactly why it needs its own test:
@@ -398,11 +399,9 @@ func TestStoreInspect_reports_content_it_could_not_verify(t *testing.T) {
 			t.Helper()
 			stageOversizedBundle(t, filepath.Join(dir, "out.pfx"))
 		},
-		"a prior the preflight refuses was never compared": func(t *testing.T, dir string) {
+		"a prior whose declared derivation work the preflight refuses was never compared": func(t *testing.T, dir string) {
 			t.Helper()
-			if err := os.WriteFile(filepath.Join(dir, "out.pfx"), []byte("not a pkcs12 bundle"), pfxFileMode); err != nil {
-				t.Fatalf("setup: WriteFile: %v", err)
-			}
+			stageBudgetRefusedBundle(t, filepath.Join(dir, "out.pfx"), &analysis)
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -516,7 +515,7 @@ func TestScannerRun_when_an_unverifiable_bundle_cannot_be_rewritten(t *testing.T
 	// Spelled out rather than imported from the production consts: an operator's log query
 	// keys on these words, so a silent rename must fail here.
 	const unreplaceableMsg = "prior pfx could not be replaced and the /output condition that refused the write is" +
-		" not one a restart clears; leaving the existing bundle in place, health is unaffected"
+		" not one a restart clears; whatever is at the output path is left as found, health is unaffected"
 	const failedMsg = "conversion failed"
 	for name, tc := range map[string]struct {
 		writeErr        error
@@ -757,7 +756,7 @@ func TestScannerRun_when_a_file_blocks_the_mirrored_output_directory(t *testing.
 // the first casualties, and the container would stay green while nothing converts.
 func TestScannerRun_a_genuine_conversion_failure_still_flips_health(t *testing.T) {
 	const unreplaceableMsg = "prior pfx could not be replaced and the /output condition that refused the write is" +
-		" not one a restart clears; leaving the existing bundle in place, health is unaffected"
+		" not one a restart clears; whatever is at the output path is left as found, health is unaffected"
 	for name, stage := range map[string]func(t *testing.T, certsRoot string){
 		"an unparseable certificate": func(t *testing.T, certsRoot string) {
 			t.Helper()
@@ -801,6 +800,29 @@ func TestScannerRun_a_genuine_conversion_failure_still_flips_health(t *testing.T
 					unreplaceableMsg, got, logs.Messages())
 			}
 		})
+	}
+}
+
+// stageBudgetRefusedBundle plants a prior bundle at path whose FIRST declared
+// key-derivation iteration count is a two-byte maximum, so the preflight refuses to spend
+// the work and nothing about the bytes is ever compared. The replacement keeps the DER
+// length identical, so the surrounding structure stays valid and only the count changes;
+// a foreign or truncated file would not do, because the preflight PROVES those are not
+// one of this app's bundles and grades them verified stale.
+func stageBudgetRefusedBundle(t *testing.T, path string, analysis *convert.Analysis) {
+	t.Helper()
+	pfx, err := analysis.Encode(convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+	encoded2048 := []byte{0x02, 0x02, 0x08, 0x00}
+	if !bytes.Contains(pfx, encoded2048) {
+		t.Fatalf("no DER-encoded 2048-iteration count found in a modern2023 bundle: the pinned encoder's" +
+			" framing changed, so this fixture no longer produces a budget refusal")
+	}
+	patched := bytes.Replace(pfx, encoded2048, []byte{0x02, 0x02, 0x7f, 0xff}, 1)
+	if err := os.WriteFile(path, patched, pfxFileMode); err != nil {
+		t.Fatalf("setup: WriteFile: %v", err)
 	}
 }
 

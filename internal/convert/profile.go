@@ -57,7 +57,7 @@ var (
 
 	// oidPBKDF2 is the only key-derivation function either modern profile names
 	// inside a PBES2 or PBMAC1 parameter block: go-pkcs12 v0.7.3 sets it
-	// unconditionally (crypto.go:320, mac.go:55).
+	// unconditionally (crypto.go:320, mac.go:54).
 	oidPBKDF2 = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 12}
 
 	// oidHMACWithSHA256 is the only PBKDF2 pseudorandom function, and the only
@@ -66,9 +66,28 @@ var (
 	oidHMACWithSHA256 = asn1.ObjectIdentifier{1, 2, 840, 113549, 2, 9}
 )
 
-// ErrProfileUnknown reports a bundle whose algorithm triple is not one this app
-// emits.
+// ErrProfileUnknown reports a bundle the preflight refused as one this app's encoder
+// profiles do not produce — anything from its DER framing to an algorithm, parameter,
+// salt or iteration count it declares. It does not say WHICH, so a caller cannot tell
+// refusal kinds apart with it.
 var ErrProfileUnknown = errors.New("pkcs12 bundle was not written by a known encoder profile")
+
+// errKDFBudget marks the one preflight refusal that is not a positive
+// identification: the file declares derivation work outside the range this app will
+// spend, so nothing about its interior was read. Minted at the site that declines the
+// work (checkIterationsRange) and read once, by refusalReason, so no consumer
+// re-derives which refusal was made.
+var errKDFBudget = fmt.Errorf("%w: declared key-derivation work outside the accepted range", ErrProfileUnknown)
+
+// refusalReason names WHICH refusal the preflight made. Every refusal but the
+// derivation budget's is a positive identification that these bytes are not a bundle
+// any of this app's profiles writes.
+func refusalReason(err error) CurrencyReason {
+	if errors.Is(err, errKDFBudget) {
+		return CurrencyPreflightFailed
+	}
+	return CurrencyForeign
+}
 
 // --- Minimal PKCS#12 shapes, for the preflight only ---
 
@@ -285,10 +304,6 @@ func inspect(pfx []byte) (EncoderType, error) {
 	if err != nil {
 		return "", err
 	}
-	// The encryption iteration counts are bounded during the authenticated-safe
-	// walk (bundleAlgorithms -> boundedSafeAlgorithms), which covers EVERY
-	// encrypted safe's outer algorithm plus the plaintext safe's shrouded key bag,
-	// not just the ones that identify the profile.
 	if _, digestErr := octetStringBytes(preamble.MacData.Mac.Digest, "mac digest"); digestErr != nil {
 		return "", digestErr
 	}
@@ -573,7 +588,7 @@ func decodeProfilePBKDF2(label string, alg *algorithmIdentifier) (pbkdf2Params, 
 	}
 	// The salt is a CHOICE, and only the specified-OCTET-STRING arm is a shape
 	// either modern profile writes or the decoder can consume (go-pkcs12 v0.7.3
-	// crypto.go:222-224, mac.go:89-91).
+	// crypto.go:222-224, mac.go:90-92).
 	salt, saltErr := octetStringBytes(kdf.Salt, label+" PBKDF2 salt")
 	if saltErr != nil {
 		return pbkdf2Params{}, saltErr
@@ -681,7 +696,7 @@ func checkEncryptionIterations(algOID asn1.ObjectIdentifier, params asn1.RawValu
 func checkIterationsRange(label string, n, minIterations int) error {
 	if n < minIterations || n > maxKDFIterations {
 		return fmt.Errorf("%w: %s iteration count %d outside %d..%d",
-			ErrProfileUnknown, label, n, minIterations, maxKDFIterations)
+			errKDFBudget, label, n, minIterations, maxKDFIterations)
 	}
 	return nil
 }

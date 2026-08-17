@@ -45,7 +45,7 @@ func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *hea
 			slog.Info("scan interrupted by shutdown", "reason", err)
 			return
 		}
-		slog.Error("processing failed", "error", err)
+		slog.Error("processing failed", "error", logtext.Path(err.Error()))
 		marker.Set(false)
 		return
 	}
@@ -135,7 +135,7 @@ func run() int {
 
 	cfg, err := config.Load()
 	if err != nil {
-		slog.Error("invalid configuration", "error", err)
+		slog.Error("invalid configuration", "error", logtext.Path(err.Error()))
 		return 1
 	}
 
@@ -212,7 +212,7 @@ func reportWatchExit(ctx context.Context, runErr error) int {
 	}
 	// Run reported that change detection ended for a reason other than
 	// shutdown: the fsnotify watch is gone and only a restart can recover it.
-	attrs := []any{"error", runErr}
+	attrs := []any{"error", logtext.Path(runErr.Error())}
 	var lost *watch.LostError
 	if errors.As(runErr, &lost) && lost.Remediation != "" {
 		attrs = append(attrs, "remediation", lost.Remediation)

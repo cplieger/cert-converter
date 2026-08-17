@@ -99,19 +99,22 @@ func TestWatchLoop_returns_a_LostError_when_the_watcher_dies(t *testing.T) {
 // TestPollLoopWithUpgrade_reports_dead_change_detection pins the one state in
 // which this app could lie about being healthy.
 //
-// With FALLBACK_SCAN_HOURS disabling the periodic rescan AND fsnotify unavailable
-// (inotify instance exhaustion is ordinary host pressure), there is no mechanism
-// left that can ever notice a renewal. Parking on ctx.Done() and returning nil at
-// shutdown would leave the health marker written by the initial scan uncontradicted
-// — disabling the fallback also disarms the probe's freshness deadline — so the
-// container would report HEALTHY indefinitely while converting nothing, and the
-// operator's first signal would be a downstream service serving an expired
+// With FALLBACK_SCAN_HOURS disabling the operator's own rescan AND fsnotify
+// unavailable (inotify instance exhaustion is ordinary host pressure), poll mode
+// holds no watch to react to and no cadence to tick on, so nothing in this process
+// notices a renewal. Parking on ctx.Done() and returning nil at shutdown would leave
+// the health marker written by the initial scan standing until the probe's freshness
+// deadline expires — three times the reconciliation floor at this cadence — so the
+// container would report HEALTHY across that whole window while converting nothing,
+// and the operator's first signal would be a downstream service serving an expired
 // certificate.
 //
-// Returning a *LostError reaches main's existing non-zero exit path. That is the
-// right answer here specifically BECAUSE the failure is restart-clearable — unlike
-// a missing volume or a bad symlink, an exhausted inotify table usually clears — so
-// the restart has a real chance of succeeding rather than looping pointlessly.
+// Returning a *LostError reaches main's existing non-zero exit path, and exiting
+// promptly is what keeps recovery on a restart's timescale instead of the 24h
+// reconciliation floor a watch-mode loop would wait for. That is the right answer
+// here specifically BECAUSE the failure is restart-clearable — unlike a missing
+// volume or a bad symlink, an exhausted inotify table usually clears — so the
+// restart has a real chance of succeeding rather than looping pointlessly.
 //
 // It also pins how the operator learns about it: this path is the only
 // operator-fixable loss, so the error it returns carries the FALLBACK_SCAN_HOURS

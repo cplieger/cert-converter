@@ -3,10 +3,15 @@ package process
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/cplieger/atomicfile/v2"
+	"github.com/cplieger/cert-converter/internal/convert"
 )
 
 // TestStoreLogSweepOutcome_operator_signals pins the /output sweep's end-of-sweep
@@ -99,11 +104,11 @@ func TestStoreLogSweepOutcome_operator_signals(t *testing.T) {
 // TestStoreLogSweepOutcome_is_silent_for_a_clean_sweep pins the quiet steady state
 // of the /output sweep: with nothing reaped, nothing refused, no unreadable
 // sub-path and no walk error, logSweepOutcome must emit nothing at all.
-// sweepStaleTemps runs at the start of every scan -- each debounced fsnotify
-// event and each fallback tick -- so a counter guard that also fired on zero
+// A sweep runs at most once per staleTempAge, but that is still every fallback
+// tick on a long-running container, so a counter guard that also fired on zero
 // would put a "count=0" info line, and for the two aggregate counters an
-// operator-facing warning with a remediation hint, into the log on every scan of
-// a perfectly healthy /output. Runs serially: it swaps slog.Default().
+// operator-facing warning with a remediation hint, into the log on a perfectly
+// healthy /output. Runs serially: it swaps slog.Default().
 func TestStoreLogSweepOutcome_is_silent_for_a_clean_sweep(t *testing.T) {
 	logs := captureLogs(t)
 
@@ -112,5 +117,67 @@ func TestStoreLogSweepOutcome_is_silent_for_a_clean_sweep(t *testing.T) {
 
 	if logs.Len() != 0 {
 		t.Errorf("logSweepOutcome(clean sweep) logged %q, want no output at all", logs.Messages())
+	}
+}
+
+
+// TestScannerRun_sweeps_stale_temps_once_per_window pins the throttle on the /output
+// stale-temp sweep: a temp is only reclaimable once it is staleTempAge old, so a scan
+// inside that window must not re-walk the untrusted output tree, and the first scan
+// past it must sweep again.
+func TestScannerRun_sweeps_stale_temps_once_per_window(t *testing.T) {
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+
+	now := time.Now()
+	prev := sweepClock
+	sweepClock = func() time.Time { return now }
+	t.Cleanup(func() { sweepClock = prev })
+
+	staleTemp := func(name string) string {
+		t.Helper()
+		p := filepath.Join(outRoot, name)
+		if err := os.WriteFile(p, []byte("partial"), 0o600); err != nil {
+			t.Fatalf("setup: WriteFile(%q): %v", p, err)
+		}
+		aged := time.Now().Add(-2 * staleTempAge)
+		if err := os.Chtimes(p, aged, aged); err != nil {
+			t.Fatalf("setup: Chtimes(%q): %v", p, err)
+		}
+		return p
+	}
+
+	scanner := New(&Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+	})
+
+	first := staleTemp(".atomicfile-111111.tmp")
+	if _, err := scanner.Run(t.Context()); err != nil {
+		t.Fatalf("Run(first scan) = %v, want nil", err)
+	}
+	if _, err := os.Stat(first); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("os.Stat(%q) = %v, want fs.ErrNotExist: the first scan of a process has no earlier"+
+			" sweep to defer to", first, err)
+	}
+
+	inWindow := staleTemp(".atomicfile-222222.tmp")
+	if _, err := scanner.Run(t.Context()); err != nil {
+		t.Fatalf("Run(second scan inside the window) = %v, want nil", err)
+	}
+	if _, err := os.Stat(inWindow); err != nil {
+		t.Errorf("os.Stat(%q) = %v, want nil: a scan inside staleTempAge must not sweep again",
+			inWindow, err)
+	}
+
+	now = now.Add(staleTempAge)
+	if _, err := scanner.Run(t.Context()); err != nil {
+		t.Fatalf("Run(scan past the window) = %v, want nil", err)
+	}
+	if _, err := os.Stat(inWindow); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("os.Stat(%q) = %v, want fs.ErrNotExist: the first scan past staleTempAge sweeps again",
+			inWindow, err)
 	}
 }

@@ -23,7 +23,8 @@ import (
 // schedule a rescan rather than guess from the suffix -- a created domain-named
 // directory such as "example.com" reads as an unrelated file to the suffix-only
 // classifier, so guessing means a pair already inside it waits for the periodic
-// fallback re-sync, and never with the fallback disabled -- AND it must still
+// fallback re-sync, or for the 24h reconciliation floor when the operator's own
+// cadence is disabled -- AND it must still
 // WARN, because the rescan does not re-attach the subtree's watches. An ENOTDIR
 // path (a component of the path is a regular file) is the portable way to
 // produce that second case without depending on permissions, which is
@@ -38,6 +39,8 @@ func TestHandleFsEvent_classifies_a_create_it_cannot_stat(t *testing.T) {
 	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
 
 	for _, tc := range []struct {
 		name     string
@@ -54,7 +57,7 @@ func TestHandleFsEvent_classifies_a_create_it_cannot_stat(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
 
-			got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: tc.path, Op: fsnotify.Create})
+			got := w.handleFsEvent(t.Context(), watcher, st, fsnotify.Event{Name: tc.path, Op: fsnotify.Create})
 
 			if got != tc.want {
 				t.Errorf("handleFsEvent(Create %s) = %v, want %v", tc.path, got, tc.want)
@@ -87,6 +90,8 @@ func TestHandleFsEvent_classifies_a_chmod_it_cannot_stat(t *testing.T) {
 	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
 
 	for _, tc := range []struct {
 		name     string
@@ -102,7 +107,7 @@ func TestHandleFsEvent_classifies_a_chmod_it_cannot_stat(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
 
-			got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: tc.path, Op: fsnotify.Chmod})
+			got := w.handleFsEvent(t.Context(), watcher, st, fsnotify.Event{Name: tc.path, Op: fsnotify.Chmod})
 
 			if got != tc.want {
 				t.Errorf("handleFsEvent(Chmod %s) = %v, want %v", tc.path, got, tc.want)
@@ -115,16 +120,16 @@ func TestHandleFsEvent_classifies_a_chmod_it_cannot_stat(t *testing.T) {
 	}
 }
 
-// TestFallbackScanAttr_tells_the_operator_whether_anything_will_rescan pins the
+// TestFallbackScanAttr_names_the_operator_configured_cadence pins the
 // fallback_scan attribute every degraded-path WARN carries. The existing
 // classify tests assert only that the WARN fires, so the attribute's value --
-// the operator's single statement of when (or whether) the reported path is
-// re-scanned -- is unverified, and the boundary that produces "disabled" can
-// invert without any test noticing. The disabled case is the load-bearing one:
-// nothing re-scans that path for the life of the process, so rendering it as a
-// duration would read as a promise the process cannot keep.
+// the label for the cadence the OPERATOR configured, with scan_floor beside it
+// stating the 24h revisit they cannot switch off -- is unverified, and the
+// boundary that produces "disabled" can invert without any test noticing. The
+// disabled case is the load-bearing one: rendering a switched-off cadence as a
+// duration would name an interval nothing runs on.
 // Not parallel: it swaps the process-global slog default.
-func TestFallbackScanAttr_tells_the_operator_whether_anything_will_rescan(t *testing.T) {
+func TestFallbackScanAttr_names_the_operator_configured_cadence(t *testing.T) {
 	const msg = "cannot classify a path whose permissions changed"
 
 	watcher := newTestWatcher(t)
@@ -146,8 +151,10 @@ func TestFallbackScanAttr_tells_the_operator_whether_anything_will_rescan(t *tes
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
 			w := New(root, func(context.Context) {}, WithFallback(tc.fallback))
+			st := newWatchState(w)
+			t.Cleanup(st.stop)
 
-			w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: filepath.Join(notADir, "tls.crt"), Op: fsnotify.Chmod})
+			w.handleFsEvent(t.Context(), watcher, st, fsnotify.Event{Name: filepath.Join(notADir, "tls.crt"), Op: fsnotify.Chmod})
 
 			got, ok := logs.AttrValue(msg, "fallback_scan")
 			if !ok {
@@ -162,12 +169,12 @@ func TestFallbackScanAttr_tells_the_operator_whether_anything_will_rescan(t *tes
 
 // TestHandleFsEvent_does_not_watch_through_a_symlinked_directory pins the
 // containment invariant both the Create and the Chmod arm rely on: they Lstat
-// (never Stat), so a symlink to a directory takes the FILE arm and
-// addWatchDirs/watcher.Add never runs on it. Neither addWatchDirs nor the
-// scanner's root-confined walk descends a symlinked directory, so watching
-// through one would register inotify watches on a tree outside /input whose
-// certs can never be converted, silently burning the watch quota. Both Create and
-// Chmod must use Lstat so a symlinked directory never enters addWatchDirs.
+// (never Stat), so a symlink to a directory takes the FILE arm and neither the
+// watch-set re-assert nor watcher.Add ever runs on the link's name. Neither the
+// re-assert's confined walk nor the scanner's root-confined walk descends a
+// symlinked directory, so watching through one would register inotify watches on a
+// tree outside /input whose certs can never be converted, silently burning the watch
+// quota.
 func TestHandleFsEvent_does_not_watch_through_a_symlinked_directory(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)
@@ -181,9 +188,11 @@ func TestHandleFsEvent_does_not_watch_through_a_symlinked_directory(t *testing.T
 		t.Skipf("symlinks unavailable on this filesystem: %v", err)
 	}
 	w := New(root, func(context.Context) {})
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
 
 	for _, op := range []fsnotify.Op{fsnotify.Create, fsnotify.Chmod} {
-		if got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: link, Op: op}); got {
+		if got := w.handleFsEvent(t.Context(), watcher, st, fsnotify.Event{Name: link, Op: op}); got {
 			t.Errorf("handleFsEvent(%v on a symlinked dir) = true, want false (the link name is not a cert or key)", op)
 		}
 	}
@@ -194,12 +203,12 @@ func TestHandleFsEvent_does_not_watch_through_a_symlinked_directory(t *testing.T
 	}
 }
 
-// TestHandleFsEvent_skips_the_rewalk_for_an_already_watched_directory pins the
+// TestHandleFsEvent_skips_the_reassert_for_an_already_watched_directory pins the
 // half of the membership guard that bounds per-event work: a Create for a
-// directory already in the watch set must NOT re-walk its subtree. The oracle is
-// a child that appeared without an event of its own — it can only reach the watch
-// list if the guard failed to skip the walk.
-func TestHandleFsEvent_skips_the_rewalk_for_an_already_watched_directory(t *testing.T) {
+// directory already in the watch set must NOT trigger the whole-tree re-assert. The
+// oracle is a child that appeared without an event of its own — it can only reach the
+// watch list if the guard failed to skip the re-assert.
+func TestHandleFsEvent_skips_the_reassert_for_an_already_watched_directory(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)
 	root := t.TempDir()
@@ -211,16 +220,18 @@ func TestHandleFsEvent_skips_the_rewalk_for_an_already_watched_directory(t *test
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
 	}
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
 	child := filepath.Join(dir, "nested")
 	if err := os.MkdirAll(child, 0o750); err != nil {
 		t.Fatal(err)
 	}
 
-	if got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: dir, Op: fsnotify.Create}); !got {
+	if got := w.handleFsEvent(t.Context(), watcher, st, fsnotify.Event{Name: dir, Op: fsnotify.Create}); !got {
 		t.Error("handleFsEvent(Create of an already-watched dir) = false, want true: the debounced rescan still covers content")
 	}
 	if watched := watcher.WatchList(); slices.Contains(watched, child) {
-		t.Errorf("a Create for the already-watched %q re-walked its subtree and registered %q; the membership guard must skip the walk (watch list = %v)",
+		t.Errorf("a Create for the already-watched %q re-asserted the watch set and registered %q; the membership guard must skip the re-assert (watch list = %v)",
 			dir, child, watched)
 	}
 }
@@ -345,11 +356,14 @@ func TestHandleRootWatchLoss_stays_live_when_the_reattach_fails(t *testing.T) {
 	}
 }
 
-// TestHandleFsEvent_registers_a_directory_created_under_a_watched_parent pins the
-// per-event SUBTREE walk on the path a writer drives: handlePathEvent calls
-// addWatchDirs on event.Name, so a directory created one at a time under an
-// already-watched parent is registered when its Create event arrives, and the pair
-// inside it is converted by the rescan the same event schedules.
+// TestHandleFsEvent_reasserts_the_watch_set_for_a_new_directory pins how a
+// directory created under an already-watched parent joins the watch set now that no
+// event walks a subtree of its own: the arm schedules the whole-tree re-assert
+// (resyncOrDefer), so past the floor the directory is registered immediately, and a
+// second trigger INSIDE the floor is deferred to the remainder of the interval rather
+// than dropped. That is the whole bound on this path — the trigger is chosen by
+// whoever writes to the tree, so without the floor the walk would run at their event
+// rate — and the deferral is what keeps the second directory covered anyway.
 //
 // The app imposes no ceiling on how many registrations it holds: the kernel owns
 // fs.inotify.max_user_watches and refuses the Add itself once the per-UID quota is
@@ -358,7 +372,7 @@ func TestHandleRootWatchLoss_stays_live_when_the_reattach_fails(t *testing.T) {
 // admission refusal here would leave the late directory unwatched, so every renewal
 // underneath it would wait for a periodic rescan.
 // Not parallel: it swaps the process-global slog default.
-func TestHandleFsEvent_registers_a_directory_created_under_a_watched_parent(t *testing.T) {
+func TestHandleFsEvent_reasserts_the_watch_set_for_a_new_directory(t *testing.T) {
 	watcher := newTestWatcher(t)
 	root := t.TempDir()
 	first := filepath.Join(root, "a.example.com")
@@ -369,6 +383,8 @@ func TestHandleFsEvent_registers_a_directory_created_under_a_watched_parent(t *t
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
 	}
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
 
 	// A directory created later, announced by its own Create event.
 	late := filepath.Join(root, "b.example.com")
@@ -377,7 +393,7 @@ func TestHandleFsEvent_registers_a_directory_created_under_a_watched_parent(t *t
 	}
 	logs := capture.Default(t)
 
-	if got := w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: late, Op: fsnotify.Create}); !got {
+	if got := w.handleFsEvent(t.Context(), watcher, st, fsnotify.Event{Name: late, Op: fsnotify.Create}); !got {
 		t.Error("handleFsEvent(Create of a new directory) = false, want true: the directory arm must schedule the rescan that converts a pair already inside it")
 	}
 
@@ -386,9 +402,27 @@ func TestHandleFsEvent_registers_a_directory_created_under_a_watched_parent(t *t
 			watched, late)
 	}
 	if !w.watchSetHas(late) {
-		t.Errorf("the membership mirror does not hold %q after its registration; the per-event guard would re-walk its subtree on every later event", late)
+		t.Errorf("the membership mirror does not hold %q after its registration; the per-event guard would re-assert the watch set on every later event", late)
 	}
 	if n := logs.CountLevel(slog.LevelWarn, watchBudgetMsg); n != 0 {
 		t.Errorf("the entry-ceiling WARN fired %d times for a tree well inside the budget, want 0; log = %v", n, logs.Messages())
+	}
+
+	// A second new directory inside the floor: deferred, never dropped.
+	inFloor := filepath.Join(root, "c.example.com")
+	if err := os.MkdirAll(inFloor, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := w.handleFsEvent(t.Context(), watcher, st, fsnotify.Event{Name: inFloor, Op: fsnotify.Create}); !got {
+		t.Error("handleFsEvent(Create inside the re-assert floor) = false, want true: the debounced scan still converts a pair inside the new directory")
+	}
+
+	if watched := watcher.WatchList(); slices.Contains(watched, inFloor) {
+		t.Errorf("watch list = %v holds %q, want the re-assert floored: a second Create inside %v must not run the whole-tree walk again",
+			watched, inFloor, minPreScanResync)
+	}
+	if !st.repairPending {
+		t.Errorf("a Create inside %v left no deferred repair armed; the trigger must be postponed to the remainder of the floor, not dropped", minPreScanResync)
 	}
 }

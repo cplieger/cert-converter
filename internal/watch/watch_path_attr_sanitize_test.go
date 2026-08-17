@@ -43,8 +43,8 @@ var unsafeInAttribute = []string{"\n", "\r", "\u202e"}
 // Four properties, and the last three are what stop an over-broad fix passing:
 //
 //   - The hostile name is REWRITTEN wherever it reaches an operator, including the
-//     watch-set dump's directories attribute, which is a []string rather than a
-//     plain string and so needs the gate applied per element.
+//     watch-set dump's directories attribute, which is one bounded inventory of many
+//     names and so needs the gate applied per element as they accumulate.
 //   - An ordinary name is BYTE-IDENTICAL. Sanitizing is a no-op for every ASCII and
 //     domain-derived name, which is why the rule moved no operator's log query key; a
 //     fix that escaped, quoted or truncated instead would fail here.
@@ -87,8 +87,10 @@ func TestWatchRecords_sanitize_walk_supplied_names_in_log_attributes(t *testing.
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("addWatchDirs(%q) = %v, want nil: the records under test come from this walk", root, err)
 	}
-	logWatchSet(watcher)
-	w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: hostileDir, Op: fsnotify.Chmod})
+	logWatchSet(t.Context(), watcher)
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+	w.handleFsEvent(t.Context(), watcher, st, fsnotify.Event{Name: hostileDir, Op: fsnotify.Chmod})
 
 	// The watch-set dump names every registered directory in ONE attribute, which is
 	// what an operator diagnosing an incomplete watch set reads.
@@ -117,7 +119,7 @@ func TestWatchRecords_sanitize_walk_supplied_names_in_log_attributes(t *testing.
 	// shape os.Root and the walk actually mint.
 	const unwatchableMsg = "skipping unwatchable path; renewals under it require a full rescan"
 	walkErr := &fs.PathError{Op: "open", Path: hostileDir, Err: fs.ErrPermission}
-	relevant, classifyErr := w.classifyWatchEntry(t.Context(), root, hostileDir, nil, walkErr)
+	relevant, classifyErr := w.classifyWatchEntry(root, hostileDir, nil, walkErr)
 	if classifyErr != nil || relevant {
 		t.Fatalf("classifyWatchEntry(path error) = (%v, %v), want (false, nil)", relevant, classifyErr)
 	}
@@ -137,7 +139,7 @@ func TestWatchRecords_sanitize_walk_supplied_names_in_log_attributes(t *testing.
 		t.Errorf("watch list = %q holds the SANITIZED name %q: the log-boundary gate leaked into the registration path", watched, wantSanitized)
 	}
 	if !w.watchSetHas(hostileDir) {
-		t.Error("the membership mirror does not hold the RAW directory name; the per-event fast path would read it as unwatched and re-walk its subtree on every event")
+		t.Error("the membership mirror does not hold the RAW directory name; the per-event fast path would read it as unwatched and re-assert the whole watch set on every event")
 	}
 }
 

@@ -57,7 +57,7 @@ func inspectCurrent(ctx context.Context, s *store, rel string, want convert.Anal
 // names and a restart cannot fix.
 //
 // Both halves are load-bearing and neither is observable elsewhere. Swallow the
-// root-level error and orphans() returns an empty candidate list, so sync mode
+// root-level error and listOutputs returns an empty candidate list, so sync mode
 // reports nothing to reap and looks exactly like a healthy tree; return it as an
 // error instead and a mount whose permissions an operator has to fix pins the
 // container unhealthy.
@@ -1210,10 +1210,11 @@ func TestStoreRemoveOrphan_reports_a_refused_unlink_and_keeps_the_candidate(t *t
 //
 // An ENOENT or a non-regular occupant seen by the READ is the same fact the lstat arms
 // above classify as contentVerifiedStale: the path holds no usable bundle, so failing to
-// write one is a conversion failure however the write failed (types.go's statusUnwritable
-// contract says exactly that). Every OTHER read failure stays "cannot tell" and keeps the
-// health-neutral outcome — the third row is here so the first two cannot pass merely
-// because the arm returns stale for everything.
+// write one is a conversion failure however the write failed (writeOutcome is the single
+// derivation site: it grants statusUnwritable solely via bundleNotProvenWrong, whose
+// allowlist is contentUnverified alone). Every OTHER read failure stays "cannot tell" and
+// keeps the health-neutral outcome — the third row is here so the first two cannot pass
+// merely because the arm returns stale for everything.
 //
 // The read seam is the only way in: the bundle has to vanish BETWEEN inspect's classifying
 // lstat and its read, which no temp directory the suite owns can stage. want is never
@@ -1294,6 +1295,90 @@ func TestStoreInspect_classifies_a_read_that_found_nothing_as_verified_stale(t *
 			if got, ok := logs.AttrValue(unreadableMsg, "remediation"); !ok || got != outputPermRemediation {
 				t.Errorf("inspect(read %v) logged %q with remediation %q (present %v), want %q: %q",
 					tc.readErr, unreadableMsg, got, ok, outputPermRemediation, logs.Messages())
+			}
+		})
+	}
+}
+
+
+// TestStoreInspect_degrades_a_prior_it_cannot_stat pins the Lstat-failure arm's two
+// halves: the classification (contentUnverified, the fact that keeps a later refused
+// rewrite health-neutral via writeOutcome's bundleNotProvenWrong allowlist) and the
+// operator record. A basename past NAME_MAX makes the pre-read Lstat fail with
+// ENAMETOOLONG — non-ENOENT, whatever uid the suite runs as — while the flat-name parent
+// pin succeeds, which is exactly the state this arm exists for.
+//
+// want is never dereferenced on this arm: the verdict is reached before any bundle is
+// read.
+//
+// Runs serially: it swaps slog.Default().
+func TestStoreInspect_degrades_a_prior_it_cannot_stat(t *testing.T) {
+	// Spelled out rather than imported from the production call site: an operator's log
+	// query keys on these words, so a silent rewording must fail here.
+	const wantMsg = "cannot stat prior pfx; regenerating"
+	s := newOutputStore(t, t.TempDir())
+	logs := captureLogs(t)
+
+	state, err := s.inspect(t.Context(), strings.Repeat("a", 300)+".pfx",
+		convert.Analysis{}, convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("inspect(un-stat-able prior) = error %v, want nil: degrade, never fail the pair", err)
+	}
+	if state != contentUnverified {
+		t.Errorf("inspect(un-stat-able prior) = %v, want contentUnverified: nothing compared these"+
+			" bytes, and contentVerifiedStale would make a later refused rewrite flip health over"+
+			" a state no restart clears", state)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, wantMsg); got != 1 {
+		t.Fatalf("inspect(un-stat-able prior) logged %q at WARN %d times, want exactly 1: %q",
+			wantMsg, got, logs.Messages())
+	}
+	if _, ok := logs.AttrValue(wantMsg, "error"); !ok {
+		t.Errorf("inspect(un-stat-able prior) logged %q with no error attribute: %q", wantMsg, logs.Messages())
+	}
+	if got, ok := logs.AttrValue(wantMsg, "remediation"); !ok || got != outputPermRemediation {
+		t.Errorf("inspect(un-stat-able prior) logged remediation %q, want %q", got, outputPermRemediation)
+	}
+}
+
+// TestClassifyPinRefusal_separates_a_refused_traversal_from_the_tree_shape pins the
+// pin-error classifier both refusing sites share: a traversal the filesystem refused for
+// a permission reason is an ownership condition, and the remediation an operator reads
+// must name ownership rather than a layout to repair.
+//
+// The two rows are the classifier's whole contract, and the second is the one the
+// /output layout cases in TestWriteRefusal_carries_a_classification_from_every_refusal_site
+// exercise through the real store; a permission traversal cannot be staged in a
+// directory the suite owns as root, which is why the classifier is driven directly here.
+func TestClassifyPinRefusal_separates_a_refused_traversal_from_the_tree_shape(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		err             error
+		want            writeRefusalCause
+		wantRemediation string
+	}{
+		"a component the process may not traverse": {
+			err: fmt.Errorf("pin output directory for %q: %w", "sub/out.pfx",
+				&fs.PathError{Op: "openat", Path: "sub", Err: fs.ErrPermission}),
+			want:            refusalOwnership,
+			wantRemediation: outputPermRemediation,
+		},
+		"a component the pinned descent refuses on its own terms": {
+			err: fmt.Errorf("pin output directory for %q: %w", "sub/out.pfx",
+				fmt.Errorf("%w: not a directory: %q", atomicfile.ErrUnsafePath, "sub")),
+			want:            refusalOutputLayout,
+			wantRemediation: outputPinRemediation,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := classifyPinRefusal(tc.err)
+			if got != tc.want {
+				t.Errorf("classifyPinRefusal(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+			if rem := got.remediation(); rem != tc.wantRemediation {
+				t.Errorf("classifyPinRefusal(%v).remediation() = %q, want %q: the record must name the"+
+					" condition the operator has to repair", tc.err, rem, tc.wantRemediation)
 			}
 		})
 	}

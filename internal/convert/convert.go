@@ -16,7 +16,6 @@ import (
 	"math/bits"
 	"slices"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/runesafe"
@@ -71,15 +70,20 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, skippedBlocks, error)
 	}
 
 	if len(scan.certs) == 0 {
-		// The label named is the private-key one when the file holds it, not simply the
-		// first skipped block: `openssl ecparam -genkey` writes EC PARAMETERS IMMEDIATELY
-		// BEFORE the EC PRIVATE KEY it describes, so a key file supplied as the certificate
-		// file named "EC PARAMETERS" — a companion of the key — while the label that
-		// actually diagnoses the mistake went unmentioned.
+		// The label named is the one that diagnoses the mistake, not simply the first
+		// skipped block: a private-key label when the file holds one, otherwise the first
+		// label naming neither a certificate nor a key companion
+		// (isExpectedCertFilePassenger owns that set). `openssl ecparam -genkey` writes
+		// EC PARAMETERS IMMEDIATELY BEFORE the EC PRIVATE KEY it describes, so a key file
+		// supplied as the certificate file named "EC PARAMETERS" — a companion of the
+		// key — while the label that actually diagnoses the mistake went unmentioned.
 		switch {
 		case scan.keyLabels.count > 0:
 			return nil, skippedBlocks{}, fmt.Errorf("no certificate PEM block found (skipped %d non-certificate PEM block(s), including a %q block: this looks like the private key file rather than the certificate file)",
 				scan.skipped.count, scan.keyLabels.firstTypeForLog())
+		case scan.unrelated.count > 0:
+			return nil, skippedBlocks{}, fmt.Errorf("no certificate PEM block found (%d of the %d skipped PEM block(s) name neither a certificate nor a key companion, first %q)",
+				scan.unrelated.count, scan.skipped.count, scan.unrelated.firstTypeForLog())
 		case scan.skipped.count > 0:
 			return nil, skippedBlocks{}, fmt.Errorf("no certificate PEM block found (skipped %d non-certificate PEM block(s), first %q)",
 				scan.skipped.count, scan.skipped.firstTypeForLog())
@@ -191,15 +195,21 @@ func isExpectedCertFilePassenger(blockType string) bool {
 	return blockType == pemTypeECParameters
 }
 
+// keyLabels are the PEM labels that name a private-key block, the encrypted
+// spellings included. It is the one declaration of that set: the predicate below,
+// the declaration markers parsePrivateKeys counts, and keyScan's per-block dispatch
+// all read it.
+var keyLabels = []string{
+	pemTypePrivateKey,
+	pemTypeRSAPrivateKey,
+	pemTypeECPrivateKey,
+	pemTypeEncryptedPrivateKey,
+}
+
 // isPrivateKeyLabel reports whether a PEM label names a private-key block, the
 // encrypted spellings included.
 func isPrivateKeyLabel(blockType string) bool {
-	switch blockType {
-	case pemTypePrivateKey, pemTypeRSAPrivateKey, pemTypeECPrivateKey,
-		pemTypeEncryptedPrivateKey:
-		return true
-	}
-	return false
+	return slices.Contains(keyLabels, blockType)
 }
 
 // pkcs8Fields returns a PKCS#8 PrivateKeyInfo's AlgorithmIdentifier element and the
@@ -214,11 +224,7 @@ func pkcs8Fields(der []byte) (algorithm asn1.RawValue, afterAlgorithm []byte, ok
 	if !ok {
 		return asn1.RawValue{}, nil, false
 	}
-	algorithm, afterAlgorithm, ok = asn1ElementWithTag(afterVersion, asn1.TagSequence)
-	if !ok {
-		return asn1.RawValue{}, nil, false
-	}
-	return algorithm, afterAlgorithm, true
+	return asn1ElementWithTag(afterVersion, asn1.TagSequence)
 }
 
 // pkcs8AlgorithmOID returns the retained (undecoded) algorithm OID element of
@@ -230,11 +236,7 @@ func pkcs8AlgorithmOID(der []byte) (oid asn1.RawValue, parameters []byte, ok boo
 	if !ok {
 		return asn1.RawValue{}, nil, false
 	}
-	oid, parameters, ok = asn1ElementWithTag(algorithm.Bytes, asn1.TagOID)
-	if !ok {
-		return asn1.RawValue{}, nil, false
-	}
-	return oid, parameters, true
+	return asn1ElementWithTag(algorithm.Bytes, asn1.TagOID)
 }
 
 // isExpectedKeyFilePassenger reports whether a non-key PEM label in the KEY file is
@@ -259,14 +261,19 @@ func pemBeginMarker(blockType string) []byte {
 // certBeginMarker is the PEM declaration line that opens a CERTIFICATE block.
 var certBeginMarker = pemBeginMarker(pemTypeCertificate)
 
-// keyBeginMarkers are the PEM declaration lines that open a private-key block
-// parsePrivateKeys knows about, including the encrypted forms it diagnoses
-// rather than decodes.
-var keyBeginMarkers = [][]byte{
-	pemBeginMarker(pemTypePrivateKey),
-	pemBeginMarker(pemTypeRSAPrivateKey),
-	pemBeginMarker(pemTypeECPrivateKey),
-	pemBeginMarker(pemTypeEncryptedPrivateKey),
+// keyBeginMarkers are the PEM declaration lines that open the private-key blocks
+// keyLabels names, the encrypted forms parsePrivateKeys diagnoses rather than
+// decodes included.
+var keyBeginMarkers = pemBeginMarkers(keyLabels)
+
+// pemBeginMarkers builds the PEM declaration lines that open blocks of the given
+// types.
+func pemBeginMarkers(blockTypes []string) [][]byte {
+	markers := make([][]byte, 0, len(blockTypes))
+	for _, blockType := range blockTypes {
+		markers = append(markers, pemBeginMarker(blockType))
+	}
+	return markers
 }
 
 // countDeclaredBlocks counts the declarations in markers the way encoding/pem
@@ -391,26 +398,7 @@ type keyScan struct {
 
 // visit classifies one PEM block, applying the parser's per-block rules.
 func (s *keyScan) visit(block *pem.Block) {
-	switch block.Type {
-	case pemTypePrivateKey, pemTypeRSAPrivateKey, pemTypeECPrivateKey:
-		s.decodedBlocks++
-		if isEncryptedPEMBlock(block) {
-			s.sawEncrypted = true
-			return
-		}
-		key, err := parsePrivateKeyBlock(block)
-		if err != nil {
-			s.parseFailures++
-			if s.firstParseErr == nil {
-				s.firstParseErr = err
-			}
-			return
-		}
-		s.keys = append(s.keys, key)
-	case pemTypeEncryptedPrivateKey:
-		s.decodedBlocks++
-		s.sawEncrypted = true
-	default:
+	if !isPrivateKeyLabel(block.Type) {
 		s.skipped.add(block.Type)
 		// Only a label naming something this app cannot read as a key AT ALL (an
 		// OpenSSH-format key, for instance) is reported; the expected companions of a
@@ -418,7 +406,24 @@ func (s *keyScan) visit(block *pem.Block) {
 		if !isExpectedKeyFilePassenger(block.Type) {
 			s.unrelated.add(block.Type)
 		}
+		return
 	}
+	s.decodedBlocks++
+	// A PKCS#8 ENCRYPTED PRIVATE KEY block is ciphertext by its label alone; the
+	// traditional spellings declare it in their headers instead.
+	if block.Type == pemTypeEncryptedPrivateKey || isEncryptedPEMBlock(block) {
+		s.sawEncrypted = true
+		return
+	}
+	key, err := parsePrivateKeyBlock(block)
+	if err != nil {
+		s.parseFailures++
+		if s.firstParseErr == nil {
+			s.firstParseErr = err
+		}
+		return
+	}
+	s.keys = append(s.keys, key)
 }
 
 // parsePrivateKeys extracts EVERY usable private key from PEM data, in file
@@ -502,8 +507,9 @@ func parseFailureForLog(err error) string {
 // another block did.
 type keyDefects struct {
 	// firstUnreadable is the first key-file PEM label that names neither a key
-	// format this app reads nor a certificate, already sanitized and bounded for a
-	// log by skippedBlocks.firstTypeForLog.
+	// format this app reads nor an expected companion of the key
+	// (isExpectedKeyFilePassenger owns that set), already sanitized and bounded
+	// for a log by skippedBlocks.firstTypeForLog.
 	firstUnreadable string
 	// firstParseFailure is WHY the first key-labelled block's DER was rejected,
 	// sanitized and bounded like every other file-derived text in this package.
@@ -599,10 +605,11 @@ func oversizedRSAKeyError(block *pem.Block) error {
 const maxRSAPrimeFactors = 64
 
 // maxRSAKeyElements bounds how many top-level elements of a PKCS#1 RSAPrivateKey
-// body the pre-scan walks, and it is a THIRD bound whose subject is the walk
-// itself rather than the key. RFC 8017 A.1.2 declares nine INTEGERs plus the
-// optional otherPrimeInfos SEQUENCE, so eight elements follow the modulus; 16 is
-// generous headroom for a structure some other tool wrote.
+// body the pre-scan walks AFTER the modulus it has already folded, and it is a THIRD
+// bound whose subject is the walk itself rather than the key. RFC 8017 A.1.2
+// declares nine INTEGERs plus the optional otherPrimeInfos SEQUENCE, so eight
+// elements follow the modulus; 16 is generous headroom for a structure some other
+// tool wrote.
 const maxRSAKeyElements = 16
 
 // rsaKeyPreScan is what the DER-only envelope scan learned about a private-key
@@ -674,8 +681,8 @@ func scanRSAPKCS1Body(modulus asn1.RawValue, rest []byte) rsaKeyPreScan {
 	scan := rsaKeyPreScan{factors: 2, isRSA: true}
 	scan.fold(modulus)
 	// The walk is bounded on BOTH axes: maxRSAKeyElements bounds how many elements
-	// it reads at all (the walk's own cost), maxRSAPrimeFactors below bounds what
-	// they may declare.
+	// after the folded modulus it reads at all (the walk's own cost),
+	// maxRSAPrimeFactors below bounds what they may declare.
 	for range maxRSAKeyElements {
 		if len(rest) == 0 {
 			break
@@ -949,69 +956,4 @@ func pkcs8PrivateKeyDER(der []byte) []byte {
 		return nil
 	}
 	return inner.Bytes
-}
-
-// passwordEncodingIssues reports the ways a PFX password cannot survive the
-// PKCS#12 BMPString (UCS-2) password encoding (RFC 7292 appendix B.1).
-type passwordEncodingIssues struct {
-	// InvalidUTF8 means the password is not valid UTF-8, so every invalid byte
-	// is encoded as U+FFFD and the PFX ends up protected by a different,
-	// lower-entropy password than the configured secret.
-	InvalidUTF8 bool
-	// NonBMP means the password holds a rune above U+FFFF, which UCS-2 cannot
-	// represent at all, so every Encode call fails.
-	NonBMP bool
-	// EmbeddedNUL means the password contains U+0000. PKCS#12 passwords are
-	// NUL-terminated BMPStrings (RFC 7292 appendix B.1), and go-pkcs12 encodes
-	// an interior NUL verbatim before appending its own terminator, so no
-	// consumer that builds the BMPString from a NUL-terminated string
-	// (OpenSSL, Windows CryptoAPI) can reproduce the key-derivation input.
-	EmbeddedNUL bool
-}
-
-// why says why the PKCS#12 UCS-2 password encoding cannot carry this password
-// intact, or "" when it can.
-func (i passwordEncodingIssues) why() string {
-	switch {
-	case i.InvalidUTF8:
-		return "is not valid UTF-8, so the PKCS#12 UCS-2 password encoding would " +
-			"replace every invalid byte with U+FFFD and protect the bundle with a " +
-			"different, lower-entropy password than the one supplied; supply a text " +
-			"secret (for example base64) instead of raw binary bytes"
-	case i.NonBMP:
-		return "contains a character outside the Basic Multilingual Plane, which the " +
-			"PKCS#12 UCS-2 password encoding cannot represent, so every encode would " +
-			"fail; choose a password made of BMP characters (ASCII is safest)"
-	case i.EmbeddedNUL:
-		return "contains a NUL byte, and PKCS#12 passwords are NUL-terminated, so no " +
-			"consumer that builds the terminated BMPString itself could open the bundle " +
-			"with the password supplied; strip NUL bytes from the secret (a UTF-16 or " +
-			"NUL-padded secret file is the usual cause)"
-	}
-	return ""
-}
-
-// inspectPasswordEncoding reports how a PFX password fares under the PKCS#12
-// UCS-2 password encoding.
-func inspectPasswordEncoding(password string) passwordEncodingIssues {
-	issues := passwordEncodingIssues{
-		InvalidUTF8: !utf8.ValidString(password),
-		EmbeddedNUL: strings.ContainsRune(password, 0),
-	}
-	for _, r := range password {
-		if r > 0xFFFF {
-			issues.NonBMP = true
-			break
-		}
-	}
-	return issues
-}
-
-// ValidatePasswordEncoding reports why the PKCS#12 UCS-2 password encoding
-// (RFC 7292 appendix B.1) cannot carry password intact, or nil when it can.
-func ValidatePasswordEncoding(password string) error {
-	if why := inspectPasswordEncoding(password).why(); why != "" {
-		return errors.New(why)
-	}
-	return nil
 }

@@ -23,7 +23,7 @@ var oidEmailAddress = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 1}
 // maxSubjectRenderAttrs' doc claims and that no committed fixture reaches: bounding
 // the attributes handed to pkix's quadratic renderer leaves the first
 // maxSubjectLogLen bytes byte-identical to the unbounded render. Without this,
-// boundedDN's truncation arm (convert.go:624-628) is never executed and any
+// boundedDN's truncation arm is never executed and any
 // off-by-one, or the reverse RDN order the arm depends on, ships green.
 func TestSubjectForLog_bound_does_not_change_what_an_operator_reads(t *testing.T) {
 	t.Parallel()

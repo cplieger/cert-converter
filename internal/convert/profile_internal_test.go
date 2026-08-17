@@ -641,7 +641,7 @@ func appendTestPlaintextSafe(t *testing.T, safes []contentInfo) []contentInfo {
 // The profile
 // identity is the (MAC, certificate, key) OID triple, and PBES2 names its cipher in
 // its PARAMETERS, so without this arm a bundle whose PBES2 wraps AES-128-CBC reads
-// as modern2023 and store.isCurrent keeps it as current indefinitely. The positive
+// as modern2023 and store.inspect keeps it as current indefinitely. The positive
 // direction is already covered by the own-profile round trips, which is what proves
 // the check does not over-reject this app's own output.
 func TestInspect_rejects_a_weaker_pbes2_cipher(t *testing.T) {

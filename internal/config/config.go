@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/cert-converter/internal/scancadence"
+	"github.com/cplieger/runesafe"
 	"github.com/cplieger/slogx"
 )
 
@@ -72,6 +74,9 @@ type Config struct {
 	EncoderName      convert.EncoderType
 	Lifecycle        outputpolicy.Lifecycle
 	PasswordStatus   PasswordStatus
+	// FallbackInterval is the operator's CONFIGURED rescan cadence, not the one
+	// that runs: 0 means they opted out of their own cadence, and the composition
+	// root resolves what actually applies through scancadence.Effective.
 	FallbackInterval time.Duration
 	// MaxScanEntries is how many /input paths one scan may enumerate; the
 	// composition root injects it into process.Options and reports it on the
@@ -90,14 +95,14 @@ func Load() (Config, error) {
 	lifecycle, lifecycleKnown := outputpolicy.ParseLifecycle(rawLifecycle)
 	if !lifecycleKnown {
 		slog.Warn("unknown OUTPUT_LIFECYCLE, using the default",
-			"value", rawLifecycle, "using", string(lifecycle), "expected", outputpolicy.LifecycleModes())
+			"value", rejectedValue(rawLifecycle), "using", string(lifecycle), "expected", outputpolicy.LifecycleModes())
 	}
 
 	rawEncoder := os.Getenv("PFX_ENCODER")
 	encName, known := convert.EncoderName(rawEncoder)
 	if !known {
 		slog.Warn("unknown PFX_ENCODER, using the default profile",
-			"value", rawEncoder, "using", string(encName), "expected", convert.EncoderNames())
+			"value", rejectedValue(rawEncoder), "using", string(encName), "expected", convert.EncoderNames())
 	}
 	warnLegacyEncoderProtection(encName)
 
@@ -121,9 +126,11 @@ func Load() (Config, error) {
 	}, nil
 }
 
-// FallbackInterval returns the effective FALLBACK_SCAN_HOURS as a
-// duration (0 = fallback rescan disabled), parsed with the same rules
-// Load applies.
+// FallbackInterval returns the CONFIGURED FALLBACK_SCAN_HOURS as a duration, parsed
+// with the same rules Load applies. It is the operator's own cadence, not the cadence
+// that runs: 0 means they opted out of that cadence, and every consumer resolves what
+// actually applies through scancadence.Effective, which floors the interval at
+// scancadence.Floor — so 0 selects the floor rather than disabling the rescan.
 func FallbackInterval() time.Duration {
 	interval, _, _ := fallbackIntervalFromEnv()
 	return interval
@@ -169,7 +176,7 @@ func WarnInvalidLogLevel() {
 		return
 	}
 	slog.Warn("invalid LOG_LEVEL, using default",
-		"value", raw, "default", strings.ToLower(lvl.String()))
+		"value", rejectedValue(raw), "default", strings.ToLower(lvl.String()))
 }
 
 // parseFallbackInterval parses a FALLBACK_SCAN_HOURS value into a re-scan
@@ -225,16 +232,30 @@ func parseMaxScanEntries(v string) (int, scanEntriesRepair) {
 	return scanbudget.Default, scanEntriesInvalid
 }
 
+// maxRejectedValueLogLen bounds the raw env value a rejection diagnostic quotes. An
+// operator's configured value is short, and nothing upstream of these parsers bounds
+// what the environment holds.
+const maxRejectedValueLogLen = 128
+
+// rejectedValue renders a rejected env value for a log attribute: this app's
+// single-line normalization, bounded at maxRejectedValueLogLen with the truncation
+// marker charged inside the limit. A value below the budget carrying no unsafe rune is
+// quoted byte for byte.
+func rejectedValue(raw string) string {
+	text, _ := runesafe.SanitizeSingleLineBudgeted(raw, maxRejectedValueLogLen, logtext.Marker)
+	return text
+}
+
 // warnFallbackRepaired emits the operator-facing diagnostic for a
 // FALLBACK_SCAN_HOURS value the parser could not use as configured.
 func warnFallbackRepaired(raw string, repair fallbackRepair) {
 	switch repair {
 	case fallbackClamped:
 		slog.Warn("FALLBACK_SCAN_HOURS too large, clamping",
-			"value", raw, "max_hours", maxFallbackHours)
+			"value", rejectedValue(raw), "max_hours", maxFallbackHours)
 	case fallbackInvalid:
 		slog.Warn("invalid FALLBACK_SCAN_HOURS, using default",
-			"value", raw, "default", defaultFallbackInterval.String(),
+			"value", rejectedValue(raw), "default", defaultFallbackInterval.String(),
 			"expected", "a whole number of hours, or 0/false to disable the periodic rescan")
 	case fallbackAccepted:
 		// The configured cadence was used as-is.
@@ -247,10 +268,10 @@ func warnMaxScanEntriesRepaired(raw string, repair scanEntriesRepair) {
 	switch repair {
 	case scanEntriesClamped:
 		slog.Warn("MAX_SCAN_ENTRIES too large, clamping",
-			"value", raw, "max_entries", scanbudget.Ceiling)
+			"value", rejectedValue(raw), "max_entries", scanbudget.Ceiling)
 	case scanEntriesInvalid:
 		slog.Warn("invalid MAX_SCAN_ENTRIES, using default",
-			"value", raw, "default", scanbudget.Default,
+			"value", rejectedValue(raw), "default", scanbudget.Default,
 			"expected", "a whole number of entries between 1 and "+strconv.Itoa(scanbudget.Ceiling)+" (there is no value that disables the budget)")
 	case scanEntriesAccepted:
 		// The configured budget was used as-is; nothing to report.
@@ -269,7 +290,7 @@ func warnFallbackDisabled(interval time.Duration) {
 		"wait for the watcher's slower full-tree reconciliation instead (this record's scan_floor names it, and the health-marker "+
 		"freshness deadline is derived from it, so a wedged watch loop is still reported unhealthy)",
 		append(scancadence.CoverageAttrs(interval),
-			"remediation", "unset FALLBACK_SCAN_HOURS (or set it above 0) if a missed renewal should be recovered on your own cadence rather than on the reconciliation floor")...)
+			"remediation", "unset FALLBACK_SCAN_HOURS (or set it to a whole number of hours no greater than 24) if a missed renewal should be recovered on your own cadence rather than on the reconciliation floor")...)
 }
 
 // warnLegacyEncoderProtection warns when the selected profile is one of the two

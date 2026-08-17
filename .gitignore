@@ -8,3 +8,6 @@
 # Go workspace
 go.work
 go.work.sum
+
+# app-review run archives (local history, never committed)
+.app-review-archive/

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"maps"
 	"os"
+	"time"
 
 	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/cert-converter/internal/convert"
@@ -38,8 +39,8 @@ type ScanResult struct {
 	// this scan's stat (noteMissingKey).
 	Vanished int
 	// Unwritable counts prior bundles this app could not replace, where it never proved the
-	// bundle on disk wrong and no restart can clear what refused the write
-	// (statusUnwritable, whose doc comment states the promise in full).
+	// bundle on disk wrong and no restart can clear what refused the write, so the bundle
+	// already there is left in place and health is unaffected.
 	Unwritable int
 }
 
@@ -116,8 +117,15 @@ type Options struct {
 // PFX format.
 type Scanner struct {
 	observations *observationLog
-	opts         Options
+	// lastSweep is when this process last swept /output for stale temps. It lives here
+	// rather than on store because store is rebuilt per Run.
+	lastSweep time.Time
+	opts      Options
 }
+
+// sweepClock is indirected for the same reason waitBeforeReap is: a test cannot
+// move an hour otherwise.
+var sweepClock = time.Now
 
 // New constructs a Scanner with the given process-lifetime scan configuration.
 func New(opts *Options) *Scanner {
@@ -145,7 +153,12 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	defer func() { _ = outHandle.Close() }()
 
 	out := &store{root: outHandle, maxEntries: s.opts.MaxScanEntries}
-	out.sweepStaleTemps(ctx)
+	if now := sweepClock(); s.lastSweep.IsZero() || now.Sub(s.lastSweep) >= staleTempAge {
+		// A temp is only a candidate once it is staleTempAge old, so sweeping more
+		// often than that re-walks the whole output tree to find nothing new.
+		s.lastSweep = now
+		out.sweepStaleTemps(ctx)
+	}
 
 	sw := &scanWalk{
 		src:          &source{root: inHandle},
@@ -735,9 +748,10 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		// A cancellation, and nothing else: inspect resolves every question about the bytes
 		// on disk into a content FACT itself — contentUnverified for the ones it could not
 		// compare (a bundle it could not stat or pin, one above the readable bound, a read
-		// failure that settles nothing, a refused preflight) and contentVerifiedStale for
-		// the ones it could (nothing there, a non-regular occupant, a profile mismatch, a
-		// bundle that will not decode with the configured password).
+		// failure that settles nothing, a preflight refusing the declared derivation work)
+		// and contentVerifiedStale for the ones it could (nothing there, a non-regular
+		// occupant, a profile mismatch, a file the preflight proved foreign, a bundle that
+		// will not decode with the configured password).
 		return failEntry(rel, "failed to inspect existing pfx", err)
 	}
 	if state.upToDate() {
@@ -794,9 +808,9 @@ func writeOutcome(state contentState, writeErr writeRefusal) conversionStatus {
 
 // unreplaceableBundleMsg is the standing WARN for a health-neutral write refusal: a prior
 // bundle this app could not VERIFY at all (above the readable bound, unreadable,
-// un-stat-able, or refused by the codec's preflight) whose replacing write a steady-state
-// /output condition refused.
-const unreplaceableBundleMsg = "prior pfx could not be replaced and the /output condition that refused the write is not one a restart clears; leaving the existing bundle in place, health is unaffected"
+// un-stat-able, or declaring derivation work the codec's preflight refused to spend)
+// whose replacing write a steady-state /output condition refused.
+const unreplaceableBundleMsg = "prior pfx could not be replaced and the /output condition that refused the write is not one a restart clears; whatever is at the output path is left as found, health is unaffected"
 
 // reportWriteFailure logs a failed PFX write in the register the DERIVED outcome calls
 // for.

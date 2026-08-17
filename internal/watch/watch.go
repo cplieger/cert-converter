@@ -41,12 +41,13 @@ func (e *LostError) Error() string { return "change detection lost: " + e.Cause 
 // The lost-change-detection conditions this package can reach.
 var (
 	errRootWatchRemoved = &LostError{
-		Cause: "the fsnotify root watch was removed while the periodic rescan is disabled",
-		// The Cause still has to name the root Remove/Rename: enabling the rescan
-		// restores a recovery mechanism but not a root that is genuinely gone, so the
-		// operator needs both facts to tell mount repair from fallback hardening.
-		Remediation: "unset FALLBACK_SCAN_HOURS (or set it above 0) so the periodic rescan re-attaches the root " +
-			"watch after it is removed; if /input itself is gone, restore the mount",
+		Cause: "the fsnotify root watch was removed and only the 24h reconciliation floor would re-attach it",
+		// Naming the root Remove/Rename is what lets the operator tell mount repair from
+		// fallback hardening: setting a cadence re-attaches the watch in place, but not a
+		// root that is genuinely gone.
+		Remediation: "unset FALLBACK_SCAN_HOURS (or set it above 0) so the root watch is re-attached in place " +
+			"within that cadence instead of waiting for the reconciliation floor; if /input itself is gone, " +
+			"restore the mount",
 	}
 	errEventsChannelClosed = &LostError{
 		Cause: "the fsnotify events channel closed",
@@ -114,7 +115,7 @@ func WithMaxEntries(n int) Option {
 
 // watchBudgetMsg is the operator-facing half of a watch-set walk that stopped at
 // the budget.
-const watchBudgetMsg = scanbudget.InputTreeTooLarge + "; stopping the watch-set walk, so directories past the budget are unwatched and renewals under them are covered only by the periodic rescan, health is unaffected"
+const watchBudgetMsg = scanbudget.InputTreeTooLarge + "; stopping the watch-set walk, so directories past the budget are unwatched and the periodic scan stops at the same ceiling rather than covering them, health is unaffected"
 
 // coverageAttrs closes a degraded-path record with the two cadences that answer
 // the one question such a record raises: will anything revisit what was just lost?
@@ -241,17 +242,28 @@ func (w *Watcher) attachWatchSet(ctx context.Context) (watcher *fsnotify.Watcher
 		return nil, true // shutdown arrived mid-attempt; not a watch failure
 	case stageConstruct:
 		w.logModeEntry(ctx, modePoll, modeStartup,
-			"fsnotify unavailable, using polling with periodic upgrade attempts", "error", err)
+			"fsnotify unavailable, "+w.pollEntryConsequence(), "error", logtext.Path(err.Error()))
 		return nil, false
 	case stageWatchDirs:
 		w.logModeEntry(ctx, modePoll, modeStartup,
-			"failed to watch directories, using polling with periodic upgrade attempts", "error", err)
+			"failed to watch directories, "+w.pollEntryConsequence(), "error", logtext.Path(err.Error()))
 		return nil, false
 	case stageAttached:
 	}
 
 	w.logModeEntry(ctx, modeWatch, modeStartup, "fsnotify active", "directory_count", len(fw.WatchList()))
 	return fw, false
+}
+
+// pollEntryConsequence names what poll mode will DO about the missing watch set,
+// which the operator's own cadence decides: with a cadence, pollUntilUpgrade polls
+// and re-attempts the fsnotify upgrade on every tick; with it disabled,
+// pollLoopWithUpgrade scans once and returns errNoWatchNoFallback for a restart.
+func (w *Watcher) pollEntryConsequence() string {
+	if w.fallback > 0 {
+		return "using polling with periodic upgrade attempts"
+	}
+	return "scanning once before exiting for a restart"
 }
 
 // attachStage names the outcome of one attach attempt, so each mode entry can
@@ -297,20 +309,29 @@ func (w *Watcher) tryAttachWatchSet(ctx context.Context) (*fsnotify.Watcher, att
 // it live, run the watch loop, and release the watcher on every exit path.
 func (w *Watcher) watchMode(ctx context.Context, watcher *fsnotify.Watcher) error {
 	defer watcher.Close()
-	logWatchSet(watcher)
+	logWatchSet(ctx, watcher)
 	return w.scanThenWatch(ctx, watcher)
 }
 
-// logWatchSet emits the watched directories at Debug.
-func logWatchSet(watcher *fsnotify.Watcher) {
-	// Every name here came from the /input walk, so each one is sanitized for the log
-	// (logtext.Path); the registered paths themselves are untouched.
-	dirs := watcher.WatchList()
-	logged := make([]string, len(dirs))
-	for i, dir := range dirs {
-		logged[i] = logtext.Path(dir)
+// maxLoggedWatchSetBytes caps the rendered watch-set inventory by BYTES, the bound its
+// /output sibling (maxLoggedOrphanBytes) carries: the element count is bounded only by the
+// walk's entry budget and the element bytes are a co-writer's choice on an untrusted tree.
+// The scale is not lost to the cut, because the record carries `count`.
+const maxLoggedWatchSetBytes = 4096
+
+// logWatchSet emits the watched directories at Debug, with the size of the set beside the
+// bounded inventory so every record carrying it — including the re-sync tail below, which
+// repeats on the fallback cadence and on every recovery path — states the scale.
+func logWatchSet(ctx context.Context, watcher *fsnotify.Watcher) {
+	if !slog.Default().Enabled(ctx, slog.LevelDebug) {
+		return
 	}
-	slog.Debug("fsnotify watch set", "directories", logged)
+	// Every name here came from the /input walk, so each one is sanitized for the log
+	// (logtext.CapJoin applies the gate per element as it accumulates); the registered
+	// paths themselves are untouched.
+	dirs := watcher.WatchList()
+	slog.Debug("fsnotify watch set",
+		"count", len(dirs), "directories", logtext.CapJoin(dirs, maxLoggedWatchSetBytes))
 }
 
 // scanThenWatch scans once with the watch set already live and then runs the
@@ -328,6 +349,10 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 
 // addWatchDirs recursively adds all directories under root to the watcher.
 func (w *Watcher) addWatchDirs(ctx context.Context, watcher *fsnotify.Watcher, root string) error {
+	// Cleaned before the closure captures it: handleWatchAddError's fatal-at-the-root
+	// comparison runs against THIS spelling, while the walk cleans only its own local
+	// copy.
+	root = filepath.Clean(root)
 	return w.walkWatchDirs(ctx, root, func(path string) error {
 		return w.attachWatch(watcher, root, path)
 	})
@@ -349,11 +374,13 @@ func (w *Watcher) walkWatchDirs(ctx context.Context, root string, register func(
 	// validateWatchRootEntry) are made against one spelling.
 	root = filepath.Clean(root)
 	// The root's OWN entry is Lstat'ed HERE, and this is the one thing the confined
-	// walk cannot express: os.OpenRoot resolves its root, so a symlinked or
-	// non-directory /input would arrive at the callback as a resolved directory and
-	// the two fatal refusals validateWatchRootEntry words would never fire -- the
-	// exec-away case that leaves Run logging "fsnotify active" over an empty watch
-	// set while the scan keeps the health marker green.
+	// walk cannot express: os.OpenRoot follows a symlinked root, so a
+	// symlink-to-directory /input would arrive at the callback as a resolved
+	// directory and be watched THROUGH the link -- the worded refusal
+	// validateWatchRootEntry states (bind-mount the target instead) would never
+	// fire. A plain non-directory root is refused by os.OpenRoot's own fstat check
+	// either way; for that shape the Lstat only upgrades the raw ENOTDIR to the
+	// worded refusal.
 	fi, statErr := os.Lstat(root)
 	if statErr != nil {
 		return statErr // a root that cannot be inspected is fatal, as it is today
@@ -391,7 +418,7 @@ func (w *Watcher) walkWatchDirs(ctx context.Context, root string, register func(
 		}
 		// d is nil on this walk's error arm (atomicfile reports a directory it could
 		// not open or finish for that directory's OWN path with d nil).
-		ok, err := w.classifyWatchEntry(ctx, root, path, d, walkErr)
+		ok, err := w.classifyWatchEntry(root, path, d, walkErr)
 		if err != nil || !ok {
 			return err
 		}
@@ -399,9 +426,11 @@ func (w *Watcher) walkWatchDirs(ctx context.Context, root string, register func(
 	})
 }
 
-// exceedsEntryBudget admits one walk callback: it honours cancellation first, then
-// charges the shared Counter for a NORMAL callback only, and reports whether the walk
-// has run out of budget.
+// exceedsEntryBudget admits one walk callback and is the ONE place either watch-set
+// walk answers cancellation: it reports a shutdown before it charges anything, so a
+// stop never spends budget nor fires the entry-ceiling WARN, then charges the shared
+// Counter for a NORMAL callback only and reports whether the walk has run out of
+// budget.
 func exceedsEntryBudget(ctx context.Context, budget *scanbudget.Counter, walkErr error) (bool, error) {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return false, ctxErr
@@ -420,16 +449,14 @@ func (w *Watcher) warnWatchBudget(root string, budget *scanbudget.Counter) {
 }
 
 // classifyWatchEntry applies the per-entry policy BOTH watch-set walks share — the
-// event-driven registering walk (addWatchDirs) and the rebuild's preflight
+// attach-time registering walk (addWatchDirs) and the rebuild's preflight
 // enumeration (desiredWatchDirs) — and reports whether the entry is a directory the
-// walk should register: cancellation first, then the walk-error policy (fatal at the
-// root, warn-and-skip below it), then the directory filter.
+// walk should register: the walk-error policy (fatal at the root, warn-and-skip below
+// it), then the directory filter. Cancellation is answered upstream, by the
+// admission gate every callback passes through first (exceedsEntryBudget).
 func (w *Watcher) classifyWatchEntry(
-	ctx context.Context, root, path string, d fs.DirEntry, walkErr error,
+	root, path string, d fs.DirEntry, walkErr error,
 ) (bool, error) {
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return false, ctxErr
-	}
 	if walkErr != nil {
 		if path == root {
 			return false, walkErr
@@ -443,12 +470,12 @@ func (w *Watcher) classifyWatchEntry(
 				"path", logtext.Path(path), "error", logtext.Path(walkErr.Error()))
 			return false, nil
 		}
-		slog.Warn("skipping unwatchable path; renewals under it require a full rescan",
+		slog.Debug("skipping unwatchable path; renewals under it require a full rescan",
 			w.coverageAttrs("path", logtext.Path(path), "error", logtext.Path(walkErr.Error()))...)
 		return false, nil
 	}
 	if !d.IsDir() {
-		return false, w.validateWatchRootEntry(path, d)
+		return false, nil
 	}
 	return true, nil
 }
@@ -487,11 +514,11 @@ func (w *Watcher) handleWatchAddError(root, path string, addErr error) error {
 	// watchAddRemediation names.
 	if errors.Is(addErr, fs.ErrNotExist) {
 		slog.Debug("directory disappeared before its watch was registered",
-			"path", logtext.Path(path), "error", addErr)
+			"path", logtext.Path(path), "error", logtext.Path(addErr.Error()))
 		return nil
 	}
 	slog.Warn("skipping unwatchable directory; renewals under it require a full rescan",
-		w.coverageAttrs("path", logtext.Path(path), "error", addErr,
+		w.coverageAttrs("path", logtext.Path(path), "error", logtext.Path(addErr.Error()),
 			"remediation", watchAddRemediation)...)
 	return nil
 }
@@ -567,16 +594,18 @@ func (w *Watcher) pruneWatches(watcher *fsnotify.Watcher, desired map[string]str
 
 // handleFsEvent keeps directory watches current and reports whether an event
 // warrants a rescan.
-func (w *Watcher) handleFsEvent(ctx context.Context, watcher *fsnotify.Watcher, event fsnotify.Event) bool {
-	slog.Debug("fs event", "op", event.Op.String(), "path", logtext.Path(event.Name))
+func (w *Watcher) handleFsEvent(ctx context.Context, watcher *fsnotify.Watcher, st *watchState, event fsnotify.Event) bool {
+	if slog.Default().Enabled(ctx, slog.LevelDebug) {
+		slog.Debug("fs event", "op", event.Op.String(), "path", logtext.Path(event.Name))
+	}
 	switch {
 	case event.Has(fsnotify.Create):
-		// A newly created directory joins the watch set (and triggers a rescan,
-		// because it may already hold a pair created before the watch attached); a
-		// newly created file is classified by name.
-		return w.handlePathEvent(ctx, watcher, event,
+		// A newly created directory schedules the whole-tree re-assert that registers
+		// it (and triggers a rescan, because it may already hold a pair created before
+		// the watch attached); a newly created file is classified by name.
+		return w.handlePathEvent(ctx, watcher, st, event,
 			"cannot classify a created path; rescanning because it may be a directory, but if it is one it stays unwatched until the next re-assert of the watch set",
-			"failed to watch new directory subtree; renewals under it are covered only by the periodic rescan")
+			"failed to re-assert the watch set after a directory was created; renewals under it are covered only by the periodic rescan")
 	case event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename):
 		// event.Name is already gone on Remove/Rename (inotify reports the old
 		// name), so there is nothing to add to the watch set: fsnotify drops the
@@ -589,19 +618,29 @@ func (w *Watcher) handleFsEvent(ctx context.Context, watcher *fsnotify.Watcher, 
 		// The recovery path for a permission repair on a cert, on a key, or on a
 		// directory the watch set had to skip -- the app's most likely operator
 		// error.
-		return w.handlePathEvent(ctx, watcher, event,
+		return w.handlePathEvent(ctx, watcher, st, event,
 			"cannot classify a path whose permissions changed; rescanning because it may be an unwatched directory",
-			"failed to watch a directory whose permissions changed; renewals under it are covered only by the periodic rescan")
+			"failed to re-assert the watch set after a directory's permissions changed; renewals under it are covered only by the periodic rescan")
 	}
 	return false
 }
 
 // handlePathEvent is the decision tree the Create and Chmod arms share, and the
-// single home of the unclassifiable-path rule: extend the watch set when the
-// event's path is a directory, classify a path that is merely GONE by name, and
-// conservatively rescan every other stat failure.
+// single home of the unclassifiable-path rule: schedule the whole-tree re-assert
+// when the event's path is a directory the watch set does not hold, classify a path
+// that is merely GONE by name, and conservatively rescan every other stat failure.
+//
+// The watch set has ONE construction path, the re-assert over w.root, and nothing
+// here walks a subtree rooted at the event's own name: os.OpenRoot checks that the
+// name is a directory only AFTER opening it, so a name a co-writer replaces with a
+// FIFO between the classifying Lstat and that open parks this goroutine in open(2)
+// for as long as the writer declines to open the FIFO for writing -- and this
+// goroutine owns the debounce, safety-net and repair timers, so change detection and
+// conversion would stop together. w.root is the mount point and cannot be swapped
+// from inside the tree.
 func (w *Watcher) handlePathEvent(
-	ctx context.Context, watcher *fsnotify.Watcher, event fsnotify.Event, classifyWarning, addWarning string,
+	ctx context.Context, watcher *fsnotify.Watcher, st *watchState, event fsnotify.Event,
+	classifyWarning, resyncWarning string,
 ) bool {
 	info, err := os.Lstat(event.Name)
 	if err != nil {
@@ -627,23 +666,12 @@ func (w *Watcher) handlePathEvent(
 	if w.watchSetHas(event.Name) {
 		return true // already watched: nothing to re-attach, the debounced rescan covers content
 	}
-	if addErr := w.addWatchDirs(ctx, watcher, event.Name); addErr != nil && ctx.Err() == nil {
-		// The same vanished-path rule classifyWatchEntry's walk-error arm and
-		// handleWatchAddError already apply, and the one this function's own Lstat arm
-		// above applies to a vanished event path: a directory created and removed again
-		// before its subtree could be walked leaves nothing to renew, so the WARN's
-		// consequence clause is false and neither action watchAddRemediation names
-		// applies to it — the directory is gone, so nothing is unreadable and no inotify
-		// slot was ever requested.
-		if errors.Is(addErr, fs.ErrNotExist) {
-			slog.Debug("directory disappeared before its subtree could be watched",
-				"path", logtext.Path(event.Name), "error", logtext.Path(addErr.Error()))
-			return true
-		}
-		slog.Warn(addWarning,
-			w.coverageAttrs("path", logtext.Path(event.Name), "error", logtext.Path(addErr.Error()),
-				"remediation", watchAddRemediation)...)
-	}
+	// A directory the mirror does not hold joins the watch set on the re-assert's own
+	// floored cadence (minPreScanResync), so the walk runs on a clock this process
+	// chose rather than on the event rate a writer to the tree chooses. The debounced
+	// scan this event also schedules converts whatever is already inside it either
+	// way, so no renewal waits for the registration.
+	st.resyncOrDefer(ctx, watcher, resyncWarning)
 	return true
 }
 
@@ -661,6 +689,14 @@ func (w *Watcher) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) erro
 // a test can hand the loop a watchState whose timers it has already positioned
 // (an almost-expired re-assert floor, for instance) and observe which arm acts on
 // them.
+//
+// CANCELLATION PRECEDENCE, stated once for every arm below: this select has none of
+// its own — Go picks a ready case at random — so a queued event, a queued watcher
+// error or a timer deadline reached in the same instant as cancellation can win over
+// ctx.Done. Each arm's handler therefore checks ctx before it does work, and the
+// reason is always the same: the loop exits on its next selection, so the work can no
+// longer accomplish anything, while the WARN it logs on the way sends an operator to
+// troubleshoot watch degradation in a container that is only stopping.
 func (w *Watcher) runWatchLoop(ctx context.Context, watcher *fsnotify.Watcher, st *watchState) error {
 	for {
 		select {
@@ -730,10 +766,6 @@ func (w *Watcher) handleEventRecv(
 	if !ok {
 		return errEventsChannelClosed
 	}
-	// Cancellation outranks an ordinary event, exactly as it does in every timer,
-	// attach, and channel-loss arm of this loop: watchLoop's select picks a ready
-	// case at random, so a queued Remove/Rename or Create can still land here after
-	// ctx.Done is ready.
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -746,7 +778,7 @@ func (w *Watcher) handleEventRecv(
 	if !w.handleRootWatchLoss(ctx, watcher, st, event) {
 		return errRootWatchRemoved
 	}
-	if w.handleFsEvent(ctx, watcher, event) {
+	if w.handleFsEvent(ctx, watcher, st, event) {
 		st.scheduleScan()
 	}
 	return nil
@@ -760,9 +792,6 @@ func (w *Watcher) handleErrorRecv(
 	if !ok {
 		return errErrorsChannelClosed
 	}
-	// Same cancellation precedence as handleEventRecv: a queued watcher error
-	// selected against a ready ctx.Done would otherwise log a degradation WARN and
-	// schedule a re-sync for a loop that is already exiting.
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -786,9 +815,7 @@ func (w *Watcher) handleSafetyNetTick(ctx context.Context, watcher *fsnotify.Wat
 	// (see minPreScanResync).
 	st.resync(ctx, watcher,
 		"failed to re-sync the watch set during the periodic safety-net scan; the scan below still runs, so a renewal is not missed")
-	// Same stop-request rule as runDebouncedScan, on the success path too: the
-	// select has no ctx precedence, so a safety-net deadline reached in the same
-	// instant as cancellation can win over ctx.Done.
+	// The re-sync above can itself be cut short by cancellation.
 	if ctx.Err() != nil {
 		return
 	}
@@ -809,7 +836,7 @@ func (w *Watcher) resyncWatchSet(ctx context.Context, watcher *fsnotify.Watcher,
 	desired, walkErr := w.desiredWatchDirs(ctx, w.root)
 	if walkErr != nil {
 		if ctx.Err() == nil {
-			slog.Warn(warning, w.coverageAttrs("root", logtext.Path(w.root), "error", walkErr)...)
+			slog.Warn(warning, w.coverageAttrs("root", logtext.Path(w.root), "error", logtext.Path(walkErr.Error()))...)
 		}
 		return
 	}
@@ -818,14 +845,14 @@ func (w *Watcher) resyncWatchSet(ctx context.Context, watcher *fsnotify.Watcher,
 	// 3.
 	if addErr := w.reassertWatches(ctx, watcher, desired); addErr != nil {
 		if ctx.Err() == nil {
-			slog.Warn(warning, w.coverageAttrs("root", logtext.Path(w.root), "error", addErr)...)
+			slog.Warn(warning, w.coverageAttrs("root", logtext.Path(w.root), "error", logtext.Path(addErr.Error()))...)
 		}
 		return
 	}
 	// Refresh the Debug dump on success: every re-sync exists to RECOVER watches that were
 	// missing, so the recovered set - not the set as it stood at attach - is what an operator
 	// diagnosing an incomplete watch set needs. The failure half is the WARN above.
-	logWatchSet(watcher)
+	logWatchSet(ctx, watcher)
 }
 
 // desiredWatchDirs is a rebuild's PREFLIGHT: it enumerates the directories the tree
@@ -957,10 +984,6 @@ func (st *watchState) resyncOrDefer(ctx context.Context, watcher *fsnotify.Watch
 // of borrowing the scan cadence an operator may have deliberately switched off.
 func (st *watchState) runDeferredRepair(ctx context.Context, watcher *fsnotify.Watcher) {
 	st.repairPending = false
-	// Same cancellation precedence as every other arm: watchLoop's select has none
-	// of its own, so a repair deadline reached in the same instant as a shutdown can
-	// win over ctx.Done, and the walk would only warn about degradation the loop is
-	// about to stop caring about.
 	if ctx.Err() != nil {
 		return
 	}
@@ -976,9 +999,6 @@ func (st *watchState) runDeferredRepair(ctx context.Context, watcher *fsnotify.W
 // makes the reconciliation floor cost an active deployment nothing.
 func (st *watchState) runDebouncedScan(ctx context.Context, watcher *fsnotify.Watcher) {
 	st.pending = false
-	// A stop request must prevent new work on every arm: watchLoop's select has
-	// no ctx precedence (Go picks a ready case at random), so a debounce deadline
-	// reached in the same instant as cancellation can win over ctx.Done.
 	if ctx.Err() != nil {
 		return
 	}
@@ -1009,12 +1029,12 @@ func (st *watchState) runSafetyNetScan(ctx context.Context) {
 func (st *watchState) handleWatcherError(err error) bool {
 	if errors.Is(err, fsnotify.ErrEventOverflow) {
 		slog.Warn("fsnotify event queue overflowed; events were dropped, forcing a rescan to recover any missed renewal",
-			st.w.coverageAttrs("root", logtext.Path(st.w.root), "error", err)...)
+			st.w.coverageAttrs("root", logtext.Path(st.w.root), "error", logtext.Path(err.Error()))...)
 		st.scheduleScan()
 		return true
 	}
 	slog.Warn("watcher error; the watch loop continues and a change missed because of it is covered only by the periodic fallback rescan",
-		st.w.coverageAttrs("root", logtext.Path(st.w.root), "error", err)...)
+		st.w.coverageAttrs("root", logtext.Path(st.w.root), "error", logtext.Path(err.Error()))...)
 	return false
 }
 
@@ -1086,12 +1106,12 @@ func (w *Watcher) pollTick(ctx context.Context) (upgraded *fsnotify.Watcher, sto
 		return nil, true // shutdown interrupted the upgrade attempt; not a poll-mode continuation
 	case stageConstruct:
 		w.logScanState(ctx, modePoll, triggerPoll,
-			"upgrade_stage", upgradeStageConstruct, "error", attachErr)
+			"upgrade_stage", upgradeStageConstruct, "error", logtext.Path(attachErr.Error()))
 		w.onChange(ctx)
 		return nil, false
 	case stageWatchDirs:
 		w.logScanState(ctx, modePoll, triggerPoll,
-			"upgrade_stage", upgradeStageWatchDirs, "error", attachErr)
+			"upgrade_stage", upgradeStageWatchDirs, "error", logtext.Path(attachErr.Error()))
 		w.onChange(ctx)
 		return nil, false
 	case stageAttached:

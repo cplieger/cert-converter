@@ -3,7 +3,9 @@ package watch
 import (
 	"context"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -354,5 +356,37 @@ func TestWatchModeScans_report_watch_mode_at_info(t *testing.T) {
 				t.Errorf("the %s logged %d ERROR records, want 0: this package is deliberately silent at ERROR, main owns the one announcement", tc.name, n)
 			}
 		})
+	}
+}
+
+
+// TestLogWatchSet_names_the_size_of_the_set pins the scale attribute on the watch-set
+// dump. The inventory beside it is a BOUNDED sample — logtext.CapJoin stops appending at
+// a byte budget on a tree whose names this app does not choose — so the attribute an
+// operator reads cannot be counted, while this is the record the re-sync tail repeats on
+// the fallback cadence and on every recovery path. The count is what keeps "how many
+// directories is this container watching" answerable there.
+// Not parallel: it swaps the process-global slog default.
+func TestLogWatchSet_names_the_size_of_the_set(t *testing.T) {
+	watcher := newTestWatcher(t) // availability probe: skips where inotify is unavailable
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "example.com"), 0o750); err != nil {
+		t.Fatalf("setup: Mkdir: %v", err)
+	}
+	w := New(root, func(context.Context) {})
+	logs := capture.Default(t)
+	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
+		t.Fatalf("addWatchDirs(%q) = %v, want nil", root, err)
+	}
+
+	logWatchSet(t.Context(), watcher)
+
+	rec := requireOneRecord(t, logs, "fsnotify watch set")
+	// The root and the one subdirectory under it: every directory below the root is
+	// registered, files are not.
+	assertAttrs(t, "the watch-set dump", rec, map[string]string{"count": "2"})
+	if got := rec.attrs["directories"]; !strings.Contains(got, "example.com") {
+		t.Errorf("the watch-set dump listed directories = %q, want the watched subdirectory named:"+
+			" the inventory is what an operator diagnosing an incomplete watch set reads", got)
 	}
 }

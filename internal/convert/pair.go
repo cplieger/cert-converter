@@ -42,19 +42,25 @@ func unencodablePasswordError(password string) error {
 // inputs would produce.
 type CurrencyReason string
 
-// The five outcomes of a currency check.
+// The six outcomes of a currency check.
 const (
 	// CurrencyMatch: the bundle on disk was written by the wanted encoder profile
 	// and carries exactly the leaf, key and chain these inputs produce.
 	CurrencyMatch CurrencyReason = "match"
-	// CurrencyPreflightFailed: the preflight refused the bytes, so nothing was
-	// decoded.
+	// CurrencyPreflightFailed: the preflight refused to LOOK — the file declares
+	// key-derivation work outside the range this app will spend — so nothing about
+	// the bytes on disk was established.
 	CurrencyPreflightFailed CurrencyReason = "preflight-failed"
-	// CurrencyProfileMismatch: the file is a well-formed bundle from one of this
-	// app's profiles, but not the wanted one — a deliberate PFX_ENCODER change.
+	// CurrencyForeign: the preflight PROVED these bytes are not a bundle any of this
+	// app's profiles writes, without decoding anything.
+	CurrencyForeign CurrencyReason = "foreign"
+	// CurrencyProfileMismatch: the preflight identified one of this app's profiles,
+	// but not the wanted one — a deliberate PFX_ENCODER change; the bundle has not
+	// been decoded.
 	CurrencyProfileMismatch CurrencyReason = "profile-mismatch"
 	// CurrencyDecodeFailed: the preflight passed but the bundle did not decode — a
-	// rotated password, a truncated file, a foreign file at that path.
+	// rotated password, or a well-formed bundle in this profile that another tool wrote.
+	// A truncated or foreign file is refused by the preflight instead, before any decode.
 	CurrencyDecodeFailed CurrencyReason = "decode-failed"
 	// CurrencyContentMismatch: the bundle decoded and its profile matches, but its
 	// leaf, key or chain is not what these inputs produce — the ordinary "the
@@ -67,7 +73,7 @@ const (
 type Currency struct {
 	// Reason is what the check concluded.
 	Reason CurrencyReason
-	// Err is the underlying failure for CurrencyPreflightFailed and
+	// Err is the underlying failure for CurrencyPreflightFailed, CurrencyForeign and
 	// CurrencyDecodeFailed, for a caller's diagnostic.
 	Err error
 	// Profile is the encoder profile the existing file was written with, set for
@@ -83,7 +89,7 @@ func (c Currency) Current() bool { return c.Reason == CurrencyMatch }
 func (a Analysis) CheckCurrency(pfx []byte, password string, wantEncoder EncoderType) Currency { //nolint:gocritic // hugeParam: same reason as Encode — the value Analyse hands back cannot be nil, so this body needs no nil arm.
 	priorProfile, err := inspect(pfx)
 	if err != nil {
-		return Currency{Reason: CurrencyPreflightFailed, Err: boundedTextError{err}}
+		return Currency{Reason: refusalReason(err), Err: boundedTextError{err}}
 	}
 	resolvedWant := resolvedProfile(wantEncoder).name
 	if priorProfile != resolvedWant {

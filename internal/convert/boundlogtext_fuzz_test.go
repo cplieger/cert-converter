@@ -15,7 +15,7 @@ import (
 // contract is a security-adjacent one: whatever the input, the result must be valid
 // UTF-8, must carry no rune runesafe's single-line policy calls unsafe (the class
 // one or both slog handlers emit raw), must be marked when it was cut, and must
-// never exceed the limit plus the marker.
+// never exceed the limit.
 //
 // The table tests cover a handful of hand-picked strings; the byte cut, the
 // mid-rune boundary and the exact limit boundary are input-dependent, which is
@@ -93,9 +93,9 @@ func FuzzBoundLogText_bounded_and_loggable(f *testing.F) {
 			t.Fatalf("boundLogText(%d bytes, %d sanitized) = %q, cut text must be marked",
 				len(s), len(sanitized), got)
 		}
-		if len(got) > maxSubjectLogLen+len(logtext.Marker) {
+		if len(got) > maxSubjectLogLen {
 			t.Fatalf("boundLogText(%d bytes) is %d bytes, want at most %d",
-				len(s), len(got), maxSubjectLogLen+len(logtext.Marker))
+				len(s), len(got), maxSubjectLogLen)
 		}
 		// The kept text is a prefix of the sanitized form: the cut removes a tail and
 		// invents nothing. This is what catches a cap that reorders, re-encodes or

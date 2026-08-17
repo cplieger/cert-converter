@@ -55,7 +55,10 @@ func Verify(dirs Paths) bool {
 	return true
 }
 
-// openMount inspects one required volume and returns its confined handle.
+// openMount inspects one required volume and returns its confined handle. The
+// os.Stat decides the type BEFORE the open, and must: os.OpenRoot opens the name
+// before it fstats it, so a bind-mounted FIFO here blocks in open(2) forever
+// instead of failing ENOTDIR (TestVerify_refuses_a_fifo_at_a_required_mount_path).
 func openMount(role, path string) (*os.Root, bool) {
 	// One sanitized rendering, reused by the attribute and by the remediation that
 	// names the same mount: both are log text, and a mount path holding CR/LF or a bidi
@@ -76,7 +79,7 @@ func openMount(role, path string) (*os.Root, bool) {
 			access = "read and write access"
 		}
 		slog.Error("required volume cannot be opened by this container's user; refusing to start",
-			"role", role, "path", logPath, "error", openErr,
+			"role", role, "path", logPath, "error", logtext.Path(openErr.Error()),
 			"remediation", "grant the UID in the container's `user:` "+access+" to "+logPath+
 				" (chgrp/chmod the host directory), or run the container as a UID that already has it")
 		return nil, false
@@ -94,19 +97,17 @@ func openMount(role, path string) (*os.Root, bool) {
 			"volume's source at a directory on the host"
 	}
 	slog.Error("required volume is missing or not a directory; refusing to start",
-		"role", role, "path", logPath, "error", statErr,
+		"role", role, "path", logPath, "error", logtext.Path(statErr.Error()),
 		"remediation", remediation)
 	return nil, false
 }
 
-// closeRoot releases one confined handle.
+// closeRoot releases one confined handle. Called only on openMount's ok branch, which
+// is the only one that yields a handle.
 func closeRoot(root *os.Root, role string) {
-	if root == nil {
-		return
-	}
 	if err := root.Close(); err != nil {
 		slog.Debug("failed to close a required volume's handle",
-			"role", role, "path", logtext.Path(root.Name()), "error", err)
+			"role", role, "path", logtext.Path(root.Name()), "error", logtext.Path(err.Error()))
 	}
 }
 
@@ -133,7 +134,7 @@ func warnOutputNotWritable(root *os.Root) {
 		// fixed arguments above is a programming error rather than an operator
 		// condition.
 		slog.Debug("the output write probe could not be attempted",
-			"role", roleOutput, "path", logtext.Path(root.Name()), "error", err)
+			"role", roleOutput, "path", logtext.Path(root.Name()), "error", logtext.Path(err.Error()))
 	case res.OK():
 		// Deliberately silent: /output being usable is the expected case, and main's
 		// startup line already states the path and the UID.
@@ -172,13 +173,13 @@ func warnOutputRefusedWrite(res atomicfile.ProbeResult) {
 		// Reachable when the write or the flush failed AND the follow-up unlink failed
 		// too: the volume is unusable and is still holding the probe file.
 		slog.Warn(outputNotWritableMsg,
-			"role", roleOutput, "path", logRoot, "stage", res.Stage.String(), "error", res.Err,
+			"role", roleOutput, "path", logRoot, "stage", res.Stage.String(), "error", logtext.Path(res.Err.Error()),
 			"uid", os.Getuid(), "gid", os.Getgid(), "remediation", remediation,
 			"leaked_probe", logtext.Path(probePath(res)), "cleanup", staleTempRemediation)
 		return
 	}
 	slog.Warn(outputNotWritableMsg,
-		"role", roleOutput, "path", logRoot, "stage", res.Stage.String(), "error", res.Err,
+		"role", roleOutput, "path", logRoot, "stage", res.Stage.String(), "error", logtext.Path(res.Err.Error()),
 		"uid", os.Getuid(), "gid", os.Getgid(), "remediation", remediation)
 }
 
@@ -190,15 +191,17 @@ func warnOutputProbeTeardown(res atomicfile.ProbeResult) {
 		msg = "failed to close the output write probe"
 	}
 	if res.Leaked {
-		slog.Warn(msg, "path", logtext.Path(probePath(res)), "stage", res.Stage.String(), "error", res.Err,
+		slog.Warn(msg, "path", logtext.Path(probePath(res)), "stage", res.Stage.String(),
+			"error", logtext.Path(res.Err.Error()),
 			"remediation", staleTempRemediation)
 		return
 	}
-	slog.Warn(msg, "path", logtext.Path(probePath(res)), "stage", res.Stage.String(), "error", res.Err)
+	slog.Warn(msg, "path", logtext.Path(probePath(res)), "stage", res.Stage.String(),
+		"error", logtext.Path(res.Err.Error()))
 }
 
-// probePath is the probe file's full path for a diagnostic, as the hand-rolled
-// probe's os.File.Name() reported it.
+// probePath is the probe file's full path for a diagnostic, joined from the directory the
+// probe reported probing and the name it left there.
 func probePath(res atomicfile.ProbeResult) string {
 	return filepath.Join(res.Dir, res.Name)
 }

@@ -793,3 +793,140 @@ func TestAnalyse_reports_a_terminus_whose_self_signature_does_not_verify(t *test
 			got.Observations(), convert.ObsChainEdgeUnprovenIssuer)
 	}
 }
+
+
+// The rootless cross-certification fixture the two tests below share. Serials are
+// distinct from the rest of this file so a chain assertion names one certificate.
+const (
+	crossCCN         = "Cross CA C"
+	crossPCN         = "Cross CA P"
+	crossCSerial     = 880
+	crossPSerial     = 881
+	crossLeafSerial  = 882
+	crossDecoySerial = 883
+)
+
+// mintCrossCertifiedPair mints a mutually-signed CA pair with no root above it, plus a
+// leaf under C: leaf -> C, C -> P and P -> C are all proven by signature, and nothing in
+// the bundle is self-signed. RFC 4158 mesh PKIs cross-certify in exactly this shape.
+func mintCrossCertifiedPair(t *testing.T, notBefore time.Time) (leafPEM, cPEM, pPEM, leafKeyPEM []byte) {
+	t.Helper()
+	keyC, keyP := testcerts.NewECDSAKey(t), testcerts.NewECDSAKey(t)
+	ca := func(serial int64, cn string, lifetime time.Duration) *x509.Certificate {
+		return &x509.Certificate{
+			SerialNumber:          big.NewInt(serial),
+			Subject:               pkix.Name{CommonName: cn},
+			NotBefore:             notBefore,
+			NotAfter:              notBefore.Add(lifetime),
+			IsCA:                  true,
+			BasicConstraintsValid: true,
+			KeyUsage:              x509.KeyUsageCertSign,
+		}
+	}
+	// A scaffold carrying P's subject and P's key, used only as the issuer template C is
+	// minted against, so C's issuer name is P's subject and P's key signed C. It never
+	// enters the bundle; the P that does is issued by C, which closes the cycle.
+	_, scaffoldP := testcerts.Mint(t, ca(crossPSerial, crossPCN, 96*time.Hour), &keyP.PublicKey, nil, keyP)
+	cPEM, cCert := testcerts.Mint(t, ca(crossCSerial, crossCCN, 72*time.Hour), &keyC.PublicKey, scaffoldP, keyP)
+	pPEM, _ = testcerts.Mint(t, ca(crossPSerial, crossPCN, 96*time.Hour), &keyP.PublicKey, cCert, keyC)
+
+	leafKey := testcerts.NewECDSAKey(t)
+	leafPEM, _ = testcerts.Mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(crossLeafSerial),
+		Subject:      pkix.Name{CommonName: "cross-certified-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, cCert, keyC)
+	return leafPEM, cPEM, pPEM, testcerts.KeyPEM(t, leafKey)
+}
+
+// TestAnalyse_names_the_cycle_when_the_walk_stops_at_a_cross_certified_issuer pins the
+// terminus sentence for a chain that ends on a cross-certification cycle. The walk
+// places C and P and then stops: P's only proven issuer is the C already on the path,
+// and a certificate may not appear twice. The sentence before this test claimed the
+// terminus has no issuer in the bundle, about a certificate whose proven issuer is one
+// line above it in the same emitted chain — and this observation is the operator's only
+// view of chain quality.
+func TestAnalyse_names_the_cycle_when_the_walk_stops_at_a_cross_certified_issuer(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	leafPEM, cPEM, pPEM, leafKeyPEM := mintCrossCertifiedPair(t, notBefore)
+
+	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, cPEM, pPEM), leafKeyPEM)
+	if err != nil {
+		t.Fatalf("Analyse(a rootless cross-certified pair) = error %v, want nil: every hop it emits is proven", err)
+	}
+	if len(got.Chain()) != 2 ||
+		got.Chain()[0].SerialNumber.Cmp(big.NewInt(crossCSerial)) != 0 ||
+		got.Chain()[1].SerialNumber.Cmp(big.NewInt(crossPSerial)) != 0 {
+		t.Fatalf("chain = %v, want C then P: the excluded issuer of the terminus must be IN the chain for this fixture to say anything",
+			chainSerials(got.Chain()))
+	}
+	if len(got.Extra()) != 0 {
+		t.Errorf("Extra = %v, want empty: every parsed certificate is on the path", chainSerials(got.Extra()))
+	}
+	if hasObservation(got.Observations(), convert.ObsChainEdgeUnprovenIssuer) {
+		t.Errorf("observations = %v, want no %q: both emitted hops are proven by signature",
+			got.Observations(), convert.ObsChainEdgeUnprovenIssuer)
+	}
+	detail, ok := observationDetail(got.Observations(), convert.ObsChainTrustAnchorAbsent)
+	if !ok {
+		t.Fatalf("observations = %v, want %q: no self-signed anchor is in the bundle",
+			got.Observations(), convert.ObsChainTrustAnchorAbsent)
+	}
+	for _, want := range []string{crossPCN, crossCCN, "cross-certify"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("anchor-absent detail = %q, want it to name %q: the walk stopped on a cycle, not on absent evidence", detail, want)
+		}
+	}
+	if strings.Contains(detail, "issuer is not in the bundle") {
+		t.Errorf("anchor-absent detail = %q, want no claim that the issuer is absent: %q is in the emitted chain", detail, crossCCN)
+	}
+}
+
+// TestAnalyse_reports_an_unproven_hop_taken_after_a_cycle pins the per-hop sentence in
+// the regime that falsified it: the same fixture plus a same-named decoy of C, which is
+// the only candidate issuer of P left once C is on the path, so the walk guesses that
+// hop. The hop's diagnostic said nothing in this bundle could be proven to have signed
+// P, while the C that provably signed it is in the emitted chain — the walk excluded it
+// for being placed already, not for want of a signature.
+func TestAnalyse_reports_an_unproven_hop_taken_after_a_cycle(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	leafPEM, cPEM, pPEM, leafKeyPEM := mintCrossCertifiedPair(t, notBefore)
+
+	decoyKey := testcerts.NewECDSAKey(t)
+	decoyPEM, _ := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(crossDecoySerial),
+		Subject:               pkix.Name{CommonName: crossCCN},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(120 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &decoyKey.PublicKey, nil, decoyKey)
+
+	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, cPEM, pPEM, decoyPEM), leafKeyPEM)
+	if err != nil {
+		t.Fatalf("Analyse(a rootless cross-certified pair + a same-named decoy) = error %v, want nil", err)
+	}
+	if len(got.Chain()) != 3 ||
+		got.Chain()[0].SerialNumber.Cmp(big.NewInt(crossCSerial)) != 0 ||
+		got.Chain()[2].SerialNumber.Cmp(big.NewInt(crossDecoySerial)) != 0 {
+		t.Fatalf("chain = %v, want C, P then the decoy: without the guessed hop above P there is no per-hop sentence to pin",
+			chainSerials(got.Chain()))
+	}
+	detail, ok := observationDetail(got.Observations(), convert.ObsChainEdgeUnprovenIssuer)
+	if !ok {
+		t.Fatalf("observations = %v, want %q: the hop above %q is a guess",
+			got.Observations(), convert.ObsChainEdgeUnprovenIssuer, crossPCN)
+	}
+	if !strings.Contains(detail, "no certificate the chain walk could still place proved it signed that certificate") {
+		t.Errorf("unproven-hop detail = %q, want it to attribute the guess to what the walk could still PLACE: %q proved that signature and is in the chain",
+			detail, crossCCN)
+	}
+	if strings.Contains(detail, "nothing in this bundle could be proven") {
+		t.Errorf("unproven-hop detail = %q, want no claim about the whole bundle: %q proved the signature over %q",
+			detail, crossCCN, crossPCN)
+	}
+}

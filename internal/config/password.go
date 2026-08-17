@@ -24,13 +24,13 @@ var ErrEmptyPassword = errors.New(
 // a non-BMP rune, or an embedded NUL and cannot be represented safely by PKCS#12.
 var ErrUnencodablePassword = errors.New("the configured PFX password cannot be encoded by PKCS#12")
 
-// PasswordStatus is a non-secret classification of how well PFX_PASSWORD
+// PasswordStatus is a non-secret classification of how well the resolved PFX password
 // protects the private key inside every generated PFX file.
 type PasswordStatus string
 
 // The PFX password classifications reported by classifyPassword.
 const (
-	// PasswordEmpty means no password at all was supplied.
+	// PasswordEmpty means the resolved password is empty.
 	PasswordEmpty PasswordStatus = "empty"
 	// PasswordWhitespaceOnly means the password consists only of whitespace,
 	// which is effectively no protection.
@@ -60,8 +60,9 @@ type resolvedPassword struct {
 // applies both startup refusals.
 func resolvePassword() (resolvedPassword, error) {
 	var blankSecretFile error
-	// Emitted before resolution: a blank pointer is not the file channel at all, so
-	// neither warnBothPasswordChannels nor envx's own error can report it.
+	// Emitted before resolution: an EMPTY pointer is not the file channel at all, so
+	// neither warnBothPasswordChannels nor envx's own error can report it. (A
+	// whitespace-only pointer IS the file channel — see warnBlankPasswordFilePointer.)
 	warnBlankPasswordFilePointer()
 	password, source, secretErr := envx.SecretWithSource("PFX_PASSWORD")
 	// Emitted here rather than from logPasswordDelivery because every startup
@@ -178,7 +179,7 @@ func warnUnrecognizedAllowEmptyPassword(raw string, recognized bool) {
 		return
 	}
 	slog.Warn("unrecognized PFX_ALLOW_EMPTY_PASSWORD, treating as false",
-		"value", strings.TrimSpace(raw), "expected", "true or false")
+		"value", rejectedValue(strings.TrimSpace(raw)), "expected", "true or false")
 }
 
 // checkPasswordEncodable rejects password shapes PKCS#12 cannot preserve.
@@ -201,8 +202,9 @@ func warnBothPasswordChannels(source envx.SecretSource) {
 }
 
 // warnBlankPasswordFilePointer warns when PFX_PASSWORD_FILE is present in the
-// environment but blank — set to the empty string, or to whitespace only — so it
-// names no secret file.
+// environment but blank — set to the empty string, or to whitespace only — so it names
+// no usable secret file: an empty pointer names none at all, and a whitespace-only one
+// is used verbatim as a filename.
 func warnBlankPasswordFilePointer() {
 	if !envx.IsBlankSecretFilePath("PFX_PASSWORD") {
 		return
@@ -214,7 +216,7 @@ func warnBlankPasswordFilePointer() {
 		// back.
 		outcome = "the whitespace value is treated as a filename instead of falling back to PFX_PASSWORD"
 	}
-	slog.Warn("PFX_PASSWORD_FILE is set but blank, so it names no secret file; "+outcome,
+	slog.Warn("PFX_PASSWORD_FILE is set but blank; "+outcome,
 		"remediation", "unset PFX_PASSWORD_FILE to configure the secret through PFX_PASSWORD, "+
 			"or point it at the mounted secret file (a compose ${PFX_PASSWORD_FILE:-} whose source variable is undefined is the usual cause)")
 }

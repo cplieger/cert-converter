@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/mounts"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/process"
@@ -771,6 +772,66 @@ func TestRun_startup_failure_diagnoses_the_configuration_and_exits_nonzero(t *te
 	}
 	if !strings.Contains(out, "invalid LOG_LEVEL") {
 		t.Errorf("run() started the watcher path without diagnosing the invalid LOG_LEVEL, the only signal the value was misspelled; stderr %q", out)
+	}
+}
+
+// TestRun_sanitizes_the_secret_path_a_configuration_refusal_carries is this package's
+// half of the log-boundary rule internal/logtext states: every `"error"` attribute is
+// emitted as logtext.Path(err.Error()), whatever supplied the value.
+//
+// It is the one member of that rule whose crossing is witnessable here. An unusable
+// PFX_PASSWORD_FILE is a hard startup refusal, envx reports it by wrapping the
+// os.PathError that names the operator's own path, and resolvePassword returns that error
+// unchanged — so the invalid-configuration ERROR renders a string an operator chose. A
+// name holding an LF forges a record boundary in a single-line sink and one holding
+// U+202E (RIGHT-TO-LEFT OVERRIDE) reorders everything after it, so a reader is shown a
+// different path than the record names.
+//
+// Serial (no t.Parallel): it swaps os.Args, os.Stderr and slog.Default(), and uses
+// t.Setenv.
+func TestRun_sanitizes_the_secret_path_a_configuration_refusal_carries(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	// Deliberately never created: the refusal for a secret file that cannot be read is
+	// what carries the path into the record.
+	secretPath := filepath.Join(t.TempDir(), "secret\n\u202egone.txt")
+	t.Setenv("PFX_PASSWORD_FILE", secretPath)
+	for _, key := range []string{"PFX_PASSWORD", "PFX_ALLOW_EMPTY_PASSWORD"} {
+		t.Setenv(key, "")
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantSanitized := logtext.Path(secretPath)
+	if wantSanitized == secretPath {
+		t.Fatalf("logtext.Path leaves the fixture path %q unchanged, so every assertion below would pass vacuously", secretPath)
+	}
+
+	prevArgs, prevLogger := os.Args, slog.Default()
+	os.Args = []string{"cert-watcher"}
+	t.Cleanup(func() {
+		os.Args = prevArgs
+		slog.SetDefault(prevLogger)
+	})
+
+	var code int
+	out := captureStderr(t, func() { code = run() })
+
+	if code != 1 {
+		t.Errorf("run() with an unreadable PFX_PASSWORD_FILE = %d, want 1; stderr %q", code, out)
+	}
+	if !strings.Contains(out, "invalid configuration") {
+		t.Fatalf("run() refused to start without the invalid-configuration record this test reads; stderr %q", out)
+	}
+	if !strings.Contains(out, wantSanitized) {
+		t.Errorf("the invalid-configuration record does not carry the secret path sanitized to %q; stderr %q", wantSanitized, out)
+	}
+	// Both the raw runes and the escapes production's TextHandler renders them as: the
+	// handler's escaping is what keeps this record unforgeable as deployed, so only the
+	// escaped form witnesses a value that arrived at the log un-gated.
+	for _, unsafe := range []string{"\u202e", `\u202e`, `\n`} {
+		if strings.Contains(out, unsafe) {
+			t.Errorf("stderr holds %q, so the operator-supplied path reached the log un-sanitized; stderr %q", unsafe, out)
+		}
 	}
 }
 

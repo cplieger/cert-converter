@@ -171,7 +171,7 @@ func TestScannerRun_reports_a_key_replaced_mid_scan_as_transient_then_names_a_ke
 	// The scan's one default-level record is the reap gate: a certificate replaced
 	// mid-walk leaves the enumeration incomplete, so orphan removal is off for this scan
 	// and says so. Nothing else may reach WARN.
-	const reapDisabled = reapDisabledPhrase + ": the scan did not fully enumerate the input tree, so no output can be proven orphaned"
+	const reapDisabled = reapDisabledPhrase + ": this scan cannot prove any /output bundle is orphaned"
 	if got := logs.CountLevel(slog.LevelWarn, ""); got != 1 {
 		t.Errorf("Run(key gone from a converted pair) logged %d WARN records (%q), want only the disabled-orphan-removal record at the default level", got, logs.Messages())
 	}

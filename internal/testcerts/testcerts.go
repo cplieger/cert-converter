@@ -12,21 +12,22 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"slices"
 	"testing"
 	"time"
 )
 
 // pemTypeCert, pemTypeKeyPKCS8 and pemTypeKeyPKCS1 are the PEM block types this
-// helper emits: X.509 certificates, PKCS#8 private keys (the ECDSA path) and the
-// legacy PKCS#1 RSA private key.
+// helper emits: X.509 certificates, PKCS#8 private keys and the legacy PKCS#1 RSA
+// private key.
 const (
 	pemTypeCert     = "CERTIFICATE"
 	pemTypeKeyPKCS8 = "PRIVATE KEY"
 	pemTypeKeyPKCS1 = "RSA PRIVATE KEY"
 )
 
-// signCert signs template with parent (parent == template yields a self-signed
-// certificate) and returns both the DER bytes and the PEM encoding.
+// signCert signs template with parent (parent == template makes the certificate
+// its own issuer) and returns both the DER bytes and the PEM encoding.
 func signCert(tb testing.TB, template, parent *x509.Certificate, pub crypto.PublicKey, priv crypto.Signer) (der, pemBytes []byte) {
 	tb.Helper()
 
@@ -37,9 +38,9 @@ func signCert(tb testing.TB, template, parent *x509.Certificate, pub crypto.Publ
 	return der, pem.EncodeToMemory(&pem.Block{Type: pemTypeCert, Bytes: der})
 }
 
-// Mint signs template with parent (a nil parent yields a self-signed certificate
-// whose template is its own issuer) and returns the PEM encoding and the parsed
-// certificate (whose Raw field carries the DER).
+// Mint signs template with parent (a nil parent uses the template as its own
+// issuer) and returns the PEM encoding and the parsed certificate (whose Raw
+// field carries the DER).
 func Mint(tb testing.TB, template *x509.Certificate, pub crypto.PublicKey,
 	parent *x509.Certificate, parentKey crypto.Signer,
 ) (pemBytes []byte, parsed *x509.Certificate) {
@@ -139,9 +140,7 @@ func GenerateCertChain(tb testing.TB) (leafPEM, keyPEM, caPEM, chainPEM []byte) 
 
 	keyPEM = KeyPEM(tb, leafKey)
 
-	// Concatenate leaf + CA into the chain.
-	chainPEM = append(chainPEM, leafPEM...)
-	chainPEM = append(chainPEM, caPEM...)
+	chainPEM = slices.Concat(leafPEM, caPEM)
 	return leafPEM, keyPEM, caPEM, chainPEM
 }
 

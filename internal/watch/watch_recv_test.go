@@ -385,9 +385,9 @@ func TestHandleSafetyNetTick_runs_the_scan_when_resync_fails(t *testing.T) {
 // (a renewal may have been missed and is covered only by the rescan this arm
 // schedules), and the benign record is the only statement that a watcher error
 // occurred at all -- so it owes the same triple every other degraded-path site
-// in this package owes: which root, whether anything will revisit it
-// (fallback_scan; "disabled" means nothing does for the life of the process),
-// and the error.
+// in this package owes: which root, on which cadence anything revisits it
+// (fallback_scan; "disabled" means the operator's own cadence is off, leaving the
+// 24h reconciliation floor scan_floor names), and the error.
 // Not parallel: it swaps the process-global slog default.
 func TestHandleWatcherError_warns_with_the_operator_diagnostics(t *testing.T) {
 	benign := errors.New("transient watcher failure")
@@ -461,13 +461,14 @@ func TestHandleWatcherError_warns_with_the_operator_diagnostics(t *testing.T) {
 // membership guard that a per-event WatchList scan used to get for free: the
 // guard now answers from this package's own mirror of the registration set, so a
 // directory whose watch the kernel discarded with the directory itself must be
-// forgotten, or its recreation looks "already watched" and is never walked
-// again -- every renewal underneath it then waits for the periodic re-sync, and
-// never arrives with the fallback disabled.
+// forgotten, or its recreation looks "already watched" and the watch set is never
+// re-asserted for it -- every renewal underneath it then waits for the periodic
+// re-sync, and for the 24h reconciliation floor with the operator's cadence
+// disabled, instead of being detected as it happens.
 //
 // The oracle is the CHILD of the recreated directory: it was never registered
 // before, so it can only appear in the watch list if the Create event actually
-// re-walked the subtree, and unlike the parent it cannot be confused with a
+// re-asserted the watch set, and unlike the parent it cannot be confused with a
 // registration the kernel is still dropping asynchronously.
 func TestHandleEventRecv_reattaches_a_recreated_directory(t *testing.T) {
 	t.Parallel()
@@ -500,7 +501,7 @@ func TestHandleEventRecv_reattaches_a_recreated_directory(t *testing.T) {
 	}
 
 	if watched := watcher.WatchList(); !slices.Contains(watched, child) {
-		t.Errorf("watch list after %q was removed and recreated = %v, want %q re-attached: the removed path must be forgotten so its recreation is walked again",
+		t.Errorf("watch list after %q was removed and recreated = %v, want %q re-attached: the removed path must be forgotten so its recreation re-asserts the watch set",
 			dir, watched, child)
 	}
 }
@@ -512,7 +513,7 @@ func TestHandleEventRecv_reattaches_a_recreated_directory(t *testing.T) {
 // Rename for it, and the Linux backend consumes IN_UNMOUNT and IN_IGNORED without
 // emitting an event at all (a child filesystem unmount, or any implicit kernel
 // removal). The mirror then claims a directory is watched that the kernel has
-// dropped, and handlePathEvent's guard skips the subtree re-walk on the strength of
+// dropped, and handlePathEvent's guard skips the whole-tree re-assert on the strength of
 // that claim, so the directory and everything under it stay unwatched. Re-asserting
 // the set once per debounced scan recovers them.
 //
@@ -539,11 +540,11 @@ func TestRunDebouncedScan_reasserts_registrations_the_kernel_dropped_silently(t 
 			t.Fatalf("setup: watcher.Remove(%q) = %v, want nil", path, err)
 		}
 	}
-	// The mirror still claims both, so the event path skips the re-walk.
+	// The mirror still claims both, so the event path skips the re-assert.
 	if !w.watchSetHas(dir) {
 		t.Fatalf("setup: the mirror forgot %q; this test needs the state where the mirror and the kernel disagree", dir)
 	}
-	if w.handleFsEvent(t.Context(), watcher, fsnotify.Event{Name: dir, Op: fsnotify.Chmod}) {
+	if w.handleFsEvent(t.Context(), watcher, st, fsnotify.Event{Name: dir, Op: fsnotify.Chmod}) {
 		st.scheduleScan()
 	}
 
@@ -663,13 +664,14 @@ func TestRecvHelpers_do_no_work_after_cancellation(t *testing.T) {
 // event.Has(fsnotify.Remove), so dropping the Rename half leaves the whole suite
 // green while a directory renamed away (an operator moving example.com aside,
 // or a rotation that renames rather than deletes) stays in the membership
-// mirror: when the name is used again the guard reports it already watched, its
-// subtree is never walked, and renewals under it are detected only by the
-// periodic rescan -- never, with the fallback disabled.
+// mirror: when the name is used again the guard reports it already watched, the
+// watch set is never re-asserted for it, and renewals under it are detected only by
+// the periodic rescan -- by the 24h reconciliation floor alone with the operator's
+// cadence disabled.
 //
 // The oracle is the CHILD of the recreated directory: it was never registered
 // before, so it can only appear in the watch list if the Create event actually
-// re-walked the subtree.
+// re-asserted the watch set.
 func TestHandleEventRecv_reattaches_a_directory_recreated_after_a_rename(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)
@@ -701,7 +703,7 @@ func TestHandleEventRecv_reattaches_a_directory_recreated_after_a_rename(t *test
 	}
 
 	if watched := watcher.WatchList(); !slices.Contains(watched, child) {
-		t.Errorf("watch list after %q was renamed away and recreated = %v, want %q re-attached: a renamed-away path must be forgotten so its recreation is walked again",
+		t.Errorf("watch list after %q was renamed away and recreated = %v, want %q re-attached: a renamed-away path must be forgotten so its recreation re-asserts the watch set",
 			dir, watched, child)
 	}
 }

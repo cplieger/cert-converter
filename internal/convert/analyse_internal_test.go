@@ -219,13 +219,13 @@ func TestNoMatchError_names_a_public_key_type_that_cannot_be_compared(t *testing
 		PublicKey: testUncomparablePublicKey{},
 	}}}
 
-	err := g.noMatchError(1, 0, keyDefects{}, skippedBlocks{})
+	err := g.noMatchError(1, keyDefects{}, skippedBlocks{})
 	if err == nil {
-		t.Fatal("noMatchError(1, 0, keyDefects{}, skippedBlocks{}) = nil, want the unverifiable-key-type diagnosis")
+		t.Fatal("noMatchError(1, keyDefects{}, skippedBlocks{}) = nil, want the unverifiable-key-type diagnosis")
 	}
 	want := `certificate "CN=legacy-dsa.example.com" has a public key of type convert.testUncomparablePublicKey that cannot be verified against the private key`
 	if got := err.Error(); got != want {
-		t.Errorf("noMatchError(1, 0, keyDefects{}, skippedBlocks{}) = %q, want %q", got, want)
+		t.Errorf("noMatchError(1, keyDefects{}, skippedBlocks{}) = %q, want %q", got, want)
 	}
 }
 
@@ -244,11 +244,11 @@ func TestNoMatchError_carries_the_input_defect_clauses_on_the_uncomparable_arm(t
 		PublicKey: testUncomparablePublicKey{},
 	}}}
 
-	err := g.noMatchError(1, 0,
+	err := g.noMatchError(1,
 		keyDefects{unparseable: 1, firstParseFailure: "truncated armour"},
 		skippedBlocks{firstType: "TRUSTED CERTIFICATE", count: 1})
 	if err == nil {
-		t.Fatal("noMatchError(1, 0, keyDefects{unparseable: 1}, skippedBlocks{count: 1}) = nil, want the unverifiable-key-type diagnosis")
+		t.Fatal("noMatchError(1, keyDefects{unparseable: 1}, skippedBlocks{count: 1}) = nil, want the unverifiable-key-type diagnosis")
 	}
 	want := `certificate "CN=legacy-dsa.example.com" has a public key of type convert.testUncomparablePublicKey that cannot be verified against the private key` +
 		`; the key file also holds block(s) that yielded no key: 1 could not be parsed (first: truncated armour)` +
@@ -277,9 +277,9 @@ func TestNoMatchError_keeps_the_mismatch_sentence_when_any_certificate_was_compa
 		{Subject: pkix.Name{CommonName: "legacy-dsa.example.com"}, PublicKey: testUncomparablePublicKey{}},
 	}}
 
-	got := g.noMatchError(1, 1, keyDefects{}, skippedBlocks{})
+	got := g.noMatchError(1, keyDefects{}, skippedBlocks{})
 	if got == nil {
-		t.Fatal("noMatchError(1, 1, keyDefects{}, skippedBlocks{}) = nil, want the mismatch diagnosis")
+		t.Fatal("noMatchError(1, keyDefects{}, skippedBlocks{}) = nil, want the mismatch diagnosis")
 	}
 	want := `none of the 1 distinct private key(s) in the key file matches any of the 2 certificate(s) in the chain; certificate "CN=legacy-dsa.example.com" has a public key of type convert.testUncomparablePublicKey that cannot be compared against the supplied private key, so it was compared against no key`
 	if got.Error() != want {
@@ -295,9 +295,9 @@ func TestNoMatchError_keeps_the_mismatch_sentence_when_any_certificate_was_compa
 		{Subject: pkix.Name{CommonName: "legacy-dsa.example.com"}, PublicKey: testUncomparablePublicKey{}},
 		{Subject: pkix.Name{CommonName: "comparable.example.com"}, PublicKey: &key.PublicKey},
 	}}
-	gotFirst := first.noMatchError(1, 0, keyDefects{}, skippedBlocks{})
+	gotFirst := first.noMatchError(1, keyDefects{}, skippedBlocks{})
 	if gotFirst == nil {
-		t.Fatal("noMatchError(1, 0, keyDefects{}, skippedBlocks{}) = nil, want the mismatch diagnosis")
+		t.Fatal("noMatchError(1, keyDefects{}, skippedBlocks{}) = nil, want the mismatch diagnosis")
 	}
 	if gotFirst.Error() != want {
 		t.Errorf("noMatchError with the uncomparable certificate first = %q, want the same trailing clause %q",
@@ -328,9 +328,9 @@ func TestNoMatchError_says_a_key_x509_could_not_read_was_compared_against_nothin
 		{Subject: pkix.Name{CommonName: "unknown-algorithm.example.com"}, PublicKey: nil},
 	}}
 
-	got := g.noMatchError(1, 1, keyDefects{}, skippedBlocks{})
+	got := g.noMatchError(1, keyDefects{}, skippedBlocks{})
 	if got == nil {
-		t.Fatal("noMatchError(1, 1, keyDefects{}, skippedBlocks{}) = nil, want the mismatch diagnosis")
+		t.Fatal("noMatchError(1, keyDefects{}, skippedBlocks{}) = nil, want the mismatch diagnosis")
 	}
 	want := `none of the 1 distinct private key(s) in the key file matches any of the 2 certificate(s) in the chain; certificate "CN=unknown-algorithm.example.com" holds a public key crypto/x509 could not read, so it was compared against no key`
 	if got.Error() != want {
@@ -549,16 +549,15 @@ func TestNameLink_separates_a_re_encoded_name_from_a_reordered_one(t *testing.T)
 	}
 }
 
-// TestNameLink_refuses_a_name_it_cannot_decode pins the guard nameLink documents:
-// "a name that cannot be decoded matches nothing". Two undecodable names both decode
-// to a nil RDNSequence and reflect.DeepEqual(nil, nil) is true, so a decode whose
-// failure is not honoured turns EVERY pair of unreadable names into a SEMANTIC name
-// match: two unrelated certificates become linked, the pair earns a candidate parent
-// edge plus a signature verification, and a stranger can be ranked into the emitted
-// chain. Nothing else in the suite reaches decodedName's failure return, and no
-// mutation of the condition survives it either (flipping the whole condition breaks
-// the decodable names every other test uses), so this direction is only reachable by
-// asserting it directly.
+// TestNameLink_refuses_a_name_it_cannot_decode pins the guard nameLink rests on: a
+// name that cannot be decoded matches nothing. Two unreadable names yield no readable
+// name to compare, so a decode failure that is not honoured turns EVERY pair of them
+// into a SEMANTIC name match: two unrelated certificates become linked, the pair earns
+// a candidate parent edge plus a signature verification, and a stranger can be ranked
+// into the emitted chain. Nothing else in the suite reaches the failing direction of
+// that decode, and no mutation of the condition survives it either (flipping the whole
+// condition breaks the decodable names every other test uses), so this direction is
+// only reachable by asserting it directly.
 func TestNameLink_refuses_a_name_it_cannot_decode(t *testing.T) {
 	t.Parallel()
 	decodable := testRawDN(t, asn1.TagPrintableString, testRDN{testOIDCN, "Decodable CA"})

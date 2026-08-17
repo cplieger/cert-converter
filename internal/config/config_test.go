@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/cert-converter/internal/scancadence"
+	"github.com/cplieger/runesafe"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -216,15 +218,29 @@ func TestLoad_warns_when_the_fallback_value_is_repaired(t *testing.T) {
 			name: "excessive value is clamped", raw: "87601", want: 87600 * time.Hour,
 			message: "FALLBACK_SCAN_HOURS too large, clamping", attrKey: "max_hours", attrWant: "87600",
 		},
-		// Both WARNs quote the value as CONFIGURED, untrimmed: a value that is
-		// unusable only because of a stray space or newline looks correct in the
-		// log once it is trimmed, and nothing else reports the difference.
+		// Both WARNs quote the value as CONFIGURED, untrimmed apart from the
+		// rejected-value gate's normalization (a tab or newline becomes a space, so the
+		// padding stays visible): a value that is unusable only because of a stray space
+		// looks correct in the log once it is trimmed, and nothing else reports the
+		// difference.
 		{
 			name: "padded invalid value is quoted untrimmed", raw: " abc\t", want: 6 * time.Hour,
 			message: "invalid FALLBACK_SCAN_HOURS, using default", attrKey: "default", attrWant: "6h0m0s",
 		},
 		{
 			name: "padded excessive value is quoted untrimmed", raw: " 87601 ", want: 87600 * time.Hour,
+			message: "FALLBACK_SCAN_HOURS too large, clamping", attrKey: "max_hours", attrWant: "87600",
+		},
+		// The rejected value is the one config-load output an untrusted environment
+		// sizes and spells, so these two shapes pin the gate rather than the value: a
+		// terminal-escape introducer must not survive into the record, and a value past
+		// the budget must arrive cut and marked instead of whole.
+		{
+			name: "a control-bearing value is normalized", raw: "12\x1b[31mh", want: 6 * time.Hour,
+			message: "invalid FALLBACK_SCAN_HOURS, using default", attrKey: "default", attrWant: "6h0m0s",
+		},
+		{
+			name: "an over-budget value is cut and marked", raw: strings.Repeat("9", 300), want: 87600 * time.Hour,
 			message: "FALLBACK_SCAN_HOURS too large, clamping", attrKey: "max_hours", attrWant: "87600",
 		},
 	} {
@@ -251,10 +267,7 @@ func TestLoad_warns_when_the_fallback_value_is_repaired(t *testing.T) {
 				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q logged %d records with the exact message %q, want 1 (logs %v)",
 					tc.raw, n, tc.message, logs.Messages())
 			}
-			if !logs.AttrContains(tc.message, "value", tc.raw) {
-				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN does not name the rejected value (logs %v)",
-					tc.raw, logs.Messages())
-			}
+			assertRejectedValue(t, logs, tc.message, tc.raw)
 			if !logs.HasAttr(tc.message, tc.attrKey, tc.attrWant) {
 				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN %q = %q, want %q=%q (logs %v)",
 					tc.raw, tc.attrKey, mustAttr(t, logs, tc.message, tc.attrKey), tc.attrKey, tc.attrWant, logs.Messages())
@@ -301,6 +314,29 @@ func mustAttr(t *testing.T, logs *capture.Recorder, msgSub, key string) string {
 		return "<absent>"
 	}
 	return got
+}
+
+// assertRejectedValue checks a rejection WARN's "value" attribute against the gate
+// every rejected env value passes through. The gate's own output IS the expectation
+// rather than a re-derivation of the sanitize-cap-mark rule, so a reintroduced local
+// composition — a second cap, a marker appended outside the budget — shows up here as a
+// difference; and a cut is asserted to be MARKED, because that mark is the operator's
+// only signal that the value they configured is longer than the record.
+func assertRejectedValue(t *testing.T, logs *capture.Recorder, msgSub, raw string) {
+	t.Helper()
+	got, ok := logs.AttrValue(msgSub, "value")
+	if !ok {
+		t.Fatalf("the WARN matching %q carries no value attribute (logs %v)", msgSub, logs.Messages())
+	}
+	want, cut := runesafe.SanitizeSingleLineBudgeted(raw, maxRejectedValueLogLen, logtext.Marker)
+	if got != want {
+		t.Errorf("the WARN for %q carried value=%q, want the gate's own %q: nothing may quote a rejected value raw",
+			raw, got, want)
+	}
+	if cut && !strings.HasSuffix(got, logtext.Marker) {
+		t.Errorf("the WARN for a %d-byte value carried %q, want the cut named with %q",
+			len(raw), got, logtext.Marker)
+	}
 }
 
 // messageIndex reports the position of the first captured record whose message
@@ -828,6 +864,8 @@ func TestLogLevel(t *testing.T) {
 		{"error", "error", slog.LevelError, true},
 		{"slog offset", "info+2", slog.LevelInfo + 2, true},
 		{"unparseable reports not ok and keeps info", "loud", slog.LevelInfo, false},
+		{"a control-bearing value is normalized in the WARN", "de\x1bbug", slog.LevelInfo, false},
+		{"an over-budget value is cut and marked", strings.Repeat("x", 300), slog.LevelInfo, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("LOG_LEVEL", tc.raw)
@@ -857,10 +895,7 @@ func TestLogLevel(t *testing.T) {
 			if tc.wantOK {
 				return
 			}
-			if got := mustAttr(t, logs, "invalid LOG_LEVEL", "value"); got != tc.raw {
-				t.Errorf("the WARN for LOG_LEVEL=%q carried value=%q, want the raw value verbatim so "+
-					"an operator can see what was misspelled", tc.raw, got)
-			}
+			assertRejectedValue(t, logs, "invalid LOG_LEVEL", tc.raw)
 			wantDefault := strings.ToLower(tc.want.String())
 			if got := mustAttr(t, logs, "invalid LOG_LEVEL", "default"); got != wantDefault {
 				t.Errorf("the WARN for LOG_LEVEL=%q carried default=%q, want %q (the level actually in effect)",
@@ -1015,8 +1050,9 @@ func TestLoad_unknown_encoder_warns_and_falls_back_to_modern2023(t *testing.T) {
 // LOG_LEVEL=warn -- the startup line naming the profile is INFO. The two iteration
 // attrs ARE the actionable content, and an edit that drops or changes either one fails
 // here. A go-pkcs12 bump that moved the library's own macIterations does NOT: both
-// numbers are literals in warnLegacyEncoderProtection and nothing in this package reads
-// them from the encoder, so that guard would have to live in internal/convert, over an
+// numbers come from internal/convert's profile table (ProtectionOf and
+// ModernMACIterations), which mirrors the library's counts by hand rather than reading
+// them off the encoder, so that guard would have to live in internal/convert, over an
 // encoded bundle's MacData.Iterations. legacyrc2's own remediation is the only place
 // the app names legacydes as the SHA-1-without-RC2 step down, and it is the branch
 // nothing else reaches.
@@ -2055,45 +2091,6 @@ func scanRepairName(r scanEntriesRepair) string {
 	return "scanEntriesRepair(" + strconv.Itoa(int(r)) + ")"
 }
 
-// TestMaxScanEntries_is_silent pins the env reader's contract for every parse class:
-// the budget is read through a plain reader, so it must never emit the startup
-// diagnostics Load owns. Without this, moving the WARNs into the parser would print a
-// startup-shaped record from every caller that only wanted the number. The budget has
-// no exported reader (it travels to the composition root on Config), so
-// maxScanEntriesFromEnv is the reader whose silence this holds.
-// slog.Default is process-global, so this test must not run in parallel with
-// anything that logs.
-func TestMaxScanEntries_is_silent(t *testing.T) {
-	for _, tc := range []struct {
-		raw  string
-		want int
-	}{
-		{"", scanbudget.Default},
-		{"   ", scanbudget.Default},
-		{"abc", scanbudget.Default},
-		{"0", scanbudget.Default},
-		{"-1", scanbudget.Default},
-		{"5000", 5000},
-		{"200000", scanbudget.Ceiling},
-		{"200001", scanbudget.Ceiling},
-		{"999999999999999999999999999999", scanbudget.Ceiling},
-	} {
-		t.Run(tc.raw, func(t *testing.T) {
-			t.Setenv("MAX_SCAN_ENTRIES", tc.raw)
-
-			logs := capture.Default(t)
-
-			if got, _, _ := maxScanEntriesFromEnv(); got != tc.want {
-				t.Errorf("maxScanEntriesFromEnv() with MAX_SCAN_ENTRIES=%q = %d, want %d", tc.raw, got, tc.want)
-			}
-			if logs.Len() != 0 {
-				t.Errorf("maxScanEntriesFromEnv() with MAX_SCAN_ENTRIES=%q logged %v, want no records: the reader is silent and Load owns the diagnostics",
-					tc.raw, logs.Messages())
-			}
-		})
-	}
-}
-
 // TestLoad_warns_when_the_scan_entry_budget_is_repaired pins the two repair
 // diagnostics at their only home. Both values are silently repaired, so the WARN
 // naming the rejected value is the operator's only way to tell an intended budget
@@ -2123,9 +2120,11 @@ func TestLoad_warns_when_the_scan_entry_budget_is_repaired(t *testing.T) {
 			name: "excessive value is clamped", raw: "200001",
 			message: "MAX_SCAN_ENTRIES too large, clamping", attrKey: "max_entries", attrWant: "200000",
 		},
-		// Both WARNs quote the value as CONFIGURED, untrimmed: a value that is
-		// unusable only because of a stray space or newline looks correct in the
-		// log once it is trimmed, and nothing else reports the difference.
+		// Both WARNs quote the value as CONFIGURED, untrimmed apart from the
+		// rejected-value gate's normalization (a tab or newline becomes a space, so the
+		// padding stays visible): a value that is unusable only because of a stray space
+		// looks correct in the log once it is trimmed, and nothing else reports the
+		// difference.
 		{
 			name: "padded invalid value is quoted untrimmed", raw: " abc\t",
 			message: "invalid MAX_SCAN_ENTRIES, using default", attrKey: "default", attrWant: "10000",
@@ -2154,10 +2153,7 @@ func TestLoad_warns_when_the_scan_entry_budget_is_repaired(t *testing.T) {
 				t.Errorf("Load() with MAX_SCAN_ENTRIES=%q logged %d records with the exact message %q, want 1 (logs %v)",
 					tc.raw, n, tc.message, logs.Messages())
 			}
-			if !logs.AttrContains(tc.message, "value", tc.raw) {
-				t.Errorf("Load() with MAX_SCAN_ENTRIES=%q WARN does not name the rejected value (logs %v)",
-					tc.raw, logs.Messages())
-			}
+			assertRejectedValue(t, logs, tc.message, tc.raw)
 			if !logs.HasAttr(tc.message, tc.attrKey, tc.attrWant) {
 				t.Errorf("Load() with MAX_SCAN_ENTRIES=%q WARN %q = %q, want %q=%q (logs %v)",
 					tc.raw, tc.attrKey, mustAttr(t, logs, tc.message, tc.attrKey), tc.attrKey, tc.attrWant, logs.Messages())

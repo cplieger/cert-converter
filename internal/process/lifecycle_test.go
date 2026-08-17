@@ -228,6 +228,50 @@ func TestStoreReconcile_warn_mode_reports_report_only_despite_a_conversion_failu
 	}
 }
 
+// TestStoreReconcile_warn_mode_does_not_claim_a_present_certificate_is_gone pins the
+// central claim of the lone-key record on the arm that actually runs: OUTPUT_LIFECYCLE=warn
+// is the DEFAULT, and `seen` is filled by the input walk before every remaining conversion
+// and before the whole /output walk — so a producer that replaces a certificate without an
+// atomic rename leaves it absent from `seen` and present on disk by the time the retention
+// loop reads it. That record asserts the certificate is GONE and tells the operator to add
+// a file that is already there, so the loop resolves the certificate itself and skips the
+// candidate. The aggregate WARN is unaffected: the bundle is still reported as an orphan,
+// it is just not reported as a half-deleted pair.
+// Serial: captureLogs swaps the process-global slog.Default.
+func TestStoreReconcile_warn_mode_does_not_claim_a_present_certificate_is_gone(t *testing.T) {
+	out, in := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(out, "back.pfx"), []byte("pfx"), 0o600); err != nil {
+		t.Fatalf("setup: WriteFile(back.pfx): %v", err)
+	}
+	// Both halves of the pair are under /input while the bundle is still a candidate.
+	cert := layout.CertForOutput("back.pfx")
+	for _, name := range []string{cert, layout.KeyFor(cert)} {
+		if err := os.WriteFile(filepath.Join(in, name), []byte("pem"), 0o600); err != nil {
+			t.Fatalf("setup: WriteFile(%s): %v", name, err)
+		}
+	}
+	logs := captureLogs(t)
+
+	deleted, err := newReaper(newOutputStore(t, out), newInputSource(t, in), outputpolicy.LifecycleWarn).
+		reconcile(t.Context(), map[string]struct{}{},
+			&reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+	if err != nil {
+		t.Fatalf("reconcile(warn, a certificate present on disk) = error %v, want nil", err)
+	}
+	if deleted != 0 {
+		t.Errorf("reconcile(warn) deleted = %d, want 0: this mode never removes anything", deleted)
+	}
+	if got := logs.CountExact(loneKeyRetainedMsg); got != 0 {
+		t.Errorf("reconcile logged %q %d times, want 0: that record asserts the certificate is gone,"+
+			" and %q is on disk: %q", loneKeyRetainedMsg, got, cert, logs.Messages())
+	}
+	const orphanMsg = "output bundles have no matching input"
+	if got := logs.CountExact(orphanMsg); got != 1 {
+		t.Errorf("reconcile logged %q %d times, want exactly 1: the candidate is still reported,"+
+			" just not as a half-deleted pair: %q", orphanMsg, got, logs.Messages())
+	}
+}
+
 // TestStoreReconcile_unsafe_output_walk_never_advises_deletion drives an unsafe OUTPUT
 // walk all the way through reconcile with a real candidate present. The other tests
 // stop at orphans reporting safe=false, so nothing pinned the two operator-facing
@@ -572,22 +616,25 @@ func TestReapConfirmed_shutdown_at_the_recheck_reports_the_candidates_it_has_not
 	}
 }
 
-// TestReapConfirmed_confirms_the_certificate_before_reading_a_key pins the ORDER of the
-// two questions the confirming pass asks about each candidate.
+// TestReapConfirmed_reports_a_restored_pair_as_restored pins which of the two questions
+// the confirming pass asks about each candidate DECIDES the record it emits.
 //
 // The scan's input enumeration is already stale by the time the reap runs, so a
-// certificate can have RETURNED between the enumeration and the re-check. A key-first
-// pass reads that restored pair as a half-deleted one: it emits loneKeyRetainedMsg —
-// which asserts the certificate is GONE, and it is not — and drops the candidate, so the
-// accurate "certificate came back during the confirmation delay" INFO can never fire for
-// it. The operator is told the wrong thing about a healthy pair, and the one record that
-// says the delay did its job goes missing.
+// certificate can have RETURNED between the enumeration and the re-check. The loop reads
+// the sibling key first, so the certificate's own Lstat is the freshest observation before
+// the unlink — but the key's answer must not be allowed to speak for the certificate's: a
+// pass that reported the key retention on the strength of the enumeration reads a restored
+// pair as a half-deleted one, emitting loneKeyRetainedMsg — which asserts the certificate
+// is GONE, and it is not — and dropping the candidate, so the accurate "certificate came
+// back during the confirmation delay" INFO can never fire for it. The operator is told the
+// wrong thing about a healthy pair, and the one record that says the delay did its job goes
+// missing.
 //
-// The fixture is that ordering exactly: both halves of the pair are under /input while
-// the bundle is still in the batch, which is what a certificate restored after the
-// enumeration looks like from here.
+// The fixture is that state exactly: both halves of the pair are under /input while the
+// bundle is still in the batch, which is what a certificate restored after the enumeration
+// looks like from here.
 // Serial: it swaps the package's reap-wait var and slog's default.
-func TestReapConfirmed_confirms_the_certificate_before_reading_a_key(t *testing.T) {
+func TestReapConfirmed_reports_a_restored_pair_as_restored(t *testing.T) {
 	logs := captureLogs(t)
 	out, in := t.TempDir(), t.TempDir()
 	if err := os.WriteFile(filepath.Join(out, "back.pfx"), []byte("pfx"), 0o600); err != nil {
@@ -992,8 +1039,8 @@ func TestStoreInspect_treats_an_undecodable_prior_as_stale(t *testing.T) {
 			// Which arm answered matters as much as the answer: the size arm reaches
 			// this same verdict without reading the bundle, so asserting the outcome
 			// alone lets the preflight go unexercised.
-			if !logs.Contains("prior pfx failed preflight; regenerating") {
-				t.Errorf("inspect(%s) logged %q, want the preflight notice: the stale verdict must come from the preflight, not from an earlier arm", tc.name, logs.Messages())
+			if !logs.Contains("prior pfx was not written by this app; regenerating") {
+				t.Errorf("inspect(%s) logged %q, want the foreign-file notice: the stale verdict must come from the preflight proving these bytes are not ours, not from an earlier arm", tc.name, logs.Messages())
 			}
 		})
 	}
@@ -1227,12 +1274,13 @@ func concatPEM(blobs ...[]byte) []byte {
 //
 // The first is which outcomes count as VERIFIED stale and which as unverified, because
 // only the first grants health the right to flip on a refused rewrite (writeOutcome).
-// A profile mismatch, a content mismatch and a failed DECODE are verified stale: the
-// codec looked, and what is on disk will not open with the configured password or is
-// not what these inputs produce, so the operator is being served the wrong bundle. A
-// failed PREFLIGHT is not: the preflight refuses to LOOK, so nothing about the bytes was
-// compared, and reporting that as proof the bundle is wrong is exactly the conflation
-// this routing was restructured to remove.
+// A profile mismatch, a content mismatch, a failed DECODE and a FOREIGN file are
+// verified stale: the codec either looked and found what is on disk will not open with
+// the configured password or is not what these inputs produce, or it proved the bytes
+// are not a bundle any of this app's profiles writes — either way the operator is being
+// served the wrong bundle. A budget PREFLIGHT refusal is not: the preflight refuses to
+// LOOK, so nothing about the bytes was established, and reporting that as proof the
+// bundle is wrong is exactly the conflation this routing was restructured to remove.
 //
 // The second is the shutdown arm, which has no other test: a decode INTERRUPTED by
 // shutdown is neither current nor stale, so it must propagate the cancellation. If it
@@ -1270,6 +1318,11 @@ func TestContentFromCurrency_maps_every_outcome(t *testing.T) {
 			wantMsg: "prior pfx failed preflight; regenerating", wantLevel: slog.LevelDebug,
 		},
 		{
+			res:  convert.Currency{Reason: convert.CurrencyForeign, Err: errors.New("not one of ours")},
+			name: "a file the preflight proved foreign is verified stale at debug", wantContent: contentVerifiedStale,
+			wantMsg: "prior pfx was not written by this app; regenerating", wantLevel: slog.LevelDebug,
+		},
+		{
 			res:  convert.Currency{Reason: convert.CurrencyProfileMismatch, Profile: convert.EncNameLegacyDES},
 			name: "an encoder change is verified stale at info", wantContent: contentVerifiedStale,
 			wantMsg: "prior pfx uses a different encoder profile; regenerating", wantLevel: slog.LevelInfo,
@@ -1278,6 +1331,11 @@ func TestContentFromCurrency_maps_every_outcome(t *testing.T) {
 			res:  convert.Currency{Reason: convert.CurrencyDecodeFailed, Err: errors.New("mac mismatch")},
 			name: "a failed decode is verified stale at debug", wantContent: contentVerifiedStale,
 			wantMsg: "prior pfx did not decode; regenerating", wantLevel: slog.LevelDebug,
+		},
+		{
+			res:  convert.Currency{Reason: "not-a-reason"},
+			name: "a verdict this app does not map is UNVERIFIED at warn", wantContent: contentUnverified,
+			wantMsg: "prior pfx currency verdict is not one this app maps; regenerating", wantLevel: slog.LevelWarn,
 		},
 		{
 			res:  convert.Currency{Reason: convert.CurrencyDecodeFailed, Err: errors.New("mac mismatch")},
@@ -2132,7 +2190,7 @@ func TestScannerRun_fails_closed_when_the_observation_log_evicts_wholeness_evide
 	if _, statErr := os.Stat(orphan); statErr != nil {
 		t.Errorf("an orphan was deleted on a scan that lost the evidence separating a replaced key from a missing one: %v", statErr)
 	}
-	const disabledWarn = reapDisabledPhrase + ": the scan did not fully enumerate the input tree, so no output can be proven orphaned"
+	const disabledWarn = reapDisabledPhrase + ": this scan cannot prove any /output bundle is orphaned"
 	if got := logs.CountLevel(slog.LevelWarn, disabledWarn); got != 1 {
 		t.Errorf("Run(log at its ceiling) logged %q at WARN %d times, want exactly 1: %q",
 			disabledWarn, got, logs.Messages())
@@ -2649,6 +2707,48 @@ func TestReapConfirmed_audits_deletions_made_before_a_shutdown(t *testing.T) {
 	if got, ok := logs.AttrValueExact(msg, "removed"); !ok || got != "1" {
 		t.Errorf("the shutdown record logged removed=%q, want \"1\": a deletion that happened must be"+
 			" counted, not only audited", got)
+	}
+}
+
+// TestReapConfirmed_reports_refusals_made_before_a_shutdown is the refusal half of the
+// defer's contract, and the half its audit sibling above cannot reach: that fixture's
+// refusedPaths is empty throughout, so relocating logReapRefusals alone to the loop's
+// normal exit leaves the whole suite green while a scan interrupted after a refused unlink
+// emits no countable signal that sync mode stopped reconciling -- this file's own reason
+// for the record.
+//
+// live: 2 is reapConfirmed's own Err() sequence with the wait stubbed: stuck.pfx's
+// top-of-loop check, stuck.pfx's pre-unlink check, then two.pfx's top-of-loop check, which
+// is the one that fires. two.pfx need not exist on disk: the loop abandons it before its
+// unlink.
+// Serial: it swaps the package's reap-wait var and slog's default.
+func TestReapConfirmed_reports_refusals_made_before_a_shutdown(t *testing.T) {
+	logs := captureLogs(t)
+	out := t.TempDir()
+	if err := os.Mkdir(filepath.Join(out, "stuck.pfx"), 0o750); err != nil {
+		t.Fatalf("setup: Mkdir(stuck.pfx): %v", err)
+	}
+	stubReapWait(t, func(context.Context) error { return nil })
+	calls := 0
+	ctx := cancelAfterNChecks{Context: t.Context(), calls: &calls, live: 2}
+
+	deleted, err := newReaper(newOutputStore(t, out), newInputSource(t, t.TempDir()),
+		outputpolicy.LifecycleSync).reapConfirmed(ctx, []string{"stuck.pfx", "two.pfx"})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("reapConfirmed(refusal then shutdown) error = %v, want context.Canceled", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("reapConfirmed(refusal then shutdown) deleted = %d, want 0", deleted)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, removalRefusedMsg); got != 1 {
+		t.Errorf("an interrupted scan that was refused one unlink logged %q at WARN %d times,"+
+			" want exactly 1: the refusal audit must cover every exit from this loop, the"+
+			" shutdown return included: %q", removalRefusedMsg, got, logs.Messages())
+	}
+	if !logs.HasAttr(removalRefusedMsg, "count", "1") {
+		got, _ := logs.AttrValue(removalRefusedMsg, "count")
+		t.Errorf("the refusal record count = %q, want %q: the count is what an operator alerts on", got, "1")
 	}
 }
 

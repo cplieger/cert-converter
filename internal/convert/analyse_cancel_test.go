@@ -17,10 +17,10 @@ import (
 )
 
 // TestAnalyse_abandons_the_analysis_when_the_context_is_cancelled pins the
-// cancellation contract Analyse's own doc states: a cancellation abandons the
-// analysis and returns an error wrapping ctx.Err(), so errors.Is(err,
-// context.Canceled) holds and process.IsShutdown classifies it as a shutdown
-// rather than a conversion failure that would flip the health marker.
+// cancellation contract: a cancellation abandons the analysis and returns an error
+// wrapping ctx.Err(), so errors.Is(err, context.Canceled) holds and
+// process.IsShutdown classifies it as a shutdown rather than a conversion failure
+// that would flip the health marker.
 //
 // The live-context call is the fixture's own falsifiability check, not decoration:
 // without it a bundle that simply failed to analyse would satisfy every assertion

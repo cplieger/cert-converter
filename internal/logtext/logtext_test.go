@@ -20,10 +20,11 @@ func TestMarker(t *testing.T) {
 }
 
 // TestCap_does_not_sanitize pins the split this package is organised around: Cap
-// bounds and marks, Path rewrites, and the ONE caller that needs both composes them in
-// that order (sanitize, then cap). Folding sanitizing into Cap would move the marker's
-// budget, which is the placement internal/process's elision suffix was sized against —
-// so the separation has to be asserted, not left to a comment.
+// bounds and marks, Path rewrites, and CapJoin — the one helper that needs both —
+// composes them in that order (sanitize, then cap) as it accumulates. Folding
+// sanitizing into Cap would move the marker's budget, which is the placement CapJoin's
+// per-element accounting is written against — so the separation has to be asserted, not
+// left to a comment.
 //
 // It drives the CUT path, not only the early return: a control rune sits inside the
 // retained prefix and the whole result is compared byte for byte. An input at the limit
@@ -67,8 +68,8 @@ func TestCap_backs_the_cut_off_to_a_rune_start(t *testing.T) {
 	if len(kept) > limit {
 		t.Errorf("Cap kept %d bytes, want at most the %d-byte limit", len(kept), limit)
 	}
-	if !strings.HasPrefix(s, kept) {
-		t.Errorf("Cap kept %q, which is not a prefix of the input: the cut must only remove a tail", kept)
+	if want := strings.Repeat("日", 2); kept != want {
+		t.Errorf("Cap kept %q, want the maximal complete-rune prefix %q", kept, want)
 	}
 }
 
@@ -128,16 +129,14 @@ func TestPath_rewrites_the_unsafe_classes_and_leaves_ordinary_names_alone(t *tes
 
 // TestMarker_names_the_cut_in_both_paths pins the sharing this package exists for,
 // from the shared leaf's own side. Two consumers bound text with this marker and must
-// not drift on the wording: internal/process caps its orphan path sample with Cap
-// (after sanitizing it with Path — Cap is the non-sanitizing half of that pair
-// because its caller composes a further elision suffix budgeted against Cap's marker
-// placement), and internal/convert hands the same const to
+// not drift on the wording: CapJoin caps a path inventory with Cap (after sanitizing
+// each name with Path — Cap is the non-sanitizing half of that pair because CapJoin
+// charges the marker's placement itself), and internal/convert hands the same const to
 // runesafe.SanitizeSingleLineBudgeted for certificate-derived text.
 //
 // What the two do NOT share is where the marker's bytes are charged, and that is
-// asserted rather than left implicit: Cap appends it after the cut (its caller
-// composes a further elision suffix and its budget was set against that placement),
-// while the library charges it against the limit. Same wording, two budgets.
+// asserted rather than left implicit: Cap appends it after the cut, while the library
+// charges it against the limit. Same wording, two budgets.
 func TestMarker_names_the_cut_in_both_paths(t *testing.T) {
 	t.Parallel()
 	const limit = 32

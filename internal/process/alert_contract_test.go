@@ -69,8 +69,9 @@ const inputBudgetPhrase = "holds more entries than one scan will enumerate"
 //
 // CertConverterInputTreeTooLarge matches on a PHRASE, not on a whole message, so any
 // other message containing that phrase fires it too -- and its remediation ("check that
-// /input is mounted at the certificate directory ... or raise MAX_SCAN_ENTRIES") sends
-// the operator to the wrong mount for any condition that is not the /input walk. The
+// /input is mounted at the certificate directory ... raise MAX_SCAN_ENTRIES and the
+// container's memory limit together") sends the operator to the wrong mount for any
+// condition that is not the /input walk. The
 // /output entry budget is the near miss: it is a different documented condition with its
 // own rule (CertConverterOrphanRemovalDisabled), its own remediation naming /output, and
 // a WARN whose own doc comment says the generic /output-ownership diagnosis is the wrong

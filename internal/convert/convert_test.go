@@ -1202,6 +1202,40 @@ func TestParseCertChain_names_the_key_label_ahead_of_an_earlier_companion(t *tes
 	}
 }
 
+// TestParseCertChain_names_the_unreadable_label_not_an_expected_companion is the
+// certificate-file twin of the key file's rule below: when the file yields no
+// certificate at all and holds no private key either, the label named is the first
+// one naming neither a certificate nor a key companion, not simply the first skipped
+// one. It needs a fixture in which those two DIFFER, which is why the first-label
+// test above cannot stand in for it — there both blocks are unrelated, so either rule
+// names the same one.
+//
+// The scenario is `openssl ecparam`'s EC PARAMETERS ahead of an OpenSSL
+// "TRUSTED CERTIFICATE": the companion comes FIRST, so naming the first skipped block
+// points the operator at the one block whose presence explains nothing.
+func TestParseCertChain_names_the_unreadable_label_not_an_expected_companion(t *testing.T) {
+	t.Parallel()
+
+	certFile := bytes.Join([][]byte{
+		pem.EncodeToMemory(&pem.Block{Type: "EC PARAMETERS", Bytes: []byte("opaque")}),
+		pem.EncodeToMemory(&pem.Block{Type: "TRUSTED CERTIFICATE", Bytes: []byte("opaque")}),
+	}, nil)
+
+	_, err := convert.ParseCertChain(certFile)
+	if err == nil {
+		t.Fatal("ParseCertChain(EC PARAMETERS plus a TRUSTED CERTIFICATE) = nil error, want a refusal")
+	}
+	if !strings.Contains(err.Error(), `first "TRUSTED CERTIFICATE"`) {
+		t.Errorf("ParseCertChain error = %q, want it to name the block naming neither a certificate nor a key companion", err.Error())
+	}
+	if strings.Contains(err.Error(), "EC PARAMETERS") {
+		t.Errorf("ParseCertChain error = %q, want the expected companion's label absent: naming it points the operator at a block that explains nothing", err.Error())
+	}
+	if !strings.Contains(err.Error(), "no certificate PEM block found") {
+		t.Errorf("ParseCertChain error = %q, want the base sentence kept as the prefix so existing log matching is unaffected", err.Error())
+	}
+}
+
 // TestParsePrivateKey_names_the_first_skipped_label_not_the_last is the key-file
 // half of the same rule. parsePrivateKeys shares skippedBlocks with parseCertChain, so
 // both diagnostics move together, but the two sentences are built separately

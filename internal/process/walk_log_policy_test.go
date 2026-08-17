@@ -212,7 +212,7 @@ func assertAggregateWarnCount(t *testing.T, logs *capture.Recorder, msg, wantCou
 // collapsing them would hide one behind the other.
 func TestStoreLogOrphanWalkOutcome_reports_each_disabling_condition(t *testing.T) {
 	const unreadableMsg = "some output paths could not be read while looking for orphans; orphan removal is disabled for this scan"
-	const symlinkMsg = "output tree contains symlinks; orphan removal is disabled for this scan because writes and the orphan walk resolve paths differently"
+	const symlinkMsg = "output tree contains symlinks; orphan removal is disabled for this scan"
 
 	s := newOutputStore(t, t.TempDir())
 
@@ -422,7 +422,7 @@ func TestWalkLogPolicy_quiet_when_nothing_is_wrong(t *testing.T) {
 //
 // Runs serially: it swaps slog.Default().
 func TestLogIncompleteInputEnumeration_quiet_arms(t *testing.T) {
-	const mountWarn = "orphan removal is disabled for this scan: the scan did not fully enumerate the input tree, so no output can be proven orphaned"
+	const mountWarn = "orphan removal is disabled for this scan: this scan cannot prove any /output bundle is orphaned"
 
 	t.Run("a shutdown is not an operator-actionable incomplete enumeration", func(t *testing.T) {
 		logs := captureLogs(t)

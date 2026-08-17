@@ -127,7 +127,7 @@ func TestCheckCurrency_preflight_refusal_is_the_bounded_one(t *testing.T) {
 }
 
 // TestCheckCurrency_classifies_every_outcome pins the return shape the caller
-// consumes. internal/process.store.isCurrent logs a different diagnostic per
+// consumes. internal/process's store.inspect logs a different diagnostic per
 // reason — a prior that does not decode at Debug, a profile change at Info, a
 // content mismatch silently — so a bare bool would flatten distinctions the
 // operator reads. Each case asserts the reason, the derived verdict, and whether
@@ -165,10 +165,10 @@ func TestCheckCurrency_classifies_every_outcome(t *testing.T) {
 			pfx: good, password: "pw", wantEncoder: convert.EncNameModern2023,
 			wantReason: convert.CurrencyMatch,
 		},
-		"a file that is not a bundle at all fails the preflight": {
+		"a file that is not a bundle at all is proven foreign by the preflight": {
 			pfx: []byte("this is not a pkcs12 bundle"), password: "pw",
 			wantEncoder: convert.EncNameModern2023,
-			wantReason:  convert.CurrencyPreflightFailed, wantErr: true,
+			wantReason:  convert.CurrencyForeign, wantErr: true,
 		},
 		"a bundle from another profile reports the profile it was written with": {
 			pfx: good, password: "pw", wantEncoder: convert.EncNameModern2026,

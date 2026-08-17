@@ -117,10 +117,7 @@ func (s *store) write(ctx context.Context, rel string, pfx []byte) writeRefusal 
 	}
 	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
 	if err != nil {
-		// Classified HERE, at the refusal, because only this site knows what it refused: a
-		// symlinked output tree is an operator layout, and a component swapped mid-descent
-		// is another writer on the volume.
-		return refuseWrite(refusalOutputLayout,
+		return refuseWrite(classifyPinRefusal(err),
 			"write pfx: pin output directory for %q: %w", rel, err)
 	}
 	defer func() { _ = parent.Close() }()
@@ -129,7 +126,7 @@ func (s *store) write(ctx context.Context, rel string, pfx []byte) writeRefusal 
 		// Mirror the read bound: inspect reads this same file back under
 		// maxPFXSize, so a bundle this app writes above that cap is one its own
 		// currency check would refuse, which is the permanent rewrite loop
-		// maxPFXSize's comment exists to prevent.
+		// maxPFXSize exists to prevent.
 		atomicfile.WithMaxBytes(maxPFXSize),
 	); err != nil {
 		// The bounded atomic write is where the errno classes live, so this site reads its
@@ -247,10 +244,11 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		// A pin this app cannot obtain — a symlinked output tree, a component it may not
 		// traverse, a directory replaced mid-descent — is "I cannot tell what is on disk",
 		// the same fact as a stat failure, and it degrades the same way rather than
-		// failing the pair. The remediation names the pin's own two causes.
-		slog.Warn("cannot stat prior pfx; regenerating",
+		// failing the pair. The remediation is the pin cause's own, so a traversal the
+		// filesystem refused for a permission reason does not read as a layout mistake.
+		slog.Warn(priorPinRefusedMsg,
 			"path", logtext.Path(rel), "error", logtext.Path(err.Error()),
-			"remediation", outputPinRemediation)
+			"remediation", classifyPinRefusal(err).remediation())
 		return contentUnverified, nil
 	}
 	defer func() { _ = parent.Close() }()
@@ -296,9 +294,8 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		}
 		// An ENOENT or a non-regular occupant here is not "cannot tell": the read looked
 		// and VERIFIED the path holds no usable prior bundle, the same two facts the lstat
-		// arms above classify as contentVerifiedStale, and the shape types.go promises
-		// stays a conversion failure when the rewrite is then refused ("an absent or
-		// non-regular output path...
+		// arms above classify as contentVerifiedStale, so a rewrite this app is then
+		// refused stays a conversion failure rather than a health-neutral one.
 		content := contentUnverified
 		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, atomicfile.ErrNotRegular) {
 			content = contentVerifiedStale
@@ -328,28 +325,38 @@ func contentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 	}
 	switch res.Reason {
 	case convert.CurrencyPreflightFailed:
-		// The preflight REFUSED TO LOOK — a bundle whose declared key-derivation counts
-		// are outside what this app will spend CPU on, or one whose structure it will not
-		// parse.
+		// The preflight REFUSED TO LOOK: the file declares key-derivation counts outside
+		// what this app will spend CPU on, so nothing about these bytes was compared.
 		slog.Debug("prior pfx failed preflight; regenerating", "path", logtext.Path(rel), "error", res.Err)
 		return contentUnverified, nil
+	case convert.CurrencyForeign:
+		// The preflight PROVED the file is not a bundle any of this app's profiles
+		// writes — the same fact the decode arm below names one step later, reached one
+		// step earlier.
+		slog.Debug("prior pfx was not written by this app; regenerating", "path", logtext.Path(rel), "error", res.Err)
+		return contentVerifiedStale, nil
 	case convert.CurrencyProfileMismatch:
 		// A deliberate PFX_ENCODER change.
 		slog.Info("prior pfx uses a different encoder profile; regenerating",
 			"path", logtext.Path(rel), "found", string(res.Profile), "configured", string(wantEncoder))
 		return contentVerifiedStale, nil
 	case convert.CurrencyDecodeFailed:
-		// Expected and non-fatal: a rotated password, a truncated file, a foreign file at
-		// that path.
+		// Expected and non-fatal: a rotated password, or a bundle in this profile that
+		// another tool wrote.
 		slog.Debug("prior pfx did not decode; regenerating", "path", logtext.Path(rel), "error", res.Err)
 		return contentVerifiedStale, nil
-	default:
-		// A match, or a plain content mismatch: the ordinary renewed-certificate
-		// outcome, which needs no diagnostic of its own.
-		if res.Current() {
-			return contentVerifiedCurrent, nil
-		}
+	case convert.CurrencyMatch:
+		return contentVerifiedCurrent, nil
+	case convert.CurrencyContentMismatch:
+		// The ordinary renewed-certificate outcome, which needs no diagnostic of its own.
 		return contentVerifiedStale, nil
+	default:
+		// A verdict this app does not know cannot have established anything about the
+		// bytes, so it takes the same direction refusalUnclassified takes: the one that
+		// does not flip health over a state a restart cannot clear.
+		slog.Warn("prior pfx currency verdict is not one this app maps; regenerating",
+			"path", logtext.Path(rel), "reason", string(res.Reason))
+		return contentUnverified, nil
 	}
 }
 
@@ -360,6 +367,11 @@ const laxBundleMsg = "prior pfx is more permissive than policy; leaving its mode
 // outputPinRemediation is the operator action behind every /output LAYOUT refusal
 // (refusalOutputLayout).
 const outputPinRemediation = "remove whatever occupies the /output directory path named in the error (this app publishes only through real directories), mount the real output directory instead of linking to it, and check /output for paths replaced while the scan was running"
+
+// priorPinRefusedMsg is the WARN for a prior bundle whose own output directory could not
+// be pinned, as distinct from one that could not be stat-ed through the pin: the two
+// /output conditions carry different repairs, so they are different records.
+const priorPinRefusedMsg = "cannot pin the output directory of a prior pfx; regenerating"
 
 // outputVolumeRemediation is the remediation for a write the VOLUME refused rather than
 // ownership: this app may write /output, but the filesystem will not take the bytes.
@@ -481,6 +493,17 @@ func classifyWriteErrno(err error) writeRefusalCause {
 	}
 }
 
+// classifyPinRefusal is how the two sites that pin an /output parent state their own
+// verdict: a component the process may not traverse is the operator's ownership to fix,
+// while everything else the pinned descent refuses — a symlinked component, a
+// non-directory, a component swapped mid-open — is the shape of the output tree.
+func classifyPinRefusal(err error) writeRefusalCause {
+	if errors.Is(err, fs.ErrPermission) {
+		return refusalOwnership
+	}
+	return refusalOutputLayout
+}
+
 // readBoundedInRoot reads a bundle from inside the output tree under maxPFXSize.
 var readBoundedInRoot = atomicfile.ReadBoundedInRoot
 
@@ -511,11 +534,11 @@ func (s *store) listOutputs(ctx context.Context) (found []string, safe bool, err
 var errOutputBudgetExceeded = errors.New("output tree exceeds the per-scan entry budget")
 
 // outputBudgetMsg is the operator-facing half of that abort.
-const outputBudgetMsg = reapDisabledPhrase + ": the /output tree holds more bundles than one output walk will enumerate, so no output can be proven orphaned; health is unaffected"
+const outputBudgetMsg = reapDisabledPhrase + ": the /output tree holds more entries than one output walk will enumerate, so no output can be proven orphaned; health is unaffected"
 
-// outputBudgetRemediation is that WARN's operator action, naming both ways out exactly
-// as scanbudget.InputRemediation does for /input.
-const outputBudgetRemediation = "check that /output is mounted at the bundle directory and holds nothing else, or raise MAX_SCAN_ENTRIES if the tree is legitimately this large"
+// outputBudgetRemediation is that WARN's operator action, naming both ways out and the cost
+// of the second exactly as scanbudget.InputRemediation does for /input.
+const outputBudgetRemediation = "check that /output is mounted at the bundle directory and holds nothing else; if the tree is legitimately this large, raise MAX_SCAN_ENTRIES and the container's memory limit together, because one walk's memory grows with the total length of the paths it enumerates and not only with their number"
 
 // outputWalk is listOutputs' visitor state: the candidate list plus the two
 // deletion-safety counters that derive the verdict.
@@ -592,9 +615,9 @@ func (s *store) logOrphanWalkOutcome(unreadable, symlinked int) {
 			"remediation", outputPermRemediation)
 	}
 	if symlinked > 0 {
-		slog.Warn("output tree contains symlinks; "+reapDisabledPhrase+" because writes and the orphan walk resolve paths differently",
+		slog.Warn("output tree contains symlinks; "+reapDisabledPhrase,
 			"dir", logDir, "count", symlinked,
-			"remediation", "mount the real output directory instead of linking to it")
+			"remediation", "remove symlinks from /output, or mount the real output directory instead of linking to it")
 	}
 }
 
@@ -654,6 +677,10 @@ func (s *store) removeOrphan(rel string) reapAttempt {
 		return reapAttemptRefused
 	}
 	if err := parent.Remove(base); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			slog.Debug("orphaned output vanished before removal", "path", logRel)
+			return reapAttemptVanished
+		}
 		slog.Warn("could not remove orphaned output", "path", logRel, "error", logtext.Path(err.Error()),
 			"remediation", outputPermRemediation)
 		return reapAttemptRefused

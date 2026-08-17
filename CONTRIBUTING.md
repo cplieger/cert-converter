@@ -17,9 +17,23 @@ github.com/cplieger/cert-converter` in `go.mod`). Build output and the
 
 ## Package layout
 
-`main.go` is wiring only: load config, build the scanner, run an initial
-scan, then hand off to the watcher. The real work lives under
-`internal/`:
+`main.go` is wiring only: install the logger, load config, verify the
+mounts, build the scanner, run an initial scan, then hand off to the
+watcher. The real work lives under `internal/`, and the boundary to know
+before adding anything is which package is allowed to JUDGE what:
+
+- **Content** — `internal/convert`. It is the only package outside test
+  support that imports `crypto/x509`, `encoding/pem`, `encoding/asn1` or
+  `go-pkcs12`; anything that has to understand certificate or bundle
+  bytes belongs there and nowhere else.
+- **Names** — `internal/layout` owns the `.crt`/`.key`/`.pfx` pairing
+  contract.
+- **Filesystem state** — `internal/process` decides what is on disk and
+  what to do about it.
+- **Startup admission** — `internal/config` decides whether the process
+  may run at all.
+
+The packages:
 
 - `internal/config`: parses `PFX_PASSWORD` (or `PFX_PASSWORD_FILE`, via
   `envx.Secret`), `PFX_ALLOW_EMPTY_PASSWORD`, `PFX_ENCODER`,
@@ -36,14 +50,32 @@ scan, then hand off to the watcher. The real work lives under
   and `config.LogLevel`
   keep their parsing silent because they are called outside `Load` (the first
   by the `health` subcommand, where a WARN would repeat on every healthcheck).
-- `internal/convert`: PEM parsing (package-internal; reached through
-  `PairInRoot`, which is the package's only production conversion edge —
-  the parsers are exposed to the package's own tests via
-  `export_test.go`), cert/key matching and confined PFX encoding
-  (`PairInRoot`, the only PFX-writing entry point; its encoder helper is
-  package-internal), the encoder-profile mapping (`EncoderName` /
-  `PickEncoder` in `encoder.go`; `EncoderName` normalizes the value and
-  reports whether it was recognized).
+- `internal/convert`: certificate and bundle content judgement. `Analyse`
+  parses a PEM chain and its private key, matches them, and returns an
+  `Analysis` plus the observations the scan logs; `Analysis.Encode`
+  produces the PKCS#12 bytes and `Analysis.CheckCurrency` decides whether
+  a bundle already on disk is the one those inputs produce. The parsers
+  are package-internal and reached through `Analyse` (they are exposed to
+  the package's own tests via `export_test.go`). The encoder-profile
+  mapping is here too (`EncoderName` normalizes the value and reports
+  whether it was recognized, `EncoderNames` and `ProtectionOf` carry the
+  profile table), along with the PKCS#12 password-encoding check
+  (`ValidatePasswordEncoding`) and the two size bounds `MaxInputBytes`
+  and `MaxBundleBytes`. Nothing here touches the filesystem: the bytes
+  are handed in and the bundle is handed back.
+- `internal/layout`: the naming contract — `IsCert`, `IsRelevant`,
+  `IsOutput`, `KeyFor`, `OutputFor` and `CertForOutput`. The three
+  extensions are spelled once, here; `process` and `watch` ask this
+  package instead of matching suffixes themselves.
+- `internal/logtext`: the log-attribute gate. `Path` sanitizes any
+  filesystem-derived string headed for a log attribute and `Cap` bounds
+  one, so a certificate name cannot reorder or split a record. The raw
+  `rel` is what filesystem decisions keep using.
+- `internal/mounts`: the startup mount check. `Verify` proves `/input`
+  and `/output` exist as directories the running UID can open and probes
+  `/output` for write access through the handle it just proved openable,
+  inspecting both volumes before refusing so one attempt names every
+  offender.
 - `internal/outputpolicy`: the `OUTPUT_LIFECYCLE` value domain — the
   `Lifecycle` type, its `warn`/`sync`/`keep` modes and `ParseLifecycle`.
   A standard-library-only leaf both `config` (which parses the operator's
@@ -53,12 +85,21 @@ scan, then hand off to the watcher. The real work lives under
   package-private `conversionStatus` outcome enum (`ScanResult` is the
   package's only exported outcome surface), and the package-private
   observation log that de-duplicates per-input warnings across scans.
-  `Scanner.Run` walks `/input`,
-  pairs each `*.crt` with its sibling `*.key`, asks `store.isCurrent` whether
-  the bundle already on disk is the one those inputs produce, and
-  writes PFX files to `/output`, returning a `ScanResult` count summary.
-  `reap.go` owns the `OUTPUT_LIFECYCLE` reconciliation, including the vetoes
-  that must hold before anything is deleted.
+  `Scanner.Run` walks `/input`, pairs each `*.crt` with its sibling
+  `*.key` (by `internal/layout`'s contract), asks `store.inspect` —
+  which reads the bundle at the output path and puts it to
+  `Analysis.CheckCurrency` — whether that bundle is the one those inputs
+  produce, and writes PFX files to `/output`, returning a `ScanResult`
+  count summary. `reap.go` owns the `OUTPUT_LIFECYCLE` reconciliation,
+  including the vetoes that must hold before anything is deleted.
+- `internal/scanbudget`: the `MAX_SCAN_ENTRIES` value domain — the
+  default, the ceiling, `Effective`, the `Counter` a walk charges every
+  visited path against, and the operator wording a budget stop carries.
+- `internal/scancadence`: the `FALLBACK_SCAN_HOURS` value domain — the
+  24h `Floor` (the longest this app goes without a full reconciliation of
+  `/input` in any configuration), `Effective`, which resolves the running
+  cadence from the operator's value, and the coverage attributes every
+  cadence-bearing record carries.
 - `internal/watch`: fsnotify watch loop with a debounce window, a periodic
   full-scan safety net (the `FALLBACK_SCAN_HOURS` cadence, or the 24h
   reconciliation floor that stands in for it) and a deferred watch-set repair on
@@ -86,8 +127,9 @@ them.
   constants in `main.go`, not env vars. Don't add env knobs for them;
   the container contract relies on the fixed mounts.
 - **Reads are bounded and confined.** Cert/key reads go through
-  `convert.ReadBoundedFromRoot`, which opens each file through the `/input`
-  `*os.Root` and reads it under the 10 MB cap (`MaxFileSize`), so a symlink
+  `atomicfile.ReadBoundedInRoot` (`internal/process`'s `source.go`), which opens
+  each file through the `/input` `*os.Root` and reads it under the 10 MB cap
+  (`convert.MaxInputBytes`), so a symlink
   planted in the watched tree cannot redirect the read outside it. The scanner
   reads each input once and derives the pair's fingerprint from those bytes
   (`pairFingerprint`), so nothing re-reads a file just to hash it. PFX writes are

@@ -12,7 +12,7 @@ import "time"
 const Floor = 24 * time.Hour
 
 // Effective reports the periodic safety-net scan's interval for a
-// configured fallback value: the operator's cadence while they chose one below the
+// configured fallback value: the operator's cadence while they chose one at or below the
 // floor, and the reconciliation floor otherwise — which covers the 0/false opt-out,
 // a negative value, and a cadence above the floor (including the 10-year ceiling
 // internal/config clamps to, at which no rescan would ever have arrived).

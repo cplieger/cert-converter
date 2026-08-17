@@ -90,21 +90,20 @@ func TestDecode_bounds_the_library_message(t *testing.T) {
 // is claiming cannot exist.
 //
 // The other half of the invariant — that the value Analyse hands back always
-// carries a leaf — is NOT structural (convert.Analysis{} stays constructible) and
-// is stated once as an ERROR RETURN in analyseAt. TestAnalyse_always_populates_the_leaf
-// below is its witness.
+// carries a leaf — is NOT structural (convert.Analysis{} stays constructible): it is
+// the producer's, which builds the value around a certificate it has already
+// resolved. TestAnalyse_always_populates_the_leaf below is its witness.
 var (
 	_ func(Analysis, EncoderType, string) ([]byte, error)  = Analysis.Encode
 	_ func(Analysis, []byte, string, EncoderType) Currency = Analysis.CheckCurrency
 )
 
-// TestAnalyse_always_populates_the_leaf witnesses the one place the leaf invariant
-// is stated, across the input shapes that reach the producer by a different route:
+// TestAnalyse_always_populates_the_leaf is the only witness of the leaf invariant,
+// across the input shapes that reach the producer by a different route:
 // a plain self-signed pair, a leaf-plus-CA chain, and a bundle whose leaf is not
-// the first block. Each returns through analyseAt's invariant check, so a future edit
-// that let a leafless value out fails here — on the error Analyse returns — rather
-// than nil-dereferencing inside go-pkcs12's sha1.Sum(certificate.Raw) at conversion
-// time.
+// the first block. A future edit that let a leafless value out fails on this test's
+// own nil check rather than nil-dereferencing inside go-pkcs12's
+// sha1.Sum(certificate.Raw) at conversion time.
 func TestAnalyse_always_populates_the_leaf(t *testing.T) {
 	t.Parallel()
 	m := testcerts.GenerateChainMaterial(t)
