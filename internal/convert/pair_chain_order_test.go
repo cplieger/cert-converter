@@ -77,7 +77,7 @@ func TestEncode_preserves_the_order_of_a_multi_CA_chain(t *testing.T) {
 				i, got[i], want[i])
 		}
 	}
-	if res := analysis.CheckCurrency(pfx, "pw", convert.EncNameModern2023); !res.Current() {
+	if res := analysis.CheckCurrency(pfx, "pw", convert.EncNameModern2023); res.Reason != convert.CurrencyMatch {
 		t.Errorf("CheckCurrency(the bundle Encode just wrote) = %q, want a match: a chain order the round trip does not preserve makes every scan rewrite the file",
 			res.Reason)
 	}

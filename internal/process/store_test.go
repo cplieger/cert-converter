@@ -1300,7 +1300,6 @@ func TestStoreInspect_classifies_a_read_that_found_nothing_as_verified_stale(t *
 	}
 }
 
-
 // TestStoreInspect_degrades_a_prior_it_cannot_stat pins the Lstat-failure arm's two
 // halves: the classification (contentUnverified, the fact that keeps a later refused
 // rewrite health-neutral via writeOutcome's bundleNotProvenWrong allowlist) and the

@@ -120,7 +120,6 @@ func TestStoreLogSweepOutcome_is_silent_for_a_clean_sweep(t *testing.T) {
 	}
 }
 
-
 // TestScannerRun_sweeps_stale_temps_once_per_window pins the throttle on the /output
 // stale-temp sweep: a temp is only reclaimable once it is staleTempAge old, so a scan
 // inside that window must not re-walk the untrusted output tree, and the first scan

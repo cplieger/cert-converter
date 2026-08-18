@@ -794,7 +794,6 @@ func TestAnalyse_reports_a_terminus_whose_self_signature_does_not_verify(t *test
 	}
 }
 
-
 // The rootless cross-certification fixture the two tests below share. Serials are
 // distinct from the rest of this file so a chain assertion names one certificate.
 const (

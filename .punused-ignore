@@ -12,29 +12,17 @@
 # routine shutdown at ERROR). Upstream: bep/punused#3.
 method (boundedTextError).Unwrap
 #
-# LostError.Error is the `error` interface implementation for the type main
-# receives from watch.Run: *LostError values are returned as `error` (lostOrShutdown,
-# watchMode, Run), so the method cannot be deleted without breaking the interface,
-# and every production render of it is IMPLICIT -- main.go's reportWatchExit puts
-# runErr into slog attrs, which calls Error() through the interface rather than by
-# name. punused sees only explicit references, and the last explicit non-test one
-# disappeared when the exported ErrWatchLost sentinel was removed (the old body was
-# `ErrWatchLost.Error() + ": " + e.Cause`). Interface-contract method: invalid by
-# construction for this check.
-method (*LostError).Error
-#
 # internal/testcerts has no _test.go of its own; it is a regular package
 # precisely so other packages' _test.go files can import a shared certificate
-# fixture builder, which guarantees EU1001 for every symbol in it. All six are
-# heavily used and none is a leftover: Mint 116 call sites, NewECDSAKey 98,
-# GenerateSelfSignedCert 59, GenerateChainMaterial 48, KeyPEM 46,
-# GenerateCertChain 12. GenerateCertChain and GenerateChainMaterial are not
-# redundant -- the former exposes only the leaf key, the latter exists to express
-# the cases identity selection must get right (issuer-owned key, renewed cert
-# reusing its predecessor's key, future-dated renewal).
-function Mint
-function KeyPEM
-function NewECDSAKey
+# fixture builder, which guarantees EU1001 for every symbol in it. All three are
+# heavily used and none is a leftover: GenerateSelfSignedCert 59 call sites,
+# GenerateChainMaterial 48, GenerateCertChain 12. GenerateCertChain and
+# GenerateChainMaterial are not redundant -- the former exposes only the leaf
+# key, the latter exists to express the cases identity selection must get right
+# (issuer-owned key, renewed cert reusing its predecessor's key, future-dated
+# renewal). The package's other exported helpers (Mint, KeyPEM, NewECDSAKey) are
+# called by these three from non-test code, so punused resolves them and they
+# need no entry.
 function GenerateSelfSignedCert
 function GenerateCertChain
 function GenerateChainMaterial

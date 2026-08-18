@@ -63,7 +63,7 @@ func TestCheckCurrency_runs_the_preflight_and_profile_check_before_the_decode(t 
 	if err != nil {
 		t.Fatalf("setup: Encode: %v", err)
 	}
-	if res := analysis.CheckCurrency(good, "pw", convert.EncNameModern2023); !res.Current() {
+	if res := analysis.CheckCurrency(good, "pw", convert.EncNameModern2023); res.Reason != convert.CurrencyMatch {
 		t.Fatalf("setup: CheckCurrency(the bundle just encoded) = %q, want a match", res.Reason)
 	}
 
@@ -93,7 +93,7 @@ func TestCheckCurrency_runs_the_preflight_and_profile_check_before_the_decode(t 
 				t.Errorf("CheckCurrency reason = %q, want %q: the read-back steps ran out of order",
 					res.Reason, tt.wantReason)
 			}
-			if res.Current() {
+			if res.Reason == convert.CurrencyMatch {
 				t.Error("CheckCurrency reported the bundle as current, want a rewrite")
 			}
 		})
@@ -192,9 +192,6 @@ func TestCheckCurrency_classifies_every_outcome(t *testing.T) {
 			if res.Reason != tt.wantReason {
 				t.Errorf("CheckCurrency reason = %q, want %q", res.Reason, tt.wantReason)
 			}
-			if want := tt.wantReason == convert.CurrencyMatch; res.Current() != want {
-				t.Errorf("Current() = %v, want %v for reason %q", res.Current(), want, res.Reason)
-			}
 			if (res.Err != nil) != tt.wantErr {
 				t.Errorf("CheckCurrency error = %v, want an error: %v", res.Err, tt.wantErr)
 			}
@@ -213,8 +210,8 @@ func TestCheckCurrency_classifies_every_outcome(t *testing.T) {
 // it", never as "the file on disk is fine".
 func TestCurrency_zero_value_is_not_current(t *testing.T) {
 	t.Parallel()
-	if (convert.Currency{}).Current() {
-		t.Error("Currency{}.Current() = true, want false: an unfilled verdict must never report a bundle as current")
+	if (convert.Currency{}).Reason == convert.CurrencyMatch {
+		t.Error("Currency{}.Reason = CurrencyMatch, want anything else: an unfilled verdict must never report a bundle as current")
 	}
 }
 
@@ -237,7 +234,7 @@ func TestCheckCurrency_resolves_an_unknown_encoder_name_the_way_Encode_does(t *t
 	if err != nil {
 		t.Fatalf("Encode(unknown encoder name) = error %v, want the modern2023 fallback to succeed", err)
 	}
-	if res := analysis.CheckCurrency(pfx, "pw", unknown); !res.Current() {
+	if res := analysis.CheckCurrency(pfx, "pw", unknown); res.Reason != convert.CurrencyMatch {
 		t.Errorf("CheckCurrency(the bundle Encode just wrote for %q) = %q, want a match",
 			unknown, res.Reason)
 	}

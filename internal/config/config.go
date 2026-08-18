@@ -70,10 +70,10 @@ const (
 
 // Config holds the runtime configuration for cert-converter.
 type Config struct {
-	Password         string
-	EncoderName      convert.EncoderType
-	Lifecycle        outputpolicy.Lifecycle
-	PasswordStatus   PasswordStatus
+	Password       string
+	EncoderName    convert.EncoderType
+	Lifecycle      outputpolicy.Lifecycle
+	PasswordStatus PasswordStatus
 	// FallbackInterval is the operator's CONFIGURED rescan cadence, not the one
 	// that runs: 0 means they opted out of their own cadence, and the composition
 	// root resolves what actually applies through scancadence.Effective.

@@ -359,7 +359,6 @@ func TestWatchModeScans_report_watch_mode_at_info(t *testing.T) {
 	}
 }
 
-
 // TestLogWatchSet_names_the_size_of_the_set pins the scale attribute on the watch-set
 // dump. The inventory beside it is a BOUNDED sample — logtext.CapJoin stops appending at
 // a byte budget on a tree whose names this app does not choose — so the attribute an

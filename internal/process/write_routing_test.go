@@ -475,7 +475,7 @@ func TestScannerRun_rewrites_a_bundle_it_could_not_verify(t *testing.T) {
 			// these inputs produce.
 			written, _ := readBundle(t, pfxPath)
 			want := mustAnalyse(t, chainPEM, keyPEM)
-			if got := want.CheckCurrency(written, "pw", convert.EncNameModern2023); !got.Current() {
+			if got := want.CheckCurrency(written, "pw", convert.EncNameModern2023); got.Reason != convert.CurrencyMatch {
 				t.Errorf("Run(unverifiable prior) left a bundle CheckCurrency reports as %v, want a match", got.Reason)
 			}
 			// And the next scan must go quiet, or the app would churn the bundle (fresh KDF

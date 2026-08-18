@@ -81,9 +81,6 @@ type Currency struct {
 	Profile EncoderType
 }
 
-// Current reports whether the existing bundle needs no rewrite.
-func (c Currency) Current() bool { return c.Reason == CurrencyMatch }
-
 // CheckCurrency reports whether pfx is already the bundle this analysis would
 // produce under wantEncoder, and when it is not, why.
 func (a Analysis) CheckCurrency(pfx []byte, password string, wantEncoder EncoderType) Currency { //nolint:gocritic // hugeParam: same reason as Encode — the value Analyse hands back cannot be nil, so this body needs no nil arm.
