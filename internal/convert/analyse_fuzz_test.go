@@ -87,10 +87,10 @@ func FuzzAnalyse_keeps_the_bundle_internally_consistent(f *testing.F) {
 		}
 		for raw, n := range emitted {
 			if !fromInput[raw] {
-				t.Fatal("Analyse emitted a certificate the certificate file does not hold")
+				t.Errorf("Analyse emitted a certificate the certificate file does not hold")
 			}
 			if n != 1 {
-				t.Fatalf("Analyse emitted one certificate %d times across the leaf, the chain and the excluded set", n)
+				t.Errorf("Analyse emitted one certificate %d times across the leaf, the chain and the excluded set", n)
 			}
 		}
 		if len(emitted) != len(fromInput) {
@@ -107,6 +107,8 @@ func FuzzAnalyse_keeps_the_bundle_internally_consistent(f *testing.F) {
 // shares "Material Test CA" as its subject, so the path walk adopts it as an
 // unproven parent instead of leaving it over.
 func fuzzSpareCA(f *testing.F) []byte {
+	f.Helper()
+
 	key := testcerts.NewECDSAKey(f)
 	now := time.Now()
 	caPEM, _ := testcerts.Mint(f, &x509.Certificate{

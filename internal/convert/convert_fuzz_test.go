@@ -305,7 +305,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		}
 		for i := range analysis.Chain() {
 			if !bytes.Equal(decodedCAs[i].Raw, analysis.Chain()[i].Raw) {
-				t.Fatalf("CA certificate %d changed across the PFX round trip", i)
+				t.Errorf("CA certificate %d changed across the PFX round trip", i)
 			}
 		}
 
@@ -313,7 +313,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 		// the input, and none is the leaf repeated.
 		for i, ca := range decodedCAs {
 			if bytes.Equal(ca.Raw, decodedLeaf.Raw) {
-				t.Fatalf("CA certificate %d is the leaf repeated", i)
+				t.Errorf("CA certificate %d is the leaf repeated", i)
 			}
 			found := false
 			for _, in := range certs {
@@ -323,7 +323,7 @@ func FuzzToPFXRoundTrip(f *testing.F) {
 				}
 			}
 			if !found {
-				t.Fatalf("CA certificate %d is not present in the input", i)
+				t.Errorf("CA certificate %d is not present in the input", i)
 			}
 		}
 
