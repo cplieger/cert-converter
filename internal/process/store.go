@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cplieger/atomicfile/v2"
+	"github.com/cplieger/atomicfile/v3"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
@@ -145,7 +145,7 @@ const staleTempAge = time.Hour
 // sweepStaleTemps removes PFX temp files orphaned by an interrupted atomic write
 // (a crash between temp-write and rename), then narrates the outcome.
 func (s *store) sweepStaleTemps(ctx context.Context) {
-	res, walkErr := atomicfile.CleanupStaleTempsInRoot(ctx, s.root, staleTempAge, atomicfile.WithRecursive())
+	res, walkErr := atomicfile.CleanupStaleTempsInRoot(ctx, s.root, staleTempAge, atomicfile.WithRecursive(true))
 	s.logSweepOutcome(res, walkErr)
 }
 
