@@ -65,15 +65,44 @@ var requiredVolumes = mounts.Paths{
 	Output: outputDir,
 }
 
-const healthSubcommand = "health"
+// Subcommands. watch is the daemon and is what the image's CMD supplies; health
+// is the probe the HEALTHCHECK re-invokes.
+const (
+	healthSubcommand = "health"
+	watchSubcommand  = "watch"
+)
 
-// dispatchArgs runs the health probe when argv requests it and REJECTS an
-// unrecognized argument.
+// usage writes the invocation summary to stderr. Shared by the no-subcommand
+// path and the rejection path so the two cannot describe different binaries.
+func usage() {
+	fmt.Fprintln(os.Stderr, "usage: cert-watcher watch     start the watcher (the image's default command)")
+	fmt.Fprintln(os.Stderr, "       cert-watcher health    probe the health marker")
+}
+
+// dispatchArgs routes argv: watch continues to the watcher, health runs the
+// probe, and EVERYTHING else — including a bare argv with no subcommand — is a
+// usage error.
+//
+// A bare argv is rejected on purpose, and it is the reason this dispatcher takes
+// a subcommand at all. The image sets CMD ["watch"], so the container's own
+// start supplies it; a bare argv therefore means the binary was run by hand, and
+// overwhelmingly that means `docker exec <container> /cert-watcher` against a
+// container whose watcher is already running. Before, that fell through to the
+// watcher: run() reaches marker.Set(false), which UNLINKS the resident
+// watcher's health marker, and then a SECOND watcher attaches over the same
+// /input and /output, so two processes convert the same certificates and make
+// orphan-reaping decisions about each other's files. Refusing costs the operator
+// one word and removes the accident outright. It does not stop a deliberate
+// `/cert-watcher watch` in a second process, which no in-process check can.
 func dispatchArgs(args []string) int {
 	if len(args) <= 1 {
-		return continueToWatcher
+		fmt.Fprintln(os.Stderr, "cert-watcher: no subcommand given")
+		usage()
+		return exitUsage
 	}
 	switch {
+	case len(args) == 2 && args[1] == watchSubcommand:
+		return continueToWatcher
 	case len(args) == 2 && args[1] == healthSubcommand:
 		// The periodic safety-net scan is the marker's guaranteed refresh floor
 		// (fs events refresh it sooner), so a marker older than 3 of those
@@ -82,18 +111,15 @@ func dispatchArgs(args []string) int {
 			health.WithMaxAge(3*scancadence.Effective(config.FallbackInterval())))
 		return continueToWatcher // unreachable in production; runProbe exits
 	default:
-		// Refuse rather than fall through: falling through reaches
-		// marker.Set(false) in run(), which UNLINKS the resident watcher's health
-		// marker, and then starts a second watcher over the same /input and /output.
-		if args[1] != healthSubcommand {
+		switch args[1] {
+		case healthSubcommand, watchSubcommand:
+			fmt.Fprintf(os.Stderr, "cert-watcher: unexpected trailing arguments %q\n", args[2:])
+		default:
 			// Names the unrecognized token even when extra operands follow it: the
 			// token IS the mistake, and reporting only the operands hides it.
 			fmt.Fprintf(os.Stderr, "cert-watcher: unrecognized argument %q\n", args[1])
-		} else {
-			fmt.Fprintf(os.Stderr, "cert-watcher: unexpected trailing arguments %q\n", args[2:])
 		}
-		fmt.Fprintln(os.Stderr, "usage: cert-watcher            start the watcher (no arguments)")
-		fmt.Fprintln(os.Stderr, "       cert-watcher health     probe the health marker")
+		usage()
 		return exitUsage
 	}
 }

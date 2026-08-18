@@ -293,12 +293,13 @@ func TestScanAndSetHealth_cancelled_context_leaves_marker_untouched(t *testing.T
 	}
 }
 
-// TestDispatchArgs pins the argv policy behind the runProbe seam: the health
-// subcommand probes the marker at health.DefaultPath, an unrecognized argument
-// is a usage error that never probes and never starts a watcher, and a bare
-// invocation starts the watcher. The usage error is written to stderr, so argv
-// dispatch must emit no log records at all. No t.Parallel: it swaps the
-// package-level runProbe var and slog.Default().
+// TestDispatchArgs pins the argv policy behind the runProbe seam: the watch
+// subcommand starts the watcher, the health subcommand probes the marker at
+// health.DefaultPath, and everything else — an unrecognized argument, a
+// trailing operand, or a bare argv with no subcommand at all — is a usage error
+// that never probes and never starts a watcher. The usage error is written to
+// stderr, so argv dispatch must emit no log records at all. No t.Parallel: it
+// swaps the package-level runProbe var and slog.Default().
 func TestDispatchArgs(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -306,16 +307,23 @@ func TestDispatchArgs(t *testing.T) {
 		wantProbe bool
 		wantCode  int
 	}{
-		{"no argument starts the watcher", []string{"cert-watcher"}, false, continueToWatcher},
+		{"watch starts the watcher", []string{"cert-watcher", "watch"}, false, continueToWatcher},
 		{"health probes the marker", []string{"cert-watcher", "health"}, true, continueToWatcher},
+		// A bare argv used to start the watcher, which made
+		// `docker exec <container> /cert-watcher` unlink the resident watcher's
+		// health marker and attach a SECOND watcher over the same /input and
+		// /output. The image's CMD supplies `watch`, so nothing legitimate
+		// invokes the binary without a subcommand.
+		{"a bare argv is a usage error and never starts a watcher", []string{"cert-watcher"}, false, exitUsage},
 		// A typo used to WARN and fall through, which unlinked the resident
 		// watcher's health marker and started a second watcher over the same
 		// output tree. It is now a usage error that never reaches the marker.
 		{"typo is a usage error and never starts a watcher", []string{"cert-watcher", "helth"}, false, exitUsage},
-		// `health` plus a trailing operand used to enter the health case
+		// A subcommand plus a trailing operand used to enter the health case
 		// and probe while silently ignoring the extra argument. The subcommand
 		// must consume the whole of argv or the invocation is a usage error.
 		{"health with a trailing argument is a usage error", []string{"cert-watcher", "health", "typo"}, false, exitUsage},
+		{"watch with a trailing argument is a usage error", []string{"cert-watcher", "watch", "typo"}, false, exitUsage},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
@@ -479,6 +487,11 @@ func TestDispatchArgs_usage_error_names_the_offending_argument(t *testing.T) {
 		wantParts []string
 	}{
 		{
+			name:      "a bare argv says no subcommand was given and names both",
+			args:      []string{"cert-watcher"},
+			wantParts: []string{"no subcommand given", "usage: cert-watcher", "cert-watcher watch", "cert-watcher health"},
+		},
+		{
 			name:      "unrecognized argument is quoted back",
 			args:      []string{"cert-watcher", "helth"},
 			wantParts: []string{`unrecognized argument "helth"`, "usage: cert-watcher", "cert-watcher health"},
@@ -487,6 +500,11 @@ func TestDispatchArgs_usage_error_names_the_offending_argument(t *testing.T) {
 			name:      "trailing operands are quoted back",
 			args:      []string{"cert-watcher", "health", "typo"},
 			wantParts: []string{`unexpected trailing arguments ["typo"]`, "usage: cert-watcher", "cert-watcher health"},
+		},
+		{
+			name:      "trailing operands after watch are quoted back too",
+			args:      []string{"cert-watcher", "watch", "typo"},
+			wantParts: []string{`unexpected trailing arguments ["typo"]`, "usage: cert-watcher", "cert-watcher watch"},
 		},
 		{
 			name:      "an unrecognized argument is named even with trailing operands",
@@ -752,7 +770,7 @@ func TestRun_startup_failure_diagnoses_the_configuration_and_exits_nonzero(t *te
 	}
 
 	prevArgs, prevLogger := os.Args, slog.Default()
-	os.Args = []string{"cert-watcher"}
+	os.Args = []string{"cert-watcher", watchSubcommand}
 	t.Cleanup(func() {
 		os.Args = prevArgs
 		slog.SetDefault(prevLogger)
@@ -807,7 +825,7 @@ func TestRun_sanitizes_the_secret_path_a_configuration_refusal_carries(t *testin
 	}
 
 	prevArgs, prevLogger := os.Args, slog.Default()
-	os.Args = []string{"cert-watcher"}
+	os.Args = []string{"cert-watcher", watchSubcommand}
 	t.Cleanup(func() {
 		os.Args = prevArgs
 		slog.SetDefault(prevLogger)
@@ -854,7 +872,7 @@ func TestRun_refuses_to_start_when_a_required_volume_is_missing(t *testing.T) {
 
 	absentOutput := filepath.Join(t.TempDir(), "absent-output")
 	prevArgs, prevLogger, prevVolumes := os.Args, slog.Default(), requiredVolumes
-	os.Args = []string{"cert-watcher"}
+	os.Args = []string{"cert-watcher", watchSubcommand}
 	requiredVolumes = mounts.Paths{
 		Input:  t.TempDir(),
 		Output: absentOutput,

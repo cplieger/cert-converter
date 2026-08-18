@@ -120,6 +120,24 @@ squash, vfat `fmask`): the replacement would land with the same lax mode and
 every scan would rewrite the bundle the previous scan wrote, churning a fresh
 mtime — and any downstream replication of `/output` — every cycle.
 
+### Commands
+
+The image supplies `watch` as its default command, so a plain
+`docker run`/`docker compose up` needs nothing extra. Both subcommands are
+listed here because the binary takes one and refuses to run without it.
+
+| Command | Description |
+| --- | --- |
+| `cert-watcher watch` | Start the watcher. The image's default command, so Compose never has to state it |
+| `cert-watcher health` | Probe the health marker and exit 0 or 1. What the baked-in `HEALTHCHECK` runs |
+
+Any other argv, including no argv at all, prints usage and exits 2. That is
+deliberate: `docker exec <container> /cert-watcher` would otherwise start a
+second watcher over the same `/input` and `/output` while the container's own
+watcher was running, and the second process clears the first one's health marker
+on the way in. Use `docker exec <container> /cert-watcher health` to read the
+marker, and leave the running watcher alone.
+
 ## Alerting
 
 cert-converter has no metrics endpoint; its operational state is in its logs.

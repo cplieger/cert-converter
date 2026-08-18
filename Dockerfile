@@ -23,3 +23,7 @@ USER 65532:65532
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=15s \
     CMD ["/cert-watcher", "health"]
 ENTRYPOINT ["/cert-watcher"]
+# The watcher is a SUBCOMMAND, not the bare binary, so `docker exec <container>
+# /cert-watcher` cannot silently start a second watcher over the same /input and
+# /output; a bare argv prints usage and exits 2 instead.
+CMD ["watch"]

@@ -12,8 +12,9 @@ volumes plus a file-based health marker.
 
 Note the name split: the repo and image are `cert-converter`, but the Go
 module and built binary are `cert-watcher` (`module
-github.com/cplieger/cert-converter` in `go.mod`). Build output and the
-`health` subcommand both use the `cert-watcher` name.
+github.com/cplieger/cert-converter` in `go.mod`). Build output and both
+subcommands (`cert-watcher watch`, `cert-watcher health`) use the
+`cert-watcher` name.
 
 ## Package layout
 
