@@ -18,7 +18,8 @@ import (
 var ErrEmptyPassword = errors.New(
 	"the resolved PFX password is empty or blank (whitespace-only, or invisible formatting characters only); " +
 		"set PFX_PASSWORD, write a non-blank secret " +
-		"to the file named by PFX_PASSWORD_FILE, or set PFX_ALLOW_EMPTY_PASSWORD=true")
+		"to the file named by PFX_PASSWORD_FILE, or set PFX_ALLOW_EMPTY_PASSWORD=true",
+)
 
 // ErrUnencodablePassword indicates the configured password contains invalid UTF-8,
 // a non-BMP rune, or an embedded NUL and cannot be represented safely by PKCS#12.

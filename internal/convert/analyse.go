@@ -189,7 +189,8 @@ func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (Anal
 	}
 	if err := g.oversizedIssuerError(path); err != nil {
 		return Analysis{}, errors.New(appendCertIssues(
-			err.Error()+in.keyIssues.suffix(), in.certIssues))
+			err.Error()+in.keyIssues.suffix(), in.certIssues,
+		))
 	}
 
 	leaf := certs[identity.cert]
@@ -198,7 +199,8 @@ func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (Anal
 	if g.isIssuer(identity.cert) {
 		return Analysis{}, errors.New(appendCertIssues(fmt.Sprintf(
 			"the private key matches %q, which is an issuer of another certificate in this bundle, not an end-entity certificate; if you meant to export that CA itself, remove the certificates it issued from the bundle%s",
-			subjectForLog(leaf), in.keyIssues.suffix()), in.certIssues))
+			subjectForLog(leaf), in.keyIssues.suffix(),
+		), in.certIssues))
 	}
 	if leaf.BasicConstraintsValid && leaf.IsCA {
 		obs = append(obs, Observation{
@@ -629,7 +631,8 @@ func (g *certGraph) unverifiableIssuerRival(child int) error {
 		}
 		return fmt.Errorf(
 			"certificate %q is named as the issuer of another certificate in this bundle and %s; no signature can be checked against it, so its place in the chain could only be guessed; remove it from the bundle",
-			subjectForLog(c), reason)
+			subjectForLog(c), reason,
+		)
 	}
 	return nil
 }
@@ -930,11 +933,13 @@ func (g *certGraph) noMatchError(usableKeys int, keyIssues keyDefects, certIssue
 			// type to name. Say what happened instead.
 			msg = fmt.Sprintf(
 				"certificate %q uses a public key algorithm crypto/x509 does not recognise, so it cannot be verified against the private key; re-issue it with an RSA, ECDSA, Ed25519 or ML-DSA key",
-				subjectForLog(c))
+				subjectForLog(c),
+			)
 		} else {
 			msg = fmt.Sprintf(
 				"certificate %q has a public key of type %T that cannot be verified against the private key",
-				subjectForLog(c), c.PublicKey)
+				subjectForLog(c), c.PublicKey,
+			)
 		}
 		// The uncomparable count only covers PARSED certificate blocks, so "the
 		// unsupported key is the only explanation left" does not rule out a
@@ -944,7 +949,8 @@ func (g *certGraph) noMatchError(usableKeys int, keyIssues keyDefects, certIssue
 	}
 	msg := fmt.Sprintf(
 		"none of the %d distinct private key(s) in the key file matches any of the %d certificate(s) in the chain%s",
-		usableKeys, len(g.certs), keyIssues.suffix())
+		usableKeys, len(g.certs), keyIssues.suffix(),
+	)
 	if firstUnverifiable >= 0 {
 		// Same split as the all-uncomparable branch above, for the same reason: a nil
 		// PublicKey is a key crypto/x509 could not READ, while a parsed key of an
@@ -986,7 +992,8 @@ func (g *certGraph) resolveAmbiguousMatches(matches []identityMatch, keyIssues k
 	if distinct := countDistinctKeys(matches); distinct > 1 {
 		return identityMatch{}, nil, errors.New(appendCertIssues(fmt.Sprintf(
 			"the input contains %d distinct certificate/key identities; this app converts one certificate/key pair per output (%s)%s",
-			distinct, subjectsForLog(g.certsOf(matches)), keyIssues.suffix()), certIssues))
+			distinct, subjectsForLog(g.certsOf(matches)), keyIssues.suffix(),
+		), certIssues))
 	}
 
 	best := matches[0]
@@ -1295,7 +1302,8 @@ func chainValidityObservations(chain []*x509.Certificate, now time.Time) []Obser
 			Detail: fmt.Sprintf(
 				"chain certificate %d of %d, %q, is outside its validity window (NotBefore %s, NotAfter %s)",
 				i+1, len(chain), subjectForLog(c),
-				c.NotBefore.UTC().Format(time.RFC3339), c.NotAfter.UTC().Format(time.RFC3339)),
+				c.NotBefore.UTC().Format(time.RFC3339), c.NotAfter.UTC().Format(time.RFC3339),
+			),
 		})
 	}
 	return obs
@@ -1320,7 +1328,8 @@ func (g *certGraph) unprovenPathObservations(path []int) []Observation {
 			Detail: fmt.Sprintf(
 				"chain certificate %d, %q, %s %q but no signature here proves it issued that certificate; it was included because no certificate the chain walk could still place proved it signed that certificate, so a consumer may be unable to verify the chain",
 				i, subjectForLog(g.certs[parent]), linkage,
-				subjectForLog(g.certs[child])),
+				subjectForLog(g.certs[child]),
+			),
 		})
 	}
 	return obs
@@ -1340,7 +1349,8 @@ func chainIssuerEligibilityObservations(chain []*x509.Certificate) []Observation
 			Kind: ObsChainCertCannotIssue,
 			Detail: fmt.Sprintf(
 				"chain certificate %d of %d, %q, %s; it is included in the bundle because it is part of the chain established here, but a strict consumer will reject the chain until that CA is re-issued",
-				i+1, len(chain), subjectForLog(c), reason),
+				i+1, len(chain), subjectForLog(c), reason,
+			),
 		})
 	}
 	return obs

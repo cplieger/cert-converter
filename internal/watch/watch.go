@@ -445,7 +445,8 @@ func exceedsEntryBudget(ctx context.Context, budget *scanbudget.Counter, walkErr
 func (w *Watcher) warnWatchBudget(root string, budget *scanbudget.Counter) {
 	slog.Warn(watchBudgetMsg, w.coverageAttrs(
 		"root", logtext.Path(root), "max_entries", budget.Max(),
-		"remediation", scanbudget.InputRemediation)...)
+		"remediation", scanbudget.InputRemediation,
+	)...)
 }
 
 // classifyWatchEntry applies the per-entry policy BOTH watch-set walks share — the
