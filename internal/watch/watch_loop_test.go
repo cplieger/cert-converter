@@ -79,8 +79,7 @@ func TestWatchLoop_returns_a_LostError_when_the_watcher_dies(t *testing.T) {
 
 	select {
 	case err := <-done:
-		var lost *LostError
-		if !errors.As(err, &lost) {
+		if _, ok := errors.AsType[*LostError](err); !ok {
 			t.Errorf("watchLoop(dead watcher) = %v, want a *LostError", err)
 		}
 		// The specific loss, not just "something died": main names it in the one
@@ -175,8 +174,7 @@ func TestRun_falls_back_to_polling_when_the_watch_set_cannot_be_built(t *testing
 
 	err := w.Run(t.Context())
 
-	var lost *LostError
-	if !errors.As(err, &lost) {
+	if _, ok := errors.AsType[*LostError](err); !ok {
 		t.Errorf("Run(unwatchable root) = %v, want a *LostError via the poll fallback: an unwatchable /input must degrade to polling, not abort the watcher", err)
 	}
 	if scans != 1 {
@@ -251,8 +249,7 @@ func TestWatchLoop_reports_lost_change_detection_when_the_root_watch_disappears(
 	}
 	select {
 	case err := <-done:
-		var lost *LostError
-		if !errors.As(err, &lost) {
+		if _, ok := errors.AsType[*LostError](err); !ok {
 			t.Errorf("watchLoop(root removed, fallback disabled) = %v, want a *LostError", err)
 		}
 		if err != error(errRootWatchRemoved) {

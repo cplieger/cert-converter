@@ -64,8 +64,7 @@ func TestDecode_bounds_the_library_message(t *testing.T) {
 	if err == nil {
 		t.Fatal("decode(bundle, wrong password) = nil error, want a decode failure")
 	}
-	var bounded boundedTextError
-	if !errors.As(err, &bounded) {
+	if _, ok := errors.AsType[boundedTextError](err); !ok {
 		t.Errorf("decode error = %v, want its chain to carry boundedTextError so a bundle-controlled identifier cannot reach the log unbounded", err)
 	}
 	if !strings.HasPrefix(err.Error(), "decode pfx: ") {
