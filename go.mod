@@ -1,13 +1,13 @@
 module github.com/cplieger/cert-converter
 
-go 1.26.6
+go 1.26.7
 
 require (
 	github.com/cplieger/atomicfile/v3 v3.0.0
 	github.com/cplieger/envx v1.5.0
-	github.com/cplieger/health v1.5.1
+	github.com/cplieger/health v1.5.2
 	github.com/cplieger/runesafe v1.4.0
-	github.com/cplieger/slogx v1.6.1
+	github.com/cplieger/slogx v1.6.2
 	github.com/fsnotify/fsnotify v1.10.1
 	pgregory.net/rapid v1.3.0
 	software.sslmate.com/src/go-pkcs12 v0.7.3
