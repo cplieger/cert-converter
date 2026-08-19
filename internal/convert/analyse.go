@@ -437,6 +437,58 @@ func unverifiableKeyReason(pub crypto.PublicKey) string {
 	return ""
 }
 
+// unverifiableAnchorReason explains why a self-issued certificate's own signature
+// could not be verified here, naming the two facts that are knowable from the
+// certificate itself: this app's verification ceilings, and the signature
+// algorithm. It replaces a diagnostic that listed three candidates and chose
+// between none of them.
+func unverifiableAnchorReason(c *x509.Certificate) string {
+	if reason := unverifiableKeyReason(c.PublicKey); reason != "" {
+		return "it " + reason + ", so no signature was checked against it at all"
+	}
+	return fmt.Sprintf("it is signed with %s, so either crypto/x509 refuses that algorithm or the certificate has been corrupted or re-signed since it was issued",
+		signatureAlgorithmForLog(c))
+}
+
+// signatureAlgorithmForLog names a certificate's signature algorithm for a
+// diagnostic. crypto/x509 renders an algorithm it does not implement as the bare
+// number "0", which names nothing an operator can act on, so such an algorithm is
+// named by the object identifier crypto/x509 retains in RawSignatureAlgorithm
+// instead — the field that exists for exactly this case, where the code knows an
+// algorithm is unrecognised and previously could not say which.
+func signatureAlgorithmForLog(c *x509.Certificate) string {
+	if c.SignatureAlgorithm != x509.UnknownSignatureAlgorithm {
+		return c.SignatureAlgorithm.String()
+	}
+	oid, ok := signatureAlgorithmOID(c.RawSignatureAlgorithm)
+	if !ok {
+		return "an algorithm crypto/x509 does not implement"
+	}
+	return "the unimplemented algorithm " + oid.String()
+}
+
+// signatureAlgorithmOID reads the algorithm out of a certificate's DER
+// AlgorithmIdentifier, refusing an identifier above maxOIDBytes for the reason
+// oversizedKeyAlgorithmOIDError refuses one at the same ceiling: the value is
+// certificate-controlled and asn1 allocates one int per encoded byte. The rendered
+// result is therefore bounded without a text cap — an object identifier renders as
+// dotted decimal arcs, and asn1 rejects an arc too large for an int.
+func signatureAlgorithmOID(der []byte) (asn1.ObjectIdentifier, bool) {
+	algorithm, _, ok := asn1ElementWithTag(der, asn1.TagSequence)
+	if !ok {
+		return nil, false
+	}
+	raw, _, ok := asn1ElementWithTag(algorithm.Bytes, asn1.TagOID)
+	if !ok || raw.IsCompound || len(raw.Bytes) > maxOIDBytes {
+		return nil, false
+	}
+	var oid asn1.ObjectIdentifier
+	if _, err := asn1.Unmarshal(raw.FullBytes, &oid); err != nil {
+		return nil, false
+	}
+	return oid, true
+}
+
 // newCertGraph derives the evidence for every pair and the candidate edge set that
 // follows from it.
 func newCertGraph(ctx context.Context, certs []*x509.Certificate, now time.Time) *certGraph {
@@ -877,7 +929,7 @@ func (g *certGraph) noMatchError(usableKeys int, keyIssues keyDefects, certIssue
 			// case where naming the algorithm matters most is the one where there is no
 			// type to name. Say what happened instead.
 			msg = fmt.Sprintf(
-				"certificate %q uses a public key algorithm crypto/x509 does not recognise, so it cannot be verified against the private key; re-issue it with an RSA, ECDSA or Ed25519 key",
+				"certificate %q uses a public key algorithm crypto/x509 does not recognise, so it cannot be verified against the private key; re-issue it with an RSA, ECDSA, Ed25519 or ML-DSA key",
 				subjectForLog(c))
 		} else {
 			msg = fmt.Sprintf(
@@ -1170,8 +1222,8 @@ func (g *certGraph) terminusObservation(terminal, provenOnPath int, extra, kept 
 	if g.selfIssuedByName(terminal) {
 		return Observation{
 			Kind: ObsChainAnchorUnverifiable,
-			Detail: fmt.Sprintf("the chain ends at %q, which names itself as its own issuer, but its self-signature could not be verified here (a corrupt or re-signed certificate, a signature algorithm crypto/x509 refuses such as MD5 or DSA, or a key above this app's verification ceilings); a consumer that validates the chain will reject this anchor%s",
-				subject, leftovers),
+			Detail: fmt.Sprintf("the chain ends at %q, which names itself as its own issuer, but its self-signature could not be verified here (%s): a consumer that validates the chain will reject this anchor%s",
+				subject, unverifiableAnchorReason(g.certs[terminal]), leftovers),
 		}
 	}
 	if len(extra) == 0 {

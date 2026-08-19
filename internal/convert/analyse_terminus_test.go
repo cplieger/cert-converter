@@ -716,9 +716,12 @@ func TestAnalyse_reports_an_unfinished_chain_when_only_the_root_is_absent(t *tes
 // TestAnalyse_reports_a_terminus_whose_self_signature_does_not_verify pins the THIRD
 // terminus fact, the one both absent-anchor kinds mis-stated: the chain ends at a
 // certificate that names ITSELF as its own issuer, so its anchor is PRESENT, but this
-// app could not verify that self-signature (a corrupt or re-signed certificate, an
-// algorithm crypto/x509 refuses such as MD5 or DSA, or a key above the verification
-// ceilings).
+// app could not verify that self-signature.
+//
+// The Detail names WHICH of the candidate causes applies rather than listing them:
+// this fixture leaves the key inside the verification ceilings and the algorithm
+// recognised, so the only remaining explanation is the bit that was flipped, and the
+// diagnostic says so by naming the algorithm the certificate is signed with.
 //
 // Before ObsChainAnchorUnverifiable this shape was reported as
 // ObsChainTrustAnchorAbsent - the INFORMATIONAL kind minted for the normal Caddy/ACME
@@ -772,9 +775,21 @@ func TestAnalyse_reports_a_terminus_whose_self_signature_does_not_verify(t *test
 	if len(got.Chain()) != 1 || got.Chain()[0].SerialNumber.Cmp(big.NewInt(875)) != 0 {
 		t.Fatalf("chain = %v, want the tampered root alone: it is still the leaf's proven issuer", chainSerials(got.Chain()))
 	}
-	if !hasObservation(got.Observations(), convert.ObsChainAnchorUnverifiable) {
-		t.Errorf("observations = %v, want %q: the anchor is present and its self-signature could not be verified",
+	detail, ok := observationDetail(got.Observations(), convert.ObsChainAnchorUnverifiable)
+	if !ok {
+		t.Fatalf("observations = %v, want %q: the anchor is present and its self-signature could not be verified",
 			got.Observations(), convert.ObsChainAnchorUnverifiable)
+	}
+	// The algorithm is the fact that discriminates the causes: naming it rules out
+	// "an algorithm crypto/x509 refuses" for the reader, which the old Detail listed
+	// as an alternative it could not choose against.
+	if !strings.Contains(detail, "it is signed with ECDSA-SHA256") {
+		t.Errorf("%q detail = %q, want it to name the signature algorithm",
+			convert.ObsChainAnchorUnverifiable, detail)
+	}
+	if !strings.Contains(detail, "corrupted or re-signed") {
+		t.Errorf("%q detail = %q, want it to name the remaining explanation",
+			convert.ObsChainAnchorUnverifiable, detail)
 	}
 	if got := convert.ObsChainAnchorUnverifiable.Class(); got != convert.ObservationClassWarning {
 		t.Errorf("ObsChainAnchorUnverifiable.Class() = %q, want %q: a consumer validating the chain will reject this anchor",

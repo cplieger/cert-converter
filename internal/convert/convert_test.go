@@ -6,14 +6,19 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
+	"crypto/mldsa"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/testcerts"
@@ -312,6 +317,39 @@ func TestParsePrivateKey_Ed25519_PKCS8(t *testing.T) {
 	}
 }
 
+// newMLDSAKey generates an ML-DSA-44 key, the parameter set FIPS 204 steers most
+// applications to and the smallest of the three. It lives here rather than in
+// testcerts because this file is its only caller; testcerts holds the fixtures many
+// packages share.
+func newMLDSAKey(tb testing.TB) *mldsa.PrivateKey {
+	tb.Helper()
+
+	key, err := mldsa.GenerateKey(mldsa.MLDSA44())
+	if err != nil {
+		tb.Fatalf("setup: generate an ML-DSA-44 key: %v", err)
+	}
+	return key
+}
+
+// TestParsePrivateKey_MLDSA_PKCS8 pins the ML-DSA arm of the PKCS#8 allowlist.
+// crypto/x509 learned to parse ML-DSA in Go 1.27, so ParsePKCS8PrivateKey started
+// returning a *mldsa.PrivateKey for input the allowlist's default arm then refused
+// — a key every other layer of this app's own pipeline handles (the identity match
+// is duck-typed on Equal, and go-pkcs12 marshals it through
+// x509.MarshalPKCS8PrivateKey like any other).
+func TestParsePrivateKey_MLDSA_PKCS8(t *testing.T) {
+	t.Parallel()
+	keyPEM := testcerts.KeyPEM(t, newMLDSAKey(t))
+
+	parsed, err := convert.ParsePrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("convert.ParsePrivateKey(ML-DSA PKCS8) = error %v, want it accepted", err)
+	}
+	if _, ok := parsed.(*mldsa.PrivateKey); !ok {
+		t.Errorf("convert.ParsePrivateKey(ML-DSA PKCS8) returned %T, want *mldsa.PrivateKey", parsed)
+	}
+}
+
 func TestParsePrivateKey_unparseable_key_data(t *testing.T) {
 	t.Parallel()
 	keyPEM := pem.EncodeToMemory(&pem.Block{
@@ -521,6 +559,85 @@ func TestConvertPair_round_trips_chain_for_every_encoder_profile(t *testing.T) {
 				t.Errorf("convertPairInRoot(%s) CA CN = %q, want %q", name, cas[0].Subject.CommonName, "Test CA")
 			}
 		})
+	}
+}
+
+// TestConvertPair_round_trips_an_MLDSA_chain walks a post-quantum pair through the
+// WHOLE door — parse, identity match, chain analysis, encode, decode — because the
+// ML-DSA arm added to the key allowlist is only worth having if every later layer
+// carries the key too. Each of those layers reaches ML-DSA a different way and none
+// of them names it: the identity match is duck-typed on Equal(crypto.PublicKey),
+// the self-signature check goes through x509.CheckSignature, and go-pkcs12 marshals
+// the key through x509.MarshalPKCS8PrivateKey. Only an end-to-end run witnesses
+// that.
+//
+// modern2023 is the deployed default, and the legacy profiles are covered by the
+// per-profile round-trip above: the profile chooses the KDF and ciphers around the
+// key, not how the key is marshalled, so the key type is orthogonal to it.
+func TestConvertPair_round_trips_an_MLDSA_chain(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+
+	caKey := newMLDSAKey(t)
+	caPEM, caCert := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(9001),
+		Subject:               pkix.Name{CommonName: "ML-DSA Test CA"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, caKey.PublicKey(), nil, caKey)
+
+	leafKey := newMLDSAKey(t)
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(9002),
+		Subject:      pkix.Name{CommonName: "mldsa-leaf.example.com"},
+		NotBefore:    now.Add(-30 * time.Minute),
+		NotAfter:     now.Add(24 * time.Hour),
+	}, leafKey.PublicKey(), caCert, caKey)
+
+	dir := t.TempDir()
+	root, rootErr := os.OpenRoot(dir)
+	if rootErr != nil {
+		t.Fatalf("setup: os.OpenRoot: %v", rootErr)
+	}
+	defer root.Close()
+
+	const rel = "mldsa.pfx"
+	chainPEM := slices.Concat(leafPEM, caPEM)
+	if _, err := convertPairInRoot(t.Context(), chainPEM, testcerts.KeyPEM(t, leafKey),
+		root, rel, "pw", convert.EncNameModern2023); err != nil {
+		t.Fatalf("convertPairInRoot(an ML-DSA pair) = error %v, want nil", err)
+	}
+
+	pfxData, err := os.ReadFile(filepath.Join(dir, rel))
+	if err != nil {
+		t.Fatalf("read the pfx written for an ML-DSA pair: %v", err)
+	}
+	gotKey, leaf, cas, err := pkcs12.DecodeChain(pfxData, "pw")
+	if err != nil {
+		t.Fatalf("decode the pfx written for an ML-DSA pair: %v", err)
+	}
+	back, ok := gotKey.(*mldsa.PrivateKey)
+	if !ok {
+		t.Fatalf("the decoded bundle carries a %T, want *mldsa.PrivateKey", gotKey)
+	}
+	if !back.Equal(leafKey) {
+		t.Error("the decoded private key is not the leaf key that went in")
+	}
+	if leaf.Subject.CommonName != "mldsa-leaf.example.com" {
+		t.Errorf("decoded leaf CN = %q, want %q", leaf.Subject.CommonName, "mldsa-leaf.example.com")
+	}
+	if leaf.SignatureAlgorithm != x509.MLDSA44 || leaf.PublicKeyAlgorithm != x509.MLDSA {
+		t.Errorf("decoded leaf algorithms = (%v, %v), want (%v, %v)",
+			leaf.SignatureAlgorithm, leaf.PublicKeyAlgorithm, x509.MLDSA44, x509.MLDSA)
+	}
+	if len(cas) != 1 {
+		t.Fatalf("the decoded bundle carries %d CA certificate(s), want 1", len(cas))
+	}
+	if cas[0].Subject.CommonName != "ML-DSA Test CA" {
+		t.Errorf("decoded CA CN = %q, want %q", cas[0].Subject.CommonName, "ML-DSA Test CA")
 	}
 }
 

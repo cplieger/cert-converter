@@ -6,6 +6,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -822,6 +823,10 @@ func parsePrivateKeyBlock(block *pem.Block) (crypto.Signer, error) {
 
 	key, pkcs8Err := x509.ParsePKCS8PrivateKey(block.Bytes)
 	if pkcs8Err == nil {
+		// An allowlist, not a crypto.Signer type assertion: every arm here is a key
+		// go-pkcs12 can also ENCODE, so a key type crypto/x509 learns to parse in some
+		// later release is refused at the parse with a diagnostic naming it, rather
+		// than accepted and then failing at the write with the library's own message.
 		switch k := key.(type) {
 		case *rsa.PrivateKey:
 			return k, nil
@@ -829,8 +834,10 @@ func parsePrivateKeyBlock(block *pem.Block) (crypto.Signer, error) {
 			return k, nil
 		case ed25519.PrivateKey:
 			return k, nil
+		case *mldsa.PrivateKey:
+			return k, nil
 		default:
-			return nil, fmt.Errorf("unsupported private key type in PKCS8 container: %T (supported: RSA, ECDSA, Ed25519)", key)
+			return nil, fmt.Errorf("unsupported private key type in PKCS8 container: %T (supported: RSA, ECDSA, Ed25519, ML-DSA)", key)
 		}
 	}
 
