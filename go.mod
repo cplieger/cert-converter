@@ -1,6 +1,6 @@
 module github.com/cplieger/cert-converter
 
-go 1.26.6
+go 1.26.7
 
 require (
 	github.com/cplieger/atomicfile/v2 v2.9.1
