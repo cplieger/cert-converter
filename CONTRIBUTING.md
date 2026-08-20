@@ -23,15 +23,15 @@ mounts, build the scanner, run an initial scan, then hand off to the
 watcher. The real work lives under `internal/`, and the boundary to know
 before adding anything is which package is allowed to JUDGE what:
 
-- **Content** — `internal/convert`. It is the only package outside test
+- **Content**: `internal/convert`. It is the only package outside test
   support that imports `crypto/x509`, `encoding/pem`, `encoding/asn1` or
   `go-pkcs12`; anything that has to understand certificate or bundle
   bytes belongs there and nowhere else.
-- **Names** — `internal/layout` owns the `.crt`/`.key`/`.pfx` pairing
+- **Names**: `internal/layout` owns the `.crt`/`.key`/`.pfx` pairing
   contract.
-- **Filesystem state** — `internal/process` decides what is on disk and
+- **Filesystem state**: `internal/process` decides what is on disk and
   what to do about it.
-- **Startup admission** — `internal/config` decides whether the process
+- **Startup admission**: `internal/config` decides whether the process
   may run at all.
 
 The packages:
@@ -64,7 +64,7 @@ The packages:
   (`ValidatePasswordEncoding`) and the two size bounds `MaxInputBytes`
   and `MaxBundleBytes`. Nothing here touches the filesystem: the bytes
   are handed in and the bundle is handed back.
-- `internal/layout`: the naming contract — `IsCert`, `IsRelevant`,
+- `internal/layout`: the naming contract: `IsCert`, `IsRelevant`,
   `IsOutput`, `KeyFor`, `OutputFor` and `CertForOutput`. The three
   extensions are spelled once, here; `process` and `watch` ask this
   package instead of matching suffixes themselves.
@@ -77,7 +77,7 @@ The packages:
   `/output` for write access through the handle it just proved openable,
   inspecting both volumes before refusing so one attempt names every
   offender.
-- `internal/outputpolicy`: the `OUTPUT_LIFECYCLE` value domain — the
+- `internal/outputpolicy`: the `OUTPUT_LIFECYCLE` value domain, the
   `Lifecycle` type, its `warn`/`sync`/`keep` modes and `ParseLifecycle`.
   A standard-library-only leaf both `config` (which parses the operator's
   raw value) and `process` (which acts on the parsed mode) import, so the
@@ -87,16 +87,16 @@ The packages:
   package's only exported outcome surface), and the package-private
   observation log that de-duplicates per-input warnings across scans.
   `Scanner.Run` walks `/input`, pairs each `*.crt` with its sibling
-  `*.key` (by `internal/layout`'s contract), asks `store.inspect` —
+  `*.key` (by `internal/layout`'s contract), asks `store.inspect`,
   which reads the bundle at the output path and puts it to
-  `Analysis.CheckCurrency` — whether that bundle is the one those inputs
+  `Analysis.CheckCurrency`, whether that bundle is the one those inputs
   produce, and writes PFX files to `/output`, returning a `ScanResult`
   count summary. `reap.go` owns the `OUTPUT_LIFECYCLE` reconciliation,
   including the vetoes that must hold before anything is deleted.
-- `internal/scanbudget`: the `MAX_SCAN_ENTRIES` value domain — the
+- `internal/scanbudget`: the `MAX_SCAN_ENTRIES` value domain, the
   default, the ceiling, `Effective`, the `Counter` a walk charges every
   visited path against, and the operator wording a budget stop carries.
-- `internal/scancadence`: the `FALLBACK_SCAN_HOURS` value domain — the
+- `internal/scancadence`: the `FALLBACK_SCAN_HOURS` value domain, the
   24h `Floor` (the longest this app goes without a full reconciliation of
   `/input` in any configuration), `Effective`, which resolves the running
   cadence from the operator's value, and the coverage attributes every
