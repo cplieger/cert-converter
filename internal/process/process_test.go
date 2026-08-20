@@ -184,7 +184,7 @@ func TestScannerRun_regenerates_pfx_when_output_is_not_a_regular_file(t *testing
 // (root.Stat succeeds, so the pair is not an orphan, while the confined bounded read
 // refuses a non-regular file), which flipped the container unhealthy.
 //
-// That was wrong by the health philosophy both the README and the steering doc state:
+// That was wrong by the health philosophy the README states:
 // health answers only "should an orchestrator restart this container?", and a directory
 // in a key's place -- like a symlink escaping /input, or a permission denial -- is a
 // steady-state layout condition no restart can clear. The old classification made the
