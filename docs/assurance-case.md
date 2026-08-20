@@ -29,7 +29,7 @@ corrupting it, even when fed malformed input, on a least-privilege runtime.
 
 ## Cryptography
 
-Uses Go stdlib `crypto/x509`, `crypto/tls`, and `software.sslmate.com`/stdlib
+Uses Go stdlib `crypto/x509` and `software.sslmate.com`/stdlib
 PKCS#12 handling; no home-grown crypto. Operates on key material but never
 transmits it; output stays on the local filesystem.
 

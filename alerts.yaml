@@ -1,0 +1,198 @@
+# Recommended alert rules for cert-converter. Loki ruler (LogQL) rule group:
+# cert-converter has no metrics endpoint, so ship the container logs to Loki
+# (Grafana Alloy discovers Docker logs with no configuration) and evaluate this
+# group with Loki's ruler; firing alerts deliver through your Alertmanager like
+# any Prometheus alert. Thresholds, the `for:` windows and the severity labels
+# are starting points; adjust the `container` selector (or `job`/`service`, if
+# your log collector sets those instead) to your deployment, and match the
+# degradation window to your FALLBACK_SCAN_HOURS.
+#
+# Every rule keys on a WARN or ERROR record, so the group works at
+# LOG_LEVEL=warn as well as at the info default.
+groups:
+  - name: cert-converter
+    rules:
+      - alert: CertConverterConversionFailed
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |~ `(conversion failed|failed to inspect existing pfx)`
+            != `(shutdown)` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter failed to convert a certificate"
+          description: >
+            A PEM or key parse error, a cert/key mismatch, or a failed PFX write
+            left the affected .pfx stale or missing, and the container is
+            unhealthy until a scan converts everything cleanly. The
+            `!= (shutdown)` filter drops the same messages when they were caused
+            by the container stopping, which are logged at DEBUG. Check /output
+            ownership and permissions for the UID in `user:`, that no symlink is
+            planted at the output path, and the certificate chain.
+      - alert: CertConverterScanAborted
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"} |= `scan aborted before completion` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter aborted a scan before completion"
+          description: >
+            The /input root itself could not be walked (unreadable mount, wrong
+            permissions, or a mid-scan unmount), so the scan returned early and
+            the container is unhealthy. Check the /input mount and its
+            permissions.
+      - alert: CertConverterInputTreeTooLarge
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |= `holds more entries than one scan will enumerate` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter stopped a scan at the /input entry budget"
+          description: >
+            The scan reached MAX_SCAN_ENTRIES (default 10000) and stopped, so
+            every certificate past that point is unconverted and orphan cleanup
+            was skipped for that scan. Health is unaffected, because no restart
+            shrinks the tree, which makes this rule the only signal. Check that
+            /input is mounted at the certificate directory and holds nothing
+            else; if the tree is legitimately this large, raise
+            MAX_SCAN_ENTRIES and the container's memory limit together,
+            because one scan's memory grows with the total length of the paths
+            it enumerates and not only with their number.
+      - alert: CertConverterChangeDetectionDegraded
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |= `change detection scan` |= `mode=poll` [8h]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter is polling instead of watching for changes"
+          description: >
+            No fsnotify watch could be established, so change detection has
+            fallen back to a full rescan every FALLBACK_SCAN_HOURS (default 6h,
+            capped at the 24h reconciliation floor) and a renewal now waits that
+            long to convert. Every poll-mode scan
+            repeats this record, so the alert stands for as long as the
+            degradation does; recovery is logged as `fsnotify recovered,
+            upgrading from poll to watch`. Health is unaffected: a poll scan
+            refreshes the marker exactly like a watch scan. Exhausted inotify
+            instances on the host are the usual cause. Match the window to your
+            FALLBACK_SCAN_HOURS.
+      - alert: CertConverterChangeDetectionDead
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |= `change detection is dead` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "cert-converter lost change detection and is exiting for a restart"
+          description: >
+            The watch loop ended for a reason other than shutdown, so the process
+            exited non-zero to be restarted, and its `error` field names which
+            loss occurred: fsnotify's channels closed under a live container, or
+            the root watch was removed, or fsnotify was unavailable at all, the
+            last two only while FALLBACK_SCAN_HOURS is 0/false, where a restart
+            re-attaches a watch in seconds and the alternative is an entirely
+            unwatched tree until the next reconciliation. Critical rather than
+            warning: with no restart
+            policy the container stays down and every renewal is silently
+            missed. Ensure the deployment restarts it
+            (`restart: unless-stopped`), and if the record carries a
+            `remediation` field naming FALLBACK_SCAN_HOURS, unset it or set it
+            above 0 so the periodic rescan covers or re-attaches the missing
+            watch. Exhausted inotify instances on the host are the usual root
+            cause and are often transient.
+      - alert: CertConverterInputPathUnreachable
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |~ `(paths were unreadable|not be resolved through the input root|skipping cert: cannot)` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter skipped an unreachable /input path"
+          description: >
+            An /input path could not be read, stat'ed, or resolved, so the
+            certificates it holds were not converted and their .pfx files stay
+            stale or absent. Health is unaffected, because no restart clears a
+            permissions or layout condition, which makes this rule the only
+            signal. Repair the permissions for the UID in `user:`, and mount the
+            certificate directory directly instead of linking to it.
+      - alert: CertConverterNoCertificatePairs
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |~ `(no certificate pairs found under the input root|every certificate under the input root is missing its sibling \.key)` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter found no convertible certificate pairs under /input"
+          description: >
+            A scan completed without converting a single `<name>.crt` with a
+            sibling `<name>.key`, so no PFX is produced at all. This is the
+            signature of a wrong or vanished /input mount, of a certbot-style
+            directory of fullchain.pem/privkey.pem this app does not read, or of
+            a key-naming layout that does not match the `<name>.key` contract.
+            Health is unaffected, so this rule is the only signal. Check the
+            /input mount and the .crt/.key filename contract. A fresh deployment
+            legitimately reports this until the first issuance; raise `for:` if
+            that is noisy.
+      - alert: CertConverterOutputCleanupDegraded
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |~ `(stale temp cleanup failed|output temps could not be inspected|inspected during stale temp cleanup)` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter cannot clean up stale /output temp files"
+          description: >
+            The stale-temp sweep aborted at the /output root, could not inspect
+            or unlink temp files left behind by an interrupted atomic write, or
+            could not enter an /output sub-path. Conversions may still succeed,
+            so health is unaffected, while `.atomicfile-*.tmp` files, each
+            holding a private key, accumulate under /output indefinitely. Check
+            /output ownership and permissions for the UID in `user:`.
+      - alert: CertConverterOrphanRemovalDisabled
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |~ `orphan removal is disabled for this scan` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter cannot reap orphaned /output bundles"
+          description: >
+            This scan could not prove an output bundle is orphaned, so it deleted
+            nothing: /input was not fully enumerated, or an /output sub-path could
+            not be read, or the output tree contains a symlink, so the orphan walk
+            could not enumerate all of it, or either tree holds more entries than
+            MAX_SCAN_ENTRIES lets one walk enumerate. Only relevant with
+            `OUTPUT_LIFECYCLE=sync`, where it is the difference between "nothing
+            to reap" and "reaping is off", otherwise indistinguishable because
+            health is unaffected: a `.pfx` whose certificate was removed from
+            /input stays served indefinitely. The record's own `remediation`
+            field names the action for the case that fired.
