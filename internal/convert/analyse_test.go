@@ -446,9 +446,20 @@ func TestAnalyse_reports_an_out_of_window_chain_certificate(t *testing.T) {
 	if len(got.Chain()) != 1 {
 		t.Fatalf("Analyse chain = %d certificate(s), want the expired issuer emitted", len(got.Chain()))
 	}
-	if !hasObservation(got.Observations(), convert.ObsChainCertOutOfWindow) {
-		t.Errorf("observations = %v, want one of kind %q naming the expired issuer",
+	outOfWindow, ok := observationDetail(got.Observations(), convert.ObsChainCertOutOfWindow)
+	if !ok {
+		t.Fatalf("observations = %v, want one of kind %q naming the expired issuer",
 			got.Observations(), convert.ObsChainCertOutOfWindow)
+	}
+	// The position is 1-based and counted against the emitted chain, because that is
+	// the only handle an operator has on WHICH bag of a multi-CA bundle to replace.
+	if want := "chain certificate 1 of 1"; !strings.Contains(outOfWindow, want) {
+		t.Errorf("%s detail = %q, want it to place the certificate as %q",
+			convert.ObsChainCertOutOfWindow, outOfWindow, want)
+	}
+	if !strings.Contains(outOfWindow, "Expired Intermediate") {
+		t.Errorf("%s detail = %q, want it to name the expired issuer",
+			convert.ObsChainCertOutOfWindow, outOfWindow)
 	}
 	if hasObservation(got.Observations(), convert.ObsIdentityExpired) {
 		t.Errorf("observations = %v, want NO %q: the identity itself is inside its window",
@@ -490,6 +501,13 @@ func TestAnalyse_caps_the_subjects_it_names_in_the_exclusion_observation(t *test
 	}
 	if strings.Contains(detail, "extra-4.example.com") || strings.Contains(detail, "extra-5.example.com") {
 		t.Errorf("observation detail = %q, want at most 3 subjects named", detail)
+	}
+	// The named subjects are asserted whole, separators included: the count cap is
+	// only half of what makes this line readable, and a list that runs its subjects
+	// together or opens with a separator is what an operator would have to read.
+	const wantList = `"CN=extra-1.example.com", "CN=extra-2.example.com", "CN=extra-3.example.com" and 2 more`
+	if _, list, found := strings.Cut(detail, "excluded: "); !found || list != wantList {
+		t.Errorf("observation detail = %q, want the excluded subjects rendered as %q", detail, wantList)
 	}
 }
 

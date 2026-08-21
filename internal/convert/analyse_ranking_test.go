@@ -567,3 +567,200 @@ func TestAnalyse_keeps_an_unproven_name_match_from_being_promoted(t *testing.T) 
 		}
 	})
 }
+
+// TestAnalyse_prefers_the_candidate_issuer_closest_to_a_proven_root pins the
+// second-place ranking key: among candidate issuers that all reach a root in this
+// bundle by signature, the one whose proven route is SHORTEST wins. Every existing
+// ranking case decides on the presence of a proven route rather than on its length, so
+// reversing the comparison left the suite green while the emitted chain grew a hop and
+// changed CA.
+//
+// Two same-named CAs compete for the leaf's one hop: one is a root itself, the other
+// hangs a level below a root that is also in the bundle. Neither signed the leaf -- the
+// key that did is not in the file, which is what leaves the hop to the ranking at all --
+// so both are guesses, and the guess that hands the consumer the shortest verifiable
+// route is the one to make.
+func TestAnalyse_prefers_the_candidate_issuer_closest_to_a_proven_root(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	const sharedIssuerCN = "Route Shared Issuer"
+
+	ca := func(serial int64, cn string) *x509.Certificate {
+		return &x509.Certificate{
+			SerialNumber:          big.NewInt(serial),
+			Subject:               pkix.Name{CommonName: cn},
+			NotBefore:             notBefore,
+			NotAfter:              notBefore.Add(72 * time.Hour),
+			IsCA:                  true,
+			BasicConstraintsValid: true,
+			KeyUsage:              x509.KeyUsageCertSign,
+		}
+	}
+
+	// The near candidate: a root in its own right, so its proven route to a root is
+	// zero hops long.
+	nearKey := testcerts.NewECDSAKey(t)
+	nearPEM, nearCert := testcerts.Mint(t, ca(910, sharedIssuerCN), &nearKey.PublicKey, nil, nearKey)
+
+	// The far candidate: the same subject name, one proven hop below a root that is in
+	// the bundle too.
+	rootKey := testcerts.NewECDSAKey(t)
+	rootPEM, rootCert := testcerts.Mint(t, ca(911, "Route Root"), &rootKey.PublicKey, nil, rootKey)
+	farKey := testcerts.NewECDSAKey(t)
+	farPEM, _ := testcerts.Mint(t, ca(912, sharedIssuerCN), &farKey.PublicKey, rootCert, rootKey)
+
+	// A third same-named CA that never enters the bundle, used only so the leaf names
+	// the shared subject as its issuer while the signature over it belongs to a key the
+	// file does not carry: with no proven parent, the hop is decided by the ranking.
+	absentKey := testcerts.NewECDSAKey(t)
+	_, absentCert := testcerts.Mint(t, ca(913, sharedIssuerCN), &absentKey.PublicKey, nil, absentKey)
+	leafKey := testcerts.NewECDSAKey(t)
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(914),
+		Subject:      pkix.Name{CommonName: "route-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, absentCert, absentKey)
+
+	got, err := convert.Analyse(t.Context(),
+		concatPEM(leafPEM, farPEM, rootPEM, nearPEM), testcerts.KeyPEM(t, leafKey))
+	if err != nil {
+		t.Fatalf("Analyse(a leaf between two same-named candidate issuers) = error %v, want nil", err)
+	}
+
+	if len(got.Chain()) != 1 || !bytes.Equal(got.Chain()[0].Raw, nearCert.Raw) {
+		t.Fatalf("chain = %v, want the root-in-its-own-right (serial 910) alone: it reaches a root in zero proven hops where the other needs one",
+			chainSerials(got.Chain()))
+	}
+	if hasObservation(got.Observations(), convert.ObsChainTrustAnchorAbsent) {
+		t.Errorf("observations = %v, want no %q: the emitted chain ends on a self-signed anchor",
+			got.Observations(), convert.ObsChainTrustAnchorAbsent)
+	}
+}
+
+// derFirst returns whichever of two certificates the bundle's last-resort ranking key
+// puts first. It exists so the two tests below can state their expectation as a named
+// fixture rather than as a serial number: the winner is decided by the ENCODING, and a
+// signature's own length varies run to run, so which serial encodes lower is not
+// knowable when the fixture is written.
+func derFirst(a, b *x509.Certificate) *x509.Certificate {
+	if bytes.Compare(a.Raw, b.Raw) < 0 {
+		return a
+	}
+	return b
+}
+
+// TestAnalyse_breaks_a_renewal_tie_on_the_certificate_bytes pins the LAST ranking key
+// of identity selection. Two certificates over one key that are also equal on validity
+// and on NotBefore have nothing left to separate them, and every other renewal case in
+// this file separates them on one of those two -- so without this case the ranking could
+// fall back to input order, and which certificate a PFX is built around would depend on
+// how an operator pasted their bundle together. That is the whole reason the ranking has
+// a third key.
+func TestAnalyse_breaks_a_renewal_tie_on_the_certificate_bytes(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+
+	// An issuer that never enters the bundle, so neither candidate has a chain and
+	// nothing in the graph can prefer one over the other.
+	caKey := testcerts.NewECDSAKey(t)
+	_, caCert := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(920),
+		Subject:               pkix.Name{CommonName: "Tie Absent CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(72 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &caKey.PublicKey, nil, caKey)
+
+	leafKey := testcerts.NewECDSAKey(t)
+	mint := func(serial int64, cn string) (pemBytes []byte, parsed *x509.Certificate) {
+		t.Helper()
+		return testcerts.Mint(t, &x509.Certificate{
+			SerialNumber: big.NewInt(serial),
+			Subject:      pkix.Name{CommonName: cn},
+			NotBefore:    notBefore,
+			NotAfter:     notBefore.Add(24 * time.Hour),
+		}, &leafKey.PublicKey, caCert, caKey)
+	}
+	firstPEM, firstCert := mint(921, "tie-one.example.com")
+	secondPEM, secondCert := mint(922, "tie-two.example.com")
+	want := derFirst(firstCert, secondCert)
+
+	got, err := convert.Analyse(t.Context(), concatPEM(firstPEM, secondPEM), testcerts.KeyPEM(t, leafKey))
+	if err != nil {
+		t.Fatalf("Analyse(two certificates over one key, tied on validity and NotBefore) = error %v, want nil", err)
+	}
+	if !hasObservation(got.Observations(), convert.ObsRenewedCertTie) {
+		t.Fatalf("observations = %v, want %q: without the tie there is no ranking to pin",
+			got.Observations(), convert.ObsRenewedCertTie)
+	}
+	if !bytes.Equal(got.Leaf().Raw, want.Raw) {
+		t.Errorf("Analyse selected %q, want %q: a tie the earlier keys cannot break is settled by the certificate bytes, lower first, so the same two certificates always select the same identity",
+			got.Leaf().Subject.CommonName, want.Subject.CommonName)
+	}
+}
+
+// TestAnalyse_breaks_a_candidate_issuer_tie_on_the_certificate_bytes is the same last
+// resort one layer up, where it decides which CA a consumer is handed rather than which
+// certificate the bundle is built around. Two same-named roots with identical windows
+// tie on every key betterParent has -- validity, proven route, inclusive route, NotAfter
+// -- and the emitted chain must still be the same one every scan, or the app rewrites
+// the bundle on alternating scans and the operator sees a CA that changes by itself.
+func TestAnalyse_breaks_a_candidate_issuer_tie_on_the_certificate_bytes(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	const sharedIssuerCN = "Tie Shared Root"
+
+	root := func(serial int64) (pemBytes []byte, parsed *x509.Certificate) {
+		t.Helper()
+		key := testcerts.NewECDSAKey(t)
+		return testcerts.Mint(t, &x509.Certificate{
+			SerialNumber:          big.NewInt(serial),
+			Subject:               pkix.Name{CommonName: sharedIssuerCN},
+			NotBefore:             notBefore,
+			NotAfter:              notBefore.Add(72 * time.Hour),
+			IsCA:                  true,
+			BasicConstraintsValid: true,
+			KeyUsage:              x509.KeyUsageCertSign,
+		}, &key.PublicKey, nil, key)
+	}
+	onePEM, oneCert := root(930)
+	twoPEM, twoCert := root(931)
+	want := derFirst(oneCert, twoCert)
+
+	// A third same-named root that stays out of the bundle, so the leaf names the shared
+	// subject as its issuer while no candidate in the file can prove it signed the leaf.
+	absentPEMKey := testcerts.NewECDSAKey(t)
+	_, absentCert := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(932),
+		Subject:               pkix.Name{CommonName: sharedIssuerCN},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(72 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &absentPEMKey.PublicKey, nil, absentPEMKey)
+	leafKey := testcerts.NewECDSAKey(t)
+	leafPEM, _ := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber: big.NewInt(933),
+		Subject:      pkix.Name{CommonName: "tie-parent-leaf.example.com"},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(24 * time.Hour),
+	}, &leafKey.PublicKey, absentCert, absentPEMKey)
+
+	got, err := convert.Analyse(t.Context(),
+		concatPEM(leafPEM, onePEM, twoPEM), testcerts.KeyPEM(t, leafKey))
+	if err != nil {
+		t.Fatalf("Analyse(a leaf between two indistinguishable same-named roots) = error %v, want nil", err)
+	}
+	if len(got.Chain()) != 1 {
+		t.Fatalf("chain = %v, want exactly one CA: the other is a rival for the same hop, not a hop of its own",
+			chainSerials(got.Chain()))
+	}
+	if !bytes.Equal(got.Chain()[0].Raw, want.Raw) {
+		t.Errorf("chain[0] = serial %v, want serial %v: a tie no other key can break is settled by the certificate bytes, lower first, so the emitted chain is the same on every scan",
+			got.Chain()[0].SerialNumber, want.SerialNumber)
+	}
+}

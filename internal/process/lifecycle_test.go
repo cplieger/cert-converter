@@ -2787,3 +2787,125 @@ func TestStoreReconcile_keep_is_silent_with_orphans_present(t *testing.T) {
 			" is silent", logs.Messages())
 	}
 }
+
+// TestLoneKeyRemediation_promises_a_reap_only_where_one_can_follow pins the tail the
+// retained-lone-key report appends per mode. Only sync ever removes a bundle, so
+// promising "so the bundle can be reaped" under warn or keep has the operator finish a
+// change under /input for an outcome that cannot follow, and withholding it under sync
+// leaves them thinking the leftover is permanent. The prefix is shared and asserted
+// with it, because the sentence has to read as one instruction either way.
+func TestLoneKeyRemediation_promises_a_reap_only_where_one_can_follow(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		mode outputpolicy.Lifecycle
+		want string
+	}{
+		{
+			mode: outputpolicy.LifecycleSync,
+			want: "finish the change under /input: add the matching <name>.crt, or remove the leftover <name>.key so the bundle can be reaped",
+		},
+		{
+			mode: outputpolicy.LifecycleWarn,
+			want: "finish the change under /input: add the matching <name>.crt, or remove the leftover <name>.key; OUTPUT_LIFECYCLE=warn never removes a bundle, so this one is kept either way",
+		},
+		{
+			mode: outputpolicy.LifecycleKeep,
+			want: "finish the change under /input: add the matching <name>.crt, or remove the leftover <name>.key; OUTPUT_LIFECYCLE=keep never removes a bundle, so this one is kept either way",
+		},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			t.Parallel()
+			if got := loneKeyRemediation(tc.mode); got != tc.want {
+				t.Errorf("loneKeyRemediation(%q) = %q, want %q", tc.mode, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestScannerRun_stays_quiet_when_the_shutdown_arrives_during_the_input_walk pins how
+// the reap gate learns that an incomplete enumeration was a SHUTDOWN rather than a
+// broken /input tree. The sibling above cancels during reconciliation, where the walk
+// finished cleanly, and walk_log_policy_test's case hands the gate that fact ready-made;
+// neither exercises the derivation, so a scan stopping at SIGTERM could start emitting
+// the operator-actionable orphan-removal-disabled WARN -- the record the README's
+// CertConverterOrphanRemovalDisabled alert keys on -- on every container stop, with a
+// remediation pointing at a mount that is fine. Serial: it swaps slog.Default.
+func TestScannerRun_stays_quiet_when_the_shutdown_arrives_during_the_input_walk(t *testing.T) {
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+	writeSelfSignedPair(t, certsRoot, "live")
+	scanner := New(&Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+		Lifecycle: outputpolicy.LifecycleSync,
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	logs := captureLogs(t)
+
+	if _, err := scanner.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run(a context already cancelled) error = %v, want context.Canceled", err)
+	}
+
+	if got := logs.CountLevel(slog.LevelWarn, ""); got != 0 {
+		t.Errorf("Run(shutdown during the input walk) logged %d WARN record(s) (%q), want 0: a container stop is not an operator-actionable incomplete enumeration",
+			got, logs.Messages())
+	}
+	const dbg = "skipping orphan reconciliation; scan cancelled during shutdown"
+	if got := logs.CountLevel(slog.LevelDebug, dbg); got != 1 {
+		t.Errorf("Run(shutdown during the input walk) logged %q, want %q once at Debug", logs.Messages(), dbg)
+	}
+}
+
+// TestStoreInspect_reads_a_prior_at_the_readable_bound pins the accepting side of the
+// bound the sibling above pins the refusing side of. maxPFXSize is the largest prior
+// bundle this app READS, so a bundle of exactly that size has to be read and compared;
+// refusing it makes the bound one byte smaller than it is documented as, and the app
+// then rewrites that bundle on every scan for ever while telling the operator their
+// output is too large to read.
+//
+// The read is stubbed rather than allowed to run so the fixture stays sparse: the gate
+// under test is the size compare, and a real read here would allocate the whole bound.
+// Runs serially: it swaps slog.Default() and the read seam.
+func TestStoreInspect_reads_a_prior_at_the_readable_bound(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.OpenFile(filepath.Join(dir, "bound.pfx"), os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("setup: OpenFile: %v", err)
+	}
+	// Sparse: no bytes are written, only the reported size reaches the bound.
+	if err := f.Truncate(maxPFXSize); err != nil {
+		t.Fatalf("setup: Truncate: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("setup: Close: %v", err)
+	}
+	s := newOutputStore(t, dir)
+
+	attempted := false
+	prevRead := readBoundedInRoot
+	readBoundedInRoot = func(context.Context, *os.Root, string, int64) ([]byte, error) {
+		attempted = true
+		return nil, errors.New("stubbed read")
+	}
+	t.Cleanup(func() { readBoundedInRoot = prevRead })
+
+	logs := captureLogs(t)
+	current, err := inspectCurrent(t.Context(), s, "bound.pfx", convert.Analysis{}, convert.EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("inspect(a prior at the readable bound) = error %v, want nil", err)
+	}
+	if current {
+		t.Error("inspect(a prior at the readable bound) = true, want false: the stubbed read resolves nothing")
+	}
+	if !attempted {
+		t.Errorf("inspect(a prior of exactly %d bytes) never read it: a bundle AT the bound is inside it", maxPFXSize)
+	}
+	if sizeMsg := "prior pfx exceeds the readable bound"; logs.Contains(sizeMsg) {
+		t.Errorf("inspect(a prior of exactly %d bytes) logged %q, want no size-bound notice: that size is the largest this app reads, not the smallest it refuses",
+			maxPFXSize, sizeMsg)
+	}
+}

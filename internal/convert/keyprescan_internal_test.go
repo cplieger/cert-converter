@@ -1035,3 +1035,89 @@ func TestDerIntegerBits_reports_no_size_for_a_value_that_is_not_one(t *testing.T
 		})
 	}
 }
+
+// TestParsePrivateKeyBlock_admits_a_key_at_the_prime_factor_ceiling pins the accepting
+// side of the factor bound. maxRSAPrimeFactors is the most factors this app is willing
+// to READ, so a key declaring exactly that many has to reach the parser: refusing it
+// makes the ceiling one lower than the diagnostic states, and the operator is told
+// their key declares "more than 64" factors when it declares 64.
+//
+// The count is two base primes plus the collection, which is where the off-by-one would
+// hide -- rsaOtherPrimeInfos is handed a limit derived from the count so far, so an
+// error either side of it lands on this fixture and on no other in this file.
+func TestParsePrivateKeyBlock_admits_a_key_at_the_prime_factor_ceiling(t *testing.T) {
+	t.Parallel()
+	one := big.NewInt(1)
+	extras := make([]otherPrimeInfoDER, maxRSAPrimeFactors-2)
+	for i := range extras {
+		extras[i] = otherPrimeInfoDER{Prime: big.NewInt(3), Exponent: one, Coefficient: one}
+	}
+	der, err := asn1.Marshal(multiPrimeKeyDER{
+		Version: 1,
+		N:       big.NewInt(196611), E: big.NewInt(65537), D: one, P: one, Q: one,
+		Dp: one, Dq: one, Qinv: one,
+		OtherPrimeInfos: extras,
+	})
+	if err != nil {
+		t.Fatalf("setup: marshal multi-prime PKCS#1 key: %v", err)
+	}
+
+	_, err = parsePrivateKeyBlock(&pem.Block{Type: pemTypeRSAPrivateKey, Bytes: der})
+	if err == nil {
+		t.Fatalf("parsePrivateKeyBlock(a key declaring exactly %d prime factors) = nil error, want the parser's own refusal of a key whose integers are not a key",
+			maxRSAPrimeFactors)
+	}
+	if want := "RSA prime factors"; strings.Contains(err.Error(), want) {
+		t.Errorf("parsePrivateKeyBlock(a key declaring exactly %d prime factors) = %q, want NO refusal naming %q: that count is the most this app reads, not the first it refuses",
+			maxRSAPrimeFactors, err.Error(), want)
+	}
+}
+
+// TestParsePrivateKeyBlock_keeps_measuring_after_the_factor_count_saturates pins what
+// the factor count's SATURATION is allowed to stop. Once the count is at its ceiling
+// the walk stops counting, because every further element measured is
+// attacker-controlled work bought for a number no caller reads -- but the SIZE ceiling
+// is a separate refusal with a separate reason, and a walk that stopped early would
+// hand crypto/rsa's precompute exactly the oversized integer the size bound exists to
+// keep away from it.
+//
+// The trailing INTEGER after the collection is not PKCS#1's shape, and that is the
+// point: the walk reads what the FILE contains, so a file that puts its oversized
+// integer where a saturated walk would stop reading is the shape to refuse.
+func TestParsePrivateKeyBlock_keeps_measuring_after_the_factor_count_saturates(t *testing.T) {
+	t.Parallel()
+	one := big.NewInt(1)
+	extras := make([]otherPrimeInfoDER, maxRSAPrimeFactors-2)
+	for i := range extras {
+		extras[i] = otherPrimeInfoDER{Prime: big.NewInt(3), Exponent: one, Coefficient: one}
+	}
+	const oversizedBits = maxVerifiableKeyBits + 1
+	der, err := asn1.Marshal(struct {
+		Version         int
+		N, E, D, P, Q   *big.Int
+		Dp, Dq, Qinv    *big.Int
+		OtherPrimeInfos []otherPrimeInfoDER
+		Trailing        *big.Int
+	}{
+		Version: 1,
+		N:       big.NewInt(196611), E: big.NewInt(65537), D: one, P: one, Q: one,
+		Dp: one, Dq: one, Qinv: one,
+		OtherPrimeInfos: extras,
+		Trailing:        new(big.Int).Lsh(one, oversizedBits-1),
+	})
+	if err != nil {
+		t.Fatalf("setup: marshal multi-prime PKCS#1 key with a trailing integer: %v", err)
+	}
+
+	_, err = parsePrivateKeyBlock(&pem.Block{Type: pemTypeRSAPrivateKey, Bytes: der})
+	if err == nil {
+		t.Fatalf("parsePrivateKeyBlock(a saturated factor count followed by a %d-bit integer) = nil error, want the size refusal",
+			oversizedBits)
+	}
+	for _, want := range []string{"16385-bit RSA integer", "16384-bit ceiling"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("parsePrivateKeyBlock(a saturated factor count followed by a %d-bit integer) = %q, want it to contain %q: the count stops counting, the size keeps measuring",
+				oversizedBits, err.Error(), want)
+		}
+	}
+}

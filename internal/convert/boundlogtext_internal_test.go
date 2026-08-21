@@ -381,3 +381,118 @@ func TestParseCertChain_bounds_the_pem_label_it_names(t *testing.T) {
 		t.Errorf("parseCertChain error is %d bytes, want the label bounded before it reaches the log", len(err.Error()))
 	}
 }
+
+// TestParsePrivateKey_decodes_an_identifier_exactly_at_the_ceiling pins the other side
+// of the three bounds above, which every fixture in this file overshoots by three
+// orders of magnitude: maxOIDBytes is the largest identifier this app is willing to
+// DECODE, not the smallest it refuses. A ceiling that refuses its own value turns a
+// key carrying a long-but-legitimate algorithm or curve identifier into an unreadable
+// one, and the diagnostic then blames an allocation bound the operator cannot act on
+// while the real cause -- an algorithm or curve this app does not implement -- goes
+// unsaid.
+func TestParsePrivateKey_decodes_an_identifier_exactly_at_the_ceiling(t *testing.T) {
+	t.Parallel()
+
+	// An identifier whose content is exactly maxOIDBytes bytes: one arc per byte, so
+	// the value stays a decodable identifier rather than a shape asn1 would reject for
+	// its own reasons.
+	atCeiling := func(t *testing.T) []byte {
+		t.Helper()
+		return testASN1Marshal(t, asn1.RawValue{Tag: asn1.TagOID, Bytes: bytes.Repeat([]byte{0x01}, maxOIDBytes)})
+	}
+	sec1AtCeiling := func(t *testing.T, curve []byte) []byte {
+		t.Helper()
+		return testASN1Marshal(t, struct {
+			Version    int
+			PrivateKey []byte
+			Parameters asn1.RawValue
+		}{
+			Version:    1,
+			PrivateKey: bytes.Repeat([]byte{0x02}, 32),
+			Parameters: asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: 0, IsCompound: true, Bytes: curve},
+		})
+	}
+
+	for _, tc := range []struct {
+		name    string
+		label   string
+		wantErr bool
+		der     func(*testing.T) []byte
+	}{
+		{
+			name:    "pkcs8 algorithm identifier",
+			label:   "PRIVATE KEY",
+			wantErr: true,
+			der: func(t *testing.T) []byte {
+				t.Helper()
+				return testASN1Marshal(t, struct {
+					Version    int
+					Algo       asn1.RawValue
+					PrivateKey []byte
+				}{Algo: asn1.RawValue{Tag: asn1.TagSequence, IsCompound: true, Bytes: atCeiling(t)}, PrivateKey: []byte{}})
+			},
+		},
+		{
+			name:    "pkcs8 algorithm parameters identifier",
+			label:   "PRIVATE KEY",
+			wantErr: true,
+			der: func(t *testing.T) []byte {
+				t.Helper()
+				return testASN1Marshal(t, struct {
+					Version    int
+					Algo       asn1.RawValue
+					PrivateKey []byte
+				}{
+					Algo: asn1.RawValue{Tag: asn1.TagSequence, IsCompound: true, Bytes: append(
+						testASN1Marshal(t, oidECPublicKey), atCeiling(t)...,
+					)},
+					PrivateKey: []byte{},
+				})
+			},
+		},
+		{
+			name:    "sec1 curve identifier",
+			label:   "EC PRIVATE KEY",
+			wantErr: true,
+			der:     func(t *testing.T) []byte { t.Helper(); return sec1AtCeiling(t, atCeiling(t)) },
+		},
+		{
+			// The inner identifier of a PKCS#8 EC container, which only the PKCS#8
+			// unwrap in oversizedSEC1CurveOIDError measures -- and the one arm of that
+			// function where a top-level identifier AT the ceiling cannot stand in,
+			// because the unwrap overwrites the top-level measurement before the
+			// refusal is decided. x509 takes the curve from the AlgorithmIdentifier and
+			// discards this one, so an ordinary P-256 key is what comes back: the
+			// ceiling must not turn a usable key into an unreadable one.
+			name:  "sec1 curve identifier inside pkcs8",
+			label: "PRIVATE KEY",
+			der: func(t *testing.T) []byte {
+				t.Helper()
+				return testASN1Marshal(t, struct {
+					Version    int
+					Algo       asn1.RawValue
+					PrivateKey []byte
+				}{
+					Algo: asn1.RawValue{Tag: asn1.TagSequence, IsCompound: true, Bytes: append(
+						testASN1Marshal(t, oidECPublicKey),
+						testASN1Marshal(t, asn1.ObjectIdentifier{1, 2, 840, 10045, 3, 1, 7})...,
+					)},
+					PrivateKey: sec1AtCeiling(t, atCeiling(t)),
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := ParsePrivateKey(pem.EncodeToMemory(&pem.Block{Type: tc.label, Bytes: tc.der(t)}))
+			if (err != nil) != tc.wantErr {
+				t.Errorf("ParsePrivateKey(a %s of exactly %d bytes) = error %v, want an error: %t",
+					tc.name, maxOIDBytes, err, tc.wantErr)
+			}
+			if want := "ceiling this app decodes an identifier at"; err != nil && strings.Contains(err.Error(), want) {
+				t.Errorf("ParsePrivateKey(a %s of exactly %d bytes) = %q, want NO refusal naming %q: the ceiling is the largest identifier this app decodes, so its own value is inside the bound",
+					tc.name, maxOIDBytes, err.Error(), want)
+			}
+		})
+	}
+}
