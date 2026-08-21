@@ -6,7 +6,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cplieger/cert-converter/internal/logtext"
-	"github.com/cplieger/runesafe"
+	"github.com/cplieger/runesafe/v2"
 )
 
 // TestMarker pins the exact wording. It is an operator's query key for a cut record

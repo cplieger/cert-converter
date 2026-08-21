@@ -10,7 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cplieger/cert-converter/internal/logtext"
-	"github.com/cplieger/runesafe"
+	"github.com/cplieger/runesafe/v2"
 )
 
 // TestBoundLogText_applies_the_runesafe_single_line_policy pins the policy
