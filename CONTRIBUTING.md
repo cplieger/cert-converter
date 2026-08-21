@@ -12,35 +12,111 @@ volumes plus a file-based health marker.
 
 Note the name split: the repo and image are `cert-converter`, but the Go
 module and built binary are `cert-watcher` (`module
-github.com/cplieger/cert-converter` in `go.mod`). Build output and the
-`health` subcommand both use the `cert-watcher` name.
+github.com/cplieger/cert-converter` in `go.mod`). Build output and both
+subcommands (`cert-watcher watch`, `cert-watcher health`) use the
+`cert-watcher` name.
 
 ## Package layout
 
-`main.go` is wiring only: load config, build the scanner, run an initial
-scan, then hand off to the watcher. The real work lives under
-`internal/`:
+`main.go` is wiring only: install the logger, load config, verify the
+mounts, build the scanner, run an initial scan, then hand off to the
+watcher. The real work lives under `internal/`, and the boundary to know
+before adding anything is which package is allowed to JUDGE what:
 
-- `internal/config`: parses `PFX_PASSWORD`, `PFX_ENCODER`, and
-  `FALLBACK_SCAN_HOURS` from the environment. `PickEncoder` maps the
-  encoder name to a `go-pkcs12` encoder; unknown values warn and fall
-  back to `modern2023`.
-- `internal/convert`: PEM parsing (`ParseCertChain`, `ParsePrivateKey`),
-  PFX encoding (`ToPFX`), and the SHA-256 `HashCache` for
-  skip-unchanged detection. `types.go` holds the `CertPair` /
-  `ConversionResult` value types.
-- `internal/process`: orchestration. `Scanner.Run` walks `/input`,
-  pairs each `*.crt` with its sibling `*.key`, consults the cache, and
-  writes PFX files to `/output`, returning a `ScanResult` count summary.
-- `internal/watch`: fsnotify watch loop with a debounce window and a
-  periodic full-scan fallback. Falls back to polling (with periodic
+- **Content**: `internal/convert`. It is the only package outside test
+  support that imports `crypto/x509`, `encoding/pem`, `encoding/asn1` or
+  `go-pkcs12`; anything that has to understand certificate or bundle
+  bytes belongs there and nowhere else.
+- **Names**: `internal/layout` owns the `.crt`/`.key`/`.pfx` pairing
+  contract.
+- **Filesystem state**: `internal/process` decides what is on disk and
+  what to do about it.
+- **Startup admission**: `internal/config` decides whether the process
+  may run at all.
+
+The packages:
+
+- `internal/config`: parses `PFX_PASSWORD` (or `PFX_PASSWORD_FILE`, via
+  `envx.Secret`), `PFX_ALLOW_EMPTY_PASSWORD`, `PFX_ENCODER`,
+  `FALLBACK_SCAN_HOURS`, `MAX_SCAN_ENTRIES`, and `LOG_LEVEL` (via
+  `config.LogLevel`, exported
+  separately from `Load` so `main` can install the logger before the
+  config load emits its own WARN lines) from the environment, then
+  delegates encoder selection to `convert.EncoderName` (an unknown
+  `PFX_ENCODER` value warns here and falls back to `modern2023`).
+  Every configuration WARN except the invalid-`LOG_LEVEL` one is emitted
+  during `Load` (directly or through its helpers), once per process start;
+  that one belongs to `main`, which must install the logger before `Load`
+  runs. The reusable readers `config.FallbackInterval`, `config.MaxScanEntries`
+  and `config.LogLevel`
+  keep their parsing silent because they are called outside `Load` (the first
+  by the `health` subcommand, where a WARN would repeat on every healthcheck).
+- `internal/convert`: certificate and bundle content judgement. `Analyse`
+  parses a PEM chain and its private key, matches them, and returns an
+  `Analysis` plus the observations the scan logs; `Analysis.Encode`
+  produces the PKCS#12 bytes and `Analysis.CheckCurrency` decides whether
+  a bundle already on disk is the one those inputs produce. The parsers
+  are package-internal and reached through `Analyse` (they are exposed to
+  the package's own tests via `export_test.go`). The encoder-profile
+  mapping is here too (`EncoderName` normalizes the value and reports
+  whether it was recognized, `EncoderNames` and `ProtectionOf` carry the
+  profile table), along with the PKCS#12 password-encoding check
+  (`ValidatePasswordEncoding`) and the two size bounds `MaxInputBytes`
+  and `MaxBundleBytes`. Nothing here touches the filesystem: the bytes
+  are handed in and the bundle is handed back.
+- `internal/layout`: the naming contract: `IsCert`, `IsRelevant`,
+  `IsOutput`, `KeyFor`, `OutputFor` and `CertForOutput`. The three
+  extensions are spelled once, here; `process` and `watch` ask this
+  package instead of matching suffixes themselves.
+- `internal/logtext`: the log-attribute gate. `Path` sanitizes any
+  filesystem-derived string headed for a log attribute and `Cap` bounds
+  one, so a certificate name cannot reorder or split a record. The raw
+  `rel` is what filesystem decisions keep using.
+- `internal/mounts`: the startup mount check. `Verify` proves `/input`
+  and `/output` exist as directories the running UID can open and probes
+  `/output` for write access through the handle it just proved openable,
+  inspecting both volumes before refusing so one attempt names every
+  offender.
+- `internal/outputpolicy`: the `OUTPUT_LIFECYCLE` value domain, the
+  `Lifecycle` type, its `warn`/`sync`/`keep` modes and `ParseLifecycle`.
+  A standard-library-only leaf both `config` (which parses the operator's
+  raw value) and `process` (which acts on the parsed mode) import, so the
+  configuration layer does not sit above the orchestrator.
+- `internal/process`: orchestration, plus `types.go` holding the
+  package-private `conversionStatus` outcome enum (`ScanResult` is the
+  package's only exported outcome surface), and the package-private
+  observation log that de-duplicates per-input warnings across scans.
+  `Scanner.Run` walks `/input`, pairs each `*.crt` with its sibling
+  `*.key` (by `internal/layout`'s contract), asks `store.inspect`,
+  which reads the bundle at the output path and puts it to
+  `Analysis.CheckCurrency`, whether that bundle is the one those inputs
+  produce, and writes PFX files to `/output`, returning a `ScanResult`
+  count summary. `reap.go` owns the `OUTPUT_LIFECYCLE` reconciliation,
+  including the vetoes that must hold before anything is deleted.
+- `internal/scanbudget`: the `MAX_SCAN_ENTRIES` value domain, the
+  default, the ceiling, `Effective`, the `Counter` a walk charges every
+  visited path against, and the operator wording a budget stop carries.
+- `internal/scancadence`: the `FALLBACK_SCAN_HOURS` value domain, the
+  24h `Floor` (the longest this app goes without a full reconciliation of
+  `/input` in any configuration), `Effective`, which resolves the running
+  cadence from the operator's value, and the coverage attributes every
+  cadence-bearing record carries.
+- `internal/watch`: fsnotify watch loop with a debounce window, a periodic
+  full-scan safety net (the `FALLBACK_SCAN_HOURS` cadence, or the 24h
+  reconciliation floor that stands in for it) and a deferred watch-set repair on
+  its own bounded schedule. Falls back to polling (with periodic
   upgrade attempts) when fsnotify is unavailable.
 - `internal/testcerts`: test-only helpers that generate certificates;
   imported only from `_test.go`.
 
 Data flow: `watch` detects a change and invokes the `onChange` callback
 wired in `main.go`, which calls `Scanner.Run`. The scan result drives the
-health marker (any failure clears it; a clean cycle sets it).
+health marker through `healthyAfterScan`: a conversion failure, or a scan that
+could not walk `/input` at all, clears it, and a cycle with neither sets it.
+Read-side conditions (an unreadable sub-path, an unresolvable symlink, an
+`/input` tree over `MAX_SCAN_ENTRIES`, a refused output permission repair) are
+warned about and deliberately leave the marker alone, because no restart clears
+them.
 
 ## Conventions and gotchas
 
@@ -51,14 +127,28 @@ health marker (any failure clears it; a clean cycle sets it).
 - **Paths are hardcoded on purpose.** `/input` and `/output` are
   constants in `main.go`, not env vars. Don't add env knobs for them;
   the container contract relies on the fixed mounts.
-- **Reads are bounded.** Cert/key reads go through
-  `convert.ReadFileWithLimit` / the cache hasher with a 10 MB cap
-  (`MaxFileSize`). PFX writes are atomic (temp + rename) via
-  `cplieger/atomicfile`. Keep new file I/O on these helpers.
-- **The watcher loop and poll fallback are not unit-tested.** They are
-  event-driven I/O paths validated by the Docker healthcheck in
-  production. Logic worth testing belongs in `config`, `convert`, or
-  `process`, not in `watch`.
+- **Reads are bounded and confined.** Cert/key reads go through
+  `atomicfile.ReadBoundedInRoot` (`internal/process`'s `source.go`), which opens
+  each file through the `/input` `*os.Root` and reads it under the 10 MB cap
+  (`convert.MaxInputBytes`), so a symlink
+  planted in the watched tree cannot redirect the read outside it. The scanner
+  reads each input once and derives the pair's fingerprint from those bytes
+  (`pairFingerprint`), so nothing re-reads a file just to hash it. PFX writes are
+  atomic (temp + rename) via `cplieger/atomicfile`. Keep new file I/O on these helpers.
+- **The watch loop and its polling fallback are unit-tested.** `newFSWatcher` is
+  the construction seam the tests swap to make fsnotify "unavailable", so the
+  poll mode, its periodic upgrade attempt, and the handback to watch mode are all
+  covered along with `Run` end to end (`watch_run_test.go`), `watchLoop`'s
+  `select` over a real cert write and a dead watcher (`watch_loop_test.go`), the
+  poll tick and its upgrade handoff (`watch_poll_test.go`), event classification
+  (`handleFsEvent`), watch-set construction (`addWatchDirs`),
+  the per-arm receive helpers (`handleEventRecv`, `handleErrorRecv`,
+  `handleSafetyNetTick`), the channel-closed-vs-shutdown translation
+  (`lostOrShutdown`), the mode records (`watch_mode_record_test.go`), the
+  deferred watch-set repair (`watch_repair_test.go`) and the
+  debounce/safety-net/repair timer accounting
+  (`watchState`, under `testing/synctest`). New logic in this package follows
+  the same shape: put it in a helper the loop calls, and test the helper.
 - **Health is a file marker, not a probe endpoint.** A successful cycle
   writes the marker; `/cert-watcher health` exits 0 if it exists. There
   is no port to bind.
@@ -86,8 +176,9 @@ golangci-lint fmt
 
 Tests are property-based ([rapid](https://github.com/flyingmutant/rapid))
 plus table-driven, and there are fuzz targets in `internal/convert`
-(`fuzz_parse_test.go`). Run a fuzz target directly when touching the
-parsers:
+(PEM and key parsing, bundle analysis, password-encoding classification, and
+log-text bounding), `internal/config`, and `internal/outputpolicy`. Run a fuzz
+target directly when touching a parser or a value domain:
 
 ```sh
 go test ./internal/convert -run '^$' -fuzz FuzzParseCertChain -fuzztime 30s

@@ -1,0 +1,279 @@
+package process
+
+import (
+	"context"
+	"io/fs"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/layout"
+	"github.com/cplieger/cert-converter/internal/logtext"
+	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/slogx/capture"
+)
+
+// hostileStem is a certificate name carrying one rune from each of the two classes
+// that make an untrusted filename a record-LEGIBILITY problem: LF ends a record for any
+// sink that reads a logfmt line back unquoted, so a name holding one splits one record
+// into two, and U+202E (RIGHT-TO-LEFT OVERRIDE) reorders everything after it in the
+// rendered line, so a name holding one can make an operator read a different path than
+// the record names.
+//
+// Neither is a forged record under the handlers this app configures: slogx.Setup's
+// TextHandler quotes a value holding a control or a bidi rune, so an ungated LF already
+// arrives as `\n` on one line. What the gate buys is handler-INDEPENDENCE — slog's
+// JSONHandler emits a bidi override raw — and an attribute value that stays single-line
+// and reorder-free wherever the record is read.
+//
+// Both are legal bytes in a POSIX filename, and BOTH mounted trees are untrusted: this
+// is a public image, so /input and /output are whatever a stranger points them at and a
+// co-writer on either one chooses the names this app enumerates.
+const hostileStem = "hostile\n\u202egone"
+
+// unsafeInAttribute is the set hostileStem is built from, for the batch-wide sweep
+// below. Not the whole runesafe policy — that is runesafe's own exhaustive
+// every-rune sweep to pin — just the two classes this test injects.
+var unsafeInAttribute = []string{"\n", "\r", "\u202e"}
+
+// TestScannerRun_sanitizes_walk_supplied_names_in_log_attributes is the oracle for the
+// path-attribute-runesafe-adoption decision: every filesystem-derived string headed for
+// a log attribute is sanitized AT THE LOG BOUNDARY, and only there.
+//
+// It runs the REAL scan over a real /input tree rather than calling logtext.Path
+// directly, because the point of the decision is the WIRING: a gate that exists and is
+// not reached at the walk's own emit sites leaves the records it was adopted for
+// ungated. So the name under test is supplied by this app's own walk, travels through
+// pairing, conversion and the atomic write, and is asserted where it actually reaches an
+// operator.
+//
+// Three properties, and the second two are what stop an over-broad fix passing:
+//
+//   - A hostile name is REWRITTEN in the attribute: neither injected rune survives
+//     anywhere in the batch.
+//   - An ordinary name is BYTE-IDENTICAL. Sanitizing is a no-op for every ASCII and
+//     domain-derived name, which is why adopting it moved no operator's log query key;
+//     a fix that escaped, quoted or truncated instead would fail here.
+//   - The bundle is on disk under the RAW name. `rel` stays raw for every filesystem
+//     decision, so the gate must sit at the slog call and nowhere upstream of it — a
+//     sanitized value used for an open, a join or a map key would publish the bundle at
+//     a name no consumer asked for.
+//
+// Runs serially: it swaps slog.Default().
+func TestScannerRun_sanitizes_walk_supplied_names_in_log_attributes(t *testing.T) {
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+
+	// The subject is the FILENAME, so both certificates carry an ordinary CN:
+	// certificate-derived text has its own gate (internal/convert's boundLogText) and a
+	// hostile subject here would let that gate satisfy this test.
+	ordinaryCert, ordinaryKey := testcerts.GenerateSelfSignedCert(t, "ordinary.example.com", "ecdsa")
+	writePair(t, certsRoot, "ordinary", ordinaryCert, ordinaryKey)
+	hostileCert, hostileKey := testcerts.GenerateSelfSignedCert(t, "hostile.example.com", "ecdsa")
+	writePair(t, certsRoot, hostileStem, hostileCert, hostileKey)
+
+	logs := captureLogs(t)
+	scanner := New(&Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+	})
+
+	res, err := scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run = %v, want nil", err)
+	}
+	// Both pairs must actually convert, or the records under test never came from the
+	// walk and every assertion below would pass vacuously.
+	if res.Converted != 2 || res.Failed != 0 {
+		t.Fatalf("Run = %+v, want Converted 2 and Failed 0: an unconverted pair emits no wrote-pfx record", res)
+	}
+
+	rawOut := layout.OutputFor(hostileStem + ".crt")
+	wantSanitized := logtext.Path(rawOut)
+	if wantSanitized == rawOut {
+		t.Fatalf("the fixture name %q survives sanitizing unchanged, so this test asserts nothing", rawOut)
+	}
+
+	// The hostile name reaches the operator rewritten, and the raw spelling appears in
+	// no attribute of the record.
+	if !logs.HasAttr("wrote pfx", "path", wantSanitized) {
+		t.Errorf("wrote-pfx paths = %q, want the hostile output name sanitized to %q",
+			logs.AttrValuesExact("wrote pfx", "path"), wantSanitized)
+	}
+	// The ordinary name is untouched: same helper, same call site, no rewriting.
+	if !logs.HasAttr("wrote pfx", "path", "ordinary.pfx") {
+		t.Errorf("wrote-pfx paths = %q, want the ordinary name %q byte-identical",
+			logs.AttrValuesExact("wrote pfx", "path"), "ordinary.pfx")
+	}
+
+	assertNoUnsafeRunesInAttributes(t, logs)
+
+	// The gate is at the LOG call, not upstream of it: the bundle is published under the
+	// raw name the walk supplied, so a consumer resolving <name>.pfx beside <name>.crt
+	// still finds it.
+	rawPath := filepath.Join(outRoot, rawOut)
+	if _, statErr := os.Lstat(rawPath); statErr != nil {
+		t.Errorf("Lstat(%q) = %v, want the bundle published under the RAW name: sanitizing must not reach a filesystem decision",
+			rawOut, statErr)
+	}
+	if _, statErr := os.Lstat(filepath.Join(outRoot, wantSanitized)); statErr == nil {
+		t.Errorf("a bundle exists at the SANITIZED name %q: the gate leaked past the log boundary into the write path", wantSanitized)
+	}
+}
+
+// assertNoUnsafeRunesInAttributes sweeps every attribute of every record in the batch.
+// It is deliberately wider than the two records asserted above: the decision covers
+// EVERY filesystem-derived log attribute, and this app names the same walk-supplied
+// path in a dozen places (the pairing lines, the currency lines, the orphan walk, the
+// summary's error), so a fix applied to the one site a test names is exactly the
+// partial adoption that leaves the rest ungated.
+//
+// A clean two-pair scan carries no legitimate CR, LF or bidi control in any attribute,
+// so any hit is the fixture's own name arriving raw.
+func assertNoUnsafeRunesInAttributes(t *testing.T, logs *capture.Recorder) {
+	t.Helper()
+	for _, rec := range logs.Records() {
+		rec.Attrs(func(a slog.Attr) bool {
+			checkAttrValue(t, rec.Message, a.Key, a.Value)
+			return true
+		})
+	}
+}
+
+// checkAttrValue reports an unsafe rune in one attribute value, descending into a group
+// so a nested attribute cannot hide one.
+func checkAttrValue(t *testing.T, msg, key string, v slog.Value) {
+	t.Helper()
+	if v.Kind() == slog.KindGroup {
+		for _, a := range v.Group() {
+			checkAttrValue(t, msg, key+"."+a.Key, a.Value)
+		}
+		return
+	}
+	rendered := v.String()
+	for _, bad := range unsafeInAttribute {
+		if strings.Contains(rendered, bad) {
+			t.Errorf("record %q attribute %s=%q holds %q: a filesystem-derived value reached the log un-sanitized",
+				msg, key, rendered, bad)
+		}
+	}
+}
+
+// TestErrorAttributes_are_sanitized_at_the_emit_sites is the oracle for the ERROR half
+// of the path-attribute gate, which the "path" half above does not reach.
+//
+// An error is a filesystem-derived string too, and by a route no `rel` argument passes
+// through: the filesystem returns *fs.PathError and atomicfile interpolates the name it
+// refused, so a hostile filename arrives inside err.Error() even at a site whose own
+// "path" attribute is already gated. The three records below are the ones where that
+// matters most, because each is the ONLY signal for its condition: a certificate this
+// app could not read, a prior bundle it could not read, and a rewrite /output refused.
+//
+// What the gate buys here is what it buys for "path" — an attribute value that is
+// single-line and reorder-free under any handler, including slog's JSONHandler, which
+// emits a bidi override raw. It is not protection against a forged record: the
+// TextHandler slogx.Setup installs quotes a value holding a control or a bidi rune, so
+// an ungated LF already arrives as `\n`. And the gate sits at the log call only — the
+// raw error keeps travelling to errors.Is/errors.As and out through every return.
+//
+// Runs serially: each subtest swaps slog.Default().
+func TestErrorAttributes_are_sanitized_at_the_emit_sites(t *testing.T) {
+	// Spelled out rather than imported from the production call sites: an operator's log
+	// query keys on these words, so a silent rewording must fail here.
+	const (
+		unreadableInputMsg = "cannot read certificate"
+		unreadablePriorMsg = "cannot read prior pfx; regenerating"
+	)
+
+	t.Run("a certificate /input refuses", func(t *testing.T) {
+		// The whole point of this case: the error, not the path, is what carries the
+		// untrusted name here. os.Root reports the name it refused inside a PathError.
+		readErr := &fs.PathError{Op: "openat", Path: hostileStem + ".crt", Err: fs.ErrPermission}
+		sw := &scanWalk{}
+		logs := captureLogs(t)
+
+		if got := sw.noteUnreadableInput(hostileStem+".crt", hostileStem+".crt", "certificate", readErr); got != statusUnreadable {
+			t.Errorf("noteUnreadableInput(permission denied) = %v, want statusUnreadable", got)
+		}
+		assertErrorAttrSanitized(t, logs, unreadableInputMsg, readErr.Error())
+	})
+
+	t.Run("a prior bundle /output refuses", func(t *testing.T) {
+		// The read seam is the only way in: the failure has to land between inspect's
+		// classifying Lstat and its read, which no temp directory the suite owns can
+		// stage, and chmod-based refusals are no-ops for the root uid CI does not use.
+		readErr := &fs.PathError{Op: "openat", Path: hostileStem + ".pfx", Err: fs.ErrPermission}
+		dir := t.TempDir()
+		s := newOutputStore(t, dir)
+		if err := s.write(t.Context(), "out.pfx", []byte("prior bundle")); err != nil {
+			t.Fatalf("setup: write: %v", err)
+		}
+		prev := readBoundedInRoot
+		readBoundedInRoot = func(context.Context, *os.Root, string, int64) ([]byte, error) {
+			return nil, readErr
+		}
+		t.Cleanup(func() { readBoundedInRoot = prev })
+		logs := captureLogs(t)
+
+		state, err := s.inspect(t.Context(), "out.pfx", convert.Analysis{}, convert.EncNameModern2023, "pw")
+		if err != nil {
+			t.Fatalf("inspect(unreadable prior bundle) = error %v, want nil: a rewrite is the remedy", err)
+		}
+		if state != contentUnverified {
+			t.Errorf("inspect(unreadable prior bundle) = %v, want contentUnverified", state)
+		}
+		assertErrorAttrSanitized(t, logs, unreadablePriorMsg, readErr.Error())
+	})
+
+	t.Run("a rewrite /output refuses for a reason no restart clears", func(t *testing.T) {
+		// atomicfile interpolates the output name it refused, so the refusal's own text
+		// carries it even though reportWriteFailure's path and output_path are gated.
+		// Minted the way store.write mints one: a permission refusal states
+		// refusalOwnership at the site that read the errno.
+		refused := refuseWrite(refusalOwnership, "write pfx: %w",
+			&fs.PathError{Op: "rename", Path: hostileStem + ".pfx", Err: fs.ErrPermission})
+		logs := captureLogs(t)
+
+		// The health-neutral arm, whose message is taken from the production const
+		// rather than spelled out: it is a paragraph, and the shorter records above
+		// already pin this suite's rewording guard.
+		reportWriteFailure(hostileStem+".crt", hostileStem+".pfx", refused, statusUnwritable)
+		assertErrorAttrSanitized(t, logs, unreplaceableBundleMsg, refused.Error())
+
+		// The loud arm reaches the operator through failEntry, a different emit site
+		// with its own gate, so it is asserted rather than assumed.
+		logs = captureLogs(t)
+		reportWriteFailure(hostileStem+".crt", hostileStem+".pfx", refused, statusFailed)
+		assertErrorAttrSanitized(t, logs, "conversion failed", refused.Error())
+	})
+}
+
+// assertErrorAttrSanitized pins one record's "error" attribute to the sanitized
+// rendering of raw, then sweeps the whole batch for a stray unsafe rune.
+//
+// The first check is what fails an ABSENT gate; the second is what fails a
+// half-applied one, because a record's remediation, output_path or nested group can
+// carry the same name. The guard on the fixture is what stops the whole helper passing
+// vacuously if the injected runes ever stop being rewritten.
+func assertErrorAttrSanitized(t *testing.T, logs *capture.Recorder, msgSub, raw string) {
+	t.Helper()
+	want := logtext.Path(raw)
+	if want == raw {
+		t.Fatalf("the fixture error text %q survives sanitizing unchanged, so this case asserts nothing", raw)
+	}
+	got, ok := logs.AttrValue(msgSub, "error")
+	if !ok {
+		t.Fatalf("record %q carries no error attribute: %q", msgSub, logs.Messages())
+	}
+	if got != want {
+		t.Errorf("record %q error attribute = %q, want the sanitized rendering %q: a filesystem-derived"+
+			" error reaches the operator through the same gate its sibling path attribute uses",
+			msgSub, got, want)
+	}
+	assertNoUnsafeRunesInAttributes(t, logs)
+}

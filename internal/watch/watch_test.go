@@ -4,29 +4,49 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
 
-// TestHandleFsEvent is the first unit coverage of the watcher's event
-// classifier. It pins the rescan decision per event class, including the
-// d-u2-1 regression: a removed/renamed domain-named directory (e.g.
-// "example.com") must trigger a rescan even though its ".com" suffix is not a
-// cert extension.
+// newTestWatcher returns a live fsnotify watcher, closed at test end, and skips
+// the test on a host where inotify is unavailable.
+func newTestWatcher(t *testing.T) *fsnotify.Watcher {
+	t.Helper()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Skipf("fsnotify unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = watcher.Close() })
+	return watcher
+}
+
+// newClosedTestWatcher returns an already-closed watcher: every watcher.Add on
+// it fails, which is how these tests drive the watch-set failure paths.
+func newClosedTestWatcher(t *testing.T) *fsnotify.Watcher {
+	t.Helper()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Skipf("fsnotify unavailable: %v", err)
+	}
+	if err := watcher.Close(); err != nil {
+		t.Fatalf("setup: watcher.Close() = %v", err)
+	}
+	return watcher
+}
+
+// TestHandleFsEvent pins the rescan decision for every event class, including
+// removed or renamed domain-named directories whose suffix is not certificate-relevant.
 func TestHandleFsEvent(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
 	w := New(root, func(context.Context) {})
 
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		t.Skipf("fsnotify unavailable: %v", err)
-	}
-	defer func() { _ = watcher.Close() }()
-	if err := w.addWatchDirs(watcher, root); err != nil {
+	watcher := newTestWatcher(t)
+	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("addWatchDirs: %v", err)
 	}
 
@@ -43,6 +63,14 @@ func TestHandleFsEvent(t *testing.T) {
 	if err := os.WriteFile(plainFile, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// A DIRECTORY whose name ends in a cert extension: layout.IsRelevant is a
+	// suffix-only classifier, so this is the path that must not be misread as a file.
+	crtDir := filepath.Join(root, "archive.crt")
+	if err := os.MkdirAll(crtDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
 
 	for _, tc := range []struct {
 		name  string
@@ -58,24 +86,127 @@ func TestHandleFsEvent(t *testing.T) {
 		{"remove domain-named directory triggers rescan", fsnotify.Event{Name: domainDir, Op: fsnotify.Remove}, true},
 		{"remove cert triggers rescan", fsnotify.Event{Name: crtFile, Op: fsnotify.Remove}, true},
 		{"rename triggers rescan", fsnotify.Event{Name: filepath.Join(root, "whatever"), Op: fsnotify.Rename}, true},
-		{"chmod only is ignored", fsnotify.Event{Name: crtFile, Op: fsnotify.Chmod}, false},
+		{"chmod on a cert triggers rescan", fsnotify.Event{Name: crtFile, Op: fsnotify.Chmod}, true},
+		{"chmod on a key triggers rescan", fsnotify.Event{Name: filepath.Join(domainDir, "tls.key"), Op: fsnotify.Chmod}, true},
+		{"chmod on a non-cert file is ignored", fsnotify.Event{Name: plainFile, Op: fsnotify.Chmod}, false},
+		// A chmod on a DIRECTORY is the permission-repair recovery path --
+		// it schedules the whole-tree re-assert of the watch set and rescans,
+		// instead of waiting for the fallback tick (for the 24h reconciliation
+		// floor, with the fallback disabled).
+		{"chmod on a domain directory rescans", fsnotify.Event{Name: domainDir, Op: fsnotify.Chmod}, true},
+		// The directory test runs before the suffix test, so a cert-named DIRECTORY
+		// takes the recovery path rather than the file path.
+		{"chmod on a cert-named directory rescans", fsnotify.Event{Name: crtDir, Op: fsnotify.Chmod}, true},
+		{"chmod on a vanished path is ignored", fsnotify.Event{Name: filepath.Join(root, "gone"), Op: fsnotify.Chmod}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := w.handleFsEvent(watcher, tc.event); got != tc.want {
+			if got := w.handleFsEvent(t.Context(), watcher, st, tc.event); got != tc.want {
 				t.Errorf("handleFsEvent(%s on %s) = %v, want %v", tc.event.Op, tc.event.Name, got, tc.want)
 			}
 		})
 	}
+
+	// Rescanning is only half of the directory contract: without the watch the
+	// re-assert restores, the immediate scan converts what is on disk now and every
+	// later renewal underneath the directory is missed.
+	if !slices.Contains(watcher.WatchList(), crtDir) {
+		t.Errorf("after the directory events the watch list is %v, want %q watched", watcher.WatchList(), crtDir)
+	}
 }
 
-func TestNew_applies_debounce_and_fallback_options(t *testing.T) {
+// TestHandleFsEvent_rescans_even_when_the_reassert_fails pins the
+// return value of the Create-directory path when the watch-set re-assert fails: the
+// event must still report true so the debounced rescan converts a cert pair that
+// already exists inside the new directory even though the watch set could not be
+// re-asserted.
+func TestHandleFsEvent_rescans_even_when_the_reassert_fails(t *testing.T) {
 	t.Parallel()
-	w := New("/input", func(context.Context) {}, WithDebounce(750*time.Millisecond), WithFallback(3*time.Hour))
-
-	if w.debounce != 750*time.Millisecond {
-		t.Errorf("New(WithDebounce(750ms)) debounce = %v, want %v", w.debounce, 750*time.Millisecond)
+	watcher := newClosedTestWatcher(t)
+	root := t.TempDir()
+	newDir := filepath.Join(root, "example.com")
+	if err := os.MkdirAll(newDir, 0o750); err != nil {
+		t.Fatal(err)
 	}
-	if w.fallback != 3*time.Hour {
-		t.Errorf("New(WithFallback(3h)) fallback = %v, want %v", w.fallback, 3*time.Hour)
+	w := New(root, func(context.Context) {})
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+
+	got := w.handleFsEvent(t.Context(), watcher, st, fsnotify.Event{Name: newDir, Op: fsnotify.Create})
+
+	if !got {
+		t.Error("handleFsEvent(Create dir, unwatchable) = false, want true: a cert pair already inside the new directory would otherwise wait for the fallback rescan")
+	}
+}
+
+// TestHandleFsEvent_rescans_when_a_repaired_directory_cannot_be_rewatched pins
+// the Chmod twin of the Create-side contract: when the permission-repair arm
+// cannot re-assert the watch set, the event must still report true so
+// the debounced rescan converts the pair that just became readable. Returning
+// false there would leave the repaired directory converting nothing until the
+// next fallback tick, and not until the 24h reconciliation floor with the fallback
+// disabled -- the exact stuck-unhealthy state the Chmod arm exists to end.
+func TestHandleFsEvent_rescans_when_a_repaired_directory_cannot_be_rewatched(t *testing.T) {
+	t.Parallel()
+	watcher := newClosedTestWatcher(t)
+	root := t.TempDir()
+	repaired := filepath.Join(root, "example.com")
+	if err := os.MkdirAll(repaired, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	w := New(root, func(context.Context) {})
+	st := newWatchState(w)
+	t.Cleanup(st.stop)
+
+	got := w.handleFsEvent(t.Context(), watcher, st, fsnotify.Event{Name: repaired, Op: fsnotify.Chmod})
+
+	if !got {
+		t.Error("handleFsEvent(Chmod dir, unwatchable) = false, want true: the permission repair would otherwise convert nothing until the next fallback tick, and not until the 24h reconciliation floor with the fallback disabled")
+	}
+}
+
+// TestAddWatchDirs_refuses_a_non_directory_root pins the non-directory-root
+// branch: walkWatchDirs Lstats the root itself and refuses a regular file or a
+// symlink there before it opens the confined root, which resolves symlinks and so
+// could not refuse either shape. Reporting that is what routes the case into Run's
+// degraded paths (poll mode, or a *LostError with the fallback disabled); returning
+// nil would leave Run logging "fsnotify active" over an empty watch set, parked in
+// a loop no event can reach while the scan keeps the health marker green.
+func TestAddWatchDirs_refuses_a_non_directory_root(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	fileRoot := filepath.Join(base, "input")
+	if err := os.WriteFile(fileRoot, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	realDir := filepath.Join(base, "real")
+	if err := os.MkdirAll(realDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	linkRoot := filepath.Join(base, "linked")
+	if err := os.Symlink(realDir, linkRoot); err != nil {
+		t.Skipf("symlinks unavailable on this filesystem: %v", err)
+	}
+	watcher := newTestWatcher(t)
+
+	for _, tc := range []struct {
+		root string
+		want string
+	}{
+		{fileRoot, "is not a directory"},
+		{linkRoot, "is a symlink"},
+	} {
+		w := New(tc.root, func(context.Context) {})
+		err := w.addWatchDirs(t.Context(), watcher, tc.root)
+		if err == nil {
+			t.Errorf("addWatchDirs(%q) = nil, want an error: the watch set is %v, so no event could ever arrive", tc.root, watcher.WatchList())
+			continue
+		}
+		// The message is the operator's only signal for this shape: a symlinked
+		// /input keeps converting and stays healthy while real-time detection is
+		// gone, so the error must name the symlink rather than the generic
+		// not-a-directory refusal.
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("addWatchDirs(%q) = %q, want it to name %q so the WARN is self-diagnosing", tc.root, err, tc.want)
+		}
 	}
 }

@@ -1,14 +1,39 @@
 # punused findings adjudicated as false positives. One literal substring per
 # line, matched against punused's output line; full-line `#` comments carry the
-# reason. Invalid-by-construction classes: `.kiro/steering/tools.md`.
+# reason.
+#
+# boundedTextError is constructed at five non-test sites (certScan.visit,
+# parsePrivateKeyBlock, Encode, CheckCurrency, decode) and its Unwrap runs on
+# every failed conversion: the error reaches process.failEntry -> IsShutdown ->
+# errors.Is(err, context.Canceled), which walks the chain through it. The
+# embedded field is the `error` interface, which promotes only Error(), so
+# without Unwrap every errors.As traversal past the wrapper dead-ends. The repo
+# has already shipped that bug once (a wrap made IsShutdown false and logged a
+# routine shutdown at ERROR). Upstream: bep/punused#3.
+method (boundedTextError).Unwrap
 #
 # internal/testcerts has no _test.go of its own; it is a regular package
-# precisely so OTHER packages' _test.go files can import a shared certificate
-# fixture builder. That guarantees EU1001 ("used in test only") for every symbol
-# it exports, whatever the symbol does -- the finding reports the package's
-# purpose, not a defect. Both are live and neither is a leftover:
-# GenerateSelfSignedCert has 46 call sites and GenerateCertChain 3, all in other
-# packages' tests, and zero production callers by design. Upstream:
-# bep/punused#3.
+# precisely so other packages' _test.go files can import a shared certificate
+# fixture builder, which guarantees EU1001 for every symbol in it. All three are
+# heavily used and none is a leftover: GenerateSelfSignedCert 59 call sites,
+# GenerateChainMaterial 48, GenerateCertChain 12. GenerateCertChain and
+# GenerateChainMaterial are not redundant -- the former exposes only the leaf
+# key, the latter exists to express the cases identity selection must get right
+# (issuer-owned key, renewed cert reusing its predecessor's key, future-dated
+# renewal). The package's other exported helpers (Mint, KeyPEM, NewECDSAKey) are
+# called by these three from non-test code, so punused resolves them and they
+# need no entry.
 function GenerateSelfSignedCert
 function GenerateCertChain
+function GenerateChainMaterial
+
+#
+# classifiedWriteError is store.write's refusal, and its Unwrap is the same
+# invalid-by-construction class as boundedTextError's above: the refusal reaches
+# process.failEntry -> IsShutdown -> errors.Is(err, context.Canceled), which walks the
+# chain through it, so a write cancelled by SIGTERM logs at Debug rather than raising the
+# documented CertConverterConversionFailed alert at ERROR. No caller names Unwrap
+# explicitly because errors.Is does the naming. Pinned by
+# TestStoreWrite_a_refusal_stays_unwrappable_so_a_cancelled_write_reads_as_shutdown.
+# Upstream: bep/punused#3.
+method (classifiedWriteError).Unwrap

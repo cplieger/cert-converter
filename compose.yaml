@@ -4,12 +4,17 @@ services:
     image: ghcr.io/cplieger/cert-converter:latest
     container_name: cert-converter
     restart: unless-stopped
-    user: "1000:1000"  # match your host user
+    # Override with PUID/PGID in .env; defaults to 1000:1000.
+    user: "${PUID:-1000}:${PGID:-1000}"  # must own the /output host dir
 
     environment:
-      PFX_PASSWORD: "your-pfx-password"  # required
+      # Env is readable via `docker inspect`; PFX_PASSWORD_FILE (a mounted secret) is not.
+      PFX_PASSWORD: "${PFX_PASSWORD:-}"  # set this or PFX_PASSWORD_FILE; empty is rejected
+      # Orphaned output: warn (default, keeps it) | sync (deletes) | keep (silent).
+      # Use sync only once /input is your single source of truth.
+      OUTPUT_LIFECYCLE: "${OUTPUT_LIFECYCLE:-warn}"
       PFX_ENCODER: "modern2023"  # modern2023, modern2026, legacy, or legacyrc2
 
     volumes:
-      - "/path/to/pem/certificates:/input:ro"
+      - "/path/to/pem/certificates:/input:ro"  # must be readable by the UID above; see README "Healthcheck"
       - "/path/to/pfx/output:/output"
