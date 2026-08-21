@@ -134,12 +134,18 @@ cover:
 | `CertConverterNoCertificatePairs` | a scan found no `<name>.crt` with a sibling `<name>.key`, so no PFX is produced at all | warning |
 | `CertConverterOutputCleanupDegraded` | stale temp files under `/output`, each holding a private key, cannot be removed | warning |
 | `CertConverterOrphanRemovalDisabled` | a scan could not prove a bundle is orphaned, so `OUTPUT_LIFECYCLE=sync` reaped nothing | warning |
+| `CertConverterScanStalled` | no `scan complete` heartbeat in 8h, so the watch loop is wedged, silent, or shipping no logs | warning |
 
-Every rule keys on a WARN or ERROR record, so the group works at
-`LOG_LEVEL=warn` as well as at the `info` default. No rule reports a wedged
-watch loop, because a healthy scan is deliberately silent at `warn`: the
-container healthcheck covers that case through the health marker's freshness
-deadline (see [Healthcheck](#healthcheck)).
+Every rule keys on a WARN or ERROR record and works at `LOG_LEVEL=warn` as well
+as at the `info` default, with one deliberate exception.
+`CertConverterScanStalled` reports a wedged watch loop, and it can only do that
+by keying on the `scan complete` heartbeat, which is an **`info`** record
+because a healthy scan has nothing to report at `warn`. So that one rule
+requires the `info` default and fires permanently at `LOG_LEVEL=warn`; drop it
+if you run at `warn`. The container healthcheck covers the same failure without
+needing the `info` level, through the health marker's freshness deadline (see
+[Healthcheck](#healthcheck)), but only where something acts on an unhealthy
+container.
 
 Thresholds and the `severity` labels are starting points; adjust the
 `container` selector to your deployment, match the degradation window to your

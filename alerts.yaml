@@ -7,8 +7,12 @@
 # your log collector sets those instead) to your deployment, and match the
 # degradation window to your FALLBACK_SCAN_HOURS.
 #
-# Every rule keys on a WARN or ERROR record, so the group works at
-# LOG_LEVEL=warn as well as at the info default.
+# Every rule here keys on a WARN or ERROR record and works at LOG_LEVEL=warn
+# as well as at the info default, with ONE deliberate exception:
+# CertConverterScanStalled keys on the INFO-level `scan complete` heartbeat,
+# because a healthy scan has nothing to log at WARN. That rule needs
+# LOG_LEVEL=info (the default) and will fire permanently at warn. Drop it if you
+# run at warn, or accept that this group's deadman costs you the info level.
 groups:
   - name: cert-converter
     rules:
@@ -117,6 +121,40 @@ groups:
             above 0 so the periodic rescan covers or re-attaches the missing
             watch. Exhausted inotify instances on the host are the usual root
             cause and are often transient.
+      # The deadman. Every other rule here fires on a record cert-converter
+      # LOGGED at WARN or ERROR, so a wedged watch loop that logs nothing at all
+      # trips none of them. This one fires on silence instead.
+      #
+      # REQUIRES LOG_LEVEL=info. `scan complete` is an INFO record, because a
+      # healthy scan has no reason to log at WARN, so at LOG_LEVEL=warn the line
+      # never arrives and this rule fires permanently. That is the one place this
+      # group departs from its WARN-or-ERROR rule, and it is why the header says
+      # so. The file-marker healthcheck covers the same failure without needing
+      # the info level, but only where something acts on an unhealthy container.
+      #
+      # Set the window ABOVE the app's guaranteed re-scan cadence, not above
+      # FALLBACK_SCAN_HOURS: on the 6h default an 8h window is right, but when
+      # FALLBACK_SCAN_HOURS is 0/false or above 24h the guarantee drops to the
+      # 24h reconciliation floor, so use 30h there or the rule false-fires
+      # nightly. The startup line prints both numbers as `fallback_scan` and
+      # `scan_floor`; the second one is the one to size against.
+      - alert: CertConverterScanStalled
+        expr: |
+          absent_over_time({container="cert-converter"} |= `scan complete` [8h])
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "no cert-converter scan-completion heartbeat in 8h"
+          description: >
+            cert-converter logs a `scan complete` line on every pass, including
+            one that found nothing to convert, and none has arrived in 8h. The
+            usual cause is fsnotify and the fallback timer both wedged, so
+            certificates silently stop converting while the container still
+            looks alive; restart it and check the host's inotify instance limit.
+            An absence rule cannot tell that apart from a container that never
+            started or was renamed, a log pipeline that stopped shipping this
+            stream, or LOG_LEVEL raised to warn, so rule those out first.
       - alert: CertConverterInputPathUnreachable
         expr: |
           sum by (container) (count_over_time(
