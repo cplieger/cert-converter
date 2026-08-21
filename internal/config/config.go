@@ -14,7 +14,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/cert-converter/internal/scancadence"
-	"github.com/cplieger/runesafe"
+	"github.com/cplieger/runesafe/v2"
 	"github.com/cplieger/slogx"
 )
 
