@@ -58,7 +58,7 @@ func FuzzBoundLogText_bounded_and_loggable(f *testing.F) {
 		// every-rune sweep pins: no C0 control, CR/LF, DEL, C1 control, bidi control
 		// or U+2028/U+2029 may survive, whichever slog handler is wired up.
 		for _, r := range got {
-			if runesafe.IsUnsafe(r, false) {
+			if runesafe.IsUnsafeSingleLine(r) {
 				t.Fatalf("boundLogText(%q) = %q, kept unsafe rune %U", s, got, r)
 			}
 		}
