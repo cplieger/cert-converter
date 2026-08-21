@@ -274,11 +274,20 @@ func TestNoteUnwalkableSymlink_stays_silent_where_nothing_is_hidden(t *testing.T
 		if logs.Len() != 0 {
 			t.Errorf("noteUnwalkableSymlink(%q) logged %q, want no output", name, logs.Messages())
 		}
+		if sw.unresolved != 0 {
+			t.Errorf("noteUnwalkableSymlink(%q) left unresolved = %d, want 0: silence and the count are one signal, and a link that hides nothing must move neither",
+				name, sw.unresolved)
+		}
 	}
 
 	logs := captureLogs(t)
 	sw.noteUnwalkableSymlink("linked-dir", entry("linked-dir"))
 	if !logs.Contains("skipping symlink that could not be resolved through the input root") {
 		t.Errorf("noteUnwalkableSymlink(%q) logged %q, want the unresolved-symlink warning", "linked-dir", logs.Messages())
+	}
+	// The count is the other half of that warning and the only aggregate trace of it:
+	// the end-of-scan summary and the reap gate both read it, not the log line.
+	if sw.unresolved != 1 {
+		t.Errorf("noteUnwalkableSymlink(%q) left unresolved = %d, want 1", "linked-dir", sw.unresolved)
 	}
 }

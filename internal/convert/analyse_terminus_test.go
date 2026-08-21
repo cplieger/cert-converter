@@ -392,6 +392,12 @@ func TestAnalyse_keeps_a_signing_CA_that_is_not_issuer_eligible(t *testing.T) {
 	if !strings.Contains(detail, "No-BC Internal CA") {
 		t.Errorf("%s detail = %q, want it to name the non-compliant CA", convert.ObsChainCertCannotIssue, detail)
 	}
+	// The position is 1-based and counted against the emitted chain, because that is
+	// the only handle an operator has on WHICH bag of a multi-CA bundle to re-issue.
+	if want := "chain certificate 1 of 1"; !strings.Contains(detail, want) {
+		t.Errorf("%s detail = %q, want it to place the certificate as %q",
+			convert.ObsChainCertCannotIssue, detail, want)
+	}
 	if !strings.Contains(detail, "basicConstraints") {
 		t.Errorf("%s detail = %q, want it to name the missing extension the operator has to fix", convert.ObsChainCertCannotIssue, detail)
 	}
@@ -942,5 +948,81 @@ func TestAnalyse_reports_an_unproven_hop_taken_after_a_cycle(t *testing.T) {
 	if strings.Contains(detail, "nothing in this bundle could be proven") {
 		t.Errorf("unproven-hop detail = %q, want no claim about the whole bundle: %q proved the signature over %q",
 			detail, crossCCN, crossPCN)
+	}
+}
+
+// TestAnalyse_names_the_cycle_when_the_bundle_is_pasted_issuer_first pins the cycle
+// sentence for the input ORDER the two tests above cannot reach. Both hand Analyse a
+// leaf-first bundle, so the proven issuer the walk had to leave in place is never the
+// FIRST certificate in the file — and a CA bundle pasted issuer-first is an input this
+// app supports and reports (ObsLeafNotFirst), not a malformed one. With the cycle's
+// issuer at block one, a diagnostic that treated it as absent would tell the operator
+// their chain has no issuer for its terminus while that issuer is the line above it in
+// the same emitted chain.
+//
+// Both leftover regimes are here because they take different arms and produce different
+// sentences: with nothing left over the bundle is complete and the missing thing is an
+// anchor, and with a certificate left over the chain is unfinished.
+func TestAnalyse_names_the_cycle_when_the_bundle_is_pasted_issuer_first(t *testing.T) {
+	t.Parallel()
+	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
+	leafPEM, cPEM, pPEM, leafKeyPEM := mintCrossCertifiedPair(t, notBefore)
+
+	// An unrelated, issuer-eligible CA: nothing links it to the cycle, so it stays off
+	// the walked path and the terminus arm that reports leftovers is the one taken.
+	strangerKey := testcerts.NewECDSAKey(t)
+	strangerPEM, _ := testcerts.Mint(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(884),
+		Subject:               pkix.Name{CommonName: "Unrelated Internal CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(72 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}, &strangerKey.PublicKey, nil, strangerKey)
+
+	for _, tc := range []struct {
+		name   string
+		bundle []byte
+		kind   convert.ObservationKind
+		want   string
+	}{
+		{
+			name:   "nothing_left_over",
+			bundle: concatPEM(cPEM, pPEM, leafPEM),
+			kind:   convert.ObsChainTrustAnchorAbsent,
+			want:   "is already in this chain",
+		},
+		{
+			name:   "a_certificate_left_over",
+			bundle: concatPEM(cPEM, pPEM, leafPEM, strangerPEM),
+			kind:   convert.ObsChainUnverified,
+			want:   "is already in this chain (the two cross-certify)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := convert.Analyse(t.Context(), tc.bundle, leafKeyPEM)
+			if err != nil {
+				t.Fatalf("Analyse(an issuer-first cross-certified bundle) = error %v, want nil", err)
+			}
+			if !hasObservation(got.Observations(), convert.ObsLeafNotFirst) {
+				t.Fatalf("observations = %v, want %q: without it the fixture is not the issuer-first order this test is about",
+					got.Observations(), convert.ObsLeafNotFirst)
+			}
+			detail, ok := observationDetail(got.Observations(), tc.kind)
+			if !ok {
+				t.Fatalf("observations = %v, want one of kind %q", got.Observations(), tc.kind)
+			}
+			if !strings.Contains(detail, tc.want) {
+				t.Errorf("%s detail = %q, want it to name the cycle as %q: %q provably signed the terminus and is in the emitted chain",
+					tc.kind, detail, tc.want, crossCCN)
+			}
+			if strings.Contains(detail, "could not be established from the bundle") ||
+				strings.Contains(detail, "issuer is not in the bundle") {
+				t.Errorf("%s detail = %q, want no claim that the terminus has no issuer here: %q is the first block of this very file",
+					tc.kind, detail, crossCCN)
+			}
+		})
 	}
 }

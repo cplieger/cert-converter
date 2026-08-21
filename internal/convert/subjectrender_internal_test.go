@@ -115,3 +115,67 @@ func TestDNSequence_surfaces_the_attributes_ToRDNSequence_drops(t *testing.T) {
 		t.Fatal("pkix.Name.ToRDNSequence now surfaces Names; re-derive dnSequence's justification")
 	}
 }
+
+// TestDNSequence_does_not_repeat_an_attribute_pkix_keeps_in_a_named_field pins the
+// filter dnSequence applies before it appends ToRDNSequence's own output. The sibling
+// test above proves dnSequence SURFACES what ToRDNSequence drops; this one proves it
+// does not surface what ToRDNSequence keeps, which is the other half and the half no
+// fixture reached: every fixture in this file uses an attribute type pkix has no named
+// field for, so the filter never fired and a diagnostic that named the subject twice
+// would have shipped green.
+//
+// The shape matters: crypto/x509 puts EVERY parsed attribute in Names, and the nine
+// types pkix also keeps in a named field are therefore reachable twice.
+func TestDNSequence_does_not_repeat_an_attribute_pkix_keeps_in_a_named_field(t *testing.T) {
+	t.Parallel()
+
+	n := pkix.Name{
+		CommonName:   "leaf.example.com",
+		Organization: []string{"Example"},
+		Country:      []string{"NL"},
+		Names: []pkix.AttributeTypeAndValue{
+			renderAttr(asn1.ObjectIdentifier{2, 5, 4, 6}, "NL"),
+			renderAttr(asn1.ObjectIdentifier{2, 5, 4, 10}, "Example"),
+			renderAttr(asn1.ObjectIdentifier{2, 5, 4, 3}, "leaf.example.com"),
+		},
+	}
+
+	const want = "CN=leaf.example.com,O=Example,C=NL"
+	if got := dnSequence(&n).String(); got != want {
+		t.Errorf("dnSequence(a parsed name).String() = %q, want %q: an attribute pkix keeps in a named field must be emitted once, by ToRDNSequence, or every subject in a diagnostic is doubled",
+			got, want)
+	}
+}
+
+// TestBoundedDN_cuts_on_an_attribute_boundary pins what the cut LEAVES, which the
+// byte-prefix comparison above cannot see: maxSubjectRenderAttrs is 256 attributes
+// while maxSubjectLogLen is 256 BYTES, so the prefix comparison stops around the
+// fiftieth attribute and everything the truncation arm does at the boundary itself is
+// invisible to it.
+//
+// An off-by-one there costs an attribute group with nothing in it, which pkix renders
+// as a bare separator: the operator reads a subject that ends in a comma.
+func TestBoundedDN_cuts_on_an_attribute_boundary(t *testing.T) {
+	t.Parallel()
+
+	var n pkix.Name
+	for i := range maxSubjectRenderAttrs + 44 {
+		n.Names = append(n.Names, renderAttr(oidEmailAddress, fmt.Sprintf("a%d@example.com", i)))
+	}
+	bounded := boundedDN(dnSequence(&n))
+
+	if got := len(bounded); got != maxSubjectRenderAttrs {
+		t.Errorf("len(boundedDN(a %d-attribute name)) = %d, want %d attribute group(s)",
+			maxSubjectRenderAttrs+44, got, maxSubjectRenderAttrs)
+	}
+	for i, rdn := range bounded {
+		if len(rdn) == 0 {
+			t.Errorf("boundedDN(a %d-attribute name)[%d] carries no attribute, and pkix renders an empty group as a bare separator",
+				maxSubjectRenderAttrs+44, i)
+		}
+	}
+	if rendered := bounded.String(); strings.HasSuffix(rendered, ",") {
+		t.Errorf("boundedDN(a %d-attribute name).String() = %q..., want no trailing separator",
+			maxSubjectRenderAttrs+44, rendered[max(0, len(rendered)-48):])
+	}
+}

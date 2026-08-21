@@ -2031,3 +2031,122 @@ func TestInspect_refuses_a_triple_no_profile_emits(t *testing.T) {
 		})
 	}
 }
+
+// ceilingOID builds a syntactically valid OBJECT IDENTIFIER whose content is exactly
+// maxOIDBytes long: the largest identifier the preflight is willing to decode, as
+// opposed to oversizedOID's first refusable one.
+func ceilingOID() asn1.RawValue {
+	content := bytes.Repeat([]byte{0x01}, maxOIDBytes)
+	content[0] = 0x2a // the 1.2 arc, so the value stays a plausible identifier
+	return asn1.RawValue{Class: asn1.ClassUniversal, Tag: asn1.TagOID, Bytes: content}
+}
+
+// TestInspect_decodes_an_identifier_exactly_at_the_ceiling pins the accepting side of
+// the allocation bound the sibling tests above pin the refusing side of. maxOIDBytes
+// is the largest identifier the preflight DECODES; a bound that refuses its own value
+// would answer a prior bundle carrying a long-but-legitimate identifier with a
+// diagnostic about an allocation ceiling instead of about the algorithm this app does
+// not implement, and the operator has nothing to do with the former.
+func TestInspect_decodes_an_identifier_exactly_at_the_ceiling(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+	pfx, err := analysis.Encode(EncNameModern2023, "pw")
+	if err != nil {
+		t.Fatalf("setup: Encode: %v", err)
+	}
+
+	// A real bundle with ONLY the MAC algorithm identifier replaced, so everything
+	// else is valid and the identifier is the only thing left to refuse.
+	var preamble pfxPreamble
+	testASN1Unmarshal(t, pfx, &preamble)
+	preamble.MacData.Mac.Algorithm.Algorithm = ceilingOID()
+	mutated := testASN1Marshal(t, preamble)
+
+	_, err = Inspect(mutated)
+	if !errors.Is(err, ErrProfileUnknown) {
+		t.Fatalf("Inspect(a MAC algorithm identifier of exactly %d bytes) = %v, want ErrProfileUnknown: the identifier decodes, and what it names is a digest this app does not implement",
+			maxOIDBytes, err)
+	}
+	if want := "object identifier exceeds"; strings.Contains(err.Error(), want) {
+		t.Errorf("Inspect(a MAC algorithm identifier of exactly %d bytes) = %q, want NO refusal naming %q: the ceiling is the largest identifier the preflight decodes, so its own value is inside the bound",
+			maxOIDBytes, err.Error(), want)
+	}
+}
+
+// TestInspect_admits_iterations_at_the_trusted_ceiling pins the accepting side of the
+// KDF budget. maxKDFIterations is the highest count this app is willing to RUN, so a
+// bundle derived at exactly that count is one this app's own encoders could have
+// written; refusing it would make the ceiling one lower than it is documented as, and
+// the app would rewrite a bundle it should have skipped on every scan for ever.
+//
+// The floor's own boundary is pinned by TestInspect_rejects_iterations_one_below_profile_floor
+// and its accepted sibling is every unmodified round trip, so only the ceiling needs
+// a case here.
+func TestInspect_admits_iterations_at_the_trusted_ceiling(t *testing.T) {
+	t.Parallel()
+	m := testcerts.GenerateChainMaterial(t)
+	analysis, err := Analyse(t.Context(), slices.Concat(m.LeafPEM, m.CAPEM), m.LeafKeyPEM)
+	if err != nil {
+		t.Fatalf("setup: Analyse: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		enc    EncoderType
+		mutate func(*testing.T, *pfxPreamble)
+	}{
+		{
+			name: "modern2023 MAC",
+			enc:  EncNameModern2023,
+			mutate: func(_ *testing.T, p *pfxPreamble) {
+				p.MacData.Iterations = maxKDFIterations
+			},
+		},
+		{
+			name: "modern2026 PBMAC1",
+			enc:  EncNameModern2026,
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				setTestPBKDF2Iterations(t, &p.MacData.Mac.Algorithm, maxKDFIterations)
+			},
+		},
+		{
+			name: "modern shrouded key bag",
+			enc:  EncNameModern2023,
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestShroudedKeyBag(t, p, func(alg *algorithmIdentifier) {
+					setTestPBKDF2Iterations(t, alg, maxKDFIterations)
+				})
+			},
+		},
+		{
+			name: "legacy encrypted certificate safe",
+			enc:  EncNameLegacyDES,
+			mutate: func(t *testing.T, p *pfxPreamble) {
+				mutateTestEncryptedSafe(t, p, func(alg *algorithmIdentifier) {
+					setTestLegacyIterations(t, alg, maxKDFIterations)
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pfx, err := analysis.Encode(tc.enc, "pw")
+			if err != nil {
+				t.Fatalf("setup: Encode(%s): %v", tc.enc, err)
+			}
+			var preamble pfxPreamble
+			testASN1Unmarshal(t, pfx, &preamble)
+			tc.mutate(t, &preamble)
+			mutated := testASN1Marshal(t, preamble)
+
+			if _, err := Inspect(mutated); err != nil {
+				t.Errorf("Inspect(%s bundle derived at exactly %d iterations) = %v, want nil: that count is inside the range this app is willing to run",
+					tc.enc, maxKDFIterations, err)
+			}
+		})
+	}
+}

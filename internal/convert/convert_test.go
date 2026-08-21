@@ -1058,6 +1058,25 @@ func TestParsePrivateKey_reports_truncated_declared_armour(t *testing.T) {
 	}
 }
 
+// TestParsePrivateKey_reports_undecodable_armour_only_when_there_is_some pins the
+// other side of the clause above. It is a COUNT, and a count appended unconditionally
+// reads "the file declares 0 private-key PEM block(s) that could not be decoded" — a
+// sentence that contradicts the diagnostic it is appended to and sends the operator
+// hunting for corrupt armour in a file whose armour is intact.
+func TestParsePrivateKey_reports_undecodable_armour_only_when_there_is_some(t *testing.T) {
+	t.Parallel()
+	// An ssh-keygen-format block: a PEM block this app cannot read as a key, decoded
+	// whole, so nothing about this file's armour is damaged.
+	_, err := convert.ParsePrivateKey(pem.EncodeToMemory(&pem.Block{Type: "OPENSSH PRIVATE KEY", Bytes: []byte("opaque")}))
+	if err == nil {
+		t.Fatal("convert.ParsePrivateKey(an ssh-keygen-format block) = nil error, want a no-key refusal")
+	}
+	if unwanted := "could not be decoded"; strings.Contains(err.Error(), unwanted) {
+		t.Errorf("convert.ParsePrivateKey(an ssh-keygen-format block) error = %q, want no %q clause: every block in this file decoded",
+			err.Error(), unwanted)
+	}
+}
+
 // TestConvertPair_rejects_unencodable_passwords_without_writing pins the
 // app-owned password guard for every shape PKCS#12 cannot carry: the rejection
 // must name the shape found so an operator can act, must not echo the secret

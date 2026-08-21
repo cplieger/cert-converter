@@ -151,9 +151,47 @@ func TestVerify_refuses_a_volume_it_cannot_open(t *testing.T) {
 	if !logs.AttrContains(msg, "remediation", "grant the UID") {
 		t.Errorf("the refusal gives no ownership remediation, so a permission problem reads as a missing mount (logs %v)", logs.Messages())
 	}
+	// The access named is the access the VOLUME needs, not the access this open
+	// wanted: granting /output read-only clears this refusal and then fails the write
+	// probe and every bundle on the next start, so the operator acts twice.
+	if !logs.AttrContains(msg, "remediation", "read and write access") {
+		t.Errorf("the /output refusal does not ask for write access, so an operator who follows it hits the write probe next (logs %v)", logs.Messages())
+	}
 	if n := logs.Count(wantVolumeMissingMsg); n != 0 {
 		t.Errorf("an unopenable mount produced %d %q records, want 0: that wording tells the operator to mount a path they already mounted (logs %v)",
 			n, wantVolumeMissingMsg, logs.Messages())
+	}
+}
+
+// TestVerify_asks_only_for_read_access_on_the_input_volume is the other half of the
+// access split the sibling above pins for /output. /input is mounted read-only in the
+// README's Volumes table and this app never writes to it, so a refusal that asked for
+// write access there would have the operator loosen a mount that is correctly tight --
+// and on a host directory they may not own, that is advice they cannot act on at all.
+// Serial (no t.Parallel): it swaps the openMountRoot package var and slog.Default().
+func TestVerify_asks_only_for_read_access_on_the_input_volume(t *testing.T) {
+	blocked, existing := t.TempDir(), t.TempDir()
+
+	prev := openMountRoot
+	openMountRoot = func(path string) (*os.Root, error) {
+		if path == blocked {
+			return nil, &fs.PathError{Op: "openat", Path: path, Err: fs.ErrPermission}
+		}
+		return prev(path)
+	}
+	t.Cleanup(func() { openMountRoot = prev })
+
+	logs := capture.Default(t)
+
+	if Verify(Paths{Input: blocked, Output: existing}) {
+		t.Fatalf("Verify(%q unopenable) = true, want false", blocked)
+	}
+	const msg = "required volume cannot be opened by this container's user; refusing to start"
+	if !logs.HasAttr(msg, "role", "input") {
+		t.Fatalf("the refusal does not name the input role, so this case asserts nothing about it (logs %v)", logs.Messages())
+	}
+	if !logs.AttrContains(msg, "remediation", "grant the UID in the container's `user:` read access") {
+		t.Errorf("the /input refusal does not ask for read access alone (logs %v)", logs.Messages())
 	}
 }
 
