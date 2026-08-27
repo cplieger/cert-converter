@@ -126,6 +126,7 @@ cover:
 | Alert | Fires when | Severity |
 | --- | --- | --- |
 | `CertConverterConversionFailed` | a parse error, a cert/key mismatch, or a failed PFX write left a `.pfx` stale or missing | warning |
+| `CertConverterOutputWriteRefused` | an `/output` condition no restart clears refused a write, so a stale `.pfx` is left as found | warning |
 | `CertConverterScanAborted` | the `/input` root itself could not be walked, so the scan returned early | warning |
 | `CertConverterInputTreeTooLarge` | a scan stopped at `MAX_SCAN_ENTRIES`, so every certificate past that point is unconverted | warning |
 | `CertConverterChangeDetectionDegraded` | no fsnotify watch could be established, so a renewal waits for the next full re-scan | warning |
