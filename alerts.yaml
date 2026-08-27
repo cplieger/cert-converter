@@ -20,7 +20,7 @@ groups:
         expr: |
           sum by (container) (count_over_time(
             {container="cert-converter"}
-            |~ `(conversion failed|failed to inspect existing pfx)`
+            |= `conversion failed`
             != `(shutdown)` [15m]
           )) > 0
         for: 0m
@@ -32,10 +32,37 @@ groups:
             A PEM or key parse error, a cert/key mismatch, or a failed PFX write
             left the affected .pfx stale or missing, and the container is
             unhealthy until a scan converts everything cleanly. The
-            `!= (shutdown)` filter drops the same messages when they were caused
-            by the container stopping, which are logged at DEBUG. Check /output
+            `!= (shutdown)` filter drops the same message when it was caused by
+            the container stopping, which is logged at DEBUG. Check /output
             ownership and permissions for the UID in `user:`, that no symlink is
             planted at the output path, and the certificate chain.
+      # The write refusal that does NOT flip health, and so has no other signal.
+      # CertConverterConversionFailed above covers a refused write only where this
+      # app had PROVEN the bundle on disk wrong; where it could not read that
+      # bundle at all and the refusal is steady state, the outcome is deliberately
+      # health-neutral, and the record below is the whole of what reports it.
+      - alert: CertConverterOutputWriteRefused
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |= `prior pfx could not be replaced` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter could not publish a pfx and left /output as found"
+          description: >
+            A renewed certificate's .pfx was not written, because an /output
+            condition no restart clears refused the write (ownership, a layout
+            the tree will not take, or a volume that will not take the bytes)
+            while this app could not read the bundle already at that path.
+            Whatever is there is left as found, so a consumer keeps reading a
+            stale bundle until its certificate expires. Health is deliberately
+            unaffected, because no restart alters an /output layout or its
+            permissions, which makes this rule the only signal. The record's own
+            `remediation` field names the action for the condition that refused
+            the write, and its `error` field names the path.
       - alert: CertConverterScanAborted
         expr: |
           sum by (container) (count_over_time(
