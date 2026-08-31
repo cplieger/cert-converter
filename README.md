@@ -9,6 +9,7 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/cert-converter/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/cert-converter)
 [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/cert-converter/releases)
 
+<!-- hub-overview BEGIN -->
 Automatically converts PEM certificates to PFX format whenever they renew. Set it and forget it.
 
 ## What it does
@@ -30,6 +31,7 @@ consumers.
 - **fsnotify with polling fallback**: reacts to certificate changes in real time, and periodic full scans catch anything fsnotify misses (network mounts, edge cases), so renewals are never skipped.
 - **Skip-unchanged read from the output itself**: currency is decided by reading the bundle on disk rather than from a state file, so a rotated password or a changed encoder profile is picked up on the next scan while unchanged certificates cause no rewrite, keeping disk writes and output timestamps meaningful.
 - **No HTTP server, no open ports**: the container has zero network listeners; health is a file-based probe, so nothing is exposed to the network.
+<!-- hub-overview END -->
 
 ## Quick start
 
