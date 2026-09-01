@@ -5,20 +5,15 @@ import (
 	"testing"
 )
 
-// TestOperatorLogContract_pins_every_published_message_substring is the only test that
-// can fail when one of these messages is reworded.
+// TestOperatorLogContract_pins_every_published_message_substring is the only
+// test that can fail when one of these messages is reworded. The README's
+// alerting section keys a Loki rule and two operator queries on exact
+// substrings of them, while every other assertion in this package compares
+// against the production const ITSELF, so a reword changes both sides
+// together and the suite stays green while the rules stop matching.
 //
-// The README's alerting section keys a Loki rule and two documented operator queries on
-// exact substrings of them, while every other assertion in this package compares a
-// captured record against the production const ITSELF -- so a reword changes both sides
-// together, the whole suite stays green, and CertConverterInputTreeTooLarge silently
-// stops matching while the two OUTPUT_LIFECYCLE=sync queries return nothing. The
-// substrings are spelled out here deliberately, exactly as the health-neutral write tests
-// spell theirs out, so renaming one has to be done on purpose.
-//
-// Each entry is the substring the README publishes rather than the whole message: the
-// rules match on a phrase, so widening the message around it stays compatible and only
-// the phrase is the contract.
+// Each entry is the substring the README publishes, not the whole message:
+// widening the message around it stays compatible.
 func TestOperatorLogContract_pins_every_published_message_substring(t *testing.T) {
 	t.Parallel()
 
@@ -64,21 +59,13 @@ func TestOperatorLogContract_pins_every_published_message_substring(t *testing.T
 // here for the exclusion below. The inclusion side is the table case above.
 const inputBudgetPhrase = "holds more entries than one scan will enumerate"
 
-// TestOperatorLogContract_keeps_the_published_matchers_mutually_exclusive is the other
-// half of the contract above, and the half a Contains-only table cannot see.
-//
-// CertConverterInputTreeTooLarge matches on a PHRASE, not on a whole message, so any
-// other message containing that phrase fires it too -- and its remediation ("check that
-// /input is mounted at the certificate directory ... raise MAX_SCAN_ENTRIES and the
-// container's memory limit together") sends the operator to the wrong mount for any
-// condition that is not the /input walk. The
-// /output entry budget is the near miss: it is a different documented condition with its
-// own rule (CertConverterOrphanRemovalDisabled), its own remediation naming /output, and
-// a WARN whose own doc comment says the generic /output-ownership diagnosis is the wrong
-// one for it. Sharing a matcher with the /input rule would undo exactly that.
-//
-// So scanBudgetMsg is the phrase's ONLY carrier. This test fails if a reword gives it a
-// second one.
+// TestOperatorLogContract_keeps_the_published_matchers_mutually_exclusive is the
+// other half of the contract above, and the half a Contains-only table cannot
+// see: CertConverterInputTreeTooLarge matches on a PHRASE, so any other
+// message containing it fires the rule too, sending the operator to the wrong
+// mount. The /output entry budget is the near miss: its own rule
+// (CertConverterOrphanRemovalDisabled) and remediation name /output, and
+// sharing a matcher with the /input rule would undo that.
 func TestOperatorLogContract_keeps_the_published_matchers_mutually_exclusive(t *testing.T) {
 	t.Parallel()
 
