@@ -16,5 +16,5 @@ services:
       PFX_ENCODER: "modern2023"  # modern2023, modern2026, legacy, or legacyrc2
 
     volumes:
-      - "/path/to/pem/certificates:/input:ro"  # must be readable by the UID above; see README "Healthcheck"
+      - "/path/to/certificates:/input:ro"  # must be readable by the UID above; see README "Healthcheck"
       - "/path/to/converted/output:/output"

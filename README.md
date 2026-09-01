@@ -19,10 +19,11 @@ for each certificate it finds. A PEM pair (`<name>.crt` plus `<name>.key`)
 becomes a PKCS#12 (`.pfx`) bundle; a PFX/P12 bundle becomes a PEM pair, a
 re-encoded bundle, or both; with both formats enabled a PEM source is also
 passed through verbatim, so one output tree serves every consumer whatever it
-accepts. RSA, ECDSA, Ed25519 and ML-DSA keys are all supported. The typical
-use: Caddy renews PEM certificates, but some of your apps only accept PFX
-(some Synology services, .NET apps, Windows-based tools). Point `/input` at
-Caddy's certificate folder and fresh PFX files appear on every renewal.
+accepts. RSA, ECDSA, Ed25519 and ML-DSA keys are all supported. A common use:
+your ACME client renews PEM certificates, but some of your apps only accept
+PFX (some Synology services, .NET apps, Windows-based tools). Point `/input`
+at the certificate directory and fresh PFX files appear on every renewal. The
+input can be any directory holding certificates, whatever wrote them.
 Each scan compares the artifacts already on disk against the ones the current
 inputs produce, so unchanged certificates are skipped; modern2023,
 modern2026, and legacy encoding profiles cover both current and older
@@ -59,7 +60,7 @@ services:
       PFX_ENCODER: "modern2023"  # modern2023, modern2026, legacy, or legacyrc2
 
     volumes:
-      - "/path/to/pem/certificates:/input:ro"  # must be readable by the UID above; see README "Healthcheck"
+      - "/path/to/certificates:/input:ro"  # must be readable by the UID above; see README "Healthcheck"
       - "/path/to/converted/output:/output"
 ```
 
@@ -86,7 +87,7 @@ services:
 
 | Mount | Description |
 | --- | --- |
-| `/input` | Certificate source directory (read-only). A source is a PEM pair, `<name>.crt` with its private key as the sibling `<name>.key` in the same directory (Caddy's layout), or, once `INPUT_PFX_PASSWORD` is configured, a PKCS#12 bundle named `<name>.pfx` or `<name>.p12`. When one name has both, the PEM pair wins and the bundle is skipped. Files with any other extension are ignored, so a certbot-style directory of `fullchain.pem`/`privkey.pem` produces no output and logs `no certificate sources found under the input root`. Sub-directories are scanned recursively, so a tree holding several issuers' directories converts every distinctly-named certificate. Must be readable by the UID in `user:`; Caddy's certificate directory is often root-owned and mode `0700`, so `chgrp`/`chmod` it for that UID or run the container as a UID that can read it. |
+| `/input` | Certificate source directory (read-only). A source is a PEM pair, `<name>.crt` with its private key as the sibling `<name>.key` in the same directory, or, once `INPUT_PFX_PASSWORD` is configured, a PKCS#12 bundle named `<name>.pfx` or `<name>.p12`. When one name has both, the PEM pair wins and the bundle is skipped. Files with any other extension are ignored, so a certbot-style directory of `fullchain.pem`/`privkey.pem` produces no output and logs `no certificate sources found under the input root`. **The whole tree is scanned recursively, to any depth**, so every source anywhere under the mount is converted; mount the specific directory you want converted rather than a parent that also holds certificates you do not. Do not use permissions to exclude a sub-path: an `/input` path this app cannot read is counted as unreadable, which is health-neutral but disables orphan cleanup for every scan and reports a standing warning. Must be readable by the UID in `user:`; an ACME client's certificate directory is often root-owned and mode `0700`, so `chgrp`/`chmod` it for that UID or run the container as a UID that can read it. |
 | `/output` | Output directory for generated artifacts; must be writable by the UID in `user:`. Artifact paths follow `OUTPUT_LAYOUT`. |
 
 Create the host output directory owned by the UID you set in `user:` before
