@@ -54,5 +54,15 @@ func (s *source) pathAbsent(rel string) (bool, error) {
 // it invalidates — confining the read to that tree: a symlink or ".." component in rel
 // can never redirect the read outside it (Go 1.24+ *os.Root).
 func (s *source) readBounded(ctx context.Context, rel string) ([]byte, error) {
-	return atomicfile.ReadBoundedInRoot(ctx, s.root, rel, convert.MaxInputBytes)
+	return s.readBoundedTo(ctx, rel, convert.MaxInputBytes)
+}
+
+// readBundleBounded admits the largest PKCS#12 this app can itself emit from two
+// individually accepted PEM inputs, so PFX output can be fed back as input.
+func (s *source) readBundleBounded(ctx context.Context, rel string) ([]byte, error) {
+	return s.readBoundedTo(ctx, rel, convert.MaxBundleBytes)
+}
+
+func (s *source) readBoundedTo(ctx context.Context, rel string, maxBytes int64) ([]byte, error) {
+	return atomicfile.ReadBoundedInRoot(ctx, s.root, rel, maxBytes)
 }

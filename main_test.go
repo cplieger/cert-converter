@@ -707,6 +707,12 @@ func TestHealthyAfterScan(t *testing.T) {
 		// health does with them.
 		{"refused output replacement stays healthy", process.ScanResult{Total: 1, Unwritable: 1}, true},
 		{"failure stays unhealthy even with unwritable", process.ScanResult{Total: 2, Failed: 1, Unwritable: 1}, false},
+		// A collision is operator ambiguity this app refuses to arbitrate: the
+		// contested output name converts nothing, a consumer keeps reading
+		// whatever is there, and no restart resolves it — unhealthy is the only
+		// signal that reaches an orchestrator.
+		{"output name collision clears health", process.ScanResult{Total: 2, Collided: 2}, false},
+		{"collision stays unhealthy even when siblings converted", process.ScanResult{Total: 3, Converted: 1, Collided: 2}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

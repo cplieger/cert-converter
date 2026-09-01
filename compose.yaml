@@ -17,4 +17,4 @@ services:
 
     volumes:
       - "/path/to/pem/certificates:/input:ro"  # must be readable by the UID above; see README "Healthcheck"
-      - "/path/to/pfx/output:/output"
+      - "/path/to/converted/output:/output"

@@ -43,7 +43,7 @@ func newInputSource(t *testing.T, dir string) *source {
 // at all. It keeps each case's call to reconcile as short as it was when reconcile
 // took the source and the mode as arguments.
 func newReaper(out *store, src *source, mode outputpolicy.Lifecycle) *reaper {
-	return &reaper{src: src, out: out, mode: mode}
+	return &reaper{src: src, out: out, mode: mode, formats: outputpolicy.DefaultFormats(), layoutMode: outputpolicy.LayoutMirror}
 }
 
 // writePair writes an already-generated pair into dir under the /input naming rule the
@@ -170,10 +170,10 @@ func TestStoreReconcile(t *testing.T) {
 				t.Fatalf("setup: WriteFile(notes.txt): %v", err)
 			}
 			s := newOutputStore(t, dir)
-			seen := map[string]struct{}{"live.crt": {}}
+			expected := map[string]struct{}{"live.pfx": {}}
 
 			got, err := newReaper(s, newInputSource(t, t.TempDir()), tc.mode).
-				reconcile(t.Context(), seen, tc.rc)
+				reconcile(t.Context(), expected, tc.rc)
 			if err != nil {
 				t.Errorf("reconcile = error %v, want nil: only a cancelled scan reports one", err)
 			}
@@ -187,7 +187,7 @@ func TestStoreReconcile(t *testing.T) {
 			}
 			// The live bundle and the unrelated file must survive every mode.
 			if _, err := os.Stat(filepath.Join(dir, "live.pfx")); err != nil {
-				t.Errorf("live.pfx was removed; its input is present in seen: %v", err)
+				t.Errorf("live.pfx was removed; its input is present in expected: %v", err)
 			}
 			if _, err := os.Stat(filepath.Join(dir, "notes.txt")); err != nil {
 				t.Errorf("notes.txt was removed; only the app's own output shape may be a candidate: %v", err)
@@ -221,7 +221,7 @@ func TestStoreReconcile_warn_mode_reports_report_only_despite_a_conversion_failu
 	if deleted != 0 {
 		t.Errorf("reconcile(warn, one failed conversion) deleted = %d, want 0", deleted)
 	}
-	const msg = "output bundles have no matching input"
+	const msg = "output artifacts have no matching input"
 	if !logs.HasAttr(msg, "action", "reported only (OUTPUT_LIFECYCLE=warn)") {
 		got, _ := logs.AttrValue(msg, "action")
 		t.Errorf("reconcile(warn, one failed conversion) logged action %q, want the report-only mode explanation", got)
@@ -244,7 +244,7 @@ func TestStoreReconcile_warn_mode_does_not_claim_a_present_certificate_is_gone(t
 		t.Fatalf("setup: WriteFile(back.pfx): %v", err)
 	}
 	// Both halves of the pair are under /input while the bundle is still a candidate.
-	cert := layout.CertForOutput("back.pfx")
+	cert := layout.CertFor(layout.OutputStem("back.pfx"))
 	for _, name := range []string{cert, layout.KeyFor(cert)} {
 		if err := os.WriteFile(filepath.Join(in, name), []byte("pem"), 0o600); err != nil {
 			t.Fatalf("setup: WriteFile(%s): %v", name, err)
@@ -265,7 +265,7 @@ func TestStoreReconcile_warn_mode_does_not_claim_a_present_certificate_is_gone(t
 		t.Errorf("reconcile logged %q %d times, want 0: that record asserts the certificate is gone,"+
 			" and %q is on disk: %q", loneKeyRetainedMsg, got, cert, logs.Messages())
 	}
-	const orphanMsg = "output bundles have no matching input"
+	const orphanMsg = "output artifacts have no matching input"
 	if got := logs.CountExact(orphanMsg); got != 1 {
 		t.Errorf("reconcile logged %q %d times, want exactly 1: the candidate is still reported,"+
 			" just not as a half-deleted pair: %q", orphanMsg, got, logs.Messages())
@@ -304,11 +304,11 @@ func TestStoreReconcile_unsafe_output_walk_never_advises_deletion(t *testing.T) 
 	if _, err := os.Stat(orphan); err != nil {
 		t.Errorf("orphan candidate was removed after an unsafe output walk: %v", err)
 	}
-	const msg = "output bundles have no matching input; " + reapDisabledPhrase
+	const msg = "output artifacts have no matching input; " + reapDisabledPhrase
 	if !logs.HasAttr(msg, "action",
-		"kept: this scan could not prove every candidate is orphaned, so deleting could remove a live bundle") {
+		"kept: this scan could not prove every candidate is orphaned, so deleting could remove a live artifact") {
 		got, _ := logs.AttrValue(msg, "action")
-		t.Errorf("reconcile(unsafe output walk) logged action %q, want the live-bundle deletion warning", got)
+		t.Errorf("reconcile(unsafe output walk) logged action %q, want the live-artifact deletion warning", got)
 	}
 	if !logs.HasAttr(msg, "remediation",
 		"do not remove anything from this list yet: fix the /output warnings above, then re-check it on a scan that reports no disabled orphan removal") {
@@ -415,7 +415,7 @@ func TestStoreReconcile_oversized_orphan_sample_keeps_the_count(t *testing.T) {
 	if deleted != 0 {
 		t.Errorf("reconcile(warn mode) deleted = %d, want 0", deleted)
 	}
-	const msg = "output bundles have no matching input"
+	const msg = "output artifacts have no matching input"
 	if want := fmt.Sprint(orphans); !logs.HasAttr(msg, "count", want) {
 		got, _ := logs.AttrValue(msg, "count")
 		t.Errorf("orphan report logged count %q, want %q: the count must survive the paths cut", got, want)
@@ -641,7 +641,7 @@ func TestReapConfirmed_reports_a_restored_pair_as_restored(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The restored pair: the certificate came back, and its sibling key never left.
-	cert := layout.CertForOutput("back.pfx")
+	cert := layout.CertFor(layout.OutputStem("back.pfx"))
 	for _, name := range []string{cert, layout.KeyFor(cert)} {
 		if err := os.WriteFile(filepath.Join(in, name), []byte("pem"), 0o600); err != nil {
 			t.Fatal(err)
@@ -662,7 +662,7 @@ func TestReapConfirmed_reports_a_restored_pair_as_restored(t *testing.T) {
 		t.Errorf("reapConfirmed logged %q %d times, want 0: that record asserts the certificate is gone,"+
 			" and this one came back: %q", loneKeyRetainedMsg, got, logs.Messages())
 	}
-	const backMsg = "keeping an output bundle whose certificate came back during the confirmation delay"
+	const backMsg = "keeping an output artifact whose source came back during the confirmation delay"
 	if got := logs.CountExact(backMsg); got != 1 {
 		t.Errorf("reapConfirmed logged %q %d times, want exactly 1: it is the only trace that the delay"+
 			" did its job: %q", backMsg, got, logs.Messages())
@@ -830,10 +830,10 @@ func TestStoreReconcile_sync_spares_a_nested_live_bundle(t *testing.T) {
 		}
 	}
 	s := newOutputStore(t, dir)
-	seen := map[string]struct{}{filepath.Join("acme-v02", "example.com", "live.crt"): {}}
+	expected := map[string]struct{}{filepath.Join("acme-v02", "example.com", "live.pfx"): {}}
 
 	got, reconcileErr := newReaper(s, newInputSource(t, t.TempDir()), outputpolicy.LifecycleSync).
-		reconcile(t.Context(), seen, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
+		reconcile(t.Context(), expected, &reapContext{result: ScanResult{Total: 1}, walkCompleted: true})
 	if reconcileErr != nil {
 		t.Errorf("reconcile(nested output tree) = error %v, want nil", reconcileErr)
 	}
@@ -1025,7 +1025,7 @@ func TestStoreInspect_treats_an_undecodable_prior_as_stale(t *testing.T) {
 		{"a truncated bundle", "truncated.pfx", full[:len(full)/2]},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := os.WriteFile(filepath.Join(dir, tc.rel), tc.content, pfxFileMode); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, tc.rel), tc.content, outputFileMode); err != nil {
 				t.Fatalf("setup: WriteFile: %v", err)
 			}
 			logs := captureLogs(t)
@@ -1147,7 +1147,7 @@ func TestScannerRun_a_stale_bundle_with_a_lax_mode_is_a_conversion_failure(t *te
 	if err := os.WriteFile(keyPath, renewedKeyPEM, 0o600); err != nil {
 		t.Fatalf("setup: rewrite key: %v", err)
 	}
-	// Laxer than pfxFileMode, so the mode fact is set as well as the content fact: the
+	// Laxer than outputFileMode, so the mode fact is set as well as the content fact: the
 	// point of this case is that the stale content still decides the outcome.
 	if err := os.Chmod(pfxPath, 0o644); err != nil {
 		t.Fatalf("setup: Chmod: %v", err)
@@ -1166,8 +1166,8 @@ func TestScannerRun_a_stale_bundle_with_a_lax_mode_is_a_conversion_failure(t *te
 	}
 	// The lax mode is still announced: detection runs before the content read, so its
 	// absence would mean this test never reached the arm under test.
-	if got := logs.CountLevel(slog.LevelWarn, laxBundleMsg); got != 1 {
-		t.Errorf("logged %q at WARN %d times, want exactly 1: %q", laxBundleMsg, got, logs.Messages())
+	if got := logs.CountLevel(slog.LevelWarn, laxArtifactMsg); got != 1 {
+		t.Errorf("logged %q at WARN %d times, want exactly 1: %q", laxArtifactMsg, got, logs.Messages())
 	}
 	if got := logs.CountLevel(slog.LevelError, "conversion failed"); got != 1 {
 		t.Errorf("logged %q at ERROR %d times, want exactly 1: an unwritten renewal is a conversion"+
@@ -1185,9 +1185,9 @@ func TestScannerRun_a_stale_bundle_with_a_lax_mode_is_a_conversion_failure(t *te
 	}
 	// The health-neutral message may not appear: a bundle this app compared and found
 	// stale earns no standing WARN in place of the failure.
-	if got := logs.CountLevel(slog.LevelWarn, unreplaceableBundleMsg); got != 0 {
+	if got := logs.CountLevel(slog.LevelWarn, unreplaceableArtifactMsg); got != 0 {
 		t.Errorf("logged %q at WARN %d times, want 0: the health-neutral WARN belongs only to a bundle"+
-			" this app never proved wrong: %q", unreplaceableBundleMsg, got, logs.Messages())
+			" this app never proved wrong: %q", unreplaceableArtifactMsg, got, logs.Messages())
 	}
 	// Nothing deleted, nothing truncated: the refused write must leave the stale bundle
 	// exactly as it was, so the next scan can try again.
@@ -1494,7 +1494,7 @@ func TestStoreReconcile_spares_an_orphan_whose_certificate_returns_during_the_re
 		t.Errorf("os.Stat(gone.pfx) = %v, want fs.ErrNotExist: one cancelled deletion must not"+
 			" spare the rest of the batch", statErr)
 	}
-	const kept = "keeping an output bundle whose certificate came back during the confirmation delay"
+	const kept = "keeping an output artifact whose source came back during the confirmation delay"
 	if logs.CountLevel(slog.LevelInfo, kept) != 1 {
 		t.Errorf("reconcile logged %q, want the cancelled deletion named once at INFO", logs.Messages())
 	}
@@ -2190,7 +2190,7 @@ func TestScannerRun_fails_closed_when_the_observation_log_evicts_wholeness_evide
 	if _, statErr := os.Stat(orphan); statErr != nil {
 		t.Errorf("an orphan was deleted on a scan that lost the evidence separating a replaced key from a missing one: %v", statErr)
 	}
-	const disabledWarn = reapDisabledPhrase + ": this scan cannot prove any /output bundle is orphaned"
+	const disabledWarn = reapDisabledPhrase + ": this scan cannot prove any /output artifact is orphaned"
 	if got := logs.CountLevel(slog.LevelWarn, disabledWarn); got != 1 {
 		t.Errorf("Run(log at its ceiling) logged %q at WARN %d times, want exactly 1: %q",
 			disabledWarn, got, logs.Messages())
@@ -2305,8 +2305,8 @@ func TestStoreReconcile_rechecks_each_candidate_immediately_before_its_own_delet
 		t.Errorf("reconcile(interleaved re-check) deleted = %d, want 1", deleted)
 	}
 	const (
-		removedMsg = "removed orphaned output whose input is gone"
-		keptMsg    = "keeping an output bundle whose certificate came back during the confirmation delay"
+		removedMsg = "removed orphaned output artifact"
+		keptMsg    = "keeping an output artifact whose source came back during the confirmation delay"
 	)
 	removedAt, keptAt := -1, -1
 	for i, msg := range logs.Messages() {
@@ -2487,7 +2487,7 @@ func TestStoreReconcile_names_a_certificate_recheck_it_could_not_make(t *testing
 		t.Errorf("reconcile(uninspectable certificate path) logged %q at WARN %d times, want exactly 1: %q",
 			recheckUnreadableMsg, got, logs.Messages())
 	}
-	const cameBackMsg = "keeping an output bundle whose certificate came back during the confirmation delay"
+	const cameBackMsg = "keeping an output artifact whose source came back during the confirmation delay"
 	if got := logs.CountLevel(slog.LevelInfo, cameBackMsg); got != 0 {
 		t.Errorf("reconcile(uninspectable certificate path) logged %q at INFO %d times, want 0: a failed"+
 			" re-check is not evidence the producer wrote the pair back: %q", cameBackMsg, got, logs.Messages())
@@ -2543,7 +2543,7 @@ func TestStoreReconcile_audits_deletions_once_per_scan_at_warn(t *testing.T) {
 		}
 	}
 	// The per-path detail stays available for a reader who asked for it, one level down.
-	if got := logs.CountLevel(slog.LevelDebug, "removed orphaned output whose input is gone"); got != 2 {
+	if got := logs.CountLevel(slog.LevelDebug, "removed orphaned output artifact"); got != 2 {
 		t.Errorf("the per-path deletion detail logged %d times at DEBUG, want 2: the audit record"+
 			" collapses the default-level report, it does not remove the detail", got)
 	}
@@ -2790,7 +2790,7 @@ func TestStoreReconcile_keep_is_silent_with_orphans_present(t *testing.T) {
 
 // TestLoneKeyRemediation_promises_a_reap_only_where_one_can_follow pins the tail the
 // retained-lone-key report appends per mode. Only sync ever removes a bundle, so
-// promising "so the bundle can be reaped" under warn or keep has the operator finish a
+// promising "so the artifact can be reaped" under warn or keep has the operator finish a
 // change under /input for an outcome that cannot follow, and withholding it under sync
 // leaves them thinking the leftover is permanent. The prefix is shared and asserted
 // with it, because the sentence has to read as one instruction either way.
@@ -2802,15 +2802,15 @@ func TestLoneKeyRemediation_promises_a_reap_only_where_one_can_follow(t *testing
 	}{
 		{
 			mode: outputpolicy.LifecycleSync,
-			want: "finish the change under /input: add the matching <name>.crt, or remove the leftover <name>.key so the bundle can be reaped",
+			want: "finish the change under /input: add the matching <name>.crt, or remove the leftover <name>.key so the artifact can be reaped",
 		},
 		{
 			mode: outputpolicy.LifecycleWarn,
-			want: "finish the change under /input: add the matching <name>.crt, or remove the leftover <name>.key; OUTPUT_LIFECYCLE=warn never removes a bundle, so this one is kept either way",
+			want: "finish the change under /input: add the matching <name>.crt, or remove the leftover <name>.key; OUTPUT_LIFECYCLE=warn never removes an artifact, so this one is kept either way",
 		},
 		{
 			mode: outputpolicy.LifecycleKeep,
-			want: "finish the change under /input: add the matching <name>.crt, or remove the leftover <name>.key; OUTPUT_LIFECYCLE=keep never removes a bundle, so this one is kept either way",
+			want: "finish the change under /input: add the matching <name>.crt, or remove the leftover <name>.key; OUTPUT_LIFECYCLE=keep never removes an artifact, so this one is kept either way",
 		},
 	} {
 		t.Run(string(tc.mode), func(t *testing.T) {

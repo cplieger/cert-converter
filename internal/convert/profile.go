@@ -178,6 +178,8 @@ const (
 	maxSafeBags           = 64
 )
 
+var errElementBudget = errors.New("ASN.1 element count exceeds the preflight budget")
+
 // sequenceElements splits one DER SEQUENCE OF into its elements' raw DER,
 // refusing a sequence with more elements than the preflight will look at.
 func sequenceElements(der []byte, what string, maxElements int) ([][]byte, error) {
@@ -191,7 +193,8 @@ func sequenceElements(der []byte, what string, maxElements int) ([][]byte, error
 	elements := make([][]byte, 0, maxElements)
 	for body := seq.Bytes; len(body) > 0; {
 		if len(elements) == maxElements {
-			return nil, fmt.Errorf("%w: more than %d element(s) in %s", ErrProfileUnknown, maxElements, what)
+			return nil, fmt.Errorf("%w: %w: more than %d element(s) in %s",
+				ErrProfileUnknown, errElementBudget, maxElements, what)
 		}
 		var elem asn1.RawValue
 		remaining, unmarshalErr := asn1.Unmarshal(body, &elem)

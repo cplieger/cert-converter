@@ -29,13 +29,34 @@ groups:
         annotations:
           summary: "cert-converter failed to convert a certificate"
           description: >
-            A PEM or key parse error, a cert/key mismatch, or a failed PFX write
-            left the affected .pfx stale or missing, and the container is
-            unhealthy until a scan converts everything cleanly. The
+            A PEM parse, PFX decode, cert/key mismatch, or output write failure
+            left one or more requested artifacts stale or missing. The container
+            stays unhealthy until a scan converts every source cleanly. The
             `!= (shutdown)` filter drops the same message when it was caused by
-            the container stopping, which is logged at DEBUG. Check /output
-            ownership and permissions for the UID in `user:`, that no symlink is
-            planted at the output path, and the certificate chain.
+            the container stopping, which is logged at DEBUG. Check /input and
+            /output ownership for the UID in `user:`, the input password for PFX
+            sources, and the certificate chain.
+      - alert: CertConverterOutputNameCollision
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |= `output name collision` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "two cert-converter inputs claim the same output name; neither is converted"
+          description: >
+            Under OUTPUT_LAYOUT=flat (the default), two inputs whose last
+            directory and file name coincide would produce the same output
+            path. This app refuses to arbitrate that ambiguity: none of the
+            colliding sources is converted, whatever is at the contested path
+            is left as found, and the container stays unhealthy until the
+            operator resolves it. The record carries the shared output name,
+            the claimant count, and a bounded sample of the claimants. Rename
+            one input directory so they differ, or set OUTPUT_LAYOUT=mirror to
+            keep every source's full path.
       # The write refusal that does NOT flip health, and so has no other signal.
       # CertConverterConversionFailed above covers a refused write only where this
       # app had PROVEN the bundle on disk wrong; where it could not read that
@@ -45,21 +66,20 @@ groups:
         expr: |
           sum by (container) (count_over_time(
             {container="cert-converter"}
-            |= `prior pfx could not be replaced` [15m]
+            |= `prior output could not be replaced` [15m]
           )) > 0
         for: 0m
         labels:
           severity: warning
         annotations:
-          summary: "cert-converter could not publish a pfx and left /output as found"
+          summary: "cert-converter could not publish an artifact and left /output as found"
           description: >
-            A renewed certificate's .pfx was not written, because an /output
-            condition no restart clears refused the write (ownership, a layout
-            the tree will not take, or a volume that will not take the bytes)
-            while this app could not read the bundle already at that path.
-            Whatever is there is left as found, so a consumer keeps reading a
-            stale bundle until its certificate expires. Health is deliberately
-            unaffected, because no restart alters an /output layout or its
+            A requested output was not written because an /output condition no
+            restart clears refused the write (ownership, layout, or a volume
+            that will not take the bytes) while this app could not read the
+            artifact already at that path. Whatever is there is left as found,
+            so a consumer can keep reading stale material. Health is deliberately
+            unaffected because no restart alters an /output layout or its
             permissions, which makes this rule the only signal. The record's own
             `remediation` field names the action for the condition that refused
             the write, and its `error` field names the path.
@@ -91,7 +111,7 @@ groups:
           summary: "cert-converter stopped a scan at the /input entry budget"
           description: >
             The scan reached MAX_SCAN_ENTRIES (default 10000) and stopped, so
-            every certificate past that point is unconverted and orphan cleanup
+            every source past that point is unconverted and orphan cleanup
             was skipped for that scan. Health is unaffected, because no restart
             shrinks the tree, which makes this rule the only signal. Check that
             /input is mounted at the certificate directory and holds nothing
@@ -195,32 +215,30 @@ groups:
           summary: "cert-converter skipped an unreachable /input path"
           description: >
             An /input path could not be read, stat'ed, or resolved, so the
-            certificates it holds were not converted and their .pfx files stay
-            stale or absent. Health is unaffected, because no restart clears a
+            sources it names were not converted and their requested outputs stay
+            stale or absent. Health is unaffected because no restart clears a
             permissions or layout condition, which makes this rule the only
             signal. Repair the permissions for the UID in `user:`, and mount the
             certificate directory directly instead of linking to it.
-      - alert: CertConverterNoCertificatePairs
+      - alert: CertConverterNoCertificateSources
         expr: |
           sum by (container) (count_over_time(
             {container="cert-converter"}
-            |~ `(no certificate pairs found under the input root|every certificate under the input root is missing its sibling \.key)` [15m]
+            |~ `(no certificate (pairs|sources) found under the input root|certificate under the input root is missing its sibling \.key)` [15m]
           )) > 0
         for: 0m
         labels:
           severity: warning
         annotations:
-          summary: "cert-converter found no convertible certificate pairs under /input"
+          summary: "cert-converter found no convertible certificate sources under /input"
           description: >
-            A scan completed without converting a single `<name>.crt` with a
-            sibling `<name>.key`, so no PFX is produced at all. This is the
-            signature of a wrong or vanished /input mount, of a certbot-style
-            directory of fullchain.pem/privkey.pem this app does not read, or of
-            a key-naming layout that does not match the `<name>.key` contract.
-            Health is unaffected, so this rule is the only signal. Check the
-            /input mount and the .crt/.key filename contract. A fresh deployment
-            legitimately reports this until the first issuance; raise `for:` if
-            that is noisy.
+            A scan found neither a complete `<name>.crt` + `<name>.key` PEM pair
+            nor a PFX/P12 bundle, so no output artifact is produced. This is the
+            signature of a wrong or vanished /input mount, an unsupported naming
+            layout, or orphaned PEM certificates. Health is unaffected, so this
+            rule is the only signal. Check the /input mount and source filenames.
+            A fresh deployment legitimately reports this until the first
+            issuance; raise `for:` if that is noisy.
       - alert: CertConverterOutputCleanupDegraded
         expr: |
           sum by (container) (count_over_time(
@@ -249,15 +267,35 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "cert-converter cannot reap orphaned /output bundles"
+          summary: "cert-converter cannot reap orphaned /output artifacts"
           description: >
-            This scan could not prove an output bundle is orphaned, so it deleted
-            nothing: /input was not fully enumerated, or an /output sub-path could
-            not be read, or the output tree contains a symlink, so the orphan walk
-            could not enumerate all of it, or either tree holds more entries than
-            MAX_SCAN_ENTRIES lets one walk enumerate. Only relevant with
-            `OUTPUT_LIFECYCLE=sync`, where it is the difference between "nothing
-            to reap" and "reaping is off", otherwise indistinguishable because
-            health is unaffected: a `.pfx` whose certificate was removed from
-            /input stays served indefinitely. The record's own `remediation`
-            field names the action for the case that fired.
+            This scan could not prove an output artifact is orphaned, so it
+            deleted nothing: /input was not fully enumerated (at scan time or
+            at the confirming re-check before deletion), an /output sub-path
+            could not be read, the output tree contains a symlink, either tree
+            exceeds MAX_SCAN_ENTRIES, or an output-name collision left this
+            scan's view of the output tree ambiguous. Only relevant with
+            `OUTPUT_LIFECYCLE=sync`, where it distinguishes "nothing to reap"
+            from "reaping is off". Health is unaffected; an artifact whose
+            source disappeared can remain served indefinitely. The record's
+            `remediation` field names the action for the case that fired.
+      - alert: CertConverterPreviousLayoutRetained
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |= `laid out for a different OUTPUT_LAYOUT` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter sync is keeping artifacts from a previous OUTPUT_LAYOUT"
+          description: >
+            OUTPUT_LIFECYCLE=sync found output artifacts laid out for a layout
+            other than the current one while OUTPUT_LAYOUT is unset, and kept
+            them: the unset default never deletes a tree a previous
+            configuration wrote, because a consumer may still mount those
+            paths. Repoint consumers at the current layout's paths, then set
+            OUTPUT_LAYOUT explicitly to let sync reconcile the old tree away,
+            or remove it by hand. Health is unaffected, so this rule is the
+            only signal.

@@ -15,7 +15,7 @@ import (
 // default-level diagnostic whose remediation tells the operator to RENAME their keys.
 // It is the false alarm a mid-scan key replacement must not raise, and the signal a
 // genuinely misnamed key must still raise, so both halves of this file assert on it.
-const missingKeyAggregate = "some certificates under the input root are missing their sibling .key"
+const missingKeyAggregate = "some PEM certificates under the input root are missing their sibling .key"
 
 // vanishedKeyMsg is noteMissingKey's transient line, deliberately the same wording the
 // bounded reads use for the same renewal window.
@@ -127,7 +127,7 @@ func TestScannerRun_reports_a_key_replaced_mid_scan_as_transient_then_names_a_ke
 	// reportLaxDir warns when it is laxer than pfxDirMode, and what t.TempDir creates
 	// depends on the host (an inherited ACL widens it). Pinned so the "no WARN at all"
 	// assertion below observes the scan's own conclusions only.
-	if err := os.Chmod(outRoot, pfxDirMode); err != nil {
+	if err := os.Chmod(outRoot, outputDirMode); err != nil {
 		t.Fatalf("setup: Chmod(outRoot): %v", err)
 	}
 	for _, name := range []string{"renewing", "stable"} {
@@ -171,7 +171,7 @@ func TestScannerRun_reports_a_key_replaced_mid_scan_as_transient_then_names_a_ke
 	// The scan's one default-level record is the reap gate: a certificate replaced
 	// mid-walk leaves the enumeration incomplete, so orphan removal is off for this scan
 	// and says so. Nothing else may reach WARN.
-	const reapDisabled = reapDisabledPhrase + ": this scan cannot prove any /output bundle is orphaned"
+	const reapDisabled = reapDisabledPhrase + ": this scan cannot prove any /output artifact is orphaned"
 	if got := logs.CountLevel(slog.LevelWarn, ""); got != 1 {
 		t.Errorf("Run(key gone from a converted pair) logged %d WARN records (%q), want only the disabled-orphan-removal record at the default level", got, logs.Messages())
 	}
@@ -226,7 +226,7 @@ func TestScannerRun_grants_the_vanished_key_grace_after_a_failed_write(t *testin
 	outRoot := t.TempDir()
 	// Pinned for the same reason the test above pins it: reportLaxDir's WARN is fixture
 	// noise that depends on the host's inherited ACLs.
-	if err := os.Chmod(outRoot, pfxDirMode); err != nil {
+	if err := os.Chmod(outRoot, outputDirMode); err != nil {
 		t.Fatalf("setup: Chmod(outRoot): %v", err)
 	}
 	for _, name := range []string{"blocked", "stable"} {
@@ -235,7 +235,7 @@ func TestScannerRun_grants_the_vanished_key_grace_after_a_failed_write(t *testin
 	// A DIRECTORY at the bundle path: the pair is read, analysed and encoded, and only
 	// then does the write fail. An ordinary conversion failure with nothing wrong on the
 	// /input side, which is the whole point — the read succeeded.
-	if err := os.Mkdir(filepath.Join(outRoot, "blocked.pfx"), pfxDirMode); err != nil {
+	if err := os.Mkdir(filepath.Join(outRoot, "blocked.pfx"), outputDirMode); err != nil {
 		t.Fatalf("setup: Mkdir(blocked.pfx): %v", err)
 	}
 	scanner := New(&Options{

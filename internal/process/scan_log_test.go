@@ -185,7 +185,7 @@ func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing
 // stay quiet, or the notice becomes noise on every fsnotify event and every
 // fallback tick. Runs serially: it swaps slog.Default().
 func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing.T) {
-	const wantMsg = "no certificate pairs found under the input root"
+	const wantMsg = "no certificate sources found under the input root"
 	tests := []struct {
 		walkErr  error
 		name     string
@@ -198,7 +198,7 @@ func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing
 		// An unresolved input symlink hides part of the tree, so "no certificate
 		// pairs" is not a claim this scan can make. The symlink WARN one flow
 		// earlier already carries the correct diagnosis; repeating it here fires
-		// the README's CertConverterNoCertificatePairs alert with the wrong one.
+		// the README's CertConverterNoCertificateSources alert with the wrong one.
 		{nil, "an unresolved symlink already explains the empty result", ScanResult{Unresolved: 1}, false},
 		{errors.New("permission denied"), "an aborted scan stays quiet", ScanResult{}, false},
 	}
@@ -233,7 +233,7 @@ func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing
 // keys this scan did observe. Runs serially: it swaps
 // slog.Default().
 func TestLogScanOutcome_flags_an_input_tree_whose_certs_all_lack_a_key(t *testing.T) {
-	const wantMsg = "every certificate under the input root is missing its sibling .key"
+	const wantMsg = "every PEM certificate under the input root is missing its sibling .key"
 	tests := []struct {
 		walkErr  error
 		name     string
@@ -503,7 +503,7 @@ func TestNoteUnreadableInput_names_the_published_unreachable_prefix(t *testing.T
 // owns that case in full.
 // Runs serially: it swaps slog.Default().
 func TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key(t *testing.T) {
-	const wantMsg = "some certificates under the input root are missing their sibling .key"
+	const wantMsg = "some PEM certificates under the input root are missing their sibling .key"
 	for _, tt := range []struct {
 		walkErr   error
 		name      string
@@ -654,9 +654,9 @@ func TestScannerRun_an_unopenable_root_emits_the_scan_outcome_record(t *testing.
 func TestLogScanOutcome_reports_observed_per_path_counts_when_the_entry_budget_stopped_the_scan(t *testing.T) {
 	const (
 		unreadableMsg = "some /input paths were unreadable and were skipped"
-		orphanMsg     = "some certificates under the input root are missing their sibling .key"
-		emptyTreeMsg  = "no certificate pairs found under the input root"
-		allOrphanMsg  = "every certificate under the input root is missing its sibling .key"
+		orphanMsg     = "some PEM certificates under the input root are missing their sibling .key"
+		emptyTreeMsg  = "no certificate sources found under the input root"
+		allOrphanMsg  = "every PEM certificate under the input root is missing its sibling .key"
 	)
 	budgetErr := fmt.Errorf("%w: stopped at 3 entries (a.crt)", errScanBudgetExceeded)
 

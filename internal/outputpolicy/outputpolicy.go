@@ -1,5 +1,6 @@
-// Package outputpolicy owns the OUTPUT_LIFECYCLE value domain: what happens to
-// an output bundle whose input pair has disappeared.
+// Package outputpolicy owns the configured output formats, layout and lifecycle:
+// which artifacts are generated, where they land, and what happens when their
+// source disappears.
 package outputpolicy
 
 import (
@@ -7,15 +8,15 @@ import (
 	"strings"
 )
 
-// Lifecycle decides what happens to an output whose input pair has disappeared.
+// Lifecycle decides what happens to an output artifact whose source disappeared.
 type Lifecycle string
 
 // The three lifecycle modes.
 const (
 	// LifecycleWarn reports orphaned outputs and deletes nothing.
 	LifecycleWarn Lifecycle = "warn"
-	// LifecycleSync makes the output tree mirror the input tree, deleting a bundle
-	// whose source is gone.
+	// LifecycleSync makes the output tree mirror the input tree, deleting an
+	// artifact whose source is gone.
 	LifecycleSync Lifecycle = "sync"
 	// LifecycleKeep leaves orphans in place silently.
 	LifecycleKeep Lifecycle = "keep"

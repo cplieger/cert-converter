@@ -29,7 +29,7 @@ func newOutputStore(t *testing.T, dir string) *store {
 		t.Fatalf("setup: os.OpenRoot(%s): %v", dir, err)
 	}
 	t.Cleanup(func() { _ = root.Close() })
-	return &store{root: root}
+	return &store{root: root, formats: outputpolicy.DefaultFormats()}
 }
 
 // inspectCurrent asks store.inspect the DERIVED question most currency tests care about:
@@ -188,8 +188,8 @@ func TestStoreWrite_creates_the_parent_directory(t *testing.T) {
 		t.Fatalf("stat written pfx: %v", err)
 	}
 	// A PFX carries a private key, so the mode is part of the contract.
-	if perm := info.Mode().Perm(); perm != pfxFileMode {
-		t.Errorf("written mode = %o, want %o", perm, pfxFileMode)
+	if perm := info.Mode().Perm(); perm != outputFileMode {
+		t.Errorf("written mode = %o, want %o", perm, outputFileMode)
 	}
 }
 
@@ -200,7 +200,7 @@ func TestStoreWrite_creates_the_parent_directory(t *testing.T) {
 // The directory creation is this package's own MkdirAll through the confined root
 // (store.write owns why it can no longer be atomicfile's WithMkdirMode: the parent has
 // to exist before the write's parent pin), so the failure surfaces under this package's
-// "write pfx" wrapping with the path it could not create. What matters for the operator
+// "write output" wrapping with the path it could not create. What matters for the operator
 // is that the step is named and the offending path appears; the precise inner wording
 // belongs to the filesystem.
 func TestStoreWrite_reports_a_parent_it_cannot_create(t *testing.T) {
@@ -216,7 +216,7 @@ func TestStoreWrite_reports_a_parent_it_cannot_create(t *testing.T) {
 	if err == nil {
 		t.Fatal("store.write(into a path blocked by a regular file) = nil error, want a failure")
 	}
-	if !strings.Contains(err.Error(), "write pfx") {
+	if !strings.Contains(err.Error(), "write output") {
 		t.Errorf("error = %q, want it to name the write step", err.Error())
 	}
 	if !strings.Contains(err.Error(), "blocked/cert.pfx") {
@@ -224,7 +224,7 @@ func TestStoreWrite_reports_a_parent_it_cannot_create(t *testing.T) {
 	}
 }
 
-// TestStoreWrite_wraps_an_atomic_write_failure pins the "write pfx" wrapping.
+// TestStoreWrite_wraps_an_atomic_write_failure pins the "write output" wrapping.
 //
 // The error must identify the PFX write rather than parsing, encoding, or parent
 // creation, each of which has its own wrapping.
@@ -244,7 +244,7 @@ func TestStoreWrite_wraps_an_atomic_write_failure(t *testing.T) {
 	if err == nil {
 		t.Fatal("store.write(onto an existing directory) = nil error, want a failure")
 	}
-	if !strings.Contains(err.Error(), "write pfx") {
+	if !strings.Contains(err.Error(), "write output") {
 		t.Errorf("error = %q, want it to name the pfx write step", err.Error())
 	}
 }
@@ -271,7 +271,7 @@ func TestStoreWrite_refuses_a_bundle_larger_than_the_read_bound(t *testing.T) {
 	if err == nil {
 		t.Fatal("store.write(over maxPFXSize) = nil error, want a refusal: a bundle this app writes above the cap is one its own currency check would call unreadable")
 	}
-	if !strings.Contains(err.Error(), "write pfx") || !strings.Contains(err.Error(), "too large") {
+	if !strings.Contains(err.Error(), "write output") || !strings.Contains(err.Error(), "too large") {
 		t.Errorf("store.write(over maxPFXSize) error = %q, want it to name the write step and the size refusal", err.Error())
 	}
 	got, readErr := os.ReadFile(filepath.Join(dir, "out.pfx"))
@@ -354,7 +354,7 @@ func TestStoreInspect_names_a_non_regular_prior_output(t *testing.T) {
 // that is a user choice. you can throw a warning but dont make the container
 // unhealthy").
 //
-// The app creates the directory at pfxDirMode once, through store.write's own confined
+// The app creates the directory at outputDirMode once, through store.write's own confined
 // MkdirAll, which is a no-op on a directory that already
 // exists — so a directory an operator (or the README's own `mkdir -p`, which yields
 // 0755 under the default umask and 0775 under a umask of 0002) left group- or
@@ -362,7 +362,7 @@ func TestStoreInspect_names_a_non_regular_prior_output(t *testing.T) {
 // bundle's own mode to 0600 on every scan.
 //
 // What "report-only" has to mean, and what a re-introduced enforcement rule would
-// break here: ANY bit beyond pfxDirMode is warned about once (the write bits included,
+// break here: ANY bit beyond outputDirMode is warned about once (the write bits included,
 // since they are the most consequential), the mode on disk is left exactly as found,
 // the currency verdict carries no error, and TestStoreWrite_publishes_into_a_lax_
 // directory below pins that the bundle is still published and the reap is not vetoed.
@@ -377,14 +377,14 @@ func TestStoreInspect_names_a_non_regular_prior_output(t *testing.T) {
 func TestStoreInspect_reports_a_lax_output_directory(t *testing.T) {
 	// Spelled out rather than imported from the production const: an operator's log
 	// query keys on these words, so a silent rewording must fail here.
-	const wantMsg = "the /output directory holding a pfx is more permissive than policy"
+	const wantMsg = "the /output directory holding generated artifacts is more permissive than policy"
 
 	for _, tc := range []struct {
 		name     string
 		mode     os.FileMode
 		wantWarn bool
 	}{
-		{name: "the policy mode is not reported", mode: pfxDirMode},
+		{name: "the policy mode is not reported", mode: outputDirMode},
 		{name: "an owner-only directory is not reported", mode: 0o700},
 		{name: "a world-traversable directory is reported and left alone", mode: 0o755, wantWarn: true},
 		{name: "a group-writable directory is reported and left alone", mode: 0o770, wantWarn: true},
@@ -739,12 +739,12 @@ func TestStoreWrite_refuses_a_bundle_whose_parent_is_an_in_root_symlink(t *testi
 	// The victim: another certificate's output directory, holding a bundle this write
 	// has no business touching.
 	victimDir := filepath.Join(dir, "victim")
-	if err := os.Mkdir(victimDir, pfxDirMode); err != nil {
+	if err := os.Mkdir(victimDir, outputDirMode); err != nil {
 		t.Fatalf("setup: Mkdir: %v", err)
 	}
 	victim := filepath.Join(victimDir, "cert.pfx")
 	const victimBytes = "the sibling domain's bundle"
-	if err := os.WriteFile(victim, []byte(victimBytes), pfxFileMode); err != nil {
+	if err := os.WriteFile(victim, []byte(victimBytes), outputFileMode); err != nil {
 		t.Fatalf("setup: WriteFile: %v", err)
 	}
 	// Read back rather than assumed: some filesystems force modes, so what matters here
@@ -765,7 +765,7 @@ func TestStoreWrite_refuses_a_bundle_whose_parent_is_an_in_root_symlink(t *testi
 		t.Error("store.write(through a symlinked parent) = nil error, want a refusal: an in-root symlink" +
 			" must not be able to redirect a private-key bundle onto another name inside /output")
 	}
-	if err != nil && !strings.Contains(err.Error(), "write pfx") {
+	if err != nil && !strings.Contains(err.Error(), "write output") {
 		t.Errorf("error = %q, want it to name the write step so the refusal reaches the operator as a"+
 			" conversion failure rather than an unexplained one", err.Error())
 	}
@@ -792,7 +792,7 @@ func TestStoreWrite_refuses_a_bundle_whose_parent_is_an_in_root_symlink(t *testi
 // untouched.
 //
 // Currency is a question about content alone, so a permission bit contributes nothing to
-// it. The WARN is the whole of what a lax mode earns (laxBundleMsg, asserted here as the
+// it. The WARN is the whole of what a lax mode earns (laxArtifactMsg, asserted here as the
 // record that must still fire), which is the ecosystem consensus: OpenSSH refuses an
 // over-permissive private key without chmodding it, certbot warns about an over-permissive
 // credentials file and makes the operator act, certbot's own key renewal applies its
@@ -847,7 +847,7 @@ func TestScannerRun_reports_but_does_not_rewrite_a_content_current_bundle_whose_
 				t.Fatalf("setup: Chmod(%v) changed the bundle's bytes, want only the mode touched", lax)
 			}
 			found := storedPerm(t, pfxPath)
-			if !laxerThan(found, pfxFileMode) {
+			if !laxerThan(found, outputFileMode) {
 				t.Skipf("this filesystem stored %v for a chmod to %v, so there is no lax mode to report",
 					found, lax)
 			}
@@ -864,9 +864,9 @@ func TestScannerRun_reports_but_does_not_rewrite_a_content_current_bundle_whose_
 			}
 			// Reported all the same: the operator is told, and told again every scan, because
 			// nothing this app does will clear the condition.
-			if got := logs.CountLevel(slog.LevelWarn, laxBundleMsg); got != 1 {
+			if got := logs.CountLevel(slog.LevelWarn, laxArtifactMsg); got != 1 {
 				t.Errorf("Run(content-current, lax mode) logged %q at WARN %d times, want exactly 1: %q",
-					laxBundleMsg, got, logs.Messages())
+					laxArtifactMsg, got, logs.Messages())
 			}
 			after, afterInfo := readBundle(t, pfxPath)
 			if !bytes.Equal(after, before) {
@@ -898,9 +898,9 @@ func TestScannerRun_reports_but_does_not_rewrite_a_content_current_bundle_whose_
 				t.Errorf("Run(third scan) = %+v, want Unchanged 1 Converted 0: the second scan must reach"+
 					" the same verdict as the first", res)
 			}
-			if got := logs.CountLevel(slog.LevelWarn, laxBundleMsg); got != 2 {
+			if got := logs.CountLevel(slog.LevelWarn, laxArtifactMsg); got != 2 {
 				t.Errorf("two scans logged %q at WARN %d times, want 2 (one per scan): the operator keeps"+
-					" being told about a mode only they can change: %q", laxBundleMsg, got, logs.Messages())
+					" being told about a mode only they can change: %q", laxArtifactMsg, got, logs.Messages())
 			}
 			final, finalInfo := readBundle(t, pfxPath)
 			if !bytes.Equal(final, before) || !os.SameFile(beforeInfo, finalInfo) {
@@ -919,7 +919,7 @@ func TestScannerRun_reports_but_does_not_rewrite_a_content_current_bundle_whose_
 // a write it was performing anyway.
 //
 // A renewed certificate over a bundle the operator left at 0644 is replaced because its
-// CONTENT is stale, and the atomic replacement lands a fresh inode at pfxFileMode for free
+// CONTENT is stale, and the atomic replacement lands a fresh inode at outputFileMode for free
 // (store.write's atomicfile.WithMode). So the mode a real deployment carries is corrected
 // on its next renewal, with no write that exists only to change permissions -- exactly what
 // certbot's own key renewal does. Its converse is the test above: a bundle whose
@@ -946,7 +946,7 @@ func TestScannerRun_a_write_for_its_own_reasons_installs_the_policy_mode(t *test
 		t.Fatalf("setup: Chmod: %v", err)
 	}
 	found := storedPerm(t, pfxPath)
-	if !laxerThan(found, pfxFileMode) {
+	if !laxerThan(found, outputFileMode) {
 		t.Skipf("this filesystem stored %v for a chmod to 0644, so there is no lax mode to correct", found)
 	}
 
@@ -976,9 +976,9 @@ func TestScannerRun_a_write_for_its_own_reasons_installs_the_policy_mode(t *test
 		t.Error("Run(renewed cert) kept the same inode, want a replacement: the mode arrives with the fresh" +
 			" inode, never from a chmod on the operator's file")
 	}
-	if perm := afterInfo.Mode().Perm(); perm != pfxFileMode {
+	if perm := afterInfo.Mode().Perm(); perm != outputFileMode {
 		t.Errorf("Run(renewed cert over mode %v) left mode %v, want %v: a write for the bundle's own reasons"+
-			" installs the policy mode outright", found, perm, os.FileMode(pfxFileMode))
+			" installs the policy mode outright", found, perm, os.FileMode(outputFileMode))
 	}
 }
 
@@ -988,7 +988,7 @@ func TestScannerRun_a_write_for_its_own_reasons_installs_the_policy_mode(t *test
 //
 // That refusal is a CONTENT fact and not a mode one. The app cannot compare bytes it cannot
 // read, so the bundle is contentUnverified and is rewritten for the same reason an
-// oversized or undecodable prior is -- and the replacement lands at pfxFileMode, which is
+// oversized or undecodable prior is -- and the replacement lands at outputFileMode, which is
 // the only way this app ever corrects a mode. The report-only shape above must not be read
 // as "a lax mode is never rewritten": that would be a real regression here, stranding the
 // operator with a bundle nothing can open and no write to replace it.
@@ -1015,7 +1015,7 @@ func TestStoreInspect_treats_a_bundle_it_cannot_read_as_unverified_content(t *te
 		t.Fatalf("setup: Chmod: %v", err)
 	}
 	found := storedPerm(t, pfxPath)
-	if !laxerThan(found, pfxFileMode) {
+	if !laxerThan(found, outputFileMode) {
 		t.Skipf("this filesystem stored %v for a chmod to 0044, so there is no lax mode to report", found)
 	}
 	prevRead := readBoundedInRoot
@@ -1040,9 +1040,9 @@ func TestStoreInspect_treats_a_bundle_it_cannot_read_as_unverified_content(t *te
 		t.Error("inspect(unreadable bundle).upToDate() = true, want false: a bundle this app cannot read is" +
 			" one it cannot prove current, so it is rewritten through the CONTENT path")
 	}
-	if got := logs.CountLevel(slog.LevelWarn, laxBundleMsg); got != 1 {
+	if got := logs.CountLevel(slog.LevelWarn, laxArtifactMsg); got != 1 {
 		t.Errorf("inspect(unreadable bundle) logged %q at WARN %d times, want exactly 1: %q",
-			laxBundleMsg, got, logs.Messages())
+			laxArtifactMsg, got, logs.Messages())
 	}
 	if got := logs.CountLevel(slog.LevelWarn, "cannot read prior pfx; regenerating"); got != 1 {
 		t.Errorf("inspect(unreadable bundle) logged the read refusal %d times, want exactly 1: %q",
@@ -1101,7 +1101,7 @@ func TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install(t
 		t.Fatalf("setup: Chmod: %v", err)
 	}
 	found := storedPerm(t, pfxPath)
-	if !laxerThan(found, pfxFileMode) {
+	if !laxerThan(found, outputFileMode) {
 		t.Skipf("this filesystem stored %v for a chmod to 0644, so there is no lax mode to report", found)
 	}
 	s := newOutputStore(t, outRoot)
@@ -1120,9 +1120,9 @@ func TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install(t
 		t.Error("inspect(lax bundle).upToDate() = false, want true: currency is a question about content" +
 			" alone, so a lax mode must not schedule a write")
 	}
-	if got := logs.CountLevel(slog.LevelWarn, laxBundleMsg); got != 1 {
+	if got := logs.CountLevel(slog.LevelWarn, laxArtifactMsg); got != 1 {
 		t.Errorf("inspect(lax bundle) logged %q at WARN %d times, want exactly 1: %q",
-			laxBundleMsg, got, logs.Messages())
+			laxArtifactMsg, got, logs.Messages())
 	}
 	// Names the mode FOUND and the mode this app will INSTALL. Read from the filesystem
 	// rather than hardcoded, so a mount that stored something other than 0644 still
@@ -1130,10 +1130,10 @@ func TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install(t
 	for key, want := range map[string]string{
 		"path": "chain.pfx",
 		"mode": found.String(),
-		"want": os.FileMode(pfxFileMode).String(),
+		"want": os.FileMode(outputFileMode).String(),
 	} {
-		if !logs.HasAttr(laxBundleMsg, key, want) {
-			got, _ := logs.AttrValue(laxBundleMsg, key)
+		if !logs.HasAttr(laxArtifactMsg, key, want) {
+			got, _ := logs.AttrValue(laxArtifactMsg, key)
 			t.Errorf("inspect(lax bundle) logged %s=%q, want %q", key, got, want)
 		}
 	}
@@ -1211,7 +1211,7 @@ func TestStoreRemoveOrphan_reports_a_refused_unlink_and_keeps_the_candidate(t *t
 // An ENOENT or a non-regular occupant seen by the READ is the same fact the lstat arms
 // above classify as contentVerifiedStale: the path holds no usable bundle, so failing to
 // write one is a conversion failure however the write failed (writeOutcome is the single
-// derivation site: it grants statusUnwritable solely via bundleNotProvenWrong, whose
+// derivation site: it grants statusUnwritable solely via artifactNotProvenWrong, whose
 // allowlist is contentUnverified alone). Every OTHER read failure stays "cannot tell" and
 // keeps the health-neutral outcome — the third row is here so the first two cannot pass
 // merely because the arm returns stale for everything.
@@ -1228,7 +1228,7 @@ func TestStoreInspect_classifies_a_read_that_found_nothing_as_verified_stale(t *
 	// The refusal is minted the way store.write mints one, because writeOutcome now reads
 	// the CARRIED class rather than the error: a permission refusal states refusalOwnership
 	// at the site that refused it.
-	refused := refuseWrite(refusalOwnership, "write pfx: %w",
+	refused := refuseWrite(refusalOwnership, "write output: %w",
 		&fs.PathError{Op: "openat", Path: "out.pfx", Err: fs.ErrPermission})
 
 	for _, tc := range []struct {
@@ -1302,7 +1302,7 @@ func TestStoreInspect_classifies_a_read_that_found_nothing_as_verified_stale(t *
 
 // TestStoreInspect_degrades_a_prior_it_cannot_stat pins the Lstat-failure arm's two
 // halves: the classification (contentUnverified, the fact that keeps a later refused
-// rewrite health-neutral via writeOutcome's bundleNotProvenWrong allowlist) and the
+// rewrite health-neutral via writeOutcome's artifactNotProvenWrong allowlist) and the
 // operator record. A basename past NAME_MAX makes the pre-read Lstat fail with
 // ENAMETOOLONG — non-ENOENT, whatever uid the suite runs as — while the flat-name parent
 // pin succeeds, which is exactly the state this arm exists for.
@@ -1380,5 +1380,22 @@ func TestClassifyPinRefusal_separates_a_refused_traversal_from_the_tree_shape(t 
 					" condition the operator has to repair", tc.err, rem, tc.wantRemediation)
 			}
 		})
+	}
+}
+
+func TestStoreWritePEM_acceptsArtifactAbovePFXCeiling(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s := newOutputStore(t, dir)
+	data := make([]byte, maxPFXSize+1)
+	if err := s.writePEM(t.Context(), "chain.crt", data); err != nil {
+		t.Fatalf("store.writePEM(%d bytes) = %v, want nil: PEM expansion must not inherit the smaller PFX ceiling", len(data), err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "chain.crt"))
+	if err != nil {
+		t.Fatalf("stat written PEM artifact: %v", err)
+	}
+	if info.Size() != int64(len(data)) {
+		t.Errorf("written PEM artifact size = %d, want %d", info.Size(), len(data))
 	}
 }

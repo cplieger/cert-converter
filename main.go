@@ -1,4 +1,5 @@
-// Package main watches a PEM certificate directory and converts changed certificates to PFX/PKCS#12 on every renewal.
+// Package main watches PEM and PFX certificate sources and keeps the configured
+// PEM/PFX output formats current.
 package main
 
 import (
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,9 +34,12 @@ const (
 const watchDebounce = 2 * time.Second
 
 // healthyAfterScan reports whether a completed scan should keep the container
-// healthy.
+// healthy: no conversion failed, and no output name is contested between two
+// inputs (a collision converts nothing for that name until the operator
+// resolves it, which no restart does — but a stale artifact a consumer keeps
+// reading is exactly what the unhealthy state exists to surface).
 func healthyAfterScan(r *process.ScanResult) bool {
-	return r.Failed == 0
+	return r.Failed == 0 && r.Collided == 0
 }
 
 // scanAndSetHealth runs one scan and updates the marker.
@@ -185,6 +190,8 @@ func run() int {
 		scancadence.CoverageAttrs(cfg.FallbackInterval),
 		[]any{
 			"encoder", cfg.EncoderName,
+			"input_password_configured", cfg.InputPasswordReady,
+			"output_formats", strings.Join(cfg.Formats.Names(), ","), "output_layout", string(cfg.Layout),
 			"output_lifecycle", string(cfg.Lifecycle), "max_scan_entries", cfg.MaxScanEntries,
 		},
 	)...)
@@ -203,8 +210,16 @@ func run() int {
 		CertsRoot: requiredVolumes.Input,
 		OutRoot:   requiredVolumes.Output,
 		Password:  cfg.Password,
-		Encoder:   cfg.EncoderName,
-		Lifecycle: cfg.Lifecycle,
+		// The input-bundle decode password is its own channel: an operator's PFX
+		// sources need not share the password this app embeds in its outputs.
+		InputPassword:      cfg.InputPassword,
+		InputPasswordReady: cfg.InputPasswordReady,
+		Encoder:            cfg.EncoderName,
+		Lifecycle:          cfg.Lifecycle,
+		Formats:            cfg.Formats,
+		FormatsExplicit:    cfg.FormatsExplicit,
+		Layout:             cfg.Layout,
+		LayoutExplicit:     cfg.LayoutExplicit,
 		// internal/config owns MAX_SCAN_ENTRIES' name, default, ceiling and every
 		// diagnostic for a repaired value; internal/process takes the budget as
 		// injected state and deliberately does not import internal/config, so this
