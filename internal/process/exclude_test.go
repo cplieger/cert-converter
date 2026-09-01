@@ -57,59 +57,148 @@ func TestScannerRun_excludedSubtreeIsNotConverted(t *testing.T) {
 	assertPFXCommonName(t, filepath.Join(output, "server", "wanted.pfx"), "output-password", "wanted.example.com")
 }
 
-// TestScannerRun_excludingASourceDoesNotReapItsArtifacts is the safety half, and
-// the reason an exclusion is not modelled as absence: a path the operator
-// declared out of scope must not have its existing artifacts deleted, because
-// nothing guards a mistyped exclusion the way the empty-tree veto guards a
-// wrong mount.
-func TestScannerRun_excludingASourceDoesNotReapItsArtifacts(t *testing.T) {
-	input := t.TempDir()
-	output := t.TempDir()
-	keptCert, keptKey := testcerts.GenerateSelfSignedCert(t, "still-converted.example.com", "ecdsa")
-	laterExcluded, laterExcludedKey := testcerts.GenerateSelfSignedCert(t, "later-excluded.example.com", "ecdsa")
-	writePEMSource(t, filepath.Join(input, "server"), "kept", keptCert, keptKey)
-	writePEMSource(t, filepath.Join(input, "clients"), "identity", laterExcluded, laterExcludedKey)
+// TestScannerRun_excludingASourceRespectsTheLifecycleMode is the mode contract
+// for a path excluded AFTER it had already converted. An exclusion narrows the
+// scope this app manages, exactly as switching a format off or changing the
+// layout does, so its stranded artifacts are ordinary orphan candidates and
+// OUTPUT_LIFECYCLE decides their fate. The invariant across every row: only
+// sync ever deletes.
+func TestScannerRun_excludingASourceRespectsTheLifecycleMode(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		mode        outputpolicy.Lifecycle
+		wantRemoved int
+		wantPresent bool
+		wantReport  bool
+	}{
+		{name: "keep is silent and deletes nothing", mode: outputpolicy.LifecycleKeep, wantPresent: true},
+		{name: "warn reports and deletes nothing", mode: outputpolicy.LifecycleWarn, wantPresent: true, wantReport: true},
+		{name: "sync reconciles the excluded artifact away", mode: outputpolicy.LifecycleSync, wantRemoved: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := t.TempDir()
+			output := t.TempDir()
+			keptCert, keptKey := testcerts.GenerateSelfSignedCert(t, "still-converted.example.com", "ecdsa")
+			laterExcluded, laterExcludedKey := testcerts.GenerateSelfSignedCert(t, "later-excluded.example.com", "ecdsa")
+			writePEMSource(t, filepath.Join(input, "server"), "kept", keptCert, keptKey)
+			writePEMSource(t, filepath.Join(input, "clients"), "identity", laterExcluded, laterExcludedKey)
 
-	// First scan converts both, so /output holds an artifact for the path the
-	// second scan excludes.
-	before := newExcludingScanner(input, output, layout.ExcludeSet{}, outputpolicy.LifecycleSync)
-	if result, err := before.Run(t.Context()); err != nil || result.Converted != 2 {
-		t.Fatalf("Run(before exclusion) = (%+v, %v), want Converted 2 and nil", result, err)
-	}
-	excludedArtifact := filepath.Join(output, "clients", "identity.pfx")
-	if _, statErr := os.Stat(excludedArtifact); statErr != nil {
-		t.Fatalf("setup: the artifact to protect was not written: %v", statErr)
-	}
+			// Convert both first, so /output holds an artifact for the path the
+			// second scan excludes.
+			seed := newExcludingScanner(input, output, layout.ExcludeSet{}, tc.mode)
+			if result, err := seed.Run(t.Context()); err != nil || result.Converted != 2 {
+				t.Fatalf("Run(before exclusion) = (%+v, %v), want Converted 2 and nil", result, err)
+			}
+			excludedArtifact := filepath.Join(output, "clients", "identity.pfx")
+			if _, statErr := os.Stat(excludedArtifact); statErr != nil {
+				t.Fatalf("setup: the artifact under test was not written: %v", statErr)
+			}
+			logs := capture.Default(t)
 
-	after := newExcludingScanner(input, output, layout.NewExcludeSet([]string{"clients"}), outputpolicy.LifecycleSync)
-	logs := capture.Default(t)
-	result, err := after.Run(t.Context())
-	if err != nil {
-		t.Fatalf("Run(after exclusion, sync) = %v", err)
+			after := newExcludingScanner(input, output, layout.NewExcludeSet([]string{"clients"}), tc.mode)
+			result, err := after.Run(t.Context())
+			if err != nil {
+				t.Fatalf("Run(after exclusion, %s) = %v", tc.mode, err)
+			}
+			if result.Excluded != 1 {
+				t.Fatalf("Run(after exclusion, %s) = %+v, want Excluded 1", tc.mode, result)
+			}
+			if result.Removed != tc.wantRemoved {
+				t.Errorf("Run(after exclusion, %s) Removed = %d, want %d", tc.mode, result.Removed, tc.wantRemoved)
+			}
+			_, statErr := os.Stat(excludedArtifact)
+			if tc.wantPresent && statErr != nil {
+				t.Errorf("OUTPUT_LIFECYCLE=%s deleted an artifact; only sync may ever delete: %v", tc.mode, statErr)
+			}
+			if !tc.wantPresent && !errors.Is(statErr, fs.ErrNotExist) {
+				t.Errorf("os.Stat(excluded artifact) = %v, want it reconciled away under sync", statErr)
+			}
+			// The source itself is never touched, in any mode.
+			assertFileBytes(t, filepath.Join(input, "clients", "identity.crt"), laterExcluded)
+			// The still-converted source keeps its artifact in every mode.
+			if _, keptErr := os.Stat(filepath.Join(output, "server", "kept.pfx")); keptErr != nil {
+				t.Errorf("the still-converted source lost its artifact under %s: %v", tc.mode, keptErr)
+			}
+			const reported = "output artifacts have no matching input"
+			if got := logs.CountLevel(slog.LevelWarn, reported) > 0; got != tc.wantReport {
+				t.Errorf("Run(after exclusion, %s) reported stranded artifacts = %v, want %v: %v",
+					tc.mode, got, tc.wantReport, logs.Messages())
+			}
+		})
 	}
-	if result.Removed != 0 {
-		t.Errorf("Run(after exclusion, sync) Removed = %d, want 0: excluding a path must never delete what is already there", result.Removed)
-	}
-	if _, statErr := os.Stat(excludedArtifact); statErr != nil {
-		t.Errorf("sync deleted an excluded source's artifact: %v", statErr)
-	}
-	// The excluded artifact must not even become a CANDIDATE. Removed == 0 alone
-	// cannot see that: the post-delay re-check also spares it, because the source
-	// is still on disk, so the count stays 0 either way. This is the assertion
-	// that fails when an excluded source stops registering its artifacts, and
-	// what it protects is real — a candidate costs the whole batch a 30s
-	// confirmation deferral on every scan.
-	const announced = "possible orphaned output artifacts; re-checking before deleting anything"
-	if count := logs.CountLevel(slog.LevelInfo, announced); count != 0 {
-		t.Errorf("Run(after exclusion, sync) announced orphan candidates %d times, want 0:"+
-			" an excluded source's artifacts must be registered as expected, not merely spared at the re-check", count)
+}
+
+// TestScannerRun_excludingASourceRespectsTheLifecycleModeInMirrorLayout is the
+// mirror-layout twin, and it also answers the directory question: sync removes
+// the artifact FILES it wrote and never the mirrored directory, because the
+// reaper unlinks regular files only.
+func TestScannerRun_excludingASourceRespectsTheLifecycleModeInMirrorLayout(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		mode        outputpolicy.Lifecycle
+		wantRemoved int
+		wantPresent bool
+	}{
+		{name: "warn keeps all three artifacts", mode: outputpolicy.LifecycleWarn, wantPresent: true},
+		{name: "sync removes all three artifacts", mode: outputpolicy.LifecycleSync, wantRemoved: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := t.TempDir()
+			output := t.TempDir()
+			keptCert, keptKey := testcerts.GenerateSelfSignedCert(t, "mirror-kept.example.com", "ecdsa")
+			excludedCert, excludedKey := testcerts.GenerateSelfSignedCert(t, "mirror-excluded.example.com", "ecdsa")
+			writePEMSource(t, filepath.Join(input, "server"), "kept", keptCert, keptKey)
+			writePEMSource(t, filepath.Join(input, "clients", "eu"), "identity", excludedCert, excludedKey)
+
+			mirrorScanner := func(exclude layout.ExcludeSet) *process.Scanner {
+				return process.New(&process.Options{
+					CertsRoot: input, OutRoot: output, Password: "output-password",
+					Encoder: convert.EncNameModern2023, Formats: outputpolicy.Formats{PFX: true, PEM: true},
+					FormatsExplicit: true, Layout: outputpolicy.LayoutMirror, LayoutExplicit: true,
+					Lifecycle: tc.mode, Exclude: exclude,
+				})
+			}
+			if result, err := mirrorScanner(layout.ExcludeSet{}).Run(t.Context()); err != nil || result.Converted != 2 {
+				t.Fatalf("Run(mirror, before exclusion) = (%+v, %v), want Converted 2 and nil", result, err)
+			}
+			excludedDir := filepath.Join(output, "clients", "eu")
+			artifacts := []string{"identity.pfx", "identity.crt", "identity.key"}
+			for _, name := range artifacts {
+				if _, statErr := os.Stat(filepath.Join(excludedDir, name)); statErr != nil {
+					t.Fatalf("setup: %s was not written: %v", name, statErr)
+				}
+			}
+
+			result, err := mirrorScanner(layout.NewExcludeSet([]string{"clients"})).Run(t.Context())
+			if err != nil {
+				t.Fatalf("Run(mirror, after exclusion, %s) = %v", tc.mode, err)
+			}
+			if result.Removed != tc.wantRemoved || result.Excluded != 1 {
+				t.Errorf("Run(mirror, after exclusion, %s) = %+v, want Removed %d Excluded 1", tc.mode, result, tc.wantRemoved)
+			}
+			for _, name := range artifacts {
+				_, statErr := os.Stat(filepath.Join(excludedDir, name))
+				if tc.wantPresent && statErr != nil {
+					t.Errorf("OUTPUT_LIFECYCLE=%s deleted %s; only sync may ever delete: %v", tc.mode, name, statErr)
+				}
+				if !tc.wantPresent && !errors.Is(statErr, fs.ErrNotExist) {
+					t.Errorf("os.Stat(%s) = %v, want it reconciled away under sync", name, statErr)
+				}
+			}
+			// The mirrored directory itself survives either way: this app unlinks
+			// the regular files it wrote and never removes a directory.
+			if info, statErr := os.Stat(excludedDir); statErr != nil || !info.IsDir() {
+				t.Errorf("os.Stat(%s) = (%v, %v), want the mirrored output directory left in place", excludedDir, info, statErr)
+			}
+		})
 	}
 }
 
 // TestScannerRun_excludedPathDoesNotDisableOrphanCleanup pins the difference
 // from the permissions workaround this feature replaces: an exclusion is an
-// operator assertion, not a coverage hole, so sync keeps reaping the artifacts
-// whose sources are genuinely gone.
+// operator assertion about scope, not a coverage hole, so sync keeps reaping
+// normally. An unreadable path would disable cleanup for the whole scan and
+// leave the genuine orphan in place; an exclusion does not.
 func TestScannerRun_excludedPathDoesNotDisableOrphanCleanup(t *testing.T) {
 	input := t.TempDir()
 	output := t.TempDir()
@@ -120,9 +209,6 @@ func TestScannerRun_excludedPathDoesNotDisableOrphanCleanup(t *testing.T) {
 	writePEMSource(t, filepath.Join(input, "server"), "gone", goneCert, goneKey)
 	writePEMSource(t, filepath.Join(input, "clients"), "identity", excludedCert, excludedKey)
 
-	// Convert everything first, so /output holds an artifact for the path the
-	// exclusion later covers; otherwise the assertion below would pass on an
-	// artifact that was simply never written.
 	seed := newExcludingScanner(input, output, layout.ExcludeSet{}, outputpolicy.LifecycleSync)
 	if result, err := seed.Run(t.Context()); err != nil || result.Converted != 3 {
 		t.Fatalf("Run(seed, no exclusion) = (%+v, %v), want Converted 3 and nil", result, err)
@@ -141,14 +227,25 @@ func TestScannerRun_excludedPathDoesNotDisableOrphanCleanup(t *testing.T) {
 	if result.Excluded != 1 {
 		t.Fatalf("Run(with exclusion, sync) = %+v, want Excluded 1", result)
 	}
-	if result.Removed != 1 {
-		t.Errorf("Run(with exclusion, sync) Removed = %d, want 1: an exclusion must not disable orphan cleanup the way an unreadable path does", result.Removed)
-	}
+	// The genuine orphan is reaped, which an unreadable path would have blocked.
+	// Under the flat layout these sources sit one directory down, so the stem
+	// keeps that directory: server/gone.crt emits server/gone.pfx.
 	if _, statErr := os.Stat(filepath.Join(output, "server", "gone.pfx")); !errors.Is(statErr, fs.ErrNotExist) {
-		t.Errorf("os.Stat(gone artifact) = %v, want the genuine orphan reaped", statErr)
+		t.Errorf("os.Stat(gone artifact) = %v, want the genuine orphan reaped: an exclusion must not disable orphan cleanup the way an unreadable path does", statErr)
 	}
-	if _, statErr := os.Stat(filepath.Join(output, "clients", "identity.pfx")); statErr != nil {
-		t.Errorf("the excluded source's artifact was reaped in the same scan: %v", statErr)
+	// The still-converted source keeps its artifact.
+	if _, statErr := os.Stat(filepath.Join(output, "server", "anchor.pfx")); statErr != nil {
+		t.Errorf("the live source's artifact was reaped: %v", statErr)
+	}
+	// And no standing warning claims the input tree could not be enumerated,
+	// which is exactly what the permissions workaround produces.
+	const disabled = "orphan removal is disabled for this scan"
+	logs := capture.Default(t)
+	if _, err := scanner.Run(t.Context()); err != nil {
+		t.Fatalf("Run(third, steady state) = %v", err)
+	}
+	if count := logs.CountLevel(slog.LevelWarn, disabled); count != 0 {
+		t.Errorf("a scan with exclusions reported %q %d times, want 0: %v", disabled, count, logs.Messages())
 	}
 }
 

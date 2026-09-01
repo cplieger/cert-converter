@@ -22,16 +22,21 @@ type reaper struct {
 	mode outputpolicy.Lifecycle
 	// layoutMode selects the post-delay source re-check: the mirror layout
 	// derives a candidate's sources from its name and stats them, while the flat
-	// layout re-enumerates /input once per batch (flatInventory).
+	// layout re-enumerates /input fresh per candidate (flatInventory).
 	layoutMode outputpolicy.Layout
+	// exclude is the scan's INPUT_EXCLUDE_PATHS set. The post-delay re-check
+	// honours it too: a source that is present but out of scope must read as
+	// absent, or sync could never reconcile away the artifacts of a path the
+	// operator just excluded.
+	exclude layout.ExcludeSet
+	// maxEntries bounds the flat re-check's own /input enumeration, same ceiling
+	// as every other walk in this app.
+	maxEntries int
 	formats    outputpolicy.Formats
 	// layoutExplicit gates cleanup of the OTHER layout's artifacts: only an
 	// operator who deliberately chose a layout has asked for its predecessor's
 	// tree to be reconciled away.
 	layoutExplicit bool
-	// maxEntries bounds the flat re-check's own /input enumeration, same ceiling
-	// as every other walk in this app.
-	maxEntries int
 }
 
 // reapContext is everything the gate needs to decide whether `seen` can be
@@ -171,9 +176,14 @@ func (rp *reaper) reportRetainedOrphans(orphaned []string, walkSafe bool) {
 }
 
 // sourcesAbsent reports whether EVERY input that would produce artifacts at stem
-// is gone; one present source, or one unanswerable stat, keeps the candidate.
+// is gone; one present source, or one unanswerable stat, keeps the candidate. An
+// EXCLUDED source reads as absent: the operator declared it out of scope, so it
+// is not a source this app produces artifacts from.
 func (rp *reaper) sourcesAbsent(stem string) (bool, error) {
 	for _, src := range layout.SourceCandidates(stem) {
+		if !rp.exclude.Empty() && rp.exclude.Excludes(src) {
+			continue
+		}
 		absent, err := rp.src.pathAbsent(src)
 		if err != nil {
 			return false, err
@@ -244,7 +254,11 @@ type flatInventory struct {
 // Any path it cannot observe makes the whole inventory unusable: deletions rest
 // on proving absence, and a partially read tree proves nothing absent.
 func (rp *reaper) enumerateFlatInventory(ctx context.Context) (*flatInventory, error) {
-	walk := &flatRecheckWalk{files: make(map[string]struct{}), budget: scanbudget.NewCounter(rp.maxEntries)}
+	walk := &flatRecheckWalk{
+		files:   make(map[string]struct{}),
+		budget:  scanbudget.NewCounter(rp.maxEntries),
+		exclude: rp.exclude,
+	}
 	if err := atomicfile.WalkDirInRoot(ctx, rp.src.root, func(rel string, d fs.DirEntry, err error) error {
 		return walk.visit(ctx, rel, d, err)
 	}); err != nil {
@@ -257,8 +271,11 @@ func (rp *reaper) enumerateFlatInventory(ctx context.Context) (*flatInventory, e
 type flatRecheckWalk struct {
 	// files is every relevant name the walk saw: sources, and keys for the
 	// lone-key veto.
-	files  map[string]struct{}
-	budget scanbudget.Counter
+	files map[string]struct{}
+	// exclude drops out-of-scope paths, so neither their artifacts nor their
+	// keys are treated as evidence a candidate is still wanted.
+	exclude layout.ExcludeSet
+	budget  scanbudget.Counter
 }
 
 // visit is the re-enumeration's walk callback: collect relevant names, and
@@ -284,7 +301,7 @@ func (w *flatRecheckWalk) visit(ctx context.Context, rel string, d fs.DirEntry, 
 		}
 		return nil
 	}
-	if layout.IsRelevant(rel) {
+	if layout.IsRelevant(rel) && (w.exclude.Empty() || !w.exclude.Excludes(rel)) {
 		w.files[rel] = struct{}{}
 	}
 	return nil
@@ -489,6 +506,12 @@ func (rp *reaper) keyStillPresent(rel, cert string) bool {
 // certificate is gone, which only the certificate's own Lstat establishes.
 func (rp *reaper) keyRetention(rel, cert string) func() {
 	key := layout.KeyFor(cert)
+	// An EXCLUDED pair is not a source, so a half-deleted-pair veto over it means
+	// nothing: the operator declared the whole path out of scope, and the veto
+	// exists to protect a pair mid-change, not one this app was told to ignore.
+	if !rp.exclude.Empty() && (rp.exclude.Excludes(key) || rp.exclude.Excludes(cert)) {
+		return nil
+	}
 	absent, err := rp.src.pathAbsent(key)
 	switch {
 	case err != nil:

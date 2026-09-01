@@ -123,7 +123,7 @@ func Load() (Config, error) {
 		lifecycle = outputpolicy.LifecycleWarn
 	}
 	layoutMode, layoutExplicit, lifecycle := resolveLayout(lifecycle)
-	exclude := resolveExcludePaths()
+	exclude, lifecycle := resolveExcludePaths(lifecycle)
 	inputPassword, err := resolveInputPassword()
 	if err != nil {
 		return Config{}, err
