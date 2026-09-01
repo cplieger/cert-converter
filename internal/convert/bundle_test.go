@@ -31,12 +31,12 @@ func TestAnalyseBundle_roundTripsEveryEncoderProfile(t *testing.T) {
 				t.Fatalf("setup: Encode(%s) = %v", encoder, err)
 			}
 
-			got, err := convert.AnalyseBundle(t.Context(), pfx, "input-password")
+			got, err := convert.AnalyseBundleWithBudget(t.Context(), pfx, "input-password", convert.NewBundleWorkBudget())
 			if err != nil {
-				t.Fatalf("AnalyseBundle(%s output) = %v, want nil", encoder, err)
+				t.Fatalf("AnalyseBundleWithBudget(%s output) = %v, want nil", encoder, err)
 			}
 			if currency := got.CheckCurrency(pfx, "input-password", encoder); currency.Reason != convert.CurrencyMatch {
-				t.Errorf("AnalyseBundle(%s output).CheckCurrency(original) = %q, want %q: leaf, key and chain must survive the decode",
+				t.Errorf("AnalyseBundleWithBudget(%s output).CheckCurrency(original) = %q, want %q: leaf, key and chain must survive the decode",
 					encoder, currency.Reason, convert.CurrencyMatch)
 			}
 		})
@@ -55,8 +55,8 @@ func TestAnalyseBundle_rejectsWrongPassword(t *testing.T) {
 		t.Fatalf("setup: Encode = %v", err)
 	}
 
-	if _, err := convert.AnalyseBundle(t.Context(), pfx, "wrong-password"); err == nil {
-		t.Fatal("AnalyseBundle(bundle, wrong password) = nil error, want a decode failure")
+	if _, err := convert.AnalyseBundleWithBudget(t.Context(), pfx, "wrong-password", convert.NewBundleWorkBudget()); err == nil {
+		t.Fatal("AnalyseBundleWithBudget(bundle, wrong password) = nil error, want a decode failure")
 	}
 }
 
@@ -107,8 +107,8 @@ func TestAnalyseBundle_honorsCancelledContext(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, err = convert.AnalyseBundle(ctx, pfx, "pw")
+	_, err = convert.AnalyseBundleWithBudget(ctx, pfx, "pw", convert.NewBundleWorkBudget())
 	if !errors.Is(err, context.Canceled) {
-		t.Errorf("AnalyseBundle(cancelled context) = %v, want context.Canceled", err)
+		t.Errorf("AnalyseBundleWithBudget(cancelled context) = %v, want context.Canceled", err)
 	}
 }

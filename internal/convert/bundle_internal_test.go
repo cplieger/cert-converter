@@ -90,9 +90,9 @@ func TestAnalyseBundle_rejectsExcessiveIterationsBeforeDecode(t *testing.T) {
 			testASN1Unmarshal(t, pfx, &preamble)
 			tc.mutate(t, &preamble)
 
-			_, err = AnalyseBundle(t.Context(), testASN1Marshal(t, preamble), "pw")
+			_, err = AnalyseBundleWithBudget(t.Context(), testASN1Marshal(t, preamble), "pw", NewBundleWorkBudget())
 			if !errors.Is(err, ErrBundleUnbounded) {
-				t.Errorf("AnalyseBundle(%s with excessive iterations) = %v, want ErrBundleUnbounded", tc.name, err)
+				t.Errorf("AnalyseBundleWithBudget(%s with excessive iterations) = %v, want ErrBundleUnbounded", tc.name, err)
 			}
 		})
 	}
@@ -116,9 +116,9 @@ func TestAnalyseBundle_rejectsAggregateDerivationWorkAboveBudget(t *testing.T) {
 		setTestPBKDF2Iterations(t, alg, 1_000_000)
 	})
 
-	_, err = AnalyseBundle(t.Context(), testASN1Marshal(t, preamble), "pw")
+	_, err = AnalyseBundleWithBudget(t.Context(), testASN1Marshal(t, preamble), "pw", NewBundleWorkBudget())
 	if !errors.Is(err, ErrBundleUnbounded) {
-		t.Errorf("AnalyseBundle(bundle with 6,000,000 weighted rounds) = %v, want ErrBundleUnbounded", err)
+		t.Errorf("AnalyseBundleWithBudget(bundle with 6,000,000 weighted rounds) = %v, want ErrBundleUnbounded", err)
 	}
 }
 
@@ -144,9 +144,9 @@ func TestAnalyseBundle_rejectsPlaintextSafeAboveBagBudget(t *testing.T) {
 		})
 	})
 
-	_, err = AnalyseBundle(t.Context(), testASN1Marshal(t, preamble), "pw")
+	_, err = AnalyseBundleWithBudget(t.Context(), testASN1Marshal(t, preamble), "pw", NewBundleWorkBudget())
 	if !errors.Is(err, ErrBundleUnbounded) {
-		t.Errorf("AnalyseBundle(plaintext safe with %d bags) = %v, want ErrBundleUnbounded", maxSafeBags+1, err)
+		t.Errorf("AnalyseBundleWithBudget(plaintext safe with %d bags) = %v, want ErrBundleUnbounded", maxSafeBags+1, err)
 	}
 }
 

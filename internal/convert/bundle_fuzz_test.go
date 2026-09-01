@@ -24,7 +24,7 @@ func FuzzAnalyseBundle_pemRoundTrip(f *testing.F) {
 		if len(pfx) > convert.MaxBundleBytes {
 			return
 		}
-		decoded, err := convert.AnalyseBundle(t.Context(), pfx, password)
+		decoded, err := convert.AnalyseBundleWithBudget(t.Context(), pfx, password, convert.NewBundleWorkBudget())
 		if err != nil {
 			return
 		}
