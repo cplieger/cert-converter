@@ -49,14 +49,14 @@ var ErrEmptyInputPassword = errors.New("the configured input PFX password is emp
 
 // resolveExcludePaths reads INPUT_EXCLUDE_PATHS: a comma-separated list of
 // root-relative paths under /input the operator has declared are not this app's
-// to convert. A rejected entry is WARNed and dropped rather than failing
-// startup, and dropping one is the safe direction — the source it named
-// converts, which produces an artifact the operator did not want but deletes
-// nothing.
-func resolveExcludePaths() layout.ExcludeSet {
+// to convert. A rejected entry is WARNed, dropped, and forces the non-deleting
+// lifecycle, exactly as an invalid OUTPUT_FORMATS or OUTPUT_LAYOUT does: an
+// operator intent this app could only partly parse must never authorize a
+// deletion.
+func resolveExcludePaths(lifecycle outputpolicy.Lifecycle) (layout.ExcludeSet, outputpolicy.Lifecycle) {
 	raw := os.Getenv("INPUT_EXCLUDE_PATHS")
 	if strings.TrimSpace(raw) == "" {
-		return layout.ExcludeSet{}
+		return layout.ExcludeSet{}, lifecycle
 	}
 	var accepted, rejected []string
 	for token := range strings.SplitSeq(raw, ",") {
@@ -75,12 +75,18 @@ func resolveExcludePaths() layout.ExcludeSet {
 		slog.Warn("INPUT_EXCLUDE_PATHS contains entries that are not usable relative paths; ignoring them",
 			"rejected", rejectedValue(strings.Join(rejected, ",")),
 			"remediation", "name each entry as a path relative to /input, without a leading slash and without any .. component")
+		if lifecycle == outputpolicy.LifecycleSync {
+			slog.Warn("OUTPUT_LIFECYCLE=sync is disabled because INPUT_EXCLUDE_PATHS is partly unusable; orphans are reported instead of deleted",
+				"using", string(outputpolicy.LifecycleWarn),
+				"remediation", "fix the rejected entries before enabling destructive output reconciliation")
+			lifecycle = outputpolicy.LifecycleWarn
+		}
 	}
 	set := layout.NewExcludeSet(accepted)
 	if !set.Empty() {
 		slog.Info("excluding input paths from conversion", "paths", strings.Join(set.Paths(), ","))
 	}
-	return set
+	return set, lifecycle
 }
 
 // validExcludePath reports whether one entry is a usable root-relative path.

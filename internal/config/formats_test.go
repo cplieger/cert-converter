@@ -177,6 +177,44 @@ func TestLoad_wiresInputExcludePaths(t *testing.T) {
 	}
 }
 
+// TestLoad_unusableExcludeEntryDisarmsSync pins the safety valve on the mode
+// contract: an INPUT_EXCLUDE_PATHS value this app could only partly parse must
+// not authorize a deletion, exactly as an invalid OUTPUT_FORMATS or
+// OUTPUT_LAYOUT does not.
+func TestLoad_unusableExcludeEntryDisarmsSync(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		raw           string
+		wantLifecycle outputpolicy.Lifecycle
+		wantWarning   bool
+	}{
+		{name: "every entry usable keeps sync", raw: "clients", wantLifecycle: outputpolicy.LifecycleSync},
+		{name: "an absolute entry disarms sync", raw: "/etc/ssl,clients", wantLifecycle: outputpolicy.LifecycleWarn, wantWarning: true},
+		{name: "a traversing entry disarms sync", raw: "../outside", wantLifecycle: outputpolicy.LifecycleWarn, wantWarning: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateFormatConfig(t)
+			t.Setenv("OUTPUT_LIFECYCLE", "sync")
+			t.Setenv("INPUT_EXCLUDE_PATHS", tc.raw)
+			logs := capture.Default(t)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() = %v, want nil", err)
+			}
+			if cfg.Lifecycle != tc.wantLifecycle {
+				t.Errorf("Load(INPUT_EXCLUDE_PATHS=%q, OUTPUT_LIFECYCLE=sync) Lifecycle = %q, want %q",
+					tc.raw, cfg.Lifecycle, tc.wantLifecycle)
+			}
+			const disarmed = "OUTPUT_LIFECYCLE=sync is disabled because INPUT_EXCLUDE_PATHS is partly unusable"
+			if got := logs.CountLevel(slog.LevelWarn, disarmed) > 0; got != tc.wantWarning {
+				t.Errorf("Load(INPUT_EXCLUDE_PATHS=%q) reported the sync downgrade = %v, want %v: %v",
+					tc.raw, got, tc.wantWarning, logs.Messages())
+			}
+		})
+	}
+}
+
 func TestLoad_wiresInputBundlePassword(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

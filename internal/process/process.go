@@ -301,6 +301,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	rp := &reaper{
 		src: sw.src, out: out, mode: s.opts.Lifecycle, formats: s.opts.Formats,
 		layoutMode: s.opts.Layout, layoutExplicit: s.opts.LayoutExplicit,
+		exclude:    s.opts.Exclude,
 		maxEntries: s.opts.MaxScanEntries,
 	}
 	removed, reconcileErr := rp.reconcile(ctx, sw.expected, &rc)
@@ -442,22 +443,20 @@ func (sw *scanWalk) ignoreDisabledBundle(rel string) bool {
 }
 
 // excludeSource resolves one enumerated source against INPUT_EXCLUDE_PATHS. An
-// excluded source is recorded as seen and registers the artifacts it WOULD
-// produce, so those artifacts never become orphan candidates: the operator said
-// "not mine to convert", not "delete what is already there", and a mistyped
-// exclusion must not become a deletion.
+// excluded source is counted and then dropped: nothing about it is read,
+// decoded or written, and it registers NO expected artifact.
 //
-// The registration is not the only thing standing between an excluded artifact
-// and an unlink — the post-delay re-check spares it too, because the source is
-// still on disk — but it is what keeps the artifact out of the candidate set at
-// all, so a scan with exclusions does not spend the 30s confirmation deferral
-// and announce candidates it will always refuse. Do not delete it as redundant.
+// Not registering is what makes OUTPUT_LIFECYCLE mean the same thing for an
+// exclusion as for every other narrowing of scope. Artifacts an excluded source
+// produced earlier become ordinary orphan candidates, so `keep` stays silent,
+// `warn` reports them, and `sync` reconciles them away — the same rule that
+// already governs a format switched off (FormatsExplicit) and a layout changed
+// (LayoutExplicit). Deletion remains gated on sync alone (resolveReap), so no
+// mode other than sync can remove anything here.
 func (sw *scanWalk) excludeSource(rel string) bool {
 	if sw.exclude.Empty() || !sw.exclude.Excludes(rel) {
 		return false
 	}
-	sw.seen[rel] = struct{}{}
-	sw.registerExpected(rel)
 	sw.results = append(sw.results, statusExcluded)
 	slog.Debug("skipping excluded source", "path", logtext.Path(rel),
 		"remediation", "remove the path from INPUT_EXCLUDE_PATHS to convert it again")
