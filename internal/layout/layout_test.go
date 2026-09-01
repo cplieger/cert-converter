@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/layout"
+	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"pgregory.net/rapid"
 )
 
@@ -24,8 +25,9 @@ func TestNamingPredicates(t *testing.T) {
 		{"flat certificate", "example.com.crt", true, true},
 		{"certificate in a domain directory", "example.com/cert.crt", true, true},
 		{"private key is relevant but is not a conversion trigger", "example.com.key", false, true},
+		{"a pfx bundle is a conversion trigger", "example.com.pfx", false, true},
+		{"a p12 bundle is a conversion trigger", "example.com.p12", false, true},
 		{"an unrelated file is neither", "README.md", false, false},
-		{"an already-converted bundle is not an input", "example.com.pfx", false, false},
 		{"the extension alone is treated as a certificate named empty", ".crt", true, true},
 		{"a name merely containing the extension is not a certificate", "cert.crt.bak", false, false},
 		{"extension matching is case sensitive", "example.com.CRT", false, false},
@@ -73,7 +75,7 @@ func TestCertificateDerivedNames(t *testing.T) {
 			if got := layout.KeyFor(tc.input); got != tc.wantKey {
 				t.Errorf("KeyFor(%q) = %q, want %q", tc.input, got, tc.wantKey)
 			}
-			if got := layout.OutputFor(tc.input); got != tc.wantOutput {
+			if got := layout.PFXOutFor(layout.SourceStem(tc.input)); got != tc.wantOutput {
 				t.Errorf("OutputFor(%q) = %q, want %q", tc.input, got, tc.wantOutput)
 			}
 		})
@@ -118,7 +120,7 @@ func TestDerivedNamesShareOneStem(t *testing.T) {
 		}
 
 		gotKey := layout.KeyFor(certPath)
-		gotOutput := layout.OutputFor(certPath)
+		gotOutput := layout.PFXOutFor(layout.SourceStem(certPath))
 
 		if want := stem + ".key"; gotKey != want {
 			t.Errorf("KeyFor(%q) = %q, want %q", certPath, gotKey, want)
@@ -155,11 +157,11 @@ func TestOutputAndCertNamesAreInverses(t *testing.T) {
 		stem := rapid.String().Draw(t, "stem")
 		certPath := stem + ".crt"
 
-		out := layout.OutputFor(certPath)
-		if !layout.IsOutput(out) {
+		out := layout.PFXOutFor(layout.SourceStem(certPath))
+		if !layout.IsOutputShape(out, outputpolicy.DefaultFormats()) {
 			t.Fatalf("IsOutput(%q) is false for a name OutputFor produced", out)
 		}
-		if got := layout.CertForOutput(out); got != certPath {
+		if got := layout.CertFor(layout.OutputStem(out)); got != certPath {
 			t.Errorf("CertForOutput(OutputFor(%q)) = %q, want the original certificate path", certPath, got)
 		}
 	})
@@ -187,7 +189,7 @@ func TestIsOutput(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := layout.IsOutput(tc.input); got != tc.want {
+			if got := layout.IsOutputShape(tc.input, outputpolicy.DefaultFormats()); got != tc.want {
 				t.Errorf("IsOutput(%q) = %v, want %v", tc.input, got, tc.want)
 			}
 		})
@@ -213,8 +215,31 @@ func TestCertForOutput(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := layout.CertForOutput(tc.input); got != tc.want {
+			if got := layout.CertFor(layout.OutputStem(tc.input)); got != tc.want {
 				t.Errorf("CertForOutput(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFlatStem_preservesExtensionOnlyBasename(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		stem string
+		want string
+	}{
+		{name: "root extension only", stem: "", want: ""},
+		{name: "one directory extension only", stem: "dir/", want: "dir/"},
+		{name: "nested extension only", stem: "a/b/", want: "b/"},
+		{name: "root ordinary", stem: "site", want: "site"},
+		{name: "one directory ordinary", stem: "issuer/site", want: "issuer/site"},
+		{name: "nested ordinary", stem: "issuer/domain/site", want: "domain/site"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := layout.FlatStem(tc.stem); got != tc.want {
+				t.Errorf("FlatStem(%q) = %q, want %q", tc.stem, got, tc.want)
 			}
 		})
 	}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/cplieger/atomicfile/v3"
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 )
 
@@ -49,11 +50,11 @@ import (
 // it wraps is diagnostic only.
 func TestWriteOutcome_derives_the_status_from_two_independent_facts(t *testing.T) {
 	t.Parallel()
-	refused := refuseWrite(refusalOwnership, "write pfx: %w",
+	refused := refuseWrite(refusalOwnership, "write output: %w",
 		&fs.PathError{Op: "openat", Path: "chain.pfx", Err: syscall.EACCES})
-	full := refuseWrite(refusalVolume, "write pfx: %w",
+	full := refuseWrite(refusalVolume, "write output: %w",
 		&fs.PathError{Op: "renameat", Path: "chain.pfx", Err: syscall.ENOSPC})
-	brokenIO := refuseWrite(refusalTransient, "write pfx: %w",
+	brokenIO := refuseWrite(refusalTransient, "write output: %w",
 		&fs.PathError{Op: "renameat", Path: "chain.pfx", Err: syscall.EIO})
 	for name, tc := range map[string]struct {
 		writeErr writeRefusal
@@ -159,7 +160,7 @@ func TestWriteRefusal_carries_a_classification_from_every_refusal_site(t *testin
 		"a symlinked output parent is a layout refusal the pin makes": {
 			stage: func(t *testing.T, dir string) string {
 				t.Helper()
-				if err := os.Mkdir(filepath.Join(dir, "real"), pfxDirMode); err != nil {
+				if err := os.Mkdir(filepath.Join(dir, "real"), outputDirMode); err != nil {
 					t.Fatalf("setup: Mkdir(real): %v", err)
 				}
 				if err := os.Symlink("real", filepath.Join(dir, "sub")); err != nil {
@@ -217,7 +218,7 @@ func TestWriteRefusal_carries_a_classification_from_every_refusal_site(t *testin
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			if err := os.Chmod(dir, pfxDirMode); err != nil {
+			if err := os.Chmod(dir, outputDirMode); err != nil {
 				t.Fatalf("setup: Chmod(dir): %v", err)
 			}
 			s := newOutputStore(t, dir)
@@ -247,7 +248,7 @@ func TestWriteRefusal_carries_a_classification_from_every_refusal_site(t *testin
 			}
 			// The diagnosis has to survive the classification: the refusal still names the
 			// write step, and the wrapped error is still reachable by errors.Is.
-			if !strings.Contains(refusal.Error(), "write pfx") {
+			if !strings.Contains(refusal.Error(), "write output") {
 				t.Errorf("store.write(%s) error = %q, want it to name the write step", rel, refusal.Error())
 			}
 		})
@@ -328,7 +329,7 @@ func TestWriteRefusalCause_states_both_facts_for_every_declared_cause(t *testing
 // Runs serially: it swaps the write seam.
 func TestStoreWrite_a_refusal_stays_unwrappable_so_a_cancelled_write_reads_as_shutdown(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.Chmod(dir, pfxDirMode); err != nil {
+	if err := os.Chmod(dir, outputDirMode); err != nil {
 		t.Fatalf("setup: Chmod(dir): %v", err)
 	}
 	s := newOutputStore(t, dir)
@@ -358,7 +359,7 @@ func TestStoreWrite_a_refusal_stays_unwrappable_so_a_cancelled_write_reads_as_sh
 // directory there meets the operator layout it cannot publish through.
 func writeBlocker(t *testing.T, path string) {
 	t.Helper()
-	if err := os.WriteFile(path, []byte("blocker"), pfxFileMode); err != nil {
+	if err := os.WriteFile(path, []byte("blocker"), outputFileMode); err != nil {
 		t.Fatalf("setup: WriteFile(blocker): %v", err)
 	}
 }
@@ -406,7 +407,7 @@ func TestStoreInspect_reports_content_it_could_not_verify(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			if err := os.Chmod(dir, pfxDirMode); err != nil {
+			if err := os.Chmod(dir, outputDirMode); err != nil {
 				t.Fatalf("setup: Chmod(dir): %v", err)
 			}
 			stage(t, dir)
@@ -443,7 +444,7 @@ func TestScannerRun_rewrites_a_bundle_it_could_not_verify(t *testing.T) {
 		},
 		"a prior the preflight refuses": func(t *testing.T, path string) {
 			t.Helper()
-			if err := os.WriteFile(path, []byte("not a pkcs12 bundle"), pfxFileMode); err != nil {
+			if err := os.WriteFile(path, []byte("not a pkcs12 bundle"), outputFileMode); err != nil {
 				t.Fatalf("setup: WriteFile: %v", err)
 			}
 		},
@@ -514,7 +515,7 @@ func TestScannerRun_rewrites_a_bundle_it_could_not_verify(t *testing.T) {
 func TestScannerRun_when_an_unverifiable_bundle_cannot_be_rewritten(t *testing.T) {
 	// Spelled out rather than imported from the production consts: an operator's log query
 	// keys on these words, so a silent rename must fail here.
-	const unreplaceableMsg = "prior pfx could not be replaced and the /output condition that refused the write is" +
+	const unreplaceableMsg = "prior output could not be replaced and the /output condition that refused the write is" +
 		" not one a restart clears; whatever is at the output path is left as found, health is unaffected"
 	const failedMsg = "conversion failed"
 	for name, tc := range map[string]struct {
@@ -639,13 +640,13 @@ func TestScannerRun_when_the_output_parent_cannot_be_pinned(t *testing.T) {
 	// The pair lives one directory down, so the output path this scan publishes to is
 	// mirrored under a parent component the pin has to descend through.
 	inputSub := filepath.Join(certsRoot, "sub")
-	if err := os.Mkdir(inputSub, pfxDirMode); err != nil {
+	if err := os.Mkdir(inputSub, outputDirMode); err != nil {
 		t.Fatalf("setup: Mkdir(input sub): %v", err)
 	}
 	writePair(t, inputSub, "chain", chainPEM, keyPEM)
 	// The real output directory, holding the bundle these very inputs produce...
 	realDir := filepath.Join(outRoot, "real")
-	if err := os.Mkdir(realDir, pfxDirMode); err != nil {
+	if err := os.Mkdir(realDir, outputDirMode); err != nil {
 		t.Fatalf("setup: Mkdir(out real): %v", err)
 	}
 	analysis := mustAnalyse(t, chainPEM, keyPEM)
@@ -654,7 +655,7 @@ func TestScannerRun_when_the_output_parent_cannot_be_pinned(t *testing.T) {
 		t.Fatalf("setup: Encode: %v", err)
 	}
 	pfxPath := filepath.Join(realDir, "chain.pfx")
-	if err := os.WriteFile(pfxPath, current, pfxFileMode); err != nil {
+	if err := os.WriteFile(pfxPath, current, outputFileMode); err != nil {
 		t.Fatalf("setup: WriteFile: %v", err)
 	}
 	// ...and the mirrored name is a relative symlink to it: inside the root, so
@@ -678,17 +679,17 @@ func TestScannerRun_when_the_output_parent_cannot_be_pinned(t *testing.T) {
 		t.Errorf("Run(symlinked output sub-directory) = %+v, want Unwritable 1 Failed 0 Converted 0: no"+
 			" restart re-reads a different /output layout, so this must not flip health", res)
 	}
-	if got := logs.CountLevel(slog.LevelWarn, unreplaceableBundleMsg); got != 1 {
+	if got := logs.CountLevel(slog.LevelWarn, unreplaceableArtifactMsg); got != 1 {
 		t.Errorf("Run(symlinked output sub-directory) logged %q at WARN %d times, want 1: neutral is not"+
-			" silent: %q", unreplaceableBundleMsg, got, logs.Messages())
+			" silent: %q", unreplaceableArtifactMsg, got, logs.Messages())
 	}
 	// And it names the LAYOUT remediation: a pin refusal is not a volume condition, so an
 	// operator sent to check free space, a quota and a read-only mount is sent after a
 	// cause that is not there while the symlinked tree stays as it is.
-	if got, ok := logs.AttrValue(unreplaceableBundleMsg, "remediation"); !ok || got != outputPinRemediation {
+	if got, ok := logs.AttrValue(unreplaceableArtifactMsg, "remediation"); !ok || got != outputPinRemediation {
 		t.Errorf("Run(symlinked output sub-directory) %q remediation = %v (present %v), want %q: the"+
 			" standing record has to name the cause the pin actually refused",
-			unreplaceableBundleMsg, got, ok, outputPinRemediation)
+			unreplaceableArtifactMsg, got, ok, outputPinRemediation)
 	}
 	// The existing bundle an operator may still be serving is left exactly as found, which
 	// is what the WARN promises.
@@ -709,12 +710,12 @@ func TestScannerRun_when_a_file_blocks_the_mirrored_output_directory(t *testing.
 	outRoot := t.TempDir()
 	_, keyPEM, _, chainPEM := testcerts.GenerateCertChain(t)
 	inputSub := filepath.Join(certsRoot, "sub")
-	if err := os.Mkdir(inputSub, pfxDirMode); err != nil {
+	if err := os.Mkdir(inputSub, outputDirMode); err != nil {
 		t.Fatalf("setup: Mkdir(input sub): %v", err)
 	}
 	writePair(t, inputSub, "chain", chainPEM, keyPEM)
 	// A regular file where the mirrored output directory has to be created.
-	if err := os.WriteFile(filepath.Join(outRoot, "sub"), []byte("blocker"), pfxFileMode); err != nil {
+	if err := os.WriteFile(filepath.Join(outRoot, "sub"), []byte("blocker"), outputFileMode); err != nil {
 		t.Fatalf("setup: WriteFile(blocker): %v", err)
 	}
 
@@ -733,14 +734,14 @@ func TestScannerRun_when_a_file_blocks_the_mirrored_output_directory(t *testing.
 		t.Errorf("Run(file blocking the mirrored output directory) = %+v, want Unwritable 1 Failed 0"+
 			" Converted 0: no restart removes the file, so this must not flip health", res)
 	}
-	if got := logs.CountLevel(slog.LevelWarn, unreplaceableBundleMsg); got != 1 {
+	if got := logs.CountLevel(slog.LevelWarn, unreplaceableArtifactMsg); got != 1 {
 		t.Errorf("Run(file blocking the mirrored output directory) logged %q at WARN %d times, want 1:"+
-			" neutral is not silent: %q", unreplaceableBundleMsg, got, logs.Messages())
+			" neutral is not silent: %q", unreplaceableArtifactMsg, got, logs.Messages())
 	}
 	// And it names the LAYOUT cause, not the volume: nothing here is about free space.
-	if got, ok := logs.AttrValue(unreplaceableBundleMsg, "remediation"); !ok || got != outputPinRemediation {
+	if got, ok := logs.AttrValue(unreplaceableArtifactMsg, "remediation"); !ok || got != outputPinRemediation {
 		t.Errorf("Run(file blocking the mirrored output directory) %q remediation = %v (present %v),"+
-			" want %q", unreplaceableBundleMsg, got, ok, outputPinRemediation)
+			" want %q", unreplaceableArtifactMsg, got, ok, outputPinRemediation)
 	}
 }
 
@@ -755,7 +756,7 @@ func TestScannerRun_when_a_file_blocks_the_mirrored_output_directory(t *testing.
 // earlier — or widened it to "any entry this scan could not publish" — these two would be
 // the first casualties, and the container would stay green while nothing converts.
 func TestScannerRun_a_genuine_conversion_failure_still_flips_health(t *testing.T) {
-	const unreplaceableMsg = "prior pfx could not be replaced and the /output condition that refused the write is" +
+	const unreplaceableMsg = "prior output could not be replaced and the /output condition that refused the write is" +
 		" not one a restart clears; whatever is at the output path is left as found, health is unaffected"
 	for name, stage := range map[string]func(t *testing.T, certsRoot string){
 		"an unparseable certificate": func(t *testing.T, certsRoot string) {
@@ -821,7 +822,7 @@ func stageBudgetRefusedBundle(t *testing.T, path string, analysis *convert.Analy
 			" framing changed, so this fixture no longer produces a budget refusal")
 	}
 	patched := bytes.Replace(pfx, encoded2048, []byte{0x02, 0x02, 0x7f, 0xff}, 1)
-	if err := os.WriteFile(path, patched, pfxFileMode); err != nil {
+	if err := os.WriteFile(path, patched, outputFileMode); err != nil {
 		t.Fatalf("setup: WriteFile: %v", err)
 	}
 }
@@ -832,7 +833,7 @@ func stageBudgetRefusedBundle(t *testing.T, path string, analysis *convert.Analy
 // TestStoreInspect_regenerates_an_oversized_prior uses.
 func stageOversizedBundle(t *testing.T, path string) {
 	t.Helper()
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, pfxFileMode)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, outputFileMode)
 	if err != nil {
 		t.Fatalf("setup: OpenFile: %v", err)
 	}
@@ -842,7 +843,7 @@ func stageOversizedBundle(t *testing.T, path string) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("setup: Close: %v", err)
 	}
-	if err := os.Chmod(path, pfxFileMode); err != nil {
+	if err := os.Chmod(path, outputFileMode); err != nil {
 		t.Fatalf("setup: Chmod: %v", err)
 	}
 }
@@ -939,5 +940,62 @@ func TestScannerRun_inspect_cancelled_by_shutdown_is_reported_quietly(t *testing
 	if got, _ := readBundle(t, pfxPath); !bytes.Equal(got, prior) {
 		t.Errorf("Run(cancelled during inspect) left %d bytes at the output path, want the %d it found: a"+
 			" shutdown is neither current nor stale, so nothing may be rewritten on the way out", len(got), len(prior))
+	}
+}
+
+func TestScannerRun_partialArtifactPublicationFailsTheSource(t *testing.T) {
+	certsRoot := t.TempDir()
+	outRoot := t.TempDir()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "partial-publication.example.com", "ecdsa")
+	writePair(t, certsRoot, "site", certPEM, keyPEM)
+	staleKey := bytes.Repeat([]byte{'x'}, len(keyPEM))
+	if err := os.WriteFile(filepath.Join(outRoot, "site.key"), staleKey, outputFileMode); err != nil {
+		t.Fatalf("setup: write prior key artifact: %v", err)
+	}
+
+	priorRead := readBoundedInRoot
+	readBoundedInRoot = func(ctx context.Context, root *os.Root, name string, max int64) ([]byte, error) {
+		if name == "site.key" {
+			return nil, &fs.PathError{Op: "read", Path: name, Err: syscall.EACCES}
+		}
+		return priorRead(ctx, root, name, max)
+	}
+	t.Cleanup(func() { readBoundedInRoot = priorRead })
+	priorWrite := writeFileInRoot
+	writeFileInRoot = func(ctx context.Context, root *os.Root, name string, data []byte, opts ...atomicfile.Option) (atomicfile.Result, error) {
+		if name == "site.key" {
+			return atomicfile.Result{}, &fs.PathError{Op: "rename", Path: name, Err: syscall.EACCES}
+		}
+		return priorWrite(ctx, root, name, data, opts...)
+	}
+	t.Cleanup(func() { writeFileInRoot = priorWrite })
+	logs := captureLogs(t)
+	scanner := New(&Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+		Formats:   outputpolicy.Formats{PEM: true},
+	})
+
+	result, err := scanner.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run(partial artifact publication) = %v", err)
+	}
+	if result.Failed != 1 || result.Unwritable != 0 || result.Converted != 0 {
+		t.Errorf("Run(partial artifact publication) = %+v, want Failed 1 Unwritable 0 Converted 0", result)
+	}
+	if count := logs.CountLevel(slog.LevelError, "conversion failed"); count != 1 {
+		t.Errorf("Run(partial artifact publication) logged conversion failure %d times, want 1: %v", count, logs.Messages())
+	}
+	if _, err := os.Stat(filepath.Join(outRoot, "site.crt")); err != nil {
+		t.Errorf("certificate artifact did not publish before the key refusal: %v", err)
+	}
+	writtenKey, err := os.ReadFile(filepath.Join(outRoot, "site.key"))
+	if err != nil {
+		t.Fatalf("read key artifact after refused replacement: %v", err)
+	}
+	if !bytes.Equal(writtenKey, staleKey) {
+		t.Error("refused key replacement changed the prior artifact")
 	}
 }

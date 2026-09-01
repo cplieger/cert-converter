@@ -234,3 +234,44 @@ func TestSourceReadBounded(t *testing.T) {
 		}
 	})
 }
+
+func TestSourceReadBundleBoundedUsesBundleSizeDomain(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	inside := filepath.Join(dir, "inside.pfx")
+	f, err := os.Create(inside)
+	if err != nil {
+		t.Fatalf("setup: create inside.pfx: %v", err)
+	}
+	if err := f.Truncate(convert.MaxInputBytes + 1); err != nil {
+		_ = f.Close()
+		t.Fatalf("setup: truncate inside.pfx: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("setup: close inside.pfx: %v", err)
+	}
+	s := newInputSource(t, dir)
+	data, err := s.readBundleBounded(t.Context(), "inside.pfx")
+	if err != nil {
+		t.Fatalf("source.readBundleBounded(%d-byte bundle) = %v, want nil: output-sized PFX must be valid input", convert.MaxInputBytes+1, err)
+	}
+	if len(data) != convert.MaxInputBytes+1 {
+		t.Errorf("source.readBundleBounded(%d-byte bundle) read %d bytes", convert.MaxInputBytes+1, len(data))
+	}
+
+	outside := filepath.Join(dir, "outside.pfx")
+	f, err = os.Create(outside)
+	if err != nil {
+		t.Fatalf("setup: create outside.pfx: %v", err)
+	}
+	if err := f.Truncate(convert.MaxBundleBytes + 1); err != nil {
+		_ = f.Close()
+		t.Fatalf("setup: truncate outside.pfx: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("setup: close outside.pfx: %v", err)
+	}
+	if _, err := s.readBundleBounded(t.Context(), "outside.pfx"); !errors.Is(err, atomicfile.ErrFileTooLarge) {
+		t.Errorf("source.readBundleBounded(%d-byte bundle) = %v, want ErrFileTooLarge", convert.MaxBundleBytes+1, err)
+	}
+}

@@ -71,8 +71,10 @@ const (
 // Config holds the runtime configuration for cert-converter.
 type Config struct {
 	Password       string
+	InputPassword  string
 	EncoderName    convert.EncoderType
 	Lifecycle      outputpolicy.Lifecycle
+	Layout         outputpolicy.Layout
 	PasswordStatus PasswordStatus
 	// FallbackInterval is the operator's CONFIGURED rescan cadence, not the one
 	// that runs: 0 means they opted out of their own cadence, and the composition
@@ -81,7 +83,17 @@ type Config struct {
 	// MaxScanEntries is how many /input paths one scan may enumerate; the
 	// composition root injects it into process.Options and reports it on the
 	// startup line, so an accepted explicit value is not silent.
-	MaxScanEntries int
+	MaxScanEntries  int
+	Formats         outputpolicy.Formats
+	FormatsExplicit bool
+	// LayoutExplicit distinguishes the unset layout default from an operator who
+	// deliberately selected a layout; sync-mode cleanup of the OTHER layout's
+	// artifacts is gated on it.
+	LayoutExplicit bool
+	// InputPasswordReady is false when no input password was configured and
+	// empty-password input was not explicitly enabled; PEM sources still work,
+	// while bundle sources fail loud.
+	InputPasswordReady bool
 }
 
 // Load reads environment variables and returns a populated Config.
@@ -96,6 +108,19 @@ func Load() (Config, error) {
 	if !lifecycleKnown {
 		slog.Warn("unknown OUTPUT_LIFECYCLE, using the default",
 			"value", rejectedValue(rawLifecycle), "using", string(lifecycle), "expected", outputpolicy.LifecycleModes())
+	}
+
+	formats, formatsExplicit, formatsValid := resolveFormats()
+	if !formatsValid && lifecycle == outputpolicy.LifecycleSync {
+		slog.Warn("OUTPUT_LIFECYCLE=sync is disabled because OUTPUT_FORMATS is invalid; orphans are reported instead of deleted",
+			"using", string(outputpolicy.LifecycleWarn),
+			"remediation", "fix OUTPUT_FORMATS before enabling destructive output reconciliation")
+		lifecycle = outputpolicy.LifecycleWarn
+	}
+	layoutMode, layoutExplicit, lifecycle := resolveLayout(lifecycle)
+	inputPassword, err := resolveInputPassword()
+	if err != nil {
+		return Config{}, err
 	}
 
 	rawEncoder := os.Getenv("PFX_ENCODER")
@@ -117,12 +142,18 @@ func Load() (Config, error) {
 	warnPasswordStrength(pw.Status, pw.Channel, pw.BlankFile)
 
 	return Config{
-		Password:         pw.Value,
-		EncoderName:      encName,
-		Lifecycle:        lifecycle,
-		FallbackInterval: fallbackInterval,
-		MaxScanEntries:   maxScanEntries,
-		PasswordStatus:   pw.Status,
+		Password:           pw.Value,
+		InputPassword:      inputPassword.Value,
+		InputPasswordReady: inputPassword.Ready,
+		EncoderName:        encName,
+		Lifecycle:          lifecycle,
+		Formats:            formats,
+		FormatsExplicit:    formatsExplicit,
+		Layout:             layoutMode,
+		LayoutExplicit:     layoutExplicit,
+		FallbackInterval:   fallbackInterval,
+		MaxScanEntries:     maxScanEntries,
+		PasswordStatus:     pw.Status,
 	}, nil
 }
 

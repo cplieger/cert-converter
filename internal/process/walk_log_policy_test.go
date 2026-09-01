@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -70,7 +71,7 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 			t.Fatalf("visit(directory in a cert path) = %v, want nil so the rest of the tree is still walked", err)
 		}
 
-		assertDebugOnly(t, logs, "skipping cert: certificate path is a directory", "blocked.crt")
+		assertDebugOnly(t, logs, "skipping source: input path is a directory", "blocked.crt")
 		if sw.unreadable != 1 {
 			t.Errorf("unreadable = %d, want 1 so the aggregate in logInputCoverageWarnings fires and reaping stays vetoed", sw.unreadable)
 		}
@@ -265,7 +266,7 @@ func TestOutputWalkVisit_an_unreadable_path_vetoes_the_reap(t *testing.T) {
 		t.Fatalf("setup: WriteFile: %v", err)
 	}
 	logs := captureLogs(t)
-	w := &outputWalk{}
+	w := &outputWalk{formats: outputpolicy.DefaultFormats()}
 
 	if err := w.visit(t.Context(), "locked/tls.pfx", nil, errors.New("permission denied")); err != nil {
 		t.Fatalf("visit(unreadable output sub-path) = %v, want nil so the rest of the tree is still walked", err)
@@ -320,7 +321,7 @@ func TestOutputWalkVisit_a_vanished_path_does_not_veto_the_reap(t *testing.T) {
 		t.Fatalf("setup: WriteFile: %v", err)
 	}
 	logs := captureLogs(t)
-	w := &outputWalk{}
+	w := &outputWalk{formats: outputpolicy.DefaultFormats()}
 
 	if err := w.visit(t.Context(), "example.com/tls.pfx", nil, fs.ErrNotExist); err != nil {
 		t.Fatalf("visit(vanished output path) = %v, want nil so the rest of the tree is still walked", err)
@@ -370,7 +371,7 @@ func TestOutputWalkVisit_stops_the_orphan_walk_once_the_scan_is_cancelled(t *tes
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	w := &outputWalk{}
+	w := &outputWalk{formats: outputpolicy.DefaultFormats()}
 
 	err := w.visit(ctx, "live.pfx", dirEntryOf(t, bundle), nil)
 
@@ -422,7 +423,7 @@ func TestWalkLogPolicy_quiet_when_nothing_is_wrong(t *testing.T) {
 //
 // Runs serially: it swaps slog.Default().
 func TestLogIncompleteInputEnumeration_quiet_arms(t *testing.T) {
-	const mountWarn = "orphan removal is disabled for this scan: this scan cannot prove any /output bundle is orphaned"
+	const mountWarn = "orphan removal is disabled for this scan: this scan cannot prove any /output artifact is orphaned"
 
 	t.Run("a shutdown is not an operator-actionable incomplete enumeration", func(t *testing.T) {
 		logs := captureLogs(t)

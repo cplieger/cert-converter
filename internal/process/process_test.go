@@ -37,6 +37,18 @@ func newSyncScanner(certsRoot, outRoot string) *process.Scanner {
 	})
 }
 
+// newMirrorScanner is newScanner pinned to OUTPUT_LAYOUT=mirror, for tests whose
+// subject is the mirrored path derivation itself.
+func newMirrorScanner(certsRoot, outRoot string) *process.Scanner {
+	return process.New(&process.Options{
+		CertsRoot: certsRoot,
+		OutRoot:   outRoot,
+		Password:  "pw",
+		Encoder:   convert.EncNameModern2023,
+		Layout:    outputpolicy.LayoutMirror,
+	})
+}
+
 // TestScannerRun_skips_a_cert_recreated_after_removal pins a DELIBERATE reversal
 // of the previous contract, and the reasoning matters more than the assertion.
 //

@@ -1,55 +1,169 @@
-// Package layout owns cert-converter's naming contract: a certificate is
-// <stem>.crt, its private key is the sibling <stem>.key, and the bundle
-// converted from the pair is <stem>.pfx.
+// Package layout owns cert-converter's naming contract: a source is either a
+// PEM pair (<stem>.crt with its sibling <stem>.key) or a PKCS#12 bundle
+// (<stem>.pfx or <stem>.p12), and each enabled output format derives its
+// artifact names from the same stem — <stem>.pfx for PFX, <stem>.crt and
+// <stem>.key for PEM.
 package layout
 
-import "strings"
+import (
+	"path"
+	"strings"
+
+	"github.com/cplieger/cert-converter/internal/outputpolicy"
+)
 
 // File extensions of the naming contract.
 const (
-	// certExt is the extension of an input certificate chain, PEM-encoded.
+	// certExt is the extension of a certificate chain, PEM-encoded: an input
+	// source, and the certificate half of the PEM output format.
 	certExt = ".crt"
 	// keyExt is the extension of the sibling private key, PEM-encoded.
 	keyExt = ".key"
-	// pfxExt is the extension of the converted PKCS#12 bundle.
+	// pfxExt is the extension of a PKCS#12 bundle: the PFX output format, and an
+	// input source.
 	pfxExt = ".pfx"
+	// p12Ext is the alternate bundle extension accepted on the input side only;
+	// outputs always use pfxExt.
+	p12Ext = ".p12"
 )
 
-// IsCert reports whether name is an input certificate — the entries a scan
-// converts from.
+// IsCert reports whether name is a PEM certificate — the certificate half of an
+// input pair.
 func IsCert(name string) bool {
 	return strings.HasSuffix(name, certExt)
 }
 
-// IsRelevant reports whether name participates in conversion at all, as either
-// half of a pair.
+// IsBundle reports whether name is a PKCS#12 bundle source.
+func IsBundle(name string) bool {
+	return strings.HasSuffix(name, pfxExt) || strings.HasSuffix(name, p12Ext)
+}
+
+// IsSource reports whether name is something a scan converts FROM: a
+// certificate or a bundle.
+func IsSource(name string) bool {
+	return IsCert(name) || IsBundle(name)
+}
+
+// IsKey reports whether name is a PEM private key — the key half of an input
+// pair, and the PEM output format's key artifact.
+func IsKey(name string) bool {
+	return strings.HasSuffix(name, keyExt)
+}
+
+// KeyStem returns a key path without its extension: the stem its pair
+// certificate and artifacts share.
+func KeyStem(keyPath string) string {
+	return strings.TrimSuffix(keyPath, keyExt)
+}
+
+// IsRelevant reports whether name participates in conversion at all: either
+// half of a pair, or a bundle.
 func IsRelevant(name string) bool {
-	return IsCert(name) || strings.HasSuffix(name, keyExt)
+	return IsSource(name) || IsKey(name)
 }
 
-// IsOutput reports whether name is a converted bundle.
-func IsOutput(name string) bool {
-	return strings.HasSuffix(name, pfxExt)
-}
-
-// CertForOutput is the REVERSE of OutputFor: the certificate path that would have
-// produced this bundle.
-func CertForOutput(pfxPath string) string {
-	return strings.TrimSuffix(pfxPath, pfxExt) + certExt
+// SourceStem returns rel without its source extension: the shared prefix every
+// sibling and artifact name is derived from.
+func SourceStem(rel string) string {
+	for _, ext := range [...]string{certExt, pfxExt, p12Ext} {
+		if stem, ok := strings.CutSuffix(rel, ext); ok {
+			return stem
+		}
+	}
+	return rel
 }
 
 // KeyFor returns the sibling private-key path for a certificate path.
 func KeyFor(certPath string) string {
-	return stem(certPath) + keyExt
+	return strings.TrimSuffix(certPath, certExt) + keyExt
 }
 
-// OutputFor returns the PKCS#12 output path for a certificate path.
-func OutputFor(certPath string) string {
-	return stem(certPath) + pfxExt
+// CertFor returns the pair-certificate path for a stem — the sibling whose
+// presence gives a pair precedence over a bundle with the same stem.
+func CertFor(stem string) string {
+	return stem + certExt
 }
 
-// stem returns certPath without its certificate extension: the shared prefix
-// from which both sibling names are derived.
-func stem(certPath string) string {
-	return strings.TrimSuffix(certPath, certExt)
+// PFXOutFor returns the PKCS#12 artifact name for an output stem.
+func PFXOutFor(stem string) string { return stem + pfxExt }
+
+// CertOutFor returns the PEM format's certificate artifact name.
+func CertOutFor(stem string) string { return stem + certExt }
+
+// KeyOutFor returns the PEM format's private-key artifact name.
+func KeyOutFor(stem string) string { return stem + keyExt }
+
+// FlatStem maps a source stem into the flat output namespace: the stem's own
+// directory name plus its base, everything above dropped. Idempotent: a stem
+// already in the flat namespace maps to itself.
+func FlatStem(stem string) string {
+	if stem == "" {
+		return ""
+	}
+	if withoutSlash, ok := strings.CutSuffix(stem, "/"); ok {
+		return path.Base(withoutSlash) + "/"
+	}
+	dir := path.Dir(stem)
+	if dir == "." {
+		return path.Base(stem)
+	}
+	return path.Join(path.Base(dir), path.Base(stem))
+}
+
+// FlatProducible reports whether an output-relative path is one the flat
+// layout can produce at all: FlatStem keeps at most one directory level, so
+// anything nested deeper was laid out by the mirror layout.
+func FlatProducible(outRel string) bool {
+	return strings.Count(outRel, "/") <= 1
+}
+
+// IsOutputShape reports whether name is an artifact the CONFIGURED formats
+// produce — the own-shape predicate behind every orphan decision, scoped to the
+// enabled set so a format switched off leaves its old artifacts untouched.
+func IsOutputShape(name string, f outputpolicy.Formats) bool {
+	if f.PFX && strings.HasSuffix(name, pfxExt) {
+		return true
+	}
+	return f.PEM && (strings.HasSuffix(name, certExt) || strings.HasSuffix(name, keyExt))
+}
+
+// OutputStem returns an artifact path without its artifact extension.
+func OutputStem(outRel string) string {
+	for _, ext := range [...]string{pfxExt, certExt, keyExt} {
+		if stem, ok := strings.CutSuffix(outRel, ext); ok {
+			return stem
+		}
+	}
+	return outRel
+}
+
+// SourceCandidates returns every input path that would, under the mirror
+// layout, produce artifacts at this stem — the reap re-check set.
+func SourceCandidates(stem string) []string {
+	return []string{stem + certExt, stem + pfxExt, stem + p12Ext}
+}
+
+// ShadowingSiblings returns the sibling source paths that outrank rel when both
+// exist: the PEM pair's certificate for any bundle, and the .pfx spelling for a
+// .p12 one. Precedence keeps two sources from producing one artifact set.
+func ShadowingSiblings(rel string) []string {
+	stem := SourceStem(rel)
+	shadows := []string{CertFor(stem)}
+	if strings.HasSuffix(rel, p12Ext) {
+		shadows = append(shadows, stem+pfxExt)
+	}
+	return shadows
+}
+
+// ArtifactsFor returns the artifact names the enabled formats derive from one
+// output stem, in the domain's order.
+func ArtifactsFor(outStem string, f outputpolicy.Formats) []string {
+	artifacts := make([]string, 0, 3)
+	if f.PFX {
+		artifacts = append(artifacts, PFXOutFor(outStem))
+	}
+	if f.PEM {
+		artifacts = append(artifacts, CertOutFor(outStem), KeyOutFor(outStem))
+	}
+	return artifacts
 }

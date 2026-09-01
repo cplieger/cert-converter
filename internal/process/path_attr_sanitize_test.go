@@ -66,7 +66,7 @@ func TestScannerRun_sanitizes_walk_supplied_names_in_log_attributes(t *testing.T
 		t.Fatalf("Run = %+v, want Converted 2 and Failed 0: an unconverted pair emits no wrote-pfx record", res)
 	}
 
-	rawOut := layout.OutputFor(hostileStem + ".crt")
+	rawOut := layout.PFXOutFor(hostileStem)
 	wantSanitized := logtext.Path(rawOut)
 	if wantSanitized == rawOut {
 		t.Fatalf("the fixture name %q survives sanitizing unchanged, so this test asserts nothing", rawOut)
@@ -193,7 +193,7 @@ func TestErrorAttributes_are_sanitized_at_the_emit_sites(t *testing.T) {
 		// atomicfile interpolates the output name it refused, so the refusal's
 		// own text carries it even though reportWriteFailure's path and
 		// output_path are gated. Minted the way store.write mints one.
-		refused := refuseWrite(refusalOwnership, "write pfx: %w",
+		refused := refuseWrite(refusalOwnership, "write output: %w",
 			&fs.PathError{Op: "rename", Path: hostileStem + ".pfx", Err: fs.ErrPermission})
 		logs := captureLogs(t)
 
@@ -201,7 +201,7 @@ func TestErrorAttributes_are_sanitized_at_the_emit_sites(t *testing.T) {
 		// rather than spelled out (the shorter records above already pin the
 		// rewording guard).
 		reportWriteFailure(hostileStem+".crt", hostileStem+".pfx", refused, statusUnwritable)
-		assertErrorAttrSanitized(t, logs, unreplaceableBundleMsg, refused.Error())
+		assertErrorAttrSanitized(t, logs, unreplaceableArtifactMsg, refused.Error())
 
 		// The loud arm reaches the operator through failEntry, a different
 		// emit site with its own gate.

@@ -367,8 +367,8 @@ func TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unw
 		t.Errorf("Run(unwritable output) logged %d leaf-not-first observations, want exactly 1: a new input"+
 			" condition is named once", got)
 	}
-	if got := logs.CountLevel(slog.LevelWarn, unreplaceableBundleMsg); got != 1 {
-		t.Errorf("Run(unwritable output) logged %q at WARN %d times, want 1", unreplaceableBundleMsg, got)
+	if got := logs.CountLevel(slog.LevelWarn, unreplaceableArtifactMsg); got != 1 {
+		t.Errorf("Run(unwritable output) logged %q at WARN %d times, want 1", unreplaceableArtifactMsg, got)
 	}
 
 	// Steady state: same inputs, same refusal. The condition repeats, the input
@@ -384,8 +384,8 @@ func TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unw
 		t.Errorf("two unwritable scans logged %d leaf-not-first observations in total, want 1: an"+
 			" already-reported input condition must not re-emit while the output stays foreign-owned", got)
 	}
-	if got := logs.CountLevel(slog.LevelWarn, unreplaceableBundleMsg); got != 2 {
+	if got := logs.CountLevel(slog.LevelWarn, unreplaceableArtifactMsg); got != 2 {
 		t.Errorf("two unwritable scans logged %q at WARN %d times, want 2 (one per scan): the standing"+
-			" condition keeps its own diagnostic", unreplaceableBundleMsg, got)
+			" condition keeps its own diagnostic", unreplaceableArtifactMsg, got)
 	}
 }

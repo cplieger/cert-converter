@@ -33,14 +33,33 @@ func TestOperatorLogContract_pins_every_published_message_substring(t *testing.T
 			// The audit record for the only destructive action this app takes.
 			name:    "the sync-mode deletion audit is queryable",
 			message: reapAuditMsg,
-			want:    "removed output bundles whose input certificates are gone",
+			want:    "removed output artifacts that are no longer requested",
 		},
 		{
 			// The only trace of a bundle kept indefinitely because its private key is still
 			// there; it is counted in nothing, so the message is the whole signal.
 			name:    "the retained-lone-key report is queryable",
 			message: loneKeyRetainedMsg,
-			want:    "keeping an output bundle whose certificate is gone but whose private key is still in /input",
+			want:    "keeping an output artifact whose certificate is gone but whose private key is still in /input",
+		},
+		{
+			// The health-flipping refusal to arbitrate two inputs over one output name.
+			name:    "CertConverterOutputNameCollision matches the collision refusal",
+			message: collisionMsg,
+			want:    "output name collision",
+		},
+		{
+			// The only signal that sync is keeping a previous layout's tree.
+			name:    "CertConverterPreviousLayoutRetained matches the retention record",
+			message: otherLayoutRetainedMsg,
+			want:    "laid out for a different OUTPUT_LAYOUT",
+		},
+		{
+			// The confirming re-check's veto rides the OrphanRemovalDisabled rule: the
+			// operator condition is the same, so the phrase must stay on the message.
+			name:    "the flat re-check veto fires CertConverterOrphanRemovalDisabled",
+			message: flatRecheckIncompleteMsg,
+			want:    "orphan removal is disabled for this scan",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

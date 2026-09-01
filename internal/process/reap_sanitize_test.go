@@ -36,7 +36,7 @@ import (
 func TestStoreReconcile_sanitizes_output_derived_names_in_log_attributes(t *testing.T) {
 	outDir, inDir := t.TempDir(), t.TempDir()
 	rawBundle := hostileStem + ".pfx"
-	rawCert := layout.CertForOutput(rawBundle)
+	rawCert := layout.CertFor(layout.OutputStem(rawBundle))
 	if err := os.WriteFile(filepath.Join(outDir, rawBundle), []byte("pfx"), 0o600); err != nil {
 		t.Fatalf("setup: WriteFile(%q): %v", rawBundle, err)
 	}
@@ -62,7 +62,7 @@ func TestStoreReconcile_sanitizes_output_derived_names_in_log_attributes(t *test
 		t.Errorf("reconcile(warn mode) deleted = %d, want 0", deleted)
 	}
 
-	const orphanMsg = "output bundles have no matching input"
+	const orphanMsg = "output artifacts have no matching input"
 	if !logs.HasAttr(orphanMsg, "paths", wantSanitized) {
 		got, _ := logs.AttrValue(orphanMsg, "paths")
 		t.Errorf("orphan report paths = %q, want the /output-derived name sanitized to %q", got, wantSanitized)

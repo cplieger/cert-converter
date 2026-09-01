@@ -99,7 +99,7 @@ func TestCountResults_counts_every_outcome_in_the_enum(t *testing.T) {
 			t.Errorf("countResults([status %d]).Total = %d, want 1", status, got.Total)
 		}
 		counted := got.Converted + got.Unchanged + got.Orphan + got.Failed +
-			got.Unreadable + got.Unresolved + got.Vanished + got.Unwritable
+			got.Unreadable + got.Unresolved + got.Vanished + got.Unwritable + got.Collided
 		if counted != 1 {
 			t.Errorf("countResults([status %d]) = %+v, want the outcome in exactly one counter, got %d",
 				status, got, counted)
@@ -188,6 +188,8 @@ func TestScanResultVetoes_every_counter_is_classified_and_honoured(t *testing.T)
 		"Unreadable": vetoDurable,
 		"Unresolved": vetoDurable,
 		"Vanished":   vetoTransient,
+		"Collided":   vetoConversion,
+		"Ignored":    vetoNone,
 	}
 
 	typ := reflect.TypeFor[ScanResult]()

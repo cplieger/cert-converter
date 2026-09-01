@@ -10,10 +10,10 @@ import (
 )
 
 // TestScannerRun_mirrors_input_subdirectories_in_output pins the output path
-// derivation for the canonical Caddy layout, where every cert lives in a
-// per-domain subdirectory rather than at the root of /input: the .pfx must be
-// written at the same relative path under /output (creating the intermediate
-// directories), not flattened into the output root.
+// derivation for the canonical Caddy layout under OUTPUT_LAYOUT=mirror, where
+// every cert lives in a per-domain subdirectory rather than at the root of
+// /input: the .pfx must be written at the same relative path under /output
+// (creating the intermediate directories), not flattened.
 func TestScannerRun_mirrors_input_subdirectories_in_output(t *testing.T) {
 	t.Parallel()
 	certsRoot := t.TempDir()
@@ -29,7 +29,7 @@ func TestScannerRun_mirrors_input_subdirectories_in_output(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(certDir, "example.com.key"), keyPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	scanner := newScanner(certsRoot, outRoot)
+	scanner := newMirrorScanner(certsRoot, outRoot)
 
 	res, err := scanner.Run(t.Context())
 	if err != nil {

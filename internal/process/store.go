@@ -1,6 +1,7 @@
 package process
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,13 +16,14 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
+	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 )
 
 // Output file and directory modes.
 const (
-	pfxFileMode = 0o600
-	pfxDirMode  = 0o750
+	outputFileMode = 0o600
+	outputDirMode  = 0o750
 )
 
 // outputPermRemediation is the shared remediation hint for /output permission and
@@ -34,22 +36,26 @@ type store struct {
 	// laxDirsReported dedupes the lax-output-directory WARN to once per directory
 	// per scan.
 	laxDirsReported map[string]struct{}
+	// formats scopes the own-shape predicate: only artifacts the CONFIGURED
+	// formats produce are enumerated as orphan candidates, so a format switched
+	// off leaves its old artifacts untouched.
+	formats outputpolicy.Formats
 	// maxEntries is this store's per-walk entry budget for the OUTPUT tree, injected
 	// from Options.MaxScanEntries exactly as scanWalk's is for /input.
 	maxEntries int
 }
 
 // laxDirMsg is the standing WARN for an /output directory more permissive than
-// pfxDirMode: a group- or world-WRITABLE directory lets any other process on the
-// shared mount unlink a bundle or replace it, and a world-TRAVERSABLE one exposes the
-// bundle names.
-const laxDirMsg = "the /output directory holding a pfx is more permissive than policy"
+// outputDirMode: a group- or world-WRITABLE directory lets another process on
+// the shared mount unlink or replace an artifact, and a world-TRAVERSABLE one
+// exposes artifact names.
+const laxDirMsg = "the /output directory holding generated artifacts is more permissive than policy"
 
-// reportLaxDir warns when rel's parent directory carries a permission bit pfxDirMode
-// does not.
+// reportLaxDir warns when rel's parent directory carries a permission bit
+// outputDirMode does not.
 func (s *store) reportLaxDir(rel string) {
 	// Walk every ancestor up to the mount root, not just the immediate parent:
-	// the leaf directory is app-created at pfxDirMode, so an operator-created
+	// the leaf directory is app-created at outputDirMode, so an operator-created
 	// /output root is reached only by walking up.
 	for dir := path.Dir(rel); ; dir = path.Dir(dir) {
 		s.reportLaxDirAt(dir)
@@ -75,12 +81,12 @@ func (s *store) reportLaxDirAt(dir string) {
 		s.laxDirsReported = make(map[string]struct{})
 	}
 	s.laxDirsReported[dir] = struct{}{}
-	if perm := fi.Mode().Perm(); laxerThan(perm, pfxDirMode) {
+	if perm := fi.Mode().Perm(); laxerThan(perm, outputDirMode) {
 		// dir is root-relative, so "." for a flat /output; the root is named
 		// alongside it, matching logOrphanWalkOutcome's own directory-level records.
 		slog.Warn(laxDirMsg,
 			"path", logtext.Path(dir), "dir", logtext.Path(s.root.Name()),
-			"mode", perm.String(), "want", os.FileMode(pfxDirMode).String(),
+			"mode", perm.String(), "want", os.FileMode(outputDirMode).String(),
 			"remediation", outputPermRemediation)
 	}
 }
@@ -90,18 +96,27 @@ func (s *store) reportLaxDirAt(dir string) {
 // directory.
 var writeFileInRoot = atomicfile.WriteFileInRoot
 
-// write puts pfx at rel inside the output tree, atomically, creating rel's parent
-// directory if needed. Every touch goes through the confined root, and through a
-// PINNED parent, so a symlink planted under /output cannot redirect the write
-// outside the mounted volume or to another name inside it.
-func (s *store) write(ctx context.Context, rel string, pfx []byte) writeRefusal {
+// write publishes a PKCS#12 artifact under the bundle read/write ceiling.
+func (s *store) write(ctx context.Context, rel string, data []byte) writeRefusal {
+	return s.writeBounded(ctx, rel, data, maxPFXSize)
+}
+
+// writePEM publishes one PEM artifact under the expansion-aware PEM ceiling.
+func (s *store) writePEM(ctx context.Context, rel string, data []byte) writeRefusal {
+	return s.writeBounded(ctx, rel, data, convert.MaxPEMOutputBytes)
+}
+
+// writeBounded puts data at rel atomically, creating its parent directory. Every
+// touch goes through the confined root and a PINNED parent, so a symlink under
+// /output cannot redirect the write outside the mount or to another name.
+func (s *store) writeBounded(ctx context.Context, rel string, data []byte, maxBytes int64) writeRefusal {
 	if dir := path.Dir(rel); dir != "." {
-		if err := s.root.MkdirAll(dir, pfxDirMode); err != nil {
+		if err := s.root.MkdirAll(dir, outputDirMode); err != nil {
 			cause := classifyWriteErrno(err)
 			if cause == refusalTransient {
 				cause = refusalOutputLayout
 			}
-			return refuseWrite(cause, "write pfx: create output directory for %q: %w", rel, err)
+			return refuseWrite(cause, "write output: create output directory for %q: %w", rel, err)
 		}
 		// MkdirAll's mode is a REQUEST, not the mode on disk: an inheritable ACL
 		// can widen it, so the directory is observed after creation rather than assumed.
@@ -110,16 +125,14 @@ func (s *store) write(ctx context.Context, rel string, pfx []byte) writeRefusal 
 	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
 	if err != nil {
 		return refuseWrite(classifyPinRefusal(err),
-			"write pfx: pin output directory for %q: %w", rel, err)
+			"write output: pin output directory for %q: %w", rel, err)
 	}
 	defer func() { _ = parent.Close() }()
-	if _, err := writeFileInRoot(ctx, parent, base, pfx,
-		atomicfile.WithMode(pfxFileMode),
-		// Mirrors the read bound: inspect reads this file back under
-		// maxPFXSize, which is the permanent rewrite loop this bound prevents.
-		atomicfile.WithMaxBytes(maxPFXSize),
+	if _, err := writeFileInRoot(ctx, parent, base, data,
+		atomicfile.WithMode(outputFileMode),
+		atomicfile.WithMaxBytes(maxBytes),
 	); err != nil {
-		return refuseWrite(classifyWriteErrno(err), "write pfx: %w", err)
+		return refuseWrite(classifyWriteErrno(err), "write output: %w", err)
 	}
 	return nil
 }
@@ -130,8 +143,8 @@ func (s *store) write(ctx context.Context, rel string, pfx []byte) writeRefusal 
 // an interrupted write rather than staged by one still in flight.
 const staleTempAge = time.Hour
 
-// sweepStaleTemps removes PFX temp files orphaned by an interrupted atomic write
-// (a crash between temp-write and rename), then narrates the outcome.
+// sweepStaleTemps removes atomic-write temp files orphaned by an interrupted
+// write, then narrates the outcome.
 func (s *store) sweepStaleTemps(ctx context.Context) {
 	res, walkErr := atomicfile.CleanupStaleTempsInRoot(ctx, s.root, staleTempAge, atomicfile.WithRecursive(true))
 	s.logSweepOutcome(res, walkErr)
@@ -167,13 +180,11 @@ func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
 
 // --- Output-derived currency ---
 
-// maxPFXSize bounds a prior output the store reads back before decoding it.
-//
-// It MUST exceed the largest bundle this app can itself produce.
+// maxPFXSize bounds a prior PKCS#12 artifact the store decodes.
 const maxPFXSize = convert.MaxBundleBytes
 
-// contentState is what one prior-bundle inspection resolves:
-// what this app KNOWS about the bytes already at the output path.
+// contentState is what one prior-artifact inspection resolves: what this app
+// KNOWS about the bytes already at the output path.
 type contentState int
 
 const (
@@ -181,27 +192,26 @@ const (
 	// returns it only alongside an error (a shutdown), where the caller returns before any
 	// outcome is derived.
 	contentUnresolved contentState = iota
-	// contentVerifiedCurrent: the bytes on disk were read, decoded and compared, and they
-	// ARE the bundle these inputs produce.
+	// contentVerifiedCurrent: the bytes on disk were compared and ARE the
+	// artifact these inputs produce.
 	contentVerifiedCurrent
-	// contentVerifiedStale: this app established that the output path does not hold a
-	// usable copy of the bundle these inputs produce — it holds nothing at all, holds
-	// something that is not a regular file, holds a bundle whose encoder profile or
-	// content differs, or holds one that will not decode with the configured password.
+	// contentVerifiedStale: this app established that the output path does not
+	// hold a usable copy of the artifact these inputs produce — it holds nothing,
+	// a non-regular occupant, or bytes that differ from the wanted output.
 	contentVerifiedStale
 	// contentUnverified: nobody compared the bytes.
 	contentUnverified
 )
 
-// upToDate reports whether the output path needs no write at all: the bytes on disk are
-// already the bundle these inputs produce.
+// upToDate reports whether the output path needs no write: the bytes on disk
+// already carry the wanted artifact.
 func (c contentState) upToDate() bool {
 	return c == contentVerifiedCurrent
 }
 
-// bundleNotProvenWrong reports whether a failed rewrite leaves the operator with a
-// bundle this app has no evidence against: one it could not read at all.
-func (c contentState) bundleNotProvenWrong() bool {
+// artifactNotProvenWrong reports whether a failed rewrite leaves the operator
+// with an artifact this app has no evidence against: one it could not read.
+func (c contentState) artifactNotProvenWrong() bool {
 	return c == contentUnverified
 }
 
@@ -250,7 +260,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		return contentVerifiedStale, nil
 	}
 
-	s.reportLaxBundle(rel, fi.Mode().Perm())
+	s.reportLaxArtifact(rel, fi.Mode().Perm())
 
 	if fi.Size() > maxPFXSize {
 		slog.Warn("prior pfx exceeds the readable bound; regenerating",
@@ -321,9 +331,70 @@ func contentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 	}
 }
 
-// laxBundleMsg is the standing WARN for a prior bundle carrying a permission bit
-// pfxFileMode does not.
-const laxBundleMsg = "prior pfx is more permissive than policy; leaving its mode as found"
+// inspectRaw resolves what this app knows about a byte-exact artifact at rel (the
+// PEM format's outputs): whether the bytes on disk are already want. The
+// scaffolding mirrors inspect — the same pinned parent, the same lstat arms, the
+// same bounded read — with a byte comparison where the PFX path decodes.
+func (s *store) inspectRaw(ctx context.Context, rel string, want []byte) (contentState, error) {
+	s.reportLaxDir(rel)
+	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return contentVerifiedStale, nil
+	case err != nil:
+		slog.Warn("cannot pin the output directory of a prior output; regenerating",
+			"path", logtext.Path(rel), "error", logtext.Path(err.Error()),
+			"remediation", classifyPinRefusal(err).remediation())
+		return contentUnverified, nil
+	}
+	defer func() { _ = parent.Close() }()
+
+	fi, err := parent.Lstat(base)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return contentVerifiedStale, nil
+	case err != nil:
+		slog.Warn("cannot stat prior output; regenerating",
+			"path", logtext.Path(rel), "error", logtext.Path(err.Error()),
+			"remediation", outputPermRemediation)
+		return contentUnverified, nil
+	case !fi.Mode().IsRegular():
+		// A symlink must never be followed here, or unrelated content could
+		// satisfy the check.
+		slog.Warn("prior output path is not a regular file; regenerating",
+			"path", logtext.Path(rel), "mode", fi.Mode().String(),
+			"remediation", "remove whatever occupies the output path; this app writes only regular files there")
+		return contentVerifiedStale, nil
+	}
+
+	s.reportLaxArtifact(rel, fi.Mode().Perm())
+
+	if fi.Size() != int64(len(want)) {
+		return contentVerifiedStale, nil
+	}
+	prior, err := readBoundedInRoot(ctx, parent, base, convert.MaxPEMOutputBytes)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return contentUnresolved, fmt.Errorf("read prior output: %w", errors.Join(ctxErr, err))
+		}
+		content := contentUnverified
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, atomicfile.ErrNotRegular) {
+			content = contentVerifiedStale
+		}
+		slog.Warn("cannot read prior output; regenerating",
+			"path", logtext.Path(rel), "error", logtext.Path(err.Error()),
+			"remediation", outputPermRemediation)
+		return content, nil
+	}
+	if !bytes.Equal(prior, want) {
+		return contentVerifiedStale, nil
+	}
+	return contentVerifiedCurrent, nil
+}
+
+// laxArtifactMsg is the standing WARN for a prior artifact carrying a
+// permission bit outputFileMode does not.
+const laxArtifactMsg = "prior output is more permissive than policy; leaving its mode as found"
 
 // outputPinRemediation is the operator action behind every /output LAYOUT refusal
 // (refusalOutputLayout).
@@ -350,13 +421,14 @@ func laxerThan(perm, policy os.FileMode) bool {
 	return perm&^policy != 0
 }
 
-// reportLaxBundle warns when a prior bundle's mode is laxer than pfxFileMode.
-func (s *store) reportLaxBundle(rel string, perm os.FileMode) {
-	if !laxerThan(perm, pfxFileMode) {
+// reportLaxArtifact warns when a prior artifact's mode is laxer than
+// outputFileMode.
+func (s *store) reportLaxArtifact(rel string, perm os.FileMode) {
+	if !laxerThan(perm, outputFileMode) {
 		return
 	}
-	slog.Warn(laxBundleMsg,
-		"path", logtext.Path(rel), "mode", perm.String(), "want", os.FileMode(pfxFileMode).String())
+	slog.Warn(laxArtifactMsg,
+		"path", logtext.Path(rel), "mode", perm.String(), "want", os.FileMode(outputFileMode).String())
 }
 
 // writeRefusalCause names WHAT refused an /output write, as the site that refused it
@@ -370,16 +442,17 @@ const (
 	// refusalOwnership: the filesystem refused the operation for a permission reason
 	// (EACCES / EPERM).
 	refusalOwnership
-	// refusalOutputLayout: the SHAPE of the operator's output tree will not take this
-	// bundle at this path — a symlinked output tree, a component that is not a directory,
-	// a non-directory occupant of a mirrored output directory, or a component another
-	// writer replaced mid-descent. A restart re-reads the same layout.
+	// refusalOutputLayout: the SHAPE of the operator's output tree will not take
+	// this artifact at this path — a symlinked output tree, a component that is
+	// not a directory, a non-directory occupant of a mirrored output directory,
+	// or a component another writer replaced mid-descent. A restart re-reads the
+	// same layout.
 	refusalOutputLayout
 	// refusalVolume: the volume will not take the bytes (EROFS / ENOSPC / EDQUOT).
 	refusalVolume
 	// refusalTransient: the write failed for something that is NOT a steady-state
-	// condition of the operator's volume — a genuinely transient I/O error, a bundle above
-	// maxPFXSize, a symlink at the output name.
+	// condition of the operator's volume — a transient I/O error, an artifact
+	// above maxPFXSize, or a symlink at the output name.
 	refusalTransient
 
 	// refusalCauseCount is the enum's LENGTH, not a cause.
@@ -407,9 +480,9 @@ func (c writeRefusalCause) remediation() string {
 	}
 }
 
-// writeRefusal is the error store.write returns when it refuses to publish a bundle: the
-// diagnosis and its classification, minted together at the point of refusal so the two
-// cannot drift apart.
+// writeRefusal is the error store.write returns when it refuses to publish an
+// artifact: the diagnosis and its classification, minted together at the point
+// of refusal so the two cannot drift apart.
 type writeRefusal interface {
 	error
 	// cause is what refused, as the refusing site diagnosed it.
@@ -462,7 +535,8 @@ func classifyPinRefusal(err error) writeRefusalCause {
 	return refusalOutputLayout
 }
 
-// readBoundedInRoot reads a bundle from inside the output tree under maxPFXSize.
+// readBoundedInRoot reads an artifact inside the output tree under the
+// caller's format-specific ceiling.
 var readBoundedInRoot = atomicfile.ReadBoundedInRoot
 
 // --- Output lifecycle: the /output half ---
@@ -471,7 +545,7 @@ var readBoundedInRoot = atomicfile.ReadBoundedInRoot
 // root-relative paths in walk order, plus whether this walk saw the tree completely
 // enough for a deletion decision to rest on it.
 func (s *store) listOutputs(ctx context.Context) (found []string, safe bool, err error) {
-	walk := outputWalk{budget: scanbudget.NewCounter(s.maxEntries)}
+	walk := outputWalk{budget: scanbudget.NewCounter(s.maxEntries), formats: s.formats}
 	if err := atomicfile.WalkDirInRoot(ctx, s.root, func(rel string, d fs.DirEntry, err error) error {
 		return walk.visit(ctx, rel, d, err)
 	}); err != nil {
@@ -494,7 +568,7 @@ const outputBudgetMsg = reapDisabledPhrase + ": the /output tree holds more entr
 
 // outputBudgetRemediation is that WARN's operator action, naming both ways out and the cost
 // of the second exactly as scanbudget.InputRemediation does for /input.
-const outputBudgetRemediation = "check that /output is mounted at the bundle directory and holds nothing else; if the tree is legitimately this large, raise MAX_SCAN_ENTRIES and the container's memory limit together, because one walk's memory grows with the total length of the paths it enumerates and not only with their number"
+const outputBudgetRemediation = "check that /output is mounted at the generated-artifact directory and holds nothing else; if the tree is legitimately this large, raise MAX_SCAN_ENTRIES and the container's memory limit together, because one walk's memory grows with the total length of the paths it enumerates and not only with their number"
 
 // outputWalk is listOutputs' visitor state: the candidate list plus the two
 // deletion-safety counters that derive the verdict.
@@ -502,6 +576,8 @@ type outputWalk struct {
 	found      []string
 	unreadable int
 	symlinked  int
+	// formats scopes which names are this app's own output shape.
+	formats outputpolicy.Formats
 	// budget is this walk's entry ceiling and its charge counter, on the same
 	// scanbudget.Counter every walk in this app uses.
 	budget scanbudget.Counter
@@ -529,8 +605,8 @@ func (w *outputWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err e
 		return nil
 	}
 	// Charged once per enumerated path, before any classification, so the budget
-	// bounds this walk's own retained state: /output is a mounted tree a
-	// co-mounting writer can fill with cheap zero-length .pfx names.
+	// bounds retained state: /output is a mounted tree a co-writer can fill with
+	// cheap zero-length artifact names.
 	if !w.budget.Charge() {
 		return fmt.Errorf("%w: stopped at %d entries (%s)", errOutputBudgetExceeded, w.budget.Count(), rel)
 	}
@@ -545,7 +621,7 @@ func (w *outputWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err e
 		// veto a deletion nor repair it.
 		return nil
 	}
-	if !layout.IsOutput(rel) {
+	if !layout.IsOutputShape(rel, w.formats) {
 		return nil
 	}
 	w.found = append(w.found, rel)
@@ -571,7 +647,7 @@ func (s *store) logOrphanWalkOutcome(unreadable, symlinked int) {
 // pinned to the physical directory the orphan walk classified: a component that is a
 // symlink or not a directory at all, or one that changed identity while it was being
 // opened.
-const pinRedirectedMsg = "could not pin the output directory of an orphaned bundle; leaving it in place"
+const pinRedirectedMsg = "could not pin the output directory of an orphaned artifact; leaving it in place"
 
 // reapAttempt is what one confirmed candidate's removal resolved.
 type reapAttempt int
@@ -584,7 +660,7 @@ const (
 
 // removalRefusedMsg is the once-per-scan record for confirmed orphans this app was refused
 // permission to unlink.
-const removalRefusedMsg = "some orphaned output bundles could not be removed; /output is not reconciling with /input"
+const removalRefusedMsg = "some orphaned output artifacts could not be removed; /output is not reconciling with /input"
 
 // removeOrphan re-checks one confirmed orphan and unlinks it through a PINNED parent
 // root, reporting how the attempt resolved (see reapAttempt).
@@ -604,7 +680,7 @@ func (s *store) removeOrphan(rel string) reapAttempt {
 	}
 	defer func() { _ = parent.Close() }()
 	// The walk classified this entry up to reapDeferral ago; only a REGULAR
-	// file is a bundle this app wrote.
+	// file is an artifact this app wrote.
 	fi, statErr := parent.Lstat(base)
 	switch {
 	case errors.Is(statErr, fs.ErrNotExist):
@@ -629,6 +705,6 @@ func (s *store) removeOrphan(rel string) reapAttempt {
 			"remediation", outputPermRemediation)
 		return reapAttemptRefused
 	}
-	slog.Debug("removed orphaned output whose input is gone", "path", logRel)
+	slog.Debug("removed orphaned output artifact", "path", logRel)
 	return reapAttemptRemoved
 }
