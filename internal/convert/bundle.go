@@ -69,12 +69,6 @@ func (b *inputWorkBudget) add(what string, iterations, weight int) error {
 	return nil
 }
 
-// AnalyseBundle resolves one PKCS#12 bundle with a fresh work budget. A scanner
-// handling several bundles uses AnalyseBundleWithBudget instead.
-func AnalyseBundle(ctx context.Context, pfx []byte, password string) (Analysis, error) {
-	return AnalyseBundleWithBudget(ctx, pfx, password, NewBundleWorkBudget())
-}
-
 // AnalyseBundleWithBudget resolves a PKCS#12 bundle into the same Analysis a PEM
 // pair yields. It charges decoder-equivalent work to budget, decodes the bundle,
 // and routes recovered parts through the one analysis pipeline.
