@@ -76,15 +76,12 @@ func (r *ScanResult) durablyEnumerated() bool {
 }
 
 // inputFullyEnumerated reports whether nothing prevented this scan from observing
-// every /input path: no unreadable path, no unresolved symlink, nothing that vanished
-// mid-walk.
+// every /input path.
 func (r *ScanResult) inputFullyEnumerated() bool {
 	return r.durablyEnumerated() && r.Vanished == 0
 }
 
-// The per-scan entry budget bounds how many /input entries ONE scan enumerates.
-
-// errScanBudgetExceeded marks the abort above.
+// errScanBudgetExceeded marks a walk the entry budget stopped.
 var errScanBudgetExceeded = errors.New("input tree exceeds the per-scan entry budget")
 
 // scanBudgetMsg is the operator-facing half of that abort.
@@ -242,7 +239,7 @@ type scanWalk struct {
 	unreadable   int
 	// vanished counts paths the walk enumerated and then could not find: the
 	// directory half of the renewal race whose file half readPair classifies as
-	// statusVanished. countResults folds it into ScanResult.Vanished.
+	// statusVanished.
 	vanished int
 	// unresolved counts input symlinks the confined root could not resolve.
 	unresolved int
@@ -260,37 +257,30 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		if rel == "." {
 			return err
 		}
-		// An ENOENT below the root is the WALK's half of the renewal race the read
-		// side already classifies as statusVanished.
+		// An ENOENT below the root is the WALK's half of the renewal race the
+		// read side classifies as statusVanished.
 		if errors.Is(err, fs.ErrNotExist) {
 			slog.Debug("skipping path that vanished during the scan", "path", logtext.Path(rel), "error", logtext.Path(err.Error()))
 			sw.vanished++
 			return nil
 		}
-		// Debug, not Warn: this is the per-path half of a two-level contract shared
-		// with the /output sweep.
 		slog.Debug("skipping unreadable path", "path", logtext.Path(rel), "error", logtext.Path(err.Error()))
 		sw.unreadable++
 		return nil
 	}
-	// Charged once per ENUMERATED path, and before anything is read or remembered, so
-	// the budget bounds the walk's own state rather than trailing it.
+	// Charged once per enumerated path, before anything is read or remembered,
+	// so the budget bounds the walk's own state rather than trailing it.
 	if !sw.budget.Charge() {
 		slog.Warn(scanBudgetMsg,
 			"path", logtext.Path(rel), "entries", sw.budget.Count(), "limit", sw.budget.Max(),
 			"remediation", scanbudget.InputRemediation)
-		// The returned error stays RAW, the rule for every error this app hands back
-		// (l-p1): the stopping path is sanitized where the record is EMITTED, by
-		// logScanOutcome's `error` attribute, so the app has one gate home and a caller
-		// inspecting this error still sees the path the walk actually stopped at.
 		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.budget.Count(), rel)
 	}
 	if d.IsDir() {
-		// A directory occupying a <name>.crt path is a certificate the scan cannot
-		// read, not an ordinary directory: counting it as unreadable keeps it
-		// health-neutral (a restart cannot clear it) while blocking orphan reaping,
-		// so sync reconciliation never deletes the still-live <name>.pfx of an input
-		// path that still exists in an unusable shape.
+		// A directory occupying a <name>.crt path is a certificate the scan
+		// cannot read: counting it as unreadable keeps it health-neutral while
+		// blocking orphan reaping, so sync never deletes the still-live
+		// <name>.pfx of an input path that still exists in an unusable shape.
 		if layout.IsCert(rel) {
 			slog.Debug("skipping cert: certificate path is a directory",
 				"path", logtext.Path(rel),
@@ -305,11 +295,10 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 	}
 	sw.seen[rel] = struct{}{}
 	sw.results = append(sw.results, sw.convertEntry(ctx, rel))
-	// A cancellation that landed *during* the conversion above already turned that
-	// entry into a shutdown artifact, but not always the same one: an interrupted
-	// /input read is statusUnreadable (noteUnreadableInput routes a cancelled read
-	// there, health-neutral, and reserves statusVanished for an ENOENT race), while an
-	// interrupted prior-bundle read or atomic write is statusFailed.
+	// A cancellation during the conversion above already turned that entry
+	// into a shutdown artifact, but not always the same one: an interrupted
+	// /input read is statusUnreadable, while an interrupted prior-bundle read
+	// or atomic write is statusFailed.
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -325,16 +314,11 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 	fi, err := sw.src.stat(rel)
 	switch {
 	case err != nil && !errors.Is(err, fs.ErrNotExist):
-		// The error is the only evidence of the cause here (a target outside the
-		// root, or an unreadable component inside it), so name the consequence and
-		// let the error carry the cause.
 		sw.unresolved++
 		slog.Warn("skipping symlink that could not be resolved through the input root; anything it points to, including certificates under a linked directory, is not scanned",
 			"path", logtext.Path(rel), "error", logtext.Path(err.Error()),
 			"remediation", "mount that certificate path into /input directly instead of linking to it, or fix the permissions on the link target")
 	case err == nil && fi.IsDir():
-		// The target is inside the root, so the walk reaches those
-		// certificates through the real directory; nothing is missed.
 		slog.Debug("skipping symlinked directory; its target is walked directly", "path", logtext.Path(rel))
 	}
 }
@@ -696,16 +680,13 @@ func (sw *scanWalk) noteMissingKey(rel, keyRel string) conversionStatus {
 	return statusOrphan
 }
 
-// noteUnreadableInput logs a failed read of an /input file and RETURNS the outcome it
-// diagnosed, so the classification and its diagnostic cannot drift apart: Debug plus
-// statusUnreadable when the read was cancelled by shutdown, Debug plus the transient
-// statusVanished when the file simply vanished, and Warn plus statusUnreadable
-// otherwise -- the last matching readPair's sibling-key stat.
+// noteUnreadableInput logs a failed read of an /input file and returns the outcome it
+// diagnosed, so the classification and its diagnostic cannot drift apart.
 func (sw *scanWalk) noteUnreadableInput(logRel, inputRel, what string, err error) conversionStatus {
 	if IsShutdown(err) {
-		// A cancelled read is the shutdown itself, not an unreadable path: the WARN
-		// below is the message the README recommends alerting on, so emitting it for
-		// a normal SIGTERM would page an operator for a mount that is fine.
+		// A cancelled read is the shutdown itself, not an unreadable path — the
+		// Warn below is what the README recommends alerting on, so emitting it
+		// for a normal SIGTERM would page an operator for a mount that is fine.
 		slog.Debug("skipping cert: "+what+" read interrupted by shutdown", "path", logtext.Path(logRel), "error", logtext.Path(err.Error()))
 		return statusUnreadable
 	}
@@ -722,7 +703,7 @@ func (sw *scanWalk) noteUnreadableInput(logRel, inputRel, what string, err error
 // convertEntry resolves the outcome for one .crt entry under certsRoot.
 func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStatus {
 	// Both sibling names come from layout, so this package and internal/watch
-	// derive the pairing rule from one place instead of two copies that can drift.
+	// derive the pairing rule from one place.
 	keyRel := layout.KeyFor(rel)
 
 	inputs, outcome := sw.readPair(ctx, rel, keyRel)
@@ -735,9 +716,8 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 
 	pfxRel := layout.OutputFor(rel)
 
-	// Resolve the pair BEFORE consulting the output: currency is now "is the file
-	// on disk the bundle these inputs produce?", which cannot be asked until the
-	// bundle those inputs produce is known.
+	// Resolve the pair before consulting the output: currency asks "is the file
+	// on disk the bundle these inputs produce?", which needs that bundle known first.
 	analysis, err := convert.Analyse(ctx, certPEM, keyPEM)
 	if err != nil {
 		return failEntry(rel, "conversion failed", err)
@@ -745,19 +725,14 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	observations := analysis.Observations()
 	state, err := sw.out.inspect(ctx, pfxRel, analysis, sw.enc, sw.password)
 	if err != nil {
-		// A cancellation, and nothing else: inspect resolves every question about the bytes
-		// on disk into a content FACT itself — contentUnverified for the ones it could not
-		// compare (a bundle it could not stat or pin, one above the readable bound, a read
-		// failure that settles nothing, a preflight refusing the declared derivation work)
-		// and contentVerifiedStale for the ones it could (nothing there, a non-regular
-		// occupant, a profile mismatch, a file the preflight proved foreign, a bundle that
-		// will not decode with the configured password).
+		// A cancellation, and nothing else: inspect resolves every other
+		// question about the bytes on disk into contentUnverified or
+		// contentVerifiedStale itself.
 		return failEntry(rel, "failed to inspect existing pfx", err)
 	}
 	if state.upToDate() {
-		// The observations describe the INPUT, so a semantically equivalent input
-		// edit still has to be named once even though the bundle on disk stays
-		// correct; observationLog.note owns that once-per-change rule.
+		// observationLog.note owns the once-per-change rule for a semantically
+		// equivalent input edit that leaves the bundle on disk unchanged.
 		sw.observations.note(rel, fingerprint, observations)
 		slog.Debug("skipping unchanged cert pair", "path", logtext.Path(rel))
 		return statusUnchanged
@@ -770,16 +745,16 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 		return failEntry(rel, "conversion failed", err)
 	}
 	writeErr := sw.out.write(ctx, pfxRel, pfxData)
-	// The one derivation, after the write, from the two facts this entry resolved: what
-	// the bundle on disk was, and how the write itself ended.
+	// The one derivation, after the write, from what the bundle on disk was
+	// and how the write itself ended.
 	outcome = writeOutcome(state, writeErr)
 	if writeErr != nil {
 		reportWriteFailure(rel, pfxRel, writeErr, outcome)
 	}
 	if outcome == statusUnwritable {
-		// The bundle on disk is one this app never proved wrong and the refusal is steady
-		// state (no restart clears it), so the observations describe an input that will be
-		// re-analysed on every scan for as long as the operator leaves /output as it is.
+		// The bundle on disk is one this app never proved wrong and the
+		// refusal is steady state, so this input is re-analysed every scan
+		// for as long as the operator leaves /output as it is.
 		sw.observations.note(rel, fingerprint, observations)
 		return outcome
 	}
@@ -806,17 +781,16 @@ func writeOutcome(state contentState, writeErr writeRefusal) conversionStatus {
 	}
 }
 
-// unreplaceableBundleMsg is the standing WARN for a health-neutral write refusal: a prior
-// bundle this app could not VERIFY at all (above the readable bound, unreadable,
-// un-stat-able, or declaring derivation work the codec's preflight refused to spend)
-// whose replacing write a steady-state /output condition refused.
+// unreplaceableBundleMsg is the standing WARN for a health-neutral write refusal: a
+// prior bundle this app could not VERIFY at all, whose replacing write a
+// steady-state /output condition refused.
 const unreplaceableBundleMsg = "prior pfx could not be replaced and the /output condition that refused the write is not one a restart clears; whatever is at the output path is left as found, health is unaffected"
 
-// reportWriteFailure logs a failed PFX write in the register the DERIVED outcome calls
-// for.
+// reportWriteFailure logs a failed PFX write in the register the derived outcome
+// calls for.
 func reportWriteFailure(logRel, pfxRel string, err writeRefusal, outcome conversionStatus) {
 	if outcome == statusUnwritable {
-		// "unverified" is the only content fact that can reach this record:
+		// "unverified" is the only content fact that reaches this record:
 		// writeOutcome grants statusUnwritable solely via bundleNotProvenWrong,
 		// whose allowlist is exactly contentUnverified.
 		slog.Warn(unreplaceableBundleMsg,
@@ -824,8 +798,8 @@ func reportWriteFailure(logRel, pfxRel string, err writeRefusal, outcome convers
 			"content", "unverified", "remediation", err.cause().remediation())
 		return
 	}
-	// failEntry is called for its LOG: the statusFailed it returns is the same value
-	// writeOutcome already derived, and taking it from there keeps one derivation.
+	// failEntry is called for its log; the statusFailed it returns is the value
+	// writeOutcome already derived, so this keeps one derivation.
 	failEntry(logRel, "conversion failed", err, "output_path", logtext.Path(pfxRel),
 		"remediation", err.cause().remediation())
 }
@@ -841,9 +815,8 @@ func logConversionObservations(rel string, observations []convert.Observation) {
 		case convert.ObservationClassInfo:
 			slog.Info("cert input observation", attrs...)
 		default:
-			// ObservationClassWarning, and any class this app does not know: reported
-			// loudly rather than dropped — the same safe direction convert takes for an
-			// unclassified kind, and the reason Warning needs no case of its own.
+			// ObservationClassWarning, and any class this app does not know:
+			// reported loudly rather than dropped.
 			slog.Warn("cert input observation", attrs...)
 		}
 	}

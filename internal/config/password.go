@@ -47,9 +47,9 @@ const (
 )
 
 // resolvedPassword is the outcome of the PFX-password channel resolution: the value, its
-// single classification, the variable an operator must edit to change it, and whether a blank
-// secret FILE is what the opt-out let through (which suppresses the generic guidance in
-// warnPasswordStrength).
+// classification, the variable an operator must edit to change it, and whether a blank
+// secret FILE is what the opt-out let through (suppresses warnPasswordStrength's generic
+// guidance).
 type resolvedPassword struct {
 	Value     string
 	Status    PasswordStatus
@@ -61,61 +61,44 @@ type resolvedPassword struct {
 // applies both startup refusals.
 func resolvePassword() (resolvedPassword, error) {
 	var blankSecretFile error
-	// Emitted before resolution: an EMPTY pointer is not the file channel at all, so
-	// neither warnBothPasswordChannels nor envx's own error can report it. (A
-	// whitespace-only pointer IS the file channel — see warnBlankPasswordFilePointer.)
+	// An EMPTY PFX_PASSWORD_FILE is not the file channel at all, so neither
+	// warnBothPasswordChannels nor envx's own error can report it.
 	warnBlankPasswordFilePointer()
 	password, source, secretErr := envx.SecretWithSource("PFX_PASSWORD")
-	// Emitted here rather than from logPasswordDelivery because every startup
-	// REFUSAL below is about the file channel while PFX_PASSWORD is the variable the
-	// operator can see is set: ErrEmptyPassword's "set PFX_PASSWORD" and envx's "read secret
-	// file for PFX_PASSWORD" both point at the ignored variable unless this line
-	// says the file wins.
+	// Every startup refusal below names PFX_PASSWORD; this line says the file wins
+	// when both channels are set, or the refusal points at the ignored variable.
 	warnBothPasswordChannels(source)
 	channel := passwordChannel(source)
 	if secretErr != nil {
 		var missing *envx.MissingError
 		switch {
 		case errors.As(secretErr, &missing):
-			// Neither channel supplied a value: fall through to the blank guard,
-			// which the operator can opt out of.
 			password = ""
 		case errors.Is(secretErr, envx.ErrBlankSecretFile):
-			// Route a blank secret file through the same opt-out as a blank
-			// environment value, so PFX_ALLOW_EMPTY_PASSWORD means one thing
-			// regardless of how the secret was delivered.
+			// Route through the same opt-out as a blank environment value, so
+			// PFX_ALLOW_EMPTY_PASSWORD means one thing on both channels.
 			password, blankSecretFile = "", secretErr
 		default:
-			// Unreadable, oversized, or a rejected path: the operator configured a
-			// secret file that cannot be used at all.
 			return resolvedPassword{}, secretErr
 		}
 	}
-	// One classification, three consumers: the empty-password guard below, the
-	// weak-password WARN (warnPasswordStrength, emitted last by Load), and the
-	// Config.PasswordStatus the startup line reports.
 	status := classifyPassword(password)
 	rawAllowEmpty := os.Getenv("PFX_ALLOW_EMPTY_PASSWORD")
 	allowEmpty, allowEmptyRecognized := allowEmptyPassword(rawAllowEmpty)
 	warnUnrecognizedAllowEmptyPassword(rawAllowEmpty, allowEmptyRecognized)
-	// Encodability is asked BEFORE the blank guard, because the two overlap: the
-	// invisible-rune class includes the supplementary variation selectors
-	// (U+E0100-U+E01EF), which are non-BMP and so unencodable by PKCS#12.
+	// Asked before the blank guard: the invisible-rune class includes the
+	// supplementary variation selectors (U+E0100-U+E01EF), which are non-BMP and so
+	// unencodable by PKCS#12 regardless of blankness.
 	if err := checkPasswordEncodable(password); err != nil {
 		return resolvedPassword{}, fmt.Errorf("%w (supplied via %s)", err, channel)
 	}
 	if status != PasswordConfigured && !allowEmpty {
 		switch {
 		case blankSecretFile != nil:
-			// A blank secret FILE is not "no password supplied": name the envx error,
-			// which carries the configured path.
 			return resolvedPassword{}, fmt.Errorf("%w: %w", ErrEmptyPassword, blankSecretFile)
 		case source == envx.SourceFile:
-			// A mounted secret that is blank only after classification (an
-			// invisible-only value, which envx does not consider blank because
-			// an invisible rune is not whitespace) reaches here with no
-			// envx error to carry the channel, so name it here or the refusal
-			// sends a file-channel operator to the variable file-wins ignores.
+			// An invisible-only mounted secret is blank only after
+			// classification, so envx carries no error naming the channel here.
 			return resolvedPassword{}, fmt.Errorf("%w (supplied via %s)", ErrEmptyPassword, channel)
 		}
 		return resolvedPassword{}, ErrEmptyPassword
@@ -129,10 +112,9 @@ func resolvePassword() (resolvedPassword, error) {
 	}, nil
 }
 
-// classifyPassword classifies a PFX password ONCE, and is the single home for the
-// blank-password predicate: resolvePassword's empty-password guard, the
-// weak-password WARN, the Config.PasswordStatus the startup log reports, and the
-// both-channels WARN all derive their decision from it, so they cannot drift.
+// classifyPassword is the single home for the blank-password predicate: every consumer
+// (the empty-password guard, the weak-password WARN, the startup status line, the
+// both-channels WARN) derives from it, so they cannot drift.
 func classifyPassword(password string) PasswordStatus {
 	switch {
 	case password == "":
@@ -172,9 +154,8 @@ func allowEmptyPassword(raw string) (allow, recognized bool) {
 	}
 }
 
-// warnUnrecognizedAllowEmptyPassword reports a PFX_ALLOW_EMPTY_PASSWORD value that is neither
-// spelling of the documented contract, which deliberately rejects 1/yes/on, so an operator who
-// wrote one of those learns the guard is still armed.
+// warnUnrecognizedAllowEmptyPassword reports a PFX_ALLOW_EMPTY_PASSWORD value that
+// matches neither documented spelling (1/yes/on are deliberately rejected).
 func warnUnrecognizedAllowEmptyPassword(raw string, recognized bool) {
 	if recognized {
 		return
@@ -202,10 +183,8 @@ func warnBothPasswordChannels(source envx.SecretSource) {
 		"remediation", "remove PFX_PASSWORD from the environment so there is one place to change the secret")
 }
 
-// warnBlankPasswordFilePointer warns when PFX_PASSWORD_FILE is present in the
-// environment but blank — set to the empty string, or to whitespace only — so it names
-// no usable secret file: an empty pointer names none at all, and a whitespace-only one
-// is used verbatim as a filename.
+// warnBlankPasswordFilePointer warns when PFX_PASSWORD_FILE is present but blank (empty
+// or whitespace-only), so it names no usable secret file.
 func warnBlankPasswordFilePointer() {
 	if !envx.IsBlankSecretFilePath("PFX_PASSWORD") {
 		return
@@ -213,8 +192,7 @@ func warnBlankPasswordFilePointer() {
 	outcome := "the PFX password is taken from PFX_PASSWORD instead"
 	if os.Getenv("PFX_PASSWORD_FILE") != "" {
 		// A whitespace-only pointer is non-empty to envx, so it IS the file
-		// channel: envx treats the raw value as a filename rather than falling
-		// back.
+		// channel and is used verbatim as a filename rather than falling back.
 		outcome = "the whitespace value is treated as a filename instead of falling back to PFX_PASSWORD"
 	}
 	slog.Warn("PFX_PASSWORD_FILE is set but blank; "+outcome,
@@ -248,18 +226,14 @@ func warnPasswordStrength(status PasswordStatus, channel string, blankFileReport
 			"source", channel,
 			"remediation", "rewrite the secret without the invisible characters (an editor saving the secret file as \"UTF-8 with BOM\" is the usual cause; printf %s writes the value verbatim)")
 	case PasswordConfigured:
-		// A real password is the healthy case: the value is a secret, so nothing
-		// is logged about it beyond the non-secret status in the startup line.
+		// The healthy case: the value is a secret, so nothing beyond the
+		// non-secret status in the startup line is logged.
 	}
 }
 
 // logPasswordDelivery reports the resolved source and actionable delivery problems
-// without logging the password or the steady-state secret path: a blank mounted
-// secret the opt-out let through, and whitespace or control characters that
-// silently become part of the password.
+// without logging the password itself.
 func logPasswordDelivery(source envx.SecretSource, password string, status PasswordStatus, blankSecretFile bool) {
-	// Derived from the one classification rather than recomputed, so the INFO can
-	// never report "configured" for a value the guard treats as blank.
 	blank := status != PasswordConfigured
 	if source == envx.SourceFile {
 		switch {
@@ -268,23 +242,18 @@ func logPasswordDelivery(source envx.SecretSource, password string, status Passw
 				"source", passwordChannel(source),
 				"remediation", "write the secret into the mounted file so generated PFX files protect the private key")
 		case blank:
-			// A mounted secret envx did not consider blank but this package does —
-			// today only an invisible-only value (envx judges blankness on the
-			// whitespace-trimmed content, and an invisible rune is not whitespace).
+			// An invisible-only value: envx judges blankness on trimmed content,
+			// and an invisible rune is not whitespace, so no envx warning fires.
 		default:
 			slog.Info("PFX password configured", "source", passwordChannel(source))
 		}
 	}
-	// A blank value is skipped: warnPasswordStrength already reports it, with the
-	// remediation that helps (set a real password, or rewrite the secret without the
-	// invisible runes) rather than the surrounding-whitespace record below, which a
-	// whitespace-only password would otherwise draw on top of it.
+	// warnPasswordStrength already reports a blank value with its own remediation.
 	if blank {
 		return
 	}
-	// Channel-agnostic on purpose: envx delivers the configured value verbatim on
-	// BOTH channels (a secret file loses at most one trailing line ending and
-	// nothing else), so edge whitespace is part of the password however it arrived.
+	// Channel-agnostic: envx delivers the configured value verbatim on both
+	// channels, so edge whitespace is part of the password however it arrived.
 	if password != strings.TrimSpace(password) {
 		slog.Warn("the PFX password has leading or trailing whitespace, which is part of the password embedded in every PFX file",
 			"source", passwordChannel(source),
