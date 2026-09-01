@@ -52,6 +52,10 @@ type ScanResult struct {
 	// enabled. They preserve pre-feature behavior and do not make the input
 	// enumeration safe for orphan deletion.
 	Ignored int
+	// Excluded counts sources INPUT_EXCLUDE_PATHS declared are not this app's to
+	// convert. They are enumerated and still protect their artifacts from the
+	// orphan reaper; only the conversion is skipped, so health is unaffected.
+	Excluded int
 }
 
 // summaryAttrs is the ONE list of the scan-summary attributes, in the order
@@ -70,6 +74,7 @@ var summaryAttrs = []struct {
 	{name: "vanished", of: func(r *ScanResult) int { return r.Vanished }},
 	{name: "unwritable", of: func(r *ScanResult) int { return r.Unwritable }},
 	{name: "collided", of: func(r *ScanResult) int { return r.Collided }},
+	{name: "excluded", of: func(r *ScanResult) int { return r.Excluded }},
 	{name: "ignored", of: func(r *ScanResult) int { return r.Ignored }},
 	{name: "removed", of: func(r *ScanResult) int { return r.Removed }},
 	{name: "failed", of: func(r *ScanResult) int { return r.Failed }},
@@ -119,6 +124,8 @@ type Options struct {
 	OutRoot       string
 	Password      string
 	InputPassword string
+	// Exclude names input paths that are enumerated but never converted.
+	Exclude layout.ExcludeSet
 	// MaxScanEntries is how many entries one scan may enumerate in EACH mounted tree
 	// before it refuses that tree (scanbudget.Default when non-positive): the /input
 	// walk (scanWalk.budget) and the /output orphan walk (outputWalk.budget)
@@ -233,6 +240,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		enc:                s.opts.Encoder,
 		formats:            s.opts.Formats,
 		layoutMode:         s.opts.Layout,
+		exclude:            s.opts.Exclude,
 		seen:               make(map[string]struct{}),
 		expected:           make(map[string]struct{}),
 		budget:             scanbudget.NewCounter(s.opts.MaxScanEntries),
@@ -330,6 +338,7 @@ type scanWalk struct {
 	bundleBudget   *convert.BundleWorkBudget
 	enc            convert.EncoderType
 	layoutMode     outputpolicy.Layout
+	exclude        layout.ExcludeSet
 	password       string
 	inputPassword  string
 	results        []conversionStatus
@@ -379,27 +388,20 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.budget.Count(), rel)
 	}
 	if d.IsDir() {
-		// A directory occupying a source path is an input the scan cannot read:
-		// counting it as unreadable keeps it health-neutral while blocking orphan
-		// reaping, so sync never deletes the still-live artifacts of an input path
-		// that still exists in an unusable shape.
-		if layout.IsSource(rel) {
-			slog.Debug("skipping source: input path is a directory",
-				"path", logtext.Path(rel),
-				"remediation", "replace the directory with a regular file")
-			sw.unreadable++
-		}
+		sw.noteSourceShapedDir(rel)
 		return nil
 	}
 	if !layout.IsSource(rel) {
 		sw.noteUnwalkableSymlink(rel, d)
 		return nil
 	}
-	if layout.IsBundle(rel) && !sw.inputPasswordReady {
-		sw.ignored++
-		slog.Debug("skipping bundle: PFX input is not enabled",
-			"path", logtext.Path(rel),
-			"remediation", "set INPUT_PFX_PASSWORD or point INPUT_PFX_PASSWORD_FILE at a secret")
+	// Ahead of every other classification: an excluded source is enumerated and
+	// still claims its artifacts, so orphan reconciliation keeps protecting
+	// them, but nothing about it is read, decoded or written.
+	if sw.excludeSource(rel) {
+		return nil
+	}
+	if sw.ignoreDisabledBundle(rel) {
 		return nil
 	}
 	if sw.layoutMode == outputpolicy.LayoutFlat {
@@ -410,6 +412,56 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		return err
 	}
 	return nil
+}
+
+// noteSourceShapedDir classifies a directory occupying a source path: an input
+// the scan cannot read. Counting it as unreadable keeps it health-neutral while
+// blocking orphan reaping, so sync never deletes the still-live artifacts of an
+// input path that still exists in an unusable shape.
+func (sw *scanWalk) noteSourceShapedDir(rel string) {
+	if !layout.IsSource(rel) {
+		return
+	}
+	slog.Debug("skipping source: input path is a directory",
+		"path", logtext.Path(rel),
+		"remediation", "replace the directory with a regular file")
+	sw.unreadable++
+}
+
+// ignoreDisabledBundle skips a PKCS#12 source while bundle input is off, which
+// preserves the behavior of every deployment that predates PFX input.
+func (sw *scanWalk) ignoreDisabledBundle(rel string) bool {
+	if !layout.IsBundle(rel) || sw.inputPasswordReady {
+		return false
+	}
+	sw.ignored++
+	slog.Debug("skipping bundle: PFX input is not enabled",
+		"path", logtext.Path(rel),
+		"remediation", "set INPUT_PFX_PASSWORD or point INPUT_PFX_PASSWORD_FILE at a secret")
+	return true
+}
+
+// excludeSource resolves one enumerated source against INPUT_EXCLUDE_PATHS. An
+// excluded source is recorded as seen and registers the artifacts it WOULD
+// produce, so those artifacts never become orphan candidates: the operator said
+// "not mine to convert", not "delete what is already there", and a mistyped
+// exclusion must not become a deletion.
+//
+// The registration is not the only thing standing between an excluded artifact
+// and an unlink — the post-delay re-check spares it too, because the source is
+// still on disk — but it is what keeps the artifact out of the candidate set at
+// all, so a scan with exclusions does not spend the 30s confirmation deferral
+// and announce candidates it will always refuse. Do not delete it as redundant.
+func (sw *scanWalk) excludeSource(rel string) bool {
+	if sw.exclude.Empty() || !sw.exclude.Excludes(rel) {
+		return false
+	}
+	sw.seen[rel] = struct{}{}
+	sw.registerExpected(rel)
+	sw.results = append(sw.results, statusExcluded)
+	slog.Debug("skipping excluded source", "path", logtext.Path(rel),
+		"remediation", "remove the path from INPUT_EXCLUDE_PATHS to convert it again")
+	return true
 }
 
 // processSource applies source precedence, registers lifecycle expectations and
@@ -471,6 +523,11 @@ func selectFlatSources(sources []string) (unique []string, collisions []flatColl
 // collisionMsg is the ERROR record for a flat output-name collision; the
 // published CertConverterOutputNameCollision alert matches on a substring of it.
 const collisionMsg = "output name collision: several inputs produce the same output path, so none of them is converted"
+
+// allExcludedMsg is the report for a scan whose every source is covered by
+// INPUT_EXCLUDE_PATHS; the published CertConverterEverySourceExcluded alert
+// matches on a substring of it.
+const allExcludedMsg = "every certificate source under the input root is excluded; no output artifacts are being produced"
 
 // collisionRemediation names both ways out of a flat collision.
 const collisionRemediation = "rename one input directory so the colliding sources differ in their last directory-plus-name, " +
@@ -574,32 +631,44 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 }
 
 // bundleShadowed reports whether a bundle source yields to a sibling that
-// outranks it (layout.ShadowingSiblings). A PEM certificate shadows a bundle only
-// when its sibling key exists too: an orphaned certificate is not a pair and must
-// not strand a usable bundle source. Precedence must be decidable, so an
+// outranks it (layout.ShadowingSiblings). Precedence must be decidable, so an
 // unanswerable sibling stat yields — converting two sources of one stem would
 // have them overwrite one artifact set in a single scan.
 func (sw *scanWalk) bundleShadowed(rel string) bool {
 	for _, sibling := range layout.ShadowingSiblings(rel) {
-		absent, err := sw.src.pathAbsent(sibling)
-		if err != nil {
+		outranks, decidable := sw.siblingOutranks(sibling)
+		if !decidable || outranks {
 			return noteShadowedBundle(rel, sibling)
 		}
-		if absent {
-			continue
-		}
-		if layout.IsCert(sibling) {
-			keyAbsent, keyErr := sw.src.pathAbsent(layout.KeyFor(sibling))
-			if keyErr != nil {
-				return noteShadowedBundle(rel, sibling)
-			}
-			if keyAbsent {
-				continue
-			}
-		}
-		return noteShadowedBundle(rel, sibling)
 	}
 	return false
+}
+
+// siblingOutranks answers whether one shadowing sibling actually outranks the
+// bundle, and whether that question could be answered at all. An EXCLUDED
+// sibling never outranks anything — precedence is decided among the sources this
+// app will actually convert, or excluding one half of a stem would silently
+// strand the other. A PEM certificate outranks a bundle only when its sibling
+// key exists too: an orphaned certificate is not a pair and must not strand a
+// usable bundle source.
+func (sw *scanWalk) siblingOutranks(sibling string) (outranks, decidable bool) {
+	if !sw.exclude.Empty() && sw.exclude.Excludes(sibling) {
+		return false, true
+	}
+	absent, err := sw.src.pathAbsent(sibling)
+	switch {
+	case err != nil:
+		return false, false
+	case absent:
+		return false, true
+	case !layout.IsCert(sibling):
+		return true, true
+	}
+	keyAbsent, keyErr := sw.src.pathAbsent(layout.KeyFor(sibling))
+	if keyErr != nil {
+		return false, false
+	}
+	return !keyAbsent, true
 }
 
 func noteShadowedBundle(rel, sibling string) bool {
@@ -683,28 +752,51 @@ func logInputCoverageWarnings(result *ScanResult, walkErr error) {
 	// exception: a claim about the WHOLE TREE ("no pair at all", "every certificate")
 	// needs a complete enumeration, while a claim about the PATHS THIS SCAN READ needs
 	// only those paths.
-	fullyEnumerated := walkErr == nil && result.inputFullyEnumerated()
+	if walkErr == nil && result.inputFullyEnumerated() {
+		logWholeTreeCoverageWarning(result)
+		return
+	}
+	if result.Orphan > 0 {
+		// The ONE arm that needs no whole-tree proof.
+		slog.Warn("some PEM certificates under the input root are missing their sibling .key; those files do not form PEM sources",
+			"orphan", result.Orphan, "total", result.Total,
+			"remediation", "name each private key <name>.key beside its <name>.crt, provide a PFX/P12 bundle with the same stem, or remove the orphan certificate")
+	}
+}
+
+// logWholeTreeCoverageWarning names the health-neutral outcomes that only a
+// COMPLETE enumeration can claim: a tree whose every source is excluded, one
+// holding nothing convertible, and one where every or some PEM certificate
+// lacks its sibling key.
+func logWholeTreeCoverageWarning(result *ScanResult) {
 	switch {
-	case fullyEnumerated && result.Total == 0 && result.Ignored > 0:
+	case result.Total > 0 && result.Excluded == result.Total:
+		// Every source found is excluded, so the scan produced nothing while
+		// reporting no failure: indistinguishable from a healthy steady state in
+		// the counts, and the signature of an over-broad INPUT_EXCLUDE_PATHS.
+		slog.Warn(allExcludedMsg,
+			"excluded", result.Excluded,
+			"remediation", "narrow INPUT_EXCLUDE_PATHS, or point /input at the directory holding the certificates you want converted")
+	case result.Total == 0 && result.Ignored > 0:
 		slog.Debug("PFX/P12 files were ignored because bundle input is not enabled",
 			"ignored", result.Ignored,
 			"remediation", "set INPUT_PFX_PASSWORD to enable PFX input")
-	case fullyEnumerated && result.Total == 0:
-		// A completed scan that visited no .crt at all is indistinguishable from
-		// a healthy steady state in the summary counts (failed=0 keeps the marker
-		// set, and the README's Loki rules match on failed/unreadable or on the
-		// absence of "scan complete"), yet it is the signature of a wrong or
-		// vanished /input mount: no artifact is produced and nothing fires. Name it.
+	case result.Total == 0:
+		// A completed scan that visited no source at all is indistinguishable
+		// from a healthy steady state in the summary counts (failed=0 keeps the
+		// marker set, and the README's Loki rules match on failed/unreadable or
+		// on the absence of "scan complete"), yet it is the signature of a wrong
+		// or vanished /input mount: no artifact is produced and nothing fires.
+		// Name it.
 		slog.Warn("no certificate sources found under the input root; no output artifacts are being produced",
 			"remediation", "check that the /input mount points at a directory containing PEM pairs or PFX/P12 bundles")
-	case fullyEnumerated && result.Orphan == result.Total:
+	case result.Orphan == result.Total:
 		// Every .crt under /input lacks its sibling .key, so the scan
 		// completed with failed=0 and produced nothing at all.
 		slog.Warn("every PEM certificate under the input root is missing its sibling .key; no output artifacts are being produced",
 			"orphan", result.Orphan,
 			"remediation", "name each private key <name>.key beside its <name>.crt, provide a PFX/P12 bundle instead, or remove the orphan certificate")
 	case result.Orphan > 0:
-		// Some, not all — and the ONE arm here that needs no whole-tree proof.
 		slog.Warn("some PEM certificates under the input root are missing their sibling .key; those files do not form PEM sources",
 			"orphan", result.Orphan, "total", result.Total,
 			"remediation", "name each private key <name>.key beside its <name>.crt, provide a PFX/P12 bundle with the same stem, or remove the orphan certificate")
@@ -1282,5 +1374,6 @@ func countResults(results []conversionStatus, walkUnreadable, walkUnresolved, wa
 		Vanished:   walkVanished + counts[statusVanished],
 		Unwritable: counts[statusUnwritable],
 		Collided:   counts[statusCollided],
+		Excluded:   counts[statusExcluded],
 	}
 }

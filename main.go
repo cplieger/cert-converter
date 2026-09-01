@@ -193,6 +193,7 @@ func run() int {
 			"input_password_configured", cfg.InputPasswordReady,
 			"output_formats", strings.Join(cfg.Formats.Names(), ","), "output_layout", string(cfg.Layout),
 			"output_lifecycle", string(cfg.Lifecycle), "max_scan_entries", cfg.MaxScanEntries,
+			"excluded_input_paths", logtext.Path(strings.Join(cfg.Exclude.Paths(), ",")),
 		},
 	)...)
 
@@ -220,6 +221,9 @@ func run() int {
 		FormatsExplicit:    cfg.FormatsExplicit,
 		Layout:             cfg.Layout,
 		LayoutExplicit:     cfg.LayoutExplicit,
+		// Enumerated but never converted; their artifacts stay protected from the
+		// orphan reaper, so a mistyped exclusion cannot become a deletion.
+		Exclude: cfg.Exclude,
 		// internal/config owns MAX_SCAN_ENTRIES' name, default, ceiling and every
 		// diagnostic for a repaired value; internal/process takes the budget as
 		// injected state and deliberately does not import internal/config, so this
