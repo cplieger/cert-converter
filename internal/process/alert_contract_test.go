@@ -43,6 +43,12 @@ func TestOperatorLogContract_pins_every_published_message_substring(t *testing.T
 			want:    "keeping an output artifact whose certificate is gone but whose private key is still in /input",
 		},
 		{
+			// The only signal that an over-broad exclusion list converted nothing.
+			name:    "CertConverterEverySourceExcluded matches the all-excluded report",
+			message: allExcludedMsg,
+			want:    "every certificate source under the input root is excluded",
+		},
+		{
 			// The health-flipping refusal to arbitrate two inputs over one output name.
 			name:    "CertConverterOutputNameCollision matches the collision refusal",
 			message: collisionMsg,

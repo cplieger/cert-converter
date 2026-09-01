@@ -7,6 +7,7 @@ package layout
 
 import (
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
@@ -167,3 +168,55 @@ func ArtifactsFor(outStem string, f outputpolicy.Formats) []string {
 	}
 	return artifacts
 }
+
+// ExcludeSet is the set of input paths the operator has declared are not this
+// app's to convert. A member is a root-relative path naming either one file or
+// one directory; a directory covers everything beneath it.
+//
+// An excluded path is NOT the same as an absent one, and not the same as an
+// unreadable one. The scan still enumerates it and still registers the
+// artifacts it would produce, so orphan reconciliation keeps protecting those
+// artifacts; only the conversion is skipped. That is what stops a mistyped
+// exclusion from turning into a deletion, since nothing else guards a partial
+// exclusion the way the empty-tree veto guards a wrong mount.
+type ExcludeSet struct {
+	paths []string
+}
+
+// NewExcludeSet builds the set from already-validated root-relative paths
+// (internal/config owns the validation and its diagnostics). Entries are
+// cleaned and sorted so the startup record and every match are deterministic.
+func NewExcludeSet(paths []string) ExcludeSet {
+	if len(paths) == 0 {
+		return ExcludeSet{}
+	}
+	cleaned := make([]string, 0, len(paths))
+	for _, p := range paths {
+		normalized := path.Clean(p)
+		if normalized == "" || normalized == "." || slices.Contains(cleaned, normalized) {
+			continue
+		}
+		cleaned = append(cleaned, normalized)
+	}
+	slices.Sort(cleaned)
+	return ExcludeSet{paths: cleaned}
+}
+
+// Empty reports whether the set excludes nothing, so a caller can skip the
+// per-entry work entirely.
+func (e ExcludeSet) Empty() bool { return len(e.paths) == 0 }
+
+// Excludes reports whether rel is excluded: it matches a member exactly, or it
+// sits beneath a member directory.
+func (e ExcludeSet) Excludes(rel string) bool {
+	target := path.Clean(rel)
+	for _, p := range e.paths {
+		if target == p || strings.HasPrefix(target, p+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// Paths returns the cleaned members, for the composition root's startup record.
+func (e ExcludeSet) Paths() []string { return slices.Clone(e.paths) }

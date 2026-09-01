@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path"
 	"strings"
 
+	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/envx/v2"
 )
@@ -44,6 +46,58 @@ func resolveLayout(lifecycle outputpolicy.Lifecycle) (outputpolicy.Layout, bool,
 // ErrEmptyInputPassword reports an explicitly configured blank input-bundle
 // password without the opt-in that acknowledges empty-password PFX decoding.
 var ErrEmptyInputPassword = errors.New("the configured input PFX password is empty or blank; set INPUT_PFX_PASSWORD or write a non-blank secret to INPUT_PFX_PASSWORD_FILE")
+
+// resolveExcludePaths reads INPUT_EXCLUDE_PATHS: a comma-separated list of
+// root-relative paths under /input the operator has declared are not this app's
+// to convert. A rejected entry is WARNed and dropped rather than failing
+// startup, and dropping one is the safe direction — the source it named
+// converts, which produces an artifact the operator did not want but deletes
+// nothing.
+func resolveExcludePaths() layout.ExcludeSet {
+	raw := os.Getenv("INPUT_EXCLUDE_PATHS")
+	if strings.TrimSpace(raw) == "" {
+		return layout.ExcludeSet{}
+	}
+	var accepted, rejected []string
+	for token := range strings.SplitSeq(raw, ",") {
+		entry := strings.TrimSpace(token)
+		if entry == "" {
+			// "a,,b" carries no intent in the empty slot; nothing to reject.
+			continue
+		}
+		if !validExcludePath(entry) {
+			rejected = append(rejected, entry)
+			continue
+		}
+		accepted = append(accepted, entry)
+	}
+	if len(rejected) > 0 {
+		slog.Warn("INPUT_EXCLUDE_PATHS contains entries that are not usable relative paths; ignoring them",
+			"rejected", rejectedValue(strings.Join(rejected, ",")),
+			"remediation", "name each entry as a path relative to /input, without a leading slash and without any .. component")
+	}
+	set := layout.NewExcludeSet(accepted)
+	if !set.Empty() {
+		slog.Info("excluding input paths from conversion", "paths", strings.Join(set.Paths(), ","))
+	}
+	return set
+}
+
+// validExcludePath reports whether one entry is a usable root-relative path.
+// The confined *os.Root already makes an escape impossible, so this guard is
+// about the entry meaning what the operator thinks it means: an absolute path
+// or a traversing one can never match a root-relative walk path, so it would
+// silently exclude nothing.
+func validExcludePath(entry string) bool {
+	if path.IsAbs(entry) || strings.ContainsRune(entry, 0) {
+		return false
+	}
+	cleaned := path.Clean(entry)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return false
+	}
+	return true
+}
 
 type resolvedInputPassword struct {
 	Value string

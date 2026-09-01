@@ -239,6 +239,25 @@ groups:
             rule is the only signal. Check the /input mount and source filenames.
             A fresh deployment legitimately reports this until the first
             issuance; raise `for:` if that is noisy.
+      - alert: CertConverterEverySourceExcluded
+        expr: |
+          sum by (container) (count_over_time(
+            {container="cert-converter"}
+            |= `every certificate source under the input root is excluded` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter excluded every certificate source it found"
+          description: >
+            INPUT_EXCLUDE_PATHS covers every source under /input, so the scan
+            converted nothing while reporting no failure. Health is unaffected
+            and the summary counts look like a healthy steady state, which
+            makes this rule the only signal. Narrow the exclusion list, or
+            point /input at the directory holding the certificates you want
+            converted. Existing artifacts are left untouched, so nothing was
+            deleted by the over-broad exclusion.
       - alert: CertConverterOutputCleanupDegraded
         expr: |
           sum by (container) (count_over_time(

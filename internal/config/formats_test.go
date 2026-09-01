@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
@@ -102,6 +103,80 @@ func TestLoad_wiresOutputFormatsAndLayout(t *testing.T) {
 	}
 }
 
+func TestLoad_wiresInputExcludePaths(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		raw         string
+		wantPaths   []string
+		wantExclude []string
+		wantKeep    []string
+		wantWarning string
+	}{
+		{name: "unset excludes nothing", wantKeep: []string{"clients/identity.crt"}},
+		{
+			name: "a directory covers what is beneath it", raw: "clients",
+			wantPaths:   []string{"clients"},
+			wantExclude: []string{"clients", "clients/identity.crt", "clients/eu/a.pfx"},
+			wantKeep:    []string{"server/site.crt", "clientsx/site.crt"},
+		},
+		{
+			name: "entries are trimmed, cleaned, deduplicated and sorted", raw: " z/ , ./a , a ,, m/n ",
+			wantPaths:   []string{"a", "m/n", "z"},
+			wantExclude: []string{"a/x.crt", "m/n/x.crt", "z/x.crt"},
+			wantKeep:    []string{"b/x.crt"},
+		},
+		{
+			name: "an absolute entry is refused", raw: "/etc/ssl,clients",
+			wantPaths:   []string{"clients"},
+			wantExclude: []string{"clients/identity.crt"},
+			wantKeep:    []string{"etc/ssl/site.crt"},
+			wantWarning: "INPUT_EXCLUDE_PATHS contains entries that are not usable relative paths",
+		},
+		{
+			name: "a traversing entry is refused", raw: "../outside,clients/eu",
+			wantPaths:   []string{"clients/eu"},
+			wantExclude: []string{"clients/eu/identity.crt"},
+			wantKeep:    []string{"clients/us/identity.crt"},
+			wantWarning: "INPUT_EXCLUDE_PATHS contains entries that are not usable relative paths",
+		},
+		{
+			name: "a self-referential entry is refused rather than excluding the whole tree", raw: ".",
+			wantKeep:    []string{"server/site.crt"},
+			wantWarning: "INPUT_EXCLUDE_PATHS contains entries that are not usable relative paths",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateFormatConfig(t)
+			t.Setenv("INPUT_EXCLUDE_PATHS", tc.raw)
+			logs := capture.Default(t)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() = %v, want nil", err)
+			}
+			if got := cfg.Exclude.Paths(); !slices.Equal(got, tc.wantPaths) {
+				t.Errorf("Load() Exclude.Paths() = %v, want %v", got, tc.wantPaths)
+			}
+			for _, rel := range tc.wantExclude {
+				if !cfg.Exclude.Excludes(rel) {
+					t.Errorf("Load(INPUT_EXCLUDE_PATHS=%q) Exclude.Excludes(%q) = false, want true", tc.raw, rel)
+				}
+			}
+			for _, rel := range tc.wantKeep {
+				if cfg.Exclude.Excludes(rel) {
+					t.Errorf("Load(INPUT_EXCLUDE_PATHS=%q) Exclude.Excludes(%q) = true, want false", tc.raw, rel)
+				}
+			}
+			if tc.wantWarning == "" {
+				return
+			}
+			if count := logs.CountLevel(slog.LevelWarn, tc.wantWarning); count != 1 {
+				t.Errorf("Load() logged %q %d times, want 1 (logs %v)", tc.wantWarning, count, logs.Messages())
+			}
+		})
+	}
+}
+
 func TestLoad_wiresInputBundlePassword(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -181,6 +256,7 @@ func isolateFormatConfig(t *testing.T) {
 	t.Setenv("FALLBACK_SCAN_HOURS", "6")
 	t.Setenv("MAX_SCAN_ENTRIES", "10000")
 	unsetEnv(t, "INPUT_PFX_PASSWORD")
+	unsetEnv(t, "INPUT_EXCLUDE_PATHS")
 }
 
 func unsetEnv(t *testing.T, name string) {

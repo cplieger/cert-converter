@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
@@ -76,6 +77,10 @@ type Config struct {
 	Lifecycle      outputpolicy.Lifecycle
 	Layout         outputpolicy.Layout
 	PasswordStatus PasswordStatus
+	// Exclude names the input paths the operator declared are not this app's to
+	// convert. Excluded sources are enumerated and still protect their artifacts
+	// from orphan reconciliation; only the conversion is skipped.
+	Exclude layout.ExcludeSet
 	// FallbackInterval is the operator's CONFIGURED rescan cadence, not the one
 	// that runs: 0 means they opted out of their own cadence, and the composition
 	// root resolves what actually applies through scancadence.Effective.
@@ -118,6 +123,7 @@ func Load() (Config, error) {
 		lifecycle = outputpolicy.LifecycleWarn
 	}
 	layoutMode, layoutExplicit, lifecycle := resolveLayout(lifecycle)
+	exclude := resolveExcludePaths()
 	inputPassword, err := resolveInputPassword()
 	if err != nil {
 		return Config{}, err
@@ -151,6 +157,7 @@ func Load() (Config, error) {
 		FormatsExplicit:    formatsExplicit,
 		Layout:             layoutMode,
 		LayoutExplicit:     layoutExplicit,
+		Exclude:            exclude,
 		FallbackInterval:   fallbackInterval,
 		MaxScanEntries:     maxScanEntries,
 		PasswordStatus:     pw.Status,
