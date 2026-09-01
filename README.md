@@ -82,7 +82,7 @@ services:
 | `PFX_ENCODER` | PFX encoding profile: modern2023 (AES-256-CBC + SHA-256, default), modern2026 (AES-256-CBC + PBMAC1, requires OpenSSL 3.4.0+), legacy (3DES + SHA-1 for older devices), or legacyrc2 (RC2-40 + SHA-1, a last-resort interop escape: a 40-bit RC2 key is brute-forceable, so the private key in such a bundle is protected only nominally; use it when a device accepts nothing else and treat the output as sensitive). `modern` is an alias for `modern2023`, and `legacy` is recorded as `legacydes` in startup logs. See the [go-pkcs12 documentation](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12#pkg-variables). | `modern2023` | No |
 | `OUTPUT_LIFECYCLE` | What happens to output artifacts this app no longer produces: their source left `/input` (for a PEM pair: certificate **and** private key both gone), `INPUT_EXCLUDE_PATHS` now covers it, or a format or layout you changed no longer emits it. `warn` (default) logs them and leaves them in place; `sync` deletes them so `/output` tracks `/input`, once a re-check 30 seconds later confirms the source is still out of scope (under the flat layout that re-check is a fresh enumeration of `/input`); `keep` is silent and never deletes. **Only `sync` ever deletes anything.** An artifact whose `<name>.key` is still present in scope is kept and reported by its own WARN, because a half-written or half-deleted pair is not proof of an orphan: finish the change under `/input` (add the matching `<name>.crt`, or remove the leftover `<name>.key`) and the next scan reaps it. `sync` removes only files matching this app's own output shape, never a directory, and it deletes nothing unless the scan proves it enumerated `/input` completely: at least one source found, the walk finished within `MAX_SCAN_ENTRIES`, and no unreadable path, unresolvable symlink, conversion failure, or output-name collision. A scan without that proof logs `orphan removal is disabled for this scan` and reaps nothing, so a broken or empty mount is never read as "every certificate was deleted". Every scan that deletes something logs a WARN naming the count and a sample of the paths. An unrecognized value logs a WARN and uses `warn`. | `warn` | No |
 | `MAX_SCAN_ENTRIES` | How many `/input` paths one scan enumerates before it stops, converting and removing nothing further. The stop is a WARN naming the path it reached, and it leaves health alone, because no restart shrinks the tree; orphan cleanup is skipped for that scan. If your certificate tree is legitimately larger than the default, raise this **and** the container's memory limit together: one scan's memory grows with the total length of the paths it enumerates and not only with their number, so raising this alone can push the scan past a fixed memory limit, where it is killed and converts nothing at all. Where the memory limit cannot move, lower this ceiling or set `OUTPUT_LIFECYCLE=keep`, which returns before the output walk and so never builds the `/output` list. An empty, whitespace, invalid, zero, or negative value uses the `10000` default, and a value above `200000` is clamped to that ceiling; either repair is reported by a WARN at startup naming the value you set. There is deliberately no value that disables the budget. | `10000` | No |
-| `LOG_LEVEL` | Minimum log level: `debug`, `info`, `warn`, or `error` (case-insensitive; slog offsets such as `info+2` work). `debug` surfaces per-certificate skip reasons (orphan, unchanged, unreadable subdir), each orphan deletion's own path, and filesystem-event detail. An unrecognized value falls back to `info`. | `info` | No |
+| `LOG_LEVEL` | Minimum log level: `debug`, `info`, `warn`, or `error` (case-insensitive; slog offsets such as `info+2` work). `debug` surfaces per-source skip reasons (orphan, unchanged, excluded, bundle ignored because PFX input is off, shadowed by a higher-precedence sibling, unreadable subdir), each orphan deletion's own path, and filesystem-event detail. An unrecognized value falls back to `info`. | `info` | No |
 
 ### Volumes
 
@@ -184,11 +184,12 @@ a restart never clears, deliberately: nothing else surfaces "a consumer is
 reading an artifact this app refuses to update" to an orchestrator.
 
 Health tracks only failures a restart can clear (plus that one deliberate
-exception), so five conditions are logged at WARN with the action to take and
+exception), so these conditions are logged at WARN with the action to take and
 leave health alone: an unreadable `/input` sub-path, an `/input` tree over
 `MAX_SCAN_ENTRIES`, an `/output` directory more permissive than `0750`, an
-artifact more permissive than `0600`, and a refused replacement of an artifact
-this app could not read or verify.
+artifact more permissive than `0600`, a refused replacement of an artifact this
+app could not read or verify, artifacts kept from a previous `OUTPUT_LAYOUT`,
+and an `INPUT_EXCLUDE_PATHS` value that covers every source found.
 
 ## Security
 
