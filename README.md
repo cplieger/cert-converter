@@ -132,7 +132,7 @@ marker, and leave the running watcher alone.
 cert-converter has no metrics endpoint; its operational state is in its logs.
 Ship the container's logs to Loki (Grafana Alloy's Docker log discovery does
 this with no configuration) and evaluate the rules in
-[`alerts.yaml`](alerts.yaml) with
+[`alerts/logql.yaml`](alerts/logql.yaml) with
 [Loki's ruler](https://grafana.com/docs/loki/latest/alert/); firing alerts
 deliver through your Alertmanager exactly like Prometheus metric alerts. They
 cover:
