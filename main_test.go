@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
+	"log"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -451,6 +453,50 @@ func TestDispatchArgs_health_probe_emits_no_startup_diagnostics(t *testing.T) {
 	}
 }
 
+// saveLogGlobals captures the three globals slog.SetDefault mutates and restores
+// them when the test ends; call it before the swap.
+//
+// SetDefault also aims the log package at the installed handler and skips that
+// redirect for slog's own default handler, so reinstalling the previous logger
+// cannot undo it; slog's default handler emits through log.Output, so a dead log
+// writer silences the package. slog restores first because a non-default previous
+// handler re-runs the redirect.
+func saveLogGlobals(t *testing.T) {
+	t.Helper()
+	prevLogger, prevWriter, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	t.Cleanup(func() {
+		slog.SetDefault(prevLogger)
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	})
+}
+
+// TestSaveLogGlobals_restores_the_log_package_too red-checks the two restores saveLogGlobals owns
+// beyond slog's own; drop either and this test fails.
+func TestSaveLogGlobals_restores_the_log_package_too(t *testing.T) {
+	prevWriter, prevFlags := log.Writer(), log.Flags()
+	t.Cleanup(func() {
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	})
+	// Neither the process default nor what SetDefault installs (a slog
+	// handlerWriter and 0), so neither assertion can pass by coincidence.
+	log.SetOutput(io.Discard)
+	log.SetFlags(log.Lshortfile)
+
+	t.Run("swap", func(t *testing.T) {
+		saveLogGlobals(t)
+		slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	})
+
+	if got := log.Writer(); got != io.Discard {
+		t.Errorf("log.Writer() = %T, want the writer set before the swap: slog.SetDefault aimed log at its own handler and restoring slog alone leaves it there", got)
+	}
+	if got := log.Flags(); got != log.Lshortfile {
+		t.Errorf("log.Flags() = %d, want %d: slog.SetDefault zeroes them and restoring slog alone leaves them at zero", got, log.Lshortfile)
+	}
+}
+
 // captureStderr redirects os.Stderr to a temp file for the duration of fn and
 // returns everything written to it. A temp file rather than an os.Pipe: a pipe
 // blocks its writer once the buffer fills, which would deadlock the test.
@@ -742,12 +788,10 @@ func TestHealthyAfterScan(t *testing.T) {
 func TestRun_argv_dispatch_precedes_the_log_level_diagnostic(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "bogus")
 
-	prevArgs, prevLogger := os.Args, slog.Default()
+	saveLogGlobals(t)
+	prevArgs := os.Args
 	os.Args = []string{"cert-watcher", "helth"}
-	t.Cleanup(func() {
-		os.Args = prevArgs
-		slog.SetDefault(prevLogger)
-	})
+	t.Cleanup(func() { os.Args = prevArgs })
 
 	var code int
 	out := captureStderr(t, func() { code = run() })
@@ -775,12 +819,10 @@ func TestRun_startup_failure_diagnoses_the_configuration_and_exits_nonzero(t *te
 		}
 	}
 
-	prevArgs, prevLogger := os.Args, slog.Default()
+	saveLogGlobals(t)
+	prevArgs := os.Args
 	os.Args = []string{"cert-watcher", watchSubcommand}
-	t.Cleanup(func() {
-		os.Args = prevArgs
-		slog.SetDefault(prevLogger)
-	})
+	t.Cleanup(func() { os.Args = prevArgs })
 
 	var code int
 	out := captureStderr(t, func() { code = run() })
@@ -830,12 +872,10 @@ func TestRun_sanitizes_the_secret_path_a_configuration_refusal_carries(t *testin
 		t.Fatalf("logtext.Path leaves the fixture path %q unchanged, so every assertion below would pass vacuously", secretPath)
 	}
 
-	prevArgs, prevLogger := os.Args, slog.Default()
+	saveLogGlobals(t)
+	prevArgs := os.Args
 	os.Args = []string{"cert-watcher", watchSubcommand}
-	t.Cleanup(func() {
-		os.Args = prevArgs
-		slog.SetDefault(prevLogger)
-	})
+	t.Cleanup(func() { os.Args = prevArgs })
 
 	var code int
 	out := captureStderr(t, func() { code = run() })
@@ -877,7 +917,8 @@ func TestRun_refuses_to_start_when_a_required_volume_is_missing(t *testing.T) {
 	}
 
 	absentOutput := filepath.Join(t.TempDir(), "absent-output")
-	prevArgs, prevLogger, prevVolumes := os.Args, slog.Default(), requiredVolumes
+	saveLogGlobals(t)
+	prevArgs, prevVolumes := os.Args, requiredVolumes
 	os.Args = []string{"cert-watcher", watchSubcommand}
 	requiredVolumes = mounts.Paths{
 		Input:  t.TempDir(),
@@ -885,7 +926,6 @@ func TestRun_refuses_to_start_when_a_required_volume_is_missing(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		os.Args = prevArgs
-		slog.SetDefault(prevLogger)
 		requiredVolumes = prevVolumes
 	})
 
