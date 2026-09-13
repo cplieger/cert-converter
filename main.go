@@ -112,8 +112,10 @@ func dispatchArgs(args []string) int {
 		// The periodic safety-net scan is the marker's guaranteed refresh floor
 		// (fs events refresh it sooner), so a marker older than 3 of those
 		// intervals means the watch loop is wedged and a restart fixes it.
-		runProbe(health.DefaultPath,
-			health.WithMaxAge(3*scancadence.Effective(config.FallbackInterval())))
+		runProbe(health.DefaultPath, health.WithMaxAge(health.Lease{
+			Interval: scancadence.Effective(config.FallbackInterval()),
+			Cycles:   3,
+		}.Duration()))
 		return continueToWatcher // unreachable in production; runProbe exits
 	default:
 		switch args[1] {
