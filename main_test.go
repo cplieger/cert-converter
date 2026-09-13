@@ -369,14 +369,14 @@ func TestDispatchArgs(t *testing.T) {
 // boundary are asserted.
 //
 // The captured options are applied with health.ProbeCheck to markers whose
-// mtimes straddle the deadline, so a wrong multiplier or a dropped option fails
+// mtimes straddle the deadline, so a wrong Cycles count or a dropped option fails
 // here rather than in production. No t.Parallel: it swaps runProbe and mutates
 // the environment.
 func TestDispatchArgs_arms_the_marker_lease(t *testing.T) {
 	// Three reconciliation floors: the watcher's own guarantee rather than a
 	// configured value, so it is derived from the same function main arms the probe
-	// with.
-	reconcileLease := 3 * scancadence.Effective(0)
+	// with, through the same Lease expression.
+	reconcileLease := health.Lease{Interval: scancadence.Effective(0), Cycles: 3}.Duration()
 
 	for _, tc := range []struct {
 		name          string
