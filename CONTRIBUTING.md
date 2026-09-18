@@ -187,6 +187,21 @@ go test ./internal/convert -run '^$' -fuzz FuzzParseCertChain -fuzztime 30s
 Benchmarks live beside the code they measure
 (`*_bench_test.go`); run them with `go test -bench . ./...`.
 
+The image smoke test (`tests/image-smoke.conf`, run by CI through the synced
+`tests/image-smoke.sh`) covers what the unit tests cannot: the assembled
+distroless image under the README's hardened profile. It generates a
+certificate pair with `openssl`, boots the image against it, opens the bundle
+the image wrote with `PFX_PASSWORD` and checks that a wrong password does not,
+then plants a corrupt pair in the watched directory and asserts the failed
+conversion is logged, produces no artifact and fails `cert-watcher health`, and
+that removing the pair restores health without a restart. Build the image and
+run it against the result with:
+
+```sh
+docker build -t cert-converter .
+sh tests/image-smoke.sh cert-converter
+```
+
 ## Commits and PRs
 
 Commits follow [Conventional Commits](https://www.conventionalcommits.org/)
