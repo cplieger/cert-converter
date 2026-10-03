@@ -6,6 +6,7 @@ package mounts
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -115,6 +116,10 @@ func closeRoot(root *os.Root, role string) {
 // package-var seam in the same style as main's runProbe and requiredVolumes.
 var probeOutputWritable = atomicfile.ProbeWritableInRoot
 
+// ArtifactMode is the mode every converted file is written at. The startup probe asks
+// for it so a volume that cannot hold it fails at startup rather than on the first renewal.
+const ArtifactMode os.FileMode = 0o600
+
 // staleTempRemediation is the operator action for a probe file left behind.
 const staleTempRemediation = "the unlink that would have removed it was just refused, so the per-scan " +
 	"stale-temp sweep (the same unlink through the same handle) can only reclaim it once that refusal is gone: " +
@@ -127,7 +132,7 @@ func warnOutputNotWritable(root *os.Root) {
 	// once before it creates anything, and its stages are single filesystem calls
 	// the OS does not make interruptible, so a context could not shorten a wedged
 	// mount. Startup has no context of its own until main's signal handler.
-	res, err := probeOutputWritable(context.Background(), root, ".")
+	res, err := probeOutputWritable(context.Background(), root, ".", atomicfile.WithMode(ArtifactMode))
 	switch {
 	case err != nil:
 		// A non-nil error means only "the probe was not attempted", which for the
@@ -169,6 +174,9 @@ func warnOutputRefusedWrite(res atomicfile.ProbeResult) {
 		remediation = "the directory entry was accepted and the data was not, so this is not an ownership problem: " +
 			"check free space and any quota on the filesystem backing " + logRoot
 	}
+	if errors.Is(res.Err, atomicfile.ErrModeNotStored) {
+		remediation = ModeNotStoredRemediation(logRoot)
+	}
 	if res.Leaked {
 		// Reachable when the write or the flush failed AND the follow-up unlink failed
 		// too: the volume is unusable and is still holding the probe file.
@@ -181,6 +189,15 @@ func warnOutputRefusedWrite(res atomicfile.ProbeResult) {
 	slog.Warn(outputNotWritableMsg,
 		"role", roleOutput, "path", logRoot, "stage", res.Stage.String(), "error", logtext.Path(res.Err.Error()),
 		"uid", os.Getuid(), "gid", os.Getgid(), "remediation", remediation)
+}
+
+// ModeNotStoredRemediation is the operator action for a volume at root that would not
+// keep a new file at ArtifactMode (atomicfile.ErrModeNotStored).
+func ModeNotStoredRemediation(root string) string {
+	return "the filesystem backing " + root + " did not keep mode " + fmt.Sprintf("%#o", uint32(ArtifactMode)) +
+		" on a new file, so this is not an ownership problem: remove the inheritable ACL entries that widen new " +
+		"files there (on ZFS, the inherited group@/everyone@ entries or the dataset's aclinherit setting), or " +
+		"mount a filesystem that stores Unix file modes"
 }
 
 // warnOutputProbeTeardown reports a probe whose data reached disk and whose

@@ -3,6 +3,7 @@ package mounts
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -292,6 +293,43 @@ func stubOutputProbe(t *testing.T, res atomicfile.ProbeResult, err error) {
 	t.Cleanup(func() { probeOutputWritable = prev })
 }
 
+// TestWarnOutputNotWritable_probes_with_the_artifact_mode pins that the startup probe
+// asks for the same owner-only mode the converted files are written at, so a volume
+// that cannot hold that mode is refused at startup like a real write would be. The
+// options the probe receives are replayed through a real write, because an Option is
+// opaque: the file that write leaves behind is what those options mean.
+//
+// Serial (no t.Parallel): it swaps the probe seam.
+func TestWarnOutputNotWritable_probes_with_the_artifact_mode(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	prev := probeOutputWritable
+	var got []atomicfile.Option
+	probeOutputWritable = func(_ context.Context, _ *os.Root, _ string, opts ...atomicfile.Option) (atomicfile.ProbeResult, error) {
+		got = opts
+		return atomicfile.ProbeResult{Dir: dir}, nil
+	}
+	t.Cleanup(func() { probeOutputWritable = prev })
+
+	warnOutputNotWritable(root)
+
+	if _, err := atomicfile.WriteFileInRoot(t.Context(), root, "replay", []byte("x"), got...); err != nil {
+		t.Fatalf("Setup: WriteFileInRoot(replay) with the probe's options: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "replay"))
+	if err != nil {
+		t.Fatalf("Setup: Stat(replay): %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != ArtifactMode {
+		t.Errorf("warnOutputNotWritable probed with options that write mode %v, want %v: the probe must"+
+			" ask for the mode every converted file is written at", perm, ArtifactMode)
+	}
+}
+
 // TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning pins the
 // whole outcome ladder onto the operator's warnings, and the two properties that
 // make the probe warn-and-continue:
@@ -375,6 +413,24 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 				"stage": atomicfile.ProbeStageSync.String(),
 				"remediation": "the directory entry was accepted and the data was not, so this is not an ownership problem: " +
 					"check free space and any quota on the filesystem backing " + dir,
+			},
+			wantAbsent: "cleanup",
+		},
+		{
+			name: "a volume that does not keep the owner-only mode is not an ownership problem",
+			res: atomicfile.ProbeResult{
+				Dir: dir, Stage: atomicfile.ProbeStageCreate,
+				Err: fmt.Errorf("%w: %s asked -rw------- stored -rw-rw----", atomicfile.ErrModeNotStored, leakedPath),
+			},
+			wantMsg:     wantOutputNotWritableMsg,
+			wantWarns:   1,
+			wantRecords: 1,
+			wantAttrs: map[string]string{
+				"stage": atomicfile.ProbeStageCreate.String(),
+				"remediation": "the filesystem backing " + dir + " did not keep mode 0600 on a new file, so this is not an " +
+					"ownership problem: remove the inheritable ACL entries that widen new files there (on ZFS, the " +
+					"inherited group@/everyone@ entries or the dataset's aclinherit setting), or mount a filesystem " +
+					"that stores Unix file modes",
 			},
 			wantAbsent: "cleanup",
 		},

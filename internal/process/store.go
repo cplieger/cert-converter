@@ -16,13 +16,14 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
+	"github.com/cplieger/cert-converter/internal/mounts"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 )
 
 // Output file and directory modes.
 const (
-	outputFileMode = 0o600
+	outputFileMode = mounts.ArtifactMode
 	outputDirMode  = 0o750
 )
 
@@ -409,6 +410,10 @@ const priorPinRefusedMsg = "cannot pin the output directory of a prior pfx; rege
 // ownership: this app may write /output, but the filesystem will not take the bytes.
 const outputVolumeRemediation = "check /output for free space, a quota and a read-only mount"
 
+// outputModeRemediation is the remediation for a write refused because /output would
+// not keep the new file at outputFileMode.
+var outputModeRemediation = mounts.ModeNotStoredRemediation("/output")
+
 // outputTransientRemediation is the operator action behind a refusal whose own site could
 // not attribute it to ownership, to the output tree's layout or to the volume
 // (refusalTransient): a raw filesystem I/O error, a symlink planted at the output name, or
@@ -450,6 +455,9 @@ const (
 	refusalOutputLayout
 	// refusalVolume: the volume will not take the bytes (EROFS / ENOSPC / EDQUOT).
 	refusalVolume
+	// refusalModeNotStored: the volume will not keep a new file at outputFileMode
+	// (atomicfile.ErrModeNotStored), typically a default ACL that widens it.
+	refusalModeNotStored
 	// refusalTransient: the write failed for something that is NOT a steady-state
 	// condition of the operator's volume — a transient I/O error, an artifact
 	// above maxPFXSize, or a symlink at the output name.
@@ -471,6 +479,8 @@ func (c writeRefusalCause) remediation() string {
 		return outputPinRemediation
 	case refusalVolume:
 		return outputVolumeRemediation
+	case refusalModeNotStored:
+		return outputModeRemediation
 	case refusalTransient:
 		return outputTransientRemediation
 	default:
@@ -513,6 +523,8 @@ func refuseWrite(cause writeRefusalCause, format string, args ...any) writeRefus
 // errnos of the directory creation.
 func classifyWriteErrno(err error) writeRefusalCause {
 	switch {
+	case errors.Is(err, atomicfile.ErrModeNotStored):
+		return refusalModeNotStored
 	// fs.ErrPermission covers both EPERM and EACCES: atomicfile's confined write
 	// returns an *fs.PathError wrapping a syscall.Errno, and Errno.Is maps both
 	// onto fs.ErrPermission (and only those, of the ones reachable here).

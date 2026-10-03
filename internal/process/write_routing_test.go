@@ -204,6 +204,19 @@ func TestWriteRefusal_carries_a_classification_from_every_refusal_site(t *testin
 			},
 			want: refusalOwnership, wantClearable: false, wantRemediation: outputPermRemediation,
 		},
+		// A volume that widens the new file past outputFileMode is a standing condition
+		// of /output, so it must not take the clearable class a restart loop rides on.
+		"a mode the volume did not keep is its own unclearable refusal": {
+			stage: func(t *testing.T, _ string) string {
+				t.Helper()
+				stubWriteRefusal(t, &atomicfile.WriteError{
+					Phase: atomicfile.PhaseTempCreate,
+					Err:   fmt.Errorf("%w: out.pfx asked -rw------- stored -rw-rw----", atomicfile.ErrModeNotStored),
+				})
+				return "out.pfx"
+			},
+			want: refusalModeNotStored, wantClearable: false, wantRemediation: outputModeRemediation,
+		},
 		// Site 3, one more time, for the class that keeps the LOUD outcome. It is here so the
 		// unclearable rows above cannot pass under a classifier that answers "unclearable"
 		// for everything.
@@ -277,11 +290,12 @@ func TestWriteRefusalCause_states_both_facts_for_every_declared_cause(t *testing
 		clearable   bool
 		remediation string
 	}{
-		refusalUnclassified: {"refusalUnclassified", false, outputPermRemediation},
-		refusalOwnership:    {"refusalOwnership", false, outputPermRemediation},
-		refusalOutputLayout: {"refusalOutputLayout", false, outputPinRemediation},
-		refusalVolume:       {"refusalVolume", false, outputVolumeRemediation},
-		refusalTransient:    {"refusalTransient", true, outputTransientRemediation},
+		refusalUnclassified:  {"refusalUnclassified", false, outputPermRemediation},
+		refusalOwnership:     {"refusalOwnership", false, outputPermRemediation},
+		refusalOutputLayout:  {"refusalOutputLayout", false, outputPinRemediation},
+		refusalVolume:        {"refusalVolume", false, outputVolumeRemediation},
+		refusalModeNotStored: {"refusalModeNotStored", false, outputModeRemediation},
+		refusalTransient:     {"refusalTransient", true, outputTransientRemediation},
 	}
 	for c := range refusalCauseCount {
 		tc, ok := want[c]
