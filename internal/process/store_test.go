@@ -978,7 +978,7 @@ func TestScannerRun_a_write_for_its_own_reasons_installs_the_policy_mode(t *test
 	}
 	if perm := afterInfo.Mode().Perm(); perm != outputFileMode {
 		t.Errorf("Run(renewed cert over mode %v) left mode %v, want %v: a write for the bundle's own reasons"+
-			" installs the policy mode outright", found, perm, os.FileMode(outputFileMode))
+			" installs the policy mode outright", found, perm, outputFileMode)
 	}
 }
 
@@ -1130,7 +1130,7 @@ func TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install(t
 	for key, want := range map[string]string{
 		"path": "chain.pfx",
 		"mode": found.String(),
-		"want": os.FileMode(outputFileMode).String(),
+		"want": outputFileMode.String(),
 	} {
 		if !logs.HasAttr(laxArtifactMsg, key, want) {
 			got, _ := logs.AttrValue(laxArtifactMsg, key)
