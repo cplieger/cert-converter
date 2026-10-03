@@ -433,7 +433,7 @@ func (s *store) reportLaxArtifact(rel string, perm os.FileMode) {
 		return
 	}
 	slog.Warn(laxArtifactMsg,
-		"path", logtext.Path(rel), "mode", perm.String(), "want", os.FileMode(outputFileMode).String())
+		"path", logtext.Path(rel), "mode", perm.String(), "want", outputFileMode.String())
 }
 
 // writeRefusalCause names WHAT refused an /output write, as the site that refused it
