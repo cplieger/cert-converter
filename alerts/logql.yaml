@@ -75,9 +75,10 @@ groups:
           summary: "cert-converter could not publish an artifact and left /output as found"
           description: >
             A requested output was not written because an /output condition no
-            restart clears refused the write (ownership, layout, or a volume
-            that will not take the bytes) while this app could not read the
-            artifact already at that path. Whatever is there is left as found,
+            restart clears refused the write while this app could not read the
+            artifact already at that path. The condition is ownership, the output
+            layout, a volume that will not take the bytes, or a volume that will
+            not keep the new file at mode 0600. Whatever is there is left as found,
             so a consumer can keep reading stale material. Health is deliberately
             unaffected because no restart alters an /output layout or its
             permissions, which makes this rule the only signal. The record's own
