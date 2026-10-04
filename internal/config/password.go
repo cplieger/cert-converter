@@ -16,8 +16,8 @@ import (
 // Unicode whitespace, or entirely invisible formatting runes — and the
 // PFX_ALLOW_EMPTY_PASSWORD opt-out is not set.
 var ErrEmptyPassword = errors.New(
-	"the resolved PFX password is empty or blank (whitespace-only, or invisible formatting characters only); " +
-		"set PFX_PASSWORD, write a non-blank secret " +
+	"the resolved PFX password is empty or blank, meaning whitespace-only or invisible formatting characters only. " +
+		"Set PFX_PASSWORD, write a non-blank secret " +
 		"to the file named by PFX_PASSWORD_FILE, or set PFX_ALLOW_EMPTY_PASSWORD=true",
 )
 
@@ -90,7 +90,7 @@ func resolvePassword() (resolvedPassword, error) {
 	// supplementary variation selectors (U+E0100-U+E01EF), which are non-BMP and so
 	// unencodable by PKCS#12 regardless of blankness.
 	if err := checkPasswordEncodable(password); err != nil {
-		return resolvedPassword{}, fmt.Errorf("%w (supplied via %s)", err, channel)
+		return resolvedPassword{}, fmt.Errorf("%w. The value was supplied via %s", err, channel)
 	}
 	if status != PasswordConfigured && !allowEmpty {
 		switch {
@@ -99,7 +99,7 @@ func resolvePassword() (resolvedPassword, error) {
 		case source == envx.SourceFile:
 			// An invisible-only mounted secret is blank only after
 			// classification, so envx carries no error naming the channel here.
-			return resolvedPassword{}, fmt.Errorf("%w (supplied via %s)", ErrEmptyPassword, channel)
+			return resolvedPassword{}, fmt.Errorf("%w. The value was supplied via %s", ErrEmptyPassword, channel)
 		}
 		return resolvedPassword{}, ErrEmptyPassword
 	}

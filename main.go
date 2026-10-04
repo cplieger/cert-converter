@@ -80,7 +80,7 @@ const (
 // usage writes the invocation summary to stderr. Shared by the no-subcommand
 // path and the rejection path so the two cannot describe different binaries.
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: cert-watcher watch     start the watcher (the image's default command)")
+	fmt.Fprintln(os.Stderr, "usage: cert-watcher watch     start the watcher, which is the image's default command")
 	fmt.Fprintln(os.Stderr, "       cert-watcher health    probe the health marker")
 }
 

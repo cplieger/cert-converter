@@ -74,7 +74,8 @@ func openMount(role, path string) (*os.Root, bool) {
 		// The access the remediation names is the access the VOLUME needs, not the
 		// access this open happened to need: an operator acts on it once, and granting
 		// /output read-only clears this refusal only to fail the write probe and every
-		// bundle on the next start. The README's Volumes table states the same split.
+		// bundle on the next start. docs/configuration.md "Volumes and file
+		// permissions" states the same split.
 		access := "read access"
 		if role == roleOutput {
 			access = "read and write access"
@@ -82,7 +83,7 @@ func openMount(role, path string) (*os.Root, bool) {
 		slog.Error("required volume cannot be opened by this container's user; refusing to start",
 			"role", role, "path", logPath, "error", logtext.Path(openErr.Error()),
 			"remediation", "grant the UID in the container's `user:` "+access+" to "+logPath+
-				" (chgrp/chmod the host directory), or run the container as a UID that already has it")
+				", or set `user:` to the UID and GID that own it")
 		return nil, false
 	}
 	// The two causes take two remedies, chosen here beside the cause rather than
