@@ -4,17 +4,20 @@ services:
     image: ghcr.io/cplieger/cert-converter:latest
     container_name: cert-converter
     restart: unless-stopped
-    # Override with PUID/PGID in .env; defaults to 1000:1000.
-    user: "${PUID:-1000}:${PGID:-1000}"  # must own the /output host dir
+    # In .env, set PUID and PGID to the user and group that own the certificate files.
+    # Create the output folder and run "sudo chown 1000:1000" on it, with those numbers, before the first start.
+    user: "${PUID:-1000}:${PGID:-1000}"
 
     environment:
-      # Env is readable via `docker inspect`; PFX_PASSWORD_FILE (a mounted secret) is not.
-      PFX_PASSWORD: "${PFX_PASSWORD:-}"  # set this or PFX_PASSWORD_FILE; empty is rejected
-      # Orphaned output: warn (default, keeps it) | sync (deletes) | keep (silent).
-      # Use sync only once /input is your single source of truth.
+      # Put PFX_PASSWORD=<a password> in .env. The container does not start without one.
+      # docker inspect shows this value. See README "Security" to use a secret file instead.
+      PFX_PASSWORD: "${PFX_PASSWORD:-}"
+      # warn keeps converted files whose certificate is gone, sync deletes them, keep stays silent.
+      # Use sync only once /input holds every certificate you want converted.
       OUTPUT_LIFECYCLE: "${OUTPUT_LIFECYCLE:-warn}"
       PFX_ENCODER: "modern2023"  # modern2023, modern2026, legacy, or legacyrc2
 
     volumes:
-      - "/path/to/certificates:/input:ro"  # must be readable by the UID above; see README "Healthcheck"
+      # The user above must be able to read this folder. See README "Quick start".
+      - "/path/to/certificates:/input:ro"
       - "/path/to/converted/output:/output"
