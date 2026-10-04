@@ -46,7 +46,7 @@ Both legacy profiles log a WARN at start, because their single-iteration SHA-1 M
 `OUTPUT_FORMATS` is a comma-separated list, and every format in it is kept current for every source. The default is `pfx`.
 
 - `pfx` writes a PKCS#12 bundle for each certificate.
-- `pem` writes a `<name>.crt` and `<name>.key` pair. A PEM source is copied verbatim, and a bundle source is decoded and written as PEM. The `.key` file is a plaintext private key on disk. [Security](security.md#passwords-and-private-keys) explains when to turn it on.
+- `pem` writes a `<name>.crt` and `<name>.key` pair. A PEM source is copied verbatim, and a bundle source is decoded and written as PEM. The `.key` file is a plaintext private key on disk. [Security](hardening.md#passwords-and-private-keys) explains when to turn it on.
 - An unrecognized entry is ignored with a WARN. A value with no usable entry falls back to the default.
 - An invalid value also forces `OUTPUT_LIFECYCLE=warn`, so a typo can never enable deletion under a format set you did not choose.
 - Switching a format off leaves its old files in place under `warn` and `keep`. Under `sync` they are removed, because setting `OUTPUT_FORMATS` explicitly states that the remaining set is complete.
