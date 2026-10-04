@@ -104,7 +104,7 @@ cert-converter opens no network port and runs as a non-root user on an image wit
 
 With `OUTPUT_FORMATS` set to `pem`, each private key is written as a plain `.key` file, so turn it on only where the output folder is access-controlled. The `legacyrc2` profile uses 40-bit RC2, which can be broken by trying every key, so keep it for a device that accepts nothing else.
 
-[Security](docs/security.md) covers the hardened compose settings, the limits on input files and what the image contains.
+[Security](docs/hardening.md) covers the hardened compose settings, the limits on input files and what the image contains.
 
 ## Troubleshooting
 
@@ -125,7 +125,7 @@ cert-converter has no metrics endpoint and reports its state in its logs. Fourte
 
 - [Configuration](docs/configuration.md) explains every setting, the two mounts and the file permissions.
 - [How cert-converter works](docs/how-it-works.md) covers watching, output naming, cleanup and health.
-- [Security](docs/security.md) covers hardening, input limits and what the image contains.
+- [Security](docs/hardening.md) covers hardening, input limits and what the image contains.
 - [Monitoring and alerts](docs/monitoring.md) lists the log lines and the alert rules.
 
 ## Credits
