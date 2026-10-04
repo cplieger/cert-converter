@@ -45,7 +45,7 @@ func resolveLayout(lifecycle outputpolicy.Lifecycle) (outputpolicy.Layout, bool,
 
 // ErrEmptyInputPassword reports an explicitly configured blank input-bundle
 // password without the opt-in that acknowledges empty-password PFX decoding.
-var ErrEmptyInputPassword = errors.New("the configured input PFX password is empty or blank; set INPUT_PFX_PASSWORD or write a non-blank secret to INPUT_PFX_PASSWORD_FILE")
+var ErrEmptyInputPassword = errors.New("the configured input PFX password is empty or blank. Set INPUT_PFX_PASSWORD or write a non-blank secret to INPUT_PFX_PASSWORD_FILE")
 
 // resolveExcludePaths reads INPUT_EXCLUDE_PATHS: a comma-separated list of
 // root-relative paths under /input the operator has declared are not this app's
@@ -137,7 +137,7 @@ func resolveInputPassword() (resolvedInputPassword, error) {
 	}
 	status := classifyPassword(password)
 	if encErr := checkPasswordEncodable(password); encErr != nil {
-		return resolvedInputPassword{}, fmt.Errorf("%w (supplied via %s)", encErr, inputPasswordChannel(source))
+		return resolvedInputPassword{}, fmt.Errorf("%w. The value was supplied via %s", encErr, inputPasswordChannel(source))
 	}
 	if status != PasswordConfigured {
 		if !configured {
