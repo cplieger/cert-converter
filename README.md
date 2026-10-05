@@ -134,7 +134,7 @@ cert-converter writes PFX files with [go-pkcs12](https://pkg.go.dev/software.ssl
 
 ## Contributing
 
-Issues and pull requests are welcome. Please open an issue first for a larger change. See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Disclaimer
 
