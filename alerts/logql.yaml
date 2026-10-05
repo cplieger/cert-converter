@@ -1,21 +1,15 @@
-# Recommended alert rules for cert-converter. Loki ruler (LogQL) rule group:
-# cert-converter has no metrics endpoint, so ship the container logs to Loki
-# (Grafana Alloy discovers Docker logs with no configuration) and evaluate this
-# group with Loki's ruler; firing alerts deliver through your Alertmanager like
-# any Prometheus alert. Thresholds, the `for:` windows and the severity labels
-# are starting points; adjust the `container` selector (or `job`/`service`, if
-# your log collector sets those instead) to your deployment, and match the
-# degradation window to your FALLBACK_SCAN_HOURS.
-#
-# Every rule here keys on a WARN or ERROR record and works at LOG_LEVEL=warn
-# as well as at the info default, with ONE deliberate exception:
-# CertConverterScanStalled keys on the INFO-level `scan complete` heartbeat,
-# because a healthy scan has nothing to log at WARN. That rule needs
-# LOG_LEVEL=info (the default) and will fire permanently at warn. Drop it if you
-# run at warn, or accept that this group's deadman costs you the info level.
+# Recommended alert rules for cert-converter, as a Loki ruler (LogQL) group.
+# cert-converter has no metrics endpoint, so ship its container logs to Loki
+# and evaluate this group with Loki's ruler. Thresholds, windows and severity
+# labels are starting points. Adjust the `container` selector to your
+# deployment. Every rule keys on a WARN or ERROR record except
+# CertConverterScanStalled, which needs LOG_LEVEL=info (the default).
+# Per-alert notes are in docs/monitoring.md, under "Alerting".
 groups:
   - name: cert-converter
     rules:
+      # `!= (shutdown)` drops the same message when the container stopping
+      # caused it. That case is logged at DEBUG.
       - alert: CertConverterConversionFailed
         expr: |
           sum by (container) (count_over_time(
@@ -29,13 +23,10 @@ groups:
         annotations:
           summary: "cert-converter failed to convert a certificate"
           description: >
-            A PEM parse, PFX decode, cert/key mismatch, or output write failure
-            left one or more requested artifacts stale or missing. The container
-            stays unhealthy until a scan converts every source cleanly. The
-            `!= (shutdown)` filter drops the same message when it was caused by
-            the container stopping, which is logged at DEBUG. Check /input and
-            /output ownership for the UID in `user:`, the input password for PFX
-            sources, and the certificate chain.
+            A parse, PFX decode, cert/key mismatch or write failure left a
+            file stale or missing. The container stays unhealthy until
+            a clean scan. Check /input and /output ownership for the UID in
+            `user:`, the PFX password and the chain.
       - alert: CertConverterOutputNameCollision
         expr: |
           sum by (container) (count_over_time(
@@ -46,22 +37,12 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "two cert-converter inputs claim the same output name; neither is converted"
+          summary: "Two cert-converter inputs claim one output name, so neither converts"
           description: >
-            Under OUTPUT_LAYOUT=flat (the default), two inputs whose last
-            directory and file name coincide would produce the same output
-            path. This app refuses to arbitrate that ambiguity: none of the
-            colliding sources is converted, whatever is at the contested path
-            is left as found, and the container stays unhealthy until the
-            operator resolves it. The record carries the shared output name,
-            the claimant count, and a bounded sample of the claimants. Rename
-            one input directory so they differ, or set OUTPUT_LAYOUT=mirror to
-            keep every source's full path.
-      # The write refusal that does NOT flip health, and so has no other signal.
-      # CertConverterConversionFailed above covers a refused write only where this
-      # app had PROVEN the bundle on disk wrong; where it could not read that
-      # bundle at all and the refusal is steady state, the outcome is deliberately
-      # health-neutral, and the record below is the whole of what reports it.
+            Two inputs map to the same flat output path. None of them converts,
+            the contested path is left as found and the container stays
+            unhealthy. Rename one input directory, or set OUTPUT_LAYOUT=mirror.
+            The record names the shared output.
       - alert: CertConverterOutputWriteRefused
         expr: |
           sum by (container) (count_over_time(
@@ -72,18 +53,12 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "cert-converter could not publish an artifact and left /output as found"
+          summary: "cert-converter could not write an output and left /output as found"
           description: >
-            A requested output was not written. An /output condition that no
-            restart clears refused the write, and this app could not read the
-            artifact already at that path. The condition is ownership, the output
-            layout, a volume that will not take the bytes, or a volume that will
-            not keep the new file at mode 0600. Whatever is there is left as found,
-            so a consumer can keep reading stale material. Health is deliberately
-            unaffected because no restart alters an /output layout or its
-            permissions, which makes this rule the only signal. The record's own
-            `remediation` field names the action for the condition that refused
-            the write, and its `error` field names the path.
+            An /output condition refused a write, so a consumer can keep reading
+            a stale file. Health is unaffected, so this rule is the only signal.
+            The record's `remediation` field names the action and its `error`
+            field names the path.
       - alert: CertConverterScanAborted
         expr: |
           sum by (container) (count_over_time(
@@ -95,10 +70,9 @@ groups:
         annotations:
           summary: "cert-converter aborted a scan before completion"
           description: >
-            The /input root itself could not be walked (unreadable mount, wrong
-            permissions, or a mid-scan unmount), so the scan returned early and
+            The /input root could not be walked, so the scan returned early and
             the container is unhealthy. Check the /input mount and its
-            permissions.
+            permissions, and look for an unmount during the scan.
       - alert: CertConverterInputTreeTooLarge
         expr: |
           sum by (container) (count_over_time(
@@ -111,15 +85,10 @@ groups:
         annotations:
           summary: "cert-converter stopped a scan at the /input entry budget"
           description: >
-            The scan reached MAX_SCAN_ENTRIES (default 10000) and stopped, so
-            every source past that point is unconverted and orphan cleanup
-            was skipped for that scan. Health is unaffected, because no restart
-            shrinks the tree, which makes this rule the only signal. Check that
-            /input is mounted at the certificate directory and holds nothing
-            else; if the tree is legitimately this large, raise
-            MAX_SCAN_ENTRIES and the container's memory limit together,
-            because one scan's memory grows with the total length of the paths
-            it enumerates and not only with their number.
+            The scan stopped at MAX_SCAN_ENTRIES, so every source past that
+            point is unconverted. Health is unaffected, so this rule is the only
+            signal. Check that /input holds only certificates. For a larger
+            tree, raise MAX_SCAN_ENTRIES and the memory limit together.
       - alert: CertConverterChangeDetectionDegraded
         expr: |
           sum by (container) (count_over_time(
@@ -132,16 +101,9 @@ groups:
         annotations:
           summary: "cert-converter is polling instead of watching for changes"
           description: >
-            No fsnotify watch could be established, so change detection has
-            fallen back to a full rescan every FALLBACK_SCAN_HOURS (default 6h,
-            capped at the 24h reconciliation floor) and a renewal now waits that
-            long to convert. Every poll-mode scan
-            repeats this record, so the alert stands for as long as the
-            degradation does; recovery is logged as `fsnotify recovered,
-            upgrading from poll to watch`. Health is unaffected: a poll scan
-            refreshes the marker exactly like a watch scan. Exhausted inotify
-            instances on the host are the usual cause. Match the window to your
-            FALLBACK_SCAN_HOURS.
+            No file watch could be set up, so a renewal waits for the next full
+            rescan every FALLBACK_SCAN_HOURS. The alert stands while polling
+            lasts. Exhausted inotify instances on the host are the usual cause.
       - alert: CertConverterChangeDetectionDead
         expr: |
           sum by (container) (count_over_time(
@@ -154,38 +116,13 @@ groups:
         annotations:
           summary: "cert-converter lost change detection and is exiting for a restart"
           description: >
-            The watch loop ended for a reason other than shutdown, so the process
-            exited non-zero to be restarted, and its `error` field names which
-            loss occurred: fsnotify's channels closed under a live container, or
-            the root watch was removed, or fsnotify was unavailable at all, the
-            last two only while FALLBACK_SCAN_HOURS is 0/false, where a restart
-            re-attaches a watch in seconds and the alternative is an entirely
-            unwatched tree until the next reconciliation. Critical rather than
-            warning: with no restart
-            policy the container stays down and every renewal is silently
-            missed. Ensure the deployment restarts it
-            (`restart: unless-stopped`), and if the record carries a
-            `remediation` field naming FALLBACK_SCAN_HOURS, unset it or set it
-            above 0 so the periodic rescan covers or re-attaches the missing
-            watch. Exhausted inotify instances on the host are the usual root
-            cause and are often transient.
-      # The deadman. Every other rule here fires on a record cert-converter
-      # LOGGED at WARN or ERROR, so a wedged watch loop that logs nothing at all
-      # trips none of them. This one fires on silence instead.
-      #
-      # REQUIRES LOG_LEVEL=info. `scan complete` is an INFO record, because a
-      # healthy scan has no reason to log at WARN, so at LOG_LEVEL=warn the line
-      # never arrives and this rule fires permanently. That is the one place this
-      # group departs from its WARN-or-ERROR rule, and it is why the header says
-      # so. The file-marker healthcheck covers the same failure without needing
-      # the info level, but only where something acts on an unhealthy container.
-      #
-      # Set the window ABOVE the app's guaranteed re-scan cadence, not above
-      # FALLBACK_SCAN_HOURS: on the 6h default an 8h window is right, but when
-      # FALLBACK_SCAN_HOURS is 0/false or above 24h the guarantee drops to the
-      # 24h reconciliation floor, so use 30h there or the rule false-fires
-      # nightly. The startup line prints both numbers as `fallback_scan` and
-      # `scan_floor`; the second one is the one to size against.
+            The watch loop ended outside shutdown, so the process exited for a
+            restart. Without a restart policy, every renewal is missed. Set
+            `restart: unless-stopped`, and follow the record's `remediation`
+            field when present. The `error` field names the loss.
+      # The deadman fires on silence. It needs LOG_LEVEL=info, because
+      # `scan complete` is an INFO record. Size the window above `scan_floor`
+      # from the startup line, so 30h when that floor is 24h.
       - alert: CertConverterScanStalled
         expr: |
           absent_over_time({container="cert-converter"} |= `scan complete` [8h])
@@ -193,16 +130,12 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "no cert-converter scan-completion heartbeat in 8h"
+          summary: "No cert-converter scan completed in 8h"
           description: >
-            cert-converter logs a `scan complete` line on every pass, including
-            one that found nothing to convert, and none has arrived in 8h. The
-            usual cause is fsnotify and the fallback timer both wedged, so
-            certificates silently stop converting while the container still
-            looks alive; restart it and check the host's inotify instance limit.
-            An absence rule cannot tell that apart from a container that never
-            started or was renamed, a log pipeline that stopped shipping this
-            stream, or LOG_LEVEL raised to warn, so rule those out first.
+            No `scan complete` line arrived in 8h, so certificates may have
+            stopped converting. First rule out a stopped container, a stalled
+            log pipeline and LOG_LEVEL=warn. Then restart it and check the
+            host's inotify instance limit.
       - alert: CertConverterInputPathUnreachable
         expr: |
           sum by (container) (count_over_time(
@@ -215,12 +148,10 @@ groups:
         annotations:
           summary: "cert-converter skipped an unreachable /input path"
           description: >
-            An /input path could not be read, stat'ed, or resolved, so the
-            sources it names were not converted and their requested outputs stay
-            stale or absent. Health is unaffected because no restart clears a
-            permissions or layout condition, which makes this rule the only
-            signal. Repair the permissions for the UID in `user:`, and mount the
-            certificate directory directly instead of linking to it.
+            An /input path could not be read or resolved, so its certificates
+            were skipped. Health is unaffected, so this rule is the only signal.
+            Fix permissions for the UID in `user:`. Mount the certificate
+            directory, not a symlink to it.
       - alert: CertConverterNoCertificateSources
         expr: |
           sum by (container) (count_over_time(
@@ -231,15 +162,11 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "cert-converter found no convertible certificate sources under /input"
+          summary: "cert-converter found no certificate sources under /input"
           description: >
-            A scan found neither a complete `<name>.crt` + `<name>.key` PEM pair
-            nor a PFX/P12 bundle, so no output artifact is produced. This is the
-            signature of a wrong or vanished /input mount, an unsupported naming
-            layout, or orphaned PEM certificates. Health is unaffected, so this
-            rule is the only signal. Check the /input mount and source filenames.
-            A fresh deployment legitimately reports this until the first
-            issuance; raise `for:` if that is noisy.
+            A scan found no complete `.crt` and `.key` pair and no PFX or P12
+            bundle, so nothing is produced. Health is unaffected, so this rule
+            is the only signal. Check the /input mount and the source file names.
       - alert: CertConverterEverySourceExcluded
         expr: |
           sum by (container) (count_over_time(
@@ -253,12 +180,9 @@ groups:
           summary: "cert-converter excluded every certificate source it found"
           description: >
             INPUT_EXCLUDE_PATHS covers every source under /input, so the scan
-            converted nothing while reporting no failure. Health is unaffected
-            and the summary counts look like a healthy steady state, which
-            makes this rule the only signal. Narrow the exclusion list, or
-            point /input at the directory holding the certificates you want
-            converted. Existing artifacts are left untouched, so nothing was
-            deleted by the over-broad exclusion.
+            converted nothing and reported no failure. This rule is the only
+            signal. Narrow the exclusion list, or point /input at the
+            certificates you want. Existing outputs are left untouched.
       - alert: CertConverterOutputCleanupDegraded
         expr: |
           sum by (container) (count_over_time(
@@ -271,12 +195,10 @@ groups:
         annotations:
           summary: "cert-converter cannot clean up stale /output temp files"
           description: >
-            The stale-temp sweep aborted at the /output root, could not inspect
-            or unlink temp files left behind by an interrupted atomic write, or
-            could not enter an /output sub-path. Conversions may still succeed,
-            so health is unaffected, while `.atomicfile-*.tmp` files, each
-            holding a private key, accumulate under /output indefinitely. Check
-            /output ownership and permissions for the UID in `user:`.
+            Leftover `.atomicfile-*.tmp` files under /output, each holding a
+            private key, cannot be removed and will accumulate. Conversions may
+            still succeed, so health is unaffected. Check /output ownership and
+            permissions for the UID in `user:`.
       - alert: CertConverterOrphanRemovalDisabled
         expr: |
           sum by (container) (count_over_time(
@@ -289,16 +211,10 @@ groups:
         annotations:
           summary: "cert-converter cannot reap orphaned /output artifacts"
           description: >
-            This scan could not prove an output artifact is orphaned, so it
-            deleted nothing: /input was not fully enumerated (at scan time or
-            at the confirming re-check before deletion), an /output sub-path
-            could not be read, the output tree contains a symlink, either tree
-            exceeds MAX_SCAN_ENTRIES, or an output-name collision left this
-            scan's view of the output tree ambiguous. Only relevant with
-            `OUTPUT_LIFECYCLE=sync`, where it distinguishes "nothing to reap"
-            from "reaping is off". Health is unaffected; an artifact whose
-            source disappeared can remain served indefinitely. The record's
-            `remediation` field names the action for the case that fired.
+            With OUTPUT_LIFECYCLE=sync, a scan could not prove a file is
+            orphaned, so it removed nothing. An output whose source is gone can
+            stay served. Health is unaffected. The record's `remediation` field
+            names the action.
       - alert: CertConverterPreviousLayoutRetained
         expr: |
           sum by (container) (count_over_time(
@@ -309,13 +225,9 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "cert-converter sync is keeping artifacts from a previous OUTPUT_LAYOUT"
+          summary: "cert-converter sync is keeping files from a previous OUTPUT_LAYOUT"
           description: >
-            OUTPUT_LIFECYCLE=sync found output artifacts laid out for a layout
-            other than the current one while OUTPUT_LAYOUT is unset, and kept
-            them: the unset default never deletes a tree a previous
-            configuration wrote, because a consumer may still mount those
-            paths. Repoint consumers at the current layout's paths, then set
-            OUTPUT_LAYOUT explicitly to let sync reconcile the old tree away,
-            or remove it by hand. Health is unaffected, so this rule is the
-            only signal.
+            Sync kept files from a previous layout because OUTPUT_LAYOUT is
+            unset. Repoint consumers at the current paths, then set
+            OUTPUT_LAYOUT explicitly or remove the old tree by hand. Health is
+            unaffected, so this rule is the only signal.
