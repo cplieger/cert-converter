@@ -18,7 +18,7 @@ cert-converter reads certificate sources from one mounted folder and writes conv
 
 ## Bundle input
 
-PFX input is off until `INPUT_PFX_PASSWORD` is set, and that password must not be blank. A bundle's authenticity is checked against it before any certificate or key parsing happens, so the password is what stands between untrusted bytes and the parser. Decoding is budgeted per bundle and per scan, weighted by each bundle's declared key-derivation cost. A bundle that declares more work than the budget covers, or more than 64 embedded objects, is refused as a conversion failure rather than allowed to stall the scan.
+PFX input is off until `INPUT_PFX_PASSWORD` is set, and that password must not be blank. A bundle's authenticity is checked against it before any certificate or key parsing happens. The password is therefore what stands between untrusted bytes and the parser. Decoding is budgeted per bundle and per scan, weighted by each bundle's declared key-derivation cost. A bundle that declares more work than the budget covers, or more than 64 embedded objects, is refused as a conversion failure. It cannot stall the scan.
 
 ## Passwords and private keys
 
@@ -26,9 +26,9 @@ PFX input is off until `INPUT_PFX_PASSWORD` is set, and that password must not b
 
 To avoid that, mount a Docker or Podman secret and set `PFX_PASSWORD_FILE` to its path inside the container. The file takes precedence over `PFX_PASSWORD`. `INPUT_PFX_PASSWORD_FILE` follows the same rules for the input password.
 
-If an environment value is acceptable, write `PFX_PASSWORD: "${PFX_PASSWORD:?}"` in the compose file and keep the value in a `.env` file with mode `0600` that git ignores. That keeps the value out of the committed compose file, though not out of `docker inspect`.
+If an environment value is acceptable, write `PFX_PASSWORD: "${PFX_PASSWORD:?}"` in the compose file. Keep the value in a `.env` file with mode `0600` that git ignores. That keeps the value out of the committed compose file, though not out of `docker inspect`.
 
-`OUTPUT_FORMATS=pem` writes each private key as a plaintext `<name>.key` file with mode `0600`. A PFX file protects its key with `PFX_PASSWORD`, and a PEM key file has no such layer, so turn `pem` on only where the output mount itself is access-controlled. The `legacy` and `legacyrc2` encoding profiles weaken that protection, as [Configuration](configuration.md#encoding-profiles) explains.
+`OUTPUT_FORMATS=pem` writes each private key as a plaintext `<name>.key` file with mode `0600`. A PFX file protects its key with `PFX_PASSWORD`, and a PEM key file has no such layer. Turn `pem` on only where the output mount itself is access-controlled. The `legacy` and `legacyrc2` encoding profiles weaken that protection, as [Configuration](configuration.md#encoding-profiles) explains.
 
 ## Hardened deployment
 

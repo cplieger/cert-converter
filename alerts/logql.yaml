@@ -74,8 +74,8 @@ groups:
         annotations:
           summary: "cert-converter could not publish an artifact and left /output as found"
           description: >
-            A requested output was not written because an /output condition no
-            restart clears refused the write while this app could not read the
+            A requested output was not written. An /output condition that no
+            restart clears refused the write, and this app could not read the
             artifact already at that path. The condition is ownership, the output
             layout, a volume that will not take the bytes, or a volume that will
             not keep the new file at mode 0600. Whatever is there is left as found,

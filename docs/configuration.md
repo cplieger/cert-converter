@@ -135,7 +135,7 @@ Generated files are mode `0600` and the folders cert-converter creates are `0750
 
 cert-converter never changes the mode of what it finds under `/output`. An output folder more permissive than `0750`, or a file more permissive than `0600`, draws a WARN naming the mode and is left as found. Tighten it yourself, because a group-writable or world-writable output folder lets any other process on that mount replace a file. A file cert-converter writes again, for example after a renewal, lands at `0600`.
 
-An inherited ACL that widens new files, for example on ZFS, or a filesystem that does not store Unix file modes, stops `/output` from keeping mode `0600`. cert-converter then writes nothing there, and the startup log warns about it at once and names the fix.
+An inherited ACL that widens new files, for example on ZFS, stops `/output` from keeping mode `0600`. So does a filesystem that does not store Unix file modes. cert-converter then writes nothing there, and the startup log warns about it at once and names the fix.
 
 ## Commands
 
