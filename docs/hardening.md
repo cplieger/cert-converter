@@ -22,17 +22,13 @@ PFX input is off until `INPUT_PFX_PASSWORD` is set, and that password must not b
 
 ## Passwords and private keys
 
-`PFX_PASSWORD` is the only protection on the private key inside every generated `.pfx`. A literal compose value, `${...}` interpolation and `env_file:` all become container environment, which anyone who can query the Docker daemon sees with `docker inspect`.
-
-To avoid that, mount a Docker or Podman secret and set `PFX_PASSWORD_FILE` to its path inside the container. The file takes precedence over `PFX_PASSWORD`. `INPUT_PFX_PASSWORD_FILE` follows the same rules for the input password.
-
-If an environment value is acceptable, write `PFX_PASSWORD: "${PFX_PASSWORD:?}"` in the compose file. Keep the value in a `.env` file with mode `0600` that git ignores. That keeps the value out of the committed compose file, though not out of `docker inspect`.
+`PFX_PASSWORD` is the only protection on the private key inside every generated `.pfx`. Set `PFX_PASSWORD_FILE` to the path of a mounted secret, so the value stays out of `docker inspect`. The file takes precedence over `PFX_PASSWORD`, and `INPUT_PFX_PASSWORD_FILE` does the same for the input password. [Secrets in files](https://github.com/cplieger/docs/blob/main/docs/hardening.md#secrets-in-files) shows the compose lines and the `.env` alternative.
 
 `OUTPUT_FORMATS=pem` writes each private key as a plaintext `<name>.key` file with mode `0600`. A PFX file protects its key with `PFX_PASSWORD`, and a PEM key file has no such layer. Turn `pem` on only where the output mount itself is access-controlled. The `legacy` and `legacyrc2` encoding profiles weaken that protection, as [Configuration](configuration.md#encoding-profiles) explains.
 
 ## Hardened deployment
 
-To lock the container down further, add these settings to the quick start service:
+Add these lines to the quick start service. [Hardening a compose file](https://github.com/cplieger/docs/blob/main/docs/hardening.md) explains each setting.
 
 ```yaml
     read_only: true
@@ -59,4 +55,4 @@ The final image is `gcr.io/distroless/static-debian13:nonroot` with one static G
 - [github.com/cplieger/atomicfile](https://github.com/cplieger/atomicfile), [envx](https://github.com/cplieger/envx), [health](https://github.com/cplieger/health), [runesafe](https://github.com/cplieger/runesafe), [slogx](https://github.com/cplieger/slogx) and [pathinside](https://github.com/cplieger/pathinside)
 - [golang.org/x/crypto](https://pkg.go.dev/golang.org/x/crypto) and [golang.org/x/sys](https://pkg.go.dev/golang.org/x/sys)
 
-The license text of every bundled component is in the image under `/usr/share/licenses/`. Dependencies are updated automatically by [Renovate](https://github.com/renovatebot/renovate), and the base images are pinned by digest. Builds carry signed SBOMs and provenance attestations, verifiable with `gh attestation verify`.
+The license text of every bundled component is in the image under `/usr/share/licenses/`. Dependencies are updated automatically by [Renovate](https://github.com/renovatebot/renovate), and the base images are pinned by digest. Builds carry signed SBOMs and provenance attestations. [Reading the software bill of materials](https://github.com/cplieger/docs/blob/main/docs/images.md#reading-the-software-bill-of-materials) and [Checking with the GitHub CLI](https://github.com/cplieger/docs/blob/main/docs/images.md#checking-with-the-github-cli) show how to check the SBOM.

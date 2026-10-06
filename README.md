@@ -100,7 +100,7 @@ Converted files are mode `0600` and belong to the container's user, so the app t
 
 cert-converter opens no network port and runs as a non-root user on an image with no shell. It refuses to convert when `/input` and `/output` are the same folder or one is inside the other. Keep the `/input` mount read-only.
 
-`PFX_PASSWORD` is the only protection on the private key inside each PFX file. A value in `.env` or `environment:` is visible to anyone who can run `docker inspect`. To keep it out, mount a Docker secret and set `PFX_PASSWORD_FILE` to its path inside the container.
+`PFX_PASSWORD` is the only protection on the private key inside each PFX file. A value in `.env` or `environment:` is visible to anyone who can run `docker inspect`. To keep it out, mount a [Docker secret](https://github.com/cplieger/docs/blob/main/docs/hardening.md#secrets-in-files) and set `PFX_PASSWORD_FILE` to its path inside the container.
 
 With `OUTPUT_FORMATS` set to `pem`, each private key is written as a plain `.key` file, so turn it on only where the output folder is access-controlled. The `legacyrc2` profile uses 40-bit RC2, which can be broken by trying every key, so keep it for a device that accepts nothing else.
 
