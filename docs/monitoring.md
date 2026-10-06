@@ -13,7 +13,7 @@ cert-converter has no metrics endpoint, and its state is in its logs. It writes 
 
 ## Alerting
 
-Ship the container's logs to Loki and load the rules in [`alerts/logql.yaml`](../alerts/logql.yaml) into [Loki's ruler](https://grafana.com/docs/loki/latest/alert/). Grafana Alloy's Docker log discovery ships the logs with no extra configuration, and firing alerts go through your Alertmanager like any Prometheus alert. They cover:
+Load the rules in [`alerts/logql.yaml`](../alerts/logql.yaml) into Loki's ruler, as [Loading an app's alert rules](https://github.com/cplieger/docs/blob/main/docs/monitoring.md#loading-an-apps-alert-rules) shows. They cover:
 
 | Alert | Fires when | Severity |
 | --- | --- | --- |

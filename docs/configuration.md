@@ -16,7 +16,7 @@ Every setting is an environment variable. The container reads them once when it 
 
 The container refuses to start when `PFX_PASSWORD` is empty or blank, unless `PFX_ALLOW_EMPTY_PASSWORD=true` is set. Blank means whitespace only, or invisible characters only, such as a byte-order mark. It also refuses a value that PKCS#12 cannot encode, because such a value produces bundles no consumer can open with the configured secret. Three kinds of value are refused this way. They are a character outside the Basic Multilingual Plane, a byte sequence that is not valid UTF-8, and an embedded NUL.
 
-`PFX_PASSWORD_FILE` also accepts a Podman secret or any other mounted file. It keeps the secret out of `docker inspect`. Setting both logs a WARN naming the one that is ignored. A configured file never falls back to `PFX_PASSWORD`.
+`PFX_PASSWORD_FILE` reads a Docker secret, a Podman secret or any other mounted file, as [Secrets in files](https://github.com/cplieger/docs/blob/main/docs/hardening.md#secrets-in-files) shows. Setting both logs a WARN naming the one that is ignored. A configured file never falls back to `PFX_PASSWORD`.
 
 - The file is read once, bounded at 1 MB, and used verbatim apart from at most one trailing line ending. Whitespace inside or around the password stays part of it.
 - Leading or trailing whitespace draws a WARN on either channel, because every consumer must type that whitespace too.
