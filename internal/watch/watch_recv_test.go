@@ -92,7 +92,7 @@ func TestHandleErrorRecv_closed_channel_stops_the_loop(t *testing.T) {
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
-	if got := w.handleErrorRecv(t.Context(), watcher, st, nil, false); got != errErrorsChannelClosed {
+	if got := st.handleErrorRecv(t.Context(), watcher, nil, false); got != errErrorsChannelClosed {
 		t.Errorf("handleErrorRecv(ok=false) = %v, want the errors-channel-closed loss (%v) so watchLoop exits and the process restarts",
 			got, errErrorsChannelClosed)
 	}
@@ -126,7 +126,7 @@ func TestHandleSafetyNetTick_resyncs_the_watch_set_before_scanning(t *testing.T)
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
-	w.handleSafetyNetTick(t.Context(), watcher, st)
+	st.handleSafetyNetTick(t.Context(), watcher)
 
 	if scans != 1 {
 		t.Errorf("handleSafetyNetTick scans = %d, want 1 (the safety-net rescan must still fire)", scans)
@@ -151,7 +151,7 @@ func TestHandleSafetyNetTick_skips_the_scan_when_shutdown_cut_the_resync_short(t
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	w.handleSafetyNetTick(ctx, watcher, st)
+	st.handleSafetyNetTick(ctx, watcher)
 
 	if scans != 0 {
 		t.Errorf("handleSafetyNetTick(cancelled ctx) ran %d scans, want 0 (the loop is about to return; a shutdown must not start a scan)", scans)
@@ -183,7 +183,7 @@ func TestHandleErrorRecv_defers_a_second_overflow_resync_to_the_floor(t *testing
 	t.Cleanup(st.stop)
 
 	// The zero lastResync means the first re-assert of a run always runs.
-	if got := w.handleErrorRecv(t.Context(), watcher, st, fsnotify.ErrEventOverflow, true); got != nil {
+	if got := st.handleErrorRecv(t.Context(), watcher, fsnotify.ErrEventOverflow, true); got != nil {
 		t.Fatalf("handleErrorRecv(first ErrEventOverflow) = %v, want nil", got)
 	}
 	if watched := watcher.WatchList(); !slices.Contains(watched, nested) {
@@ -198,7 +198,7 @@ func TestHandleErrorRecv_defers_a_second_overflow_resync_to_the_floor(t *testing
 	}
 	st.pending, st.repairPending = false, false
 
-	if got := w.handleErrorRecv(t.Context(), watcher, st, fsnotify.ErrEventOverflow, true); got != nil {
+	if got := st.handleErrorRecv(t.Context(), watcher, fsnotify.ErrEventOverflow, true); got != nil {
 		t.Errorf("handleErrorRecv(second ErrEventOverflow) = %v, want nil (an overflow is recoverable, not fatal)", got)
 	}
 	if watched := watcher.WatchList(); slices.Contains(watched, nested) {
@@ -225,7 +225,7 @@ func TestHandleErrorRecv_keeps_the_loop_running_when_the_overflow_resync_fails(t
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
-	if got := w.handleErrorRecv(t.Context(), watcher, st, fsnotify.ErrEventOverflow, true); got != nil {
+	if got := st.handleErrorRecv(t.Context(), watcher, fsnotify.ErrEventOverflow, true); got != nil {
 		t.Errorf("handleErrorRecv(overflow, re-sync failing) = %v, want nil: a failed re-sync is warned about, not fatal to the loop", got)
 	}
 	if !st.pending {
@@ -252,7 +252,7 @@ func TestHandleErrorRecv_does_not_resync_the_watch_set_for_a_benign_error(t *tes
 		t.Fatal(err)
 	}
 
-	if got := w.handleErrorRecv(t.Context(), watcher, st, errors.New("transient watcher failure"), true); got != nil {
+	if got := st.handleErrorRecv(t.Context(), watcher, errors.New("transient watcher failure"), true); got != nil {
 		t.Errorf("handleErrorRecv(non-overflow error) = %v, want nil (the loop keeps running)", got)
 	}
 	if watched := watcher.WatchList(); slices.Contains(watched, late) {
@@ -368,7 +368,7 @@ func TestHandleSafetyNetTick_runs_the_scan_when_resync_fails(t *testing.T) {
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
-	w.handleSafetyNetTick(t.Context(), watcher, st)
+	st.handleSafetyNetTick(t.Context(), watcher)
 
 	if scans != 1 {
 		t.Errorf("handleSafetyNetTick(resync failing) ran %d scans, want 1: a failed watch-set repair must not disable the polling safety net", scans)
@@ -631,7 +631,7 @@ func TestRecvHelpers_do_no_work_after_cancellation(t *testing.T) {
 			// A live context would WARN "watcher error" with the rescan cadence.
 			name: "a queued watcher error is not announced",
 			call: func(ctx context.Context, w *Watcher, watcher *fsnotify.Watcher, st *watchState) *LostError {
-				return w.handleErrorRecv(ctx, watcher, st, errors.New("transient watcher failure"), true)
+				return st.handleErrorRecv(ctx, watcher, errors.New("transient watcher failure"), true)
 			},
 		},
 	} {
@@ -732,7 +732,7 @@ func TestHandleSafetyNetTick_charges_its_reassert_to_the_floor(t *testing.T) {
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
-	w.handleSafetyNetTick(t.Context(), watcher, st)
+	st.handleSafetyNetTick(t.Context(), watcher)
 	if !slices.Contains(watcher.WatchList(), dir) {
 		t.Fatalf("watch list after the safety-net tick = %v, want %q: the tick must re-assert the watch set before scanning", watcher.WatchList(), dir)
 	}

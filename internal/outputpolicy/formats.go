@@ -10,16 +10,16 @@ type Format string
 
 // The two output formats.
 const (
-	// FormatPFX emits the PKCS#12 bundle, <stem>.pfx.
-	FormatPFX Format = "pfx"
-	// FormatPEM emits the PEM pair, <stem>.crt and <stem>.key. The key file is a
+	// formatPFX emits the PKCS#12 bundle, <stem>.pfx.
+	formatPFX Format = "pfx"
+	// formatPEM emits the PEM pair, <stem>.crt and <stem>.key. The key file is a
 	// plaintext private key, which is why this format is opt-in.
-	FormatPEM Format = "pem"
+	formatPEM Format = "pem"
 )
 
 // formatNames is the accepted OUTPUT_FORMATS value domain, stated ONCE, for the
 // same one-sided-edit reason lifecycleModes records.
-var formatNames = [...]Format{FormatPFX, FormatPEM}
+var formatNames = [...]Format{formatPFX, formatPEM}
 
 // Formats is the set of output families one scan produces.
 type Formats struct {
@@ -55,10 +55,10 @@ func parseFormats(raw string) (formats Formats, rejected []string, explicit bool
 	for token := range strings.SplitSeq(raw, ",") {
 		token = strings.TrimSpace(token)
 		switch Format(strings.ToLower(token)) {
-		case FormatPFX:
+		case formatPFX:
 			formats.PFX = true
 			explicit = true
-		case FormatPEM:
+		case formatPEM:
 			formats.PEM = true
 			explicit = true
 		case "":
@@ -77,7 +77,7 @@ func parseFormats(raw string) (formats Formats, rejected []string, explicit bool
 func (f Formats) Names() []string {
 	names := make([]string, 0, len(formatNames))
 	for _, name := range formatNames {
-		if (name == FormatPFX && f.PFX) || (name == FormatPEM && f.PEM) {
+		if (name == formatPFX && f.PFX) || (name == formatPEM && f.PEM) {
 			names = append(names, string(name))
 		}
 	}

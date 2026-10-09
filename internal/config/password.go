@@ -12,38 +12,38 @@ import (
 	"github.com/cplieger/envx/v2"
 )
 
-// ErrEmptyPassword indicates the resolved PFX password is blank — empty, entirely
+// errEmptyPassword indicates the resolved PFX password is blank — empty, entirely
 // Unicode whitespace, or entirely invisible formatting runes — and the
 // PFX_ALLOW_EMPTY_PASSWORD opt-out is not set.
-var ErrEmptyPassword = errors.New(
+var errEmptyPassword = errors.New(
 	"the resolved PFX password is empty or blank, meaning whitespace-only or invisible formatting characters only. " +
 		"Set PFX_PASSWORD, write a non-blank secret " +
 		"to the file named by PFX_PASSWORD_FILE, or set PFX_ALLOW_EMPTY_PASSWORD=true",
 )
 
-// ErrUnencodablePassword indicates the configured password contains invalid UTF-8,
+// errUnencodablePassword indicates the configured password contains invalid UTF-8,
 // a non-BMP rune, or an embedded NUL and cannot be represented safely by PKCS#12.
-var ErrUnencodablePassword = errors.New("the configured PFX password cannot be encoded by PKCS#12")
+var errUnencodablePassword = errors.New("the configured PFX password cannot be encoded by PKCS#12")
 
-// PasswordStatus is a non-secret classification of how well the resolved PFX password
+// passwordStatus is a non-secret classification of how well the resolved PFX password
 // protects the private key inside every generated PFX file.
-type PasswordStatus string
+type passwordStatus string
 
 // The PFX password classifications reported by classifyPassword.
 const (
-	// PasswordEmpty means the resolved password is empty.
-	PasswordEmpty PasswordStatus = "empty"
-	// PasswordWhitespaceOnly means the password consists only of whitespace,
+	// passwordEmpty means the resolved password is empty.
+	passwordEmpty passwordStatus = "empty"
+	// passwordWhitespaceOnly means the password consists only of whitespace,
 	// which is effectively no protection.
-	PasswordWhitespaceOnly PasswordStatus = "whitespace-only"
-	// PasswordInvisibleOnly means the password consists only of invisible runes
+	passwordWhitespaceOnly passwordStatus = "whitespace-only"
+	// passwordInvisibleOnly means the password consists only of invisible runes
 	// and at least one of them is invisible rather than whitespace — a format
 	// character, a variation selector, or another default-ignorable code point: a
 	// secret file holding nothing but a byte-order mark an editor added, or a
 	// pasted zero-width space.
-	PasswordInvisibleOnly PasswordStatus = "invisible-only"
-	// PasswordConfigured means a real password was supplied.
-	PasswordConfigured PasswordStatus = "configured"
+	passwordInvisibleOnly passwordStatus = "invisible-only"
+	// passwordConfigured means a real password was supplied.
+	passwordConfigured passwordStatus = "configured"
 )
 
 // resolvedPassword is the outcome of the PFX-password channel resolution: the value, its
@@ -52,7 +52,7 @@ const (
 // guidance).
 type resolvedPassword struct {
 	Value     string
-	Status    PasswordStatus
+	Status    passwordStatus
 	Channel   string
 	BlankFile bool
 }
@@ -92,16 +92,16 @@ func resolvePassword() (resolvedPassword, error) {
 	if err := checkPasswordEncodable(password); err != nil {
 		return resolvedPassword{}, fmt.Errorf("%w. The value was supplied via %s", err, channel)
 	}
-	if status != PasswordConfigured && !allowEmpty {
+	if status != passwordConfigured && !allowEmpty {
 		switch {
 		case blankSecretFile != nil:
-			return resolvedPassword{}, fmt.Errorf("%w: %w", ErrEmptyPassword, blankSecretFile)
+			return resolvedPassword{}, fmt.Errorf("%w: %w", errEmptyPassword, blankSecretFile)
 		case source == envx.SourceFile:
 			// An invisible-only mounted secret is blank only after
 			// classification, so envx carries no error naming the channel here.
-			return resolvedPassword{}, fmt.Errorf("%w. The value was supplied via %s", ErrEmptyPassword, channel)
+			return resolvedPassword{}, fmt.Errorf("%w. The value was supplied via %s", errEmptyPassword, channel)
 		}
-		return resolvedPassword{}, ErrEmptyPassword
+		return resolvedPassword{}, errEmptyPassword
 	}
 	logPasswordDelivery(source, password, status, blankSecretFile != nil)
 	return resolvedPassword{
@@ -115,16 +115,16 @@ func resolvePassword() (resolvedPassword, error) {
 // classifyPassword is the single home for the blank-password predicate: every consumer
 // (the empty-password guard, the weak-password WARN, the startup status line, the
 // both-channels WARN) derives from it, so they cannot drift.
-func classifyPassword(password string) PasswordStatus {
+func classifyPassword(password string) passwordStatus {
 	switch {
 	case password == "":
-		return PasswordEmpty
+		return passwordEmpty
 	case strings.TrimSpace(password) == "":
-		return PasswordWhitespaceOnly
+		return passwordWhitespaceOnly
 	case isInvisibleOnly(password):
-		return PasswordInvisibleOnly
+		return passwordInvisibleOnly
 	default:
-		return PasswordConfigured
+		return passwordConfigured
 	}
 }
 
@@ -167,7 +167,7 @@ func warnUnrecognizedAllowEmptyPassword(raw string, recognized bool) {
 // checkPasswordEncodable rejects password shapes PKCS#12 cannot preserve.
 func checkPasswordEncodable(password string) error {
 	if err := convert.ValidatePasswordEncoding(password); err != nil {
-		return fmt.Errorf("%w: %s", ErrUnencodablePassword, err)
+		return fmt.Errorf("%w: %s", errUnencodablePassword, err)
 	}
 	return nil
 }
@@ -175,7 +175,7 @@ func checkPasswordEncodable(password string) error {
 // warnBothPasswordChannels warns when the operator supplied the PFX password through
 // BOTH channels, because only one of them takes effect.
 func warnBothPasswordChannels(source envx.SecretSource) {
-	if source != envx.SourceFile || classifyPassword(os.Getenv("PFX_PASSWORD")) != PasswordConfigured {
+	if source != envx.SourceFile || classifyPassword(os.Getenv("PFX_PASSWORD")) != passwordConfigured {
 		return
 	}
 	slog.Warn("both PFX_PASSWORD and PFX_PASSWORD_FILE are set; the file wins and PFX_PASSWORD is ignored",
@@ -210,22 +210,22 @@ func passwordChannel(source envx.SecretSource) string {
 }
 
 // warnPasswordStrength warns when the password offers no real protection.
-func warnPasswordStrength(status PasswordStatus, channel string, blankFileReported bool) {
+func warnPasswordStrength(status passwordStatus, channel string, blankFileReported bool) {
 	switch status {
-	case PasswordEmpty:
+	case passwordEmpty:
 		if blankFileReported {
 			return
 		}
 		slog.Warn("PFX_PASSWORD is empty; generated PFX files protect the private key with an empty password",
 			"remediation", "set PFX_PASSWORD, or point PFX_PASSWORD_FILE at a mounted secret")
-	case PasswordWhitespaceOnly:
+	case passwordWhitespaceOnly:
 		slog.Warn("PFX_PASSWORD is whitespace-only; generated PFX files are protected by that whitespace string, which is effectively no protection",
 			"remediation", "set PFX_PASSWORD to a real value (check for stray quotes or spaces in the env file)")
-	case PasswordInvisibleOnly:
+	case passwordInvisibleOnly:
 		slog.Warn("the PFX password consists only of invisible Unicode formatting characters (byte-order mark, zero-width space, or soft hyphen); generated PFX files are protected by a password nobody can reproduce from the secret's visible contents",
 			"source", channel,
 			"remediation", "rewrite the secret without the invisible characters (an editor saving the secret file as \"UTF-8 with BOM\" is the usual cause; printf %s writes the value verbatim)")
-	case PasswordConfigured:
+	case passwordConfigured:
 		// The healthy case: the value is a secret, so nothing beyond the
 		// non-secret status in the startup line is logged.
 	}
@@ -233,8 +233,8 @@ func warnPasswordStrength(status PasswordStatus, channel string, blankFileReport
 
 // logPasswordDelivery reports the resolved source and actionable delivery problems
 // without logging the password itself.
-func logPasswordDelivery(source envx.SecretSource, password string, status PasswordStatus, blankSecretFile bool) {
-	blank := status != PasswordConfigured
+func logPasswordDelivery(source envx.SecretSource, password string, status passwordStatus, blankSecretFile bool) {
+	blank := status != passwordConfigured
 	if source == envx.SourceFile {
 		switch {
 		case blankSecretFile:

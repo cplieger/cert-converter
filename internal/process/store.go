@@ -218,8 +218,6 @@ func (c contentState) artifactNotProvenWrong() bool {
 
 // inspect resolves what this app knows about the output at rel, by READING it rather
 // than by remembering what was written: the state of its content.
-//
-//nolint:gocritic // hugeParam: convert.Analysis is ~96 bytes and passed by value on purpose; a pointer here would reopen the nil case the codec's value shape closes, to save a copy that is noise beside a PKCS#12 decode.
 func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 	wantEncoder convert.EncoderType, password string,
 ) (contentState, error) {
@@ -261,7 +259,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		return contentVerifiedStale, nil
 	}
 
-	s.reportLaxArtifact(rel, fi.Mode().Perm())
+	reportLaxArtifact(rel, fi.Mode().Perm())
 
 	if fi.Size() > maxPFXSize {
 		slog.Warn("prior pfx exceeds the readable bound; regenerating",
@@ -368,7 +366,7 @@ func (s *store) inspectRaw(ctx context.Context, rel string, want []byte) (conten
 		return contentVerifiedStale, nil
 	}
 
-	s.reportLaxArtifact(rel, fi.Mode().Perm())
+	reportLaxArtifact(rel, fi.Mode().Perm())
 
 	if fi.Size() != int64(len(want)) {
 		return contentVerifiedStale, nil
@@ -428,7 +426,7 @@ func laxerThan(perm, policy os.FileMode) bool {
 
 // reportLaxArtifact warns when a prior artifact's mode is laxer than
 // outputFileMode.
-func (s *store) reportLaxArtifact(rel string, perm os.FileMode) {
+func reportLaxArtifact(rel string, perm os.FileMode) {
 	if !laxerThan(perm, outputFileMode) {
 		return
 	}
@@ -441,9 +439,9 @@ func (s *store) reportLaxArtifact(rel string, perm os.FileMode) {
 type writeRefusalCause int
 
 const (
-	// refusalUnclassified is the zero value and is deliberately NOT a cause, like
-	// statusUnset and contentUnresolved.
-	refusalUnclassified writeRefusalCause = iota
+	// The zero value is deliberately NOT a cause, like statusUnset and
+	// contentUnresolved, and nothing produces it.
+	_ writeRefusalCause = iota
 	// refusalOwnership: the filesystem refused the operation for a permission reason
 	// (EACCES / EPERM).
 	refusalOwnership
@@ -464,6 +462,7 @@ const (
 	refusalTransient
 
 	// refusalCauseCount is the enum's LENGTH, not a cause.
+	//deadset:ignore DS1004 -- Sentinel the exhaustive cause test iterates up to, so a newly added cause cannot go uncharacterised.
 	refusalCauseCount
 )
 
@@ -484,7 +483,7 @@ func (c writeRefusalCause) remediation() string {
 	case refusalTransient:
 		return outputTransientRemediation
 	default:
-		// refusalOwnership, plus refusalUnclassified, which nothing produces — and any
+		// refusalOwnership, plus the zero value, which nothing produces — and any
 		// cause added later.
 		return outputPermRemediation
 	}
@@ -509,6 +508,8 @@ func (r classifiedWriteError) Error() string { return r.err.Error() }
 
 // Unwrap keeps errors.Is/As working THROUGH the refusal, so the wrapped diagnosis an
 // operator reads and the errno a test seam injects both stay reachable.
+//
+//deadset:ignore DS1103 -- IsShutdown reaches the wrapped context.Canceled through it, so a write cancelled at shutdown still reads as shutdown.
 func (r classifiedWriteError) Unwrap() error { return r.err }
 
 func (r classifiedWriteError) cause() writeRefusalCause { return r.refusalCause }
