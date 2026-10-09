@@ -71,7 +71,8 @@ func TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established(t *tes
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, &otherKey.PublicKey, nil, otherKey)
 
-	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, otherPEM), testcerts.KeyPEM(t, leafKey))
+	certPEM := concatPEM(leafPEM, otherPEM)
+	got, err := convert.Analyse(t.Context(), certPEM, testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(leaf whose issuer is absent) = error %v, want nil", err)
 	}
@@ -84,8 +85,9 @@ func TestAnalyse_keeps_certificates_when_the_issuer_cannot_be_established(t *tes
 	if got.Chain()[0].Subject.CommonName != "Possibly Related CA" {
 		t.Errorf("chain[0] = %q, want the kept certificate", got.Chain()[0].Subject.CommonName)
 	}
-	if len(got.Extra()) != 0 {
-		t.Errorf("Extra holds %d certificate(s), want 0: nothing was shown to be off the chain", len(got.Extra()))
+	left := mustExcludedCerts(t, certPEM, got)
+	if len(left) != 0 {
+		t.Errorf("Analyse left %d certificate(s) out of the bundle, want 0: nothing was shown to be off the chain", len(left))
 	}
 	if !hasObservation(got.Observations(), convert.ObsChainUnverified) {
 		t.Errorf("observations = %v, want one of kind %q so the operator knows the chain was not verified",
@@ -130,15 +132,17 @@ func TestAnalyse_still_excludes_an_unrelated_cert_from_a_self_signed_identity(t 
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &strangerKey.PublicKey, nil, strangerKey)
 
-	got, err := convert.Analyse(t.Context(), concatPEM(identityPEM, strangerPEM), testcerts.KeyPEM(t, key))
+	certPEM := concatPEM(identityPEM, strangerPEM)
+	got, err := convert.Analyse(t.Context(), certPEM, testcerts.KeyPEM(t, key))
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}
 	if len(got.Chain()) != 0 {
 		t.Errorf("chain length = %d, want 0: a self-signed identity has no chain", len(got.Chain()))
 	}
-	if len(got.Extra()) != 1 {
-		t.Fatalf("Extra holds %d certificate(s), want 1", len(got.Extra()))
+	left := mustExcludedCerts(t, certPEM, got)
+	if len(left) != 1 {
+		t.Fatalf("Analyse left %d certificate(s) out of the bundle, want 1", len(left))
 	}
 	if !hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
 		t.Errorf("observations = %v, want the exclusion reported", got.Observations())
@@ -235,7 +239,8 @@ func TestAnalyse_excludes_a_certificate_that_cannot_issue_certificates(t *testin
 			tc.disqualify(decoy)
 			decoyPEM, _ := testcerts.Mint(t, decoy, &decoyKey.PublicKey, nil, decoyKey)
 
-			got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, decoyPEM), testcerts.KeyPEM(t, leafKey))
+			certPEM := concatPEM(leafPEM, decoyPEM)
+			got, err := convert.Analyse(t.Context(), certPEM, testcerts.KeyPEM(t, leafKey))
 			if err != nil {
 				t.Fatalf("Analyse(leaf beside a %s) = error %v, want nil", tc.name, err)
 			}
@@ -243,8 +248,9 @@ func TestAnalyse_excludes_a_certificate_that_cannot_issue_certificates(t *testin
 				t.Errorf("chain = %v, want empty: a certificate that cannot issue certificates is no chain material",
 					chainSerials(got.Chain()))
 			}
-			if len(got.Extra()) != 1 {
-				t.Fatalf("Extra holds %d certificate(s), want 1 (the disqualified decoy)", len(got.Extra()))
+			left := mustExcludedCerts(t, certPEM, got)
+			if len(left) != 1 {
+				t.Fatalf("Analyse left %d certificate(s) out of the bundle, want 1 (the disqualified decoy)", len(left))
 			}
 			if !hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
 				t.Errorf("observations = %v, want the exclusion reported", got.Observations())
@@ -368,7 +374,8 @@ func TestAnalyse_keeps_a_signing_CA_that_is_not_issuer_eligible(t *testing.T) {
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, caCert, caKey)
 
-	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, caPEM), testcerts.KeyPEM(t, leafKey))
+	certPEM := concatPEM(leafPEM, caPEM)
+	got, err := convert.Analyse(t.Context(), certPEM, testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(leaf signed by a CA with no basic constraints) = error %v, want nil", err)
 	}
@@ -380,8 +387,9 @@ func TestAnalyse_keeps_a_signing_CA_that_is_not_issuer_eligible(t *testing.T) {
 	if !bytes.Equal(got.Chain()[0].Raw, caCert.Raw) {
 		t.Errorf("chain[0] = %q, want %q", got.Chain()[0].Subject.CommonName, caCert.Subject.CommonName)
 	}
-	if len(got.Extra()) != 0 {
-		t.Errorf("Extra holds %d certificate(s), want 0: the CA belongs in the chain, not beside it", len(got.Extra()))
+	left := mustExcludedCerts(t, certPEM, got)
+	if len(left) != 0 {
+		t.Errorf("Analyse left %d certificate(s) out of the bundle, want 0: the CA belongs in the chain, not beside it", len(left))
 	}
 
 	detail, ok := observationDetail(got.Observations(), convert.ObsChainCertCannotIssue)
@@ -458,7 +466,8 @@ func TestAnalyse_emits_a_compliant_chain_unchanged_and_silently(t *testing.T) {
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, interCert, interKey)
 
-	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, interPEM, rootPEM), testcerts.KeyPEM(t, leafKey))
+	certPEM := concatPEM(leafPEM, interPEM, rootPEM)
+	got, err := convert.Analyse(t.Context(), certPEM, testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(compliant leaf+intermediate+root) = error %v, want nil", err)
 	}
@@ -472,8 +481,9 @@ func TestAnalyse_emits_a_compliant_chain_unchanged_and_silently(t *testing.T) {
 			t.Errorf("chain[%d] = serial %s, want serial %s", i, got.Chain()[i].SerialNumber, want[i].SerialNumber)
 		}
 	}
-	if len(got.Extra()) != 0 {
-		t.Errorf("Extra holds %d certificate(s), want 0", len(got.Extra()))
+	left := mustExcludedCerts(t, certPEM, got)
+	if len(left) != 0 {
+		t.Errorf("Analyse left %d certificate(s) out of the bundle, want 0", len(left))
 	}
 	if len(got.Observations()) != 0 {
 		t.Errorf("observations = %v, want none: every certificate here is well-formed, in order and current", got.Observations())
@@ -552,15 +562,17 @@ func TestAnalyse_treats_a_reencoded_self_issued_certificate_as_its_own_root(t *t
 	strangerPEM, _ := testcerts.Mint(t, unverifiableCA(861, "Unrelated Bystander CA", notBefore, notBefore.Add(48*time.Hour)),
 		&strangerKey.PublicKey, nil, strangerKey)
 
-	got, err := convert.Analyse(t.Context(), concatPEM(selfPEM, strangerPEM), testcerts.KeyPEM(t, key))
+	certPEM := concatPEM(selfPEM, strangerPEM)
+	got, err := convert.Analyse(t.Context(), certPEM, testcerts.KeyPEM(t, key))
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}
 	if len(got.Chain()) != 0 {
 		t.Errorf("chain = %v, want empty: a self-issued certificate is its own root", chainSerials(got.Chain()))
 	}
-	if len(got.Extra()) != 1 || got.Extra()[0].SerialNumber.Cmp(big.NewInt(861)) != 0 {
-		t.Fatalf("Extra = %v, want the bystander alone", chainSerials(got.Extra()))
+	left := mustExcludedCerts(t, certPEM, got)
+	if len(left) != 1 || left[0].SerialNumber.Cmp(big.NewInt(861)) != 0 {
+		t.Fatalf("excluded serials = %v, want the bystander alone", chainSerials(left))
 	}
 	if !hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
 		t.Errorf("observations = %v, want %q: the bystander's exclusion is never silent",
@@ -615,8 +627,9 @@ func TestAnalyse_reports_an_unfinished_chain_with_nothing_left_over(t *testing.T
 	if len(got.Chain()) != 0 {
 		t.Errorf("chain = %v, want empty: the issuer is not in the bundle", chainSerials(got.Chain()))
 	}
-	if len(got.Extra()) != 0 {
-		t.Errorf("Extra = %v, want empty: there is nothing besides the identity", chainSerials(got.Extra()))
+	left := mustExcludedCerts(t, leafPEM, got)
+	if len(left) != 0 {
+		t.Errorf("excluded serials = %v, want empty: there is nothing besides the identity", chainSerials(left))
 	}
 	if !hasObservation(got.Observations(), convert.ObsChainTrustAnchorAbsent) {
 		t.Errorf("observations = %v, want %q: the leaf is not self-signed and its issuer could not be established",
@@ -689,15 +702,17 @@ func TestAnalyse_reports_an_unfinished_chain_when_only_the_root_is_absent(t *tes
 		NotAfter:     notBefore.Add(24 * time.Hour),
 	}, &leafKey.PublicKey, interCert, interKey)
 
-	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, interPEM), testcerts.KeyPEM(t, leafKey))
+	certPEM := concatPEM(leafPEM, interPEM)
+	got, err := convert.Analyse(t.Context(), certPEM, testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(a proven leaf/intermediate pair without its root) = error %v, want nil", err)
 	}
 	if len(got.Chain()) != 1 || got.Chain()[0].SerialNumber.Cmp(big.NewInt(873)) != 0 {
 		t.Fatalf("chain = %v, want the intermediate alone", chainSerials(got.Chain()))
 	}
-	if len(got.Extra()) != 0 {
-		t.Errorf("Extra = %v, want empty: every parsed certificate is on the path", chainSerials(got.Extra()))
+	left := mustExcludedCerts(t, certPEM, got)
+	if len(left) != 0 {
+		t.Errorf("excluded serials = %v, want empty: every parsed certificate is on the path", chainSerials(left))
 	}
 	if !hasObservation(got.Observations(), convert.ObsChainTrustAnchorAbsent) {
 		t.Errorf("observations = %v, want %q: the intermediate's own issuer is absent",
@@ -872,7 +887,8 @@ func TestAnalyse_names_the_cycle_when_the_walk_stops_at_a_cross_certified_issuer
 	notBefore := time.Now().Add(-time.Hour).Truncate(time.Second)
 	leafPEM, cPEM, pPEM, leafKeyPEM := mintCrossCertifiedPair(t, notBefore)
 
-	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, cPEM, pPEM), leafKeyPEM)
+	certPEM := concatPEM(leafPEM, cPEM, pPEM)
+	got, err := convert.Analyse(t.Context(), certPEM, leafKeyPEM)
 	if err != nil {
 		t.Fatalf("Analyse(a rootless cross-certified pair) = error %v, want nil: every hop it emits is proven", err)
 	}
@@ -882,8 +898,9 @@ func TestAnalyse_names_the_cycle_when_the_walk_stops_at_a_cross_certified_issuer
 		t.Fatalf("chain = %v, want C then P: the excluded issuer of the terminus must be IN the chain for this fixture to say anything",
 			chainSerials(got.Chain()))
 	}
-	if len(got.Extra()) != 0 {
-		t.Errorf("Extra = %v, want empty: every parsed certificate is on the path", chainSerials(got.Extra()))
+	left := mustExcludedCerts(t, certPEM, got)
+	if len(left) != 0 {
+		t.Errorf("excluded serials = %v, want empty: every parsed certificate is on the path", chainSerials(left))
 	}
 	if hasObservation(got.Observations(), convert.ObsChainEdgeUnprovenIssuer) {
 		t.Errorf("observations = %v, want no %q: both emitted hops are proven by signature",

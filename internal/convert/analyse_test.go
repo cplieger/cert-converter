@@ -102,7 +102,8 @@ func TestAnalyse_is_invariant_under_input_order(t *testing.T) {
 			orderedKeys = append(orderedKeys, keyBlobs[i])
 		}
 
-		got, err := convert.Analyse(t.Context(), concatPEM(orderedCerts...), concatPEM(orderedKeys...))
+		certPEM := concatPEM(orderedCerts...)
+		got, err := convert.Analyse(t.Context(), certPEM, concatPEM(orderedKeys...))
 		if err != nil {
 			rt.Fatalf("Analyse(cert order %v, key order %v) = error %v, want nil", certOrder, keyOrder, err)
 		}
@@ -115,8 +116,12 @@ func TestAnalyse_is_invariant_under_input_order(t *testing.T) {
 		if !bytes.Equal(got.Chain()[0].Raw, wantCADER) {
 			rt.Errorf("Analyse(cert order %v) chain[0] = %q, want the issuing CA", certOrder, got.Chain()[0].Subject.CommonName)
 		}
-		if len(got.Extra()) != 0 {
-			rt.Errorf("Analyse(cert order %v) excluded %d certificate(s), want 0", certOrder, len(got.Extra()))
+		left, err := excludedCerts(certPEM, got)
+		if err != nil {
+			rt.Fatalf("Setup: ParseCertChain(cert order %v) = %v", certOrder, err)
+		}
+		if len(left) != 0 {
+			rt.Errorf("Analyse(cert order %v) excluded %d certificate(s), want 0", certOrder, len(left))
 		}
 		// The invariant that makes the bundle internally consistent: the returned
 		// key is the private half of the returned leaf.

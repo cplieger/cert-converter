@@ -91,8 +91,8 @@ func TestAnalyseBundle_rejectsExcessiveIterationsBeforeDecode(t *testing.T) {
 			tc.mutate(t, &preamble)
 
 			_, err = AnalyseBundleWithBudget(t.Context(), testASN1Marshal(t, preamble), "pw", NewBundleWorkBudget())
-			if !errors.Is(err, ErrBundleUnbounded) {
-				t.Errorf("AnalyseBundleWithBudget(%s with excessive iterations) = %v, want ErrBundleUnbounded", tc.name, err)
+			if !errors.Is(err, errBundleUnbounded) {
+				t.Errorf("AnalyseBundleWithBudget(%s with excessive iterations) = %v, want errBundleUnbounded", tc.name, err)
 			}
 		})
 	}
@@ -117,8 +117,8 @@ func TestAnalyseBundle_rejectsAggregateDerivationWorkAboveBudget(t *testing.T) {
 	})
 
 	_, err = AnalyseBundleWithBudget(t.Context(), testASN1Marshal(t, preamble), "pw", NewBundleWorkBudget())
-	if !errors.Is(err, ErrBundleUnbounded) {
-		t.Errorf("AnalyseBundleWithBudget(bundle with 6,000,000 weighted rounds) = %v, want ErrBundleUnbounded", err)
+	if !errors.Is(err, errBundleUnbounded) {
+		t.Errorf("AnalyseBundleWithBudget(bundle with 6,000,000 weighted rounds) = %v, want errBundleUnbounded", err)
 	}
 }
 
@@ -145,8 +145,8 @@ func TestAnalyseBundle_rejectsPlaintextSafeAboveBagBudget(t *testing.T) {
 	})
 
 	_, err = AnalyseBundleWithBudget(t.Context(), testASN1Marshal(t, preamble), "pw", NewBundleWorkBudget())
-	if !errors.Is(err, ErrBundleUnbounded) {
-		t.Errorf("AnalyseBundleWithBudget(plaintext safe with %d bags) = %v, want ErrBundleUnbounded", maxSafeBags+1, err)
+	if !errors.Is(err, errBundleUnbounded) {
+		t.Errorf("AnalyseBundleWithBudget(plaintext safe with %d bags) = %v, want errBundleUnbounded", maxSafeBags+1, err)
 	}
 }
 
@@ -171,8 +171,8 @@ func TestBoundInputBundle_appliesScanWideWorkBudget(t *testing.T) {
 			t.Fatalf("boundInputBundle(bundle %d of 6) = %v, want nil inside scan budget", i, err)
 		}
 	}
-	if err := boundInputBundle(mutated, budget); !errors.Is(err, ErrBundleUnbounded) {
-		t.Errorf("boundInputBundle(bundle 7) = %v, want ErrBundleUnbounded after cumulative scan work", err)
+	if err := boundInputBundle(mutated, budget); !errors.Is(err, errBundleUnbounded) {
+		t.Errorf("boundInputBundle(bundle 7) = %v, want errBundleUnbounded after cumulative scan work", err)
 	}
 }
 
@@ -193,8 +193,8 @@ func TestBoundInputBundle_rejectsOverflowWithoutPoisoningScanBudget(t *testing.T
 	malicious := testASN1Marshal(t, preamble)
 	budget := NewBundleWorkBudget()
 
-	if err := boundInputBundle(malicious, budget); !errors.Is(err, ErrBundleUnbounded) {
-		t.Fatalf("boundInputBundle(overflowing PBMAC1 count) = %v, want ErrBundleUnbounded", err)
+	if err := boundInputBundle(malicious, budget); !errors.Is(err, errBundleUnbounded) {
+		t.Fatalf("boundInputBundle(overflowing PBMAC1 count) = %v, want errBundleUnbounded", err)
 	}
 	if err := boundInputBundle(valid, budget); err != nil {
 		t.Errorf("boundInputBundle(valid bundle after rejection) = %v, want nil: a rejected bundle must not poison scan budget", err)

@@ -22,9 +22,9 @@ import (
 // arbitrary input. Internal consistency: the returned key is provably the private
 // half of the returned leaf, which is what makes the emitted PFX usable at all.
 // Conservation: every certificate Analyse emits came from the certificate file,
-// each appears exactly once across the leaf, the chain and the excluded set, and
-// every distinct input certificate is accounted for in one of the three. A chain
-// assembly or path walk that dropped a link, repeated the leaf as its own CA bag or
+// each appears exactly once across the leaf and the chain, and a certificate is
+// left out of the bundle exactly when an exclusion is reported. A chain assembly or
+// path walk that dropped a link silently, repeated the leaf as its own CA bag or
 // invented a certificate would satisfy every fixture-based test in the package.
 func FuzzAnalyse_keeps_the_bundle_internally_consistent(f *testing.F) {
 	m := testcerts.GenerateChainMaterial(f)
@@ -82,20 +82,18 @@ func FuzzAnalyse_keeps_the_bundle_internally_consistent(f *testing.F) {
 		for _, c := range got.Chain() {
 			emitted[string(c.Raw)]++
 		}
-		for _, c := range got.Extra() {
-			emitted[string(c.Raw)]++
-		}
 		for raw, n := range emitted {
 			if !fromInput[raw] {
 				t.Errorf("Analyse emitted a certificate the certificate file does not hold")
 			}
 			if n != 1 {
-				t.Errorf("Analyse emitted one certificate %d times across the leaf, the chain and the excluded set", n)
+				t.Errorf("Analyse emitted one certificate %d times across the leaf and the chain", n)
 			}
 		}
-		if len(emitted) != len(fromInput) {
-			t.Fatalf("Analyse accounted for %d of the %d distinct certificates in the file; each one is the leaf, chain material or excluded",
-				len(emitted), len(fromInput))
+		left := len(fromInput) - len(emitted)
+		if reported := hasObservation(got.Observations(), convert.ObsExtraCertsExcluded); reported != (left > 0) {
+			t.Errorf("Analyse left %d of the %d distinct certificates out of the bundle, and reported an exclusion = %v: every certificate left out is reported, and only then",
+				left, len(fromInput), reported)
 		}
 	})
 }

@@ -690,8 +690,8 @@ func TestLoad_unreadable_password_file_fails_loudly(t *testing.T) {
 
 			if _, err := Load(); err == nil {
 				t.Fatal("Load() = nil error, want a startup failure for an unusable PFX_PASSWORD_FILE")
-			} else if errors.Is(err, ErrEmptyPassword) {
-				t.Errorf("Load() = %v, want the underlying secret-file error, not ErrEmptyPassword", err)
+			} else if errors.Is(err, errEmptyPassword) {
+				t.Errorf("Load() = %v, want the underlying secret-file error, not errEmptyPassword", err)
 			}
 			// The refusal quotes envx's message, which names PFX_PASSWORD — the
 			// variable the file-wins rule ignores. The conflict WARN is the only
@@ -731,8 +731,8 @@ func TestLoad_empty_password_optout_requires_literal_true(t *testing.T) {
 			if tc.wantAllow && err != nil {
 				t.Errorf("Load() with PFX_ALLOW_EMPTY_PASSWORD=%q got err %v, want nil (trimmed, case-insensitive true opts out)", tc.optout, err)
 			}
-			if !tc.wantAllow && !errors.Is(err, ErrEmptyPassword) {
-				t.Errorf("Load() with PFX_ALLOW_EMPTY_PASSWORD=%q got err %v, want ErrEmptyPassword (only literal true opts out)", tc.optout, err)
+			if !tc.wantAllow && !errors.Is(err, errEmptyPassword) {
+				t.Errorf("Load() with PFX_ALLOW_EMPTY_PASSWORD=%q got err %v, want errEmptyPassword (only literal true opts out)", tc.optout, err)
 			}
 		})
 	}
@@ -747,40 +747,40 @@ func TestClassifyPassword(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		password string
-		want     PasswordStatus
+		want     passwordStatus
 	}{
-		{"empty is empty", "", PasswordEmpty},
-		{"single space is whitespace-only", " ", PasswordWhitespaceOnly},
-		{"tab newline and space are whitespace-only", "\t\n ", PasswordWhitespaceOnly},
+		{"empty is empty", "", passwordEmpty},
+		{"single space is whitespace-only", " ", passwordWhitespaceOnly},
+		{"tab newline and space are whitespace-only", "\t\n ", passwordWhitespaceOnly},
 		// unicode.IsSpace covers U+00A0, so a non-breaking space pasted from a
 		// document is whitespace-only, not a real password.
-		{"non-breaking space is whitespace-only", "\u00a0", PasswordWhitespaceOnly},
-		{"real value is configured", "s3cret", PasswordConfigured},
-		{"padded real value is configured", "  s3cret  ", PasswordConfigured},
-		{"single printable char is configured", "x", PasswordConfigured},
+		{"non-breaking space is whitespace-only", "\u00a0", passwordWhitespaceOnly},
+		{"real value is configured", "s3cret", passwordConfigured},
+		{"padded real value is configured", "  s3cret  ", passwordConfigured},
+		{"single printable char is configured", "x", passwordConfigured},
 		// TrimSpace does not trim NUL, so a binary secret is a real password.
-		{"NUL byte is configured", "\x00", PasswordConfigured},
+		{"NUL byte is configured", "\x00", passwordConfigured},
 		// The invisible-only class: every rune survives TrimSpace yet none of them
 		// can be seen or retyped. A secret file an editor saved as "UTF-8 with BOM"
-		// and nothing else is the realistic case, and it used to classify as
-		// "configured" — starting the container without the opt-out and reporting a
-		// password that protects the key against nobody.
-		{"a byte-order mark alone is invisible-only", "\ufeff", PasswordInvisibleOnly},
-		{"a zero-width space alone is invisible-only", "\u200b", PasswordInvisibleOnly},
-		{"a soft hyphen alone is invisible-only", "\u00ad", PasswordInvisibleOnly},
-		{"several format runes are invisible-only", "\ufeff\u200b\u00ad", PasswordInvisibleOnly},
+		// and nothing else is the realistic case; read as "configured", it would
+		// start the container without the opt-out and with a password that
+		// protects the key against nobody.
+		{"a byte-order mark alone is invisible-only", "\ufeff", passwordInvisibleOnly},
+		{"a zero-width space alone is invisible-only", "\u200b", passwordInvisibleOnly},
+		{"a soft hyphen alone is invisible-only", "\u00ad", passwordInvisibleOnly},
+		{"several format runes are invisible-only", "\ufeff\u200b\u00ad", passwordInvisibleOnly},
 		// Whitespace mixed with a format rune is not whitespace-only (TrimSpace
 		// leaves the BOM behind), so it lands in the invisible-only class rather
 		// than being read as a configured password.
-		{"a byte-order mark beside whitespace is invisible-only", "\ufeff \t\n", PasswordInvisibleOnly},
+		{"a byte-order mark beside whitespace is invisible-only", "\ufeff \t\n", passwordInvisibleOnly},
 		// One visible rune is a real password: the class is about a value with
 		// nothing an operator can read, not about carrying an invisible rune.
-		{"a byte-order mark beside a real value is configured", "\ufeffhunter2", PasswordConfigured},
-		{"an interior zero-width space is configured", "pw\u200bsecret", PasswordConfigured},
+		{"a byte-order mark beside a real value is configured", "\ufeffhunter2", passwordConfigured},
+		{"an interior zero-width space is configured", "pw\u200bsecret", passwordConfigured},
 		// Invalid UTF-8 decodes as U+FFFD, which is neither space nor Cf, so a
 		// binary secret stays a configured password (checkPasswordEncodable owns
 		// refusing it).
-		{"the replacement rune is configured", "\ufffd", PasswordConfigured},
+		{"the replacement rune is configured", "\ufffd", passwordConfigured},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := classifyPassword(tc.password); got != tc.want {
@@ -804,20 +804,20 @@ func TestLoad_password_status_agrees_with_its_warning(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		password    string
-		wantStatus  PasswordStatus
+		wantStatus  passwordStatus
 		wantWarnSub string
 	}{
-		{"empty reports empty", "", PasswordEmpty, "PFX_PASSWORD is empty"},
-		{"single space is whitespace-only", " ", PasswordWhitespaceOnly, "PFX_PASSWORD is whitespace-only"},
-		{"tab and newline are whitespace-only", "\t\n ", PasswordWhitespaceOnly, "PFX_PASSWORD is whitespace-only"},
-		{"real value is configured", "s3cret", PasswordConfigured, ""},
-		{"padded value is configured", "  s3cret  ", PasswordConfigured, ""},
+		{"empty reports empty", "", passwordEmpty, "PFX_PASSWORD is empty"},
+		{"single space is whitespace-only", " ", passwordWhitespaceOnly, "PFX_PASSWORD is whitespace-only"},
+		{"tab and newline are whitespace-only", "\t\n ", passwordWhitespaceOnly, "PFX_PASSWORD is whitespace-only"},
+		{"real value is configured", "s3cret", passwordConfigured, ""},
+		{"padded value is configured", "  s3cret  ", passwordConfigured, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			isolatePasswordFile(t)
 			t.Setenv("PFX_PASSWORD", tc.password)
 			// A blank password only reaches the warning with the opt-out set;
-			// without it Load refuses to start (ErrEmptyPassword).
+			// without it Load refuses to start (errEmptyPassword).
 			t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "true")
 
 			logs := capture.Default(t)
@@ -1162,8 +1162,8 @@ func TestCheckPasswordEncodable_refuses_every_unrepresentable_shape(t *testing.T
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			err := checkPasswordEncodable(tc.password)
-			if !errors.Is(err, ErrUnencodablePassword) {
-				t.Fatalf("checkPasswordEncodable(%q) = %v, want ErrUnencodablePassword: the container must refuse to start", tc.password, err)
+			if !errors.Is(err, errUnencodablePassword) {
+				t.Fatalf("checkPasswordEncodable(%q) = %v, want errUnencodablePassword: the container must refuse to start", tc.password, err)
 			}
 			got := err.Error()
 			if !strings.Contains(got, tc.wantMessage) || !strings.Contains(got, tc.wantRemediation) {
@@ -1233,8 +1233,8 @@ func TestLoad_rejects_a_whitespace_only_password(t *testing.T) {
 
 			_, err := Load()
 			if tc.wantErr {
-				if !errors.Is(err, ErrEmptyPassword) {
-					t.Errorf("Load(PFX_PASSWORD=%q) = %v, want ErrEmptyPassword", tc.password, err)
+				if !errors.Is(err, errEmptyPassword) {
+					t.Errorf("Load(PFX_PASSWORD=%q) = %v, want errEmptyPassword", tc.password, err)
 				}
 				return
 			}
@@ -1253,8 +1253,8 @@ func TestLoad_refuses_an_unencodable_password(t *testing.T) {
 	t.Setenv("PFX_PASSWORD_FILE", "")
 
 	_, err := Load()
-	if !errors.Is(err, ErrUnencodablePassword) {
-		t.Fatalf("Load(non-BMP password) = %v, want ErrUnencodablePassword", err)
+	if !errors.Is(err, errUnencodablePassword) {
+		t.Fatalf("Load(non-BMP password) = %v, want errUnencodablePassword", err)
 	}
 	if !strings.Contains(err.Error(), "supplied via PFX_PASSWORD") {
 		t.Errorf("Load(non-BMP env password) = %v, want the refusal to name the channel that supplied the secret", err)
@@ -1302,10 +1302,10 @@ func TestLoad_refuses_a_supplementary_variation_selector_as_unencodable(t *testi
 			}
 
 			_, err := Load()
-			if !errors.Is(err, ErrUnencodablePassword) {
-				t.Errorf("Load(supplementary variation selector) = %v, want ErrUnencodablePassword", err)
+			if !errors.Is(err, errUnencodablePassword) {
+				t.Errorf("Load(supplementary variation selector) = %v, want errUnencodablePassword", err)
 			}
-			if errors.Is(err, ErrEmptyPassword) {
+			if errors.Is(err, errEmptyPassword) {
 				t.Errorf("Load(supplementary variation selector) = %v, want the encoding refusal rather than the blank one: PFX_ALLOW_EMPTY_PASSWORD cannot resolve a non-BMP password", err)
 			}
 		})
@@ -1324,8 +1324,8 @@ func TestLoad_still_routes_an_encodable_blank_through_the_optout(t *testing.T) {
 	t.Setenv("PFX_PASSWORD", bomOnly)
 
 	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
-	if _, err := Load(); !errors.Is(err, ErrEmptyPassword) {
-		t.Errorf("Load(BOM-only, no opt-out) = %v, want ErrEmptyPassword", err)
+	if _, err := Load(); !errors.Is(err, errEmptyPassword) {
+		t.Errorf("Load(BOM-only, no opt-out) = %v, want errEmptyPassword", err)
 	}
 
 	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "true")
@@ -1334,20 +1334,11 @@ func TestLoad_still_routes_an_encodable_blank_through_the_optout(t *testing.T) {
 	}
 }
 
-// TestLoad_blank_secret_file_obeys_the_same_optout pins the unification:
-// PFX_ALLOW_EMPTY_PASSWORD now means ONE thing regardless of how the secret was
-// delivered.
-//
-// Before, the same question had three answers: a blank PFX_PASSWORD was accepted with a
-// warning, a blank PFX_PASSWORD_FILE aborted startup inside envx before the opt-out was
-// ever consulted, and the opt-out governed only the environment channel. An operator who
-// set PFX_ALLOW_EMPTY_PASSWORD=true and mounted an empty secret file got a container that
-// refused to start, for the exact configuration they had just asked for.
-//
-// This is a deliberate behaviour change in BOTH directions: a blank file now starts WITH
-// the opt-out where it previously failed, and fails with ErrEmptyPassword WITHOUT it
-// where it previously failed with envx's error. An unusable file — unreadable, oversized,
-// rejected path — is still never rescued; that is TestLoad_unreadable_password_file_fails_loudly.
+// TestLoad_blank_secret_file_obeys_the_same_optout pins that PFX_ALLOW_EMPTY_PASSWORD
+// means ONE thing regardless of how the secret was delivered: a blank PFX_PASSWORD_FILE
+// starts WITH the opt-out and fails with errEmptyPassword WITHOUT it, exactly like a
+// blank PFX_PASSWORD. An unusable file (unreadable, oversized, rejected path) is never
+// rescued; that is TestLoad_unreadable_password_file_fails_loudly.
 func TestLoad_blank_secret_file_obeys_the_same_optout(t *testing.T) {
 	blankFile := func(t *testing.T) string {
 		t.Helper()
@@ -1358,13 +1349,13 @@ func TestLoad_blank_secret_file_obeys_the_same_optout(t *testing.T) {
 		return path
 	}
 
-	t.Run("blank file without the opt-out is ErrEmptyPassword", func(t *testing.T) {
+	t.Run("blank file without the opt-out is errEmptyPassword", func(t *testing.T) {
 		t.Setenv("PFX_PASSWORD", "")
 		t.Setenv("PFX_PASSWORD_FILE", blankFile(t))
 		t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
 
-		if _, err := Load(); !errors.Is(err, ErrEmptyPassword) {
-			t.Errorf("Load(blank file, no opt-out) = %v, want ErrEmptyPassword", err)
+		if _, err := Load(); !errors.Is(err, errEmptyPassword) {
+			t.Errorf("Load(blank file, no opt-out) = %v, want errEmptyPassword", err)
 		}
 	})
 
@@ -1456,7 +1447,7 @@ func TestLoad_blank_secret_file_obeys_the_same_optout(t *testing.T) {
 }
 
 // TestLoad_blank_secret_file_error_names_configured_path pins the startup
-// diagnostic: a blank secret file must fail as ErrEmptyPassword AND name the
+// diagnostic: a blank secret file must fail as errEmptyPassword AND name the
 // configured path, which is the only way an operator can tell which mounted
 // secret to repair. Classifying the error alone stays green if Load stops
 // wrapping envx's path-bearing ErrBlankSecretFile.
@@ -1470,8 +1461,8 @@ func TestLoad_blank_secret_file_error_names_configured_path(t *testing.T) {
 	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
 
 	_, err := Load()
-	if !errors.Is(err, ErrEmptyPassword) {
-		t.Fatalf("Load(blank password file) = %v, want ErrEmptyPassword", err)
+	if !errors.Is(err, errEmptyPassword) {
+		t.Fatalf("Load(blank password file) = %v, want errEmptyPassword", err)
 	}
 	if !strings.Contains(err.Error(), path) {
 		t.Errorf("Load(blank password file) error = %q, want configured path %q", err, path)
@@ -1782,8 +1773,8 @@ func TestLoad_unencodable_secret_file_names_the_file_channel(t *testing.T) {
 	t.Setenv("PFX_ALLOW_EMPTY_PASSWORD", "")
 
 	_, err := Load()
-	if !errors.Is(err, ErrUnencodablePassword) {
-		t.Fatalf("Load(unencodable secret file) = %v, want ErrUnencodablePassword", err)
+	if !errors.Is(err, errUnencodablePassword) {
+		t.Fatalf("Load(unencodable secret file) = %v, want errUnencodablePassword", err)
 	}
 	if !strings.Contains(err.Error(), "supplied via PFX_PASSWORD_FILE") {
 		t.Errorf("Load(unencodable secret file) = %v, want it to name PFX_PASSWORD_FILE, not the ignored env variable", err)
@@ -1869,8 +1860,8 @@ func TestLoad_refuses_an_invisible_only_password_on_both_channels(t *testing.T) 
 
 				cfg, err := Load()
 				if ch.wantErr {
-					if !errors.Is(err, ErrEmptyPassword) {
-						t.Fatalf("Load(%s=%q) = %v, want ErrEmptyPassword: an invisible-only password is blank, so the opt-out must govern it",
+					if !errors.Is(err, errEmptyPassword) {
+						t.Fatalf("Load(%s=%q) = %v, want errEmptyPassword: an invisible-only password is blank, so the opt-out must govern it",
 							ch.channel, tc.password, err)
 					}
 					return
@@ -1889,9 +1880,9 @@ func TestLoad_refuses_an_invisible_only_password_on_both_channels(t *testing.T) 
 					t.Errorf("Load(%s=%q, opt-out) Password = %q, want %q verbatim",
 						ch.channel, tc.password, cfg.Password, tc.password)
 				}
-				if cfg.PasswordStatus != PasswordInvisibleOnly {
+				if cfg.PasswordStatus != passwordInvisibleOnly {
 					t.Errorf("Load(%s=%q, opt-out) status = %q, want %q: the startup line must not report a password nobody can retype as configured",
-						ch.channel, tc.password, cfg.PasswordStatus, PasswordInvisibleOnly)
+						ch.channel, tc.password, cfg.PasswordStatus, passwordInvisibleOnly)
 				}
 				if n := logs.CountLevel(slog.LevelWarn, invisibleOnlyWarn); n != 1 {
 					t.Errorf("Load(%s=%q, opt-out) logged %d WARN records matching %q, want exactly 1 (logs %v)",
@@ -1971,22 +1962,22 @@ func TestLoad_derives_status_and_warnings_from_one_classification(t *testing.T) 
 		name       string
 		channel    string
 		password   string
-		wantStatus PasswordStatus
+		wantStatus passwordStatus
 		wantWarns  []string
 	}{
-		{"env empty", "PFX_PASSWORD", "", PasswordEmpty, []string{emptyWarn}},
-		{"env whitespace-only", "PFX_PASSWORD", " \t", PasswordWhitespaceOnly, []string{whitespaceWarn}},
-		{"env invisible-only", "PFX_PASSWORD", "\ufeff", PasswordInvisibleOnly, []string{invisibleOnlyWarn}},
-		{"env configured", "PFX_PASSWORD", "hunter2", PasswordConfigured, nil},
+		{"env empty", "PFX_PASSWORD", "", passwordEmpty, []string{emptyWarn}},
+		{"env whitespace-only", "PFX_PASSWORD", " \t", passwordWhitespaceOnly, []string{whitespaceWarn}},
+		{"env invisible-only", "PFX_PASSWORD", "\ufeff", passwordInvisibleOnly, []string{invisibleOnlyWarn}},
+		{"env configured", "PFX_PASSWORD", "hunter2", passwordConfigured, nil},
 		// envx judges a secret file's blankness on its whitespace-trimmed content, so
 		// an empty and a whitespace-only file are the
 		// same delivery failure and both arrive as ErrBlankSecretFile with an empty
 		// password: the channel-specific record reports it and the generic
 		// empty-password line is deliberately suppressed.
-		{"file empty", "PFX_PASSWORD_FILE", "", PasswordEmpty, []string{blankFileWarn}},
-		{"file whitespace-only", "PFX_PASSWORD_FILE", "  \n", PasswordEmpty, []string{blankFileWarn}},
-		{"file invisible-only", "PFX_PASSWORD_FILE", "\u200b", PasswordInvisibleOnly, []string{invisibleOnlyWarn}},
-		{"file configured", "PFX_PASSWORD_FILE", "hunter2", PasswordConfigured, nil},
+		{"file empty", "PFX_PASSWORD_FILE", "", passwordEmpty, []string{blankFileWarn}},
+		{"file whitespace-only", "PFX_PASSWORD_FILE", "  \n", passwordEmpty, []string{blankFileWarn}},
+		{"file invisible-only", "PFX_PASSWORD_FILE", "\u200b", passwordInvisibleOnly, []string{invisibleOnlyWarn}},
+		{"file configured", "PFX_PASSWORD_FILE", "hunter2", passwordConfigured, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setPasswordChannel(t, tc.channel, tc.password)
@@ -2015,7 +2006,7 @@ func TestLoad_derives_status_and_warnings_from_one_classification(t *testing.T) 
 			}
 			// The healthy case is also a derivation: a configured password produces
 			// no quality WARN at all, and the file channel says so at INFO.
-			if tc.wantStatus == PasswordConfigured && tc.channel == "PFX_PASSWORD_FILE" &&
+			if tc.wantStatus == passwordConfigured && tc.channel == "PFX_PASSWORD_FILE" &&
 				logs.CountLevel(slog.LevelInfo, "PFX password configured") != 1 {
 				t.Errorf("Load(%s=%q) did not report the configured mounted secret at INFO (logs %v)",
 					tc.channel, tc.password, logs.Messages())

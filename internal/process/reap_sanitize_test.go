@@ -17,7 +17,7 @@ import (
 // from the OUTPUT tree's own enumeration -- a tree a co-writer chooses the names in.
 //
 // What it pins, and what breaks without it: dropping logtext.Path from sampleOrphanPaths
-// or from keyStillPresent's two WARNs leaves every other test in this package green,
+// or from keyRetention's two WARNs leaves every other test in this package green,
 // because every orphan fixture elsewhere carries an ordinary name and sanitizing is
 // byte-identical for those.
 //
@@ -29,7 +29,7 @@ import (
 // the path the record names.
 //
 // Warn mode, the default, is what emits both records in one scan: the orphan report
-// carries the sample, and the retention loop reaches keyStillPresent for the same
+// carries the sample, and the retention loop reaches keyRetention for the same
 // candidate, whose sibling key this fixture leaves in place.
 //
 // Runs serially: it swaps slog.Default().
@@ -40,7 +40,7 @@ func TestStoreReconcile_sanitizes_output_derived_names_in_log_attributes(t *test
 	if err := os.WriteFile(filepath.Join(outDir, rawBundle), []byte("pfx"), 0o600); err != nil {
 		t.Fatalf("setup: WriteFile(%q): %v", rawBundle, err)
 	}
-	// The sibling key with no certificate: the lone-key retention, so keyStillPresent's
+	// The sibling key with no certificate: the lone-key retention, so keyRetention's
 	// WARN names the hostile path too.
 	if err := os.WriteFile(filepath.Join(inDir, layout.KeyFor(rawCert)), []byte("key"), 0o600); err != nil {
 		t.Fatalf("setup: WriteFile(key): %v", err)
