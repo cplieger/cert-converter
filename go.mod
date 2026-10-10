@@ -10,7 +10,7 @@ require (
 	github.com/cplieger/slogx v1.6.7
 	github.com/fsnotify/fsnotify v1.10.1
 	pgregory.net/rapid v1.3.0
-	software.sslmate.com/src/go-pkcs12 v0.7.3
+	software.sslmate.com/src/go-pkcs12 v0.7.4
 )
 
 require (
