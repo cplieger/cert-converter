@@ -6,7 +6,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cplieger/cert-converter/internal/logtext"
-	"github.com/cplieger/runesafe/v2"
+	"github.com/cplieger/runesafe/v3"
 )
 
 // FuzzBoundLogText_bounded_and_loggable fuzzes the package's log-hygiene rule over
