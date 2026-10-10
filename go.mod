@@ -3,7 +3,7 @@ module github.com/cplieger/cert-converter
 go 1.27.2
 
 require (
-	github.com/cplieger/atomicfile/v4 v4.0.0
+	github.com/cplieger/atomicfile/v4 v4.0.1
 	github.com/cplieger/envx/v2 v2.0.7
 	github.com/cplieger/health v1.8.2
 	github.com/cplieger/runesafe/v2 v2.1.1
@@ -15,6 +15,6 @@ require (
 
 require (
 	github.com/cplieger/pathinside/v2 v2.0.3 // indirect
-	golang.org/x/crypto v0.57.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 )
