@@ -11,7 +11,7 @@ import (
 )
 
 // Encode produces the PKCS#12 bytes for an analysed certificate/key pair.
-func (a Analysis) Encode(encName EncoderType, password string) ([]byte, error) { //nolint:gocritic // hugeParam: the value Analyse hands back cannot be nil, so this body needs no nil arm; the 96-byte copy is noise beside the PBKDF2 that follows it.
+func (a Analysis) Encode(encName EncoderType, password string) ([]byte, error) {
 	// Defensive, and deliberately NOT redundant with internal/config's
 	// checkPasswordEncodable: both guards are wanted, and neither is the only line
 	// of defence.
@@ -83,7 +83,7 @@ type Currency struct {
 
 // CheckCurrency reports whether pfx is already the bundle this analysis would
 // produce under wantEncoder, and when it is not, why.
-func (a Analysis) CheckCurrency(pfx []byte, password string, wantEncoder EncoderType) Currency { //nolint:gocritic // hugeParam: same reason as Encode — the value Analyse hands back cannot be nil, so this body needs no nil arm.
+func (a Analysis) CheckCurrency(pfx []byte, password string, wantEncoder EncoderType) Currency {
 	priorProfile, err := inspect(pfx)
 	if err != nil {
 		return Currency{Reason: refusalReason(err), Err: boundedTextError{err}}
@@ -124,7 +124,7 @@ func decode(pfx []byte, password string) (decoded, error) {
 // matchesAnalysis reports whether d is the bundle a would produce: the same
 // end-entity certificate, the same private key, and the same chain in the same
 // order.
-func (d decoded) matchesAnalysis(a Analysis) bool { //nolint:gocritic // hugeParam: reached only from CheckCurrency, which already holds the value.
+func (d decoded) matchesAnalysis(a Analysis) bool {
 	if !bytes.Equal(d.Leaf.Raw, a.leaf.Raw) {
 		return false
 	}

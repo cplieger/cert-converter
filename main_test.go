@@ -699,13 +699,6 @@ func TestReportWatchExit_announces_dead_change_detection_exactly_once(t *testing
 	})
 }
 
-// shutdownCause is a distinguishable cancellation cause: for a plain
-// cancel(), context.Cause(ctx) and ctx.Err() both render as "context
-// canceled", so a test built on cancel() cannot tell the two apart.
-type shutdownCause struct{}
-
-func (shutdownCause) Error() string { return "terminated-under-test" }
-
 // TestReportWatchExit_shutdown_names_the_cancellation_cause pins the only
 // operator-visible detail of the clean-shutdown path: the reason attr names
 // WHICH signal stopped the container. reportWatchExit reports
@@ -717,8 +710,10 @@ func (shutdownCause) Error() string { return "terminated-under-test" }
 func TestReportWatchExit_shutdown_names_the_cancellation_cause(t *testing.T) {
 	logs := capture.Default(t)
 
+	// A distinguishable cause: for a plain cancel(), context.Cause(ctx) and
+	// ctx.Err() both render as "context canceled".
 	ctx, cancel := context.WithCancelCause(context.Background())
-	cancel(shutdownCause{})
+	cancel(errors.New("terminated-under-test"))
 
 	if got := reportWatchExit(ctx, nil); got != 0 {
 		t.Fatalf("reportWatchExit(nil) = %d, want 0: a clean shutdown is not a failure", got)

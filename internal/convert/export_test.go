@@ -53,14 +53,13 @@ func ParsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 const MaxVerifiableKeyBits = maxVerifiableKeyBits
 
 // Analysis's representation, as test-only accessors. Production exports only
-// Observations, so keeping the leaf, chain, key and excluded certificates
-// unexported is what stops a consumer invalidating Analyse's cert-matches-key
-// invariant before handing the value back to Encode. The external tests still
-// have to assert on that representation, so they read it here.
+// Observations, so keeping the leaf, chain and key unexported is what stops a
+// consumer invalidating Analyse's cert-matches-key invariant before handing the
+// value back to Encode. The external tests still have to assert on that
+// representation, so they read it here.
 func (a *Analysis) Leaf() *x509.Certificate    { return a.leaf }
 func (a *Analysis) Chain() []*x509.Certificate { return a.chain }
 func (a *Analysis) Key() crypto.PrivateKey     { return a.key }
-func (a *Analysis) Extra() []*x509.Certificate { return a.extra }
 
 // The PKCS#12 password-encoding classifier, as test-only handles. Same rule as
 // the parsers above: the package publishes only ValidatePasswordEncoding, so

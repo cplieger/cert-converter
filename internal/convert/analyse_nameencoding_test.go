@@ -220,7 +220,8 @@ func TestAnalyse_orders_a_chain_proven_across_a_name_encoding_difference(t *test
 
 	// Input order deliberately breaks ancestry: root before upper. The additive
 	// fallback would emit 802,800,801.
-	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, lowerPEM, rootPEM, upperPEM), testcerts.KeyPEM(t, leafKey))
+	certPEM := concatPEM(leafPEM, lowerPEM, rootPEM, upperPEM)
+	got, err := convert.Analyse(t.Context(), certPEM, testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse(chain proven across an encoding difference) = error %v, want nil", err)
 	}
@@ -228,8 +229,9 @@ func TestAnalyse_orders_a_chain_proven_across_a_name_encoding_difference(t *test
 		t.Errorf("chain serials = %s, want 802,801,800 (ancestry order from the path walk, not the input order an additive tail would emit)",
 			serials)
 	}
-	if len(got.Extra()) != 0 {
-		t.Errorf("Extra holds %d certificate(s), want 0", len(got.Extra()))
+	left := mustExcludedCerts(t, certPEM, got)
+	if len(left) != 0 {
+		t.Errorf("Analyse left %d certificate(s) out of the bundle, want 0", len(left))
 	}
 	if hasObservation(got.Observations(), convert.ObsChainUnverified) {
 		t.Errorf("observations = %v, want no %q: every edge in this bundle is proven by signature",
@@ -276,15 +278,17 @@ func TestAnalyse_excludes_a_stranger_once_the_encoding_gap_is_proven(t *testing.
 		t.Fatal("setup: issuer and subject encodings unexpectedly match, so the gap under test is absent")
 	}
 
-	got, err := convert.Analyse(t.Context(), concatPEM(leafPEM, caPEM, strangerPEM), testcerts.KeyPEM(t, leafKey))
+	certPEM := concatPEM(leafPEM, caPEM, strangerPEM)
+	got, err := convert.Analyse(t.Context(), certPEM, testcerts.KeyPEM(t, leafKey))
 	if err != nil {
 		t.Fatalf("Analyse = error %v, want nil", err)
 	}
 	if serials := strings.Join(chainSerials(got.Chain()), ","); serials != "830" {
 		t.Errorf("chain serials = %s, want 830 alone: the proven CA is the whole chain, and the bystander is not part of it", serials)
 	}
-	if len(got.Extra()) != 1 || got.Extra()[0].SerialNumber.Cmp(big.NewInt(832)) != 0 {
-		t.Fatalf("Extra = %v, want the unrelated bystander alone", chainSerials(got.Extra()))
+	left := mustExcludedCerts(t, certPEM, got)
+	if len(left) != 1 || left[0].SerialNumber.Cmp(big.NewInt(832)) != 0 {
+		t.Fatalf("excluded serials = %v, want the unrelated bystander alone", chainSerials(left))
 	}
 	if !hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
 		t.Errorf("observations = %v, want the exclusion reported: a certificate left out of the bundle is never silent", got.Observations())

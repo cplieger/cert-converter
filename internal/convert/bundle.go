@@ -27,9 +27,9 @@ const (
 	MaxPEMOutputBytes = 2 * MaxBundleBytes
 )
 
-// ErrBundleUnbounded reports a PFX the preflight refused to hand to the decoder
+// errBundleUnbounded reports a PFX the preflight refused to hand to the decoder
 // because its per-bundle or scan-wide derivation work exceeds a ceiling.
-var ErrBundleUnbounded = errors.New("input bundle declares key-derivation work above the accepted ceiling")
+var errBundleUnbounded = errors.New("input bundle declares key-derivation work above the accepted ceiling")
 
 // BundleWorkBudget carries decoder-equivalent KDF work across one input scan.
 // Construct one per scan and pass it to every AnalyseBundleWithBudget call.
@@ -53,17 +53,17 @@ func (b *inputWorkBudget) add(what string, iterations, weight int) error {
 	// before multiplication, so attacker-controlled int overflow is impossible.
 	if int64(iterations) > maxBundleKDFWork/int64(weight) {
 		return fmt.Errorf("%w: %s declares %d iterations at weight %d, bundle limit %d",
-			ErrBundleUnbounded, what, iterations, weight, maxBundleKDFWork)
+			errBundleUnbounded, what, iterations, weight, maxBundleKDFWork)
 	}
 	work := int64(iterations) * int64(weight)
 	nextBundle := b.bundle + work
 	if nextBundle > maxBundleKDFWork {
 		return fmt.Errorf("%w: %s brings bundle work to %d weighted rounds, limit %d",
-			ErrBundleUnbounded, what, nextBundle, maxBundleKDFWork)
+			errBundleUnbounded, what, nextBundle, maxBundleKDFWork)
 	}
 	if b.scan.total > maxScanKDFWork-nextBundle {
 		return fmt.Errorf("%w: %s would bring scan work to %d weighted rounds, limit %d",
-			ErrBundleUnbounded, what, b.scan.total+nextBundle, maxScanKDFWork)
+			errBundleUnbounded, what, b.scan.total+nextBundle, maxScanKDFWork)
 	}
 	b.bundle = nextBundle
 	return nil
@@ -104,7 +104,7 @@ func AnalyseBundleWithBudget(ctx context.Context, pfx []byte, password string, b
 // CERTIFICATE blocks, leaf first, and the private key as an unencrypted PKCS#8
 // block. The output is deterministic for one analysed identity, which is what
 // lets a byte comparison decide whether a prior PEM artifact is current.
-func (a Analysis) EncodePEM() (certPEM, keyPEM []byte, err error) { //nolint:gocritic // hugeParam: same reason as Encode — the value Analyse hands back cannot be nil, so this body needs no nil arm.
+func (a Analysis) EncodePEM() (certPEM, keyPEM []byte, err error) {
 	certPEM, err = encodeCertsPEM(append([]*x509.Certificate{a.leaf}, a.chain...))
 	if err != nil {
 		return nil, nil, err
@@ -233,7 +233,7 @@ func boundPlaintextSafeBags(content []byte, budget *inputWorkBudget) error {
 	}
 	elements, err := sequenceElements(inner, "plaintext safe bags", maxSafeBags)
 	if errors.Is(err, errElementBudget) {
-		return fmt.Errorf("%w: plaintext safe holds more than %d bags", ErrBundleUnbounded, maxSafeBags)
+		return fmt.Errorf("%w: plaintext safe holds more than %d bags", errBundleUnbounded, maxSafeBags)
 	}
 	if err != nil {
 		return nil

@@ -15,7 +15,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/cert-converter/internal/scancadence"
-	"github.com/cplieger/runesafe/v2"
+	"github.com/cplieger/runesafe/v3"
 	"github.com/cplieger/slogx"
 )
 
@@ -76,7 +76,7 @@ type Config struct {
 	EncoderName    convert.EncoderType
 	Lifecycle      outputpolicy.Lifecycle
 	Layout         outputpolicy.Layout
-	PasswordStatus PasswordStatus
+	PasswordStatus passwordStatus
 	// Exclude names the input paths the operator declared are not this app's to
 	// convert. Excluded sources are enumerated and still protect their artifacts
 	// from orphan reconciliation; only the conversion is skipped.

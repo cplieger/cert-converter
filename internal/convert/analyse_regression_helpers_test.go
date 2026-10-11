@@ -32,6 +32,38 @@ func chainSerials(chain []*x509.Certificate) []string {
 	return out
 }
 
+// excludedCerts returns the distinct certificates of certPEM that are left out of the
+// bundle, in input order: every certificate that is neither its leaf nor chain
+// material.
+func excludedCerts(certPEM []byte, a convert.Analysis) ([]*x509.Certificate, error) {
+	input, err := convert.ParseCertChain(certPEM)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{string(a.Leaf().Raw): true}
+	for _, c := range a.Chain() {
+		seen[string(c.Raw)] = true
+	}
+	var out []*x509.Certificate
+	for _, c := range input {
+		if !seen[string(c.Raw)] {
+			seen[string(c.Raw)] = true
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+// mustExcludedCerts is excludedCerts for a test whose certificate file is a fixture.
+func mustExcludedCerts(t *testing.T, certPEM []byte, a convert.Analysis) []*x509.Certificate {
+	t.Helper()
+	out, err := excludedCerts(certPEM, a)
+	if err != nil {
+		t.Fatalf("Setup: ParseCertChain(fixture) = %v", err)
+	}
+	return out
+}
+
 // assertOrderInvariant runs Analyse over every rotation of certBlobs and asserts
 // the selected identity and the emitted chain are byte-identical every time.
 //

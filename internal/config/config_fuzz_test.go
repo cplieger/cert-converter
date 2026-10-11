@@ -39,8 +39,8 @@ func FuzzCheckPasswordEncodable_gate_matches_the_recognizer(f *testing.F) {
 		if err == nil {
 			return
 		}
-		if !errors.Is(err, ErrUnencodablePassword) {
-			t.Errorf("checkPasswordEncodable(%q) = %v, want it to wrap ErrUnencodablePassword", password, err)
+		if !errors.Is(err, errUnencodablePassword) {
+			t.Errorf("checkPasswordEncodable(%q) = %v, want it to wrap errUnencodablePassword", password, err)
 		}
 		if strings.Contains(err.Error(), password) {
 			t.Errorf("checkPasswordEncodable leaked the password into %q", err.Error())

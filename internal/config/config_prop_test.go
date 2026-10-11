@@ -121,7 +121,7 @@ func TestParseFallbackInterval_clamps_every_value_above_the_ceiling(t *testing.T
 
 // TestClassifyPassword_blankness_matches_the_visible_content pins the single
 // password classification over arbitrary values built from the runes that decide
-// it: a password is PasswordConfigured exactly when it carries at least one rune an
+// it: a password is passwordConfigured exactly when it carries at least one rune an
 // operator can see, and every other value is one of the three blank classes.
 //
 // This is the property the guard, the WARN and the startup status all read, so a
@@ -147,26 +147,26 @@ func TestClassifyPassword_blankness_matches_the_visible_content(t *testing.T) {
 		}
 
 		status := classifyPassword(password)
-		if hasVisible != (status == PasswordConfigured) {
+		if hasVisible != (status == passwordConfigured) {
 			t.Fatalf("classifyPassword(%q) = %q, but the value %s a visible rune: a password nobody can read must never classify as configured",
 				password, status, map[bool]string{true: "carries", false: "carries no"}[hasVisible])
 		}
 		// Each blank class describes what the value actually is, so the WARN the
 		// operator reads matches the value they configured.
 		switch status {
-		case PasswordEmpty:
+		case passwordEmpty:
 			if password != "" {
 				t.Errorf("classifyPassword(%q) = %q, want that class only for an empty value", password, status)
 			}
-		case PasswordWhitespaceOnly:
+		case passwordWhitespaceOnly:
 			if strings.TrimSpace(password) != "" {
 				t.Errorf("classifyPassword(%q) = %q, but the value survives TrimSpace", password, status)
 			}
-		case PasswordInvisibleOnly:
+		case passwordInvisibleOnly:
 			if strings.TrimSpace(password) == "" {
 				t.Errorf("classifyPassword(%q) = %q, but the value is whitespace-only, which has its own class and WARN", password, status)
 			}
-		case PasswordConfigured:
+		case passwordConfigured:
 		default:
 			t.Errorf("classifyPassword(%q) reported an unknown status %q", password, status)
 		}

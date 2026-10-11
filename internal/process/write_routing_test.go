@@ -290,7 +290,7 @@ func TestWriteRefusalCause_states_both_facts_for_every_declared_cause(t *testing
 		clearable   bool
 		remediation string
 	}{
-		refusalUnclassified:  {"refusalUnclassified", false, outputPermRemediation},
+		0:                    {"writeRefusalCause(0)", false, outputPermRemediation},
 		refusalOwnership:     {"refusalOwnership", false, outputPermRemediation},
 		refusalOutputLayout:  {"refusalOutputLayout", false, outputPinRemediation},
 		refusalVolume:        {"refusalVolume", false, outputVolumeRemediation},
@@ -330,15 +330,9 @@ func TestWriteRefusalCause_states_both_facts_for_every_declared_cause(t *testing
 
 // TestStoreWrite_a_refusal_stays_unwrappable_so_a_cancelled_write_reads_as_shutdown pins
 // the one contract the refusal's classification must not cost: errors.Is still walks
-// THROUGH it.
-//
-// reportWriteFailure hands the refusal to failEntry, whose shutdown split is
-// errors.Is(err, context.Canceled). A wrapper that carries a cause but drops Unwrap makes
-// that false, so a write interrupted by SIGTERM logs "conversion failed" at ERROR and
-// raises the documented CertConverterConversionFailed alert on every normal container
-// stop. This repo has already shipped that exact bug once from a wrapper missing Unwrap,
-// which is why the property gets a test rather than a comment — and why
-// (classifiedWriteError).Unwrap is in .punused-ignore rather than deleted as unreferenced.
+// THROUGH it. failEntry's shutdown split is errors.Is(err, context.Canceled); a wrapper
+// that drops Unwrap makes a write interrupted by SIGTERM log "conversion failed" at ERROR
+// and raise the CertConverterConversionFailed alert on every normal container stop.
 //
 // Runs serially: it swaps the write seam.
 func TestStoreWrite_a_refusal_stays_unwrappable_so_a_cancelled_write_reads_as_shutdown(t *testing.T) {

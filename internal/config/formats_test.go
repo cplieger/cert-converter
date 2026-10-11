@@ -262,8 +262,8 @@ func TestLoad_refusesUnusableInputBundlePassword(t *testing.T) {
 		cause error
 	}{
 		{name: "missing secret file", file: filepath.Join(t.TempDir(), "absent")},
-		{name: "explicit blank environment password", env: "", cause: ErrEmptyInputPassword},
-		{name: "unencodable environment password", env: "supplementary \U0001F600", cause: ErrUnencodablePassword},
+		{name: "explicit blank environment password", env: "", cause: errEmptyInputPassword},
+		{name: "unencodable environment password", env: "supplementary \U0001F600", cause: errUnencodablePassword},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			isolateFormatConfig(t)
@@ -321,7 +321,7 @@ func TestLoad_refusesBlankInputPasswordFile(t *testing.T) {
 	t.Setenv("INPUT_PFX_PASSWORD_FILE", file)
 
 	_, err := Load()
-	if !errors.Is(err, ErrEmptyInputPassword) {
-		t.Errorf("Load(blank INPUT_PFX_PASSWORD_FILE) = %v, want ErrEmptyInputPassword", err)
+	if !errors.Is(err, errEmptyInputPassword) {
+		t.Errorf("Load(blank INPUT_PFX_PASSWORD_FILE) = %v, want errEmptyInputPassword", err)
 	}
 }

@@ -14,7 +14,7 @@ package logtext
 import (
 	"strings"
 
-	"github.com/cplieger/runesafe/v2"
+	"github.com/cplieger/runesafe/v3"
 )
 
 // Marker is appended to any text Cap had to cut, and is the marker internal/convert

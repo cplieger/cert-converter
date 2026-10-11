@@ -716,10 +716,10 @@ func (w *Watcher) runWatchLoop(ctx context.Context, watcher *fsnotify.Watcher, s
 			st.runDeferredRepair(ctx, watcher)
 
 		case <-st.safetyNetTimer.C:
-			w.handleSafetyNetTick(ctx, watcher, st)
+			st.handleSafetyNetTick(ctx, watcher)
 
 		case err, ok := <-watcher.Errors:
-			if lost := w.handleErrorRecv(ctx, watcher, st, err, ok); lost != nil {
+			if lost := st.handleErrorRecv(ctx, watcher, err, ok); lost != nil {
 				return lostOrShutdown(ctx, lost)
 			}
 		}
@@ -783,44 +783,6 @@ func (w *Watcher) handleEventRecv(
 		st.scheduleScan()
 	}
 	return nil
-}
-
-// handleErrorRecv owns watchLoop's whole error-channel arm: it reports which
-// terminal loss that arm observed, or nil while change detection is live.
-func (w *Watcher) handleErrorRecv(
-	ctx context.Context, watcher *fsnotify.Watcher, st *watchState, err error, ok bool,
-) *LostError {
-	if !ok {
-		return errErrorsChannelClosed
-	}
-	if ctx.Err() != nil {
-		return nil
-	}
-	if st.handleWatcherError(err) {
-		// The dropped events may have included the Create of a new directory, which
-		// would otherwise stay unwatched for the rest of the process's life.
-		st.resyncOrDefer(ctx, watcher,
-			"failed to re-sync the watch set after an event-queue overflow; a directory whose Create was dropped stays unwatched until the next re-sync")
-	}
-	return nil
-}
-
-// handleSafetyNetTick runs the periodic safety-net rescan — the operator's
-// FALLBACK_SCAN_HOURS cadence, or the reconciliation floor standing in for it — and
-// re-asserts the watch set first.
-func (w *Watcher) handleSafetyNetTick(ctx context.Context, watcher *fsnotify.Watcher, st *watchState) {
-	// This tick re-asserts the whole set too, so it shares the pre-scan re-assert's
-	// clock: a debounced scan landing right behind it has nothing left to recover, a
-	// repair deferred earlier finds its interval already covered, and charging every
-	// site to one timestamp is what keeps the walk on a cadence this process chose
-	// (see minPreScanResync).
-	st.resync(ctx, watcher,
-		"failed to re-sync the watch set during the periodic safety-net scan; the scan below still runs, so a renewal is not missed")
-	// The re-sync above can itself be cut short by cancellation.
-	if ctx.Err() != nil {
-		return
-	}
-	st.runSafetyNetScan(ctx)
 }
 
 // resyncWatchSet re-asserts the watch set over the root (watcher.Add is idempotent,
@@ -933,6 +895,44 @@ func (st *watchState) stop() {
 	st.debounceTimer.Stop()
 	st.repairTimer.Stop()
 	st.safetyNetTimer.Stop()
+}
+
+// handleErrorRecv owns watchLoop's whole error-channel arm: it reports which
+// terminal loss that arm observed, or nil while change detection is live.
+func (st *watchState) handleErrorRecv(
+	ctx context.Context, watcher *fsnotify.Watcher, err error, ok bool,
+) *LostError {
+	if !ok {
+		return errErrorsChannelClosed
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
+	if st.handleWatcherError(err) {
+		// The dropped events may have included the Create of a new directory, which
+		// would otherwise stay unwatched for the rest of the process's life.
+		st.resyncOrDefer(ctx, watcher,
+			"failed to re-sync the watch set after an event-queue overflow; a directory whose Create was dropped stays unwatched until the next re-sync")
+	}
+	return nil
+}
+
+// handleSafetyNetTick runs the periodic safety-net rescan — the operator's
+// FALLBACK_SCAN_HOURS cadence, or the reconciliation floor standing in for it — and
+// re-asserts the watch set first.
+func (st *watchState) handleSafetyNetTick(ctx context.Context, watcher *fsnotify.Watcher) {
+	// This tick re-asserts the whole set too, so it shares the pre-scan re-assert's
+	// clock: a debounced scan landing right behind it has nothing left to recover, a
+	// repair deferred earlier finds its interval already covered, and charging every
+	// site to one timestamp is what keeps the walk on a cadence this process chose
+	// (see minPreScanResync).
+	st.resync(ctx, watcher,
+		"failed to re-sync the watch set during the periodic safety-net scan; the scan below still runs, so a renewal is not missed")
+	// The re-sync above can itself be cut short by cancellation.
+	if ctx.Err() != nil {
+		return
+	}
+	st.runSafetyNetScan(ctx)
 }
 
 // scheduleScan arms the debounce timer to coalesce a burst of events into one

@@ -156,11 +156,11 @@ func (rp *reaper) reportRetainedOrphans(orphaned []string, walkSafe bool) {
 		"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),
 		"action", inaction,
 		"remediation", remediation)
-	// keyStillPresent owns the half-deleted-pair record; with no deletion to gate,
-	// its answer is the report itself. The sources are re-resolved before that
-	// record fires: `expected` was filled by the input walk before the /output walk,
-	// so it cannot itself prove the sources are gone by now. Only the mirror
-	// layout can derive a candidate's sources from its name.
+	// keyRetention owns the half-deleted-pair record, and with no deletion to gate
+	// it is only reported. The sources are re-resolved before that record fires:
+	// `expected` was filled by the input walk before the /output walk, so it cannot
+	// itself prove the sources are gone by now. Only the mirror layout can derive a
+	// candidate's sources from its name.
 	if walkSafe && rp.layoutMode != outputpolicy.LayoutFlat {
 		for _, rel := range orphaned {
 			stem := layout.OutputStem(rel)
@@ -170,7 +170,9 @@ func (rp *reaper) reportRetainedOrphans(orphaned []string, walkSafe bool) {
 			if err != nil || !absent {
 				continue
 			}
-			rp.keyStillPresent(rel, layout.CertFor(stem))
+			if report := rp.keyRetention(rel, layout.CertFor(stem)); report != nil {
+				report()
+			}
 		}
 	}
 }
@@ -486,17 +488,6 @@ func (rp *reaper) sourceAllowsRemoval(ctx context.Context, rel string) (bool, er
 		return false, nil
 	}
 	return true, nil
-}
-
-// keyStillPresent vetoes one confirmed candidate's deletion because the sibling PRIVATE
-// KEY of its certificate is still under /input, and reports the retention.
-func (rp *reaper) keyStillPresent(rel, cert string) bool {
-	report := rp.keyRetention(rel, cert)
-	if report == nil {
-		return false
-	}
-	report()
-	return true
 }
 
 // keyRetention reads the sibling PRIVATE KEY of cert and returns the record naming

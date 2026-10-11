@@ -128,8 +128,8 @@ type Observation struct {
 }
 
 // Analysis is the resolved result of reading a certificate bundle and a key
-// file: which certificate is the identity, which private key belongs to it,
-// which certificates form its chain and in what order, and which were left out.
+// file: which certificate is the identity, which private key belongs to it, and
+// which certificates form its chain and in what order.
 type Analysis struct {
 	// leaf is the end-entity certificate the PFX is built around.
 	leaf *x509.Certificate
@@ -137,16 +137,13 @@ type Analysis struct {
 	chain []*x509.Certificate
 	// key is the private half of leaf.
 	key crypto.Signer
-	// extra holds the certificates that parsed and were deliberately excluded from the
-	// bundle: embedding an unrelated CA pollutes the trust chain the consumer sees.
-	extra []*x509.Certificate
 	// observations are non-fatal findings, in the order discovered.
 	observations []Observation
 }
 
 // Observations returns the non-fatal findings about the input, in the order
 // discovered.
-func (a Analysis) Observations() []Observation { //nolint:gocritic // hugeParam: the value shape is what removes the nil arm.
+func (a Analysis) Observations() []Observation {
 	return slices.Clone(a.observations)
 }
 
@@ -218,7 +215,7 @@ func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (Anal
 	}
 	obs = append(obs, validityObservations(leaf, now)...)
 
-	chain, extra, chainObs := g.assembleChain(path)
+	chain, chainObs := g.assembleChain(path)
 	obs = append(obs, chainObs...)
 	obs = append(obs, chainValidityObservations(chain, now)...)
 	obs = append(obs, chainIssuerEligibilityObservations(chain)...)
@@ -227,7 +224,6 @@ func analyseAt(ctx context.Context, certPEM, keyPEM []byte, now time.Time) (Anal
 		leaf:         leaf,
 		chain:        chain,
 		key:          in.signers[identity.key],
-		extra:        extra,
 		observations: obs,
 	}
 	return a, nil
@@ -1163,16 +1159,15 @@ func partitionIssuerEligible(certs []*x509.Certificate) (eligible, disqualified 
 }
 
 // assembleChain builds the emitted chain for the identity at path[0] — the walked
-// path is handed in, so it is the same slice oversizedIssuerError judged — the
-// certificates deliberately left out of it, and the observations describing
-// either outcome.
-func (g *certGraph) assembleChain(path []int) (chain, extra []*x509.Certificate, obs []Observation) {
+// path is handed in, so it is the same slice oversizedIssuerError judged — and the
+// observations describing it, including every certificate left out of it.
+func (g *certGraph) assembleChain(path []int) (chain []*x509.Certificate, obs []Observation) {
 	leaf := g.certs[path[0]]
 	chain = make([]*x509.Certificate, 0, len(path)-1)
 	for _, i := range path[1:] {
 		chain = append(chain, g.certs[i])
 	}
-	extra = g.outsidePath(path)
+	extra := g.outsidePath(path)
 
 	// The discovered path ends where relationship evidence ran out.
 	obs = append(obs, g.unprovenPathObservations(path)...)
@@ -1196,7 +1191,7 @@ func (g *certGraph) assembleChain(path []int) (chain, extra []*x509.Certificate,
 					len(disqualified), subjectForLog(g.certs[terminal]), subjectsForLog(disqualified)),
 			})
 		}
-		return chain, disqualified, append(obs, fallbackObs...)
+		return chain, append(obs, fallbackObs...)
 	}
 
 	if len(extra) > 0 {
@@ -1206,7 +1201,7 @@ func (g *certGraph) assembleChain(path []int) (chain, extra []*x509.Certificate,
 				len(extra), subjectForLog(leaf), subjectsForLog(extra)),
 		})
 	}
-	return chain, extra, obs
+	return chain, obs
 }
 
 // terminusObservation states what became of a chain whose terminus is not proven

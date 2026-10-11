@@ -415,15 +415,17 @@ func TestAnalyse_converts_beside_an_over_ceiling_certificate_that_issues_nothing
 		KeyUsage:              x509.KeyUsageCertSign,
 	}, oversizedRSAPublicKey(convert.MaxVerifiableKeyBits+17), nil, throwawayKey)
 
-	got, err := convert.Analyse(t.Context(), concatPEM(identityPEM, strangerPEM), testcerts.KeyPEM(t, identityKey))
+	certPEM := concatPEM(identityPEM, strangerPEM)
+	got, err := convert.Analyse(t.Context(), certPEM, testcerts.KeyPEM(t, identityKey))
 	if err != nil {
 		t.Fatalf("Analyse(self-signed identity + an unrelated oversized certificate) = error %v, want nil: an oversized certificate that issues nothing here cannot influence the chain", err)
 	}
 	if len(got.Chain()) != 0 {
 		t.Errorf("chain length = %d, want 0: a self-signed identity has no chain", len(got.Chain()))
 	}
-	if len(got.Extra()) != 1 {
-		t.Fatalf("Extra holds %d certificate(s), want the unrelated oversized certificate excluded", len(got.Extra()))
+	left := mustExcludedCerts(t, certPEM, got)
+	if len(left) != 1 {
+		t.Fatalf("Analyse left %d certificate(s) out of the bundle, want the unrelated oversized certificate excluded", len(left))
 	}
 	if !hasObservation(got.Observations(), convert.ObsExtraCertsExcluded) {
 		t.Errorf("observations = %v, want the exclusion reported", got.Observations())
