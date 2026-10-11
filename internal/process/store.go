@@ -508,8 +508,6 @@ func (r classifiedWriteError) Error() string { return r.err.Error() }
 
 // Unwrap keeps errors.Is/As working THROUGH the refusal, so the wrapped diagnosis an
 // operator reads and the errno a test seam injects both stay reachable.
-//
-//deadset:ignore DS1103 -- IsShutdown reaches the wrapped context.Canceled through it, so a write cancelled at shutdown still reads as shutdown.
 func (r classifiedWriteError) Unwrap() error { return r.err }
 
 func (r classifiedWriteError) cause() writeRefusalCause { return r.refusalCause }
