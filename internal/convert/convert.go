@@ -19,7 +19,7 @@ import (
 	"strings"
 
 	"github.com/cplieger/cert-converter/internal/logtext"
-	"github.com/cplieger/runesafe/v2"
+	"github.com/cplieger/runesafe/v3"
 )
 
 // PEM block type constants.
