@@ -7,7 +7,7 @@ require (
 	github.com/cplieger/envx/v2 v2.0.7
 	github.com/cplieger/health v1.8.2
 	github.com/cplieger/runesafe/v3 v3.0.0
-	github.com/cplieger/slogx v1.6.7
+	github.com/cplieger/slogx v1.7.0-dev.1
 	github.com/fsnotify/fsnotify v1.10.1
 	pgregory.net/rapid v1.3.0
 	software.sslmate.com/src/go-pkcs12 v0.7.4
