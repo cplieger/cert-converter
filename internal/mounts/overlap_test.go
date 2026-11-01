@@ -48,3 +48,33 @@ func TestPathContains_respectsPathBoundaries(t *testing.T) {
 		})
 	}
 }
+
+// TestResolvePhysicalPath_innermostMountWins pins that a path is attributed to
+// the deepest mount containing it, not to a parent mount it also lies beneath:
+// a bind mount's device and root are what make two unrelated container paths
+// the same physical tree.
+func TestResolvePhysicalPath_innermostMountWins(t *testing.T) {
+	t.Parallel()
+	mountPoint := t.TempDir()
+	target := filepath.Join(mountPoint, "certs")
+	if err := os.Mkdir(target, 0o750); err != nil {
+		t.Fatalf("setup: mkdir: %v", err)
+	}
+	resolvedMount, err := filepath.EvalSymlinks(mountPoint)
+	if err != nil {
+		t.Fatalf("setup: resolve mount point: %v", err)
+	}
+	entries := []mountEntry{
+		{device: "0:1", root: "/", mountPoint: "/"},
+		{device: "8:1", root: "/volumes/data", mountPoint: filepath.ToSlash(resolvedMount)},
+	}
+
+	got, err := resolvePhysicalPath(target, entries)
+	if err != nil {
+		t.Fatalf("resolvePhysicalPath(%q) error = %v", target, err)
+	}
+	want := physicalPath{device: "8:1", root: "/volumes/data/certs"}
+	if got != want {
+		t.Errorf("resolvePhysicalPath(%q) = %+v, want %+v", target, got, want)
+	}
+}

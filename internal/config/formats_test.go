@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
+	"github.com/cplieger/envx/v2"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -323,5 +324,95 @@ func TestLoad_refusesBlankInputPasswordFile(t *testing.T) {
 	_, err := Load()
 	if !errors.Is(err, errEmptyInputPassword) {
 		t.Errorf("Load(blank INPUT_PFX_PASSWORD_FILE) = %v, want errEmptyInputPassword", err)
+	}
+}
+
+// TestLoad_refusesInvisibleOnlyInputPasswordFile pins that a mounted input secret
+// holding only a byte-order mark is refused rather than read as "no password
+// configured": envx does not call it blank, so only the file channel's own
+// configured-ness keeps bundle decoding from being silently switched off.
+func TestLoad_refusesInvisibleOnlyInputPasswordFile(t *testing.T) {
+	isolateFormatConfig(t)
+	file := filepath.Join(t.TempDir(), "input-password")
+	if err := os.WriteFile(file, []byte("\ufeff"), 0o600); err != nil {
+		t.Fatalf("setup: write input password file: %v", err)
+	}
+	t.Setenv("INPUT_PFX_PASSWORD_FILE", file)
+
+	_, err := Load()
+	if !errors.Is(err, errEmptyInputPassword) {
+		t.Errorf("Load(INPUT_PFX_PASSWORD_FILE holding only U+FEFF) = %v, want errEmptyInputPassword", err)
+	}
+}
+
+// TestLoad_blankInputPasswordFileErrorKeepsTheFileCause pins that the refusal of a
+// blank mounted secret still carries envx's file error, which is what names the
+// file the operator has to fix.
+func TestLoad_blankInputPasswordFileErrorKeepsTheFileCause(t *testing.T) {
+	isolateFormatConfig(t)
+	file := filepath.Join(t.TempDir(), "input-password")
+	if err := os.WriteFile(file, []byte(" \n"), 0o600); err != nil {
+		t.Fatalf("setup: write blank input password file: %v", err)
+	}
+	t.Setenv("INPUT_PFX_PASSWORD_FILE", file)
+
+	_, err := Load()
+	if !errors.Is(err, envx.ErrBlankSecretFile) {
+		t.Errorf("Load(blank INPUT_PFX_PASSWORD_FILE) = %v, want errors.Is(..., envx.ErrBlankSecretFile)", err)
+	}
+}
+
+// TestLoad_reportsWhichChannelSuppliedTheInputPassword pins the two operator
+// records of the input-password channel pair: the delivery INFO names the file
+// variable only when a file supplied the secret, and the conflict WARN fires only
+// when both channels carry a value. Serial: it swaps slog.Default().
+func TestLoad_reportsWhichChannelSuppliedTheInputPassword(t *testing.T) {
+	const (
+		delivered = "input bundle password configured"
+		conflict  = "both INPUT_PFX_PASSWORD and INPUT_PFX_PASSWORD_FILE are set"
+	)
+	file := filepath.Join(t.TempDir(), "input-password")
+	if err := os.WriteFile(file, []byte("from-file"), 0o600); err != nil {
+		t.Fatalf("setup: write input password file: %v", err)
+	}
+	for _, tc := range []struct {
+		name          string
+		env           string
+		file          string
+		wantDelivered bool
+		wantConflict  bool
+	}{
+		{name: "environment only", env: "from-env"},
+		{name: "file only", file: file, wantDelivered: true},
+		{name: "both channels", env: "from-env", file: file, wantDelivered: true, wantConflict: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateFormatConfig(t)
+			if tc.env != "" {
+				t.Setenv("INPUT_PFX_PASSWORD", tc.env)
+			}
+			if tc.file != "" {
+				t.Setenv("INPUT_PFX_PASSWORD_FILE", tc.file)
+			}
+			logs := capture.Default(t)
+
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() = %v, want nil", err)
+			}
+
+			gotDelivered := logs.HasAttr(delivered, "source", "INPUT_PFX_PASSWORD_FILE")
+			if gotDelivered != tc.wantDelivered {
+				t.Errorf("Load(env=%q, file set=%v) logged %q with source=INPUT_PFX_PASSWORD_FILE = %v, want %v (logs %v)",
+					tc.env, tc.file != "", delivered, gotDelivered, tc.wantDelivered, logs.Messages())
+			}
+			if got := logs.Count(delivered) == 1; got != tc.wantDelivered {
+				t.Errorf("Load(env=%q, file set=%v) logged %q = %v, want %v (logs %v)",
+					tc.env, tc.file != "", delivered, got, tc.wantDelivered, logs.Messages())
+			}
+			if got := logs.CountLevel(slog.LevelWarn, conflict) == 1; got != tc.wantConflict {
+				t.Errorf("Load(env=%q, file set=%v) warned about both channels = %v, want %v (logs %v)",
+					tc.env, tc.file != "", got, tc.wantConflict, logs.Messages())
+			}
+		})
 	}
 }
