@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // captureLogs installs slogx/capture's Recorder as slog.Default() for the test and
@@ -348,7 +348,7 @@ func TestOutputWalkVisit_a_vanished_path_does_not_veto_the_reap(t *testing.T) {
 // TestOutputWalkVisit_stops_the_orphan_walk_once_the_scan_is_cancelled pins the orphan
 // walk's PER-ENTRY cancellation guard, the one contract of visit nothing else reaches.
 //
-// The shared walker checks the context once per READ BATCH (atomicfile's fixed 256-entry
+// The shared walker checks the context once per READ BATCH (filesafe's fixed 256-entry
 // batch), so inside a batch this guard is the only thing that stops the enumeration -- and
 // a flat /output smaller than one batch is checked exactly once, before any entry is
 // visited. Drop it and a scan cancelled inside that batch enumerates the rest of the tree

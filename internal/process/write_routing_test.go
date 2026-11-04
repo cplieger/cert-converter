@@ -13,10 +13,10 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/cplieger/atomicfile/v4"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/go/filesafe"
 )
 
 // TestWriteOutcome_derives_the_status_from_two_independent_facts pins the single place
@@ -154,7 +154,7 @@ func TestWriteRefusal_carries_a_classification_from_every_refusal_site(t *testin
 			},
 			want: refusalOutputLayout, wantClearable: false, wantRemediation: outputPinRemediation,
 		},
-		// Site 2: atomicfile.OpenParentInRoot. The directory exists and MkdirAll is happy
+		// Site 2: filesafe.OpenParentInRoot. The directory exists and MkdirAll is happy
 		// with it, so only the pin refuses: a symlink inside the root is exactly what
 		// confinement alone permits and the pin does not.
 		"a symlinked output parent is a layout refusal the pin makes": {
@@ -209,9 +209,9 @@ func TestWriteRefusal_carries_a_classification_from_every_refusal_site(t *testin
 		"a mode the volume did not keep is its own unclearable refusal": {
 			stage: func(t *testing.T, _ string) string {
 				t.Helper()
-				stubWriteRefusal(t, &atomicfile.WriteError{
-					Phase: atomicfile.PhaseTempCreate,
-					Err:   fmt.Errorf("%w: out.pfx asked -rw------- stored -rw-rw----", atomicfile.ErrModeNotStored),
+				stubWriteRefusal(t, &filesafe.WriteError{
+					Phase: filesafe.PhaseTempCreate,
+					Err:   fmt.Errorf("%w: out.pfx asked -rw------- stored -rw-rw----", filesafe.ErrModeNotStored),
 				})
 				return "out.pfx"
 			},
@@ -341,7 +341,7 @@ func TestStoreWrite_a_refusal_stays_unwrappable_so_a_cancelled_write_reads_as_sh
 		t.Fatalf("setup: Chmod(dir): %v", err)
 	}
 	s := newOutputStore(t, dir)
-	stubWriteRefusal(t, fmt.Errorf("atomicfile: staging the temp: %w", context.Canceled))
+	stubWriteRefusal(t, fmt.Errorf("filesafe: staging the temp: %w", context.Canceled))
 
 	refusal := s.write(t.Context(), "out.pfx", []byte("bundle"))
 	if refusal == nil {
@@ -380,9 +380,9 @@ func stubWriteRefusal(t *testing.T, err error) {
 	t.Helper()
 	prev := writeFileInRoot
 	writeFileInRoot = func(context.Context, *os.Root, string, []byte,
-		...atomicfile.Option,
-	) (atomicfile.Result, error) {
-		return atomicfile.Result{}, err
+		...filesafe.Option,
+	) (filesafe.Result, error) {
+		return filesafe.Result{}, err
 	}
 	t.Cleanup(func() { writeFileInRoot = prev })
 }
@@ -970,9 +970,9 @@ func TestScannerRun_partialArtifactPublicationFailsTheSource(t *testing.T) {
 	}
 	t.Cleanup(func() { readBoundedInRoot = priorRead })
 	priorWrite := writeFileInRoot
-	writeFileInRoot = func(ctx context.Context, root *os.Root, name string, data []byte, opts ...atomicfile.Option) (atomicfile.Result, error) {
+	writeFileInRoot = func(ctx context.Context, root *os.Root, name string, data []byte, opts ...filesafe.Option) (filesafe.Result, error) {
 		if name == "site.key" {
-			return atomicfile.Result{}, &fs.PathError{Op: "rename", Path: name, Err: syscall.EACCES}
+			return filesafe.Result{}, &fs.PathError{Op: "rename", Path: name, Err: syscall.EACCES}
 		}
 		return priorWrite(ctx, root, name, data, opts...)
 	}

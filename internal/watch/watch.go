@@ -12,11 +12,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cplieger/atomicfile/v4"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/cert-converter/internal/scancadence"
+	"github.com/cplieger/go/filesafe"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -397,13 +397,13 @@ func (w *Watcher) walkWatchDirs(ctx context.Context, root string, register func(
 	// (scanbudget.Default when nothing was configured): an unbounded walk is not an
 	// option, because the tree it enumerates is one this app does not own.
 	budget := scanbudget.NewCounter(w.maxEntries)
-	// atomicfile owns the traversal mechanics, exactly as internal/process's two
+	// filesafe owns the traversal mechanics, exactly as internal/process's two
 	// walks over the same trees do: fixed 256-entry ReadDir batches, so
 	// MAX_SCAN_ENTRIES bounds this walk's MEMORY and not only its entry count; one
 	// directory handle open at a time; and O_DIRECTORY|O_NONBLOCK, so a directory
 	// replaced by a FIFO between the readdir that classified it and the descent is
 	// refused with ENOTDIR instead of blocking this goroutine in open(2) forever.
-	return atomicfile.WalkDirInRoot(ctx, handle, func(rel string, d fs.DirEntry, walkErr error) error {
+	return filesafe.WalkDirInRoot(ctx, handle, func(rel string, d fs.DirEntry, walkErr error) error {
 		// fsnotify registers a PATHNAME, not a directory handle (see addWatchDirs),
 		// so the ambient name is rebuilt for the registration and the diagnostics;
 		// the enumeration itself no longer constructs one.
@@ -416,7 +416,7 @@ func (w *Watcher) walkWatchDirs(ctx context.Context, root string, register func(
 			w.warnWatchBudget(root, &budget)
 			return fs.SkipAll
 		}
-		// d is nil on this walk's error arm (atomicfile reports a directory it could
+		// d is nil on this walk's error arm (filesafe reports a directory it could
 		// not open or finish for that directory's OWN path with d nil).
 		ok, err := w.classifyWatchEntry(root, path, d, walkErr)
 		if err != nil || !ok {

@@ -1,6 +1,6 @@
 // Package logtext holds this app's log-boundary text helpers: the app-wide
 // truncation marker for text headed for a diagnostic, deliberately louder than
-// runesafe's own "...", so an operator can tell a cut record from one that ends
+// textsafe's own "...", so an operator can tell a cut record from one that ends
 // there; the sanitizing gate every filesystem-derived log attribute passes through
 // (Path); the byte-bounding helper that does NOT sanitize (Cap); and the path-inventory
 // renderer that composes both (CapJoin).
@@ -14,16 +14,16 @@ package logtext
 import (
 	"strings"
 
-	"github.com/cplieger/runesafe/v3"
+	"github.com/cplieger/go/textsafe"
 )
 
 // Marker is appended to any text Cap had to cut, and is the marker internal/convert
-// hands runesafe for the same purpose.
+// hands textsafe for the same purpose.
 const Marker = "...(truncated)"
 
 // Path makes one filesystem-derived string safe to emit as a log attribute.
 func Path(s string) string {
-	return runesafe.SanitizeSingleLine(s)
+	return textsafe.SanitizeSingleLine(s)
 }
 
 // Cap bounds s to limit BYTES, backing the cut off to a rune start, and names the
@@ -32,7 +32,7 @@ func Cap(s string, limit int) string {
 	if len(s) <= limit {
 		return s
 	}
-	return runesafe.CapBytes(s, limit) + Marker
+	return textsafe.CapBytes(s, limit) + Marker
 }
 
 // CapJoin renders an inventory of filesystem-derived names as one comma-separated log

@@ -15,13 +15,13 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/cplieger/atomicfile/v4"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/filesafe"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // newInputSource opens a confined source over dir: the INPUT tree the reap's
@@ -354,7 +354,7 @@ func TestSampleOrphanPaths_bounds_the_sample_by_bytes(t *testing.T) {
 	// maxLoggedOrphanBytes is not a multiple of three, so the cut offset lands INSIDE a
 	// rune. A naive slice would leave a partial-rune tail whose raw 0x80-0x9F bytes a
 	// non-UTF-8 terminal reads as C1 escape introducers, which is the class
-	// runesafe.CapBytes exists to prevent.
+	// textsafe.CapBytes exists to prevent.
 	t.Run("an oversized sample is cut on a rune boundary and marked", func(t *testing.T) {
 		t.Parallel()
 		paths := []string{strings.Repeat("→", maxLoggedOrphanBytes) + "/leaf.pfx"}
@@ -1718,7 +1718,7 @@ func TestLogScanOutcome_names_the_output_side_counts(t *testing.T) {
 // TestScanWalk_streams_directories_larger_than_one_read_batch pins the scan's entry
 // accounting across a tree bigger than one of the walk's read batches.
 //
-// atomicfile.WalkDirInRoot reads each directory in fixed-size batches through the
+// filesafe.WalkDirInRoot reads each directory in fixed-size batches through the
 // confined root instead of handing the whole thing to fs.WalkDir, which reads AND sorts
 // a directory's complete inventory before the entry budget gets to see a single path —
 // so a hostile flat /input could force that inventory into memory before it could be
@@ -1728,7 +1728,7 @@ func TestLogScanOutcome_names_the_output_side_counts(t *testing.T) {
 func TestScanWalk_streams_directories_larger_than_one_read_batch(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	// Comfortably more than atomicfile's fixed 256-entry read batch, so the walk's
+	// Comfortably more than filesafe's fixed 256-entry read batch, so the walk's
 	// per-directory loop has to span several of them.
 	const flat = 293
 	for i := range flat {
@@ -1754,7 +1754,7 @@ func TestScanWalk_streams_directories_larger_than_one_read_batch(t *testing.T) {
 	t.Cleanup(func() { _ = root.Close() })
 	sw := &scanWalk{src: &source{root: root}, seen: make(map[string]struct{}), observations: newObservationLog(0)}
 
-	if walkErr := atomicfile.WalkDirInRoot(t.Context(), root, func(rel string, d fs.DirEntry, err error) error {
+	if walkErr := filesafe.WalkDirInRoot(t.Context(), root, func(rel string, d fs.DirEntry, err error) error {
 		return sw.visit(t.Context(), rel, d, err)
 	}); walkErr != nil {
 		t.Fatalf("WalkDirInRoot(a tree spanning several read batches) = %v, want nil", walkErr)
@@ -1798,7 +1798,7 @@ func TestScanWalk_charges_an_unreadable_directory_once(t *testing.T) {
 	t.Cleanup(func() { _ = root.Close() })
 	sw := &scanWalk{src: &source{root: root}, seen: make(map[string]struct{}), observations: newObservationLog(0)}
 
-	if walkErr := atomicfile.WalkDirInRoot(t.Context(), root, func(rel string, d fs.DirEntry, err error) error {
+	if walkErr := filesafe.WalkDirInRoot(t.Context(), root, func(rel string, d fs.DirEntry, err error) error {
 		return sw.visit(t.Context(), rel, d, err)
 	}); walkErr != nil {
 		t.Fatalf("WalkDirInRoot(tree with one unreadable directory) = %v, want nil: an unreadable"+
@@ -1818,7 +1818,7 @@ func TestScanWalk_charges_an_unreadable_directory_once(t *testing.T) {
 
 // The directory half of the FIFO guarantee — a reader-less pipe swapped in for a
 // directory between the readdir that classified it and the open must be REFUSED with
-// ENOTDIR, never waited on — moved with the walk into atomicfile
+// ENOTDIR, never waited on — moved with the walk into filesafe
 // (TestWalkDirInRoot_refuses_a_fifo_in_a_directory_position), which owns the O_DIRECTORY
 // open. Its app-level consequence is pinned here by the unreadable-sub-path tests: such a
 // path is one unreadable entry, health-neutral and reap-vetoing.

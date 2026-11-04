@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/scanbudget"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 	"github.com/fsnotify/fsnotify"
 )
 

@@ -52,7 +52,7 @@ The final image is `gcr.io/distroless/static-debian13:nonroot` with one static G
 
 - [software.sslmate.com/src/go-pkcs12](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12)
 - [github.com/fsnotify/fsnotify](https://github.com/fsnotify/fsnotify)
-- [github.com/cplieger/atomicfile](https://github.com/cplieger/atomicfile), [envx](https://github.com/cplieger/envx), [health](https://github.com/cplieger/health), [runesafe](https://github.com/cplieger/runesafe), [slogx](https://github.com/cplieger/slogx) and [pathinside](https://github.com/cplieger/pathinside)
+- [github.com/cplieger/go/filesafe](https://github.com/cplieger/go/tree/main/filesafe), [envx](https://github.com/cplieger/go/tree/main/envx), [health](https://github.com/cplieger/go/tree/main/health), [textsafe](https://github.com/cplieger/go/tree/main/textsafe), [slogx](https://github.com/cplieger/go/tree/main/slogx) and [pathinside](https://github.com/cplieger/go/tree/main/pathinside)
 - [golang.org/x/crypto](https://pkg.go.dev/golang.org/x/crypto) and [golang.org/x/sys](https://pkg.go.dev/golang.org/x/sys)
 
 The license text of every bundled component is in the image under `/usr/share/licenses/`. Dependencies are updated automatically by [Renovate](https://github.com/renovatebot/renovate), and the base images are pinned by digest. Each image carries a signed SBOM and the build provenance Docker records. [Reading the software bill of materials](https://github.com/cplieger/docs/blob/main/docs/images.md#reading-the-software-bill-of-materials) and [Checking with the GitHub CLI](https://github.com/cplieger/docs/blob/main/docs/images.md#checking-with-the-github-cli) show how to check the SBOM.

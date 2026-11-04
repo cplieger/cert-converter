@@ -11,7 +11,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/logtext"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 	"github.com/fsnotify/fsnotify"
 )
 

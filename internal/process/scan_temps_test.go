@@ -29,7 +29,7 @@ func TestScannerRun_reaps_only_stale_output_temps(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// atomicfile stages its temp in the TARGET directory, so a nested cert
+	// filesafe stages its temp in the TARGET directory, so a nested cert
 	// (input/example.com/cert.crt) orphans its temp in the matching nested
 	// output directory; the sweep must recurse to reclaim it.
 	nestedDir := filepath.Join(outRoot, "acme-v02", "example.com")
@@ -55,7 +55,7 @@ func TestScannerRun_reaps_only_stale_output_temps(t *testing.T) {
 	if err := os.Chtimes(keep, old, old); err != nil {
 		t.Fatal(err)
 	}
-	// A name that shares only atomicfile's prefix and suffix is not its temp
+	// A name that shares only filesafe's prefix and suffix is not its temp
 	// shape, so it is operator-owned and must survive an aged sweep.
 	lookalike := filepath.Join(outRoot, ".atomicfile-notes.tmp")
 	if err := os.WriteFile(lookalike, []byte("operator-owned"), 0o600); err != nil {
@@ -141,7 +141,7 @@ func TestScannerRun_temp_sweep_stays_inside_the_output_root(t *testing.T) {
 
 // TestScannerRun_spares_a_directory_wearing_a_stale_temp_name pins the
 // non-regular-file half of the sweep's eligibility check: only a regular file is
-// a reclaimable atomicfile orphan, so an aged directory whose name has the exact
+// a reclaimable filesafe orphan, so an aged directory whose name has the exact
 // temp shape must survive even though Remove would succeed on it while empty.
 func TestScannerRun_spares_a_directory_wearing_a_stale_temp_name(t *testing.T) {
 	t.Parallel()
@@ -162,7 +162,7 @@ func TestScannerRun_spares_a_directory_wearing_a_stale_temp_name(t *testing.T) {
 
 	fi, err := os.Lstat(lookalike)
 	if err != nil {
-		t.Fatalf("os.Lstat(%q) = %v, want nil (only a regular file is a reclaimable atomicfile temp)", lookalike, err)
+		t.Fatalf("os.Lstat(%q) = %v, want nil (only a regular file is a reclaimable filesafe temp)", lookalike, err)
 	}
 	if !fi.IsDir() {
 		t.Errorf("os.Lstat(%q) mode = %v, want the directory left untouched", lookalike, fi.Mode())

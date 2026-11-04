@@ -20,8 +20,8 @@ import (
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/scancadence"
 	"github.com/cplieger/cert-converter/internal/watch"
-	"github.com/cplieger/health"
-	"github.com/cplieger/slogx"
+	"github.com/cplieger/go/health"
+	"github.com/cplieger/go/slogx"
 )
 
 // Fixed container paths — configured via volume mounts, not env vars.
