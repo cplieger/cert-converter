@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/atomicfile/v4"
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/go/filesafe"
 )
 
 // TestStoreLogSweepOutcome_operator_signals pins the /output sweep's end-of-sweep
@@ -34,26 +34,26 @@ func TestStoreLogSweepOutcome_operator_signals(t *testing.T) {
 		wantMsg       string
 		wantAttrKey   string
 		wantAttrValue string
-		res           atomicfile.SweepResult
+		res           filesafe.SweepResult
 		wantLevel     slog.Level
 	}{
 		{
 			name:        "a reclaimed orphan is reported at info",
-			res:         atomicfile.SweepResult{Removed: 2},
+			res:         filesafe.SweepResult{Removed: 2},
 			wantLevel:   slog.LevelInfo,
 			wantMsg:     "reaped stale temp files",
 			wantAttrKey: "count", wantAttrValue: "2",
 		},
 		{
 			name:        "uninspectable candidates warn with a remediation hint",
-			res:         atomicfile.SweepResult{Failed: 3},
+			res:         filesafe.SweepResult{Failed: 3},
 			wantLevel:   slog.LevelWarn,
 			wantMsg:     "some stale output temps could not be inspected or removed",
 			wantAttrKey: "remediation",
 		},
 		{
 			name:        "unreadable output sub-paths warn with a remediation hint",
-			res:         atomicfile.SweepResult{Unreadable: 4},
+			res:         filesafe.SweepResult{Unreadable: 4},
 			wantLevel:   slog.LevelWarn,
 			wantMsg:     "some output paths could not be inspected during stale temp cleanup",
 			wantAttrKey: "remediation",
@@ -113,7 +113,7 @@ func TestStoreLogSweepOutcome_is_silent_for_a_clean_sweep(t *testing.T) {
 	logs := captureLogs(t)
 
 	s := newOutputStore(t, t.TempDir())
-	s.logSweepOutcome(atomicfile.SweepResult{}, nil)
+	s.logSweepOutcome(filesafe.SweepResult{}, nil)
 
 	if logs.Len() != 0 {
 		t.Errorf("logSweepOutcome(clean sweep) logged %q, want no output at all", logs.Messages())

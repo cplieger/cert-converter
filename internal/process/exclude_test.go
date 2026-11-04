@@ -13,7 +13,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/testcerts"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // newExcludingScanner is newFormatScanner plus an exclude set, for the sub-tree

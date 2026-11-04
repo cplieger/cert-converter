@@ -14,13 +14,13 @@ import (
 	"slices"
 	"time"
 
-	"github.com/cplieger/atomicfile/v4"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/mounts"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
+	"github.com/cplieger/go/filesafe"
 )
 
 // ScanResult carries per-source outcome summary counts from a scan run.
@@ -256,7 +256,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	// /output stale-temp sweep does: every step is an openat-relative
 	// syscall and every path handed downstream is root-relative, so no
 	// ambient absolute path exists for a later read to reach for.
-	walkErr := atomicfile.WalkDirInRoot(ctx, inHandle, func(rel string, d fs.DirEntry, err error) error {
+	walkErr := filesafe.WalkDirInRoot(ctx, inHandle, func(rel string, d fs.DirEntry, err error) error {
 		return sw.visit(ctx, rel, d, err)
 	})
 	// Flat conversion runs on everything the walk enumerated, matching mirror's
@@ -360,7 +360,7 @@ type scanWalk struct {
 	inputPasswordReady bool
 }
 
-// visit is the walk's per-entry callback (atomicfile.WalkDirInRoot).
+// visit is the walk's per-entry callback (filesafe.WalkDirInRoot).
 func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()

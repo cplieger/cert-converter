@@ -12,10 +12,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cplieger/atomicfile/v4"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/go/filesafe"
 )
 
 // newOutputStore opens dir as a confined output root and returns the store under test,
@@ -198,7 +198,7 @@ func TestStoreWrite_creates_the_parent_directory(t *testing.T) {
 // regular file cannot become a directory.
 //
 // The directory creation is this package's own MkdirAll through the confined root
-// (store.write owns why it can no longer be atomicfile's WithMkdirMode: the parent has
+// (store.write owns why it can no longer be filesafe's WithMkdirMode: the parent has
 // to exist before the write's parent pin), so the failure surfaces under this package's
 // "write output" wrapping with the path it could not create. What matters for the operator
 // is that the step is named and the offending path appears; the precise inner wording
@@ -293,7 +293,7 @@ func TestStoreWrite_refuses_a_bundle_larger_than_the_read_bound(t *testing.T) {
 // TestStoreInspect_names_a_non_regular_prior_output pins the WARN on the arm
 // that refuses a prior output which is not a regular file. Nothing else records it:
 // the verdict is "stale, regenerate", and for the two shapes covered here the
-// rewrite that follows FAILS (atomicfile refuses a symlink target outright, and a
+// rewrite that follows FAILS (filesafe refuses a symlink target outright, and a
 // directory cannot be renamed over), so this line is what names the occupied output
 // path before the bare conversion error arrives. A device node, FIFO or socket IS
 // replaced by the rename instead, which makes this line that case's only trace.
@@ -574,7 +574,7 @@ func TestStoreRemoveOrphan_reports_vanished_candidate_and_continues(t *testing.T
 // with ENAMETOOLONG — non-ENOENT, whatever uid the suite runs as, where a chmod-based
 // fixture does nothing under uid 0 — while the parent pin itself succeeds, which is
 // exactly the state this arm exists for. A closed root (the previous fixture) now fails
-// one step earlier, in atomicfile's pinned descent, and lands on pinRedirectedMsg
+// one step earlier, in filesafe's pinned descent, and lands on pinRedirectedMsg
 // instead; that arm is pinned by the ancestor-swap and vanished-ancestor tests.
 // Deliberately NOT newOutputStore: nothing is created on disk for this candidate.
 // Runs serially: it swaps slog.Default().
@@ -674,7 +674,7 @@ func TestStoreRemoveOrphan_reports_a_vanished_nested_candidate_as_a_race(t *test
 // /output walk owes the reap: every bundle this app could have written, at any depth,
 // reaches the candidate list, and nothing else does.
 //
-// It is the /output half of the shared walker's contract (atomicfile.WalkDirInRoot, which
+// It is the /output half of the shared walker's contract (filesafe.WalkDirInRoot, which
 // both mounts
 // now go through): the reap's whole claim is that a candidate it cannot match to an
 // input is an orphan, so a bundle the walk never reported would be retained forever
@@ -920,7 +920,7 @@ func TestScannerRun_reports_but_does_not_rewrite_a_content_current_bundle_whose_
 //
 // A renewed certificate over a bundle the operator left at 0644 is replaced because its
 // CONTENT is stale, and the atomic replacement lands a fresh inode at outputFileMode for free
-// (store.write's atomicfile.WithMode). So the mode a real deployment carries is corrected
+// (store.write's filesafe.WithMode). So the mode a real deployment carries is corrected
 // on its next renewal, with no write that exists only to change permissions -- exactly what
 // certbot's own key renewal does. Its converse is the test above: a bundle whose
 // certificate never renews keeps the mode the operator left it with.
@@ -1244,7 +1244,7 @@ func TestStoreInspect_classifies_a_read_that_found_nothing_as_verified_stale(t *
 		},
 		{
 			"a bundle that stopped being a regular file",
-			fmt.Errorf("open prior pfx: %w", atomicfile.ErrNotRegular),
+			fmt.Errorf("open prior pfx: %w", filesafe.ErrNotRegular),
 			contentVerifiedStale, statusFailed,
 		},
 		{
@@ -1364,7 +1364,7 @@ func TestClassifyPinRefusal_separates_a_refused_traversal_from_the_tree_shape(t 
 		},
 		"a component the pinned descent refuses on its own terms": {
 			err: fmt.Errorf("pin output directory for %q: %w", "sub/out.pfx",
-				fmt.Errorf("%w: not a directory: %q", atomicfile.ErrUnsafePath, "sub")),
+				fmt.Errorf("%w: not a directory: %q", filesafe.ErrUnsafePath, "sub")),
 			want:            refusalOutputLayout,
 			wantRemediation: outputPinRemediation,
 		},

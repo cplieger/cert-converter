@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // TestVerify_refuses_a_fifo_at_a_required_mount_path pins the ONE ordering

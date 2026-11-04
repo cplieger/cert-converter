@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/atomicfile/v4"
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/go/filesafe"
 )
 
 // TestSourcePathVanished_reports_an_unclassifiable_path_as_steady_state pins
@@ -209,9 +209,9 @@ func TestSourceReadBounded(t *testing.T) {
 		// production call is this case. A wiring change to an effectively unbounded
 		// limit passes every other subtest here.
 		//
-		// Sparse: Truncate sets the SIZE atomicfile stats off the open handle without
+		// Sparse: Truncate sets the SIZE filesafe stats off the open handle without
 		// allocating convert.MaxInputBytes bytes, so the refusal is observed for the cost of an
-		// empty file. The exact-boundary semantics belong to atomicfile's own suite.
+		// empty file. The exact-boundary semantics belong to filesafe's own suite.
 		dir := t.TempDir()
 		f, err := os.Create(filepath.Join(dir, "huge.pem"))
 		if err != nil {
@@ -227,9 +227,9 @@ func TestSourceReadBounded(t *testing.T) {
 		s := newInputSource(t, dir)
 
 		data, err := s.readBounded(t.Context(), "huge.pem")
-		if !errors.Is(err, atomicfile.ErrFileTooLarge) {
+		if !errors.Is(err, filesafe.ErrFileTooLarge) {
 			t.Errorf("source.readBounded(a %d-byte file) = %d bytes, error %v; want it to satisfy"+
-				" errors.Is(err, atomicfile.ErrFileTooLarge): the production call must apply convert.MaxInputBytes (%d)",
+				" errors.Is(err, filesafe.ErrFileTooLarge): the production call must apply convert.MaxInputBytes (%d)",
 				convert.MaxInputBytes+1, len(data), err, convert.MaxInputBytes)
 		}
 	})
@@ -271,7 +271,7 @@ func TestSourceReadBundleBoundedUsesBundleSizeDomain(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("setup: close outside.pfx: %v", err)
 	}
-	if _, err := s.readBundleBounded(t.Context(), "outside.pfx"); !errors.Is(err, atomicfile.ErrFileTooLarge) {
+	if _, err := s.readBundleBounded(t.Context(), "outside.pfx"); !errors.Is(err, filesafe.ErrFileTooLarge) {
 		t.Errorf("source.readBundleBounded(%d-byte bundle) = %v, want ErrFileTooLarge", convert.MaxBundleBytes+1, err)
 	}
 }

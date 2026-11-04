@@ -15,8 +15,8 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/cert-converter/internal/scancadence"
-	"github.com/cplieger/runesafe/v3"
-	"github.com/cplieger/slogx"
+	"github.com/cplieger/go/slogx"
+	"github.com/cplieger/go/textsafe"
 )
 
 // envFalseValue is the lexical "disabled" marker for env-var parsers.
@@ -280,7 +280,7 @@ const maxRejectedValueLogLen = 128
 // marker charged inside the limit. A value below the budget carrying no unsafe rune is
 // quoted byte for byte.
 func rejectedValue(raw string) string {
-	text, _ := runesafe.SanitizeSingleLineBudgeted(raw, maxRejectedValueLogLen, logtext.Marker)
+	text, _ := textsafe.SanitizeSingleLineBudgeted(raw, maxRejectedValueLogLen, logtext.Marker)
 	return text
 }
 

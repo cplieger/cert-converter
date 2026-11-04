@@ -13,7 +13,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/testcerts"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // hostileStem is a certificate name carrying one rune from each class that makes
@@ -134,7 +134,7 @@ func checkAttrValue(t *testing.T, msg, key string, v slog.Value) {
 
 // TestErrorAttributes_are_sanitized_at_the_emit_sites covers the ERROR half of
 // the path-attribute gate, which the "path" half above does not reach: the
-// filesystem returns *fs.PathError and atomicfile interpolates the name it
+// filesystem returns *fs.PathError and filesafe interpolates the name it
 // refused, so a hostile filename arrives inside err.Error() even at a site
 // whose "path" attribute is already gated. The three records asserted are each
 // the ONLY signal for their condition: an unreadable certificate, an unreadable
@@ -190,7 +190,7 @@ func TestErrorAttributes_are_sanitized_at_the_emit_sites(t *testing.T) {
 	})
 
 	t.Run("a rewrite /output refuses for a reason no restart clears", func(t *testing.T) {
-		// atomicfile interpolates the output name it refused, so the refusal's
+		// filesafe interpolates the output name it refused, so the refusal's
 		// own text carries it even though reportWriteFailure's path and
 		// output_path are gated. Minted the way store.write mints one.
 		refused := refuseWrite(refusalOwnership, "write output: %w",

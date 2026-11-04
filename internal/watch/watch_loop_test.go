@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // TestWatchLoop_converts_a_real_cert_write_through_the_debounce is the first

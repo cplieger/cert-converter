@@ -10,7 +10,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/testcerts"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // TestScannerRun_reports_a_new_input_observation_once_on_an_unchanged_output pins

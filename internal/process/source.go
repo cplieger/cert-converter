@@ -6,8 +6,8 @@ import (
 	"io/fs"
 	"os"
 
-	"github.com/cplieger/atomicfile/v4"
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/go/filesafe"
 )
 
 // source owns every read of the input tree.
@@ -64,5 +64,5 @@ func (s *source) readBundleBounded(ctx context.Context, rel string) ([]byte, err
 }
 
 func (s *source) readBoundedTo(ctx context.Context, rel string, maxBytes int64) ([]byte, error) {
-	return atomicfile.ReadBoundedInRoot(ctx, s.root, rel, maxBytes)
+	return filesafe.ReadBoundedInRoot(ctx, s.root, rel, maxBytes)
 }

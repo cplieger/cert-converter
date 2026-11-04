@@ -45,7 +45,7 @@ func TestSampleOrphanPaths_properties(t *testing.T) {
 		lengths := rapid.SliceOfN(rapid.SampledFrom([]int{1, 12, 137, 205, 240, 400, 900}), 1, 30).
 			Draw(rt, "path_lengths")
 		// Multi-byte fill runes, so the cut offset lands inside a rune: the partial-rune
-		// tail runesafe.CapBytes exists to prevent is invisible to a byte-count bound.
+		// tail textsafe.CapBytes exists to prevent is invisible to a byte-count bound.
 		// The last two are the hostile classes: each collapses to one ASCII space, so a
 		// sample built from them also moves the cut offset the sanitizing gate feeds Cap.
 		fill := []rune{'a', 'é', '→', '\n', '\u202e'}
