@@ -12,13 +12,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cplieger/atomicfile/v4"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/mounts"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
+	"github.com/cplieger/go/filesafe"
 )
 
 // Output file and directory modes.
@@ -95,7 +95,7 @@ func (s *store) reportLaxDirAt(dir string) {
 // writeFileInRoot is store.write's confined atomic write, indirected through a
 // package var: the failure that decides a HEALTH outcome cannot be staged in a temp
 // directory.
-var writeFileInRoot = atomicfile.WriteFileInRoot
+var writeFileInRoot = filesafe.WriteFileInRoot
 
 // write publishes a PKCS#12 artifact under the bundle read/write ceiling.
 func (s *store) write(ctx context.Context, rel string, data []byte) writeRefusal {
@@ -123,15 +123,15 @@ func (s *store) writeBounded(ctx context.Context, rel string, data []byte, maxBy
 		// can widen it, so the directory is observed after creation rather than assumed.
 		s.reportLaxDir(rel)
 	}
-	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
+	parent, base, err := filesafe.OpenParentInRoot(s.root, rel)
 	if err != nil {
 		return refuseWrite(classifyPinRefusal(err),
 			"write output: pin output directory for %q: %w", rel, err)
 	}
 	defer func() { _ = parent.Close() }()
 	if _, err := writeFileInRoot(ctx, parent, base, data,
-		atomicfile.WithMode(outputFileMode),
-		atomicfile.WithMaxBytes(maxBytes),
+		filesafe.WithMode(outputFileMode),
+		filesafe.WithMaxBytes(maxBytes),
 	); err != nil {
 		return refuseWrite(classifyWriteErrno(err), "write output: %w", err)
 	}
@@ -140,21 +140,21 @@ func (s *store) writeBounded(ctx context.Context, rel string, data []byte, maxBy
 
 // --- Stale-temp sweep (store-owned) ---
 
-// staleTempAge is the age past which an atomicfile temp is considered orphaned by
+// staleTempAge is the age past which a filesafe temp is considered orphaned by
 // an interrupted write rather than staged by one still in flight.
 const staleTempAge = time.Hour
 
 // sweepStaleTemps removes atomic-write temp files orphaned by an interrupted
 // write, then narrates the outcome.
 func (s *store) sweepStaleTemps(ctx context.Context) {
-	res, walkErr := atomicfile.CleanupStaleTempsInRoot(ctx, s.root, staleTempAge, atomicfile.WithRecursive(true))
+	res, walkErr := filesafe.CleanupStaleTempsInRoot(ctx, s.root, staleTempAge, filesafe.WithRecursive(true))
 	s.logSweepOutcome(res, walkErr)
 }
 
 // logSweepOutcome emits the end-of-sweep logs: the walk error, the reclaimed-orphan
 // count, temps that could not be inspected or removed, and output sub-paths the
 // sweep could not enter.
-func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
+func (s *store) logSweepOutcome(res filesafe.SweepResult, walkErr error) {
 	logDir := logtext.Path(s.root.Name())
 	if walkErr != nil {
 		if IsShutdown(walkErr) {
@@ -226,7 +226,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 	s.reportLaxDir(rel)
 	// Pin rel's parent ONCE and address the bundle by basename through that pin
 	// for both syscalls below.
-	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
+	parent, base, err := filesafe.OpenParentInRoot(s.root, rel)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return contentVerifiedStale, nil
@@ -277,7 +277,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		// contentVerifiedStale, so a rewrite this app is then refused stays a
 		// conversion failure rather than a health-neutral one.
 		content := contentUnverified
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, atomicfile.ErrNotRegular) {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, filesafe.ErrNotRegular) {
 			content = contentVerifiedStale
 		}
 		slog.Warn("cannot read prior pfx; regenerating",
@@ -336,7 +336,7 @@ func contentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 // same bounded read — with a byte comparison where the PFX path decodes.
 func (s *store) inspectRaw(ctx context.Context, rel string, want []byte) (contentState, error) {
 	s.reportLaxDir(rel)
-	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
+	parent, base, err := filesafe.OpenParentInRoot(s.root, rel)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return contentVerifiedStale, nil
@@ -377,7 +377,7 @@ func (s *store) inspectRaw(ctx context.Context, rel string, want []byte) (conten
 			return contentUnresolved, fmt.Errorf("read prior output: %w", errors.Join(ctxErr, err))
 		}
 		content := contentUnverified
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, atomicfile.ErrNotRegular) {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, filesafe.ErrNotRegular) {
 			content = contentVerifiedStale
 		}
 		slog.Warn("cannot read prior output; regenerating",
@@ -454,7 +454,7 @@ const (
 	// refusalVolume: the volume will not take the bytes (EROFS / ENOSPC / EDQUOT).
 	refusalVolume
 	// refusalModeNotStored: the volume will not keep a new file at outputFileMode
-	// (atomicfile.ErrModeNotStored), typically a default ACL that widens it.
+	// (filesafe.ErrModeNotStored), typically a default ACL that widens it.
 	refusalModeNotStored
 	// refusalTransient: the write failed for something that is NOT a steady-state
 	// condition of the operator's volume — a transient I/O error, an artifact
@@ -522,9 +522,9 @@ func refuseWrite(cause writeRefusalCause, format string, args ...any) writeRefus
 // errnos of the directory creation.
 func classifyWriteErrno(err error) writeRefusalCause {
 	switch {
-	case errors.Is(err, atomicfile.ErrModeNotStored):
+	case errors.Is(err, filesafe.ErrModeNotStored):
 		return refusalModeNotStored
-	// fs.ErrPermission covers both EPERM and EACCES: atomicfile's confined write
+	// fs.ErrPermission covers both EPERM and EACCES: filesafe's confined write
 	// returns an *fs.PathError wrapping a syscall.Errno, and Errno.Is maps both
 	// onto fs.ErrPermission (and only those, of the ones reachable here).
 	case errors.Is(err, fs.ErrPermission):
@@ -548,7 +548,7 @@ func classifyPinRefusal(err error) writeRefusalCause {
 
 // readBoundedInRoot reads an artifact inside the output tree under the
 // caller's format-specific ceiling.
-var readBoundedInRoot = atomicfile.ReadBoundedInRoot
+var readBoundedInRoot = filesafe.ReadBoundedInRoot
 
 // --- Output lifecycle: the /output half ---
 
@@ -557,7 +557,7 @@ var readBoundedInRoot = atomicfile.ReadBoundedInRoot
 // enough for a deletion decision to rest on it.
 func (s *store) listOutputs(ctx context.Context) (found []string, safe bool, err error) {
 	walk := outputWalk{budget: scanbudget.NewCounter(s.maxEntries), formats: s.formats}
-	if err := atomicfile.WalkDirInRoot(ctx, s.root, func(rel string, d fs.DirEntry, err error) error {
+	if err := filesafe.WalkDirInRoot(ctx, s.root, func(rel string, d fs.DirEntry, err error) error {
 		return walk.visit(ctx, rel, d, err)
 	}); err != nil {
 		// The entry-budget stop's per-path counts are observations rather than
@@ -679,7 +679,7 @@ func (s *store) removeOrphan(rel string) reapAttempt {
 	// One sanitized rendering for every record this attempt can emit; `rel`
 	// itself stays raw for the pin and the unlink below.
 	logRel := logtext.Path(rel)
-	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
+	parent, base, err := filesafe.OpenParentInRoot(s.root, rel)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			slog.Debug("orphaned output vanished before removal", "path", logRel)

@@ -19,8 +19,8 @@ import (
 	"github.com/cplieger/cert-converter/internal/scancadence"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/cert-converter/internal/watch"
-	"github.com/cplieger/health"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/health"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // --- Test helpers ---

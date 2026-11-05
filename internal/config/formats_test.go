@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
-	"github.com/cplieger/envx/v2"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 func TestLoad_wiresOutputFormatsAndLayout(t *testing.T) {

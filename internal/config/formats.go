@@ -10,7 +10,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
-	"github.com/cplieger/envx/v2"
+	"github.com/cplieger/go/envx"
 )
 
 // resolveFormats reads OUTPUT_FORMATS and reports every token the parser had to
@@ -120,7 +120,7 @@ func resolveInputPassword() (resolvedInputPassword, error) {
 	password, source, secretErr := envx.SecretWithSource("INPUT_PFX_PASSWORD")
 	warnBothInputPasswordChannels(source)
 	_, envSet := os.LookupEnv("INPUT_PFX_PASSWORD")
-	configured := envSet || source == envx.SourceFile
+	configured := envSet || source == envx.SecretSourceFile
 	var blankSecretFile error
 	if secretErr != nil {
 		var missing *envx.MissingError
@@ -148,7 +148,7 @@ func resolveInputPassword() (resolvedInputPassword, error) {
 		}
 		return resolvedInputPassword{}, errEmptyInputPassword
 	}
-	if source == envx.SourceFile {
+	if source == envx.SecretSourceFile {
 		slog.Info("input bundle password configured", "source", inputPasswordChannel(source))
 	}
 	return resolvedInputPassword{Value: password, Ready: true}, nil
@@ -157,7 +157,7 @@ func resolveInputPassword() (resolvedInputPassword, error) {
 // warnBothInputPasswordChannels mirrors warnBothPasswordChannels for the input
 // channel pair.
 func warnBothInputPasswordChannels(source envx.SecretSource) {
-	if source != envx.SourceFile || os.Getenv("INPUT_PFX_PASSWORD") == "" {
+	if source != envx.SecretSourceFile || os.Getenv("INPUT_PFX_PASSWORD") == "" {
 		return
 	}
 	slog.Warn("both INPUT_PFX_PASSWORD and INPUT_PFX_PASSWORD_FILE are set; the file wins and INPUT_PFX_PASSWORD is ignored",
@@ -183,7 +183,7 @@ func warnBlankInputPasswordFilePointer() {
 // inputPasswordChannel names the variable an operator must edit to change the
 // input bundle password.
 func inputPasswordChannel(source envx.SecretSource) string {
-	if source == envx.SourceFile {
+	if source == envx.SecretSourceFile {
 		return "INPUT_PFX_PASSWORD_FILE"
 	}
 	return "INPUT_PFX_PASSWORD"

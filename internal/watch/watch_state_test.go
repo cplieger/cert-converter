@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/scancadence"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // absentWatchRoot is a path that does not exist, so a watch-set walk over it fails at
@@ -259,7 +259,7 @@ func (c liveForNCtx) Err() error {
 //
 // live: 6 is runDebouncedScan's own Err() sequence on this tree: the entry
 // guard, then the four observations the confined walk makes over the (empty)
-// root — walkWatchDirs' own pre-walk guard, atomicfile.WalkDirInRoot's
+// root — walkWatchDirs' own pre-walk guard, filesafe.WalkDirInRoot's
 // already-cancelled check, then the two the single root callback makes (the
 // budget admission gate, exceedsEntryBudget, which honours cancellation before
 // charging, and classifyWatchEntry's own guard) — then the one

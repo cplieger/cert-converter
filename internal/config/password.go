@@ -9,7 +9,7 @@ import (
 	"unicode"
 
 	"github.com/cplieger/cert-converter/internal/convert"
-	"github.com/cplieger/envx/v2"
+	"github.com/cplieger/go/envx"
 )
 
 // errEmptyPassword indicates the resolved PFX password is blank — empty, entirely
@@ -96,7 +96,7 @@ func resolvePassword() (resolvedPassword, error) {
 		switch {
 		case blankSecretFile != nil:
 			return resolvedPassword{}, fmt.Errorf("%w: %w", errEmptyPassword, blankSecretFile)
-		case source == envx.SourceFile:
+		case source == envx.SecretSourceFile:
 			// An invisible-only mounted secret is blank only after
 			// classification, so envx carries no error naming the channel here.
 			return resolvedPassword{}, fmt.Errorf("%w. The value was supplied via %s", errEmptyPassword, channel)
@@ -175,7 +175,7 @@ func checkPasswordEncodable(password string) error {
 // warnBothPasswordChannels warns when the operator supplied the PFX password through
 // BOTH channels, because only one of them takes effect.
 func warnBothPasswordChannels(source envx.SecretSource) {
-	if source != envx.SourceFile || classifyPassword(os.Getenv("PFX_PASSWORD")) != passwordConfigured {
+	if source != envx.SecretSourceFile || classifyPassword(os.Getenv("PFX_PASSWORD")) != passwordConfigured {
 		return
 	}
 	slog.Warn("both PFX_PASSWORD and PFX_PASSWORD_FILE are set; the file wins and PFX_PASSWORD is ignored",
@@ -203,7 +203,7 @@ func warnBlankPasswordFilePointer() {
 // passwordChannel names the environment variable an operator must edit to change the
 // configured PFX password.
 func passwordChannel(source envx.SecretSource) string {
-	if source == envx.SourceFile {
+	if source == envx.SecretSourceFile {
 		return "PFX_PASSWORD_FILE"
 	}
 	return "PFX_PASSWORD"
@@ -235,7 +235,7 @@ func warnPasswordStrength(status passwordStatus, channel string, blankFileReport
 // without logging the password itself.
 func logPasswordDelivery(source envx.SecretSource, password string, status passwordStatus, blankSecretFile bool) {
 	blank := status != passwordConfigured
-	if source == envx.SourceFile {
+	if source == envx.SecretSourceFile {
 		switch {
 		case blankSecretFile:
 			slog.Warn("PFX_PASSWORD_FILE is blank; starting with an empty PFX password because PFX_ALLOW_EMPTY_PASSWORD is set",

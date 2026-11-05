@@ -6,13 +6,13 @@ import (
 	"unicode/utf8"
 
 	"github.com/cplieger/cert-converter/internal/logtext"
-	"github.com/cplieger/runesafe/v3"
+	"github.com/cplieger/go/textsafe"
 )
 
 // FuzzBoundLogText_bounded_and_loggable fuzzes the package's log-hygiene rule over
 // arbitrary certificate-derived text. boundLogText is the single gate every
 // diagnostic that interpolates operator-supplied text passes through: whatever
-// the input, the result must be valid UTF-8, carry no rune runesafe's
+// the input, the result must be valid UTF-8, carry no rune textsafe's
 // single-line policy calls unsafe, be marked when cut, and never exceed the limit.
 //
 // Seeds pin the boundary lengths (exact limit, off by one) for a deterministic
@@ -46,11 +46,11 @@ func FuzzBoundLogText_bounded_and_loggable(f *testing.F) {
 		if !utf8.ValidString(got) {
 			t.Fatalf("boundLogText(%q) = %q, want valid UTF-8 whatever the input", s, got)
 		}
-		// The policy itself, cross-checked against runesafe's own every-rune
+		// The policy itself, cross-checked against textsafe's own every-rune
 		// sweep: no C0 control, CR/LF, DEL, C1 control, bidi control or
 		// U+2028/U+2029 may survive, whichever slog handler is wired up.
 		for _, r := range got {
-			if runesafe.IsUnsafeSingleLine(r) {
+			if textsafe.IsUnsafeSingleLine(r) {
 				t.Fatalf("boundLogText(%q) = %q, kept unsafe rune %U", s, got, r)
 			}
 		}
@@ -60,7 +60,7 @@ func FuzzBoundLogText_bounded_and_loggable(f *testing.F) {
 		// the limit is cut even when the sanitized form would have fit (bidi
 		// overrides collapsing to spaces), and raw under the limit can still be
 		// cut when sanitizing GROWS the text (an invalid byte becomes U+FFFD).
-		sanitized := runesafe.SanitizeSingleLine(s)
+		sanitized := textsafe.SanitizeSingleLine(s)
 		if len(s) <= maxSubjectLogLen && len(sanitized) <= maxSubjectLogLen {
 			// Fits on both counts: returned sanitized and otherwise untouched.
 			if got != sanitized {

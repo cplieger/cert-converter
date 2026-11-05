@@ -16,8 +16,8 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/cert-converter/internal/scancadence"
-	"github.com/cplieger/runesafe/v3"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
+	"github.com/cplieger/go/textsafe"
 )
 
 func TestLoad_empty_password_optout_warns_only_on_unrecognized_values(t *testing.T) {
@@ -328,7 +328,7 @@ func assertRejectedValue(t *testing.T, logs *capture.Recorder, msgSub, raw strin
 	if !ok {
 		t.Fatalf("the WARN matching %q carries no value attribute (logs %v)", msgSub, logs.Messages())
 	}
-	want, cut := runesafe.SanitizeSingleLineBudgeted(raw, maxRejectedValueLogLen, logtext.Marker)
+	want, cut := textsafe.SanitizeSingleLineBudgeted(raw, maxRejectedValueLogLen, logtext.Marker)
 	if got != want {
 		t.Errorf("the WARN for %q carried value=%q, want the gate's own %q: nothing may quote a rejected value raw",
 			raw, got, want)

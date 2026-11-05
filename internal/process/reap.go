@@ -8,11 +8,11 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/cplieger/atomicfile/v4"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
+	"github.com/cplieger/go/filesafe"
 )
 
 // reaper reconciles output artifacts with one scan's expected artifact set.
@@ -261,7 +261,7 @@ func (rp *reaper) enumerateFlatInventory(ctx context.Context) (*flatInventory, e
 		budget:  scanbudget.NewCounter(rp.maxEntries),
 		exclude: rp.exclude,
 	}
-	if err := atomicfile.WalkDirInRoot(ctx, rp.src.root, func(rel string, d fs.DirEntry, err error) error {
+	if err := filesafe.WalkDirInRoot(ctx, rp.src.root, func(rel string, d fs.DirEntry, err error) error {
 		return walk.visit(ctx, rel, d, err)
 	}); err != nil {
 		return nil, err

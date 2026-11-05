@@ -4,8 +4,8 @@ import (
 	"context"
 	"os"
 
-	"github.com/cplieger/atomicfile/v4"
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/go/filesafe"
 )
 
 // convertPairInRoot is the test-side stand-in for the retired production helper that did
@@ -30,7 +30,7 @@ func convertPairInRoot(ctx context.Context, certPEM, keyPEM []byte, root *os.Roo
 	if err != nil {
 		return analysis.Observations(), err
 	}
-	if _, err := atomicfile.WriteFileInRoot(ctx, root, rel, pfx, atomicfile.WithMode(0o600)); err != nil {
+	if _, err := filesafe.WriteFileInRoot(ctx, root, rel, pfx, filesafe.WithMode(0o600)); err != nil {
 		return analysis.Observations(), err
 	}
 	return analysis.Observations(), nil
