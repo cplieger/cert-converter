@@ -462,7 +462,7 @@ const (
 	refusalTransient
 
 	// refusalCauseCount is the enum's LENGTH, not a cause.
-	//deadset:ignore DS1004 -- Sentinel the exhaustive cause test iterates up to, so a newly added cause cannot go uncharacterised.
+	//deadset:ignore DS1102 -- Sentinel the exhaustive cause test iterates up to, so a newly added cause cannot go uncharacterised.
 	refusalCauseCount
 )
 
