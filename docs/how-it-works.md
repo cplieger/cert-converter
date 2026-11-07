@@ -28,6 +28,8 @@ When two inputs would produce the same output name, cert-converter converts neit
 
 After each scan with no conversion failure and no output-name collision, the main process writes a marker file at `/tmp/.healthy`. The `health` subcommand passes while that marker exists and is fresher than three times the guaranteed recheck cadence. That is 18 hours on the 6-hour default, and 72 hours when `FALLBACK_SCAN_HOURS` is `0`, `false` or above 24, because the 24-hour floor applies then. A staler marker means the watch loop is stuck. The startup line reports both numbers, `fallback_scan` for your cadence or `disabled`, and `scan_floor` for the guaranteed one the deadline comes from.
 
+With `METRICS_LISTEN_ADDR` set, `/healthz` reads the same marker against the same deadline, so it and the healthcheck always agree.
+
 A restart clears the marker until the first scan completes. That scan reads every output back and rewrites only the ones that no longer match their source, so a restart costs one read pass and no writes.
 
 The container is unhealthy when any of these holds:
@@ -36,7 +38,7 @@ The container is unhealthy when any of these holds:
 - A certificate fails to convert. The causes are a PEM or key parse error, a PFX decode failure, a certificate that does not match its key, and a failed write.
 - Two inputs collide on one output name under the flat layout.
 
-It recovers on the next clean scan without a restart. Docker Engine does not act on health status itself. An orchestrator that does, such as Swarm or Kubernetes, restarts the container, and under plain Docker Compose the restart is yours to do. A collision is the one unhealthy state a restart never clears. It is deliberate, because nothing else tells an orchestrator that an app is reading a file cert-converter refuses to update.
+It recovers on the next clean scan without a restart. Docker Engine does not act on health status itself. An orchestrator that does, such as Swarm or Kubernetes, restarts the container, and under plain Docker Compose the restart is yours to do. Nothing tells you about an unhealthy container unless something watches Docker health, as [Monitoring and alerts](monitoring.md#knowing-the-app-is-alive) explains. A collision is the one unhealthy state a restart never clears. It is deliberate, because nothing else tells an orchestrator that an app is reading a file cert-converter refuses to update.
 
 Health tracks only failures a restart can clear, plus that one exception. These conditions are logged at WARN with the action to take and leave health unchanged:
 
@@ -52,7 +54,7 @@ Health tracks only failures a restart can clear, plus that one exception. These 
 ## Design choices
 
 - The image has no shell or package manager and runs as a non-root user.
-- It opens no port. Health is a file the probe reads, so nothing listens on the network.
+- It opens no port unless you ask for a metrics page. Health is a file the probe reads, so the healthcheck needs no listener.
 - The file watcher reacts within seconds, and the periodic recheck covers network mounts and missed events, so a renewal is never skipped.
 - Output names follow the certificate's folder rather than the issuer's storage layout, so apps keep working across an issuer change.
 - An ambiguous output name converts nothing and turns the container unhealthy, rather than cert-converter guessing which certificate you meant.

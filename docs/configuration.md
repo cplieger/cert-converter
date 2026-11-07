@@ -111,9 +111,21 @@ An output whose `<name>.key` is still present is kept and reported by its own WA
 - Where the memory limit cannot move, lower this ceiling or set `OUTPUT_LIFECYCLE=keep`, which skips the walk of `/output`.
 - An empty, whitespace, invalid, zero or negative value uses `10000`, and a value above `200000` is clamped to that ceiling. Either repair is reported by a WARN at start naming the value you set. No value turns the budget off.
 
+## Metrics
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `METRICS_LISTEN_ADDR` | Address for a Prometheus metrics page and `/healthz`, for example `:9468`. Empty opens no port. | _(unset)_ |
+
+`METRICS_LISTEN_ADDR` is a listen address, a host and a port or a port alone such as `:9468`. While it is unset or empty, cert-converter opens no port.
+
+- Leading and trailing spaces and invisible characters are removed, so `" :9468"` listens on `:9468`.
+- The address is bound at startup, before the first scan. An address that is malformed or already taken stops the container with one error naming `METRICS_LISTEN_ADDR`, and cert-converter never falls back to another address.
+- The listener answers `GET /metrics` and `GET /healthz` with no login, so keep the port on your network. [Monitoring and alerts](monitoring.md) lists the series and what `/healthz` answers.
+
 ## Logging
 
-`LOG_LEVEL` sets the minimum log level, `debug`, `info`, `warn` or `error`, without regard to case. slog offsets such as `info+2` work too. An unrecognized value falls back to `info`.
+`LOG_LEVEL` sets the minimum log level, `debug`, `info`, `warn` or `error`, without regard to case. slog offsets such as `info+2` work too. An unrecognized value falls back to `info`. The log alert rules read an `info` record, so they need `info` or lower.
 
 `debug` adds the reason each source was skipped, each deletion's own path and the file-watch events. A source is skipped because it is an orphan, unchanged or excluded, because it is a bundle while bundle input is off, because a higher-precedence sibling shadows it, or because its folder is unreadable.
 
