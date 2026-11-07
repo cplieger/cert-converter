@@ -36,7 +36,7 @@ func TestStartMetrics_unset_opens_no_listener(t *testing.T) {
 
 	reg, _ := newMetrics()
 	ctx, cancel := context.WithCancel(t.Context())
-	wait, err := startMetrics(ctx, "", reg)
+	wait, err := startMetrics(ctx, "", reg, http.NotFoundHandler())
 	cancel()
 	if err != nil {
 		t.Fatalf("startMetrics(unset) = %v, want nil", err)
@@ -60,7 +60,7 @@ func TestStartMetrics_serves_the_page_on_GET(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	reg, _ := newMetrics()
-	wait, err := startMetrics(ctx, addr, reg)
+	wait, err := startMetrics(ctx, addr, reg, http.NotFoundHandler())
 	if err != nil {
 		cancel()
 		t.Fatalf("startMetrics(%s) = %v", addr, err)

@@ -85,9 +85,10 @@ const (
 	metricsWriteTimeout = 30 * time.Second
 )
 
-// startMetrics binds addr and serves reg's page on it until ctx ends; wait
-// blocks until the server has shut down. An empty addr opens no listener.
-func startMetrics(ctx context.Context, addr string, reg *measure.Registry) (wait func(), err error) {
+// startMetrics binds addr and serves reg's page and healthz on it until ctx
+// ends; wait blocks until the server has shut down. An empty addr opens no
+// listener.
+func startMetrics(ctx context.Context, addr string, reg *measure.Registry, healthz http.Handler) (wait func(), err error) {
 	if addr == "" {
 		return func() {}, nil
 	}
@@ -97,6 +98,7 @@ func startMetrics(ctx context.Context, addr string, reg *measure.Registry) (wait
 	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", reg.Handler())
+	mux.Handle("GET /healthz", healthz)
 	srv := httpserver.New(mux,
 		httpserver.WithReadTimeout(metricsReadTimeout),
 		httpserver.WithWriteTimeout(metricsWriteTimeout))
@@ -108,6 +110,41 @@ func startMetrics(ctx context.Context, addr string, reg *measure.Registry) (wait
 		}
 	}()
 	return func() { <-done }, nil
+}
+
+// --- Health ---
+
+// healthLease is how old the marker may grow before the watch loop counts as
+// stuck: three effective fallback cadences, the marker's guaranteed refresh
+// floor (file events refresh it sooner).
+func healthLease(fallback time.Duration) time.Duration {
+	return health.Lease{Interval: scancadence.Effective(fallback), Cycles: 3}.Duration()
+}
+
+// Reasons /healthz lists. Fixed sentences, because the route answers with no login.
+const (
+	reasonScanFailed = "the last scan did not finish cleanly, or no scan has finished since the start"
+	reasonStuck      = "no scan has finished within three guaranteed recheck cadences, so the watch loop may be stuck"
+)
+
+// newHealthz serves the verdict the health subcommand reads from marker, as
+// one check per fault so each names itself.
+func newHealthz(marker *health.Marker, fallback time.Duration) http.Handler {
+	return health.CheckHandler(
+		health.Check{Signal: marker, Reason: reasonScanFailed},
+		health.Check{Signal: notStale{marker: marker, lease: healthLease(fallback)}, Reason: reasonStuck},
+	)
+}
+
+// notStale fails only a marker that exists and is past the lease, so an
+// absent marker reports reasonScanFailed alone.
+type notStale struct {
+	marker *health.Marker
+	lease  time.Duration
+}
+
+func (s notStale) Healthy() bool {
+	return s.marker.Within(s.lease).Healthy() || !s.marker.Healthy()
 }
 
 // --- Entrypoint ---
@@ -162,13 +199,7 @@ func dispatchArgs(args []string) int {
 	case len(args) == 2 && args[1] == watchSubcommand:
 		return continueToWatcher
 	case len(args) == 2 && args[1] == healthSubcommand:
-		// The periodic safety-net scan is the marker's guaranteed refresh floor
-		// (fs events refresh it sooner), so a marker older than 3 of those
-		// intervals means the watch loop is wedged and a restart fixes it.
-		runProbe(health.DefaultPath, health.WithMaxAge(health.Lease{
-			Interval: scancadence.Effective(config.FallbackInterval()),
-			Cycles:   3,
-		}.Duration()))
+		runProbe(health.DefaultPath, health.WithMaxAge(healthLease(config.FallbackInterval())))
 		return continueToWatcher // unreachable in production; runProbe exits
 	default:
 		switch args[1] {
@@ -267,7 +298,7 @@ func run() int {
 	// of leaving it converting with no page.
 	reg, reporter := newMetrics()
 	metricsCtx, stopMetrics := context.WithCancel(ctx)
-	waitMetrics, err := startMetrics(metricsCtx, cfg.MetricsListenAddr, reg)
+	waitMetrics, err := startMetrics(metricsCtx, cfg.MetricsListenAddr, reg, newHealthz(marker, cfg.FallbackInterval))
 	if err != nil {
 		stopMetrics()
 		slog.Error("cannot listen on METRICS_LISTEN_ADDR; refusing to start",
