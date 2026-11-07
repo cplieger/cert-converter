@@ -348,6 +348,7 @@ func TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unw
 	// is the unverifiable one.
 	pfxPath := filepath.Join(outRoot, "chain.pfx")
 	stageOversizedBundle(t, pfxPath)
+	realWrite := writeFileInRoot
 	stubWriteRefusal(t, &fs.PathError{Op: "openat", Path: "chain.pfx", Err: syscall.EACCES})
 
 	logs := captureLogs(t)
@@ -383,5 +384,15 @@ func TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unw
 	if got := logs.CountLevel(slog.LevelWarn, unreplaceableArtifactMsg); got != 1 {
 		t.Errorf("two unwritable scans logged %q at WARN %d times, want 1: a standing condition is"+
 			" logged when it appears, not on every scan", unreplaceableArtifactMsg, got)
+	}
+
+	// The write goes through: the clear names the artifact under the onset's key.
+	writeFileInRoot = realWrite
+	if _, err := scanner.Run(t.Context()); err != nil {
+		t.Fatalf("Run(output writable again) = error %v, want nil", err)
+	}
+	onset, _ := logs.AttrValueExact(unreplaceableArtifactMsg, "output_path")
+	if cleared, ok := logs.AttrValueExact(standingClearedMsg, "output_path"); !ok || cleared != onset {
+		t.Errorf("the clear record's output_path = %q (present %v), want the onset's %q; log = %q", cleared, ok, onset, logs.Messages())
 	}
 }

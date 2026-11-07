@@ -1,12 +1,13 @@
 # Alert rules for cert-converter as a Prometheus rule group, for Prometheus,
 # Mimir, vmalert or any ruler that reads Prometheus rules. This file is the
-# alternative to alerts/logql.yaml, which holds the same alerts for Loki: load
-# one of the two, not both. The rules read the page cert-converter serves when
-# METRICS_LISTEN_ADDR is set; scrape it under the job name `cert-converter`,
-# which CertConverterDown names. Thresholds, windows and severity labels are
-# starting points; size the 13h stall window to twice FALLBACK_SCAN_HOURS plus
-# an hour. A refused start and a watch loop that died exit the process, so their
-# alerts exist only in the log file; here CertConverterDown covers them.
+# alternative to alerts/logql.yaml: load one of the two, not both. The rules read
+# the page served when METRICS_LISTEN_ADDR is set; scrape it as job
+# `cert-converter`. Thresholds, windows and severity labels are starting points.
+# Size the 13h stall window to twice the effective cadence plus an hour, 49h at
+# most (FALLBACK_SCAN_HOURS capped at 24, or 24 when it is 0). CertConverterDown
+# exists only here; CertConverterScanStalled covers it in alerts/logql.yaml.
+# CertConverterStartupRefused and CertConverterChangeDetectionDead exist only
+# there, because the process exits; here CertConverterDown covers them.
 groups:
   - name: cert-converter
     rules:
@@ -34,8 +35,8 @@ groups:
           description: >
             The latest scan could not convert a source, so its output is stale
             or missing and the container is unhealthy. The `conversion failed`
-            log records name the file. Check ownership for the UID in `user:`,
-            the PFX password and the chain.
+            records name the file. Check ownership for the UID in `user:`, the
+            PFX password and the chain.
       - alert: CertConverterOutputNameCollision
         expr: cert_converter_last_scan_sources{outcome="collided"} > 0
         for: 0m

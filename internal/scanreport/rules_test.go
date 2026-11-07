@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -230,6 +231,42 @@ func TestLogQLStateRulesResolveOnTheNextGoodRecord(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestLogQLStateRulesHoldThroughAnAbortedScan pins that the record of a scan
+// that could not open /input is not a good record: a standing condition the
+// previous scan found keeps its rule firing until a complete scan clears it.
+func TestLogQLStateRulesHoldThroughAnAbortedScan(t *testing.T) {
+	var rule logqlRule
+	for _, r := range stateRules(t) {
+		if r.name == "CertConverterNoCertificateSources" {
+			rule = r
+		}
+	}
+	if rule.name == "" {
+		t.Fatal("alerts/logql.yaml has no CertConverterNoCertificateSources rule")
+	}
+	in := filepath.Join(t.TempDir(), "input")
+	if err := os.Mkdir(in, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	scanner := process.New(&process.Options{CertsRoot: in, OutRoot: t.TempDir(), Password: "pw"})
+	scanOnce := func() map[string]string {
+		result, err := scanner.Run(t.Context())
+		return renderRecord(t, &Scan{Result: result, Err: err})
+	}
+	empty := scanOnce()
+	if err := os.Rename(in, in+".away"); err != nil {
+		t.Fatal(err)
+	}
+	aborted := scanOnce()
+	if aborted["aborted"] != "1" {
+		t.Fatalf("scan with /input missing wrote aborted=%q, want 1", aborted["aborted"])
+	}
+	records := []timedRecord{{fields: empty, at: 0}, {fields: aborted, at: time.Hour}}
+	if !firing(t, rule, records, 2*time.Hour) {
+		t.Errorf("%s resolved on an aborted scan's record (no_sources=%s), want it firing until a complete scan", rule.name, aborted["no_sources"])
 	}
 }
 

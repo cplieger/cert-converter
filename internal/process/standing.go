@@ -1,6 +1,7 @@
 package process
 
 import (
+	"cmp"
 	"log/slog"
 	"time"
 
@@ -29,6 +30,13 @@ const (
 
 // standingClearedMsg ends a standing condition, with how long it held.
 const standingClearedMsg = "standing condition cleared"
+
+// subjectAttr is the key a per-path kind's onset logs its subject under, when
+// not `path`; the clear uses the same key, so one value never has two names.
+var subjectAttr = map[string]string{
+	condCollision:  "output_stem",
+	condUnwritable: "output_path",
+}
 
 // standing remembers the standing conditions this process has reported, so a
 // reader sees each one when it appears, again when its count changes, and once
@@ -108,7 +116,7 @@ func (s *standing) clear(key standingKey) {
 	delete(s.conditions, key)
 	attrs := []any{"condition", key.kind}
 	if key.subject != "" {
-		attrs = append(attrs, "path", logtext.Path(key.subject))
+		attrs = append(attrs, cmp.Or(subjectAttr[key.kind], "path"), logtext.Path(key.subject))
 	}
 	attrs = append(attrs, "lasted", standingClock().Sub(held.since).Round(time.Second).String())
 	slog.Info(standingClearedMsg, attrs...)

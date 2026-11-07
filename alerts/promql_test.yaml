@@ -60,7 +60,7 @@ tests:
               outcome: failed
             exp_annotations:
               summary: "cert-converter failed to convert a certificate"
-              description: "The latest scan could not convert a source, so its output is stale or missing and the container is unhealthy. The `conversion failed` log records name the file. Check ownership for the UID in `user:`, the PFX password and the chain.\n"
+              description: "The latest scan could not convert a source, so its output is stale or missing and the container is unhealthy. The `conversion failed` records name the file. Check ownership for the UID in `user:`, the PFX password and the chain.\n"
       - eval_time: 8m
         alertname: CertConverterConversionFailed
         exp_alerts: []

@@ -1,13 +1,13 @@
 # Alert rules for cert-converter as a Loki ruler (LogQL) group. This file is
-# the alternative to alerts/promql.yaml, which holds the same alerts for a
-# metric store: load one of the two, not both. Ship the container log to Loki
-# and keep LOG_LEVEL at info, because the rules read the INFO `scan complete`
-# record each scan writes. Change the `container` selector to the label your
-# log collector sets. Thresholds, windows and severity labels are starting
-# points. The 13h windows cover two scans at the default FALLBACK_SCAN_HOURS=6
-# plus an hour; set them to twice your cadence plus an hour, or 50h when
-# FALLBACK_SCAN_HOURS=0. CertConverterStartupRefused and
-# CertConverterChangeDetectionDead exist only in this file: the process exits.
+# the alternative to alerts/promql.yaml: load one of the two, not both. Keep
+# LOG_LEVEL at info: the rules read the `scan complete` record, which is INFO
+# when a scan covered the tree and WARN when it did not. Change the `container`
+# selector to your log collector's label. Thresholds, windows and severity labels
+# are starting points. Size the 13h windows to twice the effective cadence plus an
+# hour: FALLBACK_SCAN_HOURS capped at 24, or 24 when it is 0, so 49h at most.
+# CertConverterStartupRefused and CertConverterChangeDetectionDead exist only
+# here; in alerts/promql.yaml CertConverterDown covers them. CertConverterDown
+# exists only there; here CertConverterScanStalled covers it.
 groups:
   - name: cert-converter
     rules:

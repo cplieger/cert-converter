@@ -1,6 +1,8 @@
 package process
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -128,6 +130,203 @@ func TestScannerRun_reports_each_verdict(t *testing.T) {
 		}
 		if !res.CleanupDegraded {
 			t.Errorf("Run(no sweep due, last sweep degraded) CleanupDegraded = false, want true")
+		}
+	})
+}
+
+// hideInput moves /input away, so the next Run cannot open its root, and
+// returns the function that puts it back.
+func hideInput(t *testing.T, in string) (restore func()) {
+	t.Helper()
+	away := in + ".away"
+	if err := os.Rename(in, away); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		t.Helper()
+		if err := os.Rename(away, in); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// abortedRun runs s with /input hidden and requires the scan to abort.
+func abortedRun(t *testing.T, s *Scanner, in string) ScanResult {
+	t.Helper()
+	restore := hideInput(t, in)
+	defer restore()
+	res, err := s.Run(t.Context())
+	if err == nil || res.Outcome != OutcomeAborted {
+		t.Fatalf("Run(/input missing) = (%+v, %v), want outcome aborted and the open error", res, err)
+	}
+	return res
+}
+
+// TestScannerRun_keeps_unproven_conditions_on_an_incomplete_scan pins that a
+// scan which did not enumerate the whole tree still reports what the last
+// enumeration found, raised by what it saw itself: the record's rules read the
+// latest scan, so a zero here would resolve an alert while its problem holds.
+func TestScannerRun_keeps_unproven_conditions_on_an_incomplete_scan(t *testing.T) {
+	t.Run("a failed conversion holds through an unopenable root and clears at the next complete scan", func(t *testing.T) {
+		in, out := t.TempDir(), t.TempDir()
+		writeSelfSignedPair(t, in, "blocked")
+		blocker := filepath.Join(out, "blocked.pfx")
+		if err := os.Mkdir(blocker, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		s := newVerdictScanner(in, out, Options{Lifecycle: outputpolicy.LifecycleKeep})
+		first, err := s.Run(t.Context())
+		if err != nil || first.Failed != 1 {
+			t.Fatalf("Run(write blocked) = (%+v, %v), want Failed 1", first, err)
+		}
+		if res := abortedRun(t, s, in); res.Failed != 1 {
+			t.Errorf("Run(/input missing after a failed conversion) Failed = %d, want 1", res.Failed)
+		}
+		if err := os.Remove(blocker); err != nil {
+			t.Fatal(err)
+		}
+		res, err := s.Run(t.Context())
+		if err != nil || res.Failed != 0 || res.Outcome != OutcomeComplete {
+			t.Errorf("Run(blocker removed) = (%+v, %v), want a complete scan with Failed 0", res, err)
+		}
+	})
+	t.Run("no sources holds through an unopenable root", func(t *testing.T) {
+		in := t.TempDir()
+		s := newVerdictScanner(in, t.TempDir(), Options{})
+		if first, err := s.Run(t.Context()); err != nil || !first.NoSources {
+			t.Fatalf("Run(empty /input) = (%+v, %v), want NoSources", first, err)
+		}
+		if res := abortedRun(t, s, in); !res.NoSources {
+			t.Errorf("Run(/input missing after an empty scan) NoSources = false, want true")
+		}
+	})
+	t.Run("a walk with an unreadable path keeps no sources unless it found one", func(t *testing.T) {
+		in := t.TempDir()
+		s := newVerdictScanner(in, t.TempDir(), Options{})
+		if first, err := s.Run(t.Context()); err != nil || !first.NoSources {
+			t.Fatalf("Run(empty /input) = (%+v, %v), want NoSources", first, err)
+		}
+		if err := os.Mkdir(filepath.Join(in, "dir.crt"), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Run(t.Context()); err != nil || !res.NoSources {
+			t.Errorf("Run(only an unreadable path added) = (%+v, %v), want NoSources kept", res, err)
+		}
+		writeSelfSignedPair(t, in, "live")
+		if res, err := s.Run(t.Context()); err != nil || res.NoSources {
+			t.Errorf("Run(a pair beside the unreadable path) = (%+v, %v), want NoSources false: the scan found a source", res, err)
+		}
+	})
+	t.Run("a walk with an unreadable path drops every source excluded once it found one that is not", func(t *testing.T) {
+		in := t.TempDir()
+		writeSelfSignedPair(t, in, "skip")
+		s := newVerdictScanner(in, t.TempDir(), Options{Exclude: layout.NewExcludeSet([]string{"skip.crt"})})
+		if first, err := s.Run(t.Context()); err != nil || !first.AllExcluded {
+			t.Fatalf("Run(every source excluded) = (%+v, %v), want AllExcluded", first, err)
+		}
+		if err := os.Mkdir(filepath.Join(in, "dir.crt"), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Run(t.Context()); err != nil || !res.AllExcluded {
+			t.Errorf("Run(only an unreadable path added) = (%+v, %v), want AllExcluded kept", res, err)
+		}
+		writeSelfSignedPair(t, in, "live")
+		if res, err := s.Run(t.Context()); err != nil || res.AllExcluded {
+			t.Errorf("Run(a pair that is not excluded) = (%+v, %v), want AllExcluded false", res, err)
+		}
+	})
+	t.Run("a degraded cleanup holds through an unopenable root", func(t *testing.T) {
+		in := t.TempDir()
+		writeSelfSignedPair(t, in, "live")
+		s := newVerdictScanner(in, t.TempDir(), Options{})
+		s.cleanupDegraded = true
+		s.lastSweep = sweepClock()
+		if res := abortedRun(t, s, in); !res.CleanupDegraded {
+			t.Errorf("Run(/input missing, last sweep degraded) CleanupDegraded = false, want true")
+		}
+	})
+	t.Run("removals are this scan's own", func(t *testing.T) {
+		in, out := t.TempDir(), t.TempDir()
+		writeSelfSignedPair(t, in, "live")
+		if err := os.WriteFile(filepath.Join(out, "gone.pfx"), []byte("pfx"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s := newVerdictScanner(in, out, Options{Lifecycle: outputpolicy.LifecycleSync})
+		if first, err := s.Run(t.Context()); err != nil || first.Removed != 1 {
+			t.Fatalf("Run(one orphan, sync) = (%+v, %v), want Removed 1", first, err)
+		}
+		if res := abortedRun(t, s, in); res.Removed != 0 {
+			t.Errorf("Run(/input missing) Removed = %d, want 0: it removed nothing", res.Removed)
+		}
+	})
+	// a sorts first, so the two-entry budget's prefix holds the a pair; z is past it.
+	budgetStopped := func(t *testing.T, s *Scanner) ScanResult {
+		t.Helper()
+		s.opts.MaxScanEntries = 2
+		res, err := s.Run(t.Context())
+		if err != nil || res.Outcome != OutcomeBudgetStopped {
+			t.Fatalf("Run(budget 2) = (%+v, %v), want a budget stop", res, err)
+		}
+		return res
+	}
+	threePairs := func(t *testing.T, blocked string) (in, out string) {
+		t.Helper()
+		in, out = t.TempDir(), t.TempDir()
+		for _, stem := range []string{"a", "b", "z"} {
+			writeSelfSignedPair(t, in, stem)
+		}
+		if blocked != "" {
+			if err := os.Mkdir(filepath.Join(out, blocked+".pfx"), 0o750); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return in, out
+	}
+	t.Run("a budget stop keeps a failure past its prefix", func(t *testing.T) {
+		in, out := threePairs(t, "z")
+		s := newVerdictScanner(in, out, Options{Lifecycle: outputpolicy.LifecycleKeep})
+		if first, err := s.Run(t.Context()); err != nil || first.Failed != 1 {
+			t.Fatalf("Run(z blocked) = (%+v, %v), want Failed 1", first, err)
+		}
+		if res := budgetStopped(t, s); res.Failed != 1 {
+			t.Errorf("Run(budget stop before z) Failed = %d, want the last enumeration's 1", res.Failed)
+		}
+	})
+	t.Run("a budget stop reports a failure its prefix saw", func(t *testing.T) {
+		in, out := threePairs(t, "")
+		s := newVerdictScanner(in, out, Options{Lifecycle: outputpolicy.LifecycleKeep})
+		if first, err := s.Run(t.Context()); err != nil || first.Failed != 0 {
+			t.Fatalf("Run(clean) = (%+v, %v), want Failed 0", first, err)
+		}
+		blocker := filepath.Join(out, "a.pfx")
+		if err := os.Remove(blocker); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(blocker, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		writeSelfSignedPair(t, in, "a")
+		if res := budgetStopped(t, s); res.Failed != 1 {
+			t.Errorf("Run(budget stop, a blocked in the prefix) Failed = %d, want 1", res.Failed)
+		}
+	})
+	t.Run("an error after a complete walk keeps the walk's whole-tree verdict", func(t *testing.T) {
+		in, out := t.TempDir(), t.TempDir()
+		writeSelfSignedPair(t, in, "skip")
+		if err := os.WriteFile(filepath.Join(out, "gone.pfx"), []byte("pfx"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stubReapWait(t, func(context.Context) error { return errors.New("reconcile failed") })
+		s := newVerdictScanner(in, out, Options{
+			Lifecycle: outputpolicy.LifecycleSync,
+			Exclude:   layout.NewExcludeSet([]string{"skip.crt"}),
+		})
+		res, err := s.Run(t.Context())
+		if err == nil || res.Outcome != OutcomeAborted {
+			t.Fatalf("Run(reconcile error) = (%+v, %v), want outcome aborted", res, err)
+		}
+		if !res.AllExcluded {
+			t.Errorf("Run(every source excluded, then a reconcile error) AllExcluded = false, want true: the walk enumerated the whole tree")
 		}
 	})
 }

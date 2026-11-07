@@ -75,8 +75,7 @@ func flag(b bool) int {
 	return 0
 }
 
-// logRecord writes the end-of-scan record: INFO for a scan that covered the tree,
-// WARN for one that aborted or stopped at the entry budget.
+// logRecord writes the end-of-scan record; the log rules read it at either level.
 func logRecord(ctx context.Context, scan *Scan) {
 	level := slog.LevelInfo
 	if scan.Result.Outcome != process.OutcomeComplete {

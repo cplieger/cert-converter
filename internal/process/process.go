@@ -23,7 +23,9 @@ import (
 	"github.com/cplieger/go/filesafe"
 )
 
-// ScanResult carries per-source outcome summary counts from a scan run.
+// ScanResult carries per-source outcome summary counts from a scan run. A scan
+// that did not enumerate the whole tree reports each standing condition at least
+// as the previous scan reported it, because it cannot prove one gone.
 type ScanResult struct {
 	// Removed counts artifacts deleted because their source is gone.
 	Removed    int
@@ -100,6 +102,26 @@ func (o Outcome) String() string {
 	}
 }
 
+// carryUnproven raises the conditions a scan that did not enumerate the whole
+// tree cannot prove gone to the previous report's values. With enumerated, the
+// walk finished and only the whole-tree verdicts carry; a whole-tree verdict
+// this scan's own sources disprove does not.
+func (r *ScanResult) carryUnproven(prev *ScanResult, enumerated bool) {
+	r.NoSources = r.NoSources || (prev.NoSources && r.Total <= r.Orphan)
+	r.AllExcluded = r.AllExcluded || (prev.AllExcluded && r.Excluded == r.Total)
+	if enumerated {
+		return
+	}
+	r.Orphan = max(r.Orphan, prev.Orphan)
+	r.Failed = max(r.Failed, prev.Failed)
+	r.Unreadable = max(r.Unreadable, prev.Unreadable)
+	r.Unresolved = max(r.Unresolved, prev.Unresolved)
+	r.Unwritable = max(r.Unwritable, prev.Unwritable)
+	r.Collided = max(r.Collided, prev.Collided)
+	r.OrphanRemovalDisabled = r.OrphanRemovalDisabled || prev.OrphanRemovalDisabled
+	r.PreviousLayoutRetained = r.PreviousLayoutRetained || prev.PreviousLayoutRetained
+}
+
 // conversionsClean reports whether nothing this scan did leaves the output tree in a
 // state this app is still trying to repair. A collision counts: the contested
 // path's content is ambiguous, so no deletion may rest on this scan's view.
@@ -173,6 +195,8 @@ type Scanner struct {
 	observations *observationLog
 	standing     *standing
 	opts         Options
+	// lastReported is the previous scan's result, what an incomplete scan carries.
+	lastReported ScanResult
 	// cleanupDegraded carries the last sweep's verdict to the scans between sweeps.
 	cleanupDegraded bool
 }
@@ -233,7 +257,10 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	s.standing.beginScan()
 	inHandle, outHandle, err := openScanRoots(s.opts.CertsRoot, s.opts.OutRoot)
 	if err != nil {
-		return ScanResult{Outcome: OutcomeAborted}, err
+		result := ScanResult{Outcome: OutcomeAborted, CleanupDegraded: s.cleanupDegraded}
+		result.carryUnproven(&s.lastReported, false)
+		s.lastReported = result
+		return result, err
 	}
 	defer func() { _ = inHandle.Close() }()
 	defer func() { _ = outHandle.Close() }()
@@ -297,6 +324,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	}
 	// A tree over the entry budget is REPORTED, not failed.
 	budgetExceeded := errors.Is(walkErr, errScanBudgetExceeded)
+	enumerated := walkErr == nil
 
 	result := countResults(sw.results, sw.unreadable, sw.unresolved, sw.vanished)
 	result.Ignored = sw.ignored
@@ -338,7 +366,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		walkErr = reconcileErr
 	}
 
-	s.reportVerdict(&result, out, walkErr)
+	s.reportVerdict(&result, out, walkErr, enumerated)
 	if budgetExceeded {
 		return result, nil
 	}
@@ -347,18 +375,24 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 
 // reportVerdict derives the scan's verdicts from what the walk, the reaper and
 // the last sweep found, then logs the standing conditions that changed. Only a
-// scan that ran to the end can prove a per-path condition gone.
-func (s *Scanner) reportVerdict(result *ScanResult, out *store, walkErr error) {
+// scan that ran to the end can prove a per-path condition gone. enumerated is
+// whether the /input walk finished, whatever reconciliation did after it.
+func (s *Scanner) reportVerdict(result *ScanResult, out *store, walkErr error, enumerated bool) {
 	result.Outcome = outcomeOf(walkErr)
 	result.OrphanRemovalDisabled = out.reapDisabled
 	result.PreviousLayoutRetained = out.otherLayoutKept
 	result.CleanupDegraded = s.cleanupDegraded
-	if walkErr == nil && result.inputFullyEnumerated() {
+	wholeTree := enumerated && result.inputFullyEnumerated()
+	if wholeTree {
 		coverage := wholeTreeCoverageOf(result)
 		result.NoSources = coverage == coverageNoSource || coverage == coverageAllOrphan
 		result.AllExcluded = coverage == coverageAllExcluded
 	}
 	logInputCoverageWarnings(s.standing, result, walkErr)
+	if !wholeTree {
+		result.carryUnproven(&s.lastReported, enumerated)
+	}
+	s.lastReported = *result
 	if walkErr != nil {
 		return
 	}
@@ -690,7 +724,7 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 			level = slog.LevelWarn
 		}
 		slog.Log(context.Background(), level, "skipping symlink that could not be resolved through the input root; anything it points to, including certificates under a linked directory, is not scanned",
-			"path", logtext.Path(rel), "error", logtext.Path(err.Error()),
+			"condition", condUnresolvedSymlink, "path", logtext.Path(rel), "error", logtext.Path(err.Error()),
 			"remediation", "mount that certificate path into /input directly instead of linking to it, or fix the permissions on the link target")
 	case err == nil && fi.IsDir():
 		slog.Debug("skipping symlinked directory; its target is walked directly", "path", logtext.Path(rel))

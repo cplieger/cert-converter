@@ -89,9 +89,9 @@ func TestLogLevels(t *testing.T) {
 	}
 }
 
-// TestReportSetsEverySeriesFromTheRecord pins the one-function rule: a scan sets
-// every scan series to the value of the record it wrote, both parsed from what
-// they emit, so the log rules and the metric rules read the same verdict.
+// TestReportSetsEverySeriesFromTheRecord pins that one Report call sets every
+// scan series to the value of the record it writes, both parsed from what they
+// emit, so the log rules and the metric rules read the same verdict.
 func TestReportSetsEverySeriesFromTheRecord(t *testing.T) {
 	reg := measure.NewRegistry("cert_converter")
 	reporter := NewReporter(reg)

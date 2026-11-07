@@ -11,9 +11,9 @@ import (
 
 const unreadablePathsMsg = "some /input paths were unreadable and were skipped; health is unaffected"
 
-// TestScannerRun_logs_a_standing_unreadable_path_when_it_changes pins the fleet's
-// standing-state rule on the /input coverage condition: three scans with one
-// standing unreadable path log one WARN, the clearing scan logs one INFO with how
+// TestScannerRun_logs_a_standing_unreadable_path_when_it_changes pins that a
+// standing condition is logged when it appears, changes and clears: three scans
+// with one standing unreadable path log one WARN, the clearing scan logs one INFO with how
 // long it lasted, a restart logs the condition once again, and every scan's result
 // still carries the count the end-of-scan record reports.
 // Serial: it swaps slog.Default().
@@ -71,8 +71,8 @@ func TestScannerRun_logs_a_standing_unreadable_path_when_it_changes(t *testing.T
 	}
 }
 
-// TestScannerRun_relogs_a_standing_condition_when_its_count_changes pins the
-// detail half of the rule: the count is part of what the reader is told.
+// TestScannerRun_relogs_a_standing_condition_when_its_count_changes pins that a
+// changed count is logged again: the count is part of what the reader is told.
 // Serial: it swaps slog.Default().
 func TestScannerRun_relogs_a_standing_condition_when_its_count_changes(t *testing.T) {
 	in := t.TempDir()
@@ -99,9 +99,10 @@ func TestScannerRun_relogs_a_standing_condition_when_its_count_changes(t *testin
 	}
 }
 
-// TestScannerRun_logs_a_standing_collision_when_it_changes pins the same rule on
-// the flat output-name collision: the ERROR is logged when the collision appears
-// and the INFO when it is resolved, not on every scan in between.
+// TestScannerRun_logs_a_standing_collision_when_it_changes pins the same on the
+// flat output-name collision: the ERROR is logged when the collision appears and
+// the INFO, under the same output_stem, when it is resolved, not on every scan in
+// between.
 // Serial: it swaps slog.Default().
 func TestScannerRun_logs_a_standing_collision_when_it_changes(t *testing.T) {
 	in, out := t.TempDir(), t.TempDir()
@@ -133,5 +134,48 @@ func TestScannerRun_logs_a_standing_collision_when_it_changes(t *testing.T) {
 	}
 	if !logs.HasAttr(standingClearedMsg, "condition", condCollision) {
 		t.Errorf("resolving the collision logged no clear record; log = %q", logs.Messages())
+	}
+	onset, _ := logs.AttrValueExact(collisionMsg, "output_stem")
+	if cleared, ok := logs.AttrValueExact(standingClearedMsg, "output_stem"); !ok || cleared != onset {
+		t.Errorf("the clear record's output_stem = %q (present %v), want the onset's %q", cleared, ok, onset)
+	}
+	if _, ok := logs.AttrValueExact(standingClearedMsg, "path"); ok {
+		t.Errorf("the collision's clear record carries `path`, want its subject under output_stem only")
+	}
+}
+
+// TestScannerRun_pairs_an_unresolved_symlink_onset_with_its_clear pins that both
+// records name the condition and the link the same way, so a reader can match them.
+// Serial: it swaps slog.Default().
+func TestScannerRun_pairs_an_unresolved_symlink_onset_with_its_clear(t *testing.T) {
+	base := t.TempDir()
+	in, outside := filepath.Join(base, "input"), filepath.Join(base, "outside")
+	for _, dir := range []string{in, outside} {
+		if err := os.Mkdir(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSelfSignedPair(t, in, "live")
+	link := filepath.Join(in, "linked-dir")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	logs := captureLogs(t)
+	scanner := newVerdictScanner(in, t.TempDir(), Options{})
+	if _, err := scanner.Run(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	const onsetMsg = "skipping symlink that could not be resolved through the input root"
+	if !logs.HasAttr(onsetMsg, "condition", condUnresolvedSymlink) {
+		t.Errorf("the unresolved-symlink WARN does not carry condition=%s; log = %q", condUnresolvedSymlink, logs.Messages())
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scanner.Run(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !logs.HasAttr(standingClearedMsg, "condition", condUnresolvedSymlink) || !logs.HasAttr(standingClearedMsg, "path", "linked-dir") {
+		t.Errorf("removing the link logged no clear record naming %s and path linked-dir; log = %q", condUnresolvedSymlink, logs.Messages())
 	}
 }

@@ -130,9 +130,10 @@ func runWithMetricsAddr(t *testing.T, addr string) (code int, out string) {
 	return code, out
 }
 
-// TestRun_refuses_to_start_when_METRICS_LISTEN_ADDR_cannot_be_bound pins the
-// tier-3 bind rule: a malformed or taken address exits non-zero before the first
-// scan with one error naming the variable, and never falls back to another address.
+// TestRun_refuses_to_start_when_METRICS_LISTEN_ADDR_cannot_be_bound pins that an
+// address that cannot be bound stops startup: a malformed or taken address exits
+// non-zero before the first scan with one error naming the variable, and never
+// falls back to another address.
 // Serial: it swaps os.Args, os.Stderr, slog.Default() and requiredVolumes.
 func TestRun_refuses_to_start_when_METRICS_LISTEN_ADDR_cannot_be_bound(t *testing.T) {
 	taken, err := net.Listen("tcp", "127.0.0.1:0")
