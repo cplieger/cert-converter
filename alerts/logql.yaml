@@ -6,7 +6,8 @@
 # log collector sets. Thresholds, windows and severity labels are starting
 # points. The 13h windows cover two scans at the default FALLBACK_SCAN_HOURS=6
 # plus an hour; set them to twice your cadence plus an hour, or 50h when
-# FALLBACK_SCAN_HOURS=0. CertConverterStartupRefused exists only in this file.
+# FALLBACK_SCAN_HOURS=0. CertConverterStartupRefused and
+# CertConverterChangeDetectionDead exist only in this file: the process exits.
 groups:
   - name: cert-converter
     rules:
