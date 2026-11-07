@@ -39,7 +39,7 @@ func TestWatchLoop_runs_the_repair_the_reassert_floor_deferred(t *testing.T) {
 	// A one-hour debounce and safety net: no event is written under root, and
 	// neither timer can fire on this timescale, so the only clock that can restore
 	// the watch below is the deferred repair.
-	w := New(root, func(context.Context) { scans <- struct{}{} },
+	w := New(root, func(context.Context, bool) { scans <- struct{}{} },
 		WithDebounce(time.Hour), WithFallback(time.Hour))
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
@@ -118,7 +118,7 @@ func TestWatchLoop_runs_the_repair_the_reassert_floor_deferred(t *testing.T) {
 // which is the pending flag's job.
 func TestScheduleRepair_arms_for_the_remainder_of_the_floor(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		st := newWatchState(New(absentWatchRoot, func(context.Context) {}, WithFallback(time.Hour)))
+		st := newWatchState(New(absentWatchRoot, func(context.Context, bool) {}, WithFallback(time.Hour)))
 		defer st.stop()
 
 		start := time.Now()
@@ -159,7 +159,7 @@ func TestRunDeferredRepair_skips_a_repair_another_reassert_already_covered(t *te
 		t.Fatal(err)
 	}
 	scans := 0
-	w := New(root, func(context.Context) { scans++ }, WithFallback(time.Hour))
+	w := New(root, func(context.Context, bool) { scans++ }, WithFallback(time.Hour))
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
@@ -198,7 +198,7 @@ func TestRunDeferredRepair_skips_the_walk_after_shutdown(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)
 	root := t.TempDir()
-	w := New(root, func(context.Context) {}, WithFallback(time.Hour))
+	w := New(root, func(context.Context, bool) {}, WithFallback(time.Hour))
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 	st.lastResync = time.Now().Add(-2 * minPreScanResync)

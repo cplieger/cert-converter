@@ -87,7 +87,7 @@ func TestPollLoopWithUpgrade_hands_the_upgraded_watcher_back_without_scanning(t 
 		t.Fatal(err)
 	}
 	scans := make(chan struct{}, 8)
-	w := New(root, func(context.Context) { scans <- struct{}{} },
+	w := New(root, func(context.Context, bool) { scans <- struct{}{} },
 		WithDebounce(20*time.Millisecond), WithFallback(20*time.Millisecond))
 
 	ctx := t.Context()
@@ -138,7 +138,7 @@ func TestPollLoopWithUpgrade_treats_shutdown_before_the_first_scan_as_a_clean_st
 	scans := 0
 	// No WithFallback, i.e. the dead-change-detection configuration: a live ctx
 	// here returns a *LostError, so this pins that shutdown outranks that exit.
-	w := New(t.TempDir(), func(context.Context) { scans++ })
+	w := New(t.TempDir(), func(context.Context, bool) { scans++ })
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -176,7 +176,7 @@ func TestPollTick_treats_shutdown_during_the_watch_set_rebuild_as_a_stop(t *test
 		t.Fatal(err)
 	}
 	scans := 0
-	w := New(root, func(context.Context) { scans++ }, WithFallback(time.Hour))
+	w := New(root, func(context.Context, bool) { scans++ }, WithFallback(time.Hour))
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	prev := newFSWatcher
@@ -222,7 +222,7 @@ func TestPollLoopWithUpgrade_returns_when_a_shutdown_interrupts_a_poll_tick(t *t
 	}
 
 	scans := 0
-	w := New(t.TempDir(), func(context.Context) { scans++ }, WithFallback(20*time.Millisecond))
+	w := New(t.TempDir(), func(context.Context, bool) { scans++ }, WithFallback(20*time.Millisecond))
 
 	fw, err := w.pollLoopWithUpgrade(ctx)
 
@@ -249,7 +249,7 @@ func TestRun_falls_back_to_polling_when_fsnotify_is_unavailable(t *testing.T) {
 	// No WithFallback: poll mode then has no interval, so Run scans once and
 	// returns a *LostError -- reachable only through the unavailable-fsnotify
 	// dispatch.
-	w := New(t.TempDir(), func(context.Context) { scans++ })
+	w := New(t.TempDir(), func(context.Context, bool) { scans++ })
 
 	var lost *LostError
 	if err := w.Run(t.Context()); !errors.As(err, &lost) {
@@ -271,7 +271,7 @@ func TestRun_treats_shutdown_during_fsnotify_construction_failure_as_a_clean_sto
 	stubFSWatcherUnavailable(t)
 
 	scans := 0
-	w := New(t.TempDir(), func(context.Context) { scans++ })
+	w := New(t.TempDir(), func(context.Context, bool) { scans++ })
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -292,7 +292,7 @@ func TestPollTick_stays_in_poll_mode_when_fsnotify_remains_unavailable(t *testin
 	stubFSWatcherUnavailable(t)
 
 	scans := 0
-	w := New(t.TempDir(), func(context.Context) { scans++ }, WithFallback(time.Hour))
+	w := New(t.TempDir(), func(context.Context, bool) { scans++ }, WithFallback(time.Hour))
 
 	upgraded, stopped := w.pollTick(t.Context())
 	if upgraded != nil {
@@ -327,7 +327,7 @@ func TestPollTick_does_no_work_when_the_ctx_is_already_cancelled(t *testing.T) {
 	logs := capture.Default(t)
 
 	scans := 0
-	w := New(t.TempDir(), func(context.Context) { scans++ }, WithFallback(time.Hour))
+	w := New(t.TempDir(), func(context.Context, bool) { scans++ }, WithFallback(time.Hour))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -363,7 +363,7 @@ func TestPollLoopWithUpgrade_treats_shutdown_during_the_initial_scan_as_a_clean_
 	scans := 0
 	// No WithFallback: the dead-change-detection configuration, where a live ctx
 	// after the initial scan returns a *LostError.
-	w := New(t.TempDir(), func(context.Context) {
+	w := New(t.TempDir(), func(context.Context, bool) {
 		scans++
 		cancel()
 	})
@@ -398,7 +398,7 @@ func TestPollLoopWithUpgrade_returns_on_shutdown_while_polling(t *testing.T) {
 	stubFSWatcherUnavailable(t)
 
 	scans := make(chan struct{}, 4)
-	w := New(t.TempDir(), func(context.Context) { scans <- struct{}{} }, WithFallback(time.Hour))
+	w := New(t.TempDir(), func(context.Context, bool) { scans <- struct{}{} }, WithFallback(time.Hour))
 	ctx, cancel := context.WithCancel(t.Context())
 	done := runPollLoop(ctx, w)
 
@@ -456,7 +456,7 @@ func TestPollTick_closes_the_watcher_it_could_not_give_a_watch_set(t *testing.T)
 	})
 	missingRoot := filepath.Join(t.TempDir(), "missing")
 	scans := 0
-	w := New(missingRoot, func(context.Context) { scans++ }, WithFallback(time.Hour))
+	w := New(missingRoot, func(context.Context, bool) { scans++ }, WithFallback(time.Hour))
 
 	upgraded, stopped := w.pollTick(t.Context())
 

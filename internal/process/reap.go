@@ -74,11 +74,11 @@ func (r *reapContext) enumeratedInput() bool {
 const reapDisabledPhrase = "orphan removal is disabled for this scan"
 
 // logIncompleteInputEnumeration reports why orphan reconciliation is skipped when
-// the input enumeration is incomplete.
-func logIncompleteInputEnumeration(rc *reapContext) {
+// the input enumeration is incomplete, and whether that disabled orphan removal.
+func logIncompleteInputEnumeration(rc *reapContext) (disabled bool) {
 	if rc.shutdown {
 		slog.Debug("skipping orphan reconciliation; scan cancelled during shutdown")
-		return
+		return false
 	}
 	slog.Warn(reapDisabledPhrase+": this scan cannot prove any /output artifact is orphaned",
 		"walk_completed", rc.walkCompleted, "unreadable", rc.result.Unreadable,
@@ -92,6 +92,7 @@ func logIncompleteInputEnumeration(rc *reapContext) {
 			"if the scan stopped at the entry budget, raise MAX_SCAN_ENTRIES and the container's "+
 			"memory limit together, because one scan's memory grows with the total length of the "+
 			"paths it enumerates")
+	return true
 }
 
 // reconcile compares the output tree against the artifact set this scan expects
@@ -102,7 +103,7 @@ func (rp *reaper) reconcile(ctx context.Context, expected map[string]struct{}, r
 		return 0, nil
 	}
 	if !rc.enumeratedInput() {
-		logIncompleteInputEnumeration(rc)
+		rp.out.reapDisabled = logIncompleteInputEnumeration(rc)
 		return 0, nil
 	}
 	outputs, walkSafe, err := rp.out.listOutputs(ctx)
@@ -115,11 +116,13 @@ func (rp *reaper) reconcile(ctx context.Context, expected map[string]struct{}, r
 			// A SIZE condition, not a permission one: the generic WARN below
 			// points at /output ownership, which is the wrong diagnosis for a
 			// tree simply larger than one scan will enumerate.
+			rp.out.reapDisabled = true
 			slog.Warn(outputBudgetMsg,
 				"error", logtext.Path(err.Error()), "dir", logtext.Path(rp.out.root.Name()),
 				"remediation", outputBudgetRemediation)
 			return 0, nil
 		}
+		rp.out.reapDisabled = true
 		slog.Warn("could not enumerate output orphans; "+reapDisabledPhrase,
 			"error", logtext.Path(err.Error()), "dir", logtext.Path(rp.out.root.Name()),
 			"remediation", outputPermRemediation)
@@ -150,6 +153,7 @@ func (rp *reaper) reportRetainedOrphans(orphaned []string, walkSafe bool) {
 	// README's OUTPUT_LIFECYCLE row promises this phrase for every failed proof term.
 	if rp.mode == outputpolicy.LifecycleSync {
 		msg += "; " + reapDisabledPhrase
+		rp.out.reapDisabled = true
 	}
 	inaction, remediation := retentionProse(rp.mode, walkSafe)
 	slog.Warn(msg,
@@ -347,14 +351,15 @@ func (rp *reaper) retainForLayout(rel string) bool {
 const otherLayoutRetainedMsg = "keeping output artifacts laid out for a different OUTPUT_LAYOUT"
 
 // logOtherLayoutRetained emits that record, or nothing when nothing was kept
-// for layout reasons.
-func logOtherLayoutRetained(kept []string) {
+// for layout reasons, and reports whether it kept any.
+func logOtherLayoutRetained(kept []string) bool {
 	if len(kept) == 0 {
-		return
+		return false
 	}
 	slog.Warn(otherLayoutRetainedMsg,
 		"count", len(kept), "paths", sampleOrphanPaths(kept),
 		"remediation", "set OUTPUT_LAYOUT explicitly to have sync reconcile the previous layout's artifacts away, or remove them by hand")
+	return true
 }
 
 // removeConfirmed is reapConfirmed's post-delay half: the interleaved re-check and
@@ -367,7 +372,9 @@ func (rp *reaper) removeConfirmed(ctx context.Context, candidates []string) (int
 	defer func() {
 		logReapAudit(removedPaths)
 		logReapRefusals(refusedPaths)
-		logOtherLayoutRetained(otherLayout)
+		if logOtherLayoutRetained(otherLayout) {
+			rp.out.otherLayoutKept = true
+		}
 	}()
 	// len(candidates)-deleted is the remaining-work count: `deleted` counts
 	// unlinks, so this charges every legitimately-skipped candidate (certificate
@@ -388,6 +395,7 @@ func (rp *reaper) removeConfirmed(ctx context.Context, candidates []string) (int
 				// One record covers this candidate and every one after it: the
 				// same tree would answer every remaining candidate the same way,
 				// so a per-candidate repeat would only multiply the WARN.
+				rp.out.reapDisabled = true
 				slog.Warn(flatRecheckIncompleteMsg,
 					"removed", deleted, "remaining", len(candidates)-i,
 					"error", logtext.Path(err.Error()),

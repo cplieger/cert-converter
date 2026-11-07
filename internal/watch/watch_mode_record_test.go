@@ -98,7 +98,7 @@ func TestAttachWatchSet_announces_entering_poll_mode_as_a_degradation(t *testing
 				newTestWatcher(t) // availability probe: the root, not fsnotify, must fail here
 			}
 			logs := capture.Default(t)
-			w := New(filepath.Join(t.TempDir(), "missing"), func(context.Context) {}, WithFallback(6*time.Hour))
+			w := New(filepath.Join(t.TempDir(), "missing"), func(context.Context, bool) {}, WithFallback(6*time.Hour))
 
 			watcher, stopped := w.attachWatchSet(t.Context())
 			if watcher != nil {
@@ -133,7 +133,7 @@ func TestAttachWatchSet_announces_entering_poll_mode_as_a_degradation(t *testing
 func TestAttachWatchSet_announces_watch_mode_at_info(t *testing.T) {
 	newTestWatcher(t) // availability probe: skips where inotify is unavailable
 	logs := capture.Default(t)
-	w := New(t.TempDir(), func(context.Context) {}, WithFallback(6*time.Hour))
+	w := New(t.TempDir(), func(context.Context, bool) {}, WithFallback(6*time.Hour))
 
 	watcher, stopped := w.attachWatchSet(t.Context())
 	if watcher == nil || stopped {
@@ -162,7 +162,7 @@ func TestAttachWatchSet_announces_watch_mode_at_info(t *testing.T) {
 func TestPollTick_announces_the_recovery_transition_at_info(t *testing.T) {
 	newTestWatcher(t) // availability probe: the tick must be able to upgrade
 	logs := capture.Default(t)
-	w := New(t.TempDir(), func(context.Context) {}, WithFallback(time.Hour))
+	w := New(t.TempDir(), func(context.Context, bool) {}, WithFallback(time.Hour))
 
 	upgraded, stopped := w.pollTick(t.Context())
 	if upgraded == nil || stopped {
@@ -210,7 +210,7 @@ func TestPollTick_reports_the_standing_degradation_at_warn_with_its_cause(t *tes
 			}
 			logs := capture.Default(t)
 			scans := 0
-			w := New(root, func(context.Context) { scans++ }, WithFallback(6*time.Hour))
+			w := New(root, func(context.Context, bool) { scans++ }, WithFallback(6*time.Hour))
 
 			upgraded, stopped := w.pollTick(t.Context())
 			if upgraded != nil {
@@ -256,10 +256,15 @@ func TestPollTick_reports_the_standing_degradation_at_warn_with_its_cause(t *tes
 func TestPollLoopWithUpgrade_reports_poll_mode_on_its_initial_scan(t *testing.T) {
 	stubFSWatcherUnavailable(t)
 	logs := capture.Default(t)
-	scans := 0
+	scans, polled := 0, 0
 	// No WithFallback: the initial scan is then the only one, so the record
 	// asserted below can only be its own.
-	w := New(t.TempDir(), func(context.Context) { scans++ })
+	w := New(t.TempDir(), func(_ context.Context, polling bool) {
+		scans++
+		if polling {
+			polled++
+		}
+	})
 
 	if fw, err := w.pollLoopWithUpgrade(t.Context()); fw != nil {
 		fw.Close()
@@ -269,6 +274,9 @@ func TestPollLoopWithUpgrade_reports_poll_mode_on_its_initial_scan(t *testing.T)
 	}
 	if scans != 1 {
 		t.Fatalf("pollLoopWithUpgrade ran %d scans, want 1", scans)
+	}
+	if polled != 1 {
+		t.Errorf("poll mode's initial scan ran with polling=false, want true: its end-of-scan record names the mode")
 	}
 
 	rec := requireOneRecord(t, logs, msgScanState)
@@ -290,18 +298,18 @@ func TestPollLoopWithUpgrade_reports_poll_mode_on_its_initial_scan(t *testing.T)
 // Not parallel: it swaps the process-global slog default.
 func TestWatchModeScans_report_watch_mode_at_info(t *testing.T) {
 	for _, tc := range []struct {
-		scan        func(ctx context.Context, t *testing.T, cancel context.CancelFunc, scans *int)
+		scan        func(ctx context.Context, t *testing.T, cancel context.CancelFunc, scans *int, polled *bool)
 		name        string
 		wantTrigger string
 	}{
 		{
 			name:        "post-attach scan",
 			wantTrigger: "attach",
-			scan: func(ctx context.Context, t *testing.T, cancel context.CancelFunc, scans *int) {
+			scan: func(ctx context.Context, t *testing.T, cancel context.CancelFunc, scans *int, polled *bool) {
 				watcher := newTestWatcher(t)
 				// Cancelling from inside the scan lets watchLoop return immediately
 				// afterwards, so the assertion covers exactly the attach scan.
-				w := New(t.TempDir(), func(context.Context) { *scans++; cancel() }, WithFallback(time.Hour))
+				w := New(t.TempDir(), func(_ context.Context, polling bool) { *scans++; *polled = *polled || polling; cancel() }, WithFallback(time.Hour))
 				if err := w.scanThenWatch(ctx, watcher); err != nil {
 					t.Fatalf("scanThenWatch = %v, want nil", err)
 				}
@@ -310,11 +318,11 @@ func TestWatchModeScans_report_watch_mode_at_info(t *testing.T) {
 		{
 			name:        "debounced event scan",
 			wantTrigger: "event",
-			scan: func(ctx context.Context, t *testing.T, _ context.CancelFunc, scans *int) {
+			scan: func(ctx context.Context, t *testing.T, _ context.CancelFunc, scans *int, polled *bool) {
 				// absentWatchRoot: the scan's watch-set re-assert fails at the root and
 				// returns before touching a watcher, so a nil one is safe here (the
 				// same trick watch_state_test.go uses for the timer arithmetic).
-				st := newWatchState(New(absentWatchRoot, func(context.Context) { *scans++ }, WithDebounce(time.Hour)))
+				st := newWatchState(New(absentWatchRoot, func(_ context.Context, polling bool) { *scans++; *polled = *polled || polling }, WithDebounce(time.Hour)))
 				t.Cleanup(st.stop)
 				st.scheduleScan()
 				st.runDebouncedScan(ctx, nil)
@@ -323,8 +331,8 @@ func TestWatchModeScans_report_watch_mode_at_info(t *testing.T) {
 		{
 			name:        "periodic fallback scan",
 			wantTrigger: "fallback",
-			scan: func(ctx context.Context, t *testing.T, _ context.CancelFunc, scans *int) {
-				st := newWatchState(New(absentWatchRoot, func(context.Context) { *scans++ }, WithFallback(6*time.Hour)))
+			scan: func(ctx context.Context, t *testing.T, _ context.CancelFunc, scans *int, polled *bool) {
+				st := newWatchState(New(absentWatchRoot, func(_ context.Context, polling bool) { *scans++; *polled = *polled || polling }, WithFallback(6*time.Hour)))
 				t.Cleanup(st.stop)
 				st.runSafetyNetScan(ctx)
 			},
@@ -334,12 +342,15 @@ func TestWatchModeScans_report_watch_mode_at_info(t *testing.T) {
 			logs := capture.Default(t)
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			scans := 0
+			scans, polled := 0, false
 
-			tc.scan(ctx, t, cancel, &scans)
+			tc.scan(ctx, t, cancel, &scans, &polled)
 
 			if scans != 1 {
 				t.Fatalf("the %s ran %d scans, want 1", tc.name, scans)
+			}
+			if polled {
+				t.Errorf("the %s ran with polling=true, want false in watch mode", tc.name)
 			}
 			rec := requireOneRecord(t, logs, msgScanState)
 			if rec.level != slog.LevelInfo {
@@ -372,7 +383,7 @@ func TestLogWatchSet_names_the_size_of_the_set(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(root, "example.com"), 0o750); err != nil {
 		t.Fatalf("setup: Mkdir: %v", err)
 	}
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 	logs := capture.Default(t)
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("addWatchDirs(%q) = %v, want nil", root, err)

@@ -43,7 +43,7 @@ func TestHandleFsEvent(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 
 	watcher := newTestWatcher(t)
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
@@ -127,7 +127,7 @@ func TestHandleFsEvent_rescans_even_when_the_reassert_fails(t *testing.T) {
 	if err := os.MkdirAll(newDir, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
@@ -153,7 +153,7 @@ func TestHandleFsEvent_rescans_when_a_repaired_directory_cannot_be_rewatched(t *
 	if err := os.MkdirAll(repaired, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
@@ -195,7 +195,7 @@ func TestAddWatchDirs_refuses_a_non_directory_root(t *testing.T) {
 		{fileRoot, "is not a directory"},
 		{linkRoot, "is a symlink"},
 	} {
-		w := New(tc.root, func(context.Context) {})
+		w := New(tc.root, func(context.Context, bool) {})
 		err := w.addWatchDirs(t.Context(), watcher, tc.root)
 		if err == nil {
 			t.Errorf("addWatchDirs(%q) = nil, want an error: the watch set is %v, so no event could ever arrive", tc.root, watcher.WatchList())

@@ -19,6 +19,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/mounts"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/scancadence"
+	"github.com/cplieger/cert-converter/internal/scanreport"
 	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/go/health"
 	"github.com/cplieger/go/slogx"
@@ -42,14 +43,16 @@ func healthyAfterScan(r *process.ScanResult) bool {
 	return r.Failed == 0 && r.Collided == 0
 }
 
-// scanAndSetHealth runs one scan and updates the marker.
-func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *health.Marker) {
+// scanAndSetHealth runs one scan, writes its end-of-scan record and updates the
+// marker.
+func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *health.Marker, polling bool) {
 	result, err := scanner.Run(ctx)
+	if err != nil && process.IsShutdown(err) {
+		slog.Info("scan interrupted by shutdown", "reason", err)
+		return
+	}
+	scanreport.Log(ctx, &scanreport.Scan{Result: result, Err: err, Polling: polling})
 	if err != nil {
-		if process.IsShutdown(err) {
-			slog.Info("scan interrupted by shutdown", "reason", err)
-			return
-		}
 		slog.Error("processing failed", "error", logtext.Path(err.Error()))
 		marker.Set(false)
 		return
@@ -235,8 +238,8 @@ func run() int {
 
 	// runAndSetHealth adapts scanAndSetHealth to the watcher's on-change
 	// callback signature.
-	runAndSetHealth := func(ctx context.Context) {
-		scanAndSetHealth(ctx, scanner, marker)
+	runAndSetHealth := func(ctx context.Context, polling bool) {
+		scanAndSetHealth(ctx, scanner, marker, polling)
 	}
 
 	// No scan here: w.Run owns the first scan in both modes.

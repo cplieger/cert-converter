@@ -35,7 +35,7 @@ func TestAddWatchDirs_watches_whole_subtree_and_fails_on_missing_root(t *testing
 	if err := os.WriteFile(certFile, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("addWatchDirs(%q) = %v, want nil", root, err)
@@ -68,7 +68,7 @@ func TestAddWatchDirs_fails_when_the_root_watch_cannot_be_added(t *testing.T) {
 	watcher := newClosedTestWatcher(t)
 	root := t.TempDir()
 
-	if err := New(root, func(context.Context) {}).addWatchDirs(t.Context(), watcher, root); err == nil {
+	if err := New(root, func(context.Context, bool) {}).addWatchDirs(t.Context(), watcher, root); err == nil {
 		t.Error("addWatchDirs(closed watcher) = nil, want an error so Run falls back to polling instead of watching nothing")
 	}
 }
@@ -83,7 +83,7 @@ func TestAddWatchDirs_reports_shutdown_instead_of_a_watch_failure(t *testing.T) 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := New(root, func(context.Context) {}).addWatchDirs(ctx, watcher, root)
+	err := New(root, func(context.Context, bool) {}).addWatchDirs(ctx, watcher, root)
 
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("addWatchDirs(cancelled ctx) = %v, want context.Canceled so Run treats it as shutdown rather than falling back to polling", err)
@@ -189,7 +189,7 @@ func TestClassifyWatchEntry_applies_the_walk_error_policy(t *testing.T) {
 			if tc.atRoot {
 				path = root
 			}
-			w := New(root, func(context.Context) {}, WithFallback(tc.fallback))
+			w := New(root, func(context.Context, bool) {}, WithFallback(tc.fallback))
 
 			_, err := w.classifyWatchEntry(root, path, nil, walkErr)
 
@@ -266,7 +266,7 @@ func TestHandleWatchAddError_classifies_root_and_child_registration_failures(t *
 			if tc.atRoot {
 				path = root
 			}
-			w := New(root, func(context.Context) {}, WithFallback(tc.fallback))
+			w := New(root, func(context.Context, bool) {}, WithFallback(tc.fallback))
 
 			err := w.handleWatchAddError(root, path, addErr)
 
@@ -305,7 +305,7 @@ func TestResyncWatchSet_stays_silent_when_shutdown_cut_the_walk_short(t *testing
 	if err := os.MkdirAll(filepath.Join(root, "example.com"), 0o750); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {}, WithFallback(6*time.Hour))
+	w := New(root, func(context.Context, bool) {}, WithFallback(6*time.Hour))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -344,7 +344,7 @@ func TestAddWatchDirs_stops_at_the_entry_budget(t *testing.T) {
 		}
 	}
 	logs := capture.Default(t)
-	w := New(root, func(context.Context) {}, WithMaxEntries(2))
+	w := New(root, func(context.Context, bool) {}, WithMaxEntries(2))
 
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("addWatchDirs over a tree past the budget = %v, want nil: a too-large tree degrades to a PARTIAL watch set, and reporting it as a root failure would drop the process into poll mode", err)
@@ -407,7 +407,7 @@ func TestResyncWatchSet_prunes_a_directory_the_tree_no_longer_has(t *testing.T) 
 	if err := os.MkdirAll(gone, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 
 	w.resyncWatchSet(t.Context(), watcher, "failed to re-sync the watch set")
 	if !w.watchSetHas(gone) {
@@ -461,7 +461,7 @@ func TestResyncWatchSet_unregisters_a_directory_the_rebuild_no_longer_reaches(t 
 	if err := os.MkdirAll(tail, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {}, WithMaxEntries(2))
+	w := New(root, func(context.Context, bool) {}, WithMaxEntries(2))
 
 	w.resyncWatchSet(t.Context(), watcher, "failed to re-sync the watch set")
 	if !slices.Contains(watcher.WatchList(), tail) {
@@ -513,7 +513,7 @@ func TestResyncWatchSet_keeps_the_mirror_charged_when_the_rebuild_is_abandoned(t
 	if err := os.MkdirAll(filepath.Join(root, "example.com"), 0o750); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 
 	w.resyncWatchSet(t.Context(), watcher, "failed to re-sync the watch set")
 	charged := len(w.watchSetSnapshot())
@@ -560,7 +560,7 @@ func TestPruneWatches_keeps_a_refused_removal_charged_to_the_mirror(t *testing.T
 			t.Fatal(err)
 		}
 	}
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
 	}
@@ -628,7 +628,7 @@ func TestResyncWatchSet_removes_stale_registrations_before_it_re_asserts(t *test
 	if err := os.MkdirAll(tail, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {}, WithMaxEntries(2))
+	w := New(root, func(context.Context, bool) {}, WithMaxEntries(2))
 
 	w.resyncWatchSet(t.Context(), watcher, "failed to re-sync the watch set")
 	if !slices.Contains(watcher.WatchList(), tail) {

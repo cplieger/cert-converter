@@ -77,7 +77,9 @@ var removeWatch = func(watcher *fsnotify.Watcher, path string) error {
 
 // Watcher monitors a directory tree for cert/key changes and invokes a callback.
 type Watcher struct {
-	onChange func(ctx context.Context)
+	// onChange runs one scan; polling is true while change detection is in poll
+	// mode, so the scan's record names the mode it ran in.
+	onChange func(ctx context.Context, polling bool)
 
 	// watched mirrors the fsnotify registration set, so membership is a map
 	// lookup rather than a scan of fsnotify's own list (see watchSetHas).
@@ -189,15 +191,16 @@ func (w *Watcher) logModeEntry(ctx context.Context, mode, previous detectionMode
 	slog.Log(ctx, mode.level(), msg, append(attrs, extra...)...)
 }
 
-// logScanState emits the ONE state record every scan carries, naming the mode
-// that is live as the scan runs.
-func (w *Watcher) logScanState(ctx context.Context, mode detectionMode, trigger string, extra ...any) {
+// scan emits the ONE state record every scan carries, naming the mode that is
+// live as the scan runs, then runs the scan in that mode.
+func (w *Watcher) scan(ctx context.Context, mode detectionMode, trigger string, extra ...any) {
 	attrs := w.coverageAttrs("mode", string(mode), "trigger", trigger)
 	slog.Log(ctx, mode.level(), msgScanState, append(attrs, extra...)...)
+	w.onChange(ctx, mode == modePoll)
 }
 
 // New creates a Watcher for the given root directory.
-func New(root string, onChange func(ctx context.Context), opts ...Option) *Watcher {
+func New(root string, onChange func(ctx context.Context, polling bool), opts ...Option) *Watcher {
 	// Cleaned here so the field can only ever hold a canonical path: the
 	// root-vs-descendant severity policy (handleWatchAddError, classifyWatchEntry,
 	// validateWatchRootEntry) is raw string equality against it, and a trailing
@@ -340,8 +343,7 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 	if ctx.Err() != nil {
 		return nil
 	}
-	w.logScanState(ctx, modeWatch, triggerAttach)
-	w.onChange(ctx)
+	w.scan(ctx, modeWatch, triggerAttach)
 	return w.watchLoop(ctx, watcher)
 }
 
@@ -1010,15 +1012,13 @@ func (st *watchState) runDebouncedScan(ctx context.Context, watcher *fsnotify.Wa
 	if ctx.Err() != nil {
 		return
 	}
-	st.w.logScanState(ctx, modeWatch, triggerEvent)
-	st.w.onChange(ctx)
+	st.w.scan(ctx, modeWatch, triggerEvent)
 	st.safetyNetTimer.Reset(scancadence.Effective(st.w.fallback))
 }
 
 // runSafetyNetScan fires the periodic safety-net rescan and re-arms its timer.
 func (st *watchState) runSafetyNetScan(ctx context.Context) {
-	st.w.logScanState(ctx, modeWatch, st.w.safetyNetTrigger())
-	st.w.onChange(ctx)
+	st.w.scan(ctx, modeWatch, st.w.safetyNetTrigger())
 	st.safetyNetTimer.Reset(scancadence.Effective(st.w.fallback))
 }
 
@@ -1049,8 +1049,7 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) (upgraded *fsnotify.W
 	if ctx.Err() != nil {
 		return nil, nil
 	}
-	w.logScanState(ctx, modePoll, triggerStartup)
-	w.onChange(ctx)
+	w.scan(ctx, modePoll, triggerStartup)
 
 	if w.fallback <= 0 {
 		// Shutdown that arrived during the initial scan above is a clean stop, not
@@ -1106,14 +1105,12 @@ func (w *Watcher) pollTick(ctx context.Context) (upgraded *fsnotify.Watcher, sto
 	case stageStopped:
 		return nil, true // shutdown interrupted the upgrade attempt; not a poll-mode continuation
 	case stageConstruct:
-		w.logScanState(ctx, modePoll, triggerPoll,
+		w.scan(ctx, modePoll, triggerPoll,
 			"upgrade_stage", upgradeStageConstruct, "error", logtext.Path(attachErr.Error()))
-		w.onChange(ctx)
 		return nil, false
 	case stageWatchDirs:
-		w.logScanState(ctx, modePoll, triggerPoll,
+		w.scan(ctx, modePoll, triggerPoll,
 			"upgrade_stage", upgradeStageWatchDirs, "error", logtext.Path(attachErr.Error()))
-		w.onChange(ctx)
 		return nil, false
 	case stageAttached:
 	}

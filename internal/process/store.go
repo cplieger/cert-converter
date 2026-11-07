@@ -44,6 +44,10 @@ type store struct {
 	// maxEntries is this store's per-walk entry budget for the OUTPUT tree, injected
 	// from Options.MaxScanEntries exactly as scanWalk's is for /input.
 	maxEntries int
+	// reapDisabled and otherLayoutKept are this scan's reconciliation verdicts,
+	// set beside the WARN that reports each one so the record cannot drift from it.
+	reapDisabled    bool
+	otherLayoutKept bool
 }
 
 // laxDirMsg is the standing WARN for an /output directory more permissive than
@@ -145,21 +149,23 @@ func (s *store) writeBounded(ctx context.Context, rel string, data []byte, maxBy
 const staleTempAge = time.Hour
 
 // sweepStaleTemps removes atomic-write temp files orphaned by an interrupted
-// write, then narrates the outcome.
-func (s *store) sweepStaleTemps(ctx context.Context) {
+// write, then narrates the outcome. swept is false when shutdown cut the sweep
+// short, which proves nothing either way.
+func (s *store) sweepStaleTemps(ctx context.Context) (degraded, swept bool) {
 	res, walkErr := filesafe.CleanupStaleTempsInRoot(ctx, s.root, staleTempAge, filesafe.WithRecursive(true))
-	s.logSweepOutcome(res, walkErr)
+	return s.logSweepOutcome(res, walkErr), walkErr == nil || !IsShutdown(walkErr)
 }
 
 // logSweepOutcome emits the end-of-sweep logs: the walk error, the reclaimed-orphan
 // count, temps that could not be inspected or removed, and output sub-paths the
-// sweep could not enter.
-func (s *store) logSweepOutcome(res filesafe.SweepResult, walkErr error) {
+// sweep could not enter. It reports whether any of them leaves temps behind.
+func (s *store) logSweepOutcome(res filesafe.SweepResult, walkErr error) (degraded bool) {
 	logDir := logtext.Path(s.root.Name())
 	if walkErr != nil {
 		if IsShutdown(walkErr) {
 			slog.Debug("stale temp cleanup cancelled during shutdown", "dir", logDir, "error", logtext.Path(walkErr.Error()))
 		} else {
+			degraded = true
 			slog.Warn("stale temp cleanup failed", "dir", logDir, "error", logtext.Path(walkErr.Error()),
 				"remediation", outputPermRemediation)
 		}
@@ -170,13 +176,16 @@ func (s *store) logSweepOutcome(res filesafe.SweepResult, walkErr error) {
 		slog.Info("reaped stale temp files", "dir", logDir, "count", res.Removed)
 	}
 	if res.Failed > 0 {
+		degraded = true
 		slog.Warn("some stale output temps could not be inspected or removed", "dir", logDir,
 			"count", res.Failed, "remediation", outputPermRemediation)
 	}
 	if res.Unreadable > 0 {
+		degraded = true
 		slog.Warn("some output paths could not be inspected during stale temp cleanup",
 			"dir", logDir, "count", res.Unreadable, "remediation", outputPermRemediation)
 	}
+	return degraded
 }
 
 // --- Output-derived currency ---
@@ -642,6 +651,9 @@ func (w *outputWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err e
 // logOrphanWalkOutcome emits the orphan walk's single aggregate Warn.
 func (s *store) logOrphanWalkOutcome(unreadable, symlinked int) {
 	logDir := logtext.Path(s.root.Name())
+	if unreadable > 0 || symlinked > 0 {
+		s.reapDisabled = true
+	}
 	if unreadable > 0 {
 		slog.Warn("some output paths could not be read while looking for orphans; "+reapDisabledPhrase,
 			"dir", logDir, "count", unreadable,
