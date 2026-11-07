@@ -24,8 +24,9 @@ import (
 )
 
 // ScanResult carries per-source outcome summary counts from a scan run. A scan
-// that did not enumerate the whole tree reports each standing condition at least
-// as the previous scan reported it, because it cannot prove one gone.
+// whose /input walk did not finish reports the per-path counts and the reap and
+// layout flags at least as the previous scan did, and any scan that did not cover
+// the tree keeps NoSources and AllExcluded unless its own sources disprove them.
 type ScanResult struct {
 	// Removed counts artifacts deleted because their source is gone.
 	Removed    int
@@ -324,7 +325,6 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	}
 	// A tree over the entry budget is REPORTED, not failed.
 	budgetExceeded := errors.Is(walkErr, errScanBudgetExceeded)
-	enumerated := walkErr == nil
 
 	result := countResults(sw.results, sw.unreadable, sw.unresolved, sw.vanished)
 	result.Ignored = sw.ignored
@@ -366,7 +366,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		walkErr = reconcileErr
 	}
 
-	s.reportVerdict(&result, out, walkErr, enumerated)
+	s.reportVerdict(&result, out, walkErr)
 	if budgetExceeded {
 		return result, nil
 	}
@@ -375,13 +375,13 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 
 // reportVerdict derives the scan's verdicts from what the walk, the reaper and
 // the last sweep found, then logs the standing conditions that changed. Only a
-// scan that ran to the end can prove a per-path condition gone. enumerated is
-// whether the /input walk finished, whatever reconciliation did after it.
-func (s *Scanner) reportVerdict(result *ScanResult, out *store, walkErr error, enumerated bool) {
+// scan that ran to the end can prove a per-path condition gone.
+func (s *Scanner) reportVerdict(result *ScanResult, out *store, walkErr error) {
 	result.Outcome = outcomeOf(walkErr)
 	result.OrphanRemovalDisabled = out.reapDisabled
 	result.PreviousLayoutRetained = out.otherLayoutKept
 	result.CleanupDegraded = s.cleanupDegraded
+	enumerated := walkErr == nil
 	wholeTree := enumerated && result.inputFullyEnumerated()
 	if wholeTree {
 		coverage := wholeTreeCoverageOf(result)

@@ -115,7 +115,7 @@ var (
 func NewReporter(reg *measure.Registry) *Reporter {
 	r := &Reporter{
 		sources: measure.NewLabeledGauge("last_scan_sources",
-			"Sources the last scan resolved to each outcome.", []string{"outcome"}),
+			"Sources at each outcome in the last scan; a scan that did not cover the tree keeps the previous scan's problem counts.", []string{"outcome"}),
 		found: measure.NewGauge("last_scan_sources_found",
 			"Certificate sources the last scan found under /input."),
 		finished: measure.NewGauge("last_scan_timestamp_seconds",

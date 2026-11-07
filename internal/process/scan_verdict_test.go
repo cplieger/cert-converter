@@ -1,8 +1,6 @@
 package process
 
 import (
-	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -310,23 +308,45 @@ func TestScannerRun_keeps_unproven_conditions_on_an_incomplete_scan(t *testing.T
 			t.Errorf("Run(budget stop, a blocked in the prefix) Failed = %d, want 1", res.Failed)
 		}
 	})
-	t.Run("an error after a complete walk keeps the walk's whole-tree verdict", func(t *testing.T) {
-		in, out := t.TempDir(), t.TempDir()
-		writeSelfSignedPair(t, in, "skip")
-		if err := os.WriteFile(filepath.Join(out, "gone.pfx"), []byte("pfx"), 0o600); err != nil {
-			t.Fatal(err)
+	t.Run("an unopenable root keeps every carried condition", func(t *testing.T) {
+		in := t.TempDir()
+		s := newVerdictScanner(in, t.TempDir(), Options{})
+		prev := ScanResult{
+			Orphan: 2, Failed: 3, Unreadable: 4, Unresolved: 5, Unwritable: 6, Collided: 7,
+			NoSources: true, AllExcluded: true,
+			OrphanRemovalDisabled: true, PreviousLayoutRetained: true,
 		}
-		stubReapWait(t, func(context.Context) error { return errors.New("reconcile failed") })
-		s := newVerdictScanner(in, out, Options{
-			Lifecycle: outputpolicy.LifecycleSync,
-			Exclude:   layout.NewExcludeSet([]string{"skip.crt"}),
-		})
-		res, err := s.Run(t.Context())
-		if err == nil || res.Outcome != OutcomeAborted {
-			t.Fatalf("Run(reconcile error) = (%+v, %v), want outcome aborted", res, err)
+		s.lastReported = prev
+		res := abortedRun(t, s, in)
+		if res.Orphan != prev.Orphan {
+			t.Errorf("Run(/input missing) Orphan = %d, want %d", res.Orphan, prev.Orphan)
+		}
+		if res.Failed != prev.Failed {
+			t.Errorf("Run(/input missing) Failed = %d, want %d", res.Failed, prev.Failed)
+		}
+		if res.Unreadable != prev.Unreadable {
+			t.Errorf("Run(/input missing) Unreadable = %d, want %d", res.Unreadable, prev.Unreadable)
+		}
+		if res.Unresolved != prev.Unresolved {
+			t.Errorf("Run(/input missing) Unresolved = %d, want %d", res.Unresolved, prev.Unresolved)
+		}
+		if res.Unwritable != prev.Unwritable {
+			t.Errorf("Run(/input missing) Unwritable = %d, want %d", res.Unwritable, prev.Unwritable)
+		}
+		if res.Collided != prev.Collided {
+			t.Errorf("Run(/input missing) Collided = %d, want %d", res.Collided, prev.Collided)
+		}
+		if !res.NoSources {
+			t.Errorf("Run(/input missing) NoSources = false, want true")
 		}
 		if !res.AllExcluded {
-			t.Errorf("Run(every source excluded, then a reconcile error) AllExcluded = false, want true: the walk enumerated the whole tree")
+			t.Errorf("Run(/input missing) AllExcluded = false, want true")
+		}
+		if !res.OrphanRemovalDisabled {
+			t.Errorf("Run(/input missing) OrphanRemovalDisabled = false, want true")
+		}
+		if !res.PreviousLayoutRetained {
+			t.Errorf("Run(/input missing) PreviousLayoutRetained = false, want true")
 		}
 	})
 }
