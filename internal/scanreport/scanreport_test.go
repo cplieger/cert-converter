@@ -1,12 +1,18 @@
 package scanreport
 
 import (
+	"bytes"
 	"errors"
 	"log/slog"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cplieger/cert-converter/internal/process"
+	"github.com/cplieger/go/measure"
+	"github.com/cplieger/go/slogx"
 	"github.com/cplieger/go/slogx/capture"
 )
 
@@ -72,13 +78,86 @@ func TestLogLevels(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
-			Log(t.Context(), &tc.scan)
+			logRecord(t.Context(), &tc.scan)
 			if got := logs.CountLevel(tc.level, Message); got != 1 {
-				t.Errorf("Log(%s) wrote %q, want one %s record %q", tc.name, logs.Messages(), tc.level, Message)
+				t.Errorf("logRecord(%s) wrote %q, want one %s record %q", tc.name, logs.Messages(), tc.level, Message)
 			}
 			if tc.scan.Err != nil && !logs.HasAttr(Message, "error", tc.scan.Err.Error()) {
-				t.Errorf("Log(%s) wrote no error attribute naming the cause", tc.name)
+				t.Errorf("logRecord(%s) wrote no error attribute naming the cause", tc.name)
 			}
 		})
+	}
+}
+
+// TestReportSetsEverySeriesFromTheRecord pins the one-function rule: a scan sets
+// every scan series to the value of the record it wrote, both parsed from what
+// they emit, so the log rules and the metric rules read the same verdict.
+func TestReportSetsEverySeriesFromTheRecord(t *testing.T) {
+	reg := measure.NewRegistry("cert_converter")
+	reporter := NewReporter(reg)
+	at := time.Unix(1_800_000_000, 0)
+	prevClock := reportClock
+	reportClock = func() time.Time { return at }
+	t.Cleanup(func() { reportClock = prevClock })
+
+	scan := Scan{Polling: true, Result: process.ScanResult{
+		Total: 9, Converted: 1, Unchanged: 2, Orphan: 3, Unreadable: 4, Unresolved: 5, Vanished: 6,
+		Unwritable: 7, Collided: 8, Excluded: 10, Ignored: 11, Removed: 12, Failed: 13,
+		Outcome: process.OutcomeBudgetStopped, NoSources: true, CleanupDegraded: true,
+	}}
+	var buf bytes.Buffer
+	handler, _ := slogx.NewHandler(slogx.Options{Output: &buf})
+	capture.SwapDefault(t, slog.New(handler))
+	reporter.Report(t.Context(), &scan)
+	record := parseLogfmt(t, strings.TrimSpace(buf.String()))
+
+	families, err := reg.Gather(t.Context())
+	if err != nil {
+		t.Fatalf("Gather = %v", err)
+	}
+	got := make(map[string]float64)
+	for _, f := range families {
+		for _, s := range f.Samples {
+			key := f.Name
+			for _, l := range s.Labels {
+				key += "{" + l.Name + "=" + l.Value + "}"
+			}
+			got[key] = s.Value
+		}
+	}
+	num := func(field string) float64 {
+		v, err := strconv.ParseFloat(record[field], 64)
+		if err != nil {
+			t.Fatalf("record field %s = %q: %v", field, record[field], err)
+		}
+		return v
+	}
+	want := map[string]float64{
+		"cert_converter_last_scan_sources_found":                   num("total"),
+		"cert_converter_removed_artifacts_total":                   num("removed"),
+		"cert_converter_last_scan_timestamp_seconds":               float64(at.Unix()),
+		"cert_converter_last_scan_outcome{outcome=complete}":       1 - num("aborted") - num("budget_stopped"),
+		"cert_converter_last_scan_outcome{outcome=aborted}":        num("aborted"),
+		"cert_converter_last_scan_outcome{outcome=budget_stopped}": num("budget_stopped"),
+		"cert_converter_change_detection_mode{mode=poll}":          num("polling"),
+		"cert_converter_change_detection_mode{mode=watch}":         1 - num("polling"),
+	}
+	for _, outcome := range []string{"converted", "unchanged", "orphan", "unreadable", "unresolved", "vanished", "unwritable", "collided", "excluded", "ignored", "failed"} {
+		want["cert_converter_last_scan_sources{outcome="+outcome+"}"] = num(outcome)
+	}
+	for _, condition := range []string{"no_sources", "all_excluded", "orphan_removal_disabled", "previous_layout_retained", "cleanup_degraded"} {
+		want["cert_converter_condition{condition="+condition+"}"] = num(condition)
+	}
+	for key, w := range want {
+		if g, ok := got[key]; !ok || g != w {
+			t.Errorf("%s = %v (present %v), want %v from the record", key, g, ok, w)
+		}
+	}
+	for key := range got {
+		if strings.HasPrefix(key, "cert_converter_") {
+			if _, ok := want[key]; !ok {
+				t.Errorf("the registry exports %s, which no record field sets", key)
+			}
+		}
 	}
 }

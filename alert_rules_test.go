@@ -46,12 +46,14 @@ func TestChangeDetectionDeadMatchesTheExitLine(t *testing.T) {
 }
 
 // TestStartupRefusedMatchesEveryRefusal binds the startup-refusal rule to the
-// lines run writes before it exits 1: an invalid setting and a missing volume.
+// lines run writes before it exits 1: an invalid setting, a missing volume and a
+// METRICS_LISTEN_ADDR it cannot bind.
 func TestStartupRefusedMatchesEveryRefusal(t *testing.T) {
 	filter := logqlLineFilter(t, "CertConverterStartupRefused")
 	for name, out := range map[string]string{
 		"invalid configuration": startupFailureOutput(t),
 		"missing volume":        missingVolumeOutput(t),
+		"metrics bind failure":  bindFailureOutput(t),
 	} {
 		var refusal string
 		for line := range strings.Lines(out) {

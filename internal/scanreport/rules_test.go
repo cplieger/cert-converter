@@ -84,11 +84,11 @@ func renderRecord(t *testing.T, scan *Scan) map[string]string {
 	prev := slog.Default()
 	slog.SetDefault(slog.New(handler))
 	t.Cleanup(func() { slog.SetDefault(prev) })
-	Log(t.Context(), scan)
+	logRecord(t.Context(), scan)
 	slog.SetDefault(prev)
 	line := strings.TrimSpace(buf.String())
 	if strings.Count(line, "\n") != 0 {
-		t.Fatalf("Log wrote %q, want exactly one line", line)
+		t.Fatalf("logRecord wrote %q, want exactly one line", line)
 	}
 	return parseLogfmt(t, line)
 }
@@ -129,7 +129,7 @@ func parseLogfmt(t *testing.T, line string) map[string]string {
 func TestLogQLRulesUnwrapNumericRecordFields(t *testing.T) {
 	record := renderRecord(t, &Scan{Result: process.ScanResult{Total: 1, Converted: 1}})
 	if record["msg"] != Message {
-		t.Fatalf("Log wrote msg=%q, want %q", record["msg"], Message)
+		t.Fatalf("logRecord wrote msg=%q, want %q", record["msg"], Message)
 	}
 	for _, rule := range stateRules(t) {
 		t.Run(rule.name, func(t *testing.T) {

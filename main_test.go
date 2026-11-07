@@ -75,7 +75,7 @@ func TestScanAndSetHealth_sets_marker_after_failure_free_scan(t *testing.T) {
 	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 	writeCertAndKey(t, inDir, "test", certPEM, keyPEM)
 
-	scanAndSetHealth(t.Context(), scanner, marker, false)
+	scanAndSetHealth(t.Context(), scanner, testReporter(), marker, false)
 
 	if _, err := os.Stat(markerPath); err != nil {
 		t.Errorf("health marker should exist after a failure-free scan: %v", err)
@@ -95,7 +95,7 @@ func TestScanAndSetHealth_clears_marker_when_scan_errors(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "does-not-exist")
 	scanner := newTestScanner(missing, t.TempDir(), "", convert.EncNameModern2023)
 
-	scanAndSetHealth(t.Context(), scanner, marker, false)
+	scanAndSetHealth(t.Context(), scanner, testReporter(), marker, false)
 
 	if _, err := os.Stat(markerPath); err == nil {
 		t.Error("health marker should be cleared when the input root cannot be scanned")
@@ -155,7 +155,7 @@ func TestScanAndSetHealth_unreadable_pair_stays_healthy(t *testing.T) {
 	logs := capture.Default(t)
 	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 
-	scanAndSetHealth(t.Context(), scanner, marker, false)
+	scanAndSetHealth(t.Context(), scanner, testReporter(), marker, false)
 
 	// CountExact, not Count: the record must be one line, not a second one that
 	// merely contains the message.
@@ -203,7 +203,7 @@ func TestScanAndSetHealth_clears_marker_after_conversion_failure(t *testing.T) {
 	writeCertAndKey(t, inDir, "broken", []byte("not a certificate"), []byte("not a private key"))
 	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 
-	scanAndSetHealth(t.Context(), scanner, marker, false)
+	scanAndSetHealth(t.Context(), scanner, testReporter(), marker, false)
 
 	if _, err := os.Stat(markerPath); err == nil {
 		t.Error("health marker should be cleared when a certificate conversion fails")
@@ -235,7 +235,7 @@ func TestScanAndSetHealth_clean_scan_emits_no_unreadable_warning(t *testing.T) {
 
 	logs := capture.Default(t)
 
-	scanAndSetHealth(t.Context(), scanner, marker, false)
+	scanAndSetHealth(t.Context(), scanner, testReporter(), marker, false)
 
 	const unreadableMsg = "some /input paths were unreadable and were skipped; health is unaffected"
 	if n := logs.Count(unreadableMsg); n != 0 {
@@ -275,7 +275,7 @@ func TestScanAndSetHealth_cancelled_context_leaves_marker_untouched(t *testing.T
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 
-			scanAndSetHealth(ctx, scanner, marker, false)
+			scanAndSetHealth(ctx, scanner, testReporter(), marker, false)
 
 			_, statErr := os.Stat(markerPath)
 			if gotHealthy := statErr == nil; gotHealthy != tc.initiallyHealthy {
