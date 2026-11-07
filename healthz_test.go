@@ -42,7 +42,6 @@ func markerState(t *testing.T, marker *health.Marker, path, state string, age ti
 	}
 }
 
-// freeAddr returns a loopback address nothing listens on.
 func freeAddr(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

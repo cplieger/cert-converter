@@ -127,8 +127,8 @@ const (
 	reasonStuck      = "no scan has finished within three guaranteed recheck cadences, so the watch loop may be stuck"
 )
 
-// newHealthz serves the verdict the health subcommand reads from marker, as
-// one check per fault so each names itself.
+// newHealthz serves the verdict the health subcommand reads from marker while
+// the marker directory is writable, as one check per fault so each names itself.
 func newHealthz(marker *health.Marker, fallback time.Duration) http.Handler {
 	return health.CheckHandler(
 		health.Check{Signal: marker, Reason: reasonScanFailed},
@@ -136,8 +136,8 @@ func newHealthz(marker *health.Marker, fallback time.Duration) http.Handler {
 	)
 }
 
-// notStale fails only a marker that exists and is past the lease, so an
-// absent marker reports reasonScanFailed alone.
+// notStale fails a marker that reads healthy but is past the lease, so an
+// absent marker reports reasonScanFailed alone and not reasonStuck too.
 type notStale struct {
 	marker *health.Marker
 	lease  time.Duration

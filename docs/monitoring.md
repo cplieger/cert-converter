@@ -44,7 +44,7 @@ cert-converter writes logfmt records to standard error, with every timestamp in 
 - A standing problem, such as an unreadable path, is logged once when it appears, again when its count changes, once when it clears and once after each restart. The clearing record is `standing condition cleared`, with the `condition` and how long it `lasted`.
 - Look for a `remediation` field on warnings and errors. When present, it names the action to take.
 
-`scan complete` closes every scan that is not cut short by a shutdown. It is `INFO` when the scan covered the whole tree, and `WARN` when the scan aborted or stopped at `MAX_SCAN_ENTRIES`, with an `error` field on an abort. The log rules read this record at either level, so keep `LOG_LEVEL` at `info` if you use them. Every field is a number.
+`scan complete` closes every scan that is not cut short by a shutdown. It is `INFO` when the scan covered the whole tree, and `WARN` when the scan aborted or stopped at `MAX_SCAN_ENTRIES`, with an `error` field on an abort. The log rules read this record at either level, so keep `LOG_LEVEL` at `info` if you use them. Every field except `error` is a number.
 
 | Field | Meaning |
 | --- | --- |
@@ -67,9 +67,11 @@ cert-converter writes logfmt records to standard error, with every timestamp in 
 
 A scan that did not see the whole tree cannot prove a problem gone, so its record keeps what the previous scan reported.
 
-- When the scan aborted or stopped at `MAX_SCAN_ENTRIES`, the counts `orphan`, `unreadable`, `unresolved`, `unwritable`, `collided` and `failed` stay at least at the previous scan's values. So do `orphan_removal_disabled` and `previous_layout_retained`. The container's health follows those counts.
+- When the scan aborted or stopped at `MAX_SCAN_ENTRIES`, the counts `orphan`, `unreadable`, `unresolved`, `unwritable`, `collided` and `failed` stay at least at the previous scan's values. So do `orphan_removal_disabled` and `previous_layout_retained`, and `no_sources` and `all_excluded` unless this scan found a source.
 - When the walk finished but left an unreadable path, an unresolved symlink or a vanished path, only `no_sources` and `all_excluded` keep the previous value. A source the scan did find clears them.
 - The next scan that covers the whole tree resets every value.
+
+An aborted scan turns the container unhealthy. So does a failed conversion or a name collision, including a `failed` or `collided` count carried through a stop at `MAX_SCAN_ENTRIES`. The other carried values leave health unchanged.
 
 ## Alerting
 
@@ -98,7 +100,7 @@ Every state alert reads the last scan. It fires at the first scan that sees the 
 | `CertConverterPreviousLayoutRetained` | `sync` found files from a previous `OUTPUT_LAYOUT` and kept them, because the layout is not set explicitly | warning |
 | `CertConverterScanStalled` | no scan has finished for two full recheck cadences plus an hour, so the watch loop is stuck or the log stopped arriving | warning |
 
-Thresholds and the `severity` labels are starting points. Every window is 13 hours, which fits the 6-hour default of `FALLBACK_SCAN_HOURS`. Size it to twice your effective cadence plus an hour. The effective cadence is `FALLBACK_SCAN_HOURS` capped at 24 hours, or 24 hours when it is `0` or `false`, so the window is 49 hours at most. Change the `container` selector to the label your log collector sets, such as `job` or `service`, and keep the scrape job name `CertConverterDown` reads.
+Thresholds and the `severity` labels are starting points. `CertConverterScanStalled` and every state alert in `alerts/logql.yaml` read a 13-hour window, which fits the 6-hour default of `FALLBACK_SCAN_HOURS`. Size it to twice your effective cadence plus an hour. The effective cadence is `FALLBACK_SCAN_HOURS` capped at 24 hours, or 24 hours when it is `0` or `false`, so the window is 49 hours at most. `CertConverterStartupRefused` and `CertConverterChangeDetectionDead` count their exit line over 15 minutes, which does not depend on the cadence. Change the `container` selector to the label your log collector sets, such as `job` or `service`, and keep the scrape job name `CertConverterDown` reads.
 
 Notes on individual alerts:
 
@@ -122,7 +124,7 @@ Notes on individual alerts:
 | `/healthz` | `GET`, `HEAD` | `METRICS_LISTEN_ADDR`, only when it is set | none | `200 {"status":"ok"}`, or `503 {"status":"unhealthy","reasons":[...]}` |
 | `/metrics` | `GET` | the same port | none. Keep the port on your network | Prometheus text format |
 
-**What healthy means.** `/healthz` gives the same verdict as the Docker healthcheck. The last scan read `/input`, converted every source and found no output name collision, and it finished within three guaranteed recheck cadences. That is 18 hours at the 6-hour default, and 72 hours when the 24-hour floor applies. Until the first scan after a start finishes, the answer is `503`. Each failing check adds one sentence to `reasons`. Problems a restart cannot fix, such as an unreadable path below `/input`, leave health unchanged and show on `/metrics` and in the log. [How cert-converter works](how-it-works.md#health) lists them.
+**What healthy means.** `/healthz` gives the same verdict as the Docker healthcheck while the health file can be written. The last scan read `/input`, converted every source and found no output name collision, and it finished within three guaranteed recheck cadences. That is 18 hours at the 6-hour default, and 72 hours when the 24-hour floor applies. Until the first scan after a start finishes, the answer is `503`. Each failing check adds one sentence to `reasons`. Problems a restart cannot fix, such as an unreadable path below `/input`, leave health unchanged and show on `/metrics` and in the log. [How cert-converter works](how-it-works.md#health) lists them.
 
 cert-converter keeps its health file in `/tmp`. If it cannot write there, for example with `read_only: true` and no `tmpfs` on `/tmp`, `/healthz` answers `503` while the Docker healthcheck passes, and the startup log warns about it. The hardened profile in [Security](hardening.md#hardened-deployment) adds the `tmpfs`.
 
