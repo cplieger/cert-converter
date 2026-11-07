@@ -48,7 +48,7 @@ cert-converter writes logfmt records to standard error, with every timestamp in 
 
 | Field | Meaning |
 | --- | --- |
-| `total` | Sources found under `/input` |
+| `total` | PEM pairs, bundles and orphan `.crt` files the scan classified, whatever their outcome. Paths the walk skipped because it could not read or resolve them, or because they vanished, are not in it. |
 | `converted`, `unchanged` | Sources written this scan, and sources whose output already matched |
 | `orphan` | `.crt` files with no `.key` beside them |
 | `unreadable`, `unresolved` | Paths that could not be read, and symlinks that could not be resolved |
@@ -67,8 +67,8 @@ cert-converter writes logfmt records to standard error, with every timestamp in 
 
 A scan that did not see the whole tree cannot prove a problem gone, so its record keeps what the previous scan reported.
 
-- When the scan aborted or stopped at `MAX_SCAN_ENTRIES`, the counts `orphan`, `unreadable`, `unresolved`, `unwritable`, `collided` and `failed` stay at least at the previous scan's values. So do `orphan_removal_disabled` and `previous_layout_retained`, and `no_sources` and `all_excluded` unless this scan found a source.
-- When the walk finished but left an unreadable path, an unresolved symlink or a vanished path, only `no_sources` and `all_excluded` keep the previous value. A source the scan did find clears them.
+- When the scan aborted or stopped at `MAX_SCAN_ENTRIES`, the counts `orphan`, `unreadable`, `unresolved`, `unwritable`, `collided` and `failed` stay at least at the previous scan's values. So do `orphan_removal_disabled` and `previous_layout_retained`.
+- When the scan aborted, stopped at `MAX_SCAN_ENTRIES`, or finished its walk but left an unreadable path, an unresolved symlink or a vanished path, `no_sources` keeps the previous value unless this scan counted a PEM pair or a bundle, an excluded one included. `all_excluded` keeps the previous value unless this scan's `excluded` count is below its `total`.
 - The next scan that covers the whole tree resets every value.
 
 An aborted scan turns the container unhealthy. So does a failed conversion or a name collision, including a `failed` or `collided` count carried through a stop at `MAX_SCAN_ENTRIES`. The other carried values leave health unchanged.
