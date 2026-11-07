@@ -17,16 +17,12 @@ import (
 )
 
 // TestSourcePathVanished_reports_an_unclassifiable_path_as_steady_state pins
-// pathVanished's fallback arm, the one its godoc states and no test reaches: any
-// Lstat failure that is NOT ENOENT answers false, so an /input path the scan cannot
-// even classify is reported as the steady-state condition (Warn plus the unreadable
-// count the documented alert keys on) rather than as the transient renewal race
-// (Debug only, health green, no default-level line). Inverting it would leave such a
-// certificate producing no PFX forever with nothing naming it.
-//
-// A regular file standing in for a path component is the reachable non-ENOENT
-// failure: the confined Lstat answers ENOTDIR, which satisfies neither fs.ErrNotExist
-// nor the surviving-symlink arm.
+// pathVanished's fallback arm: any Lstat failure that is NOT ENOENT answers false, so
+// an /input path the scan cannot even classify is the steady-state condition (Warn
+// plus the unreadable count) rather than the transient renewal race (Debug only).
+// Inverting it would leave such a certificate producing no PFX with nothing naming
+// it. A regular file standing in for a path component makes the confined Lstat
+// answer ENOTDIR, which satisfies neither fs.ErrNotExist nor the symlink arm.
 func TestSourcePathVanished_reports_an_unclassifiable_path_as_steady_state(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

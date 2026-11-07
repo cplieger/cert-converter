@@ -130,16 +130,12 @@ func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing
 }
 
 // TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs pins the
-// empty-input notice the README documents (a certbot-style directory of
-// fullchain.pem/privkey.pem "produces no output and logs `no certificate pairs
-// found under the input root`"). A completed scan that visited no .crt is
-// indistinguishable from a healthy steady state in the summary counts -- failed
-// is 0, so the marker stays set and none of the README's Loki rules fire -- so
-// this line is the only signal of a wrong or vanished /input mount. It must fire
-// for exactly that shape: a scan that converted a pair, one whose empty result
-// is already explained by an unreadable sub-path, and an aborted scan must all
-// stay quiet, or the notice becomes noise on every fsnotify event and every
-// fallback tick. Runs serially: it swaps slog.Default().
+// empty-input notice the README documents. A completed scan that visited no .crt
+// looks healthy in the counts (failed is 0, so the marker stays set), so this line
+// and the record's no_sources field are the only signal of a wrong or vanished
+// /input mount. A scan that converted a pair, one whose empty result an unreadable
+// sub-path explains, and an aborted scan must all stay quiet.
+// Runs serially: it swaps slog.Default().
 func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing.T) {
 	const wantMsg = "no certificate sources found under the input root"
 	tests := []struct {
@@ -153,8 +149,8 @@ func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing
 		{nil, "an unreadable sub-path already explains the empty result", ScanResult{Unreadable: 1}, false},
 		// An unresolved input symlink hides part of the tree, so "no certificate
 		// pairs" is not a claim this scan can make. The symlink WARN one flow
-		// earlier already carries the correct diagnosis; repeating it here fires
-		// the README's CertConverterNoCertificateSources alert with the wrong one.
+		// earlier already carries the correct diagnosis; repeating it here gives the
+		// reader the wrong one.
 		{nil, "an unresolved symlink already explains the empty result", ScanResult{Unresolved: 1}, false},
 		{errors.New("permission denied"), "an aborted scan stays quiet", ScanResult{}, false},
 	}
@@ -163,7 +159,7 @@ func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logInputCoverageWarnings(&tt.result, tt.walkErr)
+			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr)
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; empty-input notice present = %v, want %v",
@@ -207,7 +203,7 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_all_lack_a_key(t *testin
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logInputCoverageWarnings(&tt.result, tt.walkErr)
+			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr)
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; all-orphan notice present = %v, want %v",
@@ -391,47 +387,6 @@ func TestNoteUnreadableInput_levels(t *testing.T) {
 	}
 }
 
-// TestNoteUnreadableInput_names_the_published_unreachable_prefix pins the exact substring
-// the README publishes as one of CertConverterInputPathUnreachable's four matchers,
-// `skipping cert: cannot read`.
-//
-// The table above asserts the SUFFIX only ("cannot read certificate"), and every other
-// assertion in this package compares a captured record against the production string
-// itself -- so rewording the emitted message (to "cannot read the certificate for cert",
-// say) keeps the whole suite green while the documented alert stops matching and an
-// operator whose /input has become unreadable is never paged. The rule's other three
-// matchers are each spelled out literally somewhere in the suite; this was the one that
-// was not.
-//
-// Both `what` values are driven because the message is composed at the call site
-// ("skipping cert: cannot read " + what) rather than held as a const, so the prefix is not
-// pinned by any single string.
-// Runs serially: it swaps slog.Default().
-func TestNoteUnreadableInput_names_the_published_unreachable_prefix(t *testing.T) {
-	const published = "skipping cert: cannot read"
-
-	root, err := os.OpenRoot(t.TempDir())
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
-	sw := &scanWalk{src: &source{root: root}}
-
-	for _, what := range []string{"certificate", "private key"} {
-		logs := captureLogs(t)
-		if got := sw.noteUnreadableInput("example.com/tls.crt", "tls.crt", what,
-			errors.New("permission denied")); got != statusUnreadable {
-			t.Fatalf("noteUnreadableInput(%s, permission denied) = %v, want statusUnreadable", what, got)
-		}
-		if got := logs.CountLevel(slog.LevelWarn, published); got != 1 {
-			t.Errorf("noteUnreadableInput(%s, permission denied) logged %q at WARN %d times, want exactly"+
-				" 1: the README publishes that substring as CertConverterInputPathUnreachable's matcher,"+
-				" so rewording it silently stops the documented alert from ever firing again: %q",
-				what, published, got, logs.Messages())
-		}
-	}
-}
-
 // TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key pins the
 // partial-orphan notice, the sibling of the all-orphan one above: when only SOME
 // .crt files lack their .key, the pairs that do have a key still convert, so the
@@ -489,7 +444,7 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key(t *
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logInputCoverageWarnings(&tt.result, tt.walkErr)
+			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr)
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; partial-orphan notice present = %v, want %v",
@@ -622,7 +577,7 @@ func TestLogScanOutcome_reports_observed_per_path_counts_when_the_entry_budget_s
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logInputCoverageWarnings(&tt.result, tt.walkErr)
+			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr)
 
 			if got := logs.Contains(unreadableMsg); got != tt.wantUnreadable {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; unreadable notice present = %v, want %v",

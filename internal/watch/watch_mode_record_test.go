@@ -15,10 +15,9 @@ import (
 // The mode signal is an operator contract, not an incidental log line: a
 // container degraded to poll mode raises renewal latency to FALLBACK_SCAN_HOURS
 // while health stays green, so the ONLY way an operator learns about it is these
-// records. The tests below pin all three halves of the contract — the two
-// transitions, the per-scan state record's level in each mode, and the upgrade
-// failure's cause surviving into the WARN — on ATTRIBUTES, because that is what a
-// Loki/Alertmanager rule keys on.
+// records and the end-of-scan record's polling field. The tests below pin the two
+// transitions, the per-scan state record's level and the upgrade failure's cause
+// on ATTRIBUTES, which is what a reader filters on.
 
 // loggedRecord is one captured record reduced to what these tests assert on: its
 // level and its top-level attributes by key.
@@ -183,14 +182,12 @@ func TestPollTick_announces_the_recovery_transition_at_info(t *testing.T) {
 	}
 }
 
-// TestPollTick_reports_the_standing_degradation_at_warn_with_its_cause pins the
-// record that makes a PERMANENT degradation visible: every poll-mode scan reports
-// at WARN with mode="poll", so a container that has been polling for a week keeps
-// producing a signal at LOG_LEVEL=warn instead of looking healthy after its one
-// startup line. The upgrade failure's cause must survive the level change, which
-// is what upgrade_stage and error carry.
+// TestPollTick_reports_the_poll_scan_at_info_with_its_cause pins the per-scan
+// record of poll mode: INFO with mode="poll", because entering poll mode already
+// logged the WARN and the end-of-scan record carries the mode on every scan. The
+// upgrade failure's cause rides the record as upgrade_stage and error.
 // Not parallel: it swaps the process-global slog default and the newFSWatcher seam.
-func TestPollTick_reports_the_standing_degradation_at_warn_with_its_cause(t *testing.T) {
+func TestPollTick_reports_the_poll_scan_at_info_with_its_cause(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		root        string
@@ -224,16 +221,9 @@ func TestPollTick_reports_the_standing_degradation_at_warn_with_its_cause(t *tes
 				t.Fatalf("pollTick ran %d scans, want 1: the tick's scan is the only live change detection", scans)
 			}
 
-			// README's CertConverterChangeDetectionDegraded rule matches the
-			// literal line `change detection scan` plus mode=poll, so the message
-			// is pinned as a LITERAL rather than via msgScanState: a reword of the
-			// shared constant must fail here, not in an operator's Loki rule that
-			// silently stops matching. recordsFor matches the message exactly, so
-			// this pins the whole line; main_test.go pins its alerted messages the
-			// same way.
-			rec := requireOneRecord(t, logs, "change detection scan")
-			if rec.level != slog.LevelWarn {
-				t.Errorf("poll-mode scan logged at %v, want WARN: a standing degradation must stay visible at LOG_LEVEL=warn", rec.level)
+			rec := requireOneRecord(t, logs, msgScanState)
+			if rec.level != slog.LevelInfo {
+				t.Errorf("poll-mode scan logged at %v, want INFO: entering poll mode is the WARN", rec.level)
 			}
 			assertAttrs(t, "the poll-mode scan record", rec, map[string]string{
 				"mode":          "poll",
@@ -280,8 +270,8 @@ func TestPollLoopWithUpgrade_reports_poll_mode_on_its_initial_scan(t *testing.T)
 	}
 
 	rec := requireOneRecord(t, logs, msgScanState)
-	if rec.level != slog.LevelWarn {
-		t.Errorf("poll mode's initial scan logged at %v, want WARN", rec.level)
+	if rec.level != slog.LevelInfo {
+		t.Errorf("poll mode's initial scan logged at %v, want INFO", rec.level)
 	}
 	assertAttrs(t, "poll mode's initial scan record", rec, map[string]string{
 		"mode":          "poll",
@@ -399,4 +389,30 @@ func TestLogWatchSet_names_the_size_of_the_set(t *testing.T) {
 		t.Errorf("the watch-set dump listed directories = %q, want the watched subdirectory named:"+
 			" the inventory is what an operator diagnosing an incomplete watch set reads", got)
 	}
+}
+
+// TestPollTick_says_how_long_polling_lasted pins the end of the standing
+// degradation: the record that leaves poll mode carries how long it lasted, so a
+// reader sees one outage and its length.
+// Not parallel: it swaps the process-global slog default and modeClock.
+func TestPollTick_says_how_long_polling_lasted(t *testing.T) {
+	newTestWatcher(t) // availability probe: the tick must be able to upgrade
+	start := time.Date(2026, 1, 2, 3, 0, 0, 0, time.UTC)
+	now := start
+	prev := modeClock
+	modeClock = func() time.Time { return now }
+	t.Cleanup(func() { modeClock = prev })
+	logs := capture.Default(t)
+	w := New(t.TempDir(), func(context.Context, bool) {}, WithFallback(time.Hour))
+
+	w.logModeEntry(t.Context(), modePoll, modeStartup, "fsnotify unavailable")
+	now = start.Add(90 * time.Minute)
+	upgraded, _ := w.pollTick(t.Context())
+	if upgraded == nil {
+		t.Fatal("pollTick handed back no watcher, want the upgrade")
+	}
+	defer upgraded.Close()
+
+	rec := requireOneRecord(t, logs, "fsnotify recovered, upgrading from poll to watch")
+	assertAttrs(t, "the recovery transition", rec, map[string]string{"polled_for": "1h30m0s"})
 }

@@ -37,13 +37,13 @@ type store struct {
 	// laxDirsReported dedupes the lax-output-directory WARN to once per directory
 	// per scan.
 	laxDirsReported map[string]struct{}
+	// maxEntries is this store's per-walk entry budget for the OUTPUT tree, injected
+	// from Options.MaxScanEntries exactly as scanWalk's is for /input.
+	maxEntries int
 	// formats scopes the own-shape predicate: only artifacts the CONFIGURED
 	// formats produce are enumerated as orphan candidates, so a format switched
 	// off leaves its old artifacts untouched.
 	formats outputpolicy.Formats
-	// maxEntries is this store's per-walk entry budget for the OUTPUT tree, injected
-	// from Options.MaxScanEntries exactly as scanWalk's is for /input.
-	maxEntries int
 	// reapDisabled and otherLayoutKept are this scan's reconciliation verdicts,
 	// set beside the WARN that reports each one so the record cannot drift from it.
 	reapDisabled    bool

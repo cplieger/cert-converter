@@ -200,13 +200,13 @@ func TestErrorAttributes_are_sanitized_at_the_emit_sites(t *testing.T) {
 		// The health-neutral arm, message taken from the production const
 		// rather than spelled out (the shorter records above already pin the
 		// rewording guard).
-		reportWriteFailure(hostileStem+".crt", hostileStem+".pfx", refused, statusUnwritable)
+		(&scanWalk{standing: newStanding()}).reportWriteFailure(hostileStem+".crt", hostileStem+".pfx", refused, statusUnwritable)
 		assertErrorAttrSanitized(t, logs, unreplaceableArtifactMsg, refused.Error())
 
 		// The loud arm reaches the operator through failEntry, a different
 		// emit site with its own gate.
 		logs = captureLogs(t)
-		reportWriteFailure(hostileStem+".crt", hostileStem+".pfx", refused, statusFailed)
+		(&scanWalk{standing: newStanding()}).reportWriteFailure(hostileStem+".crt", hostileStem+".pfx", refused, statusFailed)
 		assertErrorAttrSanitized(t, logs, "conversion failed", refused.Error())
 	})
 }

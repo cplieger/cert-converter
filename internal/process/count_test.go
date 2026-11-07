@@ -123,20 +123,12 @@ const (
 )
 
 // TestScanResultVetoes_every_counter_is_classified_and_honoured is the reap-gate half of
-// the structural guard scanreport's TestRecordCarriesEveryVerdictField gives the
-// reporting half.
-//
-// The three veto predicates on ScanResult are spelled once each so their two askers
-// cannot drift, but nothing makes a NEW counter reach them: adding an /input coverage
-// dimension compiles, is forced into the summary by the reporting guard, and is then
-// simply absent from durablyEnumerated -- so a scan that could not enumerate /input passes
-// the gate and reap deletes bundles it cannot prove orphaned, silently, over private key
-// material the documented deployment replicates onward. The case tables that exercise the
-// vetoes name today's fields, so none of them can fail for a field that does not exist
-// yet; reflection is what closes that.
-//
-// It asserts two things per counter: that the counter is classified at all, and that a
-// non-zero value makes exactly the predicates its class owns answer false.
+// the guard scanreport's TestRecordCarriesEveryVerdictField gives the reporting half.
+// A new /input coverage counter compiles and reaches the record, but nothing makes it
+// reach durablyEnumerated, so sync would delete bundles it cannot prove orphaned. The
+// case tables name today's fields; reflection covers a field that does not exist yet.
+// Per counter it asserts the counter is classified and that a non-zero value makes
+// exactly the predicates its class owns answer false.
 func TestScanResultVetoes_every_counter_is_classified_and_honoured(t *testing.T) {
 	t.Parallel()
 

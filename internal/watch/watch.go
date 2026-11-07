@@ -64,6 +64,9 @@ var (
 
 // --- Watcher construction and options ---
 
+// modeClock is indirected so a test can move how long polling lasted.
+var modeClock = time.Now
+
 // newFSWatcher is the fsnotify construction seam.
 var newFSWatcher = fsnotify.NewWatcher
 
@@ -77,6 +80,10 @@ var removeWatch = func(watcher *fsnotify.Watcher, path string) error {
 
 // Watcher monitors a directory tree for cert/key changes and invokes a callback.
 type Watcher struct {
+	// pollingSince is when change detection last entered poll mode, so the
+	// record that leaves it says how long polling lasted.
+	pollingSince time.Time
+
 	// onChange runs one scan; polling is true while change detection is in poll
 	// mode, so the scan's record names the mode it ran in.
 	onChange func(ctx context.Context, polling bool)
@@ -153,11 +160,11 @@ const (
 	modeStartup detectionMode = "startup" // previous_mode only, never mode
 )
 
-// level maps a mode to the level its records are emitted at, and is the single
-// home of the rule that gives the degradation a recurring signal at
-// LOG_LEVEL=warn: poll mode is a STANDING degradation, so its records are WARNs,
-// while watch mode is the intended state and reports at Info.
-func (m detectionMode) level() slog.Level {
+// entryLevel is the level of the record that enters mode: entering poll mode is
+// the start of a standing degradation, so a reader at LOG_LEVEL=warn sees it,
+// while watch mode is the intended state. The per-scan records stay at INFO and
+// the end-of-scan record carries the mode.
+func (m detectionMode) entryLevel() slog.Level {
 	if m == modePoll {
 		return slog.LevelWarn
 	}
@@ -188,14 +195,20 @@ const (
 // mode, coming from previous.
 func (w *Watcher) logModeEntry(ctx context.Context, mode, previous detectionMode, msg string, extra ...any) {
 	attrs := w.coverageAttrs("mode", string(mode), "previous_mode", string(previous))
-	slog.Log(ctx, mode.level(), msg, append(attrs, extra...)...)
+	switch {
+	case mode == modePoll:
+		w.pollingSince = modeClock()
+	case previous == modePoll && !w.pollingSince.IsZero():
+		attrs = append(attrs, "polled_for", modeClock().Sub(w.pollingSince).Round(time.Second).String())
+	}
+	slog.Log(ctx, mode.entryLevel(), msg, append(attrs, extra...)...)
 }
 
 // scan emits the ONE state record every scan carries, naming the mode that is
 // live as the scan runs, then runs the scan in that mode.
 func (w *Watcher) scan(ctx context.Context, mode detectionMode, trigger string, extra ...any) {
 	attrs := w.coverageAttrs("mode", string(mode), "trigger", trigger)
-	slog.Log(ctx, mode.level(), msgScanState, append(attrs, extra...)...)
+	slog.Log(ctx, slog.LevelInfo, msgScanState, append(attrs, extra...)...)
 	w.onChange(ctx, mode == modePoll)
 }
 
@@ -1054,8 +1067,8 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) (upgraded *fsnotify.W
 	if w.fallback <= 0 {
 		// Shutdown that arrived during the initial scan above is a clean stop, not
 		// lost change detection: returning a *LostError here would make main log
-		// "change detection is dead" and exit 1 on a normal SIGTERM, firing the
-		// CertConverterChangeDetectionDead critical alert for a graceful stop.
+		// "change detection is dead" and exit 1 on a normal SIGTERM, telling the
+		// reader a graceful stop was a failure.
 		if ctx.Err() != nil {
 			return nil, nil
 		}

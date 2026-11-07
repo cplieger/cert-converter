@@ -2797,8 +2797,7 @@ func TestLoneKeyRemediation_promises_a_reap_only_where_one_can_follow(t *testing
 // broken /input tree. The sibling above cancels during reconciliation, where the walk
 // finished cleanly, and walk_log_policy_test's case hands the gate that fact ready-made;
 // neither exercises the derivation, so a scan stopping at SIGTERM could start emitting
-// the operator-actionable orphan-removal-disabled WARN -- the record the README's
-// CertConverterOrphanRemovalDisabled alert keys on -- on every container stop, with a
+// the operator-actionable orphan-removal-disabled WARN on every container stop, with a
 // remediation pointing at a mount that is fine. Serial: it swaps slog.Default.
 func TestScannerRun_stays_quiet_when_the_shutdown_arrives_during_the_input_walk(t *testing.T) {
 	certsRoot := t.TempDir()

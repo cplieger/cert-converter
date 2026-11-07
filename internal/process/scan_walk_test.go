@@ -227,9 +227,8 @@ func TestNoteUnwalkableSymlink_reports_resolution_outcomes(t *testing.T) {
 // silence half of the symlink notice, which its message assertions cannot cover.
 // A dangling link whose target stays inside the root hides no certificates, and
 // a symlinked .crt or .key is already classified and logged by convertEntry, so
-// neither may produce a second line. The warning suppressed here is the one the
-// README's CertConverterInputSymlinkSkipped alert keys on, so a false positive
-// pages an operator over a link that costs nothing. The final case is the
+// neither may produce a second line; a false positive would send an operator after
+// a link that costs nothing. The final case is the
 // control: an unresolvable non-cert link must still warn, so the test cannot
 // pass by silencing everything. Runs serially: it swaps slog.Default().
 func TestNoteUnwalkableSymlink_stays_silent_where_nothing_is_hidden(t *testing.T) {

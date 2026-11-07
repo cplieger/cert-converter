@@ -69,8 +69,8 @@ func (r *reapContext) enumeratedInput() bool {
 	return r.walkEnumerationComplete() && r.evidenceEvicted == 0 && r.result.Total > 0
 }
 
-// reapDisabledPhrase is the substring the README's CertConverterOrphanRemovalDisabled Loki
-// rule matches.
+// reapDisabledPhrase is the clause every record that turns orphan removal off for
+// a scan carries, so a reader searching the log for it finds every cause.
 const reapDisabledPhrase = "orphan removal is disabled for this scan"
 
 // logIncompleteInputEnumeration reports why orphan reconciliation is skipped when
@@ -148,9 +148,9 @@ func (rp *reaper) reconcile(ctx context.Context, expected map[string]struct{}, r
 // kept because OUTPUT_LIFECYCLE forbids a deletion for this scan.
 func (rp *reaper) reportRetainedOrphans(orphaned []string, walkSafe bool) {
 	msg := "output artifacts have no matching input"
-	// Reaching this line in sync mode means orphan removal is OFF for this scan —
-	// the condition CertConverterOrphanRemovalDisabled matches, and the
-	// README's OUTPUT_LIFECYCLE row promises this phrase for every failed proof term.
+	// Reaching this line in sync mode means orphan removal is OFF for this scan,
+	// and the README's OUTPUT_LIFECYCLE row promises this phrase for every failed
+	// proof term.
 	if rp.mode == outputpolicy.LifecycleSync {
 		msg += "; " + reapDisabledPhrase
 		rp.out.reapDisabled = true
@@ -230,8 +230,8 @@ func (rp *reaper) reapConfirmed(ctx context.Context, orphaned []string) (int, er
 
 // flatRecheckIncompleteMsg reports a confirming /input re-enumeration that could
 // not observe the whole tree, which vetoes this candidate and every one after
-// it. It carries reapDisabledPhrase on purpose: the operator condition is the
-// same one the published CertConverterOrphanRemovalDisabled rule matches.
+// it. It carries reapDisabledPhrase because the operator condition is the same:
+// orphan removal is off for this scan.
 const flatRecheckIncompleteMsg = reapDisabledPhrase + ": /input could not be fully re-enumerated before deleting, " +
 	"and an incompletely read input tree is not proof any artifact is orphaned"
 

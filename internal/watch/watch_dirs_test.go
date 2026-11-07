@@ -318,20 +318,10 @@ func TestResyncWatchSet_stays_silent_when_shutdown_cut_the_walk_short(t *testing
 }
 
 // TestAddWatchDirs_stops_at_the_entry_budget pins the watch-set walk's entry
-// ceiling, the one behaviour this cycle ADDED to addWatchDirs and the only
-// uncovered non-defensive pair of statements left in the package. Three separate
-// contracts ride on it and none was pinned: the walk STOPS at the budget rather
-// than failing (fs.SkipAll makes WalkDir return nil, which is what keeps Run in
-// watch mode instead of degrading it to polling), the entries up to the budget stay
-// registered (the root above all, or nothing is watched at all), and the refusal is
-// ONE record per walk rather than one per skipped directory, carrying the phrase the
-// CertConverterInputTreeTooLarge alert rule matches (README.md). Deleting the
-// ceiling, inverting the comparison, or returning the error instead of fs.SkipAll all
-// left the suite green.
-//
-// Budget 2 is the whole tree minus one: the root is charged first, then
-// a.example.com (WalkDir enumerates lexically), so b.example.com is the entry past
-// the ceiling.
+// ceiling: the walk STOPS at the budget rather than failing (fs.SkipAll keeps Run in
+// watch mode), the entries up to the budget stay registered, and the refusal is ONE
+// record per walk. Budget 2 is the whole tree minus one: the root is charged first,
+// then a.example.com (WalkDir enumerates lexically), so b.example.com is past it.
 // Not parallel: it swaps the process-global slog default.
 func TestAddWatchDirs_stops_at_the_entry_budget(t *testing.T) {
 	watcher := newTestWatcher(t)
@@ -379,16 +369,8 @@ func TestAddWatchDirs_stops_at_the_entry_budget(t *testing.T) {
 			t.Errorf("budget WARN %s = %q, want %q", key, got, want)
 		}
 	}
-	// README's CertConverterInputTreeTooLarge rule matches this phrase, so it is
-	// pinned as a LITERAL rather than via watchBudgetMsg: a reword of the
-	// constant must fail here, loudly, rather than in an operator's Loki rule
-	// that silently stops matching -- the overrun is health-neutral, so that rule
-	// is the operator's only signal. main_test.go pins its alerted messages the
-	// same way.
-	const alertedPhrase = "holds more entries than one scan will enumerate"
-	if n := logs.CountLevel(slog.LevelWarn, alertedPhrase); n != 1 {
-		t.Errorf("%d WARN records carry the alert-matched phrase %q, want exactly 1: the CertConverterInputTreeTooLarge rule matches that literal; log = %v",
-			n, alertedPhrase, logs.Messages())
+	if n := logs.CountLevel(slog.LevelWarn, watchBudgetMsg); n != 1 {
+		t.Errorf("%d WARN records carry the budget stop, want exactly 1; log = %v", n, logs.Messages())
 	}
 }
 

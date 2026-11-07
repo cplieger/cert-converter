@@ -8,8 +8,7 @@ import (
 // TestFloor_is_the_documented_reconciliation_cadence pins the one number three
 // operator promises are derived from: the README states the guarantee as 24 hours
 // (config table, Healthcheck section) and the health lease as 72 (3*Floor,
-// main.go), and the CertConverterChangeDetectionDegraded alert description says
-// "capped at the 24h reconciliation floor". Every other assertion in this repo
+// main.go). Every other assertion in this repo
 // compares against Floor itself, so without a literal here the constant can move
 // and only the docs become wrong.
 func TestFloor_is_the_documented_reconciliation_cadence(t *testing.T) {
