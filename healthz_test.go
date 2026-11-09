@@ -199,12 +199,12 @@ func TestHealthz_agrees_with_the_health_subcommand(t *testing.T) {
 
 				rec := httptest.NewRecorder()
 				newHealthz(marker, config.FallbackInterval()).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-				probe := health.ProbeCheck(path, probeOpts...)
+				probeHealthy := health.Inspect(path, probeOpts...).Healthy()
 				if rec.Code != tc.wantCode {
 					t.Errorf("/healthz = %d, want %d", rec.Code, tc.wantCode)
 				}
-				if (probe == 0) != (rec.Code == http.StatusOK) {
-					t.Errorf("/healthz = %d but cert-watcher health exits %d: the two readers disagree", rec.Code, probe)
+				if probeHealthy != (rec.Code == http.StatusOK) {
+					t.Errorf("/healthz = %d but cert-watcher health reads healthy = %v: the two readers disagree", rec.Code, probeHealthy)
 				}
 			})
 		}

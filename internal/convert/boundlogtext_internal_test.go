@@ -131,9 +131,9 @@ func TestBoundLogText_is_the_library_primitive_with_this_apps_marker(t *testing.
 		"a subject one byte over":                {in: strings.Repeat("a", maxSubjectLogLen+1), wantCut: true},
 		"multi-byte runes cut mid-rune":          {in: strings.Repeat("\u2603", 4000), wantCut: true},
 		"invalid bytes that GROW past the limit": {in: strings.Repeat("\xff", 200), wantCut: true},
-		// THE input class that tells a cap-first primitive from a sanitize-first one
-		// (user-ratified 2026-08): 86 unsafe runes are 258 raw bytes that collapse to 86
-		// sanitized. A sanitize-first cap returns the 86 whole and unmarked; the cap-first
+		// THE input class that tells a cap-first primitive from a sanitize-first one:
+		// 86 unsafe runes are 258 raw bytes that collapse to 86 sanitized. A
+		// sanitize-first cap returns the 86 whole and unmarked; the cap-first
 		// primitive this app uses cuts the RAW bytes at the limit, so this is cut and
 		// marked. The work is bounded by the limit and not by the input, so wantCut is
 		// true BY DESIGN here: if it ever reads false, boundLogText caps after sanitizing.
