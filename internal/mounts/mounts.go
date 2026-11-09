@@ -171,7 +171,7 @@ func warnOutputRefusedWrite(res filesafe.ProbeResult) {
 		" to the UID in user: (and check the mount is not read-only)"
 	// A create refusal is an ownership/read-only/missing-mount condition, which the
 	// chown advice above fits.
-	if res.Stage == filesafe.ProbeStageWrite || res.Stage == filesafe.ProbeStageSync {
+	if res.Phase == filesafe.ProbePhaseWrite || res.Phase == filesafe.ProbePhaseSync {
 		remediation = "the directory entry was accepted and the data was not, so this is not an ownership problem: " +
 			"check free space and any quota on the filesystem backing " + logRoot
 	}
@@ -182,13 +182,13 @@ func warnOutputRefusedWrite(res filesafe.ProbeResult) {
 		// Reachable when the write or the flush failed AND the follow-up unlink failed
 		// too: the volume is unusable and is still holding the probe file.
 		slog.Warn(outputNotWritableMsg,
-			"role", roleOutput, "path", logRoot, "stage", res.Stage.String(), "error", logtext.Path(res.Err.Error()),
+			"role", roleOutput, "path", logRoot, "stage", res.Phase.String(), "error", logtext.Path(res.Err.Error()),
 			"uid", os.Getuid(), "gid", os.Getgid(), "remediation", remediation,
 			"leaked_probe", logtext.Path(probePath(res)), "cleanup", staleTempRemediation)
 		return
 	}
 	slog.Warn(outputNotWritableMsg,
-		"role", roleOutput, "path", logRoot, "stage", res.Stage.String(), "error", logtext.Path(res.Err.Error()),
+		"role", roleOutput, "path", logRoot, "stage", res.Phase.String(), "error", logtext.Path(res.Err.Error()),
 		"uid", os.Getuid(), "gid", os.Getgid(), "remediation", remediation)
 }
 
@@ -205,16 +205,16 @@ func ModeNotStoredRemediation(root string) string {
 // teardown did not.
 func warnOutputProbeTeardown(res filesafe.ProbeResult) {
 	msg := "failed to remove the output write probe"
-	if res.Stage == filesafe.ProbeStageClose {
+	if res.Phase == filesafe.ProbePhaseClose {
 		msg = "failed to close the output write probe"
 	}
 	if res.Leaked {
-		slog.Warn(msg, "path", logtext.Path(probePath(res)), "stage", res.Stage.String(),
+		slog.Warn(msg, "path", logtext.Path(probePath(res)), "stage", res.Phase.String(),
 			"error", logtext.Path(res.Err.Error()),
 			"remediation", staleTempRemediation)
 		return
 	}
-	slog.Warn(msg, "path", logtext.Path(probePath(res)), "stage", res.Stage.String(),
+	slog.Warn(msg, "path", logtext.Path(probePath(res)), "stage", res.Phase.String(),
 		"error", logtext.Path(res.Err.Error()))
 }
 

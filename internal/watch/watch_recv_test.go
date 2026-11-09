@@ -438,7 +438,7 @@ func TestHandleWatcherError_warns_with_the_operator_diagnostics(t *testing.T) {
 				t.Fatalf("WARN %q logged %d times, want exactly 1; log = %v", tc.msg, n, logs.Messages())
 			}
 			for key, want := range tc.wantAttrs {
-				got, ok := logs.AttrValue(tc.msg, key)
+				got, ok := logs.AttrValue(capture.Message(tc.msg), capture.AttrName(key))
 				if !ok {
 					t.Errorf("WARN %q carries no %q attribute; an operator cannot act on the error without it", tc.msg, key)
 					continue
@@ -448,7 +448,7 @@ func TestHandleWatcherError_warns_with_the_operator_diagnostics(t *testing.T) {
 				}
 			}
 			if tc.msg == "watcher error" {
-				if got, _ := logs.AttrValue(tc.msg, "root"); got != root {
+				if got, _ := logs.AttrValue(capture.Message(tc.msg), "root"); got != root {
 					t.Errorf("WARN %q root = %q, want %q so the operator knows which tree lost an event", tc.msg, got, root)
 				}
 			}

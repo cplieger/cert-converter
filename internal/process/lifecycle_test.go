@@ -1396,7 +1396,7 @@ func TestContentFromCurrency_maps_every_outcome(t *testing.T) {
 			if got := logs.CountLevel(tc.wantLevel, tc.wantMsg); got != 1 {
 				t.Errorf("contentFromCurrency(%s) logged %q at %s %d times, want exactly 1", tc.res.Reason, tc.wantMsg, tc.wantLevel, got)
 			}
-			if !logs.HasAttr(tc.wantMsg, "path", "example.com/tls.pfx") {
+			if !logs.HasAttr(capture.Message(tc.wantMsg), "path", "example.com/tls.pfx") {
 				t.Errorf("contentFromCurrency(%s) logged %q, want the output path named", tc.res.Reason, logs.Messages())
 			}
 		})
@@ -1708,8 +1708,8 @@ func TestLogScanOutcome_names_the_output_side_counts(t *testing.T) {
 	logScanOutcome(t.Context(), &ScanResult{Total: 2, Converted: 1, Removed: 3, Unwritable: 2}, nil)
 
 	for key, want := range map[string]string{"removed": "3", "unwritable": "2"} {
-		if !logs.HasAttr("scan complete", key, want) {
-			got, _ := logs.AttrValue("scan complete", key)
+		if !logs.HasAttr("scan complete", capture.AttrName(key), want) {
+			got, _ := logs.AttrValue("scan complete", capture.AttrName(key))
 			t.Errorf("logScanOutcome logged %s=%q, want %q", key, got, want)
 		}
 	}
@@ -2254,7 +2254,7 @@ func TestScannerRun_prunes_the_observation_log_despite_an_eviction(t *testing.T)
 // operator's only way out and a hint that does not name the setting is not one.
 func assertRemediationMentions(t *testing.T, logs *capture.Recorder, msg, want string) {
 	t.Helper()
-	got, ok := logs.AttrValue(msg, "remediation")
+	got, ok := logs.AttrValue(capture.Message(msg), "remediation")
 	if !ok {
 		t.Errorf("record %q carries no remediation: it is the only line the operator sees", msg)
 		return

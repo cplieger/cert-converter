@@ -473,7 +473,7 @@ func TestAttachWatchSet_names_the_rescan_cadence_when_it_degrades_to_polling(t *
 			if n := logs.CountLevel(slog.LevelWarn, tc.msg); n != 1 {
 				t.Fatalf("WARN %q logged %d times, want exactly 1; log = %v", tc.msg, n, logs.Messages())
 			}
-			got, ok := logs.AttrValue(tc.msg, "fallback_scan")
+			got, ok := logs.AttrValue(capture.Message(tc.msg), "fallback_scan")
 			if !ok {
 				t.Fatalf("WARN %q carries no fallback_scan attribute; an operator cannot tell which rescan cadence their configuration is running; log = %v", tc.msg, logs.Messages())
 			}

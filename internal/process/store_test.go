@@ -16,6 +16,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/go/filesafe"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // newOutputStore opens dir as a confined output root and returns the store under test,
@@ -429,7 +430,7 @@ func TestStoreInspect_reports_a_lax_output_directory(t *testing.T) {
 				return
 			}
 			for _, key := range []string{"path", "mode", "want", "remediation"} {
-				if _, ok := logs.AttrValue(wantMsg, key); !ok {
+				if _, ok := logs.AttrValue(wantMsg, capture.AttrName(key)); !ok {
 					t.Errorf("inspect(directory mode %o) logged %q without a %s attribute, want the"+
 						" directory, the mode found, the mode wanted and what to do: %q",
 						tc.mode, wantMsg, key, logs.Messages())
@@ -1132,8 +1133,8 @@ func TestStoreInspect_warns_naming_the_mode_found_and_the_mode_it_will_install(t
 		"mode": found.String(),
 		"want": outputFileMode.String(),
 	} {
-		if !logs.HasAttr(laxArtifactMsg, key, want) {
-			got, _ := logs.AttrValue(laxArtifactMsg, key)
+		if !logs.HasAttr(laxArtifactMsg, capture.AttrName(key), want) {
+			got, _ := logs.AttrValue(laxArtifactMsg, capture.AttrName(key))
 			t.Errorf("inspect(lax bundle) logged %s=%q, want %q", key, got, want)
 		}
 	}

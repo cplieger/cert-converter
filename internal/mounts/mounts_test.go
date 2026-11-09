@@ -205,7 +205,7 @@ func TestVerify_asks_only_for_read_access_on_the_input_volume(t *testing.T) {
 func TestVerify_runs_the_output_write_probe(t *testing.T) {
 	dir := t.TempDir()
 	stubOutputProbe(t, filesafe.ProbeResult{
-		Dir: dir, Stage: filesafe.ProbeStageCreate, Err: fs.ErrPermission,
+		Dir: dir, Phase: filesafe.ProbePhaseCreate, Err: fs.ErrPermission,
 	}, nil)
 	logs := capture.Default(t)
 
@@ -265,7 +265,7 @@ func TestWarnOutputNotWritable_reports_failed_probe(t *testing.T) {
 	// The stage is what tells an operator WHICH refusal they are looking at, now
 	// that the probe walks the whole create/write/flush/close/unlink ladder instead
 	// of the create alone.
-	if !logs.HasAttr(msg, "stage", filesafe.ProbeStageCreate.String()) {
+	if !logs.HasAttr(msg, "stage", filesafe.ProbePhaseCreate.String()) {
 		t.Errorf("warnOutputNotWritable(%q) does not name the failing probe stage (logs %v)",
 			blocked, logs.Messages())
 	}
@@ -287,7 +287,7 @@ const wantOutputNotWritableMsg = "the output volume is not writable by the runni
 func stubOutputProbe(t *testing.T, res filesafe.ProbeResult, err error) {
 	t.Helper()
 	prev := probeOutputWritable
-	probeOutputWritable = func(context.Context, *os.Root, string, ...filesafe.Option) (filesafe.ProbeResult, error) {
+	probeOutputWritable = func(context.Context, *os.Root, string, ...filesafe.WriteOption) (filesafe.ProbeResult, error) {
 		return res, err
 	}
 	t.Cleanup(func() { probeOutputWritable = prev })
@@ -296,7 +296,7 @@ func stubOutputProbe(t *testing.T, res filesafe.ProbeResult, err error) {
 // TestWarnOutputNotWritable_probes_with_the_artifact_mode pins that the startup probe
 // asks for the same owner-only mode the converted files are written at, so a volume
 // that cannot hold that mode is refused at startup like a real write would be. The
-// options the probe receives are replayed through a real write, because an Option is
+// options the probe receives are replayed through a real write, because a WriteOption is
 // opaque: the file that write leaves behind is what those options mean.
 //
 // Serial (no t.Parallel): it swaps the probe seam.
@@ -308,8 +308,8 @@ func TestWarnOutputNotWritable_probes_with_the_artifact_mode(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = root.Close() })
 	prev := probeOutputWritable
-	var got []filesafe.Option
-	probeOutputWritable = func(_ context.Context, _ *os.Root, _ string, opts ...filesafe.Option) (filesafe.ProbeResult, error) {
+	var got []filesafe.WriteOption
+	probeOutputWritable = func(_ context.Context, _ *os.Root, _ string, opts ...filesafe.WriteOption) (filesafe.ProbeResult, error) {
 		got = opts
 		return filesafe.ProbeResult{Dir: dir}, nil
 	}
@@ -371,14 +371,14 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 		{
 			name: "a refused create reports the volume as not writable",
 			res: filesafe.ProbeResult{
-				Dir: dir, Stage: filesafe.ProbeStageCreate, Err: fs.ErrPermission,
+				Dir: dir, Phase: filesafe.ProbePhaseCreate, Err: fs.ErrPermission,
 			},
 			wantMsg:     wantOutputNotWritableMsg,
 			wantWarns:   1,
 			wantRecords: 1,
 			wantAttrs: map[string]string{
 				"role": "output", "path": dir,
-				"stage": filesafe.ProbeStageCreate.String(),
+				"stage": filesafe.ProbePhaseCreate.String(),
 			},
 			// Nothing was durably written, so there is no probe file to reclaim and the
 			// sweep sentence would send an operator after a file that does not exist.
@@ -387,14 +387,14 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 		{
 			name: "a refused write that also leaked names the leftover",
 			res: filesafe.ProbeResult{
-				Dir: dir, Name: leakedName, Stage: filesafe.ProbeStageWrite,
+				Dir: dir, Name: leakedName, Phase: filesafe.ProbePhaseWrite,
 				Err: fs.ErrPermission, Leaked: true,
 			},
 			wantMsg:     wantOutputNotWritableMsg,
 			wantWarns:   1,
 			wantRecords: 1,
 			wantAttrs: map[string]string{
-				"stage": filesafe.ProbeStageWrite.String(), "leaked_probe": leakedPath,
+				"stage": filesafe.ProbePhaseWrite.String(), "leaked_probe": leakedPath,
 				"cleanup": staleTempRemediation,
 				"remediation": "the directory entry was accepted and the data was not, so this is not an ownership problem: " +
 					"check free space and any quota on the filesystem backing " + dir,
@@ -403,14 +403,14 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 		{
 			name: "a refused flush is not an ownership problem",
 			res: filesafe.ProbeResult{
-				Dir: dir, Name: leakedName, Stage: filesafe.ProbeStageSync,
+				Dir: dir, Name: leakedName, Phase: filesafe.ProbePhaseSync,
 				Err: errors.New("disk quota exceeded"),
 			},
 			wantMsg:     wantOutputNotWritableMsg,
 			wantWarns:   1,
 			wantRecords: 1,
 			wantAttrs: map[string]string{
-				"stage": filesafe.ProbeStageSync.String(),
+				"stage": filesafe.ProbePhaseSync.String(),
 				"remediation": "the directory entry was accepted and the data was not, so this is not an ownership problem: " +
 					"check free space and any quota on the filesystem backing " + dir,
 			},
@@ -419,14 +419,14 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 		{
 			name: "a volume that does not keep the owner-only mode is not an ownership problem",
 			res: filesafe.ProbeResult{
-				Dir: dir, Stage: filesafe.ProbeStageCreate,
+				Dir: dir, Phase: filesafe.ProbePhaseCreate,
 				Err: fmt.Errorf("%w: %s asked -rw------- stored -rw-rw----", filesafe.ErrModeNotStored, leakedPath),
 			},
 			wantMsg:     wantOutputNotWritableMsg,
 			wantWarns:   1,
 			wantRecords: 1,
 			wantAttrs: map[string]string{
-				"stage": filesafe.ProbeStageCreate.String(),
+				"stage": filesafe.ProbePhaseCreate.String(),
 				"remediation": "the filesystem backing " + dir + " did not keep mode 0600 on a new file, so this is not an " +
 					"ownership problem: remove the inheritable ACL entries that widen new files there (on ZFS, the " +
 					"inherited group@/everyone@ entries or the dataset's aclinherit setting), or mount a filesystem " +
@@ -437,14 +437,14 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 		{
 			name: "a close failure keeps its own message",
 			res: filesafe.ProbeResult{
-				Dir: dir, Name: leakedName, Stage: filesafe.ProbeStageClose,
+				Dir: dir, Name: leakedName, Phase: filesafe.ProbePhaseClose,
 				Err: errors.New("input/output error"),
 			},
 			wantMsg:     "failed to close the output write probe",
 			wantWarns:   1,
 			wantRecords: 1,
 			wantAttrs: map[string]string{
-				"path": leakedPath, "stage": filesafe.ProbeStageClose.String(),
+				"path": leakedPath, "stage": filesafe.ProbePhaseClose.String(),
 			},
 			// The probe file WAS removed here, so the sweep remediation must not fire:
 			// it is keyed on ProbeResult.Leaked, not on the stage.
@@ -453,7 +453,7 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 		{
 			name: "a close failure that leaked keeps the sweep remediation",
 			res: filesafe.ProbeResult{
-				Dir: dir, Name: leakedName, Stage: filesafe.ProbeStageClose,
+				Dir: dir, Name: leakedName, Phase: filesafe.ProbePhaseClose,
 				Err: errors.New("input/output error"), Leaked: true,
 			},
 			wantMsg:     "failed to close the output write probe",
@@ -464,7 +464,7 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 		{
 			name: "a refused unlink keeps its own message and the sweep remediation",
 			res: filesafe.ProbeResult{
-				Dir: dir, Name: leakedName, Stage: filesafe.ProbeStageRemove,
+				Dir: dir, Name: leakedName, Phase: filesafe.ProbePhaseRemove,
 				Err: fs.ErrPermission, Leaked: true,
 			},
 			wantMsg:     "failed to remove the output write probe",
@@ -507,13 +507,13 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 				t.Fatalf("warnOutputNotWritable did not emit the %q WARN (logs %v)", tc.wantMsg, logs.Messages())
 			}
 			for key, want := range tc.wantAttrs {
-				if !logs.HasAttr(tc.wantMsg, key, want) {
+				if !logs.HasAttr(capture.Message(tc.wantMsg), capture.AttrName(key), want) {
 					t.Errorf("warnOutputNotWritable %q record: attr %q = %q, want %q (logs %v)",
 						tc.wantMsg, key, attrOrMissing(logs, tc.wantMsg, key), want, logs.Messages())
 				}
 			}
 			if tc.wantAbsent != "" {
-				if got, ok := logs.AttrValue(tc.wantMsg, tc.wantAbsent); ok {
+				if got, ok := logs.AttrValue(capture.Message(tc.wantMsg), capture.AttrName(tc.wantAbsent)); ok {
 					t.Errorf("warnOutputNotWritable %q record carries attr %q = %q, want it absent",
 						tc.wantMsg, tc.wantAbsent, got)
 				}
@@ -524,7 +524,7 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 
 // attrOrMissing renders an attr for a failure message, or reports it as absent.
 func attrOrMissing(logs *capture.Recorder, msgSub, key string) string {
-	if got, ok := logs.AttrValue(msgSub, key); ok {
+	if got, ok := logs.AttrValue(capture.Message(msgSub), capture.AttrName(key)); ok {
 		return got
 	}
 	return "<absent>"

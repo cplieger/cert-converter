@@ -280,7 +280,7 @@ const maxRejectedValueLogLen = 128
 // marker charged inside the limit. A value below the budget carrying no unsafe rune is
 // quoted byte for byte.
 func rejectedValue(raw string) string {
-	text, _ := textsafe.SanitizeSingleLineBudgeted(raw, maxRejectedValueLogLen, logtext.Marker)
+	text, _ := textsafe.SanitizeSingleLineCapped(raw, maxRejectedValueLogLen, logtext.Marker)
 	return text
 }
 

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // TestLogScanOutcome_levels pins the level and message of the end-of-scan
@@ -50,8 +51,8 @@ func TestLogScanOutcome_levels(t *testing.T) {
 			if got := logs.CountLevel(tt.wantLevel, tt.wantMsg); got != 1 {
 				t.Errorf("logScanOutcome(walkErr=%v) logged %q at %s %d times, want 1", tt.walkErr, tt.wantMsg, tt.wantLevel, got)
 			}
-			if !logs.HasAttr(tt.wantMsg, "converted", "1") {
-				got, _ := logs.AttrValue(tt.wantMsg, "converted")
+			if !logs.HasAttr(capture.Message(tt.wantMsg), "converted", "1") {
+				got, _ := logs.AttrValue(capture.Message(tt.wantMsg), "converted")
 				t.Errorf("logScanOutcome(walkErr=%v) logged converted=%q, want the converted count in the summary", tt.walkErr, got)
 			}
 		})
@@ -91,7 +92,7 @@ func TestFailEntry_levels(t *testing.T) {
 			if got := logs.CountLevel(tt.wantLevel, tt.wantMsg); got != 1 {
 				t.Errorf("failEntry(%v) logged %q at %s %d times, want 1", tt.err, tt.wantMsg, tt.wantLevel, got)
 			}
-			if !logs.HasAttr(tt.wantMsg, "path", "example.com/tls.crt") {
+			if !logs.HasAttr(capture.Message(tt.wantMsg), "path", "example.com/tls.crt") {
 				t.Errorf("failEntry(%v) logged %q, want the cert's relative path", tt.err, logs.Messages())
 			}
 		})
@@ -310,8 +311,8 @@ func TestLogConversionObservations_levels(t *testing.T) {
 			// Keyed attributes: the kind must be the `kind` attribute, not text that
 			// happens to appear in the detail or the path.
 			for key, want := range map[string]string{"kind": string(tc.kind), "path": "example.com/tls.crt"} {
-				if !logs.HasAttr(msg, key, want) {
-					got, _ := logs.AttrValue(msg, key)
+				if !logs.HasAttr(msg, capture.AttrName(key), want) {
+					got, _ := logs.AttrValue(msg, capture.AttrName(key))
 					t.Errorf("logConversionObservations(%s) logged %s=%q, want %q", tc.kind, key, got, want)
 				}
 			}
@@ -422,12 +423,12 @@ func TestNoteUnreadableInput_levels(t *testing.T) {
 			if got := logs.CountLevel(tc.wantLevel, tc.wantMsg); got != 1 {
 				t.Fatalf("noteUnreadableInput(%v) logged %q, want %q at %s", tc.err, logs.Messages(), tc.wantMsg, tc.wantLevel)
 			}
-			if !logs.HasAttr(tc.wantMsg, "path", logRel) {
+			if !logs.HasAttr(capture.Message(tc.wantMsg), "path", logRel) {
 				t.Errorf("noteUnreadableInput(%v) logged %q, want the cert's relative path", tc.err, logs.Messages())
 			}
 			// The remediation hint belongs to the actionable arm only: on the benign
 			// race there is nothing for the operator to do.
-			_, hasHint := logs.AttrValue(tc.wantMsg, "remediation")
+			_, hasHint := logs.AttrValue(capture.Message(tc.wantMsg), "remediation")
 			if wantHint := tc.wantLevel == slog.LevelWarn; hasHint != wantHint {
 				t.Errorf("noteUnreadableInput(%v) remediation hint present = %v, want %v: %q", tc.err, hasHint, wantHint, logs.Messages())
 			}
