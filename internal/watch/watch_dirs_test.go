@@ -124,7 +124,7 @@ func assertSkipRecord(t *testing.T, logs *capture.Recorder, level slog.Level,
 		"fallback_scan": wantFallback,
 		"error":         wantErr.Error(),
 	} {
-		got, ok := logs.AttrValue(msg, key)
+		got, ok := logs.AttrValue(capture.Message(msg), capture.AttrName(key))
 		if !ok {
 			t.Errorf("record %q carries no %q attribute; an operator cannot act on the skip without it", msg, key)
 			continue
@@ -370,7 +370,7 @@ func TestAddWatchDirs_stops_at_the_entry_budget(t *testing.T) {
 		"max_entries": "2",
 		"remediation": scanbudget.InputRemediation,
 	} {
-		got, ok := logs.AttrValue(watchBudgetMsg, key)
+		got, ok := logs.AttrValue(watchBudgetMsg, capture.AttrName(key))
 		if !ok {
 			t.Errorf("budget WARN carries no %q attribute; an operator cannot act on the overrun without it", key)
 			continue

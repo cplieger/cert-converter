@@ -326,7 +326,7 @@ const maxBlockTypeLogLen = 64
 // boundLogText makes input-derived text safe and bounded for a log-bound
 // diagnostic.
 func boundLogText(s string, limit int) string {
-	text, _ := textsafe.SanitizeSingleLineBudgeted(s, limit, logtext.Marker)
+	text, _ := textsafe.SanitizeSingleLineCapped(s, limit, logtext.Marker)
 	return text
 }
 

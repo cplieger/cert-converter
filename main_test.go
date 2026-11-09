@@ -366,7 +366,7 @@ func TestDispatchArgs(t *testing.T) {
 // healthy indefinitely. A marker past the lease must now fail, so both sides of that
 // boundary are asserted.
 //
-// The captured options are applied with health.ProbeCheck to markers whose
+// The captured options are applied with health.Inspect to markers whose
 // mtimes straddle the deadline, so a wrong Cycles count or a dropped option fails
 // here rather than in production. No t.Parallel: it swaps runProbe and mutates
 // the environment.
@@ -380,13 +380,13 @@ func TestDispatchArgs_arms_the_marker_lease(t *testing.T) {
 		name          string
 		fallbackHours string
 		markerAge     time.Duration
-		wantCode      int
+		wantHealthy   bool
 	}{
-		{"default cadence keeps a marker inside the 18h lease healthy", "", 17 * time.Hour, 0},
-		{"default cadence fails a marker past the 18h lease", "", 19 * time.Hour, 1},
-		{"a disabled fallback keeps a marker inside the reconciliation lease healthy", "0", reconcileLease - time.Hour, 0},
-		{"a disabled fallback fails a marker past the reconciliation lease", "0", reconcileLease + time.Hour, 1},
-		{"a cadence above the floor is capped to the reconciliation lease", "87600", reconcileLease + time.Hour, 1},
+		{"default cadence keeps a marker inside the 18h lease healthy", "", 17 * time.Hour, true},
+		{"default cadence fails a marker past the 18h lease", "", 19 * time.Hour, false},
+		{"a disabled fallback keeps a marker inside the reconciliation lease healthy", "0", reconcileLease - time.Hour, true},
+		{"a disabled fallback fails a marker past the reconciliation lease", "0", reconcileLease + time.Hour, false},
+		{"a cadence above the floor is capped to the reconciliation lease", "87600", reconcileLease + time.Hour, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("FALLBACK_SCAN_HOURS", tc.fallbackHours)
@@ -414,9 +414,9 @@ func TestDispatchArgs_arms_the_marker_lease(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if got := health.ProbeCheck(marker, gotOpts...); got != tc.wantCode {
-				t.Errorf("ProbeCheck(marker aged %v, opts from FALLBACK_SCAN_HOURS=%q) = %d, want %d",
-					tc.markerAge, tc.fallbackHours, got, tc.wantCode)
+			if got := health.Inspect(marker, gotOpts...).Healthy(); got != tc.wantHealthy {
+				t.Errorf("Inspect(marker aged %v, opts from FALLBACK_SCAN_HOURS=%q).Healthy() = %v, want %v",
+					tc.markerAge, tc.fallbackHours, got, tc.wantHealthy)
 			}
 		})
 	}

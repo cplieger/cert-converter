@@ -17,6 +17,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/go/filesafe"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // TestWriteOutcome_derives_the_status_from_two_independent_facts pins the single place
@@ -380,7 +381,7 @@ func stubWriteRefusal(t *testing.T, err error) {
 	t.Helper()
 	prev := writeFileInRoot
 	writeFileInRoot = func(context.Context, *os.Root, string, []byte,
-		...filesafe.Option,
+		...filesafe.WriteOption,
 	) (filesafe.Result, error) {
 		return filesafe.Result{}, err
 	}
@@ -594,8 +595,8 @@ func TestScannerRun_when_an_unverifiable_bundle_cannot_be_rewritten(t *testing.T
 					"content":     "unverified",
 					"remediation": tc.wantRemediation,
 				} {
-					if !logs.HasAttr(unreplaceableMsg, key, want) {
-						got, _ := logs.AttrValue(unreplaceableMsg, key)
+					if !logs.HasAttr(unreplaceableMsg, capture.AttrName(key), want) {
+						got, _ := logs.AttrValue(unreplaceableMsg, capture.AttrName(key))
 						t.Errorf("Run(unverifiable prior, refused rewrite) logged %s=%q, want %q", key, got, want)
 					}
 				}
@@ -970,7 +971,7 @@ func TestScannerRun_partialArtifactPublicationFailsTheSource(t *testing.T) {
 	}
 	t.Cleanup(func() { readBoundedInRoot = priorRead })
 	priorWrite := writeFileInRoot
-	writeFileInRoot = func(ctx context.Context, root *os.Root, name string, data []byte, opts ...filesafe.Option) (filesafe.Result, error) {
+	writeFileInRoot = func(ctx context.Context, root *os.Root, name string, data []byte, opts ...filesafe.WriteOption) (filesafe.Result, error) {
 		if name == "site.key" {
 			return filesafe.Result{}, &fs.PathError{Op: "rename", Path: name, Err: syscall.EACCES}
 		}

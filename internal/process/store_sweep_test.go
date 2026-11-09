@@ -12,6 +12,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/go/filesafe"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // TestStoreLogSweepOutcome_operator_signals pins the /output sweep's end-of-sweep
@@ -90,7 +91,7 @@ func TestStoreLogSweepOutcome_operator_signals(t *testing.T) {
 			// The attribute is asserted by KEY on the record carrying the message, so a
 			// value that happens to appear elsewhere in the line cannot satisfy it. An
 			// empty wantAttrValue asserts presence only.
-			got, ok := logs.AttrValue(tt.wantMsg, tt.wantAttrKey)
+			got, ok := logs.AttrValue(capture.Message(tt.wantMsg), capture.AttrName(tt.wantAttrKey))
 			if !ok {
 				t.Errorf("logSweepOutcome(%v) logged %q, want attribute %q", tt.walkErr, logs.Messages(), tt.wantAttrKey)
 			}

@@ -222,7 +222,7 @@ func assertErrorAttrSanitized(t *testing.T, logs *capture.Recorder, msgSub, raw 
 	if want == raw {
 		t.Fatalf("the fixture error text %q survives sanitizing unchanged, so this case asserts nothing", raw)
 	}
-	got, ok := logs.AttrValue(msgSub, "error")
+	got, ok := logs.AttrValue(capture.Message(msgSub), "error")
 	if !ok {
 		t.Fatalf("record %q carries no error attribute: %q", msgSub, logs.Messages())
 	}

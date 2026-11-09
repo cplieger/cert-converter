@@ -345,7 +345,7 @@ func TestHandleRootWatchLoss_stays_live_when_the_reattach_fails(t *testing.T) {
 		t.Fatalf("WARN %q logged %d times, want exactly 1; log = %v", msg, n, logs.Messages())
 	}
 	for key, want := range map[string]string{"root": root, "fallback_scan": "6h0m0s"} {
-		got, ok := logs.AttrValue(msg, key)
+		got, ok := logs.AttrValue(msg, capture.AttrName(key))
 		if !ok {
 			t.Errorf("WARN %q carries no %q attribute; an operator cannot tell which tree lost real-time detection or when it is re-scanned", msg, key)
 			continue

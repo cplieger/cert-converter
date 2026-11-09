@@ -162,7 +162,7 @@ func assertDebugOnly(t *testing.T, logs *capture.Recorder, msg, wantPath string)
 	if got := logs.CountLevel(slog.LevelWarn, msg); got != 0 {
 		t.Errorf("%q logged at WARN %d times, want 0; per-path lines must not reach the default level", msg, got)
 	}
-	if !logs.HasAttr(msg, "path", wantPath) {
+	if !logs.HasAttr(capture.Message(msg), "path", wantPath) {
 		t.Errorf("record %q does not name path=%q; demoting it must not make it undiscoverable", msg, wantPath)
 	}
 }
@@ -196,11 +196,11 @@ func assertAggregateWarnCount(t *testing.T, logs *capture.Recorder, msg, wantCou
 	if got := logs.CountLevel(slog.LevelWarn, msg); got != 1 {
 		t.Errorf("%q logged at WARN %d times, want exactly 1: %q", msg, got, logs.Messages())
 	}
-	if !logs.HasAttr(msg, "count", wantCount) {
-		got, _ := logs.AttrValue(msg, "count")
+	if !logs.HasAttr(capture.Message(msg), "count", wantCount) {
+		got, _ := logs.AttrValue(capture.Message(msg), "count")
 		t.Errorf("aggregate WARN %q count = %q, want %q", msg, got, wantCount)
 	}
-	if _, ok := logs.AttrValue(msg, "remediation"); !ok {
+	if _, ok := logs.AttrValue(capture.Message(msg), "remediation"); !ok {
 		t.Errorf("aggregate WARN %q has no remediation hint: it is the only line the operator sees", msg)
 	}
 }
