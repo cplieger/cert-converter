@@ -53,7 +53,7 @@ func TestWatchRecords_sanitize_walk_supplied_names_in_log_attributes(t *testing.
 	}
 
 	watcher := newTestWatcher(t)
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 
 	logs := capture.Default(t)
 

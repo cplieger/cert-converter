@@ -333,7 +333,7 @@ func TestWriteRefusalCause_states_both_facts_for_every_declared_cause(t *testing
 // the one contract the refusal's classification must not cost: errors.Is still walks
 // THROUGH it. failEntry's shutdown split is errors.Is(err, context.Canceled); a wrapper
 // that drops Unwrap makes a write interrupted by SIGTERM log "conversion failed" at ERROR
-// and raise the CertConverterConversionFailed alert on every normal container stop.
+// on every normal container stop.
 //
 // Runs serially: it swaps the write seam.
 func TestStoreWrite_a_refusal_stays_unwrappable_so_a_cancelled_write_reads_as_shutdown(t *testing.T) {
@@ -608,7 +608,7 @@ func TestScannerRun_when_an_unverifiable_bundle_cannot_be_rewritten(t *testing.T
 					" untouched", got, sizeBefore)
 			}
 
-			// Steady state: the same verdict and the same one line per scan, no compounding.
+			// Steady state: the same verdict, and the standing refusal is not logged again.
 			res, err = scanner.Run(t.Context())
 			if err != nil {
 				t.Fatalf("Run(second scan) = error %v, want nil", err)
@@ -618,8 +618,8 @@ func TestScannerRun_when_an_unverifiable_bundle_cannot_be_rewritten(t *testing.T
 					res, tc.wantUnwritable, tc.wantFailed)
 			}
 			if tc.wantUnwritable > 0 {
-				if got := logs.CountLevel(slog.LevelWarn, unreplaceableMsg); got != 2 {
-					t.Errorf("two scans logged %q at WARN %d times, want 2 (one per scan): %q",
+				if got := logs.CountLevel(slog.LevelWarn, unreplaceableMsg); got != 1 {
+					t.Errorf("two scans logged %q at WARN %d times, want 1: a standing refusal is logged when it appears: %q",
 						unreplaceableMsg, got, logs.Messages())
 				}
 			}
@@ -879,24 +879,11 @@ func mustAnalyse(t *testing.T, certPEM, keyPEM []byte) convert.Analysis {
 	return analysis
 }
 
-// TestScannerRun_inspect_cancelled_by_shutdown_is_reported_quietly pins the one
-// producer of the README's second CertConverterConversionFailed matcher, and the
-// quiet direction its alert filter depends on.
-//
-// The alert matches `(conversion failed|failed to inspect existing pfx)` and drops
-// `(shutdown)`, and the README states the dropped variants are logged at DEBUG. The
-// inspect-error arm of convertEntry is the only site that emits "failed to inspect
-// existing pfx", and inspect's only error returns are shutdown races — so if that arm
-// ever stopped routing through failEntry's shutdown split, every SIGTERM that lands
-// mid-inspect would page an operator, with the whole suite green. The message is
-// spelled out here, not read from production, exactly as the health-neutral write
-// tests spell theirs: a reword must fail this test, because it silently kills the
-// documented alert.
-//
-// The final assertion is the durability half: a cancelled inspect must not be read
-// as "stale" on the way out, or every in-flight pair would be rewritten at shutdown
-// with fresh KDF salts and a fresh mtime the documented deployment re-replicates.
-//
+// TestScannerRun_inspect_cancelled_by_shutdown_is_reported_quietly pins the quiet
+// direction of the one producer of "failed to inspect existing pfx": inspect's only
+// error returns are shutdown races, so that arm must route through failEntry's
+// shutdown split or every SIGTERM mid-inspect logs an ERROR. A cancelled inspect must
+// also not read as "stale", or every in-flight pair would be rewritten at shutdown.
 // Runs serially: it swaps slog.Default() and the read seam.
 func TestScannerRun_inspect_cancelled_by_shutdown_is_reported_quietly(t *testing.T) {
 	certsRoot := t.TempDir()
@@ -944,7 +931,7 @@ func TestScannerRun_inspect_cancelled_by_shutdown_is_reported_quietly(t *testing
 	}
 	if got := logs.CountLevel(slog.LevelError, "failed to inspect existing pfx"); got != 0 {
 		t.Errorf("Run(cancelled during inspect) logged %q at ERROR %d times, want 0: a routine SIGTERM must"+
-			" not fire CertConverterConversionFailed: %q", "failed to inspect existing pfx", got, logs.Messages())
+			" not log a failure: %q", "failed to inspect existing pfx", got, logs.Messages())
 	}
 	if got, _ := readBundle(t, pfxPath); !bytes.Equal(got, prior) {
 		t.Errorf("Run(cancelled during inspect) left %d bytes at the output path, want the %d it found: a"+

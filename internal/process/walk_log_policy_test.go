@@ -294,21 +294,12 @@ func TestOutputWalkVisit_an_unreadable_path_vetoes_the_reap(t *testing.T) {
 	assertDebugOnly(t, logs, wantMsg, "locked/tls.pfx")
 }
 
-// TestOutputWalkVisit_a_vanished_path_does_not_veto_the_reap is the negative twin of the
-// test above, and the ONE witness for the /output half of the producer race: an ENOENT
-// below the root is a path removed under the walk -- by an operator following this app's
-// own "remove them from the output volume by hand" advice, or any other writer on a mount
-// this app does not own -- not a path this scan could not READ.
-//
-// Both halves matter and neither is asserted anywhere else. It must not raise
-// w.unreadable, because that counter is what carries reapDisabledPhrase into the
-// documented CertConverterOrphanRemovalDisabled alert with a remediation that sends the
-// operator after /output ownership, for an ordinary removal; and it must not stop the
-// enumeration, because the surviving bundles are still candidates. The asymmetry with the
-// /input side (scan_walk_test.go's vanished arm, which DOES veto) is deliberate: a missing
-// /input path leaves a hole in `seen` and can make a live bundle read as an orphan, while
-// a missing /output path is simply absent from w.found and a candidate never enumerated is
-// never reaped.
+// TestOutputWalkVisit_a_vanished_path_does_not_veto_the_reap pins the /output half of
+// the producer race: an ENOENT below the root is a path removed under the walk, not one
+// this scan could not READ. It must not raise w.unreadable, whose WARN would send the
+// operator after /output ownership for an ordinary removal, and it must not stop the
+// enumeration. Unlike /input, a missing /output path is simply absent from w.found,
+// and a candidate never enumerated is never reaped.
 // Runs serially: it swaps slog.Default().
 func TestOutputWalkVisit_a_vanished_path_does_not_veto_the_reap(t *testing.T) {
 	// Spelled out rather than imported from the production call site: an operator's

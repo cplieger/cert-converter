@@ -85,7 +85,8 @@ Settings are environment variables, read when the container starts, so recreate 
 | `INPUT_PFX_PASSWORD` | Password for PFX or P12 files under `/input`. Bundle input stays off while it is unset. | _(unset)_ |
 | `INPUT_EXCLUDE_PATHS` | Comma-separated paths under `/input` to leave unconverted. | _(unset)_ |
 | `FALLBACK_SCAN_HOURS` | Hours between full rechecks of `/input`. At `0`, or above `24`, a full recheck runs once every 24 hours. | `6` |
-| `LOG_LEVEL` | `debug`, `info`, `warn` or `error`. | `info` |
+| `METRICS_LISTEN_ADDR` | Address for a Prometheus metrics page and `/healthz`, for example `:9468`. Empty opens no port. | _(unset)_ |
+| `LOG_LEVEL` | `debug`, `info`, `warn` or `error`. The log alert rules need `info`. | `info` |
 
 `INPUT_PFX_PASSWORD_FILE` and `MAX_SCAN_ENTRIES` are in [Configuration](docs/configuration.md).
 
@@ -94,11 +95,11 @@ Settings are environment variables, read when the container starts, so recreate 
 | `/input` | Certificate folder, read-only and searched to any depth. Must be readable by the container's user. |
 | `/output` | Converted files. Must be writable by the container's user. |
 
-Converted files are mode `0600` and belong to the container's user, so the app that reads them must run as that user or as root. The container opens no ports.
+Converted files are mode `0600` and belong to the container's user, so the app that reads them must run as that user or as root. The container opens no port unless you set `METRICS_LISTEN_ADDR`.
 
 ## Security
 
-cert-converter opens no network port and runs as a non-root user on an image with no shell. It refuses to convert when `/input` and `/output` are the same folder or one is inside the other. Keep the `/input` mount read-only.
+cert-converter opens no network port unless you set `METRICS_LISTEN_ADDR`. That port has no login, so keep it on your network. It runs as a non-root user on an image with no shell. Keep the `/input` mount read-only.
 
 `PFX_PASSWORD` is the only protection on the private key inside each PFX file. A value in `.env` or `environment:` is visible to anyone who can run `docker inspect`. To keep it out, mount a [Docker secret](https://github.com/cplieger/docs/blob/main/docs/hardening.md#secrets-in-files) and set `PFX_PASSWORD_FILE` to its path inside the container.
 
@@ -108,7 +109,7 @@ With `OUTPUT_FORMATS` set to `pem`, each private key is written as a plain `.key
 
 ## Troubleshooting
 
-The healthcheck runs `/cert-watcher health`. It passes while the last scan had no conversion failure and no name collision, and finished within the last 18 hours, or 72 hours when `FALLBACK_SCAN_HOURS` is `0`, `false` or above `24`. The container turns unhealthy when `/input` cannot be read, a certificate fails to convert, or two certificates claim the same output name. It recovers on the next clean scan. Docker does not restart an unhealthy container by itself.
+The healthcheck runs `/cert-watcher health`. It passes while the last scan had no conversion failure and no name collision, and finished within the last 18 hours, or 72 hours when `FALLBACK_SCAN_HOURS` is `0`, `false` or above `24`. The container turns unhealthy when `/input` cannot be read, a certificate fails to convert, or two certificates claim the same output name. It recovers on the next clean scan. Docker does not restart an unhealthy container by itself, and an unhealthy container notifies nobody. [Monitoring and alerts](docs/monitoring.md) says what does.
 
 - `refusing to start` in the log means a mount is missing or the container's user cannot open it. The `remediation` field names the fix.
 - `the resolved PFX password is empty or blank` means `PFX_PASSWORD` is missing from `.env`.
@@ -119,14 +120,14 @@ The healthcheck runs `/cert-watcher health`. It passes while the last scan had n
 
 ## Monitoring
 
-cert-converter has no metrics endpoint and reports its state in its logs. Fourteen Loki alert rules ship in [`alerts/logql.yaml`](alerts/logql.yaml). [Monitoring and alerts](docs/monitoring.md) lists them and shows how to load them.
+cert-converter writes one `scan complete` record to its log after every scan. Set `METRICS_LISTEN_ADDR` and it also serves a Prometheus metrics page. The same alerts ship twice, for Prometheus in [`alerts/promql.yaml`](alerts/promql.yaml) and for Loki in [`alerts/logql.yaml`](alerts/logql.yaml), so load one of the two. The image has a Docker healthcheck, and [Knowing the app is alive](docs/monitoring.md#knowing-the-app-is-alive) says what it proves and who is told. [Monitoring and alerts](docs/monitoring.md) lists the metrics and the rules.
 
 ## Documentation
 
 - [Configuration](docs/configuration.md) explains every setting, the two mounts and the file permissions.
 - [How cert-converter works](docs/how-it-works.md) covers watching, output naming, cleanup and health.
 - [Security](docs/hardening.md) covers hardening, input limits and what the image contains.
-- [Monitoring and alerts](docs/monitoring.md) lists the log lines and the alert rules.
+- [Monitoring and alerts](docs/monitoring.md) lists the metrics, the log record and both alert rule files, and who tells you the container stopped.
 
 ## Credits
 

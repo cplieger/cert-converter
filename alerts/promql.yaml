@@ -1,0 +1,188 @@
+# Alert rules for cert-converter as a Prometheus rule group, for Prometheus,
+# Mimir, vmalert or any ruler that reads Prometheus rules. This file is the
+# alternative to alerts/logql.yaml: load one of the two, not both. The rules read
+# the page served when METRICS_LISTEN_ADDR is set; scrape it as job
+# `cert-converter`. Thresholds, windows and severity labels are starting points.
+# Size the 13h stall window to twice the effective cadence plus an hour, 49h at
+# most (FALLBACK_SCAN_HOURS capped at 24, or 24 when it is 0). CertConverterDown
+# exists only here; CertConverterScanStalled covers it in alerts/logql.yaml.
+# CertConverterStartupRefused and CertConverterChangeDetectionDead exist only
+# there, because the process exits; here CertConverterDown covers them.
+groups:
+  - name: cert-converter
+    rules:
+      # Two arms, because neither covers the other: `up == 0` catches a target
+      # that fails its scrape and keeps its labels, `absent(up{...})` catches a
+      # target that is gone. Use an exact job matcher, never a regex.
+      - alert: CertConverterDown
+        expr: up{job="cert-converter"} == 0 or absent(up{job="cert-converter"})
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "cert-converter is not being scraped"
+          description: >
+            No successful scrape for 5m: the container is stopped, crash-looping
+            or refusing to start, or the scrape cannot reach METRICS_LISTEN_ADDR.
+            Check the container's state and its last ERROR line.
+      - alert: CertConverterConversionFailed
+        expr: cert_converter_last_scan_sources{outcome="failed"} > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter failed to convert a certificate"
+          description: >
+            The latest scan could not convert a source, so its output is stale
+            or missing and the container is unhealthy. The `conversion failed`
+            records name the file. Check ownership for the UID in `user:`, the
+            PFX password and the chain.
+      - alert: CertConverterOutputNameCollision
+        expr: cert_converter_last_scan_sources{outcome="collided"} > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Two cert-converter inputs claim one output name, so neither converts"
+          description: >
+            Two inputs map to the same flat output path, so none of them converts
+            and the container is unhealthy. The `output name collision` record
+            names the path. Rename one input directory, or set OUTPUT_LAYOUT=mirror.
+      - alert: CertConverterOutputWriteRefused
+        expr: cert_converter_last_scan_sources{outcome="unwritable"} > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter could not replace an output and left it as found"
+          description: >
+            An /output condition refused a write, so a consumer can keep reading
+            a stale file. Health is unaffected, so this alert is the only signal.
+            The log record's `remediation` field names the action.
+      - alert: CertConverterScanAborted
+        expr: cert_converter_last_scan_outcome{outcome="aborted"} == 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter aborted a scan before completion"
+          description: >
+            The latest scan ended early, usually because /input or /output could
+            not be opened or walked, and the container is unhealthy. The
+            `scan complete` record's `error` field names the cause.
+      - alert: CertConverterInputTreeTooLarge
+        expr: cert_converter_last_scan_outcome{outcome="budget_stopped"} == 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter stopped a scan at the /input entry budget"
+          description: >
+            The scan stopped at MAX_SCAN_ENTRIES, so every source past that point
+            is unconverted. Health is unaffected. Check that /input holds only
+            certificates. For a larger tree, raise MAX_SCAN_ENTRIES and the
+            memory limit together.
+      - alert: CertConverterChangeDetectionDegraded
+        expr: cert_converter_change_detection_mode{mode="poll"} == 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter is polling instead of watching for changes"
+          description: >
+            No file watch could be set up, so a renewal waits for the next
+            rescan every FALLBACK_SCAN_HOURS. The alert holds while polling
+            lasts. Exhausted inotify instances on the host are the usual cause.
+      - alert: CertConverterInputPathUnreachable
+        expr: sum without (outcome) (cert_converter_last_scan_sources{outcome=~"unreadable|unresolved"}) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter skipped an unreachable /input path"
+          description: >
+            An /input path could not be read or a symlink could not be resolved,
+            so its certificates were skipped. Health is unaffected. Fix
+            permissions for the UID in `user:`, and mount the certificate
+            directory instead of a symlink to it.
+      - alert: CertConverterNoCertificateSources
+        expr: cert_converter_condition{condition="no_sources"} == 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter found no certificate sources under /input"
+          description: >
+            A complete scan found no `.crt` and `.key` pair and no PFX or P12
+            bundle, so nothing is produced. Health is unaffected. Check the
+            /input mount and the source file names.
+      - alert: CertConverterEverySourceExcluded
+        expr: cert_converter_condition{condition="all_excluded"} == 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter excluded every certificate source it found"
+          description: >
+            INPUT_EXCLUDE_PATHS covers every source under /input, so the scan
+            converted nothing and reported no failure. Narrow the exclusion list,
+            or point /input at the certificates you want.
+      - alert: CertConverterOutputCleanupDegraded
+        expr: cert_converter_condition{condition="cleanup_degraded"} == 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter cannot clean up stale /output temp files"
+          description: >
+            Leftover `.atomicfile-*.tmp` files under /output, each holding a
+            private key, cannot be removed and will accumulate. Health is
+            unaffected. Check /output ownership and permissions for the UID in
+            `user:`.
+      - alert: CertConverterOrphanRemovalDisabled
+        expr: cert_converter_condition{condition="orphan_removal_disabled"} == 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter cannot remove orphaned /output artifacts"
+          description: >
+            The scan could not prove any output orphaned, so it removed nothing,
+            and an output whose source is gone can stay served. Health is
+            unaffected. The `orphan removal is disabled` log record's
+            `remediation` field names the action.
+      - alert: CertConverterPreviousLayoutRetained
+        expr: cert_converter_condition{condition="previous_layout_retained"} == 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cert-converter sync is keeping files from a previous OUTPUT_LAYOUT"
+          description: >
+            Sync kept files laid out for the other layout because OUTPUT_LAYOUT
+            is unset. Repoint consumers at the current paths, then set
+            OUTPUT_LAYOUT explicitly or remove the old tree by hand.
+      # The timestamp is 0 until the first scan ends, so the second arm reads
+      # the process age instead: a first scan that never ends still pages once
+      # the process has run for the whole window.
+      - alert: CertConverterScanStalled
+        expr: |
+          (
+            time() - cert_converter_last_scan_timestamp_seconds > 13 * 3600
+            and cert_converter_last_scan_timestamp_seconds > 0
+          )
+          or
+          (
+            time() - process_start_time_seconds > 13 * 3600
+            and on (job, instance) cert_converter_last_scan_timestamp_seconds == 0
+          )
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No cert-converter scan finished in 13h"
+          description: >
+            No scan ended for two scan cadences while the page answers, so the
+            watch loop is likely wedged and certificates may have stopped
+            converting. Restart the container and check the host's inotify
+            instance limit.

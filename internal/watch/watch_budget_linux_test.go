@@ -66,7 +66,7 @@ func TestAddWatchDirs_walk_error_does_not_spend_budget_twice(t *testing.T) {
 	defer watcher.Close()
 
 	// Three paths of budget: the root, the unreadable directory, and its sibling.
-	w := New(root, func(context.Context) {}, WithMaxEntries(3))
+	w := New(root, func(context.Context, bool) {}, WithMaxEntries(3))
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("addWatchDirs(%q) = %v", root, err)
 	}

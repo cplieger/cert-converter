@@ -30,7 +30,7 @@ const absentWatchRoot = "/nonexistent-cert-converter-watch-root"
 // arrives, and nothing is deferred until a scan lands inside the re-assert floor.
 func TestNewWatchState_arms_the_reconciliation_floor_when_the_fallback_is_disabled(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		st := newWatchState(New("/input", func(context.Context) {}, WithDebounce(time.Second), WithFallback(0)))
+		st := newWatchState(New("/input", func(context.Context, bool) {}, WithDebounce(time.Second), WithFallback(0)))
 		defer st.stop()
 
 		if st.safetyNetTimer == nil {
@@ -65,7 +65,7 @@ func TestRunSafetyNetScan_reconciles_and_re_arms_with_the_fallback_disabled(t *t
 	logs := capture.Default(t)
 	synctest.Test(t, func(t *testing.T) {
 		scans := 0
-		st := newWatchState(New(absentWatchRoot, func(context.Context) { scans++ }, WithFallback(0)))
+		st := newWatchState(New(absentWatchRoot, func(context.Context, bool) { scans++ }, WithFallback(0)))
 		defer st.stop()
 
 		start := time.Now()
@@ -122,7 +122,7 @@ func TestSafetyNetCadence_never_exceeds_the_reconciliation_floor(t *testing.T) {
 		{"the config ceiling is capped", triggerReconcile, 87600 * time.Hour, scancadence.Floor},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			w := New("/input", func(context.Context) {}, WithFallback(tc.fallback))
+			w := New("/input", func(context.Context, bool) {}, WithFallback(tc.fallback))
 			if got := scancadence.Effective(tc.fallback); got != tc.want {
 				t.Errorf("scancadence.Effective(%v) = %v, want %v: the probe's deadline is derived from this and must match the loop's own cadence",
 					tc.fallback, got, tc.want)
@@ -147,7 +147,7 @@ func TestSafetyNetCadence_never_exceeds_the_reconciliation_floor(t *testing.T) {
 // watcher inside a synctest bubble would block the fake clock on an inotify read.
 func TestWatchState_scheduleScan_does_not_extend_the_debounce_window(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		st := newWatchState(New(absentWatchRoot, func(context.Context) {}, WithDebounce(2*time.Second)))
+		st := newWatchState(New(absentWatchRoot, func(context.Context, bool) {}, WithDebounce(2*time.Second)))
 		defer st.stop()
 
 		start := time.Now()
@@ -181,7 +181,7 @@ func TestWatchState_scans_re_arm_the_fallback_from_the_last_scan(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		scans := 0
 		st := newWatchState(New(absentWatchRoot,
-			func(context.Context) { scans++ },
+			func(context.Context, bool) { scans++ },
 			WithDebounce(2*time.Second), WithFallback(6*time.Hour)))
 		defer st.stop()
 
@@ -217,7 +217,7 @@ func TestWatchState_scans_re_arm_the_fallback_from_the_last_scan(t *testing.T) {
 func TestRunDebouncedScan_skips_scan_after_shutdown(t *testing.T) {
 	t.Parallel()
 	scans := 0
-	w := New(t.TempDir(), func(context.Context) { scans++ }, WithDebounce(time.Hour))
+	w := New(t.TempDir(), func(context.Context, bool) { scans++ }, WithDebounce(time.Hour))
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 	st.scheduleScan()
@@ -272,7 +272,7 @@ func TestRunDebouncedScan_skips_the_scan_when_shutdown_cut_the_resync_short(t *t
 	watcher := newTestWatcher(t)
 	root := t.TempDir()
 	scans := 0
-	w := New(root, func(context.Context) { scans++ }, WithDebounce(time.Hour))
+	w := New(root, func(context.Context, bool) { scans++ }, WithDebounce(time.Hour))
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 	st.scheduleScan()

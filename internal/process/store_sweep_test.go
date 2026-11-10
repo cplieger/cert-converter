@@ -37,6 +37,7 @@ func TestStoreLogSweepOutcome_operator_signals(t *testing.T) {
 		wantAttrValue string
 		res           filesafe.SweepResult
 		wantLevel     slog.Level
+		wantDegraded  bool
 	}{
 		{
 			name:        "a reclaimed orphan is reported at info",
@@ -46,25 +47,28 @@ func TestStoreLogSweepOutcome_operator_signals(t *testing.T) {
 			wantAttrKey: "count", wantAttrValue: "2",
 		},
 		{
-			name:        "uninspectable candidates warn with a remediation hint",
-			res:         filesafe.SweepResult{Failed: 3},
-			wantLevel:   slog.LevelWarn,
-			wantMsg:     "some stale output temps could not be inspected or removed",
-			wantAttrKey: "remediation",
+			name:         "uninspectable candidates warn with a remediation hint",
+			res:          filesafe.SweepResult{Failed: 3},
+			wantLevel:    slog.LevelWarn,
+			wantMsg:      "some stale output temps could not be inspected or removed",
+			wantDegraded: true,
+			wantAttrKey:  "remediation",
 		},
 		{
-			name:        "unreadable output sub-paths warn with a remediation hint",
-			res:         filesafe.SweepResult{Unreadable: 4},
-			wantLevel:   slog.LevelWarn,
-			wantMsg:     "some output paths could not be inspected during stale temp cleanup",
-			wantAttrKey: "remediation",
+			name:         "unreadable output sub-paths warn with a remediation hint",
+			res:          filesafe.SweepResult{Unreadable: 4},
+			wantLevel:    slog.LevelWarn,
+			wantMsg:      "some output paths could not be inspected during stale temp cleanup",
+			wantDegraded: true,
+			wantAttrKey:  "remediation",
 		},
 		{
-			name:        "a failed sweep warns",
-			walkErr:     errors.New("permission denied"),
-			wantLevel:   slog.LevelWarn,
-			wantMsg:     "stale temp cleanup failed",
-			wantAttrKey: "error",
+			name:         "a failed sweep warns",
+			walkErr:      errors.New("permission denied"),
+			wantLevel:    slog.LevelWarn,
+			wantMsg:      "stale temp cleanup failed",
+			wantDegraded: true,
+			wantAttrKey:  "error",
 		},
 		{
 			name:        "a shutdown abort stays at debug",
@@ -80,8 +84,11 @@ func TestStoreLogSweepOutcome_operator_signals(t *testing.T) {
 			logs := captureLogs(t)
 
 			s := newOutputStore(t, t.TempDir())
-			s.logSweepOutcome(tt.res, tt.walkErr)
+			degraded := s.logSweepOutcome(tt.res, tt.walkErr)
 
+			if degraded != tt.wantDegraded {
+				t.Errorf("logSweepOutcome(%v) degraded = %v, want %v: the scan's cleanup_degraded field reads it", tt.walkErr, degraded, tt.wantDegraded)
+			}
 			if !logs.Contains(tt.wantMsg) {
 				t.Errorf("logSweepOutcome(%v) logged %q, want message %q", tt.walkErr, logs.Messages(), tt.wantMsg)
 			}

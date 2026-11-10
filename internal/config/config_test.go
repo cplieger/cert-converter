@@ -196,8 +196,7 @@ func TestFallbackInterval_is_silent(t *testing.T) {
 // diagnostics at their new home. Both values are silently repaired, so the WARN
 // naming the rejected value is the operator's only way to tell an intended
 // cadence from a default or a clamp. Message text, level and attribute keys are
-// asserted verbatim: a documented Loki matcher or an operator's grep keys on
-// them. Exactly one record per process start, and the derived value is asserted
+// asserted verbatim: an operator's grep keys on them. Exactly one record per process start, and the derived value is asserted
 // beside the warning so the two cannot drift.
 // slog.Default is process-global, so this test must not run in parallel with
 // anything that logs.
@@ -1904,13 +1903,12 @@ func TestLoad_refuses_an_invisible_only_password_on_both_channels(t *testing.T) 
 }
 
 // invisibleOnlyWarn is the message substring of the invisible-only strength WARN.
-// Named once: three tests key on it, and it is the operator-facing text a Loki
-// matcher selects.
+// Named once: three tests key on it.
 const invisibleOnlyWarn = "consists only of invisible Unicode formatting characters"
 
 // paddedPasswordWarn is the message substring of the leading/trailing-whitespace WARN.
 // Named once: three tests key on it (both delivery channels plus the blank-password
-// suppression), and it is the operator-facing text a Loki matcher selects. Channel-
+// suppression). Channel-
 // neutral by design — the record fires for a padded PFX_PASSWORD and a padded
 // PFX_PASSWORD_FILE alike, and names which one in its "source" attribute.
 const paddedPasswordWarn = "the PFX password has leading or trailing whitespace"
@@ -2085,12 +2083,9 @@ func scanRepairName(r scanEntriesRepair) string {
 // TestLoad_warns_when_the_scan_entry_budget_is_repaired pins the two repair
 // diagnostics at their only home. Both values are silently repaired, so the WARN
 // naming the rejected value is the operator's only way to tell an intended budget
-// from a default or a clamp — a deployment that meant to raise the ceiling would
-// otherwise keep failing its scan at the default with nothing to explain why.
-// Message text, level and attribute keys are asserted verbatim: a documented Loki
-// matcher or an operator's grep keys on them. Exactly one record per process start.
-// slog.Default is process-global, so this test must not run in parallel with
-// anything that logs.
+// from a default or a clamp. Message text, level and attribute keys are asserted
+// verbatim: an operator's grep keys on them. Exactly one record per process start.
+// slog.Default is process-global, so this test must not run in parallel.
 func TestLoad_warns_when_the_scan_entry_budget_is_repaired(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

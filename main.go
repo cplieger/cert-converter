@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"slices"
@@ -19,8 +21,11 @@ import (
 	"github.com/cplieger/cert-converter/internal/mounts"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/scancadence"
+	"github.com/cplieger/cert-converter/internal/scanreport"
 	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/go/health"
+	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/measure"
 	"github.com/cplieger/go/slogx"
 )
 
@@ -42,19 +47,104 @@ func healthyAfterScan(r *process.ScanResult) bool {
 	return r.Failed == 0 && r.Collided == 0
 }
 
-// scanAndSetHealth runs one scan and updates the marker.
-func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, marker *health.Marker) {
+// scanAndSetHealth runs one scan, reports its verdict to the record and the
+// metrics, and updates the marker.
+func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, reporter *scanreport.Reporter, marker *health.Marker, polling bool) {
 	result, err := scanner.Run(ctx)
+	if err != nil && process.IsShutdown(err) {
+		slog.Info("scan interrupted by shutdown", "reason", err)
+		return
+	}
+	reporter.Report(ctx, &scanreport.Scan{Result: result, Err: err, Polling: polling})
 	if err != nil {
-		if process.IsShutdown(err) {
-			slog.Info("scan interrupted by shutdown", "reason", err)
-			return
-		}
 		slog.Error("processing failed", "error", logtext.Path(err.Error()))
 		marker.Set(false)
 		return
 	}
 	marker.Set(healthyAfterScan(&result))
+}
+
+// --- Metrics ---
+
+// metricsPrefix names every cert-converter series on the metrics page.
+const metricsPrefix = "cert_converter"
+
+// newMetrics builds the registry run serves, with the scan metrics on it.
+func newMetrics() (*measure.Registry, *scanreport.Reporter) {
+	reg := measure.NewRegistry(metricsPrefix)
+	return reg, scanreport.NewReporter(reg)
+}
+
+// listenTCP is a seam so a test can see that an unset address opens nothing.
+var listenTCP = net.Listen
+
+// Timeouts for the metrics page: a scrape reads one small page, so a slow client
+// is cut off rather than held.
+const (
+	metricsReadTimeout  = 10 * time.Second
+	metricsWriteTimeout = 30 * time.Second
+)
+
+// startMetrics binds addr and serves reg's page and healthz on it until ctx
+// ends; wait blocks until the server has shut down. An empty addr opens no
+// listener.
+func startMetrics(ctx context.Context, addr string, reg *measure.Registry, healthz http.Handler) (wait func(), err error) {
+	if addr == "" {
+		return func() {}, nil
+	}
+	ln, err := listenTCP("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", reg.Handler())
+	mux.Handle("GET /healthz", healthz)
+	srv := httpserver.New(mux)
+	srv.ReadTimeout = metricsReadTimeout
+	srv.WriteTimeout = metricsWriteTimeout
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := httpserver.Run(ctx, srv, ln); err != nil {
+			slog.Error("metrics listener stopped", "address", logtext.Path(addr), "error", logtext.Path(err.Error()))
+		}
+	}()
+	return func() { <-done }, nil
+}
+
+// --- Health ---
+
+// healthLease is how old the marker may grow before the watch loop counts as
+// stuck: three effective fallback cadences, the marker's guaranteed refresh
+// floor (file events refresh it sooner).
+func healthLease(fallback time.Duration) time.Duration {
+	return health.Lease{Interval: scancadence.Effective(fallback), Cycles: 3}.Duration()
+}
+
+// Reasons /healthz lists. Fixed sentences, because the route answers with no login.
+const (
+	reasonScanFailed = "the last scan did not finish cleanly, or no scan has finished since the start"
+	reasonStuck      = "no scan has finished within three guaranteed recheck cadences, so the watch loop may be stuck"
+)
+
+// newHealthz serves the verdict the health subcommand reads from marker while
+// the marker directory is writable, as one check per fault so each names itself.
+func newHealthz(marker *health.Marker, fallback time.Duration) http.Handler {
+	return health.CheckHandler(
+		health.Check{Signal: marker, Reason: reasonScanFailed},
+		health.Check{Signal: notStale{marker: marker, lease: healthLease(fallback)}, Reason: reasonStuck},
+	)
+}
+
+// notStale fails a marker that reads healthy but is past the lease, so an
+// absent marker reports reasonScanFailed alone and not reasonStuck too.
+type notStale struct {
+	marker *health.Marker
+	lease  time.Duration
+}
+
+func (s notStale) Healthy() bool {
+	return s.marker.Within(s.lease).Healthy() || !s.marker.Healthy()
 }
 
 // --- Entrypoint ---
@@ -109,13 +199,7 @@ func dispatchArgs(args []string) int {
 	case len(args) == 2 && args[1] == watchSubcommand:
 		return continueToWatcher
 	case len(args) == 2 && args[1] == healthSubcommand:
-		// The periodic safety-net scan is the marker's guaranteed refresh floor
-		// (fs events refresh it sooner), so a marker older than 3 of those
-		// intervals means the watch loop is wedged and a restart fixes it.
-		runProbe(health.DefaultPath, health.WithMaxAge(health.Lease{
-			Interval: scancadence.Effective(config.FallbackInterval()),
-			Cycles:   3,
-		}.Duration()))
+		runProbe(health.DefaultPath, health.WithMaxAge(healthLease(config.FallbackInterval())))
 		return continueToWatcher // unreachable in production; runProbe exits
 	default:
 		switch args[1] {
@@ -196,6 +280,7 @@ func run() int {
 			"output_formats", strings.Join(cfg.Formats.Names(), ","), "output_layout", string(cfg.Layout),
 			"output_lifecycle", string(cfg.Lifecycle), "max_scan_entries", cfg.MaxScanEntries,
 			"excluded_input_paths", logtext.Path(strings.Join(cfg.Exclude.Paths(), ",")),
+			"metrics_listen_addr", logtext.Path(cfg.MetricsListenAddr),
 		},
 	)...)
 
@@ -208,6 +293,23 @@ func run() int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Bound before the first scan, so a typo stops the container at once instead
+	// of leaving it converting with no page.
+	reg, reporter := newMetrics()
+	metricsCtx, stopMetrics := context.WithCancel(ctx)
+	waitMetrics, err := startMetrics(metricsCtx, cfg.MetricsListenAddr, reg, newHealthz(marker, cfg.FallbackInterval))
+	if err != nil {
+		stopMetrics()
+		slog.Error("cannot listen on METRICS_LISTEN_ADDR; refusing to start",
+			"address", logtext.Path(cfg.MetricsListenAddr), "error", logtext.Path(err.Error()),
+			"remediation", "set METRICS_LISTEN_ADDR to a free address such as :9468, or unset it")
+		return 1
+	}
+	defer func() {
+		stopMetrics()
+		waitMetrics()
+	}()
 
 	scanner := process.New(&process.Options{
 		CertsRoot: requiredVolumes.Input,
@@ -235,8 +337,8 @@ func run() int {
 
 	// runAndSetHealth adapts scanAndSetHealth to the watcher's on-change
 	// callback signature.
-	runAndSetHealth := func(ctx context.Context) {
-		scanAndSetHealth(ctx, scanner, marker)
+	runAndSetHealth := func(ctx context.Context, polling bool) {
+		scanAndSetHealth(ctx, scanner, reporter, marker, polling)
 	}
 
 	// No scan here: w.Run owns the first scan in both modes.

@@ -2,7 +2,6 @@ package process
 
 import (
 	"reflect"
-	"strings"
 	"testing"
 )
 
@@ -107,42 +106,6 @@ func TestCountResults_counts_every_outcome_in_the_enum(t *testing.T) {
 	}
 }
 
-// TestSummaryAttrs_names_every_scan_result_counter is the reporting half of the same
-// guard. logScanOutcome renders the ONE operator-visible scan summary from
-// summaryAttrs, and the README's Loki rules key on those attribute names, so a counter
-// added to ScanResult without a row here is invisible in production with no compile
-// error to say so. Reflection is what makes the assertion cover a field that does not
-// exist yet.
-func TestSummaryAttrs_names_every_scan_result_counter(t *testing.T) {
-	t.Parallel()
-	fields := reflect.TypeFor[ScanResult]().NumField()
-	if len(summaryAttrs) != fields {
-		t.Errorf("len(summaryAttrs) = %d, want %d (one row per ScanResult counter)", len(summaryAttrs), fields)
-	}
-	for i := range fields {
-		var result ScanResult
-		reflect.ValueOf(&result).Elem().Field(i).SetInt(1)
-		name := reflect.TypeFor[ScanResult]().Field(i).Name
-		reporting := make([]string, 0, 1)
-		for _, a := range summaryAttrs {
-			if a.of(&result) == 1 {
-				reporting = append(reporting, a.name)
-			}
-		}
-		if len(reporting) != 1 {
-			t.Errorf("ScanResult.%s is reported by summaryAttrs rows %v, want exactly one", name, reporting)
-			continue
-		}
-		// The attribute NAME is the operator-visible half of the contract: the
-		// README's Loki rules match on `orphan=`, `unreadable=` and the rest, so a
-		// row whose func reads the wrong counter must fail here even though the
-		// bijection above still holds.
-		if want := strings.ToLower(name); reporting[0] != want {
-			t.Errorf("ScanResult.%s is reported as %q, want %q", name, reporting[0], want)
-		}
-	}
-}
-
 // The reap-gate role a ScanResult counter plays. Every counter has exactly one, and the
 // table below is the ONE place that classification is written down.
 const (
@@ -160,20 +123,12 @@ const (
 )
 
 // TestScanResultVetoes_every_counter_is_classified_and_honoured is the reap-gate half of
-// the structural guard TestSummaryAttrs_names_every_scan_result_counter already gives the
-// reporting half.
-//
-// The three veto predicates on ScanResult are spelled once each so their two askers
-// cannot drift, but nothing makes a NEW counter reach them: adding an /input coverage
-// dimension compiles, is forced into the summary by the reporting guard, and is then
-// simply absent from durablyEnumerated -- so a scan that could not enumerate /input passes
-// the gate and reap deletes bundles it cannot prove orphaned, silently, over private key
-// material the documented deployment replicates onward. The case tables that exercise the
-// vetoes name today's fields, so none of them can fail for a field that does not exist
-// yet; reflection is what closes that.
-//
-// It asserts two things per counter: that the counter is classified at all, and that a
-// non-zero value makes exactly the predicates its class owns answer false.
+// the guard scanreport's TestRecordCarriesEveryVerdictField gives the reporting half.
+// A new /input coverage counter compiles and reaches the record, but nothing makes it
+// reach durablyEnumerated, so sync would delete bundles it cannot prove orphaned. The
+// case tables name today's fields; reflection covers a field that does not exist yet.
+// Per counter it asserts the counter is classified and that a non-zero value makes
+// exactly the predicates its class owns answer false.
 func TestScanResultVetoes_every_counter_is_classified_and_honoured(t *testing.T) {
 	t.Parallel()
 
@@ -195,6 +150,11 @@ func TestScanResultVetoes_every_counter_is_classified_and_honoured(t *testing.T)
 
 	typ := reflect.TypeFor[ScanResult]()
 	for i := range typ.NumField() {
+		// Only the int fields are counters; Outcome and the bool fields are verdicts Run
+		// derives after the gate has answered.
+		if typ.Field(i).Type != reflect.TypeFor[int]() {
+			continue
+		}
 		name := typ.Field(i).Name
 		class, classified := classes[name]
 		if !classified {

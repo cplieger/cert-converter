@@ -1608,11 +1608,10 @@ func TestStoreReconcile_defers_once_per_batch(t *testing.T) {
 // TestScannerRun_reports_a_shutdown_that_arrives_during_reconciliation pins the one
 // place Scanner.Run turns a reconciliation error into the scan's own outcome. The input
 // walk completed cleanly, so walkErr is nil and nothing else in Run can notice that the
-// scan stopped halfway through the OUTPUT tree: without the fold, Run returns nil, logs
-// "scan complete" at Info -- the record the README's stall alert keys on -- and
-// main.healthyAfterScan leaves the health marker set for a scan that was cancelled
-// mid-reap under OUTPUT_LIFECYCLE=sync. Serial: it swaps waitBeforeReap and
-// slog.Default.
+// scan stopped halfway through the OUTPUT tree: without the fold, Run returns nil, the
+// caller writes a clean end-of-scan record and main.healthyAfterScan leaves the health
+// marker set for a scan that was cancelled mid-reap under OUTPUT_LIFECYCLE=sync.
+// Serial: it swaps waitBeforeReap.
 func TestScannerRun_reports_a_shutdown_that_arrives_during_reconciliation(t *testing.T) {
 	certsRoot := t.TempDir()
 	outRoot := t.TempDir()
@@ -1638,7 +1637,6 @@ func TestScannerRun_reports_a_shutdown_that_arrives_during_reconciliation(t *tes
 		cancel()
 		return ctx.Err()
 	})
-	logs := captureLogs(t)
 
 	res, err := scanner.Run(ctx)
 
@@ -1647,12 +1645,6 @@ func TestScannerRun_reports_a_shutdown_that_arrives_during_reconciliation(t *tes
 	}
 	if res.Removed != 0 {
 		t.Errorf("Run(shutdown during reconciliation) Removed = %d, want 0", res.Removed)
-	}
-	if got := logs.CountExact("scan complete"); got != 0 {
-		t.Errorf("Run(shutdown during reconciliation) logged %q, want no scan-complete record: it would leave the health marker set and satisfy the stall alert", logs.Messages())
-	}
-	if got := logs.CountLevel(slog.LevelDebug, "scan cancelled during shutdown"); got != 1 {
-		t.Errorf("Run(shutdown during reconciliation) logged %q, want the shutdown summary once at Debug", logs.Messages())
 	}
 	if _, statErr := os.Stat(orphan); statErr != nil {
 		t.Errorf("os.Stat(%q) = %v, want the orphan left in place: nothing may be deleted once the process is stopping", orphan, statErr)
@@ -1690,28 +1682,6 @@ func TestScannerRun_reports_the_reap_count(t *testing.T) {
 	}
 	if _, statErr := os.Stat(orphan); statErr == nil {
 		t.Errorf("os.Stat(%q) = nil, want the orphan deleted: the case must exercise a real reap", orphan)
-	}
-}
-
-// TestLogScanOutcome_names_the_output_side_counts pins the two /output-side counts in
-// the end-of-scan summary, the pair no other test asserts (unresolved and vanished each
-// have their own). Both are operator signals: removed is how many bundles this scan
-// deleted under OUTPUT_LIFECYCLE=sync, and unwritable is the health-neutral count of
-// bundles whose replacing write the volume refused, deliberately kept out of failed= and
-// unreadable= so each documented alert keeps its own diagnosis. Dropping either
-// attribute leaves a scan that deleted key material, or that left a world-readable
-// private key in place, indistinguishable from a clean one. Serial: it swaps
-// slog.Default.
-func TestLogScanOutcome_names_the_output_side_counts(t *testing.T) {
-	logs := captureLogs(t)
-
-	logScanOutcome(t.Context(), &ScanResult{Total: 2, Converted: 1, Removed: 3, Unwritable: 2}, nil)
-
-	for key, want := range map[string]string{"removed": "3", "unwritable": "2"} {
-		if !logs.HasAttr("scan complete", capture.AttrName(key), want) {
-			got, _ := logs.AttrValue("scan complete", capture.AttrName(key))
-			t.Errorf("logScanOutcome logged %s=%q, want %q", key, got, want)
-		}
 	}
 }
 
@@ -2827,8 +2797,7 @@ func TestLoneKeyRemediation_promises_a_reap_only_where_one_can_follow(t *testing
 // broken /input tree. The sibling above cancels during reconciliation, where the walk
 // finished cleanly, and walk_log_policy_test's case hands the gate that fact ready-made;
 // neither exercises the derivation, so a scan stopping at SIGTERM could start emitting
-// the operator-actionable orphan-removal-disabled WARN -- the record the README's
-// CertConverterOrphanRemovalDisabled alert keys on -- on every container stop, with a
+// the operator-actionable orphan-removal-disabled WARN on every container stop, with a
 // remediation pointing at a mount that is fine. Serial: it swaps slog.Default.
 func TestScannerRun_stays_quiet_when_the_shutdown_arrives_during_the_input_walk(t *testing.T) {
 	certsRoot := t.TempDir()

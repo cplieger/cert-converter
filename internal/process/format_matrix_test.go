@@ -193,9 +193,8 @@ func TestScannerRun_flatCollisionConvertsNeitherAndNamesBoth(t *testing.T) {
 	}
 }
 
-// collisionMsgPublished is the exact production record; retyped here so a reword
-// of the ERROR line fails this test instead of silently unpinning the published
-// CertConverterOutputNameCollision alert.
+// collisionMsgPublished is the exact production record, retyped here so a reword
+// of the ERROR line is a deliberate change.
 const collisionMsgPublished = "output name collision: several inputs produce the same output path, so none of them is converted"
 
 func TestScannerRun_syncRemovesEveryArtifactOfGoneSource(t *testing.T) {

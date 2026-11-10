@@ -75,7 +75,7 @@ func TestScanAndSetHealth_sets_marker_after_failure_free_scan(t *testing.T) {
 	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 	writeCertAndKey(t, inDir, "test", certPEM, keyPEM)
 
-	scanAndSetHealth(t.Context(), scanner, marker)
+	scanAndSetHealth(t.Context(), scanner, testReporter(), marker, false)
 
 	if _, err := os.Stat(markerPath); err != nil {
 		t.Errorf("health marker should exist after a failure-free scan: %v", err)
@@ -95,7 +95,7 @@ func TestScanAndSetHealth_clears_marker_when_scan_errors(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "does-not-exist")
 	scanner := newTestScanner(missing, t.TempDir(), "", convert.EncNameModern2023)
 
-	scanAndSetHealth(t.Context(), scanner, marker)
+	scanAndSetHealth(t.Context(), scanner, testReporter(), marker, false)
 
 	if _, err := os.Stat(markerPath); err == nil {
 		t.Error("health marker should be cleared when the input root cannot be scanned")
@@ -155,21 +155,17 @@ func TestScanAndSetHealth_unreadable_pair_stays_healthy(t *testing.T) {
 	logs := capture.Default(t)
 	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 
-	scanAndSetHealth(t.Context(), scanner, marker)
+	scanAndSetHealth(t.Context(), scanner, testReporter(), marker, false)
 
-	// CountExact, not Count: README's Alerting section tells operators running at
-	// LOG_LEVEL=warn to alert on the prefix "some /input paths were unreadable and
-	// were skipped". Pinning the whole message byte-for-byte is the superset of
-	// that contract: any reword fails here - loudly, with the message in the
-	// failure - rather than in an operator's Loki rule that silently stops
-	// matching. Count would pass on a superstring reword.
+	// CountExact, not Count: the record must be one line, not a second one that
+	// merely contains the message.
 	const unreadableMsg = "some /input paths were unreadable and were skipped; health is unaffected"
 	if n := logs.CountLevel(slog.LevelWarn, unreadableMsg); n != 1 {
-		t.Errorf("a scan with one unreadable pair logged %d WARN records with the alerted message %q, want exactly 1; got logs %q",
+		t.Errorf("a scan with one unreadable pair logged %d WARN records with the message %q, want exactly 1; got logs %q",
 			n, unreadableMsg, logs.Messages())
 	}
 	if n := logs.CountExact(unreadableMsg); n != 1 {
-		t.Errorf("a scan with one unreadable pair logged %d records exactly matching the alerted message %q, want 1; got logs %q",
+		t.Errorf("a scan with one unreadable pair logged %d records exactly matching the message %q, want 1; got logs %q",
 			n, unreadableMsg, logs.Messages())
 	}
 	if !logs.HasAttr(unreadableMsg, "unreadable", "1") {
@@ -207,7 +203,7 @@ func TestScanAndSetHealth_clears_marker_after_conversion_failure(t *testing.T) {
 	writeCertAndKey(t, inDir, "broken", []byte("not a certificate"), []byte("not a private key"))
 	scanner := newTestScanner(inDir, outDir, "", convert.EncNameModern2023)
 
-	scanAndSetHealth(t.Context(), scanner, marker)
+	scanAndSetHealth(t.Context(), scanner, testReporter(), marker, false)
 
 	if _, err := os.Stat(markerPath); err == nil {
 		t.Error("health marker should be cleared when a certificate conversion fails")
@@ -216,11 +212,8 @@ func TestScanAndSetHealth_clears_marker_after_conversion_failure(t *testing.T) {
 
 // TestScanAndSetHealth_clean_scan_emits_no_unreadable_warning pins the NEGATIVE
 // half of the unreadable WARN, which its positive twin above cannot: a scan
-// with nothing unreadable must not emit that message at all. README's Alerting
-// section tells operators running at LOG_LEVEL=warn to alert on the line "some
-// /input paths were unreadable and were skipped" to keep the coverage the
-// healthcheck deliberately omits, so a guard that stops discriminating turns
-// every clean cycle into that alert. The guard itself now lives in
+// with nothing unreadable must not emit that message at all, or a warn-level
+// reader is told of a fault on every clean cycle. The guard itself lives in
 // internal/process (logInputCoverageWarnings); this is the composition-root
 // assertion that a clean cycle is silent all the way through, which no
 // package-level test of that function can make.
@@ -242,7 +235,7 @@ func TestScanAndSetHealth_clean_scan_emits_no_unreadable_warning(t *testing.T) {
 
 	logs := capture.Default(t)
 
-	scanAndSetHealth(t.Context(), scanner, marker)
+	scanAndSetHealth(t.Context(), scanner, testReporter(), marker, false)
 
 	const unreadableMsg = "some /input paths were unreadable and were skipped; health is unaffected"
 	if n := logs.Count(unreadableMsg); n != 0 {
@@ -282,7 +275,7 @@ func TestScanAndSetHealth_cancelled_context_leaves_marker_untouched(t *testing.T
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 
-			scanAndSetHealth(ctx, scanner, marker)
+			scanAndSetHealth(ctx, scanner, testReporter(), marker, false)
 
 			_, statErr := os.Stat(markerPath)
 			if gotHealthy := statErr == nil; gotHealthy != tc.initiallyHealthy {
@@ -587,7 +580,7 @@ func TestReportWatchExit_announces_dead_change_detection_exactly_once(t *testing
 					tc.runErr, n, logs.Messages())
 			}
 			if n := logs.CountExact(deadMsg); n != 1 {
-				t.Errorf("reportWatchExit(%v) logged %d records with the exact alerted message %q, want 1 (logs %v)",
+				t.Errorf("reportWatchExit(%v) logged %d records with the exact message %q, want 1 (logs %v)",
 					tc.runErr, n, deadMsg, logs.Messages())
 			}
 			if !logs.AttrContains(deadMsg, "error", "change detection lost") {
@@ -626,7 +619,7 @@ func TestReportWatchExit_announces_dead_change_detection_exactly_once(t *testing
 			t.Fatalf("reportWatchExit(%v) logged %d ERROR records %v, want exactly 1: the alert counts lines", runErr, n, logs.Messages())
 		}
 		if n := logs.CountExact(deadMsg); n != 1 {
-			t.Errorf("reportWatchExit(%v) logged %d records with the alerted message %q, want 1 (logs %v)", runErr, n, deadMsg, logs.Messages())
+			t.Errorf("reportWatchExit(%v) logged %d records with the message %q, want 1 (logs %v)", runErr, n, deadMsg, logs.Messages())
 		}
 		if got, has := logs.AttrValue(deadMsg, "remediation"); has {
 			t.Errorf("reportWatchExit(%v) attached remediation %q, want none: only a *LostError carries one", runErr, got)
@@ -756,7 +749,10 @@ func TestRun_argv_dispatch_precedes_the_log_level_diagnostic(t *testing.T) {
 	}
 }
 
-func TestRun_startup_failure_diagnoses_the_configuration_and_exits_nonzero(t *testing.T) {
+// runWithUnusablePassword runs the watcher path with no usable PFX password and
+// an invalid LOG_LEVEL, and returns its exit code and stderr.
+func runWithUnusablePassword(t *testing.T) (code int, out string) {
+	t.Helper()
 	t.Setenv("LOG_LEVEL", "bogus")
 	// Unset rather than blank: PFX_PASSWORD_FILE="" is SET-but-blank, which is a
 	// different documented case with its own WARN. The t.Setenv call first is
@@ -773,8 +769,20 @@ func TestRun_startup_failure_diagnoses_the_configuration_and_exits_nonzero(t *te
 	os.Args = []string{"cert-watcher", watchSubcommand}
 	t.Cleanup(func() { os.Args = prevArgs })
 
-	var code int
-	out := captureStderr(t, func() { code = run() })
+	out = captureStderr(t, func() { code = run() })
+
+	return code, out
+}
+
+// startupFailureOutput is runWithUnusablePassword's stderr.
+func startupFailureOutput(t *testing.T) string {
+	t.Helper()
+	_, out := runWithUnusablePassword(t)
+	return out
+}
+
+func TestRun_startup_failure_diagnoses_the_configuration_and_exits_nonzero(t *testing.T) {
+	code, out := runWithUnusablePassword(t)
 
 	if code != 1 {
 		t.Errorf("run() with an unusable PFX password = %d, want 1 so the orchestrator does not read the stop as a clean shutdown; stderr %q", code, out)
@@ -848,14 +856,10 @@ func TestRun_sanitizes_the_secret_path_a_configuration_refusal_carries(t *testin
 	}
 }
 
-// TestRun_refuses_to_start_when_a_required_volume_is_missing pins the branch that
-// ACTS on mounts.Verify's verdict: run() must return 1 before it builds a scanner
-// or a watcher, because starting anyway converts nothing and restart-loops
-// forever on a condition a restart cannot clear. It also pins the startup INFO
-// line, the operator's only statement of the effective configuration.
-// Serial (no t.Parallel): it swaps os.Args, os.Stderr, slog.Default() and the
-// requiredVolumes seam, and uses t.Setenv.
-func TestRun_refuses_to_start_when_a_required_volume_is_missing(t *testing.T) {
+// runWithMissingOutputVolume runs the watcher path with /output absent and
+// returns its exit code, stderr and the absent path.
+func runWithMissingOutputVolume(t *testing.T) (code int, out, absentOutput string) {
+	t.Helper()
 	t.Setenv("LOG_LEVEL", "info")
 	t.Setenv("PFX_PASSWORD", "test-password")
 	for _, key := range []string{"PFX_PASSWORD_FILE", "PFX_ALLOW_EMPTY_PASSWORD"} {
@@ -865,7 +869,7 @@ func TestRun_refuses_to_start_when_a_required_volume_is_missing(t *testing.T) {
 		}
 	}
 
-	absentOutput := filepath.Join(t.TempDir(), "absent-output")
+	absentOutput = filepath.Join(t.TempDir(), "absent-output")
 	capture.SwapDefault(t, slog.New(slog.DiscardHandler))
 	prevArgs, prevVolumes := os.Args, requiredVolumes
 	os.Args = []string{"cert-watcher", watchSubcommand}
@@ -881,9 +885,8 @@ func TestRun_refuses_to_start_when_a_required_volume_is_missing(t *testing.T) {
 	// run() is called on a goroutine with a deadline because the failure mode
 	// under test is "it started the watcher anyway": w.Run blocks until a signal
 	// arrives, so a dropped guard would hang this test instead of failing it.
-	var code int
 	returned := make(chan int, 1)
-	out := captureStderr(t, func() {
+	out = captureStderr(t, func() {
 		go func() { returned <- run() }()
 		select {
 		case code = <-returned:
@@ -891,6 +894,26 @@ func TestRun_refuses_to_start_when_a_required_volume_is_missing(t *testing.T) {
 			t.Error("run() did not return with a missing output mount: it started the watcher instead of refusing")
 		}
 	})
+
+	return code, out, absentOutput
+}
+
+// missingVolumeOutput is runWithMissingOutputVolume's stderr.
+func missingVolumeOutput(t *testing.T) string {
+	t.Helper()
+	_, out, _ := runWithMissingOutputVolume(t)
+	return out
+}
+
+// TestRun_refuses_to_start_when_a_required_volume_is_missing pins the branch that
+// ACTS on mounts.Verify's verdict: run() must return 1 before it builds a scanner
+// or a watcher, because starting anyway converts nothing and restart-loops
+// forever on a condition a restart cannot clear. It also pins the startup INFO
+// line, the operator's only statement of the effective configuration.
+// Serial (no t.Parallel): it swaps os.Args, os.Stderr, slog.Default() and the
+// requiredVolumes seam, and uses t.Setenv.
+func TestRun_refuses_to_start_when_a_required_volume_is_missing(t *testing.T) {
+	code, out, absentOutput := runWithMissingOutputVolume(t)
 
 	if code != 1 {
 		t.Errorf("run() with a missing output mount = %d, want 1: starting anyway converts nothing and restart-loops forever; stderr %q", code, out)

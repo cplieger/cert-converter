@@ -23,7 +23,10 @@ import (
 	"github.com/cplieger/go/filesafe"
 )
 
-// ScanResult carries per-source outcome summary counts from a scan run.
+// ScanResult carries per-source outcome summary counts from a scan run. A scan
+// whose /input walk did not finish reports the per-path counts and the reap and
+// layout flags at least as the previous scan did, and any scan that did not cover
+// the tree keeps NoSources and AllExcluded unless its own sources disprove them.
 type ScanResult struct {
 	// Removed counts artifacts deleted because their source is gone.
 	Removed    int
@@ -56,28 +59,68 @@ type ScanResult struct {
 	// convert. They are enumerated and still protect their artifacts from the
 	// orphan reaper; only the conversion is skipped, so health is unaffected.
 	Excluded int
+	Outcome  Outcome
+	// NoSources reports a complete enumeration that found nothing to convert: no
+	// source at all, or only PEM certificates that lack their key.
+	NoSources bool
+	// AllExcluded reports a complete enumeration whose every source
+	// INPUT_EXCLUDE_PATHS covers.
+	AllExcluded bool
+	// OrphanRemovalDisabled reports a scan that could not prove any /output
+	// artifact orphaned, so OUTPUT_LIFECYCLE removed nothing.
+	OrphanRemovalDisabled bool
+	// PreviousLayoutRetained reports a sync scan that kept artifacts laid out for
+	// the other OUTPUT_LAYOUT.
+	PreviousLayoutRetained bool
+	// CleanupDegraded is the latest stale-temp sweep's verdict: some temp could not
+	// be removed or inspected. The sweep runs at most hourly, so a scan that did
+	// not sweep carries the previous sweep's verdict.
+	CleanupDegraded bool
 }
 
-// summaryAttrs is the ONE list of the scan-summary attributes, in the order
-// logScanOutcome emits them; the README's alerting section keys Loki rules on these
-// names, so both the names and the order are the operator-visible contract.
-var summaryAttrs = []struct {
-	of   func(*ScanResult) int
-	name string
-}{
-	{name: "total", of: func(r *ScanResult) int { return r.Total }},
-	{name: "converted", of: func(r *ScanResult) int { return r.Converted }},
-	{name: "unchanged", of: func(r *ScanResult) int { return r.Unchanged }},
-	{name: "orphan", of: func(r *ScanResult) int { return r.Orphan }},
-	{name: "unreadable", of: func(r *ScanResult) int { return r.Unreadable }},
-	{name: "unresolved", of: func(r *ScanResult) int { return r.Unresolved }},
-	{name: "vanished", of: func(r *ScanResult) int { return r.Vanished }},
-	{name: "unwritable", of: func(r *ScanResult) int { return r.Unwritable }},
-	{name: "collided", of: func(r *ScanResult) int { return r.Collided }},
-	{name: "excluded", of: func(r *ScanResult) int { return r.Excluded }},
-	{name: "ignored", of: func(r *ScanResult) int { return r.Ignored }},
-	{name: "removed", of: func(r *ScanResult) int { return r.Removed }},
-	{name: "failed", of: func(r *ScanResult) int { return r.Failed }},
+// Outcome is how a scan ended. The zero value is a scan that covered the tree.
+type Outcome int
+
+// The scan outcomes.
+const (
+	OutcomeComplete Outcome = iota
+	// OutcomeAborted is a scan that ended early on an error other than shutdown.
+	OutcomeAborted
+	// OutcomeBudgetStopped is a scan that stopped at the /input entry budget and
+	// converted only what it enumerated before the stop.
+	OutcomeBudgetStopped
+)
+
+// String names the outcome as the metrics label and the docs spell it.
+func (o Outcome) String() string {
+	switch o {
+	case OutcomeAborted:
+		return "aborted"
+	case OutcomeBudgetStopped:
+		return "budget_stopped"
+	default:
+		return "complete"
+	}
+}
+
+// carryUnproven raises the conditions a scan that did not enumerate the whole
+// tree cannot prove gone to the previous report's values. With enumerated, the
+// walk finished and only the whole-tree verdicts carry; a whole-tree verdict
+// this scan's own sources disprove does not.
+func (r *ScanResult) carryUnproven(prev *ScanResult, enumerated bool) {
+	r.NoSources = r.NoSources || (prev.NoSources && r.Total <= r.Orphan)
+	r.AllExcluded = r.AllExcluded || (prev.AllExcluded && r.Excluded == r.Total)
+	if enumerated {
+		return
+	}
+	r.Orphan = max(r.Orphan, prev.Orphan)
+	r.Failed = max(r.Failed, prev.Failed)
+	r.Unreadable = max(r.Unreadable, prev.Unreadable)
+	r.Unresolved = max(r.Unresolved, prev.Unresolved)
+	r.Unwritable = max(r.Unwritable, prev.Unwritable)
+	r.Collided = max(r.Collided, prev.Collided)
+	r.OrphanRemovalDisabled = r.OrphanRemovalDisabled || prev.OrphanRemovalDisabled
+	r.PreviousLayoutRetained = r.PreviousLayoutRetained || prev.PreviousLayoutRetained
 }
 
 // conversionsClean reports whether nothing this scan did leaves the output tree in a
@@ -108,10 +151,6 @@ var (
 
 // scanBudgetMsg is the operator-facing half of that abort.
 const scanBudgetMsg = scanbudget.InputTreeTooLarge + "; stopping this scan without converting or removing anything further, health is unaffected"
-
-// scanBudgetSummaryMsg is the end-of-scan summary line for a walk the entry budget
-// stopped.
-const scanBudgetSummaryMsg = "scan stopped at the /input entry budget"
 
 // Options carries the process-lifetime scan configuration the composition root
 // chooses once at startup: confined roots, input and output passwords, output
@@ -151,11 +190,16 @@ type Options struct {
 // Scanner walks a certificate directory, resolves PEM pairs and PKCS#12
 // bundles into one identity model, and updates every configured output format.
 type Scanner struct {
-	observations *observationLog
 	// lastSweep is when this process last swept /output for stale temps. It lives here
 	// rather than on store because store is rebuilt per Run.
-	lastSweep time.Time
-	opts      Options
+	lastSweep    time.Time
+	observations *observationLog
+	standing     *standing
+	opts         Options
+	// lastReported is the previous scan's result, what an incomplete scan carries.
+	lastReported ScanResult
+	// cleanupDegraded carries the last sweep's verdict to the scans between sweeps.
+	cleanupDegraded bool
 }
 
 // sweepClock is indirected for the same reason waitBeforeReap is: a test cannot
@@ -179,6 +223,7 @@ func New(opts *Options) *Scanner {
 	return &Scanner{
 		opts:         normalized,
 		observations: newObservationLog(normalized.MaxScanEntries),
+		standing:     newStanding(),
 	}
 }
 
@@ -210,9 +255,13 @@ func openScanRoots(inputPath, outputPath string) (input, output *os.Root, err er
 // configured output formats, and returns per-source counts plus any walk-level
 // error.
 func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
+	s.standing.beginScan()
 	inHandle, outHandle, err := openScanRoots(s.opts.CertsRoot, s.opts.OutRoot)
 	if err != nil {
-		return ScanResult{}, failScan(ctx, err)
+		result := ScanResult{Outcome: OutcomeAborted, CleanupDegraded: s.cleanupDegraded}
+		result.carryUnproven(&s.lastReported, false)
+		s.lastReported = result
+		return result, err
 	}
 	defer func() { _ = inHandle.Close() }()
 	defer func() { _ = outHandle.Close() }()
@@ -226,13 +275,16 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		// A temp is only a candidate once it is staleTempAge old, so sweeping more
 		// often than that re-walks the whole output tree to find nothing new.
 		s.lastSweep = now
-		out.sweepStaleTemps(ctx)
+		if degraded, swept := out.sweepStaleTemps(ctx); swept {
+			s.cleanupDegraded = degraded
+		}
 	}
 
 	sw := &scanWalk{
 		src:                &source{root: inHandle},
 		out:                out,
 		observations:       s.observations,
+		standing:           s.standing,
 		bundleBudget:       convert.NewBundleWorkBudget(),
 		password:           s.opts.Password,
 		inputPassword:      s.opts.InputPassword,
@@ -314,11 +366,54 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		walkErr = reconcileErr
 	}
 
-	logScanOutcome(ctx, &result, walkErr)
+	s.reportVerdict(&result, out, walkErr)
 	if budgetExceeded {
 		return result, nil
 	}
 	return result, walkErr
+}
+
+// reportVerdict derives the scan's verdicts from what the walk, the reaper and
+// the last sweep found, then logs the standing conditions that changed. Only a
+// scan that ran to the end can prove a per-path condition gone.
+func (s *Scanner) reportVerdict(result *ScanResult, out *store, walkErr error) {
+	result.Outcome = outcomeOf(walkErr)
+	result.OrphanRemovalDisabled = out.reapDisabled
+	result.PreviousLayoutRetained = out.otherLayoutKept
+	result.CleanupDegraded = s.cleanupDegraded
+	enumerated := walkErr == nil
+	wholeTree := enumerated && result.inputFullyEnumerated()
+	if wholeTree {
+		coverage := wholeTreeCoverageOf(result)
+		result.NoSources = coverage == coverageNoSource || coverage == coverageAllOrphan
+		result.AllExcluded = coverage == coverageAllExcluded
+	}
+	logInputCoverageWarnings(s.standing, result, walkErr)
+	if !wholeTree {
+		result.carryUnproven(&s.lastReported, enumerated)
+	}
+	s.lastReported = *result
+	if walkErr != nil {
+		return
+	}
+	s.standing.clearUnseen(condCollision, false)
+	s.standing.clearUnseen(condUnwritable, false)
+	s.standing.clearUnseen(condUnresolvedSymlink, false)
+	// The aggregate unreadable_paths condition reports the clear; its per-path
+	// detail goes quietly.
+	s.standing.clearUnseen(condUnreadablePath, true)
+}
+
+// outcomeOf classifies the error a scan ended with.
+func outcomeOf(walkErr error) Outcome {
+	switch {
+	case walkErr == nil:
+		return OutcomeComplete
+	case errors.Is(walkErr, errScanBudgetExceeded):
+		return OutcomeBudgetStopped
+	default:
+		return OutcomeAborted
+	}
 }
 
 // scanWalk carries the read-only conversion parameters and mutable accounting
@@ -336,6 +431,7 @@ type scanWalk struct {
 	// published.
 	pendingSources []string
 	observations   *observationLog
+	standing       *standing
 	bundleBudget   *convert.BundleWorkBudget
 	enc            convert.EncoderType
 	layoutMode     outputpolicy.Layout
@@ -519,13 +615,11 @@ func selectFlatSources(sources []string) (unique []string, collisions []flatColl
 	return unique, collisions
 }
 
-// collisionMsg is the ERROR record for a flat output-name collision; the
-// published CertConverterOutputNameCollision alert matches on a substring of it.
+// collisionMsg is the ERROR record for a flat output-name collision.
 const collisionMsg = "output name collision: several inputs produce the same output path, so none of them is converted"
 
 // allExcludedMsg is the report for a scan whose every source is covered by
-// INPUT_EXCLUDE_PATHS; the published CertConverterEverySourceExcluded alert
-// matches on a substring of it.
+// INPUT_EXCLUDE_PATHS.
 const allExcludedMsg = "every certificate source under the input root is excluded; no output artifacts are being produced"
 
 // collisionRemediation names both ways out of a flat collision.
@@ -576,11 +670,15 @@ func (sw *scanWalk) recordCollisions(ctx context.Context, collisions []flatColli
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		slog.Error(collisionMsg,
-			"output_stem", logtext.Path(collision.stem),
-			"count", len(collision.sources),
-			"sources", logtext.CapJoin(collision.sources, maxLoggedOrphanBytes),
-			"remediation", collisionRemediation)
+		if !sw.standing.report(standingKey{kind: condCollision, subject: collision.stem}, len(collision.sources)) {
+			slog.Debug(collisionMsg, "output_stem", logtext.Path(collision.stem), "count", len(collision.sources))
+		} else {
+			slog.Error(collisionMsg,
+				"condition", condCollision, "output_stem", logtext.Path(collision.stem),
+				"count", len(collision.sources),
+				"sources", logtext.CapJoin(collision.sources, maxLoggedOrphanBytes),
+				"remediation", collisionRemediation)
+		}
 		for _, rel := range collision.sources {
 			// A collided source still CLAIMS its artifacts: the inputs exist, so
 			// the orphan reaper must keep whatever is at the contested path while
@@ -621,8 +719,12 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 	switch {
 	case err != nil && !errors.Is(err, fs.ErrNotExist):
 		sw.unresolved++
-		slog.Warn("skipping symlink that could not be resolved through the input root; anything it points to, including certificates under a linked directory, is not scanned",
-			"path", logtext.Path(rel), "error", logtext.Path(err.Error()),
+		level := slog.LevelDebug
+		if sw.standing.report(standingKey{kind: condUnresolvedSymlink, subject: rel}, 1) {
+			level = slog.LevelWarn
+		}
+		slog.Log(context.Background(), level, "skipping symlink that could not be resolved through the input root; anything it points to, including certificates under a linked directory, is not scanned",
+			"condition", condUnresolvedSymlink, "path", logtext.Path(rel), "error", logtext.Path(err.Error()),
 			"remediation", "mount that certificate path into /input directly instead of linking to it, or fix the permissions on the link target")
 	case err == nil && fi.IsDir():
 		slog.Debug("skipping symlinked directory; its target is walked directly", "path", logtext.Path(rel))
@@ -690,116 +792,105 @@ func (sw *scanWalk) registerExpected(rel string) {
 
 // --- Logging policy ---
 
-// failScan reports a scan that ended before the walk began: a certs or output
-// root that could not be opened as an *os.Root.
-func failScan(ctx context.Context, err error) error {
-	logScanOutcome(ctx, &ScanResult{}, err)
-	return err
-}
-
-// logScanOutcome emits the end-of-scan summary.
-func logScanOutcome(ctx context.Context, result *ScanResult, walkErr error) {
-	level, msg := slog.LevelInfo, "scan complete"
-	if walkErr != nil {
-		level, msg = slog.LevelWarn, "scan aborted before completion"
-		switch {
-		case IsShutdown(walkErr):
-			level, msg = slog.LevelDebug, "scan cancelled during shutdown"
-		case errors.Is(walkErr, errScanBudgetExceeded):
-			level, msg = slog.LevelWarn, scanBudgetSummaryMsg
-		}
-	}
-	attrs := make([]any, 0, 2+2*len(summaryAttrs))
-	if walkErr != nil {
-		// The walk error names a path in two shapes — an *fs.PathError from the
-		// filesystem, and the entry-budget stop's own wrap — so the summary's error
-		// attribute passes the same gate its count attributes' sibling `path` does.
-		attrs = append(attrs, "error", logtext.Path(walkErr.Error()))
-	}
-	for _, a := range summaryAttrs {
-		attrs = append(attrs, a.name, a.of(result))
-	}
-	slog.Log(ctx, level, msg, attrs...)
-	logInputCoverageWarnings(result, walkErr)
-}
-
 // logInputCoverageWarnings names the health-neutral outcomes that produce no
-// output artifacts — for the whole input tree, or for one PEM pair — and that
-// summary counts alone cannot distinguish from a healthy steady state: an input
-// tree the scan could not fully read, one holding no source at all, one where
-// every PEM certificate lacks its sibling .key, and one where only some do.
-func logInputCoverageWarnings(result *ScanResult, walkErr error) {
-	// A typed stop reason, not a string match: errScanBudgetExceeded already exists as
-	// its own sentinel precisely so the budget stop can be told from an unreadable root
-	// or a cancellation, and Run wraps it with the entry count rather than replacing it.
+// output artifacts, for the whole input tree or for some PEM pairs, and that
+// summary counts alone cannot distinguish from a healthy steady state. Each is a
+// standing condition, logged when it appears, changes or clears.
+func logInputCoverageWarnings(st *standing, result *ScanResult, walkErr error) {
 	budgetStopped := errors.Is(walkErr, errScanBudgetExceeded)
 	if walkErr != nil && !budgetStopped {
 		return
 	}
-	if result.Unreadable > 0 {
-		// Message byte-identical to the one the composition root emitted: README's
-		// Alerting section tells an operator at LOG_LEVEL=warn to alert on this exact
-		// line, so its wording is a contract regardless of which package renders it.
+	// A claim about the WHOLE TREE ("no pair at all", "every certificate") needs a
+	// complete enumeration; a claim about the paths this scan read does not. Only a
+	// complete scan can prove a condition gone.
+	complete := walkErr == nil && result.inputFullyEnumerated()
+	if st.track(standingKey{kind: condUnreadablePaths}, result.Unreadable, walkErr == nil) {
 		slog.Warn("some /input paths were unreadable and were skipped; health is unaffected",
-			"unreadable", result.Unreadable,
+			"condition", condUnreadablePaths, "unreadable", result.Unreadable,
 			// inputPermRemediation, not a permission-only hint of its own: the count
 			// aggregates every unreadable shape this package classifies, and only some
 			// of them are permission problems.
 			"remediation", inputPermRemediation)
 	}
-	// Each arm is gated by the evidence IT needs, which is the rule here rather than an
-	// exception: a claim about the WHOLE TREE ("no pair at all", "every certificate")
-	// needs a complete enumeration, while a claim about the PATHS THIS SCAN READ needs
-	// only those paths.
-	if walkErr == nil && result.inputFullyEnumerated() {
-		logWholeTreeCoverageWarning(result)
-		return
+	orphans := result.Orphan
+	if complete {
+		coverage := wholeTreeCoverageOf(result)
+		logWholeTreeCoverage(st, result, coverage)
+		if coverage != coveragePartialOrphan {
+			orphans = 0
+		}
 	}
-	if result.Orphan > 0 {
-		// The ONE arm that needs no whole-tree proof.
+	if st.track(standingKey{kind: condOrphanCertificates}, orphans, complete) {
 		slog.Warn("some PEM certificates under the input root are missing their sibling .key; those files do not form PEM sources",
-			"orphan", result.Orphan, "total", result.Total,
+			"condition", condOrphanCertificates, "orphan", result.Orphan, "total", result.Total,
 			"remediation", "name each private key <name>.key beside its <name>.crt, provide a PFX/P12 bundle with the same stem, or remove the orphan certificate")
 	}
 }
 
-// logWholeTreeCoverageWarning names the health-neutral outcomes that only a
-// COMPLETE enumeration can claim: a tree whose every source is excluded, one
-// holding nothing convertible, and one where every or some PEM certificate
-// lacks its sibling key.
-func logWholeTreeCoverageWarning(result *ScanResult) {
+// treeCoverage is what a complete enumeration found to convert.
+type treeCoverage int
+
+const (
+	coverageConvertible treeCoverage = iota
+	coverageAllExcluded
+	coverageIgnoredOnly
+	coverageNoSource
+	coverageAllOrphan
+	coveragePartialOrphan
+)
+
+// wholeTreeCoverageOf classifies a COMPLETE enumeration's counts. The caller owns
+// the completeness proof: a partial walk cannot claim anything about the whole tree.
+func wholeTreeCoverageOf(result *ScanResult) treeCoverage {
 	switch {
 	case result.Total > 0 && result.Excluded == result.Total:
-		// Every source found is excluded, so the scan produced nothing while
-		// reporting no failure: indistinguishable from a healthy steady state in
-		// the counts, and the signature of an over-broad INPUT_EXCLUDE_PATHS.
-		slog.Warn(allExcludedMsg,
-			"excluded", result.Excluded,
-			"remediation", "narrow INPUT_EXCLUDE_PATHS, or point /input at the directory holding the certificates you want converted")
+		return coverageAllExcluded
 	case result.Total == 0 && result.Ignored > 0:
+		return coverageIgnoredOnly
+	case result.Total == 0:
+		return coverageNoSource
+	case result.Orphan == result.Total:
+		return coverageAllOrphan
+	case result.Orphan > 0:
+		return coveragePartialOrphan
+	default:
+		return coverageConvertible
+	}
+}
+
+// logWholeTreeCoverage tracks the outcomes only a COMPLETE enumeration can
+// claim: a tree whose every source is excluded, one holding no source, and one
+// where every PEM certificate lacks its sibling key.
+func logWholeTreeCoverage(st *standing, result *ScanResult, coverage treeCoverage) {
+	if coverage == coverageIgnoredOnly {
 		slog.Debug("PFX/P12 files were ignored because bundle input is not enabled",
 			"ignored", result.Ignored,
 			"remediation", "set INPUT_PFX_PASSWORD to enable PFX input")
-	case result.Total == 0:
-		// A completed scan that visited no source at all is indistinguishable
-		// from a healthy steady state in the summary counts (failed=0 keeps the
-		// marker set, and the README's Loki rules match on failed/unreadable or
-		// on the absence of "scan complete"), yet it is the signature of a wrong
-		// or vanished /input mount: no artifact is produced and nothing fires.
-		// Name it.
-		slog.Warn("no certificate sources found under the input root; no output artifacts are being produced",
-			"remediation", "check that the /input mount points at a directory containing PEM pairs or PFX/P12 bundles")
-	case result.Orphan == result.Total:
-		// Every .crt under /input lacks its sibling .key, so the scan
-		// completed with failed=0 and produced nothing at all.
-		slog.Warn("every PEM certificate under the input root is missing its sibling .key; no output artifacts are being produced",
-			"orphan", result.Orphan,
-			"remediation", "name each private key <name>.key beside its <name>.crt, provide a PFX/P12 bundle instead, or remove the orphan certificate")
-	case result.Orphan > 0:
-		slog.Warn("some PEM certificates under the input root are missing their sibling .key; those files do not form PEM sources",
-			"orphan", result.Orphan, "total", result.Total,
-			"remediation", "name each private key <name>.key beside its <name>.crt, provide a PFX/P12 bundle with the same stem, or remove the orphan certificate")
 	}
+	if st.track(standingKey{kind: condAllExcluded}, countIf(coverage == coverageAllExcluded, result.Excluded), true) {
+		slog.Warn(allExcludedMsg,
+			"condition", condAllExcluded, "excluded", result.Excluded,
+			"remediation", "narrow INPUT_EXCLUDE_PATHS, or point /input at the directory holding the certificates you want converted")
+	}
+	if st.track(standingKey{kind: condNoSources}, countIf(coverage == coverageNoSource, 1), true) {
+		slog.Warn("no certificate sources found under the input root; no output artifacts are being produced",
+			"condition", condNoSources,
+			"remediation", "check that the /input mount points at a directory containing PEM pairs or PFX/P12 bundles")
+	}
+	if st.track(standingKey{kind: condAllOrphan}, countIf(coverage == coverageAllOrphan, result.Orphan), true) {
+		slog.Warn("every PEM certificate under the input root is missing its sibling .key; no output artifacts are being produced",
+			"condition", condAllOrphan, "orphan", result.Orphan,
+			"remediation", "name each private key <name>.key beside its <name>.crt, provide a PFX/P12 bundle instead, or remove the orphan certificate")
+	}
+}
+
+// countIf is n when the condition holds and 0 when it does not.
+func countIf(holds bool, n int) int {
+	if holds {
+		return n
+	}
+	return 0
 }
 
 // IsShutdown reports whether err is the process shutting down (context
@@ -1076,9 +1167,8 @@ func (sw *scanWalk) noteMissingKey(rel, keyRel string) conversionStatus {
 // diagnosed, so the classification and its diagnostic cannot drift apart.
 func (sw *scanWalk) noteUnreadableInput(logRel, inputRel, what string, err error) conversionStatus {
 	if IsShutdown(err) {
-		// A cancelled read is the shutdown itself, not an unreadable path — the
-		// Warn below is what the README recommends alerting on, so emitting it
-		// for a normal SIGTERM would page an operator for a mount that is fine.
+		// A cancelled read is the shutdown itself, not an unreadable path: the Warn
+		// below would tell a reader a mount that is fine needs fixing.
 		slog.Debug("skipping cert: "+what+" read interrupted by shutdown", "path", logtext.Path(logRel), "error", logtext.Path(err.Error()))
 		return statusUnreadable
 	}
@@ -1086,7 +1176,11 @@ func (sw *scanWalk) noteUnreadableInput(logRel, inputRel, what string, err error
 		slog.Debug("skipping cert: "+what+" vanished during the scan", "path", logtext.Path(logRel), "error", logtext.Path(err.Error()))
 		return statusVanished
 	}
-	slog.Warn("skipping cert: cannot read "+what,
+	level := slog.LevelDebug
+	if sw.standing.report(standingKey{kind: condUnreadablePath, subject: inputRel}, 1) {
+		level = slog.LevelWarn
+	}
+	slog.Log(context.Background(), level, "skipping cert: cannot read "+what,
 		"path", logtext.Path(logRel), "error", logtext.Path(err.Error()),
 		"remediation", inputPermRemediation)
 	return statusUnreadable
@@ -1273,7 +1367,7 @@ func (sw *scanWalk) emitPFX(ctx context.Context, rel, pfxRel string, em *emissio
 	// and how the write itself ended.
 	outcome := writeOutcome(state, writeErr)
 	if writeErr != nil {
-		reportWriteFailure(rel, pfxRel, writeErr, outcome)
+		sw.reportWriteFailure(rel, pfxRel, writeErr, outcome)
 	}
 	if outcome == statusConverted {
 		slog.Info("wrote pfx", "path", logtext.Path(pfxRel))
@@ -1294,7 +1388,7 @@ func (sw *scanWalk) emitRaw(ctx context.Context, rel, outRel string, data []byte
 	writeErr := sw.out.writePEM(ctx, outRel, data)
 	outcome := writeOutcome(state, writeErr)
 	if writeErr != nil {
-		reportWriteFailure(rel, outRel, writeErr, outcome)
+		sw.reportWriteFailure(rel, outRel, writeErr, outcome)
 	}
 	if outcome == statusConverted {
 		slog.Info("wrote pem", "path", logtext.Path(outRel))
@@ -1315,20 +1409,25 @@ func writeOutcome(state contentState, writeErr writeRefusal) conversionStatus {
 	}
 }
 
-// unreplaceableArtifactMsg is the standing WARN for a health-neutral write
-// refusal: a prior artifact this app could not VERIFY at all, whose replacing
-// write a steady-state /output condition refused.
+// unreplaceableArtifactMsg reports a health-neutral write refusal: a prior
+// artifact this app could not VERIFY at all, whose replacing write a
+// steady-state /output condition refused. It is a standing condition per output
+// path.
 const unreplaceableArtifactMsg = "prior output could not be replaced and the /output condition that refused the write is not one a restart clears; whatever is at the output path is left as found, health is unaffected"
 
 // reportWriteFailure logs a failed artifact write in the register the derived
 // outcome calls for.
-func reportWriteFailure(logRel, outputRel string, err writeRefusal, outcome conversionStatus) {
+func (sw *scanWalk) reportWriteFailure(logRel, outputRel string, err writeRefusal, outcome conversionStatus) {
 	if outcome == statusUnwritable {
+		if !sw.standing.report(standingKey{kind: condUnwritable, subject: outputRel}, 1) {
+			slog.Debug(unreplaceableArtifactMsg, "output_path", logtext.Path(outputRel))
+			return
+		}
 		// "unverified" is the only content fact that reaches this record:
 		// writeOutcome grants statusUnwritable solely via artifactNotProvenWrong,
 		// whose allowlist is exactly contentUnverified.
 		slog.Warn(unreplaceableArtifactMsg,
-			"path", logtext.Path(logRel), "output_path", logtext.Path(outputRel), "error", logtext.Path(err.Error()),
+			"condition", condUnwritable, "path", logtext.Path(logRel), "output_path", logtext.Path(outputRel), "error", logtext.Path(err.Error()),
 			"content", "unverified", "remediation", err.cause().remediation())
 		return
 	}
