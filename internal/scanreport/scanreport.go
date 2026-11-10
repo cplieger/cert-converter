@@ -13,10 +13,10 @@ import (
 	"github.com/cplieger/go/measure"
 )
 
-// Message is the end-of-scan record's message. The shipped log rules select the
-// record by it and read its fields by name, so both are the record's contract
+// recordMessage is the end-of-scan record's message. The shipped log rules select
+// the record by it and read its fields by name, so both are the record's contract
 // (TestLogQLRulesUnwrapNumericRecordFields).
-const Message = "scan complete"
+const recordMessage = "scan complete"
 
 // Scan is one finished scan: the scanner's verdict, the error it ended with, and
 // whether change detection was polling when it ran.
@@ -88,7 +88,7 @@ func logRecord(ctx context.Context, scan *Scan) {
 	for _, f := range fields {
 		attrs = append(attrs, f.name, f.of(scan))
 	}
-	slog.Log(ctx, level, Message, attrs...)
+	slog.Log(ctx, level, recordMessage, attrs...)
 }
 
 // Reporter writes each scan's verdict to the record and the metrics in one call.

@@ -129,14 +129,14 @@ func parseLogfmt(t *testing.T, line string) map[string]string {
 // leaving a rule that never fires.
 func TestLogQLRulesUnwrapNumericRecordFields(t *testing.T) {
 	record := renderRecord(t, &Scan{Result: process.ScanResult{Total: 1, Converted: 1}})
-	if record["msg"] != Message {
-		t.Fatalf("logRecord wrote msg=%q, want %q", record["msg"], Message)
+	if record["msg"] != recordMessage {
+		t.Fatalf("logRecord wrote msg=%q, want %q", record["msg"], recordMessage)
 	}
 	for _, rule := range stateRules(t) {
 		t.Run(rule.name, func(t *testing.T) {
 			for _, m := range filterRe.FindAllStringSubmatch(rule.expr, -1) {
-				if m[1] != Message {
-					t.Errorf("%s filters on %q, want the record's message %q", rule.name, m[1], Message)
+				if m[1] != recordMessage {
+					t.Errorf("%s filters on %q, want the record's message %q", rule.name, m[1], recordMessage)
 				}
 			}
 			for _, field := range rule.fields {

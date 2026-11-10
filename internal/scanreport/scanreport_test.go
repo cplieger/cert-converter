@@ -79,10 +79,10 @@ func TestLogLevels(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
 			logRecord(t.Context(), &tc.scan)
-			if got := logs.CountLevel(tc.level, Message); got != 1 {
-				t.Errorf("logRecord(%s) wrote %q, want one %s record %q", tc.name, logs.Messages(), tc.level, Message)
+			if got := logs.CountLevel(tc.level, recordMessage); got != 1 {
+				t.Errorf("logRecord(%s) wrote %q, want one %s record %q", tc.name, logs.Messages(), tc.level, recordMessage)
 			}
-			if tc.scan.Err != nil && !logs.HasAttr(Message, "error", tc.scan.Err.Error()) {
+			if tc.scan.Err != nil && !logs.HasAttr(recordMessage, "error", tc.scan.Err.Error()) {
 				t.Errorf("logRecord(%s) wrote no error attribute naming the cause", tc.name)
 			}
 		})
