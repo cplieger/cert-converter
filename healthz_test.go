@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/config"
-	"github.com/cplieger/go/health"
+	"github.com/cplieger/go/health/v2"
 )
 
 // healthzBody is the JSON body every cplieger /healthz answers with.
