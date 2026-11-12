@@ -15,7 +15,7 @@ This page lists what cert-converter reports, the alert rules that ship with it, 
 
 The metrics page is off by default, and the container then opens no port. Set `METRICS_LISTEN_ADDR` to a listen address, for example `:9468`, and cert-converter serves `GET /metrics` on it. [Reaching an app's metrics page](https://github.com/cplieger/docs/blob/main/docs/monitoring.md#reaching-an-apps-metrics-page) shows how to let your scraper reach it. The page has no login, so keep the port on your network. Name the scrape job `cert-converter`, because `CertConverterDown` reads `up{job="cert-converter"}`.
 
-Every series describes the last scan, and each scan sets them all from the same verdict it writes to the `scan complete` record. The labels carry only the fixed values listed below, never a path.
+Each scan sets the scan series from the same verdict it writes to the `scan complete` record. The labels carry only the values listed below, never a path.
 
 | Series | Type | Labels | Meaning |
 | --- | --- | --- | --- |
@@ -26,8 +26,10 @@ Every series describes the last scan, and each scan sets them all from the same 
 | `cert_converter_change_detection_mode` | gauge | `mode`: `watch`, `poll` | `1` for the mode the last scan ran in, `0` for the other |
 | `cert_converter_condition` | gauge | `condition`: `no_sources`, `all_excluded`, `orphan_removal_disabled`, `previous_layout_retained`, `cleanup_degraded` | `1` while the last scan reported the condition |
 | `cert_converter_removed_artifacts_total` | counter | none | Outputs removed because their source is gone |
+| `cert_converter_scan_deadline_timestamp_seconds` | gauge | none | Unix time by which the next healthy scan is due: the end of the last healthy scan, or the start, plus three guaranteed recheck cadences, 18 hours at the default. A scan that leaves the container unhealthy leaves it where it was. This version never sets it to `0` |
+| `cert_converter_build_info` | gauge | `version` | Always `1`. `version` is the release the image was built from |
 
-Every labelled series starts at `0`, so each rule sees its series from the first scrape. The page also carries the Go runtime and process families (`go_*`, `process_*`) under the names Go's official Prometheus client uses, so stock Go dashboards work.
+Every labelled scan series starts at `0`, so each rule sees its series from the first scrape. The page also carries the Go runtime and process families (`go_*`, `process_*`) under the names Go's official Prometheus client uses, so stock Go dashboards work.
 
 Three queries to start with in Grafana's Metrics Drilldown:
 
@@ -42,6 +44,8 @@ cert-converter writes logfmt records to standard error, with every timestamp in 
 - `starting cert watcher` opens each start and lists the settings in use, the user the container runs as, and both scan cadences as `fallback_scan` and `scan_floor`.
 - `wrote pfx` and `wrote pem` name each file written.
 - A standing problem, such as an unreadable path, is logged once when it appears, again when its count changes, once when it clears and once after each restart. The clearing record is `standing condition cleared`, with the `condition` and how long it `lasted`.
+- Three records follow the same rule for each path they name, and carry a `condition` field. `conversion failed` is `conversion_failed`, an ERROR for each source, logged again when its cause changes. The permission WARNs are `permissive_output_dir` for an `/output` folder and `permissive_output_file` for an output file, logged again when the mode changes. While one holds, later scans log it at Debug. It clears when a scan of the whole tree no longer finds it, or, for an output file, when cert-converter writes the file again.
+- With `METRICS_LISTEN_ADDR` set, each request to the listener writes an `http` record: at Debug for `/metrics` and `/healthz`, and at `INFO` for any other path.
 - Look for a `remediation` field on warnings and errors. When present, it names the action to take.
 
 `scan complete` closes every scan that is not cut short by a shutdown. It is `INFO` when the scan covered the whole tree, and `WARN` when the scan aborted or stopped at `MAX_SCAN_ENTRIES`, with an `error` field on an abort. The log rules read this record at either level, so keep `LOG_LEVEL` at `info` if you use them. Every field except `error` is a number.
@@ -100,9 +104,11 @@ Every state alert reads the last scan. It fires at the first scan that sees the 
 | `CertConverterOutputCleanupDegraded` | leftover temporary files under `/output`, each holding a private key, cannot be removed | warning |
 | `CertConverterOrphanRemovalDisabled` | the last scan could not prove a file is orphaned, so `OUTPUT_LIFECYCLE=sync` removed nothing | warning |
 | `CertConverterPreviousLayoutRetained` | `sync` found files from a previous `OUTPUT_LAYOUT` and kept them, because the layout is not set explicitly | warning |
-| `CertConverterScanStalled` | no scan has finished for two full recheck cadences plus an hour, so the watch loop is stuck or the log stopped arriving | warning |
+| `CertConverterScanStalled` | in `alerts/promql.yaml`, no scan has left the container healthy by `cert_converter_scan_deadline_timestamp_seconds` plus 15 minutes, so the watch loop is stuck or scans keep failing. In `alerts/logql.yaml`, no scan has finished in 13 hours, so the watch loop is stuck or the log stopped arriving | warning |
 
-Thresholds and the `severity` labels are starting points. `CertConverterScanStalled` and every state alert in `alerts/logql.yaml` read a 13-hour window, which fits the 6-hour default of `FALLBACK_SCAN_HOURS`. Size it to twice your effective cadence plus an hour. The effective cadence is `FALLBACK_SCAN_HOURS` capped at 24 hours, or 24 hours when it is `0` or `false`, so the window is 49 hours at most. `CertConverterStartupRefused` and `CertConverterChangeDetectionDead` count their exit line over 15 minutes, which does not depend on the cadence. Change the `container` selector to the label your log collector sets, such as `job` or `service`, and keep the scrape job name `CertConverterDown` reads.
+Thresholds and the `severity` labels are starting points. Every state alert in `alerts/logql.yaml`, and `CertConverterScanStalled` there, reads a 13-hour window, which fits the 6-hour default of `FALLBACK_SCAN_HOURS`. Size it to twice your effective cadence plus an hour. The effective cadence is `FALLBACK_SCAN_HOURS` capped at 24 hours, or 24 hours when it is `0` or `false`, so the window is 49 hours at most. `CertConverterStartupRefused` and `CertConverterChangeDetectionDead` count their exit line over 15 minutes, which does not depend on the cadence. Change the `container` selector to the label your log collector sets, such as `job` or `service`, and keep the scrape job name `CertConverterDown` reads.
+
+`CertConverterScanStalled` in `alerts/promql.yaml` has two arms, and `cert_converter_scan_deadline_timestamp_seconds` picks one. While the deadline is above `0`, the alert fires 15 minutes after it passes. That covers a stuck watch loop, a first scan that never ends, and scans that keep failing, which also fire their own alerts. cert-converter works the deadline out from `FALLBACK_SCAN_HOURS`, so this arm has no window to change. While the deadline reads `0`, the alert fires when no scan has ended for 13 hours. This version never writes `0`, so the deadline arm always decides. Load the rule file of the release you run, since an older image serves no deadline and neither arm can fire.
 
 Notes on individual alerts:
 
@@ -126,11 +132,9 @@ Notes on individual alerts:
 | `/healthz` | `GET`, `HEAD` | `METRICS_LISTEN_ADDR`, only when it is set | none | `200 {"status":"ok"}`, or `503 {"status":"unhealthy","reasons":[...]}` |
 | `/metrics` | `GET` | the same port | none. Keep the port on your network | Prometheus text format |
 
-**What healthy means.** `/healthz` gives the same verdict as the Docker healthcheck while the health file can be written. The last scan read `/input`, converted every source and found no output name collision, and it finished within three guaranteed recheck cadences. That is 18 hours at the 6-hour default, and 72 hours when the 24-hour floor applies. Until the first scan after a start finishes, the answer is `503`. Each failing check adds one sentence to `reasons`. Problems a restart cannot fix, such as an unreadable path below `/input`, leave health unchanged and show on `/metrics` and in the log. [How cert-converter works](how-it-works.md#health) lists them.
+**What healthy means.** The last scan read `/input`, converted every source and found no output name collision, and it finished within three guaranteed recheck cadences. That is 18 hours at the 6-hour default, and 72 hours when the 24-hour floor applies. Until the first scan after a start finishes, the answer is `503`. Each failing check adds one sentence to `reasons`. Problems a restart cannot fix, such as an unreadable path below `/input`, leave health unchanged and show on `/metrics` and in the log. [How cert-converter works](how-it-works.md#health) lists them.
 
-cert-converter keeps its health file in `/tmp`. If it cannot write there, for example with `read_only: true` and no `tmpfs` on `/tmp`, `/healthz` answers `503` while the Docker healthcheck passes, and the startup log warns about it. The hardened profile in [Security](hardening.md#hardened-deployment) adds the `tmpfs`.
-
-**Docker health.** The image checks itself every 30 seconds with `/cert-watcher health`, which reads the health file the app refreshes after each clean scan. Docker marks the container unhealthy after 3 failures, and allows 15 seconds after a start. Docker's health status notifies nobody on its own, and Docker does not restart an unhealthy container.
+**Docker health.** The image checks itself every 30 seconds with `/cert-watcher health`, which reads the health file the app refreshes after each clean scan at `/dev/shm/cert-converter.healthy`. If that file cannot be written, the check passes and the log says so once, while `/healthz` on the metrics listener still gives the true answer. Docker marks the container unhealthy after 3 failures, and allows 15 seconds after a start. Docker's health status notifies nobody on its own, and Docker does not restart an unhealthy container.
 
 **Who is told.**
 
