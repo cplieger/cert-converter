@@ -7,19 +7,25 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/mounts"
 	"github.com/cplieger/cert-converter/internal/scanreport"
+	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/go/health/v2"
+	"github.com/cplieger/go/measure"
 	"github.com/cplieger/go/slogx/capture"
 )
 
 func testReporter() *scanreport.Reporter {
-	_, reporter := newMetrics()
+	_, reporter := newMetrics(0)
 	return reporter
 }
 
@@ -31,7 +37,7 @@ func TestStartMetrics_logs_strays_but_not_scrapes(t *testing.T) {
 	rec := capture.Default(t)
 	addr := freeAddr(t)
 	ctx, cancel := context.WithCancel(t.Context())
-	reg, _ := newMetrics()
+	reg, _ := newMetrics(0)
 	wait, err := startMetrics(ctx, addr, reg, http.NotFoundHandler())
 	if err != nil {
 		cancel()
@@ -76,7 +82,7 @@ func TestStartMetrics_logs_strays_but_not_scrapes(t *testing.T) {
 func TestStartMetrics_serves_the_page_on_GET(t *testing.T) {
 	addr := freeAddr(t)
 	ctx, cancel := context.WithCancel(t.Context())
-	reg, _ := newMetrics()
+	reg, _ := newMetrics(0)
 	wait, err := startMetrics(ctx, addr, reg, http.NotFoundHandler())
 	if err != nil {
 		cancel()
@@ -179,4 +185,71 @@ func bindFailureOutput(t *testing.T) string {
 	t.Helper()
 	_, out := runWithMetricsAddr(t, "not-an-address")
 	return out
+}
+
+// scanDeadline reads the deadline CertConverterScanStalled compares with time().
+func scanDeadline(t *testing.T, reg *measure.Registry) time.Time {
+	t.Helper()
+	families, err := reg.Gather(t.Context())
+	if err != nil {
+		t.Fatalf("Gather = %v", err)
+	}
+	for _, f := range families {
+		if f.Name == "cert_converter_scan_deadline_timestamp_seconds" && len(f.Samples) == 1 {
+			return time.Unix(int64(f.Samples[0].Value), 0)
+		}
+	}
+	t.Fatal("the page has no single cert_converter_scan_deadline_timestamp_seconds sample")
+	return time.Time{}
+}
+
+// TestScanAndSetHealth_moves_the_deadline_only_on_a_healthy_scan pins the stall
+// rule's deadline to the health verdict: it starts one health lease after the
+// start, a scan that fails a conversion or cannot open /input leaves it, and a
+// healthy scan moves it one lease past its end, so CertConverterScanStalled and
+// the stale /healthz check judge the same moment.
+func TestScanAndSetHealth_moves_the_deadline_only_on_a_healthy_scan(t *testing.T) {
+	capture.SwapDefault(t, slog.New(slog.DiscardHandler))
+	synctest.Test(t, func(t *testing.T) {
+		const fallback = time.Hour
+		lease := 3 * fallback
+		start := time.Now()
+		reg, reporter := newMetrics(fallback)
+		st := health.NewStatus()
+		if got, want := scanDeadline(t, reg), start.Add(lease).Truncate(time.Second); !got.Equal(want) {
+			t.Errorf("deadline at the start = %v, want the start plus three cadences %v", got, want)
+		}
+
+		inDir, outDir := t.TempDir(), t.TempDir()
+		writeCertAndKey(t, inDir, "broken", []byte("not a certificate"), []byte("not a private key"))
+		time.Sleep(time.Hour)
+		scanAndSetHealth(t.Context(), newTestScanner(inDir, outDir, "", convert.EncNameModern2023), reporter, st, false)
+		if got, want := scanDeadline(t, reg), start.Add(lease).Truncate(time.Second); !got.Equal(want) {
+			t.Errorf("deadline after a failed conversion = %v, want it unchanged at %v", got, want)
+		}
+
+		time.Sleep(time.Hour)
+		missing := filepath.Join(t.TempDir(), "does-not-exist")
+		scanAndSetHealth(t.Context(), newTestScanner(missing, outDir, "", convert.EncNameModern2023), reporter, st, false)
+		if got, want := scanDeadline(t, reg), start.Add(lease).Truncate(time.Second); !got.Equal(want) {
+			t.Errorf("deadline after an aborted scan = %v, want it unchanged at %v", got, want)
+		}
+
+		for _, name := range []string{"broken.crt", "broken.key"} {
+			if err := os.Remove(filepath.Join(inDir, name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "deadline", "ecdsa")
+		writeCertAndKey(t, inDir, "good", certPEM, keyPEM)
+		time.Sleep(time.Hour)
+		end := time.Now()
+		scanAndSetHealth(t.Context(), newTestScanner(inDir, outDir, "", convert.EncNameModern2023), reporter, st, false)
+		if !st.Healthy() {
+			t.Fatal("the scan of one good pair did not report healthy")
+		}
+		if got, want := scanDeadline(t, reg), end.Add(lease).Truncate(time.Second); !got.Equal(want) {
+			t.Errorf("deadline after a healthy scan = %v, want its end plus three cadences %v", got, want)
+		}
+	})
 }

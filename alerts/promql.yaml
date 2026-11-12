@@ -3,8 +3,11 @@
 # alternative to alerts/logql.yaml: load one of the two, not both. The rules read
 # the page served when METRICS_LISTEN_ADDR is set; scrape it as job
 # `cert-converter`. Thresholds, windows and severity labels are starting points.
-# Size the 13h stall window to twice the effective cadence plus an hour, 49h at
-# most (FALLBACK_SCAN_HOURS capped at 24, or 24 when it is 0). CertConverterDown
+# CertConverterScanStalled reads the scan deadline the app derives from
+# FALLBACK_SCAN_HOURS, so it needs no resizing. Its fixed 13h window applies only
+# while that deadline reads 0, which this version never writes. Load this file
+# with a release that exports cert_converter_scan_deadline_timestamp_seconds: on
+# an older one neither arm of that rule fires. CertConverterDown
 # exists only here; CertConverterScanStalled covers it in alerts/logql.yaml.
 # CertConverterStartupRefused and CertConverterChangeDetectionDead exist only
 # there, because the process exits; here CertConverterDown covers them.
@@ -162,27 +165,40 @@ groups:
             Sync kept files laid out for the other layout because OUTPUT_LAYOUT
             is unset. Repoint consumers at the current paths, then set
             OUTPUT_LAYOUT explicitly or remove the old tree by hand.
-      # The timestamp is 0 until the first scan ends, so the second arm reads
-      # the process age instead: a first scan that never ends still pages once
-      # the process has run for the whole window.
+      # Two arms. The deadline decides: each healthy scan moves it three
+      # guaranteed recheck cadences ahead, so a wedged watch loop and scans
+      # that keep failing both cross it. The 13h window reads only while the
+      # deadline is 0; size it to twice the effective cadence plus an hour, 49h
+      # at most (FALLBACK_SCAN_HOURS capped at 24, or 24 when it is 0). The
+      # timestamp is 0 until the first scan ends, so its last branch reads the
+      # process age instead.
       - alert: CertConverterScanStalled
         expr: |
           (
+            time() > cert_converter_scan_deadline_timestamp_seconds + 900
+            and cert_converter_scan_deadline_timestamp_seconds > 0
+          )
+          or
+          (
             time() - cert_converter_last_scan_timestamp_seconds > 13 * 3600
             and cert_converter_last_scan_timestamp_seconds > 0
+            and on (job, instance) cert_converter_scan_deadline_timestamp_seconds == 0
           )
           or
           (
             time() - process_start_time_seconds > 13 * 3600
             and on (job, instance) cert_converter_last_scan_timestamp_seconds == 0
+            and on (job, instance) cert_converter_scan_deadline_timestamp_seconds == 0
           )
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "No cert-converter scan finished in 13h"
+          summary: "No cert-converter scan finished healthy in time"
           description: >
-            No scan ended for two scan cadences while the page answers, so the
-            watch loop is likely wedged and certificates may have stopped
-            converting. Restart the container and check the host's inotify
-            instance limit.
+            No scan finished healthy by the deadline cert-converter exports,
+            three guaranteed recheck cadences after the last healthy scan or
+            the start; with no deadline (0), no scan ended in 13h. Scans that
+            keep failing cross it too, so check the other cert-converter alerts
+            first. Otherwise the watch loop is likely wedged: restart the
+            container and check the host's inotify instance limit.

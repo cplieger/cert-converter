@@ -58,7 +58,7 @@ func TestStartMetrics_serves_healthz(t *testing.T) {
 	marker := health.NewStatus()
 	addr := freeAddr(t)
 	ctx, cancel := context.WithCancel(t.Context())
-	reg, _ := newMetrics()
+	reg, _ := newMetrics(0)
 	wait, err := startMetrics(ctx, addr, reg, newHealthz(marker, config.FallbackInterval()))
 	if err != nil {
 		cancel()

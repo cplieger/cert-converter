@@ -54,13 +54,12 @@ func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, reporter *s
 		slog.Info("scan interrupted by shutdown", "reason", err)
 		return
 	}
-	reporter.Report(ctx, &scanreport.Scan{Result: result, Err: err, Polling: polling})
+	healthy := err == nil && healthyAfterScan(&result)
+	reporter.Report(ctx, &scanreport.Scan{Result: result, Err: err, Polling: polling, Healthy: healthy})
 	if err != nil {
 		slog.Error("processing failed", "error", logtext.Path(err.Error()))
-		st.Set(false)
-		return
 	}
-	st.Set(healthyAfterScan(&result))
+	st.Set(healthy)
 }
 
 // --- Metrics ---
@@ -68,10 +67,12 @@ func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, reporter *s
 // metricsPrefix names every cert-converter series on the metrics page.
 const metricsPrefix = "cert_converter"
 
-// newMetrics builds the registry run serves, with the scan metrics on it.
-func newMetrics() (*measure.Registry, *scanreport.Reporter) {
+// newMetrics builds the registry run serves, with the scan metrics on it. The
+// scan deadline's gap is the health lease, so CertConverterScanStalled and the
+// stale /healthz check judge the same moment.
+func newMetrics(fallback time.Duration) (*measure.Registry, *scanreport.Reporter) {
 	reg := measure.NewRegistry(metricsPrefix)
-	return reg, scanreport.NewReporter(reg)
+	return reg, scanreport.NewReporter(reg, healthLease(fallback))
 }
 
 // startMetrics binds addr and serves reg's page and healthz on it until ctx
@@ -268,7 +269,7 @@ func run() int {
 
 	// Bound before the first scan, so a typo stops the container at once instead
 	// of leaving it converting with no page.
-	reg, reporter := newMetrics()
+	reg, reporter := newMetrics(cfg.FallbackInterval)
 	metricsCtx, stopMetrics := context.WithCancel(ctx)
 	waitMetrics, err := startMetrics(metricsCtx, cfg.MetricsListenAddr, reg, newHealthz(st, cfg.FallbackInterval))
 	if err != nil {
