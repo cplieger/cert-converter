@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -368,6 +369,143 @@ func TestScannerRun_keeps_per_path_conditions_through_a_hidden_subtree(t *testin
 	}
 }
 
+// countRecords counts the records at level whose message contains msgSub and
+// whose key attribute renders as value.
+func countRecords(logs *capture.Recorder, level slog.Level, msgSub, key, value string) int {
+	n := 0
+	for _, r := range logs.Records() {
+		if r.Level != level || !strings.Contains(r.Message, msgSub) {
+			continue
+		}
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == key && a.Value.String() == value {
+				n++
+				return false
+			}
+			return true
+		})
+	}
+	return n
+}
+
+// TestScannerRun_clears_a_fixed_failure_beside_a_durable_unresolved_link pins
+// that a link the scan cannot follow holds back only what it hides: a source the
+// scan reached and converted logs its clear, so its next failure is news again.
+// Serial: it swaps slog.Default().
+func TestScannerRun_clears_a_fixed_failure_beside_a_durable_unresolved_link(t *testing.T) {
+	base := t.TempDir()
+	in, outside := filepath.Join(base, "input"), filepath.Join(base, "outside")
+	for _, dir := range []string{in, outside} {
+		if err := os.Mkdir(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(outside, filepath.Join(in, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	writeBrokenPair(t, in, "broken", "not base64")
+	logs := captureLogs(t)
+	scanner := newVerdictScanner(in, t.TempDir(), Options{})
+	if res := runScans(t, scanner, 1); res.Failed != 1 || res.Unresolved != 1 {
+		t.Fatalf("setup: first scan = %+v, want one failure and one unresolved link", res)
+	}
+
+	writeSelfSignedPair(t, in, "broken")
+	if res := runScans(t, scanner, 1); res.Failed != 0 || res.Unresolved != 1 {
+		t.Fatalf("setup: fixed scan = %+v, want no failure and the link still unresolved", res)
+	}
+	if got := countClears(logs, condConversionFailed); got != 1 {
+		t.Errorf("the fixed source logged %d conversion_failed clears, want 1; log = %q", got, logs.Messages())
+	}
+
+	writeBrokenPair(t, in, "broken", "not base64")
+	runScans(t, scanner, 1)
+	if got := logs.CountLevel(slog.LevelError, conversionFailedLine); got != 2 {
+		t.Errorf("the source that failed again logged %d ERRORs in total, want 2: the new failure is news", got)
+	}
+}
+
+// TestScannerRun_keeps_a_nested_unresolved_link_through_a_hidden_subtree pins
+// that a link inside a subtree the scan could not enter stays reported: no clear
+// while the subtree is hidden, and no second onset when it returns.
+// Serial: it swaps slog.Default().
+func TestScannerRun_keeps_a_nested_unresolved_link_through_a_hidden_subtree(t *testing.T) {
+	base := t.TempDir()
+	in, outside := filepath.Join(base, "input"), filepath.Join(base, "outside")
+	site, target := filepath.Join(in, "site"), filepath.Join(outside, "target")
+	for _, dir := range []string{in, outside, site, target} {
+		if err := os.Mkdir(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSelfSignedPair(t, in, "live")
+	if err := os.Symlink(target, filepath.Join(site, "link")); err != nil {
+		t.Fatal(err)
+	}
+	logs := captureLogs(t)
+	scanner := newVerdictScanner(in, t.TempDir(), Options{})
+	if res := runScans(t, scanner, 1); res.Unresolved != 1 {
+		t.Fatalf("setup: Unresolved = %d, want 1 for site/link", res.Unresolved)
+	}
+
+	hidden := filepath.Join(outside, "site")
+	if err := os.Rename(site, hidden); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(hidden, site); err != nil {
+		t.Fatal(err)
+	}
+	runScans(t, scanner, 1)
+	if logs.HasAttr(standingClearedMsg, "path", "site/link") {
+		t.Errorf("a scan that could not enter site cleared site/link; log = %q", logs.Messages())
+	}
+
+	if err := os.Remove(site); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(hidden, site); err != nil {
+		t.Fatal(err)
+	}
+	runScans(t, scanner, 1)
+	const onsetMsg = "skipping symlink that could not be resolved through the input root"
+	if got := countRecords(logs, slog.LevelWarn, onsetMsg, "path", "site/link"); got != 1 {
+		t.Errorf("site/link was reported at WARN %d times, want 1: it held throughout", got)
+	}
+}
+
+// TestScannerRun_logs_an_unstattable_sibling_key_once pins that a key the
+// confined root refuses is a standing unreadable path, not a WARN on every scan.
+// Serial: it swaps slog.Default().
+func TestScannerRun_logs_an_unstattable_sibling_key_once(t *testing.T) {
+	base := t.TempDir()
+	in, outside := filepath.Join(base, "input"), filepath.Join(base, "outside")
+	for _, dir := range []string{in, outside} {
+		if err := os.Mkdir(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSelfSignedPair(t, in, "live")
+	writeSelfSignedPair(t, outside, "escape")
+	if err := os.Rename(filepath.Join(outside, "escape.crt"), filepath.Join(in, "escape.crt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "escape.key"), filepath.Join(in, "escape.key")); err != nil {
+		t.Fatal(err)
+	}
+	logs := captureLogs(t)
+	scanner := newVerdictScanner(in, t.TempDir(), Options{})
+	if res := runScans(t, scanner, 3); res.Unreadable != 1 {
+		t.Fatalf("setup: Unreadable = %d, want 1 for the escaping key", res.Unreadable)
+	}
+	const statMsg = "skipping cert: cannot stat sibling key"
+	if got := logs.CountLevel(slog.LevelWarn, statMsg); got != 1 {
+		t.Errorf("three scans with one unstattable key logged %d WARNs, want 1", got)
+	}
+	if got := logs.CountLevel(slog.LevelDebug, statMsg); got != 2 {
+		t.Errorf("the two repeat scans logged %d Debug records, want 2", got)
+	}
+}
+
 // TestReportVerdict_clears_per_path_conditions_only_after_a_whole_tree_scan pins
 // the gate for every per-path condition a skipped /input path can hide.
 // Serial: it swaps slog.Default().
@@ -395,7 +533,8 @@ func TestReportVerdict_clears_per_path_conditions_only_after_a_whole_tree_scan(t
 			}
 			s.standing.beginScan()
 			result := tc.result
-			s.reportVerdict(&result, &store{standing: s.standing}, map[string]struct{}{}, nil)
+			sw := &scanWalk{expected: map[string]struct{}{}}
+			s.reportVerdict(&result, &store{standing: s.standing}, sw, nil)
 			for _, key := range held {
 				if cleared := countClears(logs, key.kind) == 1; cleared != tc.wantCleared {
 					t.Errorf("%s cleared = %v, want %v; log = %q", key.kind, cleared, tc.wantCleared, logs.Messages())

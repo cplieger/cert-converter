@@ -366,7 +366,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		walkErr = reconcileErr
 	}
 
-	s.reportVerdict(&result, out, sw.expected, walkErr)
+	s.reportVerdict(&result, out, sw, walkErr)
 	if budgetExceeded {
 		return result, nil
 	}
@@ -375,9 +375,9 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 
 // reportVerdict derives the scan's verdicts from what the walk, the reaper and
 // the last sweep found, then logs the standing conditions that changed. Only a
-// scan that ran to the end can prove a per-path condition gone, and only one that
-// also saw every /input path can prove a condition under that path gone.
-func (s *Scanner) reportVerdict(result *ScanResult, out *store, expected map[string]struct{}, walkErr error) {
+// scan that ran to the end can prove a per-path condition gone, and only for a
+// subject it reached, or any subject once it saw every /input path.
+func (s *Scanner) reportVerdict(result *ScanResult, out *store, sw *scanWalk, walkErr error) {
 	result.Outcome = outcomeOf(walkErr)
 	result.OrphanRemovalDisabled = out.reapDisabled
 	result.PreviousLayoutRetained = out.otherLayoutKept
@@ -397,15 +397,20 @@ func (s *Scanner) reportVerdict(result *ScanResult, out *store, expected map[str
 	if walkErr != nil {
 		return
 	}
-	s.standing.clearUnseen(condCollision, false)
-	s.standing.clearUnseen(condUnresolvedSymlink, false)
+	inputReached := func(subject string) bool { return wholeTree || sw.reach.input(subject) }
+	// A collision is arbitrated among the sources this scan saw, so a stem it no
+	// longer reports was converted from one source.
+	s.standing.clearUnseen(condCollision, false, func(string) bool { return true })
+	s.standing.clearUnseen(condUnresolvedSymlink, false, inputReached)
 	// The aggregate unreadable_paths condition reports the clear; its per-path
 	// detail goes quietly.
-	s.standing.clearUnseen(condUnreadablePath, true)
+	s.standing.clearUnseen(condUnreadablePath, true, inputReached)
+	s.standing.clearUnseen(condConversionFailed, false, inputReached)
+	s.standing.clearUnseen(condUnwritable, false, func(subject string) bool {
+		return wholeTree || sw.reach.output(subject)
+	})
 	if wholeTree {
-		s.standing.clearUnseen(condUnwritable, false)
-		s.standing.clearUnseen(condConversionFailed, false)
-		out.clearUnmanaged(expected)
+		out.clearUnmanaged(sw.expected)
 	}
 }
 
@@ -434,6 +439,7 @@ type scanWalk struct {
 	// failed is whether each source that failed in this walk was news, so every
 	// failure of one source in one scan shares the first one's level.
 	failed map[string]bool
+	reach  scanReach
 	// pendingSources defers flat-layout conversion until every source name is
 	// known, so output-name collisions are arbitrated before any artifact is
 	// published.
@@ -470,6 +476,7 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		return ctx.Err()
 	}
 	if err != nil {
+		sw.reach.unlist(rel)
 		if rel == "." {
 			return err
 		}
@@ -493,6 +500,8 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.budget.Count(), rel)
 	}
 	if d.IsDir() {
+		// Withdrawn by the error call above if its listing fails.
+		sw.reach.list(rel)
 		sw.noteSourceShapedDir(rel)
 		return nil
 	}
@@ -575,12 +584,14 @@ func (sw *scanWalk) processSource(ctx context.Context, rel string) error {
 		return nil
 	}
 	sw.seen[rel] = struct{}{}
-	sw.registerExpected(rel)
+	artifacts := sw.registerExpected(rel)
 	convertSource := sw.convertEntry
 	if layout.IsBundle(rel) {
 		convertSource = sw.convertBundle
 	}
-	sw.results = append(sw.results, convertSource(ctx, rel))
+	outcome := convertSource(ctx, rel)
+	sw.reach.noteSource(rel, outcome, artifacts)
+	sw.results = append(sw.results, outcome)
 	// A cancellation during conversion already became a per-source outcome, but
 	// the walk itself must still stop so the scan is never reported complete.
 	return ctx.Err()
@@ -787,15 +798,18 @@ func noteShadowedBundle(rel, sibling string) bool {
 }
 
 // registerExpected records every artifact path the enabled formats derive from
-// rel, at enumeration time, whatever its conversion later resolves to.
-func (sw *scanWalk) registerExpected(rel string) {
+// rel, at enumeration time, whatever its conversion later resolves to, and
+// returns them.
+func (sw *scanWalk) registerExpected(rel string) []string {
 	outStem := layout.SourceStem(rel)
 	if sw.layoutMode == outputpolicy.LayoutFlat {
 		outStem = layout.FlatStem(outStem)
 	}
-	for _, artifact := range layout.ArtifactsFor(outStem, sw.formats) {
+	artifacts := layout.ArtifactsFor(outStem, sw.formats)
+	for _, artifact := range artifacts {
 		sw.expected[artifact] = struct{}{}
 	}
+	return artifacts
 }
 
 // --- Logging policy ---
@@ -1170,7 +1184,11 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 		// A non-ENOENT stat failure (a sibling key that is a symlink the *os.Root
 		// refuses because it escapes /input, or a permission/IO error) is NOT a
 		// genuine "no key" orphan — the key is there and cannot be read.
-		slog.Warn("skipping cert: cannot stat sibling key", "path", logtext.Path(rel), "error", logtext.Path(statErr.Error()),
+		level := slog.LevelDebug
+		if sw.standing.report(standingKey{kind: condUnreadablePath, subject: keyRel}, 1) {
+			level = slog.LevelWarn
+		}
+		slog.Log(context.Background(), level, "skipping cert: cannot stat sibling key", "path", logtext.Path(rel), "error", logtext.Path(statErr.Error()),
 			"remediation", inputPermRemediation)
 		return pairInputs{}, statusUnreadable
 	}

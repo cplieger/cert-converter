@@ -132,14 +132,15 @@ func (s *standing) clear(key standingKey) {
 	slog.Info(standingClearedMsg, attrs...)
 }
 
-// clearUnseen ends every condition of kind this scan did not report. Only a scan
-// that saw the whole tree may call it: a partial scan's silence proves nothing.
-func (s *standing) clearUnseen(kind string, quiet bool) {
+// clearUnseen ends every condition of kind this scan did not report and whose
+// subject it reached: silence about a subject the scan never reached proves nothing.
+// Only a scan that ran to the end may call it.
+func (s *standing) clearUnseen(kind string, quiet bool, reached func(subject string) bool) {
 	if s == nil {
 		return
 	}
 	for key := range s.conditions {
-		if _, ok := s.seen[key]; key.kind != kind || ok {
+		if _, ok := s.seen[key]; key.kind != kind || ok || !reached(key.subject) {
 			continue
 		}
 		if quiet {

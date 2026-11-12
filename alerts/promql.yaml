@@ -191,7 +191,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "No cert-converter scan finished healthy in time"
+          summary: "cert-converter scans have stalled"
           description: >
             No scan finished healthy by the exported deadline, or, with
             deadline 0, none finished in 13h. Failing scans cross it too: check

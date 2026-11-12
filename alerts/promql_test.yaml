@@ -352,7 +352,7 @@ tests:
               job: cert-converter
               instance: cc:9468
             exp_annotations:
-              summary: "No cert-converter scan finished healthy in time"
+              summary: "cert-converter scans have stalled"
               description: "No scan finished healthy by the exported deadline, or, with deadline 0, none finished in 13h. Failing scans cross it too: check other cert-converter alerts first. Otherwise the watch loop is likely wedged: restart the container and check inotify limits.\n"
       - eval_time: 105m
         alertname: CertConverterScanStalled
@@ -393,7 +393,7 @@ tests:
               job: cert-converter
               instance: cc:9468
             exp_annotations:
-              summary: "No cert-converter scan finished healthy in time"
+              summary: "cert-converter scans have stalled"
               description: "No scan finished healthy by the exported deadline, or, with deadline 0, none finished in 13h. Failing scans cross it too: check other cert-converter alerts first. Otherwise the watch loop is likely wedged: restart the container and check inotify limits.\n"
       - eval_time: 13h30m
         alertname: CertConverterScanStalled
@@ -420,7 +420,7 @@ tests:
               job: cert-converter
               instance: cc:9468
             exp_annotations:
-              summary: "No cert-converter scan finished healthy in time"
+              summary: "cert-converter scans have stalled"
               description: "No scan finished healthy by the exported deadline, or, with deadline 0, none finished in 13h. Failing scans cross it too: check other cert-converter alerts first. Otherwise the watch loop is likely wedged: restart the container and check inotify limits.\n"
 
   - name: CertConverterScanStalled never fires the deadline arm on a deadline of 0, with a scan every 6h
