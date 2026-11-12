@@ -1,7 +1,9 @@
 package process
 
 import (
+	"io/fs"
 	"path"
+	"strings"
 
 	"github.com/cplieger/cert-converter/internal/layout"
 )
@@ -12,6 +14,9 @@ import (
 type scanReach struct {
 	// listed is every /input directory the walk listed in full.
 	listed map[string]struct{}
+	// entered is every /input directory or symlink the walk enumerated, by the
+	// order it was enumerated in: a path under none of them is absent.
+	entered map[string]int
 	// unread is every /input path of a source the scan could not read to a verdict.
 	unread map[string]struct{}
 	// resolved is every artifact of a source whose every artifact was inspected
@@ -22,12 +27,20 @@ type scanReach struct {
 	whole bool
 }
 
-// list records that the walk is listing the /input directory dir.
-func (r *scanReach) list(dir string) {
-	if r.listed == nil {
+// enter records that the walk enumerated rel, whose entry is d: a directory is
+// listed until withdrawn or stopped inside.
+func (r *scanReach) enter(rel string, d fs.DirEntry) {
+	if !d.IsDir() && d.Type()&fs.ModeSymlink == 0 {
+		return
+	}
+	if r.entered == nil {
+		r.entered = make(map[string]int)
 		r.listed = make(map[string]struct{})
 	}
-	r.listed[dir] = struct{}{}
+	r.entered[rel] = len(r.entered)
+	if d.IsDir() {
+		r.listed[rel] = struct{}{}
+	}
 }
 
 // withdraw records that the walk could not read rel: a directory is not
@@ -40,15 +53,38 @@ func (r *scanReach) withdraw(rel string) {
 	r.unread[rel] = struct{}{}
 }
 
-// stop records that the walk ended at rel: every directory holding rel was
-// entered and not listed in full.
+// stop records that the walk ended at rel. The walk lists a directory's entries
+// before it walks any subdirectory, depth first in the order it enumerated them
+// (filesafe.WalkDirInRoot), so the directories it listed in full are those it
+// began before the one holding rel.
 func (r *scanReach) stop(rel string) {
-	for dir := path.Dir(rel); ; dir = path.Dir(dir) {
-		delete(r.listed, dir)
-		if dir == "." {
-			return
+	at := path.Dir(rel)
+	for dir := range r.listed {
+		if !r.walkedBefore(dir, at) {
+			delete(r.listed, dir)
 		}
 	}
+}
+
+// walkedBefore reports whether the walk began listing the directory dir before
+// the directory at: dir holds at, or dir's branch was enumerated first under the
+// directory holding both.
+func (r *scanReach) walkedBefore(dir, at string) bool {
+	switch {
+	case dir == at:
+		return false
+	case dir == ".":
+		return true
+	case at == ".":
+		return false
+	}
+	dirParts, atParts := strings.Split(dir, "/"), strings.Split(at, "/")
+	for i := range min(len(dirParts), len(atParts)) {
+		if dirParts[i] != atParts[i] {
+			return r.entered[strings.Join(dirParts[:i+1], "/")] < r.entered[strings.Join(atParts[:i+1], "/")]
+		}
+	}
+	return len(dirParts) < len(atParts)
 }
 
 // noteSource records how far the scan got with the source rel, whose artifacts
@@ -75,11 +111,21 @@ func (r *scanReach) noteSource(rel string, outcome conversionStatus, artifacts [
 }
 
 // input reports whether the scan reached the /input path subject: it listed the
-// directory holding it and read it to a verdict.
+// directory holding it and read it to a verdict, or it listed an ancestor whose
+// listing holds nothing on the way to it, so subject is absent.
 func (r *scanReach) input(subject string) bool {
-	_, listed := r.listed[path.Dir(subject)]
-	_, unread := r.unread[subject]
-	return listed && !unread
+	if _, unread := r.unread[subject]; unread {
+		return false
+	}
+	for child, dir := subject, path.Dir(subject); ; child, dir = dir, path.Dir(dir) {
+		if _, listed := r.listed[dir]; listed {
+			_, entered := r.entered[child]
+			return child == subject || !entered
+		}
+		if dir == "." {
+			return false
+		}
+	}
 }
 
 // output reports whether the scan resolved the artifact at the /output path subject.

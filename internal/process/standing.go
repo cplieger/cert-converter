@@ -112,21 +112,6 @@ func (s *standing) record(key standingKey, n int, state string, sources []string
 	return news
 }
 
-// sources maps the subject of every standing condition of kind to the sources
-// it was last reported for, in a new map whose slices the caller must not modify.
-func (s *standing) sources(kind string) map[string][]string {
-	if s == nil {
-		return nil
-	}
-	held := make(map[string][]string)
-	for key, since := range s.conditions {
-		if key.kind == kind {
-			held[key.subject] = since.sources
-		}
-	}
-	return held
-}
-
 // track reports a count condition: a positive n is reported, and a zero n
 // clears it when the scan's evidence can prove it gone (canClear).
 func (s *standing) track(key standingKey, n int, canClear bool) bool {

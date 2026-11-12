@@ -119,7 +119,11 @@ func (r *ScanResult) carryUnproven(prev *ScanResult, enumerated bool) {
 	r.Unreadable = max(r.Unreadable, prev.Unreadable)
 	r.Unresolved = max(r.Unresolved, prev.Unresolved)
 	r.Unwritable = max(r.Unwritable, prev.Unwritable)
-	r.Collided = max(r.Collided, prev.Collided)
+	// A scan that got as far as the claim ledger counts its own collisions
+	// (claimLedger); only an aborted one may not have.
+	if r.Outcome == OutcomeAborted {
+		r.Collided = max(r.Collided, prev.Collided)
+	}
 	r.OrphanRemovalDisabled = r.OrphanRemovalDisabled || prev.OrphanRemovalDisabled
 	r.PreviousLayoutRetained = r.PreviousLayoutRetained || prev.PreviousLayoutRetained
 }
@@ -196,7 +200,10 @@ type Scanner struct {
 	lastSweep    time.Time
 	observations *observationLog
 	standing     *standing
-	opts         Options
+	// claimants is every flat output stem's claimants as the last scan that ran
+	// the claim ledger left them (claimLedger).
+	claimants map[string][]string
+	opts      Options
 	// lastReported is the previous scan's result, what an incomplete scan carries.
 	lastReported ScanResult
 	// cleanupDegraded carries the last sweep's verdict to the scans between sweeps.
@@ -225,6 +232,7 @@ func New(opts *Options) *Scanner {
 		opts:         normalized,
 		observations: newObservationLog(normalized.MaxScanEntries),
 		standing:     newStanding(),
+		claimants:    make(map[string][]string),
 	}
 }
 
@@ -286,6 +294,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		out:                out,
 		observations:       s.observations,
 		standing:           s.standing,
+		claimants:          s.claimants,
 		bundleBudget:       convert.NewBundleWorkBudget(),
 		password:           s.opts.Password,
 		inputPassword:      s.opts.InputPassword,
@@ -444,6 +453,7 @@ type scanWalk struct {
 	pendingSources []string
 	observations   *observationLog
 	standing       *standing
+	claimants      map[string][]string
 	bundleBudget   *convert.BundleWorkBudget
 	enc            convert.EncoderType
 	layoutMode     outputpolicy.Layout
@@ -474,7 +484,6 @@ type scanWalk struct {
 // visit is the walk's per-entry callback (filesafe.WalkDirInRoot).
 func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err error) error {
 	if ctx.Err() != nil {
-		sw.reach.stop(rel)
 		return ctx.Err()
 	}
 	if err != nil {
@@ -502,9 +511,9 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 			"remediation", scanbudget.InputRemediation)
 		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.budget.Count(), rel)
 	}
+	// A directory is withdrawn by the error call above if its listing fails.
+	sw.reach.enter(rel, d)
 	if d.IsDir() {
-		// Withdrawn by the error call above if its listing fails.
-		sw.reach.list(rel)
 		sw.noteSourceShapedDir(rel)
 		return nil
 	}
@@ -623,7 +632,7 @@ func groupFlatClaims(sources []string) []flatClaim {
 }
 
 // stemLedger is one flat output stem's claimants: those this scan saw claim it,
-// and those a standing collision on the stem holds that the scan did not reach.
+// and the stored ones the scan did not reach.
 // A stem two or more claimants hold converts none of them: arbitrating by name,
 // age or expiry would silently publish one operator input as another's artifact.
 type stemLedger struct {
@@ -643,17 +652,24 @@ func (l *stemLedger) members() []string {
 }
 
 // claimLedger returns this scan's ledger of every flat stem named in claims or
-// held by a standing collision. A held claimant leaves only when the scan reached
-// it and did not see it claim the stem: being out of reach never removes one.
+// held by the stored ledger, and stores it for the next scan. A stored claimant
+// leaves only when the scan reached it and did not see it claim the stem: being
+// out of reach never removes one.
 func (sw *scanWalk) claimLedger(claims []flatClaim) []stemLedger {
-	held := sw.standing.sources(condCollision)
-	ledgers := make([]stemLedger, 0, len(claims)+len(held))
+	unclaimed := maps.Clone(sw.claimants)
+	ledgers := make([]stemLedger, 0, len(claims)+len(unclaimed))
 	for _, claim := range claims {
-		ledgers = append(ledgers, stemLedger{stem: claim.stem, seen: claim.sources, unreached: sw.outOfReach(held[claim.stem], claim.sources)})
-		delete(held, claim.stem)
+		ledgers = append(ledgers, stemLedger{stem: claim.stem, seen: claim.sources, unreached: sw.outOfReach(sw.claimants[claim.stem], claim.sources)})
+		delete(unclaimed, claim.stem)
 	}
-	for _, stem := range slices.Sorted(maps.Keys(held)) {
-		ledgers = append(ledgers, stemLedger{stem: stem, unreached: sw.outOfReach(held[stem], nil)})
+	for _, stem := range slices.Sorted(maps.Keys(unclaimed)) {
+		ledgers = append(ledgers, stemLedger{stem: stem, unreached: sw.outOfReach(unclaimed[stem], nil)})
+	}
+	clear(sw.claimants)
+	for i := range ledgers {
+		if members := ledgers[i].members(); len(members) > 0 {
+			sw.claimants[ledgers[i].stem] = members
+		}
 	}
 	return ledgers
 }
@@ -748,7 +764,7 @@ func (sw *scanWalk) recordCollisions(ctx context.Context, ledgers []stemLedger) 
 			continue
 		}
 		members := ledger.members()
-		if !sw.standing.reportFor(key, len(members), members) {
+		if !sw.standing.report(key, len(members)) {
 			slog.Debug(collisionMsg, "output_stem", logtext.Path(ledger.stem), "count", len(members))
 		} else {
 			slog.Error(collisionMsg,
