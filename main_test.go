@@ -293,8 +293,8 @@ func TestScanAndSetHealth_cancelled_context_leaves_marker_untouched(t *testing.T
 
 // TestDispatchArgs pins the argv policy behind the runProbe seam: the watch
 // subcommand starts the watcher, the health subcommand probes the marker at
-// /dev/shm/cert-converter.healthy, and everything else — an unrecognized
-// argument, a trailing operand, or a bare argv with no subcommand at all — is a
+// /dev/shm/cert-converter.healthy, and everything else (an unrecognized
+// argument, a trailing operand, or a bare argv with no subcommand at all) is a
 // usage error that never probes and never starts a watcher. The usage error is
 // written to stderr, so argv dispatch must emit no log records at all. No
 // t.Parallel: it swaps the package-level runProbe var and slog.Default().
