@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -22,42 +23,58 @@ func testReporter() *scanreport.Reporter {
 	return reporter
 }
 
-// TestStartMetrics_unset_opens_no_listener pins the default: with
-// METRICS_LISTEN_ADDR unset the image opens no port, as before the setting existed.
-// Serial: it swaps the listenTCP seam.
-func TestStartMetrics_unset_opens_no_listener(t *testing.T) {
-	calls := 0
-	prev := listenTCP
-	listenTCP = func(network, addr string) (net.Listener, error) {
-		calls++
-		return prev(network, addr)
-	}
-	t.Cleanup(func() { listenTCP = prev })
-
-	reg, _ := newMetrics()
+// TestStartMetrics_logs_strays_but_not_scrapes pins the listener's access log: a
+// scrape or a /healthz probe repeats one standing state, so it logs at Debug and
+// never fills the INFO log, while a request for any other path is one INFO
+// event an operator can see. Serial: it swaps slog.Default().
+func TestStartMetrics_logs_strays_but_not_scrapes(t *testing.T) {
+	rec := capture.Default(t)
+	addr := freeAddr(t)
 	ctx, cancel := context.WithCancel(t.Context())
-	wait, err := startMetrics(ctx, "", reg, http.NotFoundHandler())
-	cancel()
+	reg, _ := newMetrics()
+	wait, err := startMetrics(ctx, addr, reg, http.NotFoundHandler())
 	if err != nil {
-		t.Fatalf("startMetrics(unset) = %v, want nil", err)
+		cancel()
+		t.Fatalf("startMetrics(%s) = %v", addr, err)
 	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, path := range []string{"/metrics", "/healthz", "/stray"} {
+		resp, err := client.Get("http://" + addr + path)
+		if err != nil {
+			cancel()
+			wait()
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		_ = resp.Body.Close()
+	}
+	// The shutdown waits for every handler, so each access line is written.
+	cancel()
 	wait()
-	if calls != 0 {
-		t.Errorf("startMetrics(unset) bound %d listeners, want 0: an unset address opens no port", calls)
+
+	lines := map[slog.Level][]string{}
+	for _, r := range rec.Records() {
+		if r.Message != "http" {
+			continue
+		}
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "path" {
+				lines[r.Level] = append(lines[r.Level], a.Value.String())
+			}
+			return true
+		})
+	}
+	if got, want := lines[slog.LevelDebug], []string{"/metrics", "/healthz"}; !slices.Equal(got, want) {
+		t.Errorf("Debug access lines = %q, want %q", got, want)
+	}
+	if got, want := lines[slog.LevelInfo], []string{"/stray"}; !slices.Equal(got, want) {
+		t.Errorf("INFO access lines = %q, want %q", got, want)
 	}
 }
 
 // TestStartMetrics_serves_the_page_on_GET pins the route: GET /metrics answers the
 // registry's page and any other method is refused.
 func TestStartMetrics_serves_the_page_on_GET(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	if err := ln.Close(); err != nil {
-		t.Fatal(err)
-	}
+	addr := freeAddr(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	reg, _ := newMetrics()
 	wait, err := startMetrics(ctx, addr, reg, http.NotFoundHandler())

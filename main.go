@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -75,37 +74,18 @@ func newMetrics() (*measure.Registry, *scanreport.Reporter) {
 	return reg, scanreport.NewReporter(reg)
 }
 
-// listenTCP is a seam so a test can see that an unset address opens nothing.
-var listenTCP = net.Listen
-
-// Timeouts for the metrics page: a scrape reads one small page, so a slow client
-// is cut off rather than held.
-const (
-	metricsReadTimeout  = 10 * time.Second
-	metricsWriteTimeout = 30 * time.Second
-)
-
 // startMetrics binds addr and serves reg's page and healthz on it until ctx
 // ends; wait blocks until the server has shut down. An empty addr opens no
 // listener.
 func startMetrics(ctx context.Context, addr string, reg *measure.Registry, healthz http.Handler) (wait func(), err error) {
-	if addr == "" {
-		return func() {}, nil
-	}
-	ln, err := listenTCP("tcp", addr)
+	ms, err := httpserver.ListenMetrics(ctx, addr, httpserver.MetricsHandlers{Metrics: reg.Handler(), Healthz: healthz})
 	if err != nil {
 		return nil, err
 	}
-	mux := http.NewServeMux()
-	mux.Handle("GET /metrics", reg.Handler())
-	mux.Handle("GET /healthz", healthz)
-	srv := httpserver.New(mux)
-	srv.ReadTimeout = metricsReadTimeout
-	srv.WriteTimeout = metricsWriteTimeout
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := httpserver.Run(ctx, srv, ln); err != nil {
+		if err := ms.Serve(ctx); err != nil {
 			slog.Error("metrics listener stopped", "address", logtext.Path(addr), "error", logtext.Path(err.Error()))
 		}
 	}()
