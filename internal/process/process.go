@@ -375,7 +375,8 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 
 // reportVerdict derives the scan's verdicts from what the walk, the reaper and
 // the last sweep found, then logs the standing conditions that changed. Only a
-// scan that ran to the end can prove a per-path condition gone.
+// scan that ran to the end can prove a per-path condition gone, and only one that
+// also saw every /input path can prove a condition under that path gone.
 func (s *Scanner) reportVerdict(result *ScanResult, out *store, expected map[string]struct{}, walkErr error) {
 	result.Outcome = outcomeOf(walkErr)
 	result.OrphanRemovalDisabled = out.reapDisabled
@@ -397,13 +398,15 @@ func (s *Scanner) reportVerdict(result *ScanResult, out *store, expected map[str
 		return
 	}
 	s.standing.clearUnseen(condCollision, false)
-	s.standing.clearUnseen(condUnwritable, false)
 	s.standing.clearUnseen(condUnresolvedSymlink, false)
-	s.standing.clearUnseen(condConversionFailed, false)
-	out.clearUnmanaged(expected)
 	// The aggregate unreadable_paths condition reports the clear; its per-path
 	// detail goes quietly.
 	s.standing.clearUnseen(condUnreadablePath, true)
+	if wholeTree {
+		s.standing.clearUnseen(condUnwritable, false)
+		s.standing.clearUnseen(condConversionFailed, false)
+		out.clearUnmanaged(expected)
+	}
 }
 
 // outcomeOf classifies the error a scan ended with.

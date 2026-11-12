@@ -11,6 +11,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 const unreadablePathsMsg = "some /input paths were unreadable and were skipped; health is unaffected"
@@ -290,6 +291,117 @@ func TestScannerRun_keeps_a_conversion_failure_through_an_incomplete_scan(t *tes
 	}
 	if logs.HasAttr(standingClearedMsg, "condition", "conversion_failed") {
 		t.Errorf("a budget-stopped scan cleared a failure it never reached; log = %q", logs.Messages())
+	}
+}
+
+// countClears counts the clear records naming condition kind.
+func countClears(logs *capture.Recorder, kind string) int {
+	n := 0
+	for _, got := range logs.AttrValuesExact(standingClearedMsg, "condition") {
+		if got == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// TestScannerRun_keeps_per_path_conditions_through_a_hidden_subtree pins the
+// incomplete scan that ends without an error: a subtree behind an unresolvable
+// symlink keeps its failure and its permissive artifact, and the scan that sees
+// it again clears only what is gone.
+// Serial: it swaps slog.Default().
+func TestScannerRun_keeps_per_path_conditions_through_a_hidden_subtree(t *testing.T) {
+	base := t.TempDir()
+	in, outside, out := filepath.Join(base, "input"), filepath.Join(base, "outside"), t.TempDir()
+	site := filepath.Join(in, "site")
+	for _, dir := range []string{in, outside, site} {
+		if err := os.Mkdir(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSelfSignedPair(t, in, "live")
+	writeSelfSignedPair(t, site, "cert")
+	writeBrokenPair(t, site, "broken", "not base64")
+	logs := captureLogs(t)
+	scanner := newVerdictScanner(in, out, Options{})
+	runScans(t, scanner, 1)
+	chmodOrSkip(t, filepath.Join(out, "site", "cert.pfx"), 0o640)
+	runScans(t, scanner, 1)
+	if !logs.HasAttr(permissiveFileLine, "path", "site/cert.pfx") || !logs.HasAttr(conversionFailedLine, "path", "site/broken.crt") {
+		t.Fatalf("setup: the failure and the permissive artifact were not both reported; log = %q", logs.Messages())
+	}
+
+	hidden := filepath.Join(outside, "site")
+	if err := os.Rename(site, hidden); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(hidden, site); err != nil {
+		t.Fatal(err)
+	}
+	if res := runScans(t, scanner, 1); res.Unresolved != 1 {
+		t.Fatalf("setup: Unresolved = %d, want 1: the subtree must be hidden behind the link", res.Unresolved)
+	}
+	for _, kind := range []string{condConversionFailed, condPermissiveFile} {
+		if got := countClears(logs, kind); got != 0 {
+			t.Errorf("a scan that could not reach the subtree logged %d %s clears, want 0; log = %q", got, kind, logs.Messages())
+		}
+	}
+
+	if err := os.Remove(site); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(hidden, site); err != nil {
+		t.Fatal(err)
+	}
+	writeSelfSignedPair(t, site, "broken")
+	if res := runScans(t, scanner, 1); res.Failed != 0 || res.Unresolved != 0 {
+		t.Fatalf("setup: the restored tree scan = %+v, want no failure and nothing unresolved", res)
+	}
+	if got := countClears(logs, condConversionFailed); got != 1 {
+		t.Errorf("the fixed source logged %d conversion_failed clears, want 1", got)
+	}
+	if got := countClears(logs, condPermissiveFile); got != 0 {
+		t.Errorf("the still-permissive artifact logged %d clears, want 0", got)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, permissiveFileLine); got != 1 {
+		t.Errorf("the permissive artifact was reported %d times in total, want 1: it held throughout", got)
+	}
+}
+
+// TestReportVerdict_clears_per_path_conditions_only_after_a_whole_tree_scan pins
+// the gate for every per-path condition a skipped /input path can hide.
+// Serial: it swaps slog.Default().
+func TestReportVerdict_clears_per_path_conditions_only_after_a_whole_tree_scan(t *testing.T) {
+	held := []standingKey{
+		{kind: condConversionFailed, subject: "site/a.crt"},
+		{kind: condUnwritable, subject: "site/a.pfx"},
+		{kind: condPermissiveFile, subject: "site/b.pfx"},
+		{kind: condPermissiveDir, subject: "site"},
+	}
+	for name, tc := range map[string]struct {
+		result      ScanResult
+		wantCleared bool
+	}{
+		"an unresolved symlink hid part of the tree": {result: ScanResult{Unresolved: 1}},
+		"an unreadable path hid part of the tree":    {result: ScanResult{Unreadable: 1}},
+		"an entry vanished during the walk":          {result: ScanResult{Vanished: 1}},
+		"the scan saw the whole tree":                {wantCleared: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			logs := captureLogs(t)
+			s := newVerdictScanner(t.TempDir(), t.TempDir(), Options{})
+			for _, key := range held {
+				s.standing.report(key, 1)
+			}
+			s.standing.beginScan()
+			result := tc.result
+			s.reportVerdict(&result, &store{standing: s.standing}, map[string]struct{}{}, nil)
+			for _, key := range held {
+				if cleared := countClears(logs, key.kind) == 1; cleared != tc.wantCleared {
+					t.Errorf("%s cleared = %v, want %v; log = %q", key.kind, cleared, tc.wantCleared, logs.Messages())
+				}
+			}
+		})
 	}
 }
 
