@@ -67,11 +67,19 @@ func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, reporter *s
 // metricsPrefix names every cert-converter series on the metrics page.
 const metricsPrefix = "cert_converter"
 
+// version is the release this binary was built from, stamped by the Dockerfile's
+// BUILD_VERSION; an unstamped build reports "dev".
+var version = "dev"
+
 // newMetrics builds the registry run serves, with the scan metrics on it. The
 // scan deadline's gap is the health lease, so CertConverterScanStalled and the
 // stale /healthz check judge the same moment.
 func newMetrics(fallback time.Duration) (*measure.Registry, *scanreport.Reporter) {
 	reg := measure.NewRegistry(metricsPrefix)
+	buildInfo := measure.NewLabeledGauge("build_info",
+		"Always 1; the version label is the cert-converter release this process runs.", []string{"version"})
+	reg.MustRegister(buildInfo)
+	buildInfo.Set(1, version)
 	return reg, scanreport.NewReporter(reg, healthLease(fallback))
 }
 

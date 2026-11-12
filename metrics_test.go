@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -110,6 +111,24 @@ func TestStartMetrics_serves_the_page_on_GET(t *testing.T) {
 	_ = post.Body.Close()
 	if post.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("POST /metrics = %d, want 405", post.StatusCode)
+	}
+}
+
+// TestNewMetrics_serves_build_info pins the series a query joins on to find the
+// release a target runs: one line at 1, labelled with the stamped version.
+func TestNewMetrics_serves_build_info(t *testing.T) {
+	t.Parallel()
+	reg, _ := newMetrics(0)
+	rec := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", http.NoBody))
+	var lines []string
+	for line := range strings.SplitSeq(rec.Body.String(), "\n") {
+		if strings.HasPrefix(line, "cert_converter_build_info") {
+			lines = append(lines, line)
+		}
+	}
+	if want := `cert_converter_build_info{version="` + version + `"} 1`; !slices.Equal(lines, []string{want}) {
+		t.Errorf("build_info lines = %q, want [%q]", lines, want)
 	}
 }
 
