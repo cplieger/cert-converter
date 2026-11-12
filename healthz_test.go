@@ -7,13 +7,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/config"
-	"github.com/cplieger/go/health"
+	"github.com/cplieger/go/health/v2"
 )
 
 // healthzBody is the JSON body every cplieger /healthz answers with.
@@ -22,21 +21,15 @@ type healthzBody struct {
 	Reasons []string `json:"reasons"`
 }
 
-// markerState puts a test marker in a state: written by a clean scan (fresh),
-// removed by a failed one (failed), or written age ago (aged).
-func markerState(t *testing.T, marker *health.Marker, path, state string, age time.Duration) {
+// markerState puts a test verdict in a state: set by a clean scan (fresh) or
+// by a failed one (failed).
+func markerState(t *testing.T, st *health.Status, state string) {
 	t.Helper()
 	switch state {
 	case "fresh":
-		marker.Set(true)
+		st.Set(true)
 	case "failed":
-		marker.Set(false)
-	case "aged":
-		marker.Set(true)
-		aged := time.Now().Add(-age)
-		if err := os.Chtimes(path, aged, aged); err != nil {
-			t.Fatal(err)
-		}
+		st.Set(false)
 	default:
 		t.Fatalf("unknown marker state %q", state)
 	}
@@ -56,16 +49,16 @@ func freeAddr(t *testing.T) string {
 }
 
 // TestStartMetrics_serves_healthz pins the route on METRICS_LISTEN_ADDR: GET
-// and HEAD answer 200 with {"status":"ok"} on a fresh marker, 503 with one
-// reason per fault on a failed or a stale marker, and any other method gets 405.
+// and HEAD answer 200 with {"status":"ok"} on a fresh verdict, 503 with one
+// reason on a failed one, and any other method gets 405. The stale verdict
+// needs a fake clock, so TestHealthz_names_each_fault covers it.
 // Serial: it reads FALLBACK_SCAN_HOURS.
 func TestStartMetrics_serves_healthz(t *testing.T) {
 	t.Setenv("FALLBACK_SCAN_HOURS", "")
-	path := filepath.Join(t.TempDir(), ".healthy")
-	marker := health.NewMarker(path)
+	marker := health.NewStatus()
 	addr := freeAddr(t)
 	ctx, cancel := context.WithCancel(t.Context())
-	reg, _ := newMetrics()
+	reg, _ := newMetrics(0)
 	wait, err := startMetrics(ctx, addr, reg, newHealthz(marker, config.FallbackInterval()))
 	if err != nil {
 		cancel()
@@ -96,9 +89,6 @@ func TestStartMetrics_serves_healthz(t *testing.T) {
 		return resp.StatusCode, resp.Header, body
 	}
 
-	// The default 6-hour cadence gives an 18-hour lease.
-	const pastLease = 19 * time.Hour
-	reasons := map[string]string{}
 	for _, tc := range []struct {
 		name       string
 		state      string
@@ -107,10 +97,9 @@ func TestStartMetrics_serves_healthz(t *testing.T) {
 	}{
 		{"fresh", "fresh", http.StatusOK, "ok"},
 		{"failed", "failed", http.StatusServiceUnavailable, "unhealthy"},
-		{"stale", "aged", http.StatusServiceUnavailable, "unhealthy"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			markerState(t, marker, path, tc.state, pastLease)
+			markerState(t, marker, tc.state)
 			code, header, body := get(t)
 			if code != tc.wantCode || body.Status != tc.wantStatus {
 				t.Errorf("GET /healthz on a %s marker = %d %q, want %d %q", tc.name, code, body.Status, tc.wantCode, tc.wantStatus)
@@ -129,17 +118,12 @@ func TestStartMetrics_serves_healthz(t *testing.T) {
 				t.Errorf("GET /healthz on a fresh marker lists reasons %q, want none", body.Reasons)
 			case tc.wantCode != http.StatusOK && len(body.Reasons) != 1:
 				t.Errorf("GET /healthz on a %s marker lists reasons %q, want exactly one", tc.name, body.Reasons)
-			case tc.wantCode != http.StatusOK:
-				reasons[tc.name] = body.Reasons[0]
 			}
 		})
 	}
-	if reasons["failed"] == reasons["stale"] {
-		t.Errorf("a failed and a stale marker both report %q, want a reason naming each fault", reasons["failed"])
-	}
 
 	t.Run("HEAD", func(t *testing.T) {
-		markerState(t, marker, path, "fresh", 0)
+		markerState(t, marker, "fresh")
 		resp, err := client.Head(url)
 		if err != nil {
 			t.Fatalf("HEAD /healthz: %v", err)
@@ -161,52 +145,77 @@ func TestStartMetrics_serves_healthz(t *testing.T) {
 	})
 }
 
-// TestHealthz_agrees_with_the_health_subcommand pins one verdict for two
-// readers: for a fresh, a failed, a stale and a not yet stale marker, /healthz answers 200
-// exactly when `cert-watcher health` exits 0, at the default cadence and when
-// FALLBACK_SCAN_HOURS=0 selects the 24-hour floor.
+// healthzVerdict answers one GET /healthz on h.
+func healthzVerdict(t *testing.T, h http.Handler) (int, healthzBody) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	var body healthzBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("GET /healthz body %q is not JSON: %v", rec.Body.Bytes(), err)
+	}
+	return rec.Code, body
+}
+
+// TestHealthz_names_each_fault pins that a failed scan and a watch loop that
+// stopped refreshing a healthy verdict each answer 503 with one reason of their
+// own. Serial: it reads FALLBACK_SCAN_HOURS.
+func TestHealthz_names_each_fault(t *testing.T) {
+	t.Setenv("FALLBACK_SCAN_HOURS", "")
+	synctest.Test(t, func(t *testing.T) {
+		st := health.NewStatus()
+		h := newHealthz(st, config.FallbackInterval())
+
+		st.Set(false)
+		code, failed := healthzVerdict(t, h)
+		if code != http.StatusServiceUnavailable || len(failed.Reasons) != 1 {
+			t.Fatalf("GET /healthz after a failed scan = %d %q, want 503 with one reason", code, failed.Reasons)
+		}
+
+		st.Set(true)
+		// The default 6-hour cadence gives an 18-hour lease.
+		time.Sleep(19 * time.Hour)
+		code, stale := healthzVerdict(t, h)
+		if code != http.StatusServiceUnavailable || len(stale.Reasons) != 1 {
+			t.Fatalf("GET /healthz 19h after the last clean scan = %d %q, want 503 with one reason", code, stale.Reasons)
+		}
+		if failed.Reasons[0] == stale.Reasons[0] {
+			t.Errorf("a failed and a stale verdict both report %q, want a reason naming each fault", stale.Reasons[0])
+		}
+	})
+}
+
+// TestHealthz_agrees_with_the_health_subcommand pins one deadline for two
+// readers: /healthz turns 503 once the last clean scan is older than the lease
+// the health subcommand gives the probe, and not before, at the default cadence
+// and when FALLBACK_SCAN_HOURS=0 selects the 24-hour floor.
 // Serial: it swaps runProbe and sets FALLBACK_SCAN_HOURS.
 func TestHealthz_agrees_with_the_health_subcommand(t *testing.T) {
-	for _, cadence := range []struct {
-		fallbackHours string
-		lease         time.Duration
-	}{
-		{"", 18 * time.Hour},
-		{"0", 72 * time.Hour},
-	} {
-		for _, tc := range []struct {
-			state    string
-			age      time.Duration
-			wantCode int
-		}{
-			{"fresh", 0, http.StatusOK},
-			{"aged", cadence.lease - time.Hour, http.StatusOK},
-			{"failed", 0, http.StatusServiceUnavailable},
-			{"aged", cadence.lease + time.Hour, http.StatusServiceUnavailable},
-		} {
-			name := "FALLBACK_SCAN_HOURS=" + cadence.fallbackHours + " " + tc.state + " " + tc.age.String()
-			t.Run(name, func(t *testing.T) {
-				t.Setenv("FALLBACK_SCAN_HOURS", cadence.fallbackHours)
-				var probeOpts []health.ProbeOption
-				prev := runProbe
-				runProbe = func(_ string, opts ...health.ProbeOption) { probeOpts = opts }
-				t.Cleanup(func() { runProbe = prev })
-				_ = dispatchArgs([]string{"cert-watcher", healthSubcommand})
+	for _, fallbackHours := range []string{"", "0"} {
+		t.Run("FALLBACK_SCAN_HOURS="+fallbackHours, func(t *testing.T) {
+			t.Setenv("FALLBACK_SCAN_HOURS", fallbackHours)
+			var probeLease time.Duration
+			prev := runProbe
+			runProbe = func(_ string, maxAge time.Duration) { probeLease = maxAge }
+			t.Cleanup(func() { runProbe = prev })
+			_ = dispatchArgs([]string{"cert-watcher", healthSubcommand})
+			if probeLease <= 0 {
+				t.Fatalf("the health subcommand armed no lease (%v)", probeLease)
+			}
 
-				path := filepath.Join(t.TempDir(), ".healthy")
-				marker := health.NewMarker(path)
-				markerState(t, marker, path, tc.state, tc.age)
-
-				rec := httptest.NewRecorder()
-				newHealthz(marker, config.FallbackInterval()).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-				probeHealthy := health.Inspect(path, probeOpts...).Healthy()
-				if rec.Code != tc.wantCode {
-					t.Errorf("/healthz = %d, want %d", rec.Code, tc.wantCode)
+			synctest.Test(t, func(t *testing.T) {
+				st := health.NewStatus()
+				h := newHealthz(st, config.FallbackInterval())
+				st.Set(true)
+				time.Sleep(probeLease - time.Minute)
+				if code, body := healthzVerdict(t, h); code != http.StatusOK {
+					t.Errorf("/healthz a minute inside the probe's %v lease = %d %q, want 200", probeLease, code, body.Reasons)
 				}
-				if probeHealthy != (rec.Code == http.StatusOK) {
-					t.Errorf("/healthz = %d but cert-watcher health reads healthy = %v: the two readers disagree", rec.Code, probeHealthy)
+				time.Sleep(2 * time.Minute)
+				if code, _ := healthzVerdict(t, h); code != http.StatusServiceUnavailable {
+					t.Errorf("/healthz a minute past the probe's %v lease = %d, want 503", probeLease, code)
 				}
 			})
-		}
+		})
 	}
 }

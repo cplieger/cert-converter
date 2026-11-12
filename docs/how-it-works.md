@@ -26,11 +26,11 @@ When two inputs would produce the same output name, cert-converter converts neit
 
 ## Health
 
-After each scan with no conversion failure and no output-name collision, the main process writes a marker file at `/tmp/.healthy`. The `health` subcommand passes while that marker exists and is fresher than three times the guaranteed recheck cadence. That is 18 hours on the 6-hour default, and 72 hours when `FALLBACK_SCAN_HOURS` is `0`, `false` or above 24, because the 24-hour floor applies then. A staler marker means the watch loop is stuck. The startup line reports both numbers, `fallback_scan` for your cadence or `disabled`, and `scan_floor` for the guaranteed one the deadline comes from.
+After each scan, the main process keeps its health verdict in memory: healthy when the scan read `/input` and had no conversion failure and no output-name collision. It mirrors that verdict to a file at `/dev/shm/cert-converter.healthy`, refreshing the file after each healthy scan and removing it after an unhealthy one. The `health` subcommand passes while that file exists and is fresher than three times the guaranteed recheck cadence. That is 18 hours on the 6-hour default, and 72 hours when `FALLBACK_SCAN_HOURS` is `0`, `false` or above 24, because the 24-hour floor applies then. A staler file means the watch loop is stuck. The startup line reports both numbers, `fallback_scan` for your cadence or `disabled`, and `scan_floor` for the guaranteed one the deadline comes from.
 
-With `METRICS_LISTEN_ADDR` set, `/healthz` reads the same marker against the same deadline, so it and the healthcheck agree while the marker can be written. [Knowing the app is alive](monitoring.md#knowing-the-app-is-alive) covers an unwritable `/tmp`.
+With `METRICS_LISTEN_ADDR` set, `/healthz` reads the verdict in memory against the same deadline, so it and the healthcheck agree while the file can be written. If `/dev/shm` cannot be written, the healthcheck passes and the startup log says so, while `/healthz` still gives the true answer.
 
-A restart clears the marker until the first scan completes. That scan reads every output back and rewrites only the ones that no longer match their source, so a restart costs one read pass and no writes.
+A restart removes the file until the first scan completes. That scan reads every output back and rewrites only the ones that no longer match their source, so a restart costs one read pass and no writes.
 
 The container is unhealthy when any of these holds:
 

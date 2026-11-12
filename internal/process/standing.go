@@ -26,6 +26,9 @@ const (
 	condUnwritable         = "unwritable_output"
 	condUnreadablePath     = "unreadable_path"
 	condUnresolvedSymlink  = "unresolved_symlink"
+	condConversionFailed   = "conversion_failed"
+	condPermissiveDir      = "permissive_output_dir"
+	condPermissiveFile     = "permissive_output_file"
 )
 
 // standingClearedMsg ends a standing condition, with how long it held.
@@ -39,8 +42,8 @@ var subjectAttr = map[string]string{
 }
 
 // standing remembers the standing conditions this process has reported, so a
-// reader sees each one when it appears, again when its count changes, and once
-// when it clears, instead of on every scan. A restart starts with none, so the
+// reader sees each one when it appears, again when its count or state changes,
+// and once when it clears, instead of on every scan. A restart starts with none, so the
 // new process reports every condition that still holds once more.
 type standing struct {
 	conditions map[standingKey]standingSince
@@ -51,7 +54,10 @@ type standing struct {
 
 type standingSince struct {
 	since time.Time
-	count int
+	state string
+	// sources is the /input sources the condition was last reported for.
+	sources []string
+	count   int
 }
 
 // standingClock is indirected so a test can move the lasted duration.
@@ -76,20 +82,49 @@ func (s *standing) beginScan() {
 //
 // A nil standing remembers nothing, so every report is news.
 func (s *standing) report(key standingKey, n int) bool {
+	return s.reportState(key, n, "")
+}
+
+// reportState is report for a condition whose state, such as a mode or a cause,
+// is news when it changes too.
+func (s *standing) reportState(key standingKey, n int, state string) bool {
+	return s.record(key, n, state, nil)
+}
+
+// reportFor is report for a condition the /input sources cause; they are kept
+// until the next report or the clear, and a change in them is not news.
+func (s *standing) reportFor(key standingKey, n int, sources []string) bool {
+	return s.record(key, n, "", sources)
+}
+
+func (s *standing) record(key standingKey, n int, state string, sources []string) bool {
 	if s == nil {
 		return true
 	}
 	s.seen[key] = struct{}{}
 	held, ok := s.conditions[key]
-	if ok && held.count == n {
-		return false
-	}
+	news := !ok || held.count != n || held.state != state
 	if !ok {
 		held.since = standingClock()
 	}
-	held.count = n
+	held.count, held.state, held.sources = n, state, sources
 	s.conditions[key] = held
-	return true
+	return news
+}
+
+// unseenSources maps the subject of every standing condition of kind this scan
+// has not reported to the sources it was last reported for.
+func (s *standing) unseenSources(kind string) map[string][]string {
+	if s == nil {
+		return nil
+	}
+	held := make(map[string][]string)
+	for key, since := range s.conditions {
+		if _, ok := s.seen[key]; key.kind == kind && !ok {
+			held[key.subject] = since.sources
+		}
+	}
+	return held
 }
 
 // track reports a count condition: a positive n is reported, and a zero n
@@ -122,14 +157,15 @@ func (s *standing) clear(key standingKey) {
 	slog.Info(standingClearedMsg, attrs...)
 }
 
-// clearUnseen ends every condition of kind this scan did not report. Only a scan
-// that saw the whole tree may call it: a partial scan's silence proves nothing.
-func (s *standing) clearUnseen(kind string, quiet bool) {
+// clearUnseen ends every condition of kind this scan did not report and whose
+// subject or sources it reached: silence about a subject the scan never reached
+// proves nothing. Only a scan that ran to the end may call it.
+func (s *standing) clearUnseen(kind string, quiet bool, reached func(subject string, sources []string) bool) {
 	if s == nil {
 		return
 	}
-	for key := range s.conditions {
-		if _, ok := s.seen[key]; key.kind != kind || ok {
+	for key, held := range s.conditions {
+		if _, ok := s.seen[key]; key.kind != kind || ok || !reached(key.subject, held.sources) {
 			continue
 		}
 		if quiet {
@@ -137,5 +173,18 @@ func (s *standing) clearUnseen(kind string, quiet bool) {
 			continue
 		}
 		s.clear(key)
+	}
+}
+
+// clearUnless ends every condition of kind whose subject fails holds. Only a
+// scan that saw the whole tree may call it.
+func (s *standing) clearUnless(kind string, holds func(subject string) bool) {
+	if s == nil {
+		return
+	}
+	for key := range s.conditions {
+		if key.kind == kind && !holds(key.subject) {
+			s.clear(key)
+		}
 	}
 }

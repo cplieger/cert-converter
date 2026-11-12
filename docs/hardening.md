@@ -36,15 +36,9 @@ Add these lines to the quick start service. [Hardening a compose file](https://g
       - ALL
     security_opt:
       - no-new-privileges:true
-    tmpfs:
-      - "/tmp:size=1m,mode=1777,noexec,nosuid,nodev"
 ```
 
-With `read_only: true`, the health marker still needs a writable `/tmp`, and the tmpfs supplies it. One megabyte is ample, because the marker is the only thing cert-converter writes outside `/output`.
-
-## Accepted scanner finding
-
-semgrep flags the fixed `/tmp/.healthy` marker path as a predictable temporary file. It is a contract between the main process and the `health` probe inside the container's own filesystem, not shared state an attacker can create first. Live scan results are on the repository's Security tab.
+With `read_only: true`, cert-converter writes to two places. Converted files go to the `/output` mount. The health file goes to `/dev/shm`, which stays writable under a read-only root, so no tmpfs is needed. If `/dev/shm` cannot be written, as under `ipc: none`, the healthcheck passes and the startup log says so, while `/healthz` on the metrics listener still gives the true answer.
 
 ## What the image contains
 

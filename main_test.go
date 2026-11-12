@@ -16,10 +16,9 @@ import (
 	"github.com/cplieger/cert-converter/internal/mounts"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/process"
-	"github.com/cplieger/cert-converter/internal/scancadence"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/cert-converter/internal/watch"
-	"github.com/cplieger/go/health"
+	"github.com/cplieger/go/health/v2"
 	"github.com/cplieger/go/slogx/capture"
 )
 
@@ -56,12 +55,12 @@ func writeCertAndKey(t *testing.T, dir, base string, certPEM, keyPEM []byte) (cr
 
 // --- Tests: scanAndSetHealth ---
 
-// newTestMarker constructs a marker rooted in a fresh TempDir so tests
-// don't race on /tmp/.healthy.
-func newTestMarker(t *testing.T) (*health.Marker, string) {
+// newTestMarker builds a Status mirrored to a marker in a fresh TempDir, so
+// tests neither share nor touch the production marker path.
+func newTestMarker(t *testing.T) (*health.Status, string) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), ".healthy")
-	return health.NewMarker(path), path
+	path := filepath.Join(t.TempDir(), "cert-converter.healthy")
+	return health.NewStatus(health.WithMarker(path)), path
 }
 
 func TestScanAndSetHealth_sets_marker_after_failure_free_scan(t *testing.T) {
@@ -77,6 +76,9 @@ func TestScanAndSetHealth_sets_marker_after_failure_free_scan(t *testing.T) {
 
 	scanAndSetHealth(t.Context(), scanner, testReporter(), marker, false)
 
+	if !marker.Healthy() {
+		t.Error("the verdict should be healthy after a failure-free scan")
+	}
 	if _, err := os.Stat(markerPath); err != nil {
 		t.Errorf("health marker should exist after a failure-free scan: %v", err)
 	}
@@ -205,6 +207,9 @@ func TestScanAndSetHealth_clears_marker_after_conversion_failure(t *testing.T) {
 
 	scanAndSetHealth(t.Context(), scanner, testReporter(), marker, false)
 
+	if marker.Healthy() {
+		t.Error("the verdict should be unhealthy when a certificate conversion fails")
+	}
 	if _, err := os.Stat(markerPath); err == nil {
 		t.Error("health marker should be cleared when a certificate conversion fails")
 	}
@@ -288,12 +293,13 @@ func TestScanAndSetHealth_cancelled_context_leaves_marker_untouched(t *testing.T
 
 // TestDispatchArgs pins the argv policy behind the runProbe seam: the watch
 // subcommand starts the watcher, the health subcommand probes the marker at
-// health.DefaultPath, and everything else — an unrecognized argument, a
-// trailing operand, or a bare argv with no subcommand at all — is a usage error
-// that never probes and never starts a watcher. The usage error is written to
-// stderr, so argv dispatch must emit no log records at all. No t.Parallel: it
-// swaps the package-level runProbe var and slog.Default().
+// /dev/shm/cert-converter.healthy, and everything else (an unrecognized
+// argument, a trailing operand, or a bare argv with no subcommand at all) is a
+// usage error that never probes and never starts a watcher. The usage error is
+// written to stderr, so argv dispatch must emit no log records at all. No
+// t.Parallel: it swaps the package-level runProbe var and slog.Default().
 func TestDispatchArgs(t *testing.T) {
+	const wantPath = "/dev/shm/cert-converter.healthy"
 	for _, tc := range []struct {
 		name      string
 		args      []string
@@ -302,19 +308,13 @@ func TestDispatchArgs(t *testing.T) {
 	}{
 		{"watch starts the watcher", []string{"cert-watcher", "watch"}, false, continueToWatcher},
 		{"health probes the marker", []string{"cert-watcher", "health"}, true, continueToWatcher},
-		// A bare argv used to start the watcher, which made
-		// `docker exec <container> /cert-watcher` unlink the resident watcher's
-		// health marker and attach a SECOND watcher over the same /input and
-		// /output. The image's CMD supplies `watch`, so nothing legitimate
-		// invokes the binary without a subcommand.
+		// The image's CMD supplies `watch`, so nothing legitimate invokes the
+		// binary without a subcommand; a bare argv would otherwise remove the
+		// resident watcher's marker and attach a second watcher.
 		{"a bare argv is a usage error and never starts a watcher", []string{"cert-watcher"}, false, exitUsage},
-		// A typo used to WARN and fall through, which unlinked the resident
-		// watcher's health marker and started a second watcher over the same
-		// output tree. It is now a usage error that never reaches the marker.
 		{"typo is a usage error and never starts a watcher", []string{"cert-watcher", "helth"}, false, exitUsage},
-		// A subcommand plus a trailing operand used to enter the health case
-		// and probe while silently ignoring the extra argument. The subcommand
-		// must consume the whole of argv or the invocation is a usage error.
+		// The subcommand must consume the whole of argv or the invocation is a
+		// usage error.
 		{"health with a trailing argument is a usage error", []string{"cert-watcher", "health", "typo"}, false, exitUsage},
 		{"watch with a trailing argument is a usage error", []string{"cert-watcher", "watch", "typo"}, false, exitUsage},
 	} {
@@ -323,7 +323,7 @@ func TestDispatchArgs(t *testing.T) {
 
 			gotPath, probed := "", false
 			prev := runProbe
-			runProbe = func(path string, _ ...health.ProbeOption) {
+			runProbe = func(path string, _ time.Duration) {
 				probed, gotPath = true, path
 			}
 			t.Cleanup(func() { runProbe = prev })
@@ -333,8 +333,8 @@ func TestDispatchArgs(t *testing.T) {
 			if probed != tc.wantProbe {
 				t.Errorf("dispatchArgs(%q) probed = %v, want %v", tc.args, probed, tc.wantProbe)
 			}
-			if tc.wantProbe && gotPath != health.DefaultPath {
-				t.Errorf("dispatchArgs(%q) probed %q, want %q", tc.args, gotPath, health.DefaultPath)
+			if tc.wantProbe && gotPath != wantPath {
+				t.Errorf("dispatchArgs(%q) probed %q, want %q", tc.args, gotPath, wantPath)
 			}
 			if logs.Len() != 0 {
 				t.Errorf("dispatchArgs(%q) logged %v, want no log records: the usage error goes to stderr", tc.args, logs.Messages())
@@ -347,48 +347,32 @@ func TestDispatchArgs(t *testing.T) {
 }
 
 // TestDispatchArgs_arms_the_marker_lease pins the staleness deadline the health
-// subcommand hands the probe: three refresh floors — 18h on the default 6h cadence,
-// and three reconciliation floors when FALLBACK_SCAN_HOURS switches the routine
-// rescan off, because the watcher still reconciles on that floor and every
-// reconciliation refreshes the marker. A cadence ABOVE the floor is capped by the
-// same rule, so the config package's 10-year ceiling can no longer arm a deadline
-// that never expires.
-//
-// The disabled case is the one that changed: it used to disarm the deadline entirely
-// (WithMaxAge(0) is a no-op), which is what let a wedged watcher keep a container
-// healthy indefinitely. A marker past the lease must now fail, so both sides of that
-// boundary are asserted.
-//
-// The captured options are applied with health.Inspect to markers whose
-// mtimes straddle the deadline, so a wrong Cycles count or a dropped option fails
-// here rather than in production. No t.Parallel: it swaps runProbe and mutates
-// the environment.
+// subcommand hands the probe: three guaranteed recheck cadences, 18h on the
+// default 6h cadence and 72h when FALLBACK_SCAN_HOURS switches the routine
+// rescan off or asks for more than the 24h floor, because the watcher still
+// reconciles on that floor and every reconciliation refreshes the marker. A zero
+// lease would disarm the deadline and let a wedged watcher stay healthy, so the
+// lease is never zero. No t.Parallel: it swaps runProbe and mutates the
+// environment.
 func TestDispatchArgs_arms_the_marker_lease(t *testing.T) {
-	// Three reconciliation floors: the watcher's own guarantee rather than a
-	// configured value, so it is derived from the same function main arms the probe
-	// with, through the same Lease expression.
-	reconcileLease := health.Lease{Interval: scancadence.Effective(0), Cycles: 3}.Duration()
-
 	for _, tc := range []struct {
 		name          string
 		fallbackHours string
-		markerAge     time.Duration
-		wantHealthy   bool
+		want          time.Duration
 	}{
-		{"default cadence keeps a marker inside the 18h lease healthy", "", 17 * time.Hour, true},
-		{"default cadence fails a marker past the 18h lease", "", 19 * time.Hour, false},
-		{"a disabled fallback keeps a marker inside the reconciliation lease healthy", "0", reconcileLease - time.Hour, true},
-		{"a disabled fallback fails a marker past the reconciliation lease", "0", reconcileLease + time.Hour, false},
-		{"a cadence above the floor is capped to the reconciliation lease", "87600", reconcileLease + time.Hour, false},
+		{"the default cadence arms 18h", "", 18 * time.Hour},
+		{"a 1h cadence arms 3h", "1", 3 * time.Hour},
+		{"a disabled fallback arms three 24h floors", "0", 72 * time.Hour},
+		{"a cadence above the floor is capped to three floors", "87600", 72 * time.Hour},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("FALLBACK_SCAN_HOURS", tc.fallbackHours)
 
-			var gotOpts []health.ProbeOption
+			var got time.Duration
 			probed := false
 			prev := runProbe
-			runProbe = func(_ string, opts ...health.ProbeOption) {
-				probed, gotOpts = true, opts
+			runProbe = func(_ string, maxAge time.Duration) {
+				probed, got = true, maxAge
 			}
 			t.Cleanup(func() { runProbe = prev })
 
@@ -397,19 +381,8 @@ func TestDispatchArgs_arms_the_marker_lease(t *testing.T) {
 			if !probed {
 				t.Fatalf("dispatchArgs([health]) did not probe with FALLBACK_SCAN_HOURS=%q", tc.fallbackHours)
 			}
-
-			marker := filepath.Join(t.TempDir(), ".healthy")
-			if err := os.WriteFile(marker, nil, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			aged := time.Now().Add(-tc.markerAge)
-			if err := os.Chtimes(marker, aged, aged); err != nil {
-				t.Fatal(err)
-			}
-
-			if got := health.Inspect(marker, gotOpts...).Healthy(); got != tc.wantHealthy {
-				t.Errorf("Inspect(marker aged %v, opts from FALLBACK_SCAN_HOURS=%q).Healthy() = %v, want %v",
-					tc.markerAge, tc.fallbackHours, got, tc.wantHealthy)
+			if got != tc.want {
+				t.Errorf("dispatchArgs([health]) with FALLBACK_SCAN_HOURS=%q armed a %v lease, want %v", tc.fallbackHours, got, tc.want)
 			}
 		})
 	}
@@ -428,7 +401,7 @@ func TestDispatchArgs_health_probe_emits_no_startup_diagnostics(t *testing.T) {
 			t.Setenv("FALLBACK_SCAN_HOURS", raw)
 
 			prev := runProbe
-			runProbe = func(string, ...health.ProbeOption) {}
+			runProbe = func(string, time.Duration) {}
 			t.Cleanup(func() { runProbe = prev })
 
 			logs := capture.Default(t)
@@ -507,7 +480,7 @@ func TestDispatchArgs_usage_error_names_the_offending_argument(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			prev := runProbe
-			runProbe = func(string, ...health.ProbeOption) {
+			runProbe = func(string, time.Duration) {
 				t.Error("a usage error must never probe the health marker")
 			}
 			t.Cleanup(func() { runProbe = prev })

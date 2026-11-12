@@ -380,17 +380,11 @@ func TestOutputWalkVisit_stops_the_orphan_walk_once_the_scan_is_cancelled(t *tes
 }
 
 // TestWalkLogPolicy_quiet_when_nothing_is_wrong pins the steady state: a readable
-// output tree with no symlinks emits no aggregate at all. A guard that also fired on
-// zero would put a "count=0" warning with a remediation hint into the log on every
-// scan of a perfectly healthy /output.
-//
-// The root's own mode is deliberately left as the host created it (t.TempDir yields
-// 0755 on some hosts, and an inherited default ACL can widen a fresh directory): the
-// orphan walk has no business inspecting directory permissions at all, so a
-// permissiveness record appearing here is a failure. The /output directory mode is
-// reported once per scan from the write side (store.reportLaxDir) and acts on nothing
-// — an earlier cycle asked this walk for that verdict and used it to veto reaping,
-// which the 2026-07 decision removed.
+// output tree with no symlinks emits no aggregate at all, where a guard that also
+// fired on zero would log a "count=0" warning on every healthy scan. The root's mode
+// is left as the host created it (t.TempDir yields 0755 on some hosts): the orphan
+// walk never inspects directory permissions, which only the write side reports
+// (store.reportLaxDir), so a permissiveness record here is a failure.
 func TestWalkLogPolicy_quiet_when_nothing_is_wrong(t *testing.T) {
 	dir := t.TempDir()
 	logs := captureLogs(t)

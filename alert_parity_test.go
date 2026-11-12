@@ -66,7 +66,7 @@ func seriesNames(expr string) []string {
 // fails when a shipped PromQL rule reads a series that registry does not export,
 // so a renamed or dropped series fails the build instead of silencing an alert.
 func TestPromQLRulesReadOnlyExportedSeries(t *testing.T) {
-	reg, _ := newMetrics()
+	reg, _ := newMetrics(0)
 	families, err := reg.Gather(t.Context())
 	if err != nil {
 		t.Fatalf("Gather = %v", err)

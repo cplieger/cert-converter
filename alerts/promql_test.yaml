@@ -330,11 +330,55 @@ tests:
         alertname: CertConverterPreviousLayoutRetained
         exp_alerts: []
 
-  - name: CertConverterScanStalled pages when no scan ended for 13h
+  - name: CertConverterScanStalled fires past the deadline even while failing scans keep ending, and resolves at a healthy scan
     interval: 1m
     input_series:
+      # Deadline at 1h, so the arm reads past 1h15m and fires 10m later.
+      - series: 'cert_converter_scan_deadline_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "3600x99 999999x50"
+      - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "60+60x150"
+      - series: 'process_start_time_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "0x150"
+    alert_rule_test:
+      - eval_time: 74m
+        alertname: CertConverterScanStalled
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: CertConverterScanStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+            exp_annotations:
+              summary: "cert-converter scans have stalled"
+              description: "No scan finished healthy by the exported deadline, or, with deadline 0, none finished in 13h. Failing scans cross it too: check other cert-converter alerts first. Otherwise the watch loop is likely wedged: restart the container and check inotify limits.\n"
+      - eval_time: 105m
+        alertname: CertConverterScanStalled
+        exp_alerts: []
+
+  - name: CertConverterScanStalled stays quiet while the deadline is ahead, however old the last scan is
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_scan_deadline_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "360000x900"
       - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
         values: "60x900"
+      - series: 'process_start_time_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "0x900"
+    alert_rule_test:
+      - eval_time: 14h
+        alertname: CertConverterScanStalled
+        exp_alerts: []
+
+  - name: CertConverterScanStalled reads the 13h window while the deadline is 0, and clears at the next scan
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_scan_deadline_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "0x900"
+      - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "60x799 48000x100"
       - series: 'process_start_time_seconds{job="cert-converter", instance="cc:9468"}'
         values: "0x900"
     alert_rule_test:
@@ -349,12 +393,17 @@ tests:
               job: cert-converter
               instance: cc:9468
             exp_annotations:
-              summary: "No cert-converter scan finished in 13h"
-              description: "No scan ended for two scan cadences while the page answers, so the watch loop is likely wedged and certificates may have stopped converting. Restart the container and check the host's inotify instance limit.\n"
+              summary: "cert-converter scans have stalled"
+              description: "No scan finished healthy by the exported deadline, or, with deadline 0, none finished in 13h. Failing scans cross it too: check other cert-converter alerts first. Otherwise the watch loop is likely wedged: restart the container and check inotify limits.\n"
+      - eval_time: 13h30m
+        alertname: CertConverterScanStalled
+        exp_alerts: []
 
-  - name: CertConverterScanStalled reads the process age before the first scan ends
+  - name: CertConverterScanStalled reads the process age while the deadline is 0 and no scan has ended
     interval: 1m
     input_series:
+      - series: 'cert_converter_scan_deadline_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "0x900"
       - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
         values: "0x900"
       - series: 'process_start_time_seconds{job="cert-converter", instance="cc:9468"}'
@@ -371,12 +420,14 @@ tests:
               job: cert-converter
               instance: cc:9468
             exp_annotations:
-              summary: "No cert-converter scan finished in 13h"
-              description: "No scan ended for two scan cadences while the page answers, so the watch loop is likely wedged and certificates may have stopped converting. Restart the container and check the host's inotify instance limit.\n"
+              summary: "cert-converter scans have stalled"
+              description: "No scan finished healthy by the exported deadline, or, with deadline 0, none finished in 13h. Failing scans cross it too: check other cert-converter alerts first. Otherwise the watch loop is likely wedged: restart the container and check inotify limits.\n"
 
-  - name: a scan every 6h never stalls
+  - name: CertConverterScanStalled never fires the deadline arm on a deadline of 0, with a scan every 6h
     interval: 1m
     input_series:
+      - series: 'cert_converter_scan_deadline_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "0x1100"
       - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
         values: "0 21600+0x359 43200+0x359 64800+0x359"
       - series: 'process_start_time_seconds{job="cert-converter", instance="cc:9468"}'

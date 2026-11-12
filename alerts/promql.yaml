@@ -1,13 +1,13 @@
-# Alert rules for cert-converter as a Prometheus rule group, for Prometheus,
-# Mimir, vmalert or any ruler that reads Prometheus rules. This file is the
-# alternative to alerts/logql.yaml: load one of the two, not both. The rules read
-# the page served when METRICS_LISTEN_ADDR is set; scrape it as job
-# `cert-converter`. Thresholds, windows and severity labels are starting points.
-# Size the 13h stall window to twice the effective cadence plus an hour, 49h at
-# most (FALLBACK_SCAN_HOURS capped at 24, or 24 when it is 0). CertConverterDown
-# exists only here; CertConverterScanStalled covers it in alerts/logql.yaml.
-# CertConverterStartupRefused and CertConverterChangeDetectionDead exist only
-# there, because the process exits; here CertConverterDown covers them.
+# Alert rules for cert-converter as a Prometheus rule group, for any ruler that
+# reads them. Load this file or alerts/logql.yaml, not both. The rules read the
+# page served when METRICS_LISTEN_ADDR is set, scraped as job `cert-converter`.
+# Thresholds, windows and severity labels are starting points.
+# CertConverterScanStalled reads cert_converter_scan_deadline_timestamp_seconds,
+# which sizes itself from FALLBACK_SCAN_HOURS; its 13h window applies only while
+# that reads 0, which this version never writes. Load the file of the release
+# you run. CertConverterDown exists only here (CertConverterScanStalled covers
+# it in alerts/logql.yaml); CertConverterStartupRefused and
+# CertConverterChangeDetectionDead exist only there, as the process exits.
 groups:
   - name: cert-converter
     rules:
@@ -162,27 +162,38 @@ groups:
             Sync kept files laid out for the other layout because OUTPUT_LAYOUT
             is unset. Repoint consumers at the current paths, then set
             OUTPUT_LAYOUT explicitly or remove the old tree by hand.
-      # The timestamp is 0 until the first scan ends, so the second arm reads
-      # the process age instead: a first scan that never ends still pages once
-      # the process has run for the whole window.
+      # Two arms. The deadline decides: each healthy scan moves it three
+      # guaranteed recheck cadences ahead, so a wedged watch loop and scans
+      # that keep failing both cross it. The 13h window reads only while the
+      # deadline is 0; size it to twice the effective cadence plus an hour, 49h
+      # at most (FALLBACK_SCAN_HOURS capped at 24, or 24 when it is 0). The
+      # timestamp is 0 until the first scan ends, so its last branch reads the
+      # process age instead.
       - alert: CertConverterScanStalled
         expr: |
           (
+            time() > cert_converter_scan_deadline_timestamp_seconds + 900
+            and cert_converter_scan_deadline_timestamp_seconds > 0
+          )
+          or
+          (
             time() - cert_converter_last_scan_timestamp_seconds > 13 * 3600
             and cert_converter_last_scan_timestamp_seconds > 0
+            and on (job, instance) cert_converter_scan_deadline_timestamp_seconds == 0
           )
           or
           (
             time() - process_start_time_seconds > 13 * 3600
             and on (job, instance) cert_converter_last_scan_timestamp_seconds == 0
+            and on (job, instance) cert_converter_scan_deadline_timestamp_seconds == 0
           )
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "No cert-converter scan finished in 13h"
+          summary: "cert-converter scans have stalled"
           description: >
-            No scan ended for two scan cadences while the page answers, so the
-            watch loop is likely wedged and certificates may have stopped
-            converting. Restart the container and check the host's inotify
-            instance limit.
+            No scan finished healthy by the exported deadline, or, with
+            deadline 0, none finished in 13h. Failing scans cross it too: check
+            other cert-converter alerts first. Otherwise the watch loop is
+            likely wedged: restart the container and check inotify limits.

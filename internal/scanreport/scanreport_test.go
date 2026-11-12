@@ -93,12 +93,11 @@ func TestLogLevels(t *testing.T) {
 // scan series to the value of the record it writes, both parsed from what they
 // emit, so the log rules and the metric rules read the same verdict.
 func TestReportSetsEverySeriesFromTheRecord(t *testing.T) {
-	reg := measure.NewRegistry("cert_converter")
-	reporter := NewReporter(reg)
+	const lease = 18 * time.Hour
 	at := time.Unix(1_800_000_000, 0)
-	prevClock := reportClock
-	reportClock = func() time.Time { return at }
-	t.Cleanup(func() { reportClock = prevClock })
+	pinClock(t, &at)
+	reg := measure.NewRegistry("cert_converter")
+	reporter := NewReporter(reg, lease)
 
 	scan := Scan{Polling: true, Result: process.ScanResult{
 		Total: 9, Converted: 1, Unchanged: 2, Orphan: 3, Unreadable: 4, Unresolved: 5, Vanished: 6,
@@ -141,6 +140,9 @@ func TestReportSetsEverySeriesFromTheRecord(t *testing.T) {
 		"cert_converter_last_scan_outcome{outcome=budget_stopped}": num("budget_stopped"),
 		"cert_converter_change_detection_mode{mode=poll}":          num("polling"),
 		"cert_converter_change_detection_mode{mode=watch}":         1 - num("polling"),
+		// Not a record field: the scan is not healthy, so the deadline keeps its
+		// start value (TestScanDeadline).
+		"cert_converter_scan_deadline_timestamp_seconds": float64(at.Add(lease).Unix()),
 	}
 	for _, outcome := range []string{"converted", "unchanged", "orphan", "unreadable", "unresolved", "vanished", "unwritable", "collided", "excluded", "ignored", "failed"} {
 		want["cert_converter_last_scan_sources{outcome="+outcome+"}"] = num(outcome)
@@ -158,6 +160,80 @@ func TestReportSetsEverySeriesFromTheRecord(t *testing.T) {
 			if _, ok := want[key]; !ok {
 				t.Errorf("the registry exports %s, which no record field sets", key)
 			}
+		}
+	}
+}
+
+// pinClock makes reportClock read *now until the test ends.
+func pinClock(t *testing.T, now *time.Time) {
+	t.Helper()
+	prev := reportClock
+	reportClock = func() time.Time { return *now }
+	t.Cleanup(func() { reportClock = prev })
+}
+
+// TestScanDeadline pins the stall rule's deadline: the start plus the lease
+// before any scan, a healthy scan's end plus the lease after it, and unchanged
+// by a scan that is not healthy, so scans that keep failing cross it.
+func TestScanDeadline(t *testing.T) {
+	const lease = 18 * time.Hour
+	start := time.Unix(1_800_000_000, 0)
+	now := start
+	pinClock(t, &now)
+	capture.SwapDefault(t, slog.New(slog.DiscardHandler))
+	reg := measure.NewRegistry("cert_converter")
+	reporter := NewReporter(reg, lease)
+	deadline := func() float64 {
+		t.Helper()
+		families, err := reg.Gather(t.Context())
+		if err != nil {
+			t.Fatalf("Gather = %v", err)
+		}
+		for _, f := range families {
+			if f.Name == "cert_converter_scan_deadline_timestamp_seconds" && len(f.Samples) == 1 {
+				return f.Samples[0].Value
+			}
+		}
+		t.Fatal("the registry exports no single cert_converter_scan_deadline_timestamp_seconds sample")
+		return 0
+	}
+	unix := func(at time.Time) float64 { return float64(at.Unix()) }
+
+	if got, want := deadline(), unix(start.Add(lease)); got != want {
+		t.Errorf("deadline before any scan = %v, want the start plus the lease %v", got, want)
+	}
+	steps := []struct {
+		name string
+		scan Scan
+		at   time.Duration
+		want time.Time
+	}{
+		{
+			name: "a healthy scan moves it", at: time.Hour,
+			scan: Scan{Healthy: true, Result: process.ScanResult{Total: 1, Converted: 1}},
+			want: start.Add(time.Hour + lease),
+		},
+		{
+			name: "a failed conversion leaves it", at: 2 * time.Hour,
+			scan: Scan{Result: process.ScanResult{Total: 1, Failed: 1}},
+			want: start.Add(time.Hour + lease),
+		},
+		{
+			name: "an aborted scan leaves it", at: 3 * time.Hour,
+			scan: Scan{Result: process.ScanResult{Outcome: process.OutcomeAborted}, Err: errors.New("open input root")},
+			want: start.Add(time.Hour + lease),
+		},
+		{
+			name: "the next healthy scan moves it again", at: 4 * time.Hour,
+			scan: Scan{Healthy: true},
+			want: start.Add(4*time.Hour + lease),
+		},
+	}
+	for _, step := range steps {
+		now = start.Add(step.at)
+		reporter.Report(t.Context(), &step.scan)
+		if got := deadline(); got != unix(step.want) {
+			t.Errorf("%s: deadline = %v, want %v", step.name, got, unix(step.want))
 		}
 	}
 }

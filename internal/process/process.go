@@ -48,8 +48,9 @@ type ScanResult struct {
 	// write, so the artifact is left in place and health is unaffected.
 	Unwritable int
 	// Collided counts flat-layout sources whose output name another source also
-	// claims; none of them was converted, and the container goes unhealthy until
-	// the operator resolves the ambiguity.
+	// claims, a standing collision's claimants the scan could not reach included;
+	// none of them was converted, and the container goes unhealthy until the
+	// operator resolves the ambiguity.
 	Collided int
 	// Ignored counts PFX/P12 files skipped because PFX input was not explicitly
 	// enabled. They preserve pre-feature behavior and do not make the input
@@ -270,7 +271,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	if s.opts.FormatsExplicit {
 		cleanupFormats = outputpolicy.Formats{PFX: true, PEM: true}
 	}
-	out := &store{root: outHandle, maxEntries: s.opts.MaxScanEntries, formats: cleanupFormats}
+	out := &store{root: outHandle, standing: s.standing, maxEntries: s.opts.MaxScanEntries, formats: cleanupFormats}
 	if now := sweepClock(); s.lastSweep.IsZero() || now.Sub(s.lastSweep) >= staleTempAge {
 		// A temp is only a candidate once it is staleTempAge old, so sweeping more
 		// often than that re-walks the whole output tree to find nothing new.
@@ -311,11 +312,11 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	walkErr := filesafe.WalkDirInRoot(ctx, inHandle, func(rel string, d fs.DirEntry, err error) error {
 		return sw.visit(ctx, rel, d, err)
 	})
+	sw.reach.whole = sw.readWholeTree(walkErr)
 	// Flat conversion runs on everything the walk enumerated, matching mirror's
 	// availability: an unreadable sub-path skips ITS sources, never the tree's.
-	// Collisions are arbitrated among the enumerated sources only — a source
-	// hidden behind an unreadable path is caught by the first complete scan, and
-	// conversion is idempotent, so partial visibility cannot flap artifacts.
+	// Collisions are arbitrated among the enumerated sources, and a standing
+	// collision keeps its stem while a claimant is out of reach (holdContested).
 	// A budget stop converts the enumerated prefix, exactly as mirror converts
 	// inline until the stop; a shutdown or root error converts nothing.
 	if s.opts.Layout == outputpolicy.LayoutFlat && (walkErr == nil || errors.Is(walkErr, errScanBudgetExceeded)) {
@@ -327,6 +328,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	budgetExceeded := errors.Is(walkErr, errScanBudgetExceeded)
 
 	result := countResults(sw.results, sw.unreadable, sw.unresolved, sw.vanished)
+	result.Collided += sw.contested
 	result.Ignored = sw.ignored
 	rc := reapContext{
 		// The scan's counts are carried whole rather than copied field-by-field:
@@ -366,7 +368,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		walkErr = reconcileErr
 	}
 
-	s.reportVerdict(&result, out, walkErr)
+	s.reportVerdict(&result, out, sw, walkErr)
 	if budgetExceeded {
 		return result, nil
 	}
@@ -375,8 +377,9 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 
 // reportVerdict derives the scan's verdicts from what the walk, the reaper and
 // the last sweep found, then logs the standing conditions that changed. Only a
-// scan that ran to the end can prove a per-path condition gone.
-func (s *Scanner) reportVerdict(result *ScanResult, out *store, walkErr error) {
+// scan that ran to the end can prove a per-path condition gone, and only for a
+// subject it reached, or any subject once it saw every /input path.
+func (s *Scanner) reportVerdict(result *ScanResult, out *store, sw *scanWalk, walkErr error) {
 	result.Outcome = outcomeOf(walkErr)
 	result.OrphanRemovalDisabled = out.reapDisabled
 	result.PreviousLayoutRetained = out.otherLayoutKept
@@ -396,12 +399,22 @@ func (s *Scanner) reportVerdict(result *ScanResult, out *store, walkErr error) {
 	if walkErr != nil {
 		return
 	}
-	s.standing.clearUnseen(condCollision, false)
-	s.standing.clearUnseen(condUnwritable, false)
-	s.standing.clearUnseen(condUnresolvedSymlink, false)
+	inputReached := func(subject string, _ []string) bool { return wholeTree || sw.reach.input(subject) }
+	// A collision clears once the scan reached every claimant it was reported for.
+	s.standing.clearUnseen(condCollision, false, func(_ string, claimants []string) bool {
+		return sw.reach.claimants(claimants)
+	})
+	s.standing.clearUnseen(condUnresolvedSymlink, false, inputReached)
 	// The aggregate unreadable_paths condition reports the clear; its per-path
 	// detail goes quietly.
-	s.standing.clearUnseen(condUnreadablePath, true)
+	s.standing.clearUnseen(condUnreadablePath, true, inputReached)
+	s.standing.clearUnseen(condConversionFailed, false, inputReached)
+	s.standing.clearUnseen(condUnwritable, false, func(subject string, sources []string) bool {
+		return wholeTree || sw.reach.output(subject) || sw.gone(sources)
+	})
+	if wholeTree {
+		out.clearUnmanaged(sw.expected)
+	}
 }
 
 // outcomeOf classifies the error a scan ended with.
@@ -426,6 +439,10 @@ type scanWalk struct {
 	// this walk saw, registered at enumeration time so a source whose conversion
 	// later fails still protects its artifacts from the orphan reaper.
 	expected map[string]struct{}
+	// failed is whether each source that failed in this walk was news, so every
+	// failure of one source in one scan shares the first one's level.
+	failed map[string]bool
+	reach  scanReach
 	// pendingSources defers flat-layout conversion until every source name is
 	// known, so output-name collisions are arbitrated before any artifact is
 	// published.
@@ -450,7 +467,10 @@ type scanWalk struct {
 	vanished int
 	// unresolved counts input symlinks the confined root could not resolve.
 	unresolved int
-	formats    outputpolicy.Formats
+	// contested counts the claimants of standing collisions this scan could not
+	// reach (holdContested).
+	contested int
+	formats   outputpolicy.Formats
 	// inputPasswordReady is false unless a non-blank password or the explicit
 	// empty-password opt-in was configured.
 	inputPasswordReady bool
@@ -462,6 +482,7 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		return ctx.Err()
 	}
 	if err != nil {
+		sw.reach.withdraw(rel)
 		if rel == "." {
 			return err
 		}
@@ -485,6 +506,8 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.budget.Count(), rel)
 	}
 	if d.IsDir() {
+		// Withdrawn by the error call above if its listing fails.
+		sw.reach.list(rel)
 		sw.noteSourceShapedDir(rel)
 		return nil
 	}
@@ -567,12 +590,14 @@ func (sw *scanWalk) processSource(ctx context.Context, rel string) error {
 		return nil
 	}
 	sw.seen[rel] = struct{}{}
-	sw.registerExpected(rel)
+	artifacts := sw.registerExpected(rel)
 	convertSource := sw.convertEntry
 	if layout.IsBundle(rel) {
 		convertSource = sw.convertBundle
 	}
-	sw.results = append(sw.results, convertSource(ctx, rel))
+	outcome := convertSource(ctx, rel)
+	sw.reach.noteSource(rel, outcome, artifacts)
+	sw.results = append(sw.results, outcome)
 	// A cancellation during conversion already became a per-source outcome, but
 	// the walk itself must still stop so the scan is never reported complete.
 	return ctx.Err()
@@ -655,7 +680,7 @@ func (sw *scanWalk) processFlatSources(ctx context.Context) error {
 	if err := sw.recordCollisions(ctx, collisions); err != nil {
 		return err
 	}
-	for _, rel := range unique {
+	for _, rel := range sw.holdContested(unique) {
 		if err := sw.processSource(ctx, rel); err != nil {
 			return err
 		}
@@ -670,7 +695,7 @@ func (sw *scanWalk) recordCollisions(ctx context.Context, collisions []flatColli
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if !sw.standing.report(standingKey{kind: condCollision, subject: collision.stem}, len(collision.sources)) {
+		if !sw.standing.reportFor(standingKey{kind: condCollision, subject: collision.stem}, len(collision.sources), collision.sources) {
 			slog.Debug(collisionMsg, "output_stem", logtext.Path(collision.stem), "count", len(collision.sources))
 		} else {
 			slog.Error(collisionMsg,
@@ -689,6 +714,60 @@ func (sw *scanWalk) recordCollisions(ctx context.Context, collisions []flatColli
 		}
 	}
 	return nil
+}
+
+// gone reports whether the scan proved every one of sources absent: it reached
+// each one's directory and did not see it.
+func (sw *scanWalk) gone(sources []string) bool {
+	for _, rel := range sources {
+		if _, seen := sw.seen[rel]; seen || !sw.reach.input(rel) {
+			return false
+		}
+	}
+	return len(sources) > 0
+}
+
+// readWholeTree reports whether the walk, ended by walkErr, read every /input path.
+func (sw *scanWalk) readWholeTree(walkErr error) bool {
+	return walkErr == nil && sw.unreadable == 0 && sw.unresolved == 0 && sw.vanished == 0
+}
+
+// holdContested returns unique without the sources whose stem a standing
+// collision still contests through a claimant this scan did not reach: those are
+// recorded as collided, and the unreached claimants are counted in contested.
+func (sw *scanWalk) holdContested(unique []string) []string {
+	if sw.reach.whole {
+		return unique
+	}
+	contested := make(map[string]struct{})
+	for stem, claimants := range sw.standing.unseenSources(condCollision) {
+		unreached := 0
+		for _, rel := range claimants {
+			if !sw.reach.input(rel) {
+				unreached++
+			}
+		}
+		if unreached > 0 {
+			contested[stem] = struct{}{}
+			sw.contested += unreached
+		}
+	}
+	if len(contested) == 0 {
+		return unique
+	}
+	kept := make([]string, 0, len(unique))
+	for _, rel := range unique {
+		stem := layout.FlatStem(layout.SourceStem(rel))
+		if _, held := contested[stem]; !held {
+			kept = append(kept, rel)
+			continue
+		}
+		slog.Debug(collisionMsg, "output_stem", logtext.Path(stem), "path", logtext.Path(rel))
+		sw.seen[rel] = struct{}{}
+		sw.registerExpected(rel)
+		sw.results = append(sw.results, statusCollided)
+	}
+	return kept
 }
 
 // resolveFlatOrphanCert filters one arbitration candidate: a certificate whose
@@ -779,15 +858,18 @@ func noteShadowedBundle(rel, sibling string) bool {
 }
 
 // registerExpected records every artifact path the enabled formats derive from
-// rel, at enumeration time, whatever its conversion later resolves to.
-func (sw *scanWalk) registerExpected(rel string) {
+// rel, at enumeration time, whatever its conversion later resolves to, and
+// returns them.
+func (sw *scanWalk) registerExpected(rel string) []string {
 	outStem := layout.SourceStem(rel)
 	if sw.layoutMode == outputpolicy.LayoutFlat {
 		outStem = layout.FlatStem(outStem)
 	}
-	for _, artifact := range layout.ArtifactsFor(outStem, sw.formats) {
+	artifacts := layout.ArtifactsFor(outStem, sw.formats)
+	for _, artifact := range artifacts {
 		sw.expected[artifact] = struct{}{}
 	}
+	return artifacts
 }
 
 // --- Logging policy ---
@@ -902,12 +984,43 @@ func IsShutdown(err error) bool {
 // failEntry records one per-entry failure: it logs the failure and returns the
 // failed status for the caller to propagate.
 func failEntry(logPath, msg string, err error, extra ...any) conversionStatus {
-	attrs := append([]any{"path", logtext.Path(logPath), "error", logtext.Path(err.Error())}, extra...)
+	attrs := failureAttrs(logPath, err, extra)
 	if IsShutdown(err) {
 		slog.Debug(msg+" (shutdown)", attrs...)
 	} else {
 		slog.Error(msg, attrs...)
 	}
+	return statusFailed
+}
+
+func failureAttrs(logPath string, err error, extra []any) []any {
+	return append([]any{"path", logtext.Path(logPath), "error", logtext.Path(err.Error())}, extra...)
+}
+
+// conversionFailedMsg reports a source that could not be converted.
+const conversionFailedMsg = "conversion failed"
+
+// failSource records a source's conversion failure as a standing condition keyed
+// by cause, a stable description of what failed: ERROR when the failure is new or
+// its cause changed, Debug while it holds.
+func (sw *scanWalk) failSource(rel, cause string, err error, extra ...any) conversionStatus {
+	if IsShutdown(err) {
+		return failEntry(rel, conversionFailedMsg, err, extra...)
+	}
+	news, decided := sw.failed[rel]
+	if !decided {
+		news = sw.standing.reportState(standingKey{kind: condConversionFailed, subject: rel}, 1, cause)
+		if sw.failed == nil {
+			sw.failed = make(map[string]bool)
+		}
+		sw.failed[rel] = news
+	}
+	level := slog.LevelDebug
+	if news {
+		level = slog.LevelError
+	}
+	slog.Log(context.Background(), level, conversionFailedMsg,
+		append([]any{"condition", condConversionFailed}, failureAttrs(rel, err, extra)...)...)
 	return statusFailed
 }
 
@@ -1131,7 +1244,11 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 		// A non-ENOENT stat failure (a sibling key that is a symlink the *os.Root
 		// refuses because it escapes /input, or a permission/IO error) is NOT a
 		// genuine "no key" orphan — the key is there and cannot be read.
-		slog.Warn("skipping cert: cannot stat sibling key", "path", logtext.Path(rel), "error", logtext.Path(statErr.Error()),
+		level := slog.LevelDebug
+		if sw.standing.report(standingKey{kind: condUnreadablePath, subject: keyRel}, 1) {
+			level = slog.LevelWarn
+		}
+		slog.Log(context.Background(), level, "skipping cert: cannot stat sibling key", "path", logtext.Path(rel), "error", logtext.Path(statErr.Error()),
 			"remediation", inputPermRemediation)
 		return pairInputs{}, statusUnreadable
 	}
@@ -1204,7 +1321,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	// on disk the bundle these inputs produce?", which needs that bundle known first.
 	analysis, err := convert.Analyse(ctx, certPEM, keyPEM)
 	if err != nil {
-		return failEntry(rel, "conversion failed", err)
+		return sw.failSource(rel, err.Error(), err)
 	}
 	return sw.emit(ctx, rel, &emission{
 		analysis:     analysis,
@@ -1221,7 +1338,7 @@ var errInputPasswordNotConfigured = errors.New("PFX input reached conversion wit
 // convertBundle resolves the outcome for one PKCS#12 source under certsRoot.
 func (sw *scanWalk) convertBundle(ctx context.Context, rel string) conversionStatus {
 	if !sw.inputPasswordReady {
-		return failEntry(rel, "conversion failed", errInputPasswordNotConfigured)
+		return sw.failSource(rel, errInputPasswordNotConfigured.Error(), errInputPasswordNotConfigured)
 	}
 	data, err := sw.src.readBundleBounded(ctx, rel)
 	if err != nil {
@@ -1230,7 +1347,7 @@ func (sw *scanWalk) convertBundle(ctx context.Context, rel string) conversionSta
 	fingerprint := pairFingerprint(data, nil)
 	analysis, err := convert.AnalyseBundleWithBudget(ctx, data, sw.inputPassword, sw.bundleBudget)
 	if err != nil {
-		return failEntry(rel, "conversion failed", err)
+		return sw.failSource(rel, err.Error(), err)
 	}
 	return sw.emit(ctx, rel, &emission{
 		analysis:     analysis,
@@ -1281,7 +1398,7 @@ func (sw *scanWalk) emit(ctx context.Context, rel string, em *emission) conversi
 	if sw.formats.PEM {
 		certPEM, keyPEM, err := em.pemBytes()
 		if err != nil {
-			statuses = append(statuses, failEntry(rel, "conversion failed", err))
+			statuses = append(statuses, sw.failSource(rel, err.Error(), err))
 		} else {
 			statuses = append(statuses,
 				sw.emitRaw(ctx, rel, layout.CertOutFor(outStem), certPEM),
@@ -1290,11 +1407,13 @@ func (sw *scanWalk) emit(ctx context.Context, rel string, em *emission) conversi
 	}
 	outcome := foldStatuses(statuses)
 	if outcome == statusFailed && !slices.Contains(statuses, statusFailed) {
-		failEntry(rel, "conversion failed", errPartialPublication)
+		sw.failSource(rel, errPartialPublication.Error(), errPartialPublication)
 	}
 	switch outcome {
 	case statusFailed:
-		logConversionObservations(rel, em.observations)
+		if sw.failed[rel] {
+			logConversionObservations(rel, em.observations)
+		}
 	case statusUnwritable:
 		// An artifact on disk this app never proved wrong, behind a refusal no
 		// restart clears: re-analysed every scan for as long as the operator
@@ -1360,7 +1479,7 @@ func (sw *scanWalk) emitPFX(ctx context.Context, rel, pfxRel string, em *emissio
 	slog.Debug("converting source", "path", logtext.Path(rel), "output_path", logtext.Path(pfxRel))
 	pfxData, err := em.analysis.Encode(sw.enc, sw.password)
 	if err != nil {
-		return failEntry(rel, "conversion failed", err)
+		return sw.failSource(rel, err.Error(), err)
 	}
 	writeErr := sw.out.write(ctx, pfxRel, pfxData)
 	// The one derivation, after the write, from what the bundle on disk was
@@ -1419,7 +1538,7 @@ const unreplaceableArtifactMsg = "prior output could not be replaced and the /ou
 // outcome calls for.
 func (sw *scanWalk) reportWriteFailure(logRel, outputRel string, err writeRefusal, outcome conversionStatus) {
 	if outcome == statusUnwritable {
-		if !sw.standing.report(standingKey{kind: condUnwritable, subject: outputRel}, 1) {
+		if !sw.standing.reportFor(standingKey{kind: condUnwritable, subject: outputRel}, 1, []string{logRel}) {
 			slog.Debug(unreplaceableArtifactMsg, "output_path", logtext.Path(outputRel))
 			return
 		}
@@ -1431,10 +1550,12 @@ func (sw *scanWalk) reportWriteFailure(logRel, outputRel string, err writeRefusa
 			"content", "unverified", "remediation", err.cause().remediation())
 		return
 	}
-	// failEntry is called for its log; the statusFailed it returns is the value
-	// writeOutcome already derived, so this keeps one derivation.
-	failEntry(logRel, "conversion failed", err, "output_path", logtext.Path(outputRel),
-		"remediation", err.cause().remediation())
+	// failSource is called for its log; the statusFailed it returns is the value
+	// writeOutcome already derived, so this keeps one derivation. The cause names
+	// the artifact and the refusal class, not the error text, which can carry a
+	// temp file's random name.
+	sw.failSource(logRel, fmt.Sprintf("write %s: %d", outputRel, err.cause()), err,
+		"output_path", logtext.Path(outputRel), "remediation", err.cause().remediation())
 }
 
 // logConversionObservations surfaces Analyse's non-fatal findings about a pair's

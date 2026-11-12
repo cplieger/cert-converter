@@ -18,12 +18,14 @@ import (
 // (TestLogQLRulesUnwrapNumericRecordFields).
 const recordMessage = "scan complete"
 
-// Scan is one finished scan: the scanner's verdict, the error it ended with, and
-// whether change detection was polling when it ran.
+// Scan is one finished scan: the scanner's verdict, the error it ended with,
+// whether change detection was polling when it ran, and whether it left the
+// container healthy.
 type Scan struct {
 	Err     error
 	Result  process.ScanResult
 	Polling bool
+	Healthy bool
 }
 
 // series says which metric a record field also sets.
@@ -100,9 +102,12 @@ type Reporter struct {
 	mode      *measure.LabeledGauge
 	condition *measure.LabeledGauge
 	removed   *measure.Counter
+	deadline  *measure.Gauge
+	lease     time.Duration
 }
 
-// reportClock is indirected so a test can pin the last-scan timestamp.
+// reportClock is indirected so a test can pin the last-scan timestamp and the
+// scan deadline.
 var reportClock = time.Now
 
 var (
@@ -111,9 +116,11 @@ var (
 )
 
 // NewReporter registers the scan metrics on reg and seeds every label value at 0,
-// so a rule sees each series from the first scrape.
-func NewReporter(reg *measure.Registry) *Reporter {
+// so a rule sees each series from the first scrape. lease is the gap the scan
+// deadline allows after the start and after each healthy scan.
+func NewReporter(reg *measure.Registry, lease time.Duration) *Reporter {
 	r := &Reporter{
+		lease: lease,
 		sources: measure.NewLabeledGauge("last_scan_sources",
 			"Sources at each outcome in the last scan; a scan that did not cover the tree keeps the previous scan's problem counts.", []string{"outcome"}),
 		found: measure.NewGauge("last_scan_sources_found",
@@ -128,9 +135,12 @@ func NewReporter(reg *measure.Registry) *Reporter {
 			"1 while the last scan reported the standing condition, else 0.", []string{"condition"}),
 		removed: measure.NewCounter("removed_artifacts_total",
 			"Output artifacts removed because their source is gone."),
+		deadline: measure.NewGauge("scan_deadline_timestamp_seconds",
+			"Unix time by which the next healthy scan is due: the last healthy scan's end, or the start, plus three guaranteed recheck cadences."),
 	}
-	reg.MustRegister(r.sources, r.found, r.finished, r.outcome, r.mode, r.condition, r.removed)
+	reg.MustRegister(r.sources, r.found, r.finished, r.outcome, r.mode, r.condition, r.removed, r.deadline)
 	r.set(&Scan{}, 0)
+	r.renewDeadline(reportClock())
 	for _, o := range outcomes {
 		r.outcome.Set(0, o.String())
 	}
@@ -144,8 +154,18 @@ func NewReporter(reg *measure.Registry) *Reporter {
 // scan shutdown cut short has no verdict, so the caller does not report it.
 func (r *Reporter) Report(ctx context.Context, scan *Scan) {
 	logRecord(ctx, scan)
-	r.set(scan, float64(reportClock().Unix()))
+	now := reportClock()
+	r.set(scan, float64(now.Unix()))
 	r.removed.Add(int64(scan.Result.Removed))
+	if scan.Healthy {
+		r.renewDeadline(now)
+	}
+}
+
+// renewDeadline dates the next healthy scan one lease after at. Only the start
+// and a healthy scan call it, so scans that keep failing cross the deadline.
+func (r *Reporter) renewDeadline(at time.Time) {
+	r.deadline.Set(float64(at.Add(r.lease).Unix()))
 }
 
 func (r *Reporter) set(scan *Scan, finished float64) {
