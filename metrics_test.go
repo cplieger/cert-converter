@@ -54,7 +54,8 @@ func TestStartMetrics_logs_strays_but_not_scrapes(t *testing.T) {
 		}
 		_ = resp.Body.Close()
 	}
-	// The shutdown waits for every handler, so each access line is written.
+	// The shutdown waits for every handler, so each access line is written. A line
+	// is written after its response, so the order of two lines is not fixed.
 	cancel()
 	wait()
 
@@ -70,7 +71,8 @@ func TestStartMetrics_logs_strays_but_not_scrapes(t *testing.T) {
 			return true
 		})
 	}
-	if got, want := lines[slog.LevelDebug], []string{"/metrics", "/healthz"}; !slices.Equal(got, want) {
+	debug := slices.Sorted(slices.Values(lines[slog.LevelDebug]))
+	if got, want := debug, []string{"/healthz", "/metrics"}; !slices.Equal(got, want) {
 		t.Errorf("Debug access lines = %q, want %q", got, want)
 	}
 	if got, want := lines[slog.LevelInfo], []string{"/stray"}; !slices.Equal(got, want) {

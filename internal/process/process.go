@@ -48,8 +48,9 @@ type ScanResult struct {
 	// write, so the artifact is left in place and health is unaffected.
 	Unwritable int
 	// Collided counts flat-layout sources whose output name another source also
-	// claims; none of them was converted, and the container goes unhealthy until
-	// the operator resolves the ambiguity.
+	// claims, a standing collision's claimants the scan could not reach included;
+	// none of them was converted, and the container goes unhealthy until the
+	// operator resolves the ambiguity.
 	Collided int
 	// Ignored counts PFX/P12 files skipped because PFX input was not explicitly
 	// enabled. They preserve pre-feature behavior and do not make the input
@@ -311,11 +312,11 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	walkErr := filesafe.WalkDirInRoot(ctx, inHandle, func(rel string, d fs.DirEntry, err error) error {
 		return sw.visit(ctx, rel, d, err)
 	})
+	sw.reach.whole = sw.readWholeTree(walkErr)
 	// Flat conversion runs on everything the walk enumerated, matching mirror's
 	// availability: an unreadable sub-path skips ITS sources, never the tree's.
-	// Collisions are arbitrated among the enumerated sources only — a source
-	// hidden behind an unreadable path is caught by the first complete scan, and
-	// conversion is idempotent, so partial visibility cannot flap artifacts.
+	// Collisions are arbitrated among the enumerated sources, and a standing
+	// collision keeps its stem while a claimant is out of reach (holdContested).
 	// A budget stop converts the enumerated prefix, exactly as mirror converts
 	// inline until the stop; a shutdown or root error converts nothing.
 	if s.opts.Layout == outputpolicy.LayoutFlat && (walkErr == nil || errors.Is(walkErr, errScanBudgetExceeded)) {
@@ -327,6 +328,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	budgetExceeded := errors.Is(walkErr, errScanBudgetExceeded)
 
 	result := countResults(sw.results, sw.unreadable, sw.unresolved, sw.vanished)
+	result.Collided += sw.contested
 	result.Ignored = sw.ignored
 	rc := reapContext{
 		// The scan's counts are carried whole rather than copied field-by-field:
@@ -397,17 +399,18 @@ func (s *Scanner) reportVerdict(result *ScanResult, out *store, sw *scanWalk, wa
 	if walkErr != nil {
 		return
 	}
-	inputReached := func(subject string) bool { return wholeTree || sw.reach.input(subject) }
-	// A collision is arbitrated among the sources this scan saw, so a stem it no
-	// longer reports was converted from one source.
-	s.standing.clearUnseen(condCollision, false, func(string) bool { return true })
+	inputReached := func(subject string, _ []string) bool { return wholeTree || sw.reach.input(subject) }
+	// A collision clears once the scan reached every claimant it was reported for.
+	s.standing.clearUnseen(condCollision, false, func(_ string, claimants []string) bool {
+		return sw.reach.claimants(claimants)
+	})
 	s.standing.clearUnseen(condUnresolvedSymlink, false, inputReached)
 	// The aggregate unreadable_paths condition reports the clear; its per-path
 	// detail goes quietly.
 	s.standing.clearUnseen(condUnreadablePath, true, inputReached)
 	s.standing.clearUnseen(condConversionFailed, false, inputReached)
-	s.standing.clearUnseen(condUnwritable, false, func(subject string) bool {
-		return wholeTree || sw.reach.output(subject)
+	s.standing.clearUnseen(condUnwritable, false, func(subject string, sources []string) bool {
+		return wholeTree || sw.reach.output(subject) || sw.gone(sources)
 	})
 	if wholeTree {
 		out.clearUnmanaged(sw.expected)
@@ -464,7 +467,10 @@ type scanWalk struct {
 	vanished int
 	// unresolved counts input symlinks the confined root could not resolve.
 	unresolved int
-	formats    outputpolicy.Formats
+	// contested counts the claimants of standing collisions this scan could not
+	// reach (holdContested).
+	contested int
+	formats   outputpolicy.Formats
 	// inputPasswordReady is false unless a non-blank password or the explicit
 	// empty-password opt-in was configured.
 	inputPasswordReady bool
@@ -476,7 +482,7 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 		return ctx.Err()
 	}
 	if err != nil {
-		sw.reach.unlist(rel)
+		sw.reach.withdraw(rel)
 		if rel == "." {
 			return err
 		}
@@ -674,7 +680,7 @@ func (sw *scanWalk) processFlatSources(ctx context.Context) error {
 	if err := sw.recordCollisions(ctx, collisions); err != nil {
 		return err
 	}
-	for _, rel := range unique {
+	for _, rel := range sw.holdContested(unique) {
 		if err := sw.processSource(ctx, rel); err != nil {
 			return err
 		}
@@ -689,7 +695,7 @@ func (sw *scanWalk) recordCollisions(ctx context.Context, collisions []flatColli
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if !sw.standing.report(standingKey{kind: condCollision, subject: collision.stem}, len(collision.sources)) {
+		if !sw.standing.reportFor(standingKey{kind: condCollision, subject: collision.stem}, len(collision.sources), collision.sources) {
 			slog.Debug(collisionMsg, "output_stem", logtext.Path(collision.stem), "count", len(collision.sources))
 		} else {
 			slog.Error(collisionMsg,
@@ -708,6 +714,60 @@ func (sw *scanWalk) recordCollisions(ctx context.Context, collisions []flatColli
 		}
 	}
 	return nil
+}
+
+// gone reports whether the scan proved every one of sources absent: it reached
+// each one's directory and did not see it.
+func (sw *scanWalk) gone(sources []string) bool {
+	for _, rel := range sources {
+		if _, seen := sw.seen[rel]; seen || !sw.reach.input(rel) {
+			return false
+		}
+	}
+	return len(sources) > 0
+}
+
+// readWholeTree reports whether the walk, ended by walkErr, read every /input path.
+func (sw *scanWalk) readWholeTree(walkErr error) bool {
+	return walkErr == nil && sw.unreadable == 0 && sw.unresolved == 0 && sw.vanished == 0
+}
+
+// holdContested returns unique without the sources whose stem a standing
+// collision still contests through a claimant this scan did not reach: those are
+// recorded as collided, and the unreached claimants are counted in contested.
+func (sw *scanWalk) holdContested(unique []string) []string {
+	if sw.reach.whole {
+		return unique
+	}
+	contested := make(map[string]struct{})
+	for stem, claimants := range sw.standing.unseenSources(condCollision) {
+		unreached := 0
+		for _, rel := range claimants {
+			if !sw.reach.input(rel) {
+				unreached++
+			}
+		}
+		if unreached > 0 {
+			contested[stem] = struct{}{}
+			sw.contested += unreached
+		}
+	}
+	if len(contested) == 0 {
+		return unique
+	}
+	kept := make([]string, 0, len(unique))
+	for _, rel := range unique {
+		stem := layout.FlatStem(layout.SourceStem(rel))
+		if _, held := contested[stem]; !held {
+			kept = append(kept, rel)
+			continue
+		}
+		slog.Debug(collisionMsg, "output_stem", logtext.Path(stem), "path", logtext.Path(rel))
+		sw.seen[rel] = struct{}{}
+		sw.registerExpected(rel)
+		sw.results = append(sw.results, statusCollided)
+	}
+	return kept
 }
 
 // resolveFlatOrphanCert filters one arbitration candidate: a certificate whose
@@ -1478,7 +1538,7 @@ const unreplaceableArtifactMsg = "prior output could not be replaced and the /ou
 // outcome calls for.
 func (sw *scanWalk) reportWriteFailure(logRel, outputRel string, err writeRefusal, outcome conversionStatus) {
 	if outcome == statusUnwritable {
-		if !sw.standing.report(standingKey{kind: condUnwritable, subject: outputRel}, 1) {
+		if !sw.standing.reportFor(standingKey{kind: condUnwritable, subject: outputRel}, 1, []string{logRel}) {
 			slog.Debug(unreplaceableArtifactMsg, "output_path", logtext.Path(outputRel))
 			return
 		}

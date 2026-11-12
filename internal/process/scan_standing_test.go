@@ -506,10 +506,11 @@ func TestScannerRun_logs_an_unstattable_sibling_key_once(t *testing.T) {
 	}
 }
 
-// TestReportVerdict_clears_per_path_conditions_only_after_a_whole_tree_scan pins
-// the gate for every per-path condition a skipped /input path can hide.
+// TestReportVerdict_clears_unreached_per_path_conditions_only_after_a_whole_tree_scan
+// pins the gate for every per-path condition a skipped /input path can hide, on a
+// scan that reached none of the held subjects.
 // Serial: it swaps slog.Default().
-func TestReportVerdict_clears_per_path_conditions_only_after_a_whole_tree_scan(t *testing.T) {
+func TestReportVerdict_clears_unreached_per_path_conditions_only_after_a_whole_tree_scan(t *testing.T) {
 	held := []standingKey{
 		{kind: condConversionFailed, subject: "site/a.crt"},
 		{kind: condUnwritable, subject: "site/a.pfx"},

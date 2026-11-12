@@ -17,6 +17,9 @@ type scanReach struct {
 	// resolved is every artifact of a source whose every artifact was inspected
 	// and, where stale, written.
 	resolved map[string]struct{}
+	// whole is whether the walk listed every /input path, so one it did not
+	// enumerate is gone.
+	whole bool
 }
 
 // list records that the walk is listing the /input directory dir.
@@ -27,9 +30,14 @@ func (r *scanReach) list(dir string) {
 	r.listed[dir] = struct{}{}
 }
 
-// unlist withdraws dir: its listing failed.
-func (r *scanReach) unlist(dir string) {
-	delete(r.listed, dir)
+// withdraw records that the walk could not read rel: a directory is not
+// listed, and rel itself is unread.
+func (r *scanReach) withdraw(rel string) {
+	delete(r.listed, rel)
+	if r.unread == nil {
+		r.unread = make(map[string]struct{})
+	}
+	r.unread[rel] = struct{}{}
 }
 
 // noteSource records how far the scan got with the source rel, whose artifacts
@@ -61,6 +69,20 @@ func (r *scanReach) input(subject string) bool {
 	_, listed := r.listed[path.Dir(subject)]
 	_, unread := r.unread[subject]
 	return listed && !unread
+}
+
+// claimants reports whether the scan reached every one of sources: it saw the
+// whole tree, or it reached each one.
+func (r *scanReach) claimants(sources []string) bool {
+	if r.whole {
+		return true
+	}
+	for _, rel := range sources {
+		if !r.input(rel) {
+			return false
+		}
+	}
+	return true
 }
 
 // output reports whether the scan resolved the artifact at the /output path subject.
