@@ -159,20 +159,12 @@ func usage() {
 }
 
 // dispatchArgs routes argv: watch continues to the watcher, health runs the
-// probe, and EVERYTHING else — including a bare argv with no subcommand — is a
-// usage error.
+// probe, and anything else, a bare argv included, is a usage error.
 //
-// A bare argv is rejected on purpose, and it is the reason this dispatcher takes
-// a subcommand at all. The image sets CMD ["watch"], so the container's own
-// start supplies it; a bare argv therefore means the binary was run by hand, and
-// overwhelmingly that means `docker exec <container> /cert-watcher` against a
-// container whose watcher is already running. Before, that fell through to the
-// watcher: run() builds a health Status, which REMOVES the resident watcher's
-// health marker, and then a SECOND watcher attaches over the same
-// /input and /output, so two processes convert the same certificates and make
-// orphan-reaping decisions about each other's files. Refusing costs the operator
-// one word and removes the accident outright. It does not stop a deliberate
-// `/cert-watcher watch` in a second process, which no in-process check can.
+// A bare argv is refused because the image's CMD supplies watch, so a bare one
+// is a hand run (`docker exec <container> /cert-watcher`) beside a live watcher.
+// Starting it would remove that watcher's health marker and run a second
+// watcher over the same /input and /output, reaping each other's files.
 func dispatchArgs(args []string) int {
 	if len(args) <= 1 {
 		fmt.Fprintln(os.Stderr, "cert-watcher: no subcommand given")
