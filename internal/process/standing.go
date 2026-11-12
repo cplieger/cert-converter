@@ -112,15 +112,15 @@ func (s *standing) record(key standingKey, n int, state string, sources []string
 	return news
 }
 
-// unseenSources maps the subject of every standing condition of kind this scan
-// has not reported to the sources it was last reported for.
-func (s *standing) unseenSources(kind string) map[string][]string {
+// sources maps the subject of every standing condition of kind to the sources
+// it was last reported for, in a new map whose slices the caller must not modify.
+func (s *standing) sources(kind string) map[string][]string {
 	if s == nil {
 		return nil
 	}
 	held := make(map[string][]string)
 	for key, since := range s.conditions {
-		if _, ok := s.seen[key]; key.kind == kind && !ok {
+		if key.kind == kind {
 			held[key.subject] = since.sources
 		}
 	}

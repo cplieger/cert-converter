@@ -5,11 +5,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // collidingTree builds two flat claimants of the stem site/cert under in, a/site
@@ -116,6 +118,176 @@ func TestScannerRun_keeps_a_collision_whose_claimants_are_both_hidden(t *testing
 	}
 	if got := logs.CountLevel(slog.LevelError, collisionMsg); got != 1 {
 		t.Errorf("the collision was reported at ERROR %d times in total, want 1", got)
+	}
+}
+
+// replaceAClaimantWhileOneIsHidden runs three flat scans over collidingTree's
+// claimants of site/cert: a and b collide; b goes behind an unresolvable link
+// while c joins; c's pair is deleted with b still hidden. It returns each scan's
+// result and the func that puts b back.
+func replaceAClaimantWhileOneIsHidden(t *testing.T, scanner *Scanner, in, outside string) ([]ScanResult, func()) {
+	t.Helper()
+	results := []ScanResult{runScans(t, scanner, 1)}
+	restore := hideBehindLink(t, in, outside, "b")
+	c := filepath.Join(in, "c", "site")
+	if err := os.MkdirAll(c, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	writeSelfSignedPair(t, c, "cert")
+	results = append(results, runScans(t, scanner, 1))
+	for _, name := range []string{"cert.crt", "cert.key"} {
+		if err := os.Remove(filepath.Join(c, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	results = append(results, runScans(t, scanner, 1))
+	if results[1].Unresolved != 1 || results[2].Unresolved != 1 {
+		t.Fatalf("setup: Unresolved = %d then %d, want 1 on both: b must stay hidden behind the link", results[1].Unresolved, results[2].Unresolved)
+	}
+	return results, restore
+}
+
+// collisionErrorCounts returns the count of every collision record logged at
+// ERROR, in order.
+func collisionErrorCounts(logs *capture.Recorder) []int64 {
+	var counts []int64
+	for _, r := range logs.Records() {
+		if r.Level != slog.LevelError || r.Message != collisionMsg {
+			continue
+		}
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "count" {
+				counts = append(counts, a.Value.Int64())
+			}
+			return true
+		})
+	}
+	return counts
+}
+
+// TestScannerRun_keeps_a_hidden_claimant_when_the_other_claimants_change pins
+// that a claimant out of reach stays in its stem's collision while visible
+// claimants come and go: the collision counts it, never clears, publishes
+// nothing, and reports each change of its claimant count once.
+// Serial: it swaps slog.Default().
+func TestScannerRun_keeps_a_hidden_claimant_when_the_other_claimants_change(t *testing.T) {
+	in, outside := collidingTree(t)
+	out := t.TempDir()
+	logs := captureLogs(t)
+	scanner := newVerdictScanner(in, out, Options{Layout: outputpolicy.LayoutFlat})
+	results, _ := replaceAClaimantWhileOneIsHidden(t, scanner, in, outside)
+
+	if results[1].Collided != 3 {
+		t.Errorf("the scan with b hidden and c added: Collided = %d, want 3 (a, b and c)", results[1].Collided)
+	}
+	if results[2].Collided != 2 || results[2].conversionsClean() {
+		t.Errorf("the scan after c left = %+v, want Collided 2 (a and the hidden b) and conversions not clean", results[2])
+	}
+	if _, err := os.Lstat(filepath.Join(out, "site", "cert.pfx")); !os.IsNotExist(err) {
+		t.Errorf("a was published while the hidden b still claims its stem: Lstat(site/cert.pfx) = %v", err)
+	}
+	if got := countClears(logs, condCollision); got != 0 {
+		t.Errorf("the collision logged %d clears, want 0; log = %q", got, logs.Messages())
+	}
+	if got, want := collisionErrorCounts(logs), []int64{2, 3, 2}; !slices.Equal(got, want) {
+		t.Errorf("collision ERROR counts = %v, want %v: the onset, then each change of the claimant count", got, want)
+	}
+}
+
+// TestScannerRun_clears_a_collision_once_its_hidden_claimant_is_reached_and_gone
+// continues the sequence above: b back in reach keeps the collision, and b's pair
+// deleted from a listed directory clears it and publishes a.
+// Serial: it swaps slog.Default().
+func TestScannerRun_clears_a_collision_once_its_hidden_claimant_is_reached_and_gone(t *testing.T) {
+	in, outside := collidingTree(t)
+	out := t.TempDir()
+	logs := captureLogs(t)
+	scanner := newVerdictScanner(in, out, Options{Layout: outputpolicy.LayoutFlat})
+	_, restore := replaceAClaimantWhileOneIsHidden(t, scanner, in, outside)
+	pfx := filepath.Join(out, "site", "cert.pfx")
+
+	restore()
+	if res := runScans(t, scanner, 1); res.Collided != 2 || res.Unresolved != 0 {
+		t.Errorf("the scan with b back = %+v, want Collided 2 and nothing unresolved", res)
+	}
+	if _, err := os.Lstat(pfx); !os.IsNotExist(err) {
+		t.Errorf("a was published while b is back and still claims its stem: Lstat(site/cert.pfx) = %v", err)
+	}
+	if got := countClears(logs, condCollision); got != 0 {
+		t.Errorf("the scan with b back logged %d collision clears, want 0", got)
+	}
+
+	for _, name := range []string{"cert.crt", "cert.key"} {
+		if err := os.Remove(filepath.Join(in, "b", "site", name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res := runScans(t, scanner, 1)
+	if res.Collided != 0 || !res.conversionsClean() {
+		t.Errorf("the scan after b's pair left = %+v, want Collided 0 and conversions clean", res)
+	}
+	if got := countClears(logs, condCollision); got != 1 {
+		t.Errorf("the resolved collision logged %d clears, want 1; log = %q", got, logs.Messages())
+	}
+	if _, err := os.Stat(pfx); err != nil {
+		t.Errorf("a, now the only claimant, was not published: %v", err)
+	}
+	if got, want := collisionErrorCounts(logs), []int64{2, 3, 2}; !slices.Equal(got, want) {
+		t.Errorf("collision ERROR counts = %v, want %v: b coming back into reach is not news", got, want)
+	}
+}
+
+// TestScannerRun_clears_a_collision_whose_last_claimant_is_hidden pins that
+// a collision ends once one claimant is left, even while that claimant is out of
+// reach: nothing is contested, so the stem is not held.
+// Serial: it swaps slog.Default().
+func TestScannerRun_clears_a_collision_whose_last_claimant_is_hidden(t *testing.T) {
+	in, outside := collidingTree(t)
+	logs := captureLogs(t)
+	scanner := newVerdictScanner(in, t.TempDir(), Options{Layout: outputpolicy.LayoutFlat})
+	runScans(t, scanner, 1)
+
+	hideBehindLink(t, in, outside, "b")
+	for _, name := range []string{"cert.crt", "cert.key"} {
+		if err := os.Remove(filepath.Join(in, "a", "site", name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res := runScans(t, scanner, 1)
+	if res.Collided != 0 || res.Unresolved != 1 {
+		t.Errorf("the scan after a left with b hidden = %+v, want Collided 0 and b unresolved", res)
+	}
+	if got := countClears(logs, condCollision); got != 1 {
+		t.Errorf("the collision logged %d clears, want 1; log = %q", got, logs.Messages())
+	}
+}
+
+// TestScannerRun_keeps_a_collision_whose_claimant_a_budget_stop_did_not_reach pins
+// that a directory the walk entered but stopped inside reaches none of its paths,
+// so a claimant after the stop still holds its stem.
+// Serial: it swaps slog.Default().
+func TestScannerRun_keeps_a_collision_whose_claimant_a_budget_stop_did_not_reach(t *testing.T) {
+	in, _ := collidingTree(t)
+	out := t.TempDir()
+	logs := captureLogs(t)
+	scanner := newVerdictScanner(in, out, Options{Layout: outputpolicy.LayoutFlat})
+	runScans(t, scanner, 1)
+
+	// Seven entries are ".", a, a/site, its pair, b and b/site: the stop lands on b's certificate.
+	budgeted := newVerdictScanner(in, out, Options{Layout: outputpolicy.LayoutFlat, MaxScanEntries: 7})
+	budgeted.standing = scanner.standing
+	res, err := budgeted.Run(t.Context())
+	if res.Outcome != OutcomeBudgetStopped {
+		t.Fatalf("setup: Run = %+v, %v, want a budget stop inside b/site", res, err)
+	}
+	if res.Collided != 2 {
+		t.Errorf("the budget-stopped scan: Collided = %d, want 2 (a and the unreached b)", res.Collided)
+	}
+	if _, err := os.Lstat(filepath.Join(out, "site", "cert.pfx")); !os.IsNotExist(err) {
+		t.Errorf("a was published while the scan stopped before b: Lstat(site/cert.pfx) = %v", err)
+	}
+	if got := countClears(logs, condCollision); got != 0 {
+		t.Errorf("the budget-stopped scan logged %d collision clears, want 0; log = %q", got, logs.Messages())
 	}
 }
 
