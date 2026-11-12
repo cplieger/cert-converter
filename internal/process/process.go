@@ -270,7 +270,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	if s.opts.FormatsExplicit {
 		cleanupFormats = outputpolicy.Formats{PFX: true, PEM: true}
 	}
-	out := &store{root: outHandle, maxEntries: s.opts.MaxScanEntries, formats: cleanupFormats}
+	out := &store{root: outHandle, standing: s.standing, maxEntries: s.opts.MaxScanEntries, formats: cleanupFormats}
 	if now := sweepClock(); s.lastSweep.IsZero() || now.Sub(s.lastSweep) >= staleTempAge {
 		// A temp is only a candidate once it is staleTempAge old, so sweeping more
 		// often than that re-walks the whole output tree to find nothing new.
@@ -366,7 +366,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		walkErr = reconcileErr
 	}
 
-	s.reportVerdict(&result, out, walkErr)
+	s.reportVerdict(&result, out, sw.expected, walkErr)
 	if budgetExceeded {
 		return result, nil
 	}
@@ -376,7 +376,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 // reportVerdict derives the scan's verdicts from what the walk, the reaper and
 // the last sweep found, then logs the standing conditions that changed. Only a
 // scan that ran to the end can prove a per-path condition gone.
-func (s *Scanner) reportVerdict(result *ScanResult, out *store, walkErr error) {
+func (s *Scanner) reportVerdict(result *ScanResult, out *store, expected map[string]struct{}, walkErr error) {
 	result.Outcome = outcomeOf(walkErr)
 	result.OrphanRemovalDisabled = out.reapDisabled
 	result.PreviousLayoutRetained = out.otherLayoutKept
@@ -399,6 +399,8 @@ func (s *Scanner) reportVerdict(result *ScanResult, out *store, walkErr error) {
 	s.standing.clearUnseen(condCollision, false)
 	s.standing.clearUnseen(condUnwritable, false)
 	s.standing.clearUnseen(condUnresolvedSymlink, false)
+	s.standing.clearUnseen(condConversionFailed, false)
+	out.clearUnmanaged(expected)
 	// The aggregate unreadable_paths condition reports the clear; its per-path
 	// detail goes quietly.
 	s.standing.clearUnseen(condUnreadablePath, true)
@@ -426,6 +428,9 @@ type scanWalk struct {
 	// this walk saw, registered at enumeration time so a source whose conversion
 	// later fails still protects its artifacts from the orphan reaper.
 	expected map[string]struct{}
+	// failed is whether each source that failed in this walk was news, so every
+	// failure of one source in one scan shares the first one's level.
+	failed map[string]bool
 	// pendingSources defers flat-layout conversion until every source name is
 	// known, so output-name collisions are arbitrated before any artifact is
 	// published.
@@ -902,12 +907,43 @@ func IsShutdown(err error) bool {
 // failEntry records one per-entry failure: it logs the failure and returns the
 // failed status for the caller to propagate.
 func failEntry(logPath, msg string, err error, extra ...any) conversionStatus {
-	attrs := append([]any{"path", logtext.Path(logPath), "error", logtext.Path(err.Error())}, extra...)
+	attrs := failureAttrs(logPath, err, extra)
 	if IsShutdown(err) {
 		slog.Debug(msg+" (shutdown)", attrs...)
 	} else {
 		slog.Error(msg, attrs...)
 	}
+	return statusFailed
+}
+
+func failureAttrs(logPath string, err error, extra []any) []any {
+	return append([]any{"path", logtext.Path(logPath), "error", logtext.Path(err.Error())}, extra...)
+}
+
+// conversionFailedMsg reports a source that could not be converted.
+const conversionFailedMsg = "conversion failed"
+
+// failSource records a source's conversion failure as a standing condition keyed
+// by cause, a stable description of what failed: ERROR when the failure is new or
+// its cause changed, Debug while it holds.
+func (sw *scanWalk) failSource(rel, cause string, err error, extra ...any) conversionStatus {
+	if IsShutdown(err) {
+		return failEntry(rel, conversionFailedMsg, err, extra...)
+	}
+	news, decided := sw.failed[rel]
+	if !decided {
+		news = sw.standing.reportState(standingKey{kind: condConversionFailed, subject: rel}, 1, cause)
+		if sw.failed == nil {
+			sw.failed = make(map[string]bool)
+		}
+		sw.failed[rel] = news
+	}
+	level := slog.LevelDebug
+	if news {
+		level = slog.LevelError
+	}
+	slog.Log(context.Background(), level, conversionFailedMsg,
+		append([]any{"condition", condConversionFailed}, failureAttrs(rel, err, extra)...)...)
 	return statusFailed
 }
 
@@ -1204,7 +1240,7 @@ func (sw *scanWalk) convertEntry(ctx context.Context, rel string) conversionStat
 	// on disk the bundle these inputs produce?", which needs that bundle known first.
 	analysis, err := convert.Analyse(ctx, certPEM, keyPEM)
 	if err != nil {
-		return failEntry(rel, "conversion failed", err)
+		return sw.failSource(rel, err.Error(), err)
 	}
 	return sw.emit(ctx, rel, &emission{
 		analysis:     analysis,
@@ -1221,7 +1257,7 @@ var errInputPasswordNotConfigured = errors.New("PFX input reached conversion wit
 // convertBundle resolves the outcome for one PKCS#12 source under certsRoot.
 func (sw *scanWalk) convertBundle(ctx context.Context, rel string) conversionStatus {
 	if !sw.inputPasswordReady {
-		return failEntry(rel, "conversion failed", errInputPasswordNotConfigured)
+		return sw.failSource(rel, errInputPasswordNotConfigured.Error(), errInputPasswordNotConfigured)
 	}
 	data, err := sw.src.readBundleBounded(ctx, rel)
 	if err != nil {
@@ -1230,7 +1266,7 @@ func (sw *scanWalk) convertBundle(ctx context.Context, rel string) conversionSta
 	fingerprint := pairFingerprint(data, nil)
 	analysis, err := convert.AnalyseBundleWithBudget(ctx, data, sw.inputPassword, sw.bundleBudget)
 	if err != nil {
-		return failEntry(rel, "conversion failed", err)
+		return sw.failSource(rel, err.Error(), err)
 	}
 	return sw.emit(ctx, rel, &emission{
 		analysis:     analysis,
@@ -1281,7 +1317,7 @@ func (sw *scanWalk) emit(ctx context.Context, rel string, em *emission) conversi
 	if sw.formats.PEM {
 		certPEM, keyPEM, err := em.pemBytes()
 		if err != nil {
-			statuses = append(statuses, failEntry(rel, "conversion failed", err))
+			statuses = append(statuses, sw.failSource(rel, err.Error(), err))
 		} else {
 			statuses = append(statuses,
 				sw.emitRaw(ctx, rel, layout.CertOutFor(outStem), certPEM),
@@ -1290,11 +1326,13 @@ func (sw *scanWalk) emit(ctx context.Context, rel string, em *emission) conversi
 	}
 	outcome := foldStatuses(statuses)
 	if outcome == statusFailed && !slices.Contains(statuses, statusFailed) {
-		failEntry(rel, "conversion failed", errPartialPublication)
+		sw.failSource(rel, errPartialPublication.Error(), errPartialPublication)
 	}
 	switch outcome {
 	case statusFailed:
-		logConversionObservations(rel, em.observations)
+		if sw.failed[rel] {
+			logConversionObservations(rel, em.observations)
+		}
 	case statusUnwritable:
 		// An artifact on disk this app never proved wrong, behind a refusal no
 		// restart clears: re-analysed every scan for as long as the operator
@@ -1360,7 +1398,7 @@ func (sw *scanWalk) emitPFX(ctx context.Context, rel, pfxRel string, em *emissio
 	slog.Debug("converting source", "path", logtext.Path(rel), "output_path", logtext.Path(pfxRel))
 	pfxData, err := em.analysis.Encode(sw.enc, sw.password)
 	if err != nil {
-		return failEntry(rel, "conversion failed", err)
+		return sw.failSource(rel, err.Error(), err)
 	}
 	writeErr := sw.out.write(ctx, pfxRel, pfxData)
 	// The one derivation, after the write, from what the bundle on disk was
@@ -1431,10 +1469,12 @@ func (sw *scanWalk) reportWriteFailure(logRel, outputRel string, err writeRefusa
 			"content", "unverified", "remediation", err.cause().remediation())
 		return
 	}
-	// failEntry is called for its log; the statusFailed it returns is the value
-	// writeOutcome already derived, so this keeps one derivation.
-	failEntry(logRel, "conversion failed", err, "output_path", logtext.Path(outputRel),
-		"remediation", err.cause().remediation())
+	// failSource is called for its log; the statusFailed it returns is the value
+	// writeOutcome already derived, so this keeps one derivation. The cause names
+	// the artifact and the refusal class, not the error text, which can carry a
+	// temp file's random name.
+	sw.failSource(logRel, fmt.Sprintf("write %s: %d", outputRel, err.cause()), err,
+		"output_path", logtext.Path(outputRel), "remediation", err.cause().remediation())
 }
 
 // logConversionObservations surfaces Analyse's non-fatal findings about a pair's

@@ -863,8 +863,8 @@ func TestScannerRun_reports_but_does_not_rewrite_a_content_current_bundle_whose_
 				t.Errorf("Run(content-current, lax mode) = %+v, want Unchanged 1 Converted 0 Failed 0"+
 					" Unwritable 0: a lax mode must not schedule a write", res)
 			}
-			// Reported all the same: the operator is told, and told again every scan, because
-			// nothing this app does will clear the condition.
+			// Reported all the same: the operator is told, because nothing this app does will
+			// clear the condition.
 			if got := logs.CountLevel(slog.LevelWarn, laxArtifactMsg); got != 1 {
 				t.Errorf("Run(content-current, lax mode) logged %q at WARN %d times, want exactly 1: %q",
 					laxArtifactMsg, got, logs.Messages())
@@ -889,8 +889,8 @@ func TestScannerRun_reports_but_does_not_rewrite_a_content_current_bundle_whose_
 			}
 
 			// Steady state rather than convergence, and that is the point: the mode is still
-			// lax, it is reported again, and the bundle is still not touched. A per-scan WARN
-			// over an unchanged file is the cheap outcome; a per-scan REWRITE was not.
+			// lax, the standing condition is not logged again, and the bundle is still not
+			// touched.
 			res, err = scanner.Run(t.Context())
 			if err != nil {
 				t.Fatalf("Run(third scan) = error %v, want nil", err)
@@ -899,9 +899,9 @@ func TestScannerRun_reports_but_does_not_rewrite_a_content_current_bundle_whose_
 				t.Errorf("Run(third scan) = %+v, want Unchanged 1 Converted 0: the second scan must reach"+
 					" the same verdict as the first", res)
 			}
-			if got := logs.CountLevel(slog.LevelWarn, laxArtifactMsg); got != 2 {
-				t.Errorf("two scans logged %q at WARN %d times, want 2 (one per scan): the operator keeps"+
-					" being told about a mode only they can change: %q", laxArtifactMsg, got, logs.Messages())
+			if got := logs.CountLevel(slog.LevelWarn, laxArtifactMsg); got != 1 {
+				t.Errorf("two scans logged %q at WARN %d times, want 1: a standing condition is logged"+
+					" when it appears: %q", laxArtifactMsg, got, logs.Messages())
 			}
 			final, finalInfo := readBundle(t, pfxPath)
 			if !bytes.Equal(final, before) || !os.SameFile(beforeInfo, finalInfo) {

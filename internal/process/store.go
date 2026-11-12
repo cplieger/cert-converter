@@ -34,9 +34,11 @@ const outputPermRemediation = "check /output ownership and permissions for the U
 // store owns every touch of the output tree.
 type store struct {
 	root *os.Root
-	// laxDirsReported dedupes the lax-output-directory WARN to once per directory
-	// per scan.
-	laxDirsReported map[string]struct{}
+	// standing carries the permissive-mode conditions across scans; nil reports
+	// every finding as new.
+	standing *standing
+	// laxDirsChecked is the directories this scan has checked for a permissive mode.
+	laxDirsChecked map[string]struct{}
 	// maxEntries is this store's per-walk entry budget for the OUTPUT tree, injected
 	// from Options.MaxScanEntries exactly as scanWalk's is for /input.
 	maxEntries int
@@ -50,8 +52,7 @@ type store struct {
 	otherLayoutKept bool
 }
 
-// laxDirMsg is the standing WARN for an /output directory more permissive than
-// outputDirMode: a group- or world-WRITABLE directory lets another process on
+// laxDirMsg reports an /output directory more permissive than outputDirMode: a group- or world-WRITABLE directory lets another process on
 // the shared mount unlink or replace an artifact, and a world-TRAVERSABLE one
 // exposes artifact names.
 const laxDirMsg = "the /output directory holding generated artifacts is more permissive than policy"
@@ -70,30 +71,44 @@ func (s *store) reportLaxDir(rel string) {
 	}
 }
 
-// reportLaxDirAt reports one output directory, once per directory per scan.
+// reportLaxDirAt checks one output directory once per scan: a permissive mode is
+// a standing condition keyed by the mode, cleared when the directory is found
+// tightened or gone.
 func (s *store) reportLaxDirAt(dir string) {
-	if _, done := s.laxDirsReported[dir]; done {
+	if _, done := s.laxDirsChecked[dir]; done {
 		return
 	}
+	key := standingKey{kind: condPermissiveDir, subject: dir}
 	// Lstat, not Stat: a symlink at a directory name is classified as itself,
 	// never by its target, so a linked directory is skipped rather than reported
 	// for a mode this app did not observe on the real path.
 	fi, err := s.root.Lstat(dir)
-	if err != nil || !fi.IsDir() {
+	switch {
+	case errors.Is(err, fs.ErrNotExist), err == nil && !fi.IsDir():
+		s.standing.clear(key)
+		return
+	case err != nil:
 		return
 	}
-	if s.laxDirsReported == nil {
-		s.laxDirsReported = make(map[string]struct{})
+	if s.laxDirsChecked == nil {
+		s.laxDirsChecked = make(map[string]struct{})
 	}
-	s.laxDirsReported[dir] = struct{}{}
-	if perm := fi.Mode().Perm(); laxerThan(perm, outputDirMode) {
-		// dir is root-relative, so "." for a flat /output; the root is named
-		// alongside it, matching logOrphanWalkOutcome's own directory-level records.
-		slog.Warn(laxDirMsg,
-			"path", logtext.Path(dir), "dir", logtext.Path(s.root.Name()),
-			"mode", perm.String(), "want", os.FileMode(outputDirMode).String(),
-			"remediation", outputPermRemediation)
+	s.laxDirsChecked[dir] = struct{}{}
+	perm := fi.Mode().Perm()
+	if !laxerThan(perm, outputDirMode) {
+		s.standing.clear(key)
+		return
 	}
+	level := slog.LevelDebug
+	if s.standing.reportState(key, 1, perm.String()) {
+		level = slog.LevelWarn
+	}
+	// dir is root-relative, so "." for a flat /output; the root is named
+	// alongside it, matching logOrphanWalkOutcome's own directory-level records.
+	slog.Log(context.Background(), level, laxDirMsg,
+		"condition", condPermissiveDir, "path", logtext.Path(dir), "dir", logtext.Path(s.root.Name()),
+		"mode", perm.String(), "want", os.FileMode(outputDirMode).String(),
+		"remediation", outputPermRemediation)
 }
 
 // writeFileInRoot is store.write's confined atomic write, indirected through a
@@ -139,6 +154,7 @@ func (s *store) writeBounded(ctx context.Context, rel string, data []byte, maxBy
 	); err != nil {
 		return refuseWrite(classifyWriteErrno(err), "write output: %w", err)
 	}
+	s.artifactGone(rel)
 	return nil
 }
 
@@ -238,6 +254,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 	parent, base, err := filesafe.OpenParentInRoot(s.root, rel)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
+		s.artifactGone(rel)
 		return contentVerifiedStale, nil
 	case err != nil:
 		// A pin this app cannot obtain degrades the same way a stat failure
@@ -253,6 +270,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 	fi, err := parent.Lstat(base)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
+		s.artifactGone(rel)
 		return contentVerifiedStale, nil
 	case err != nil:
 		slog.Warn("cannot stat prior pfx; regenerating",
@@ -260,6 +278,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 			"remediation", outputPermRemediation)
 		return contentUnverified, nil
 	case !fi.Mode().IsRegular():
+		s.artifactGone(rel)
 		// A symlink must never be followed here, or unrelated content could
 		// satisfy the check.
 		slog.Warn("prior output path is not a regular file; regenerating",
@@ -268,7 +287,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		return contentVerifiedStale, nil
 	}
 
-	reportLaxArtifact(rel, fi.Mode().Perm())
+	s.reportLaxArtifact(rel, fi.Mode().Perm())
 
 	if fi.Size() > maxPFXSize {
 		slog.Warn("prior pfx exceeds the readable bound; regenerating",
@@ -348,6 +367,7 @@ func (s *store) inspectRaw(ctx context.Context, rel string, want []byte) (conten
 	parent, base, err := filesafe.OpenParentInRoot(s.root, rel)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
+		s.artifactGone(rel)
 		return contentVerifiedStale, nil
 	case err != nil:
 		slog.Warn("cannot pin the output directory of a prior output; regenerating",
@@ -360,6 +380,7 @@ func (s *store) inspectRaw(ctx context.Context, rel string, want []byte) (conten
 	fi, err := parent.Lstat(base)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
+		s.artifactGone(rel)
 		return contentVerifiedStale, nil
 	case err != nil:
 		slog.Warn("cannot stat prior output; regenerating",
@@ -367,6 +388,7 @@ func (s *store) inspectRaw(ctx context.Context, rel string, want []byte) (conten
 			"remediation", outputPermRemediation)
 		return contentUnverified, nil
 	case !fi.Mode().IsRegular():
+		s.artifactGone(rel)
 		// A symlink must never be followed here, or unrelated content could
 		// satisfy the check.
 		slog.Warn("prior output path is not a regular file; regenerating",
@@ -375,7 +397,7 @@ func (s *store) inspectRaw(ctx context.Context, rel string, want []byte) (conten
 		return contentVerifiedStale, nil
 	}
 
-	reportLaxArtifact(rel, fi.Mode().Perm())
+	s.reportLaxArtifact(rel, fi.Mode().Perm())
 
 	if fi.Size() != int64(len(want)) {
 		return contentVerifiedStale, nil
@@ -400,8 +422,8 @@ func (s *store) inspectRaw(ctx context.Context, rel string, want []byte) (conten
 	return contentVerifiedCurrent, nil
 }
 
-// laxArtifactMsg is the standing WARN for a prior artifact carrying a
-// permission bit outputFileMode does not.
+// laxArtifactMsg reports a prior artifact carrying a permission bit
+// outputFileMode does not.
 const laxArtifactMsg = "prior output is more permissive than policy; leaving its mode as found"
 
 // outputPinRemediation is the operator action behind every /output LAYOUT refusal
@@ -433,14 +455,51 @@ func laxerThan(perm, policy os.FileMode) bool {
 	return perm&^policy != 0
 }
 
-// reportLaxArtifact warns when a prior artifact's mode is laxer than
-// outputFileMode.
-func reportLaxArtifact(rel string, perm os.FileMode) {
+// reportLaxArtifact reports a prior artifact's permissive mode as a standing
+// condition keyed by the mode, and clears it once the mode is within policy.
+func (s *store) reportLaxArtifact(rel string, perm os.FileMode) {
+	key := standingKey{kind: condPermissiveFile, subject: rel}
 	if !laxerThan(perm, outputFileMode) {
+		s.standing.clear(key)
 		return
 	}
-	slog.Warn(laxArtifactMsg,
-		"path", logtext.Path(rel), "mode", perm.String(), "want", outputFileMode.String())
+	level := slog.LevelDebug
+	if s.standing.reportState(key, 1, perm.String()) {
+		level = slog.LevelWarn
+	}
+	slog.Log(context.Background(), level, laxArtifactMsg,
+		"condition", condPermissiveFile, "path", logtext.Path(rel), "mode", perm.String(), "want", outputFileMode.String())
+}
+
+// artifactGone clears rel's permissive-mode condition: nothing this app wrote is
+// at rel any more, or a fresh write put outputFileMode there.
+func (s *store) artifactGone(rel string) {
+	s.standing.clear(standingKey{kind: condPermissiveFile, subject: rel})
+}
+
+// clearUnmanaged ends the permissive-mode conditions on paths no expected
+// artifact lives at or under. Only a scan that saw the whole tree may call it.
+func (s *store) clearUnmanaged(expected map[string]struct{}) {
+	dirs := make(map[string]struct{})
+	for artifact := range expected {
+		for dir := path.Dir(artifact); ; dir = path.Dir(dir) {
+			if _, ok := dirs[dir]; ok {
+				break
+			}
+			dirs[dir] = struct{}{}
+			if dir == "." {
+				break
+			}
+		}
+	}
+	s.standing.clearUnless(condPermissiveFile, func(rel string) bool {
+		_, ok := expected[rel]
+		return ok
+	})
+	s.standing.clearUnless(condPermissiveDir, func(dir string) bool {
+		_, ok := dirs[dir]
+		return ok
+	})
 }
 
 // writeRefusalCause names WHAT refused an /output write, as the site that refused it

@@ -26,6 +26,9 @@ const (
 	condUnwritable         = "unwritable_output"
 	condUnreadablePath     = "unreadable_path"
 	condUnresolvedSymlink  = "unresolved_symlink"
+	condConversionFailed   = "conversion_failed"
+	condPermissiveDir      = "permissive_output_dir"
+	condPermissiveFile     = "permissive_output_file"
 )
 
 // standingClearedMsg ends a standing condition, with how long it held.
@@ -39,8 +42,8 @@ var subjectAttr = map[string]string{
 }
 
 // standing remembers the standing conditions this process has reported, so a
-// reader sees each one when it appears, again when its count changes, and once
-// when it clears, instead of on every scan. A restart starts with none, so the
+// reader sees each one when it appears, again when its count or state changes,
+// and once when it clears, instead of on every scan. A restart starts with none, so the
 // new process reports every condition that still holds once more.
 type standing struct {
 	conditions map[standingKey]standingSince
@@ -51,6 +54,7 @@ type standing struct {
 
 type standingSince struct {
 	since time.Time
+	state string
 	count int
 }
 
@@ -76,18 +80,24 @@ func (s *standing) beginScan() {
 //
 // A nil standing remembers nothing, so every report is news.
 func (s *standing) report(key standingKey, n int) bool {
+	return s.reportState(key, n, "")
+}
+
+// reportState is report for a condition whose state, such as a mode or a cause,
+// is news when it changes too.
+func (s *standing) reportState(key standingKey, n int, state string) bool {
 	if s == nil {
 		return true
 	}
 	s.seen[key] = struct{}{}
 	held, ok := s.conditions[key]
-	if ok && held.count == n {
+	if ok && held.count == n && held.state == state {
 		return false
 	}
 	if !ok {
 		held.since = standingClock()
 	}
-	held.count = n
+	held.count, held.state = n, state
 	s.conditions[key] = held
 	return true
 }
@@ -137,5 +147,18 @@ func (s *standing) clearUnseen(kind string, quiet bool) {
 			continue
 		}
 		s.clear(key)
+	}
+}
+
+// clearUnless ends every condition of kind whose subject fails holds. Only a
+// scan that saw the whole tree may call it.
+func (s *standing) clearUnless(kind string, holds func(subject string) bool) {
+	if s == nil {
+		return
+	}
+	for key := range s.conditions {
+		if key.kind == kind && !holds(key.subject) {
+			s.clear(key)
+		}
 	}
 }
