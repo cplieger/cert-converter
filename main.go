@@ -23,7 +23,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/scancadence"
 	"github.com/cplieger/cert-converter/internal/scanreport"
 	"github.com/cplieger/cert-converter/internal/watch"
-	"github.com/cplieger/go/health"
+	"github.com/cplieger/go/health/v2"
 	"github.com/cplieger/go/httpserver"
 	"github.com/cplieger/go/measure"
 	"github.com/cplieger/go/slogx"
@@ -48,8 +48,8 @@ func healthyAfterScan(r *process.ScanResult) bool {
 }
 
 // scanAndSetHealth runs one scan, reports its verdict to the record and the
-// metrics, and updates the marker.
-func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, reporter *scanreport.Reporter, marker *health.Marker, polling bool) {
+// metrics, and updates the health verdict.
+func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, reporter *scanreport.Reporter, st *health.Status, polling bool) {
 	result, err := scanner.Run(ctx)
 	if err != nil && process.IsShutdown(err) {
 		slog.Info("scan interrupted by shutdown", "reason", err)
@@ -58,10 +58,10 @@ func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, reporter *s
 	reporter.Report(ctx, &scanreport.Scan{Result: result, Err: err, Polling: polling})
 	if err != nil {
 		slog.Error("processing failed", "error", logtext.Path(err.Error()))
-		marker.Set(false)
+		st.Set(false)
 		return
 	}
-	marker.Set(healthyAfterScan(&result))
+	st.Set(healthyAfterScan(&result))
 }
 
 // --- Metrics ---
@@ -114,8 +114,8 @@ func startMetrics(ctx context.Context, addr string, reg *measure.Registry, healt
 
 // --- Health ---
 
-// healthLease is how old the marker may grow before the watch loop counts as
-// stuck: three effective fallback cadences, the marker's guaranteed refresh
+// healthLease is how old the last clean scan may grow before the watch loop
+// counts as stuck: three effective fallback cadences, the guaranteed refresh
 // floor (file events refresh it sooner).
 func healthLease(fallback time.Duration) time.Duration {
 	return health.Lease{Interval: scancadence.Effective(fallback), Cycles: 3}.Duration()
@@ -127,30 +127,25 @@ const (
 	reasonStuck      = "no scan has finished within three guaranteed recheck cadences, so the watch loop may be stuck"
 )
 
-// newHealthz serves the verdict the health subcommand reads from marker while
-// the marker directory is writable, as one check per fault so each names itself.
-func newHealthz(marker *health.Marker, fallback time.Duration) http.Handler {
+// newHealthz serves st with the lease the health subcommand gives the probe, as
+// one check per fault so each names itself.
+func newHealthz(st *health.Status, fallback time.Duration) http.Handler {
 	return health.CheckHandler(
-		health.Check{Signal: marker, Reason: reasonScanFailed},
-		health.Check{Signal: notStale{marker: marker, lease: healthLease(fallback)}, Reason: reasonStuck},
+		health.Check{Signal: st, Reason: reasonScanFailed},
+		health.Check{Signal: st.Fresh(healthLease(fallback)), Reason: reasonStuck},
 	)
 }
 
-// notStale fails a marker that reads healthy but is past the lease, so an
-// absent marker reports reasonScanFailed alone and not reasonStuck too.
-type notStale struct {
-	marker *health.Marker
-	lease  time.Duration
-}
-
-func (s notStale) Healthy() bool {
-	return s.marker.Within(s.lease).Healthy() || !s.marker.Healthy()
-}
+// healthMarkerPath is the file the watcher mirrors its verdict to and the health
+// subcommand reads.
+var healthMarkerPath = health.MarkerPath("cert-converter")
 
 // --- Entrypoint ---
 
 // runProbe is a seam: health.RunProbe exits the process, so tests replace it.
-var runProbe = health.RunProbe
+var runProbe = func(path string, maxAge time.Duration) {
+	health.RunProbe(path, health.WithMaxAge(maxAge))
+}
 
 // requiredVolumes is the ONE statement of this container's mount set: the paths
 // the startup guard proves openable, and the same paths the scanner, the watcher
@@ -183,8 +178,8 @@ func usage() {
 // start supplies it; a bare argv therefore means the binary was run by hand, and
 // overwhelmingly that means `docker exec <container> /cert-watcher` against a
 // container whose watcher is already running. Before, that fell through to the
-// watcher: run() reaches marker.Set(false), which UNLINKS the resident
-// watcher's health marker, and then a SECOND watcher attaches over the same
+// watcher: run() builds a health Status, which REMOVES the resident watcher's
+// health marker, and then a SECOND watcher attaches over the same
 // /input and /output, so two processes convert the same certificates and make
 // orphan-reaping decisions about each other's files. Refusing costs the operator
 // one word and removes the accident outright. It does not stop a deliberate
@@ -199,7 +194,7 @@ func dispatchArgs(args []string) int {
 	case len(args) == 2 && args[1] == watchSubcommand:
 		return continueToWatcher
 	case len(args) == 2 && args[1] == healthSubcommand:
-		runProbe(health.DefaultPath, health.WithMaxAge(healthLease(config.FallbackInterval())))
+		runProbe(healthMarkerPath, healthLease(config.FallbackInterval()))
 		return continueToWatcher // unreachable in production; runProbe exits
 	default:
 		switch args[1] {
@@ -227,8 +222,7 @@ func main() {
 
 // run is the real entrypoint: it returns the process exit code instead of
 // calling os.Exit itself, so every deferred cleanup registered below (the
-// signal-context stop, the health-marker removal) actually runs on the failure
-// paths too.
+// signal-context stop, the health drain) actually runs on the failure paths too.
 func run() int {
 	slogx.Setup(slogx.Options{Level: config.LogLevel()})
 
@@ -242,13 +236,11 @@ func run() int {
 	// once-per-process-start startup line into one on every healthcheck.
 	config.WarnInvalidLogLevel()
 
-	// Clear any marker left by a previous run BEFORE the first failure exit:
-	// /tmp/.healthy lives in the container's writable layer and survives a
-	// restart, so an early return here would leave a stale healthy marker for a
-	// process that never validated its configuration.
-	marker := health.NewMarker(health.DefaultPath)
-	marker.Set(false)
-	defer marker.Cleanup()
+	// Built BEFORE the first failure exit: NewStatus removes a marker an earlier
+	// run left, so a process that never validated its configuration cannot read
+	// healthy.
+	st := health.NewStatus(health.WithMarker(healthMarkerPath))
+	defer st.BeginDrain()
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -298,7 +290,7 @@ func run() int {
 	// of leaving it converting with no page.
 	reg, reporter := newMetrics()
 	metricsCtx, stopMetrics := context.WithCancel(ctx)
-	waitMetrics, err := startMetrics(metricsCtx, cfg.MetricsListenAddr, reg, newHealthz(marker, cfg.FallbackInterval))
+	waitMetrics, err := startMetrics(metricsCtx, cfg.MetricsListenAddr, reg, newHealthz(st, cfg.FallbackInterval))
 	if err != nil {
 		stopMetrics()
 		slog.Error("cannot listen on METRICS_LISTEN_ADDR; refusing to start",
@@ -338,7 +330,7 @@ func run() int {
 	// runAndSetHealth adapts scanAndSetHealth to the watcher's on-change
 	// callback signature.
 	runAndSetHealth := func(ctx context.Context, polling bool) {
-		scanAndSetHealth(ctx, scanner, reporter, marker, polling)
+		scanAndSetHealth(ctx, scanner, reporter, st, polling)
 	}
 
 	// No scan here: w.Run owns the first scan in both modes.
