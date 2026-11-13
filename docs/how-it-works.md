@@ -57,7 +57,7 @@ Health tracks only failures a restart can clear, plus a collision a restart keep
 - Files kept from a previous `OUTPUT_LAYOUT`.
 - An `INPUT_EXCLUDE_PATHS` value that covers every source found.
 
-[Monitoring and alerts](monitoring.md) has an alert rule for each of them except the two permission warnings, which appear only in the log.
+[Monitoring and alerts](monitoring.md) has an alert rule for each of them except the two permission warnings and the dangling source link warning (`condition=dangling_source_link`), which appear only in the log.
 
 ## Design choices
 

@@ -1523,8 +1523,8 @@ func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInput
 	return pairInputs{certPEM: certPEM, keyPEM: keyPEM}, statusUnset
 }
 
-// noteMissingKey classifies a sibling .key that is not there at the stat and returns the
-// outcome, with its diagnosis already logged.
+// noteMissingKey classifies a sibling .key this scan judged Absent and returns the outcome,
+// with its diagnosis already logged.
 func (sw *scanWalk) noteMissingKey(rel, keyRel string) conversionStatus {
 	if sw.observations.completedPair(rel) && sw.src.pathVanished(keyRel) {
 		sw.observations.forgetPair(rel)
