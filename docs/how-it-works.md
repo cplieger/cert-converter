@@ -38,9 +38,9 @@ The container is unhealthy when any of these holds:
 - A certificate fails to convert. The causes are a PEM or key parse error, a PFX decode failure, a certificate that does not match its key, and a failed write.
 - Two inputs collide on one output name under the flat layout.
 
-It recovers on the next clean scan without a restart. Docker Engine does not act on health status itself. An orchestrator that does, such as Swarm or Kubernetes, restarts the container, and under plain Docker Compose the restart is yours to do. Nothing tells you about an unhealthy container unless something watches Docker health, as [Monitoring and alerts](monitoring.md#knowing-the-app-is-alive) explains. A collision is the one unhealthy state a restart never clears. It is deliberate, because nothing else tells an orchestrator that an app is reading a file cert-converter refuses to update.
+It recovers on the next clean scan without a restart. Docker Engine does not act on health status itself. An orchestrator that does, such as Swarm or Kubernetes, restarts the container, and under plain Docker Compose the restart is yours to do. Nothing tells you about an unhealthy container unless something watches Docker health, as [Monitoring and alerts](monitoring.md#knowing-the-app-is-alive) explains. A collision whose inputs the restarted process can still reach is found again, so the container stays unhealthy. That is deliberate, because nothing else tells an orchestrator that an app is reading a file cert-converter refuses to update. A restart forgets an input the new process cannot reach, so if one input is left in reach it converts and health recovers.
 
-Health tracks only failures a restart can clear, plus that one exception. These conditions are logged at WARN with the action to take and leave health unchanged:
+Health tracks only failures a restart can clear, plus a collision a restart finds again. These conditions are logged at WARN with the action to take and leave health unchanged:
 
 - An unreadable path below `/input`, or a symlink that points outside the mount.
 - An `/input` tree larger than `MAX_SCAN_ENTRIES`.

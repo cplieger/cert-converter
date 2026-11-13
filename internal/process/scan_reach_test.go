@@ -147,6 +147,39 @@ func TestScannerRun_keeps_a_collision_whose_claimants_are_both_hidden(t *testing
 	}
 }
 
+// TestScannerRun_keeps_a_collision_whose_claimant_is_hidden_behind_an_input_named_link
+// pins that an unresolvable link named like a certificate or key hides what is
+// under it as any other unresolvable link does, on a scan an unrelated link
+// keeps short of the whole tree.
+// Serial: it swaps slog.Default().
+func TestScannerRun_keeps_a_collision_whose_claimant_is_hidden_behind_an_input_named_link(t *testing.T) {
+	for _, name := range []string{"b.crt", "b.key"} {
+		t.Run(name, func(t *testing.T) {
+			in, outside := claimantTree(t, "a", name)
+			if err := os.Symlink(outside, filepath.Join(in, "linked")); err != nil {
+				t.Fatal(err)
+			}
+			out := t.TempDir()
+			logs := captureLogs(t)
+			scanner := newVerdictScanner(in, out, Options{Layout: outputpolicy.LayoutFlat})
+			if res := runScans(t, scanner, 1); res.Collided != 2 {
+				t.Fatalf("setup: Collided = %d, want 2", res.Collided)
+			}
+
+			hideBehindLink(t, in, outside, name)
+			if res := runScans(t, scanner, 1); res.Collided != 2 || res.conversionsClean() {
+				t.Errorf("a scan that could not reach %s = %+v, want Collided 2 and conversions not clean", name, res)
+			}
+			if _, err := os.Lstat(filepath.Join(out, "site", "cert.pfx")); !os.IsNotExist(err) {
+				t.Errorf("a was published while %s was hidden: Lstat(site/cert.pfx) = %v", name, err)
+			}
+			if got := countClears(logs, condCollision); got != 0 {
+				t.Errorf("a scan that could not reach %s logged %d collision clears, want 0; log = %q", name, got, logs.Messages())
+			}
+		})
+	}
+}
+
 // replaceAClaimantWhileOneIsHidden runs three flat scans over collidingTree's
 // claimants of site/cert: a and b collide; b goes behind an unresolvable link
 // while c joins; c's pair is deleted with b still hidden. It returns each scan's
@@ -264,7 +297,8 @@ func clearWithLastClaimantHidden(t *testing.T, scanner *Scanner, in, outside str
 
 // TestScannerRun_clears_a_collision_whose_last_claimant_is_hidden pins that
 // a collision ends once one claimant is left, even while that claimant is out of
-// reach: nothing is contested, so the stem is not held.
+// reach: the collision clears and Collided is 0, while the hidden claimant stays
+// stored as the stem's claimant.
 // Serial: it swaps slog.Default().
 func TestScannerRun_clears_a_collision_whose_last_claimant_is_hidden(t *testing.T) {
 	in, outside := collidingTree(t)
@@ -375,11 +409,20 @@ func TestScannerRun_holds_a_newcomer_against_a_hidden_published_claimant(t *test
 }
 
 // TestScannerRun_clears_a_collision_whose_claimant_directory_left pins that a
-// claimant whose directory was removed or renamed is gone once the scan listed
-// the directory that held it, even while an unrelated link keeps the scan short
-// of the whole tree.
+// claimant whose directory was removed, renamed or replaced by a link the scan
+// resolved (to a directory it walks directly, or to nothing) is gone once the
+// scan listed the directory that held it, even while an unrelated link keeps
+// the scan short of the whole tree.
 // Serial: it swaps slog.Default().
 func TestScannerRun_clears_a_collision_whose_claimant_directory_left(t *testing.T) {
+	replaceWithLink := func(target string) func(in string) error {
+		return func(in string) error {
+			if err := os.RemoveAll(filepath.Join(in, "b")); err != nil {
+				return err
+			}
+			return os.Symlink(target, filepath.Join(in, "b"))
+		}
+	}
 	for _, tc := range []struct {
 		leave func(in string) error
 		name  string
@@ -388,6 +431,8 @@ func TestScannerRun_clears_a_collision_whose_claimant_directory_left(t *testing.
 		{name: "renamed", leave: func(in string) error {
 			return os.Rename(filepath.Join(in, "b", "site"), filepath.Join(in, "b", "other"))
 		}},
+		{name: "linked_to_a_walked_directory", leave: replaceWithLink("a")},
+		{name: "linked_to_nothing", leave: replaceWithLink("does-not-exist")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			in, outside := collidingTree(t)

@@ -1,7 +1,6 @@
 package process
 
 import (
-	"io/fs"
 	"path"
 	"strings"
 
@@ -14,8 +13,10 @@ import (
 type scanReach struct {
 	// listed is every /input directory the walk listed in full.
 	listed map[string]struct{}
-	// entered is every /input directory or symlink the walk enumerated, by the
-	// order it was enumerated in: a path under none of them is absent.
+	// entered numbers, in enumeration order, every /input directory the walk
+	// enumerated and every symlink the scan could not resolve: walkedBefore
+	// orders directories by it, and input takes one on the way to a path as a
+	// place that path may still exist.
 	entered map[string]int
 	// unread is every /input path of a source the scan could not read to a verdict.
 	unread map[string]struct{}
@@ -27,20 +28,26 @@ type scanReach struct {
 	whole bool
 }
 
-// enter records that the walk enumerated rel, whose entry is d: a directory is
-// listed until withdrawn or stopped inside.
-func (r *scanReach) enter(rel string, d fs.DirEntry) {
-	if !d.IsDir() && d.Type()&fs.ModeSymlink == 0 {
-		return
-	}
+// enterDir records that the walk enumerated the directory rel: it stays listed
+// unless its listing fails (withdraw) or the walk stops before finishing it
+// (stop).
+func (r *scanReach) enterDir(rel string) {
+	r.order(rel)
+	r.listed[rel] = struct{}{}
+}
+
+// enterLink records that the walk enumerated the symlink rel and the scan could
+// not resolve it, so a path under it is not proven absent.
+func (r *scanReach) enterLink(rel string) {
+	r.order(rel)
+}
+
+func (r *scanReach) order(rel string) {
 	if r.entered == nil {
 		r.entered = make(map[string]int)
 		r.listed = make(map[string]struct{})
 	}
 	r.entered[rel] = len(r.entered)
-	if d.IsDir() {
-		r.listed[rel] = struct{}{}
-	}
 }
 
 // withdraw records that the walk could not read rel: a directory is not
@@ -111,8 +118,9 @@ func (r *scanReach) noteSource(rel string, outcome conversionStatus, artifacts [
 }
 
 // input reports whether the scan reached the /input path subject: it listed the
-// directory holding it and read it to a verdict, or it listed an ancestor whose
-// listing holds nothing on the way to it, so subject is absent.
+// directory holding it and read it to a verdict, or it listed an ancestor that
+// holds no directory or unresolved symlink on the way to it, so subject is
+// absent.
 func (r *scanReach) input(subject string) bool {
 	if _, unread := r.unread[subject]; unread {
 		return false

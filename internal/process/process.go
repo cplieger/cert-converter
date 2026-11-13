@@ -511,14 +511,14 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 			"remediation", scanbudget.InputRemediation)
 		return fmt.Errorf("%w: stopped at %d entries (%s)", errScanBudgetExceeded, sw.budget.Count(), rel)
 	}
-	// A directory is withdrawn by the error call above if its listing fails.
-	sw.reach.enter(rel, d)
 	if d.IsDir() {
+		// Withdrawn by the error call above if its listing fails.
+		sw.reach.enterDir(rel)
 		sw.noteSourceShapedDir(rel)
 		return nil
 	}
+	sw.noteUnwalkableSymlink(rel, d)
 	if !layout.IsSource(rel) {
-		sw.noteUnwalkableSymlink(rel, d)
 		return nil
 	}
 	// Ahead of every other classification: an excluded source is enumerated and
@@ -543,7 +543,8 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 // noteSourceShapedDir classifies a directory occupying a source path: an input
 // the scan cannot read. Counting it as unreadable keeps it health-neutral while
 // blocking orphan reaping, so sync never deletes the still-live artifacts of an
-// input path that still exists in an unusable shape.
+// input path that still exists in an unusable shape. The directory claims no
+// stem, so a flat claimant replaced by one leaves its stem's ledger.
 func (sw *scanWalk) noteSourceShapedDir(rel string) {
 	if !layout.IsSource(rel) {
 		return
@@ -820,15 +821,21 @@ func (sw *scanWalk) resolveFlatOrphanCert(ctx context.Context, rel string) (bool
 	return true, sw.processSource(ctx, rel)
 }
 
-// noteUnwalkableSymlink reports a symlink under the input root that the walk
-// cannot follow.
+// noteUnwalkableSymlink records a symlink the walk enumerated, which it never
+// descends. One the scan cannot resolve through the input root keeps what is
+// under it unreached and, unless its name makes it an input that reports its
+// own read, is warned about and counted.
 func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
-	if d.Type()&fs.ModeSymlink == 0 || layout.IsRelevant(rel) {
+	if d.Type()&fs.ModeSymlink == 0 {
 		return
 	}
 	fi, err := sw.src.stat(rel)
 	switch {
 	case err != nil && !errors.Is(err, fs.ErrNotExist):
+		sw.reach.enterLink(rel)
+		if layout.IsRelevant(rel) {
+			return
+		}
 		sw.unresolved++
 		level := slog.LevelDebug
 		if sw.standing.report(standingKey{kind: condUnresolvedSymlink, subject: rel}, 1) {
@@ -837,7 +844,7 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 		slog.Log(context.Background(), level, "skipping symlink that could not be resolved through the input root; anything it points to, including certificates under a linked directory, is not scanned",
 			"condition", condUnresolvedSymlink, "path", logtext.Path(rel), "error", logtext.Path(err.Error()),
 			"remediation", "mount that certificate path into /input directly instead of linking to it, or fix the permissions on the link target")
-	case err == nil && fi.IsDir():
+	case err == nil && fi.IsDir() && !layout.IsRelevant(rel):
 		slog.Debug("skipping symlinked directory; its target is walked directly", "path", logtext.Path(rel))
 	}
 }
