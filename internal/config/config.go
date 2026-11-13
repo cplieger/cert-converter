@@ -83,8 +83,8 @@ type Config struct {
 	Layout            outputpolicy.Layout
 	PasswordStatus    passwordStatus
 	// Exclude names the input paths the operator declared are not this app's to
-	// convert. Excluded sources are enumerated and still protect their artifacts
-	// from orphan reconciliation; only the conversion is skipped.
+	// convert. Excluded sources are enumerated and never converted, and their
+	// earlier artifacts are orphan candidates.
 	Exclude layout.ExcludeSet
 	// FallbackInterval is the operator's CONFIGURED rescan cadence, not the one
 	// that runs: 0 means they opted out of their own cadence, and the composition

@@ -52,35 +52,6 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 		}
 	})
 
-	// A DIRECTORY occupying a <name>.crt path is the same shape of steady-state layout
-	// mistake as the arm above — it recurs on every scan until an operator moves it —
-	// and it feeds the SAME unreadable counter, so the aggregate WARN in
-	// logInputCoverageWarnings already fires on this scan. Naming the path at the default level
-	// as well made one condition produce two WARN records per scan, which is the exact
-	// double-report this policy exists to prevent.
-	//
-	// The counter assertion here is what makes that argument true rather than assumed:
-	// demoting the line is only safe while the aggregate still fires. The reaping veto
-	// the same counter drives is pinned end-to-end by
-	// TestScannerRun_directory_in_cert_path_does_not_authorise_reaping.
-	t.Run("input walk directory in a cert path", func(t *testing.T) {
-		logs := captureLogs(t)
-		sw := &scanWalk{seen: map[string]struct{}{}}
-
-		if err := sw.visit(t.Context(), "blocked.crt", dirEntryOf(t, t.TempDir()), nil); err != nil {
-			t.Fatalf("visit(directory in a cert path) = %v, want nil so the rest of the tree is still walked", err)
-		}
-
-		assertDebugOnly(t, logs, "skipping source: input path is a directory", "blocked.crt")
-		if sw.unreadable != 1 {
-			t.Errorf("unreadable = %d, want 1 so the aggregate in logInputCoverageWarnings fires and reaping stays vetoed", sw.unreadable)
-		}
-		if len(sw.seen) != 0 || len(sw.results) != 0 {
-			t.Errorf("seen/results = %d/%d, want 0/0: an unreadable cert path is not a pair outcome",
-				len(sw.seen), len(sw.results))
-		}
-	})
-
 	t.Run("orphan walk unreadable output path", func(t *testing.T) {
 		dir := t.TempDir()
 		blocked := filepath.Join(dir, "blocked")
@@ -498,5 +469,34 @@ func TestStoreListOutputs_enumerates_a_tree_inside_the_budget(t *testing.T) {
 	if len(found) != 1 || found[0] != "a.pfx" {
 		t.Errorf("listOutputs(a tree exactly at the budget) found %v, want [a.pfx]: only this app's own"+
 			" output shape is a candidate", found)
+	}
+}
+
+// TestScannerRun_reports_a_directory_at_a_source_path_once pins that a directory
+// occupying a <name>.crt path is a standing condition: one WARN naming it, with the
+// fix, then Debug while it holds, and every scan counts it unreadable so reaping
+// stays vetoed.
+// Serial: it swaps slog.Default().
+func TestScannerRun_reports_a_directory_at_a_source_path_once(t *testing.T) {
+	in := t.TempDir()
+	if err := os.Mkdir(filepath.Join(in, "blocked.crt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	logs := captureLogs(t)
+	scanner := newVerdictScanner(in, t.TempDir(), Options{})
+	for scan := range 2 {
+		if res := runScans(t, scanner, 1); res.Unreadable != 1 {
+			t.Errorf("scan %d: Unreadable = %d, want 1", scan+1, res.Unreadable)
+		}
+	}
+	warns := conditionRecords(logs, slog.LevelWarn, condUnreadablePath, "blocked.crt")
+	if len(warns) != 1 {
+		t.Fatalf("two scans logged %d unreadable_path WARNs for blocked.crt, want 1; log = %q", len(warns), logs.Messages())
+	}
+	if !mentions(&warns[0], "replace it with a regular file") {
+		t.Errorf("the WARN for blocked.crt does not tell the operator to replace it with a regular file")
+	}
+	if got := conditionCount(logs, slog.LevelDebug, condUnreadablePath, "blocked.crt"); got != 1 {
+		t.Errorf("the second scan logged %d unreadable_path Debug records for blocked.crt, want 1", got)
 	}
 }

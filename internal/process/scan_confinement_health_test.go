@@ -1,12 +1,14 @@
 package process_test
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // TestScannerRun_symlink_escape_is_health_neutral pins the case that motivated the
@@ -192,22 +194,14 @@ func TestScannerRun_directory_in_cert_path_does_not_authorise_reaping(t *testing
 	}
 }
 
-// TestScannerRun_dangling_cert_symlink_stays_an_unreadable_path pins the steady-state
-// side of the ENOENT split. A .crt that is a symlink to a target that does not exist
-// hands the confined read the SAME ENOENT a renewal race does, but it is not a race:
-// the link is still there, so every future scan gets the same answer and that
-// certificate produces no PFX until an operator fixes the link. It therefore belongs
-// in ScanResult.Unreadable — the count behind the documented unreadable-path alert and
-// its /input remediation — and NOT in Vanished, whose Debug-only reporting would leave
-// the condition invisible at the default log level forever.
-//
-// The transient arm (a path that is genuinely gone, or replaced under the read) is
-// pinned by TestNoteUnreadableInput_levels, where the filesystem state can be arranged
-// exactly; reaching it from Run would need a deletion racing the scan's own read.
-//
-// Either outcome stays health-neutral and still blocks reaping.
-func TestScannerRun_dangling_cert_symlink_stays_an_unreadable_path(t *testing.T) {
-	t.Parallel()
+// TestScannerRun_dangling_cert_symlink_is_a_deleted_source_with_a_warning pins the
+// steady-state side of the ENOENT split: a .crt linked to a name missing inside
+// /input is as gone as a deleted certificate, in no count and health-neutral, and
+// its own standing warning still names it, since a lost live/ link target is more
+// often an accident than an intent. TestNoteUnreadableInput_levels pins the
+// transient arm, which Run could reach only through a deletion racing its read.
+// Serial: it swaps slog.Default().
+func TestScannerRun_dangling_cert_symlink_is_a_deleted_source_with_a_warning(t *testing.T) {
 	certsRoot := t.TempDir()
 	outRoot := t.TempDir()
 
@@ -215,37 +209,61 @@ func TestScannerRun_dangling_cert_symlink_stays_an_unreadable_path(t *testing.T)
 	if err := os.WriteFile(filepath.Join(certsRoot, "gone.key"), keyPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// The cert entry exists for the walk and its target never will. A RELATIVE target
-	// inside the root, so the confined read reaches ENOENT rather than a confinement
-	// refusal (which is a different unreadable case, counted the same way).
+	// A RELATIVE target inside the root, so the confined stat reaches ENOENT rather
+	// than a confinement refusal, which proves nothing.
 	if err := os.Symlink("already-renewed.pem", filepath.Join(certsRoot, "gone.crt")); err != nil {
 		t.Fatal(err)
 	}
 
-	// A prior output nothing in this tree claims: the unreadable cert must not authorise
-	// reaping it either, because the scan did not enumerate the whole tree.
+	// A prior output nothing in this tree claims: a tree with no source left must not
+	// authorise reaping it, exactly as when the last pair is deleted.
 	prior := filepath.Join(outRoot, "unrelated.pfx")
 	if err := os.WriteFile(prior, []byte("prior bundle"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	logs := capture.Default(t)
 
 	res, err := newSyncScanner(certsRoot, outRoot).Run(t.Context())
 	if err != nil {
 		t.Fatalf("Run(dangling cert symlink) = %v, want nil: an unreadable input is not a scan error", err)
 	}
-	if res.Unreadable != 1 {
-		t.Errorf("Unreadable = %d, want 1: a link whose target is missing on every scan is the steady-state condition an operator must hear about", res.Unreadable)
+	if res.Unreadable != 0 || res.Total != 0 {
+		t.Errorf("Unreadable = %d, Total = %d, want 0 and 0: a link to nothing is no source", res.Unreadable, res.Total)
 	}
 	if res.Vanished != 0 {
-		t.Errorf("Vanished = %d, want 0: a symlink that is still there did not vanish, and reporting it as the renewal race hides it at Debug forever", res.Vanished)
+		t.Errorf("Vanished = %d, want 0: a symlink that is still there did not vanish during the scan", res.Vanished)
 	}
 	if res.Failed != 0 {
-		t.Errorf("Failed = %d, want 0: an unreadable input is health-neutral, because no restart clears it", res.Failed)
+		t.Errorf("Failed = %d, want 0: a link to nothing is health-neutral, as a deleted certificate is", res.Failed)
+	}
+	if got := countAttrs(logs.Records(), slog.LevelWarn, "condition", "dangling_source_link", "path", "gone.crt"); got != 1 {
+		t.Errorf("the link logged %d dangling_source_link WARNs, want 1: the operator must hear about it", got)
 	}
 	if res.Removed != 0 {
-		t.Errorf("Removed = %d, want 0: a scan that missed part of /input cannot prove any output orphaned", res.Removed)
+		t.Errorf("Removed = %d, want 0: a tree with no source cannot prove any output orphaned", res.Removed)
 	}
 	if _, statErr := os.Stat(prior); statErr != nil {
-		t.Errorf("the prior .pfx was deleted (%v); an incomplete input enumeration must not become a deleted output", statErr)
+		t.Errorf("the prior .pfx was deleted (%v); an empty input tree must not become a deleted output", statErr)
 	}
+}
+
+// countAttrs counts the records at level that carry every key and rendered value
+// in pairs.
+func countAttrs(records []slog.Record, level slog.Level, pairs ...string) int {
+	n := 0
+	for _, r := range records {
+		matched := 0
+		r.Attrs(func(a slog.Attr) bool {
+			for i := 0; i+1 < len(pairs); i += 2 {
+				if a.Key == pairs[i] && a.Value.String() == pairs[i+1] {
+					matched++
+				}
+			}
+			return true
+		})
+		if r.Level == level && matched == len(pairs)/2 {
+			n++
+		}
+	}
+	return n
 }

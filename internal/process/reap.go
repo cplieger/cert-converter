@@ -21,9 +21,14 @@ type reaper struct {
 	src *source
 	out *store
 	// unreached keeps every orphan candidate it reports true for: one whose
-	// source may lie where the scan could not look. Nil keeps none.
+	// source may lie where the scan could not look. Nil keeps none. Only the
+	// mirror layout can derive a source from an artifact's path; the flat layout
+	// keeps its unreached claimants' artifacts expected instead.
 	unreached func(outRel string) bool
-	mode      outputpolicy.Lifecycle
+	// owners is each flat stem's owner as the ownership record stood before this
+	// scan's ledger update (ownerKeeps).
+	owners map[string]string
+	mode   outputpolicy.Lifecycle
 	// layoutMode selects the post-delay source re-check: the mirror layout
 	// derives a candidate's sources from its name and stats them, while the flat
 	// layout re-enumerates /input fresh per candidate (flatInventory).
@@ -41,6 +46,9 @@ type reaper struct {
 	// operator who deliberately chose a layout has asked for its predecessor's
 	// tree to be reconciled away.
 	layoutExplicit bool
+	// inputPasswordReady is whether bundle sources convert at all: a bundle owner
+	// while PFX input is off claims nothing.
+	inputPasswordReady bool
 }
 
 // reapContext is everything the gate needs to decide whether `seen` can be
@@ -189,20 +197,21 @@ func (rp *reaper) reportRetainedOrphans(orphaned []string, walkSafe bool) {
 }
 
 // sourcesAbsent reports whether EVERY input that would produce artifacts at stem
-// is gone; one present source, or one unanswerable stat, keeps the candidate. An
-// EXCLUDED source reads as absent: the operator declared it out of scope, so it
-// is not a source this app produces artifacts from.
+// is Absent (source.judge); one Present source keeps the candidate, and one the
+// re-check cannot judge keeps it with the reason as the error. An EXCLUDED
+// source reads as absent: the operator declared it out of scope, so it is not a
+// source this app produces artifacts from.
 func (rp *reaper) sourcesAbsent(stem string) (bool, error) {
 	for _, src := range layout.SourceCandidates(stem) {
 		if !rp.exclude.Empty() && rp.exclude.Excludes(src) {
 			continue
 		}
-		absent, err := rp.src.pathAbsent(src)
-		if err != nil {
-			return false, err
-		}
-		if !absent {
+		switch v, err := rp.src.judge(src); v {
+		case verdictAbsent:
+		case verdictPresent:
 			return false, nil
+		default:
+			return false, err
 		}
 	}
 	return true, nil
@@ -268,6 +277,8 @@ type flatInventory struct {
 // on proving absence, and a partially read tree proves nothing absent.
 func (rp *reaper) enumerateFlatInventory(ctx context.Context) (*flatInventory, error) {
 	walk := &flatRecheckWalk{
+		src:     rp.src,
+		bundles: rp.inputPasswordReady,
 		files:   make(map[string]struct{}),
 		budget:  scanbudget.NewCounter(rp.maxEntries),
 		exclude: rp.exclude,
@@ -285,14 +296,18 @@ type flatRecheckWalk struct {
 	// files is every relevant name the walk saw: sources, and keys for the
 	// lone-key veto.
 	files map[string]struct{}
+	src   *source
 	// exclude drops out-of-scope paths, so neither their artifacts nor their
 	// keys are treated as evidence a candidate is still wanted.
 	exclude layout.ExcludeSet
 	budget  scanbudget.Counter
+	// bundles is whether bundle sources convert at all.
+	bundles bool
 }
 
-// visit is the re-enumeration's walk callback: collect relevant names, and
-// refuse the whole inventory on anything the walk cannot observe.
+// visit is the re-enumeration's walk callback: collect relevant names the way
+// the scan judges them, and refuse the whole inventory on anything the walk
+// cannot observe.
 func (w *flatRecheckWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
@@ -306,18 +321,48 @@ func (w *flatRecheckWalk) visit(ctx context.Context, rel string, d fs.DirEntry, 
 	if !w.budget.Charge() {
 		return errRecheckIncomplete
 	}
+	excluded := !w.exclude.Empty() && w.exclude.Excludes(rel)
 	if d.IsDir() {
-		if layout.IsSource(rel) {
-			// A directory occupying a source path is input this walk cannot
-			// classify, exactly as the scan counts it unreadable.
-			return errRecheckIncomplete
-		}
-		return nil
+		return w.visitDir(rel, excluded)
 	}
-	if layout.IsRelevant(rel) && (w.exclude.Empty() || !w.exclude.Excludes(rel)) {
+	if d.Type()&fs.ModeSymlink != 0 {
+		if counted, err := w.visitLink(rel); !counted {
+			return err
+		}
+	}
+	if layout.IsRelevant(rel) && !excluded {
 		w.files[rel] = struct{}{}
 	}
 	return nil
+}
+
+func (w *flatRecheckWalk) visitDir(rel string, excluded bool) error {
+	switch {
+	case excluded || (layout.IsBundle(rel) && !w.bundles):
+	case layout.IsSource(rel):
+		// A directory occupying a source path is input this walk cannot
+		// classify, exactly as the scan counts it unreadable.
+		return errRecheckIncomplete
+	case layout.IsKey(rel):
+		// A key the scan cannot read is still a key in /input.
+		w.files[rel] = struct{}{}
+	}
+	return nil
+}
+
+// visitLink judges the link rel as the scan does and reports whether it still
+// counts as the name it carries: an input-named link judged Absent claims and
+// keeps nothing, and an unresolved link named otherwise may hide any subtree.
+func (w *flatRecheckWalk) visitLink(rel string) (bool, error) {
+	f := w.src.linkFacts(rel)
+	relevant := layout.IsRelevant(rel)
+	switch {
+	case relevant && judgeFacts(f, roleFile) == verdictAbsent:
+		return false, nil
+	case !relevant && judgeFacts(f, roleDir) == verdictUnproven:
+		return false, fmt.Errorf("%w: %w", errRecheckIncomplete, f.err)
+	}
+	return true, nil
 }
 
 // deriveFlatInventory turns one complete enumeration into the two re-check
@@ -452,6 +497,9 @@ func (rp *reaper) recheckAllowsRemoval(ctx context.Context, rel string) (bool, e
 // first, so a mirror-laid leftover enjoys the same half-deleted-pair veto its
 // flat sibling does.
 func (rp *reaper) flatAllowsRemoval(ctx context.Context, rel string) (bool, error) {
+	if rp.ownerKeeps(rel) {
+		return false, nil
+	}
 	inv, err := rp.enumerateFlatInventory(ctx)
 	switch {
 	case err != nil && IsShutdown(err):
@@ -471,6 +519,35 @@ func (rp *reaper) flatAllowsRemoval(ctx context.Context, rel string) (bool, erro
 		return false, nil
 	}
 	return true, nil
+}
+
+// ownerKeeps reports whether the recorded owner of the flat candidate rel's stem
+// may still claim it, which keeps the candidate. Only a removal that rests on
+// source absence asks: an artifact of a switched-off format never reaches the
+// re-check, and one the flat layout cannot produce was laid out by the other
+// layout. An owner behind a link the re-check cannot follow keeps it, which the
+// listing below cannot see.
+func (rp *reaper) ownerKeeps(rel string) bool {
+	if !layout.FlatProducible(rel) {
+		return false
+	}
+	owner, recorded := rp.owners[layout.FlatStem(layout.OutputStem(rel))]
+	if !recorded || (!rp.exclude.Empty() && rp.exclude.Excludes(owner)) ||
+		(layout.IsBundle(owner) && !rp.inputPasswordReady) {
+		return false
+	}
+	switch v, err := rp.src.judge(owner); v {
+	case verdictAbsent:
+		return false
+	case verdictPresent:
+		slog.Info("keeping an output artifact whose source came back during the confirmation delay",
+			"path", logtext.Path(rel), "input", logtext.Path(owner))
+	default:
+		slog.Warn(recheckUnreadableMsg,
+			"path", logtext.Path(rel), "input", logtext.Path(owner), "error", logtext.Path(err.Error()),
+			"remediation", recheckUnreadableRemediation)
+	}
+	return true
 }
 
 // sourceAllowsRemoval performs the post-delay source re-check for one artifact
@@ -505,11 +582,12 @@ func (rp *reaper) sourceAllowsRemoval(ctx context.Context, rel string) (bool, er
 	return true, nil
 }
 
-// keyRetention reads the sibling PRIVATE KEY of cert and returns the record naming
-// the retention it forces, or nil when the key is gone too. The record is returned
-// rather than emitted so a caller that reads the key before re-checking the
-// certificate still emits it behind that re-check: every record here asserts the
-// certificate is gone, which only the certificate's own Lstat establishes.
+// keyRetention judges the sibling PRIVATE KEY of cert and returns the record
+// naming the retention it forces, or nil when the key is Absent too. The record
+// is returned rather than emitted so a caller that reads the key before
+// re-checking the certificate still emits it behind that re-check: every record
+// here asserts the certificate is gone, which only the certificate's own
+// judgement establishes.
 func (rp *reaper) keyRetention(rel, cert string) func() {
 	key := layout.KeyFor(cert)
 	// An EXCLUDED pair is not a source, so a half-deleted-pair veto over it means
@@ -518,23 +596,23 @@ func (rp *reaper) keyRetention(rel, cert string) func() {
 	if !rp.exclude.Empty() && (rp.exclude.Excludes(key) || rp.exclude.Excludes(cert)) {
 		return nil
 	}
-	absent, err := rp.src.pathAbsent(key)
-	switch {
-	case err != nil:
-		// Fail closed without claiming a key was observed.
+	switch v, err := rp.src.judge(key); v {
+	case verdictAbsent:
+		return nil
+	case verdictPresent, verdictMismatch:
+		return func() {
+			slog.Warn(loneKeyRetainedMsg,
+				"path", logtext.Path(rel), "input", logtext.Path(cert), "key", logtext.Path(key),
+				"remediation", loneKeyRemediation(rp.mode))
+		}
+	default:
+		// An Unproven key proves nothing: fail closed without claiming a key was
+		// observed.
 		return func() {
 			slog.Warn(recheckUnreadableMsg,
 				"path", logtext.Path(rel), "input", logtext.Path(cert), "key", logtext.Path(key),
 				"error", logtext.Path(err.Error()),
 				"remediation", recheckUnreadableRemediation)
-		}
-	case absent:
-		return nil
-	default:
-		return func() {
-			slog.Warn(loneKeyRetainedMsg,
-				"path", logtext.Path(rel), "input", logtext.Path(cert), "key", logtext.Path(key),
-				"remediation", loneKeyRemediation(rp.mode))
 		}
 	}
 }

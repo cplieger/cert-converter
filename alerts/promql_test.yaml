@@ -205,7 +205,7 @@ tests:
               instance: cc:9468
             exp_annotations:
               summary: "cert-converter skipped an unreachable /input path"
-              description: "An /input path could not be read or a symlink could not be resolved, so its certificates were skipped. Health is unaffected. Fix permissions for the UID in `user:`, and mount the certificate directory instead of a symlink to it.\n"
+              description: "An /input path could not be read or a symlink could not be resolved, so its certificates were skipped. Health is unaffected unless a skipped source already had a conversion failure, which keeps the container unhealthy. Fix permissions for the UID in `user:`, and mount the certificate directory instead of a symlink to it.\n"
       - eval_time: 8m
         alertname: CertConverterInputPathUnreachable
         exp_alerts: []

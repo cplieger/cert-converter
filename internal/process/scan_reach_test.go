@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -1009,5 +1010,416 @@ func TestScannerRun_clears_an_unwritable_output_whose_source_left_a_listed_direc
 	}
 	if got := logs.CountLevel(slog.LevelWarn, unreplaceableArtifactMsg); got != 2 {
 		t.Errorf("the refusal was reported at WARN %d times in total, want 2: the returned source's refusal is news", got)
+	}
+}
+
+// relink replaces whatever is at path with a symlink to target.
+func relink(t *testing.T, path, target string) {
+	t.Helper()
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// attrIs reports whether r carries the attribute key rendered as want.
+func attrIs(r *slog.Record, key, want string) bool {
+	found := false
+	r.Attrs(func(a slog.Attr) bool {
+		found = a.Key == key && a.Value.String() == want
+		return !found
+	})
+	return found
+}
+
+// conditionRecords returns the records at level whose condition attribute is
+// kind and, when path is not empty, whose path attribute is path.
+func conditionRecords(logs *capture.Recorder, level slog.Level, kind, path string) []slog.Record {
+	var found []slog.Record
+	for _, r := range logs.Records() {
+		if r.Level == level && attrIs(&r, "condition", kind) && (path == "" || attrIs(&r, "path", path)) {
+			found = append(found, r)
+		}
+	}
+	return found
+}
+
+// conditionCount counts conditionRecords.
+func conditionCount(logs *capture.Recorder, level slog.Level, kind, path string) int {
+	return len(conditionRecords(logs, level, kind, path))
+}
+
+// clearCount counts the clear records naming condition kind and the subject path.
+func clearCount(logs *capture.Recorder, kind, path string) int {
+	n := 0
+	for _, r := range conditionRecords(logs, slog.LevelInfo, kind, path) {
+		if r.Message == standingClearedMsg {
+			n++
+		}
+	}
+	return n
+}
+
+// TestScannerRun_clears_a_collision_whose_claimant_source_links_to_nothing pins
+// that a claimant whose certificate or key became a link to a name missing
+// inside /input is gone, as a deleted file is: the collision clears, the other
+// claimant publishes, and each such link logs one warning of its own.
+// Serial: it swaps slog.Default().
+func TestScannerRun_clears_a_collision_whose_claimant_source_links_to_nothing(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		dangle     []string
+		remove     []string
+		wantOrphan int
+	}{
+		{name: "certificate_and_key", dangle: []string{"cert.crt", "cert.key"}},
+		{name: "certificate_with_the_key_deleted", dangle: []string{"cert.crt"}, remove: []string{"cert.key"}},
+		// The certificate is regular and its key is gone: an orphan certificate,
+		// which claims no stem.
+		{name: "key_links_to_nothing", dangle: []string{"cert.key"}, wantOrphan: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in, _ := collidingTree(t)
+			out := t.TempDir()
+			logs := captureLogs(t)
+			scanner := newVerdictScanner(in, out, Options{Layout: outputpolicy.LayoutFlat})
+			if res := runScans(t, scanner, 1); res.Collided != 2 {
+				t.Fatalf("setup: Collided = %d, want 2", res.Collided)
+			}
+			dir := filepath.Join(in, "b", "site")
+			for _, name := range tc.remove {
+				if err := os.Remove(filepath.Join(dir, name)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, name := range tc.dangle {
+				relink(t, filepath.Join(dir, name), "missing-"+name)
+			}
+
+			res := runScans(t, scanner, 1)
+			if res.Collided != 0 || res.Orphan != tc.wantOrphan {
+				t.Errorf("the scan after b's links went nowhere = %+v, want Collided 0 and Orphan %d", res, tc.wantOrphan)
+			}
+			if got := countClears(logs, condCollision); got != 1 {
+				t.Errorf("the collision logged %d clears, want 1; log = %q", got, logs.Messages())
+			}
+			if _, err := os.Stat(filepath.Join(out, "site", "cert.pfx")); err != nil {
+				t.Errorf("a, now the only claimant, was not published: %v", err)
+			}
+			for _, name := range tc.dangle {
+				if got := conditionCount(logs, slog.LevelWarn, "dangling_source_link", "b/site/"+name); got != 1 {
+					t.Errorf("the link b/site/%s logged %d dangling_source_link WARNs, want 1", name, got)
+				}
+			}
+		})
+	}
+}
+
+// TestScannerRun_keeps_a_collision_whose_claimant_source_links_out_of_the_input
+// pins that a claimant whose certificate became a link the input root cannot
+// follow, whether its target outside exists or not, still holds its stem.
+// Serial: it swaps slog.Default().
+func TestScannerRun_keeps_a_collision_whose_claimant_source_links_out_of_the_input(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		files     []string
+		targetMet bool
+	}{
+		{name: "certificate_and_key_to_missing_targets", files: []string{"cert.crt", "cert.key"}},
+		{name: "certificate_to_a_missing_target", files: []string{"cert.crt"}},
+		{name: "certificate_to_a_file", files: []string{"cert.crt"}, targetMet: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in, outside := collidingTree(t)
+			out := t.TempDir()
+			captureLogs(t)
+			scanner := newVerdictScanner(in, out, Options{Layout: outputpolicy.LayoutFlat, Lifecycle: outputpolicy.LifecycleSync})
+			if res := runScans(t, scanner, 1); res.Collided != 2 {
+				t.Fatalf("setup: Collided = %d, want 2", res.Collided)
+			}
+			for _, name := range tc.files {
+				target := filepath.Join(outside, "missing-"+name)
+				if tc.targetMet {
+					if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				relink(t, filepath.Join(in, "b", "site", name), target)
+			}
+
+			if res := runScans(t, scanner, 1); res.Collided != 2 {
+				t.Errorf("the scan after b's source left the input root = %+v, want Collided 2", res)
+			}
+			if _, err := os.Lstat(filepath.Join(out, "site", "cert.pfx")); !os.IsNotExist(err) {
+				t.Errorf("a was published while b's link proves nothing: Lstat(site/cert.pfx) = %v", err)
+			}
+		})
+	}
+}
+
+// TestScannerRun_counts_a_standing_failure_behind_an_input_named_link pins that a
+// conversion failure the scan can no longer reach, because an unresolvable link
+// named like an input stands where its directory was, keeps counting: health
+// stays failed, and the scan does not claim the input holds no source.
+// Serial: it swaps slog.Default().
+func TestScannerRun_counts_a_standing_failure_behind_an_input_named_link(t *testing.T) {
+	for _, lay := range []outputpolicy.Layout{outputpolicy.LayoutFlat, outputpolicy.LayoutMirror} {
+		t.Run(string(lay), func(t *testing.T) {
+			in, outside := inputAndOutside(t)
+			dir := filepath.Join(in, "x.key")
+			if err := os.Mkdir(dir, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			writeBrokenPair(t, dir, "broken", "not base64")
+			logs := captureLogs(t)
+			scanner := newVerdictScanner(in, t.TempDir(), Options{Layout: lay})
+			if res := runScans(t, scanner, 1); res.Failed != 1 {
+				t.Fatalf("setup: first scan = %+v, want one failure", res)
+			}
+
+			hideBehindLink(t, in, outside, "x.key")
+			res := runScans(t, scanner, 1)
+			if res.Failed != 1 || res.conversionsClean() {
+				t.Errorf("a scan that could not reach x.key = %+v, want Failed 1 and conversions not clean", res)
+			}
+			if res.NoSources || logs.Contains("no certificate sources found under the input root") {
+				t.Errorf("a scan that could not reach x.key reported no sources: NoSources = %v; log = %q", res.NoSources, logs.Messages())
+			}
+			if got := conditionCount(logs, slog.LevelWarn, condUnresolvedSymlink, "x.key"); got != 1 {
+				t.Errorf("the link hiding the failure logged %d unresolved_symlink WARNs, want 1", got)
+			}
+		})
+	}
+}
+
+// TestScannerRun_reports_an_input_named_link_that_hides_a_claimant pins that an
+// unresolvable link named like a certificate or key that stands where a stored
+// claimant's directory was is reported as a standing condition: one WARN, Debug
+// while it holds, one clear once the scan reaches the path, with no count. A
+// bundle name reports through its read, and a plain name as any other link.
+// Serial: it swaps slog.Default().
+func TestScannerRun_reports_an_input_named_link_that_hides_a_claimant(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		wantUnresolved int
+		viaRead        bool
+	}{
+		{name: "b.key"},
+		{name: "b.crt"},
+		{name: "b", wantUnresolved: 1},
+		{name: "b.pfx", viaRead: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in, outside := claimantTree(t, "a", tc.name)
+			logs := captureLogs(t)
+			scanner := newVerdictScanner(in, t.TempDir(), Options{Layout: outputpolicy.LayoutFlat, InputPassword: "x", InputPasswordReady: true})
+			if res := runScans(t, scanner, 1); res.Collided != 2 {
+				t.Fatalf("setup: Collided = %d, want 2", res.Collided)
+			}
+
+			restore := hideBehindLink(t, in, outside, tc.name)
+			if res := runScans(t, scanner, 1); res.Unresolved != tc.wantUnresolved {
+				t.Errorf("the first hidden scan: Unresolved = %d, want %d", res.Unresolved, tc.wantUnresolved)
+			}
+			runScans(t, scanner, 1)
+			restore()
+			runScans(t, scanner, 1)
+
+			if tc.viaRead {
+				if got := countRecords(logs, slog.LevelWarn, "", "path", tc.name); got != 1 {
+					t.Errorf("%s logged %d WARNs naming it in total, want 1", tc.name, got)
+				}
+				if got := conditionCount(logs, slog.LevelWarn, condUnresolvedSymlink, tc.name) + conditionCount(logs, slog.LevelDebug, condUnresolvedSymlink, tc.name); got != 0 {
+					t.Errorf("%s logged %d unresolved_symlink records, want 0: its read reports it", tc.name, got)
+				}
+				return
+			}
+			if got := conditionCount(logs, slog.LevelWarn, condUnresolvedSymlink, tc.name); got != 1 {
+				t.Errorf("%s logged %d unresolved_symlink WARNs, want 1; log = %q", tc.name, got, logs.Messages())
+			}
+			if got := conditionCount(logs, slog.LevelDebug, condUnresolvedSymlink, tc.name); got != 1 {
+				t.Errorf("%s logged %d unresolved_symlink Debug records, want 1 for the scan it held", tc.name, got)
+			}
+			if got := clearCount(logs, condUnresolvedSymlink, tc.name); got != 1 {
+				t.Errorf("%s logged %d unresolved_symlink clears, want 1 once it was back", tc.name, got)
+			}
+		})
+	}
+}
+
+// TestScannerRun_reports_a_source_name_that_is_not_a_file_in_a_collision pins
+// that a stored claimant's certificate or key replaced by something that is not
+// a regular file proves nothing: the claimant keeps its stem, and the entry
+// counts as unreadable with one warning naming it, whether or not it is read.
+// Serial: it swaps slog.Default().
+func TestScannerRun_reports_a_source_name_that_is_not_a_file_in_a_collision(t *testing.T) {
+	mkdir := func(t *testing.T, _, path string) {
+		t.Helper()
+		if err := os.Mkdir(path, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	linkToDir := func(t *testing.T, in, path string) {
+		t.Helper()
+		mkdir(t, "", filepath.Join(in, "d"))
+		if err := os.Symlink("../../d", path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fifo := func(t *testing.T, _, path string) {
+		t.Helper()
+		if err := syscall.Mkfifo(path, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		replace func(t *testing.T, in, path string)
+		name    string
+		entry   string
+	}{
+		{name: "directory", entry: "cert.crt", replace: mkdir},
+		{name: "link_to_a_directory", entry: "cert.crt", replace: linkToDir},
+		{name: "fifo", entry: "cert.crt", replace: fifo},
+		{name: "key_is_a_directory", entry: "cert.key", replace: mkdir},
+		{name: "key_links_to_a_directory", entry: "cert.key", replace: linkToDir},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in, _ := collidingTree(t)
+			out := t.TempDir()
+			logs := captureLogs(t)
+			scanner := newVerdictScanner(in, out, Options{Layout: outputpolicy.LayoutFlat})
+			if res := runScans(t, scanner, 1); res.Collided != 2 {
+				t.Fatalf("setup: Collided = %d, want 2", res.Collided)
+			}
+			path := filepath.Join(in, "b", "site", tc.entry)
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			tc.replace(t, in, path)
+
+			res := runScans(t, scanner, 1)
+			if res.Collided != 2 || res.Unreadable != 1 {
+				t.Errorf("the scan after b's %s became %s = %+v, want Collided 2 and Unreadable 1", tc.entry, tc.name, res)
+			}
+			if _, err := os.Lstat(filepath.Join(out, "site", "cert.pfx")); !os.IsNotExist(err) {
+				t.Errorf("a was published while b still claims its stem: Lstat(site/cert.pfx) = %v", err)
+			}
+			warns := conditionRecords(logs, slog.LevelWarn, condUnreadablePath, "b/site/"+tc.entry)
+			if len(warns) != 1 {
+				t.Fatalf("b/site/%s logged %d unreadable_path WARNs, want 1; log = %q", tc.entry, len(warns), logs.Messages())
+			}
+			found := false
+			warns[0].Attrs(func(a slog.Attr) bool {
+				found = a.Key == "remediation" && strings.Contains(a.Value.String(), "replace it with a regular file")
+				return !found
+			})
+			if !found {
+				t.Errorf("the WARN for b/site/%s does not tell the operator to replace it with a regular file", tc.entry)
+			}
+			if tc.entry == "cert.key" && !attrIs(&warns[0], "source", "b/site/cert.crt") {
+				t.Errorf("the WARN for b/site/cert.key does not name its certificate b/site/cert.crt under source")
+			}
+		})
+	}
+	t.Run("key_directory_is_still_walked", func(t *testing.T) {
+		in, _ := inputAndOutside(t)
+		writeSelfSignedPair(t, in, "site")
+		if err := os.Remove(filepath.Join(in, "site.key")); err != nil {
+			t.Fatal(err)
+		}
+		addClaimant(t, filepath.Join(in, "site.key"), "a")
+		out := t.TempDir()
+		logs := captureLogs(t)
+		scanner := newVerdictScanner(in, out, Options{Layout: outputpolicy.LayoutFlat})
+		if res := runScans(t, scanner, 1); res.Unreadable != 1 {
+			t.Errorf("the scan of site.crt beside the directory site.key = %+v, want Unreadable 1", res)
+		}
+		if _, err := os.Stat(filepath.Join(out, "site", "cert.pfx")); err != nil {
+			t.Errorf("the source nested under site.key was not converted: %v", err)
+		}
+		if got := countRecords(logs, slog.LevelWarn, "", "path", "site.crt") + countRecords(logs, slog.LevelWarn, "", "path", "site.key"); got != 1 {
+			t.Errorf("the pair site.crt logged %d WARNs naming site.crt or site.key, want 1", got)
+		}
+
+		removePair(t, filepath.Join(in, "site.key"), "a")
+		addClaimant(t, in, "c")
+		if res := runScans(t, scanner, 1); res.Collided != 0 || res.Converted != 1 {
+			t.Errorf("the scan that added c after the nested source left = %+v, want Collided 0 and c converted", res)
+		}
+	})
+}
+
+// TestScannerRun_counts_a_standing_failure_whose_source_turns_unreadable pins that
+// a source with a standing conversion failure keeps counting as failed while its
+// certificate or its key turns into a link the scan cannot follow: nothing has
+// shown the failure fixed.
+// Serial: it swaps slog.Default().
+func TestScannerRun_counts_a_standing_failure_whose_source_turns_unreadable(t *testing.T) {
+	for _, lay := range []outputpolicy.Layout{outputpolicy.LayoutFlat, outputpolicy.LayoutMirror} {
+		t.Run(string(lay), func(t *testing.T) {
+			for _, tc := range []struct{ name, half string }{
+				{name: "certificate_turns_unreadable", half: "bad.crt"},
+				{name: "key_turns_unreadable", half: "bad.key"},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					in, outside := inputAndOutside(t)
+					writeSelfSignedPair(t, in, "other")
+					writeBrokenPair(t, in, "bad", "not base64")
+					elsewhere := filepath.Join(outside, "elsewhere")
+					if err := os.WriteFile(elsewhere, []byte("x"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					logs := captureLogs(t)
+					scanner := newVerdictScanner(in, t.TempDir(), Options{Layout: lay})
+					if res := runScans(t, scanner, 1); res.Failed != 1 {
+						t.Fatalf("setup: first scan = %+v, want one failure", res)
+					}
+
+					relink(t, filepath.Join(in, tc.half), elsewhere)
+					from := logs.Len()
+					res := runScans(t, scanner, 1)
+					if res.Failed != 1 || res.Unreadable != 1 || res.conversionsClean() {
+						t.Errorf("the scan after %s left the input root = %+v, want Failed 1, Unreadable 1 and conversions not clean", tc.half, res)
+					}
+					aggregates := 0
+					for _, r := range logs.Records()[from:] {
+						if r.Level != slog.LevelWarn || !attrIs(&r, "condition", condUnreadablePaths) {
+							continue
+						}
+						aggregates++
+						if strings.HasSuffix(r.Message, "health is unaffected") {
+							t.Errorf("the unreadable_paths WARN says %q while it carries a failure", r.Message)
+						}
+					}
+					if aggregates != 1 {
+						t.Errorf("the scan logged %d unreadable_paths WARNs, want 1", aggregates)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestScannerRun_keeps_a_mirrored_artifact_behind_an_input_named_link_after_a_restart
+// pins that a new process keeps a mirrored artifact whose source sits behind an
+// unresolvable link named like an input: the artifact's path names its source.
+// Serial: it swaps slog.Default().
+func TestScannerRun_keeps_a_mirrored_artifact_behind_an_input_named_link_after_a_restart(t *testing.T) {
+	in, outside := inputAndOutside(t)
+	addClaimant(t, filepath.Join(in, "site.key"), "a")
+	writeSelfSignedPair(t, in, "other")
+	out := t.TempDir()
+	captureLogs(t)
+	opts := Options{Layout: outputpolicy.LayoutMirror, Lifecycle: outputpolicy.LifecycleSync}
+	runScans(t, newVerdictScanner(in, out, opts), 1)
+
+	hideBehindLink(t, in, outside, "site.key")
+	if res := runScans(t, newVerdictScanner(in, out, opts), 1); res.Removed != 0 {
+		t.Errorf("the restarted scan that could not reach site.key = %+v, want nothing removed", res)
+	}
+	if _, err := os.Stat(filepath.Join(out, "site.key", "a", "site", "cert.pfx")); err != nil {
+		t.Errorf("a's artifact did not survive the restart: %v", err)
 	}
 }

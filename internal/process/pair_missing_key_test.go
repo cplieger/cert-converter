@@ -22,21 +22,11 @@ const missingKeyAggregate = "some PEM certificates under the input root are miss
 const vanishedKeyMsg = "skipping cert: private key vanished during the scan"
 
 // TestReadPair_separates_a_key_that_vanished_from_a_key_that_was_never_there pins
-// noteMissingKey's whole decision at the unit level: one ENOENT from the sibling-key
-// stat, three readings.
-//
-// Without memory of the pair the key was never observed, so the answer must stay the
-// steady-state orphan whose aggregate WARN names the rename remediation. With memory --
-// this process read the pair whole on an earlier scan, so the key WAS there -- an
-// absent key path is the renewal race and must be the transient statusVanished, which
-// is Debug-only and keeps the orphan aggregate from firing. A surviving symlink at the
-// key path is not a replacement at all (pathVanished says so), so it stays an orphan
-// even with memory: the certbot live/ -> archive/ shape returns the same ENOENT on
-// every scan forever, and calling it transient would silence it permanently.
-//
-// The last case is the safety property, and it is why the memory is spent rather than
-// kept: a key that is still gone on the NEXT scan has no memory behind it and reads as
-// the genuine orphan again, so a key deleted for good is quiet for exactly one scan.
+// noteMissingKey: with no memory of the pair a missing key is the steady-state
+// orphan; after this process read the pair whole it is the renewal race,
+// statusVanished, Debug only. A key turned into a link to a missing name reads as
+// deleted. The memory is spent, so a key still gone on the next scan is the orphan
+// again and a key removed for good is quiet for exactly one scan.
 // Runs serially: it swaps slog.Default().
 func TestReadPair_separates_a_key_that_vanished_from_a_key_that_was_never_there(t *testing.T) {
 	input := t.TempDir()
@@ -45,8 +35,7 @@ func TestReadPair_separates_a_key_that_vanished_from_a_key_that_was_never_there(
 			t.Fatal(err)
 		}
 	}
-	// A key path that still EXISTS as a symlink whose target does not: the confined
-	// Stat reports ENOENT exactly like an absent key, and this is the steady state.
+	// A key path that still exists as a symlink to a missing name.
 	if err := os.Symlink("nowhere.key", filepath.Join(input, "linked.key")); err != nil {
 		t.Fatal(err)
 	}
@@ -71,12 +60,13 @@ func TestReadPair_separates_a_key_that_vanished_from_a_key_that_was_never_there(
 	}{
 		{"a key never observed is an orphan", "fresh.crt", "fresh.key", "skipping cert without matching key", statusOrphan},
 		{"a key this process read whole has vanished", "renewed.crt", "renewed.key", vanishedKeyMsg, statusVanished},
-		{"a surviving symlink at the key path stays an orphan", "linked.crt", "linked.key", "skipping cert without matching key", statusOrphan},
-		// The same pair as the second case, one scan later, with its memory spent.
+		{"a key that became a link to nothing has vanished", "linked.crt", "linked.key", vanishedKeyMsg, statusVanished},
+		// The same pairs one scan later, with their memory spent.
 		{"the vanished grace is spent after one scan", "renewed.crt", "renewed.key", "skipping cert without matching key", statusOrphan},
+		{"the linked key's grace is spent after one scan", "linked.crt", "linked.key", "skipping cert without matching key", statusOrphan},
 	} {
-		// Sequential on purpose: the last case depends on the second having spent the
-		// pair's memory, and captureLogs swaps the process-global slog.Default.
+		// Sequential on purpose: the spent-grace cases depend on the earlier ones having
+		// spent each pair's memory, and captureLogs swaps the process-global slog.Default.
 		t.Run(tc.name, func(t *testing.T) {
 			logs := captureLogs(t)
 

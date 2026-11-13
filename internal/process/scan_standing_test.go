@@ -15,7 +15,7 @@ import (
 	"github.com/cplieger/go/slogx/capture"
 )
 
-const unreadablePathsMsg = "some /input paths were unreadable and were skipped; health is unaffected"
+const unreadablePathsMsg = "some /input paths were unreadable and were skipped; health is unaffected unless a skipped path had a standing conversion failure"
 
 // TestScannerRun_logs_a_standing_unreadable_path_when_it_changes pins that a
 // standing condition is logged when it appears, changes and clears: three scans
@@ -503,6 +503,10 @@ func TestScannerRun_logs_an_unstattable_sibling_key_once(t *testing.T) {
 	}
 	if got := logs.CountLevel(slog.LevelDebug, statMsg); got != 2 {
 		t.Errorf("the two repeat scans logged %d Debug records, want 2", got)
+	}
+	if got := countRecords(logs, slog.LevelWarn, statMsg, "condition", condUnreadablePath); got != 1 ||
+		!logs.HasAttr(statMsg, "path", "escape.key") || !logs.HasAttr(statMsg, "source", "escape.crt") {
+		t.Errorf("the WARN does not carry condition %s, path escape.key and source escape.crt; log = %q", condUnreadablePath, logs.Messages())
 	}
 }
 

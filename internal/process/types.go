@@ -20,8 +20,8 @@ const (
 	// also claims; nothing was converted for the contested name and
 	// the container goes unhealthy until the operator resolves the ambiguity.
 	statusCollided
-	// statusExcluded marks a source INPUT_EXCLUDE_PATHS covers: enumerated, its
-	// artifacts still protected from the reaper, never converted.
+	// statusExcluded marks a source INPUT_EXCLUDE_PATHS covers: enumerated and
+	// never converted.
 	statusExcluded
 
 	// statusCount is the enum's LENGTH, not an outcome.

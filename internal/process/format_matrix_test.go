@@ -330,7 +330,7 @@ func assertOnlyRegularFiles(t *testing.T, root string, want []string) {
 		if err != nil {
 			return err
 		}
-		if path == root || d.IsDir() {
+		if path == root || d.IsDir() || d.Name() == ".cert-converter-claims.json" {
 			return nil
 		}
 		rel, err := filepath.Rel(root, path)
