@@ -477,6 +477,16 @@ func (s *store) artifactGone(rel string) {
 	s.standing.clear(standingKey{kind: condPermissiveFile, subject: rel})
 }
 
+// holdsDir reports whether /output may hold a directory at rel: one is there, or
+// the answer is unknown.
+func (s *store) holdsDir(rel string) bool {
+	fi, err := s.root.Lstat(rel)
+	if err != nil {
+		return !errors.Is(err, fs.ErrNotExist)
+	}
+	return fi.IsDir()
+}
+
 // clearUnmanaged ends the permissive-mode conditions on paths no expected
 // artifact lives at or under. Only a scan that saw the whole tree may call it.
 func (s *store) clearUnmanaged(expected map[string]struct{}) {

@@ -119,7 +119,11 @@ func (r *ScanResult) carryUnproven(prev *ScanResult, enumerated bool) {
 	r.Unreadable = max(r.Unreadable, prev.Unreadable)
 	r.Unresolved = max(r.Unresolved, prev.Unresolved)
 	r.Unwritable = max(r.Unwritable, prev.Unwritable)
-	r.Collided = max(r.Collided, prev.Collided)
+	// A scan that got as far as the claim ledger counts its own collisions
+	// (claimLedger); only an aborted one may not have.
+	if r.Outcome == OutcomeAborted {
+		r.Collided = max(r.Collided, prev.Collided)
+	}
 	r.OrphanRemovalDisabled = r.OrphanRemovalDisabled || prev.OrphanRemovalDisabled
 	r.PreviousLayoutRetained = r.PreviousLayoutRetained || prev.PreviousLayoutRetained
 }
@@ -196,7 +200,10 @@ type Scanner struct {
 	lastSweep    time.Time
 	observations *observationLog
 	standing     *standing
-	opts         Options
+	// claimants is every flat output stem's claimants as the last scan that ran
+	// the claim ledger left them (claimLedger).
+	claimants map[string][]string
+	opts      Options
 	// lastReported is the previous scan's result, what an incomplete scan carries.
 	lastReported ScanResult
 	// cleanupDegraded carries the last sweep's verdict to the scans between sweeps.
@@ -225,6 +232,7 @@ func New(opts *Options) *Scanner {
 		opts:         normalized,
 		observations: newObservationLog(normalized.MaxScanEntries),
 		standing:     newStanding(),
+		claimants:    make(map[string][]string),
 	}
 }
 
@@ -286,6 +294,7 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		out:                out,
 		observations:       s.observations,
 		standing:           s.standing,
+		claimants:          s.claimants,
 		bundleBudget:       convert.NewBundleWorkBudget(),
 		password:           s.opts.Password,
 		inputPassword:      s.opts.InputPassword,
@@ -312,11 +321,9 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	walkErr := filesafe.WalkDirInRoot(ctx, inHandle, func(rel string, d fs.DirEntry, err error) error {
 		return sw.visit(ctx, rel, d, err)
 	})
-	sw.reach.whole = sw.readWholeTree(walkErr)
 	// Flat conversion runs on everything the walk enumerated, matching mirror's
 	// availability: an unreadable sub-path skips ITS sources, never the tree's.
-	// Collisions are arbitrated among the enumerated sources, and a standing
-	// collision keeps its stem while a claimant is out of reach (holdContested).
+	// claimLedger owns how a collision is arbitrated.
 	// A budget stop converts the enumerated prefix, exactly as mirror converts
 	// inline until the stop; a shutdown or root error converts nothing.
 	if s.opts.Layout == outputpolicy.LayoutFlat && (walkErr == nil || errors.Is(walkErr, errScanBudgetExceeded)) {
@@ -346,17 +353,18 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		evidenceEvicted: s.observations.takeEvictedWholeness(),
 	}
 	// Prune observation state for pairs that are gone, but ONLY when the walk
-	// proved the enumeration complete: an aborted walk, an unreadable sub-path or
-	// an unresolved symlink means `seen` is not the whole input tree, so a pair
-	// hidden behind it would be forgotten and re-warn on the next clean scan.
+	// proved the enumeration complete and only for paths it reached: a pair
+	// hidden behind an unreadable sub-path or an unresolved symlink would be
+	// forgotten and re-warn on the next clean scan.
 	if rc.walkEnumerationComplete() {
-		s.observations.forget(sw.seen)
+		s.observations.forget(sw.keepObserved)
 	}
 	rp := &reaper{
 		src: sw.src, out: out, mode: s.opts.Lifecycle, formats: s.opts.Formats,
 		layoutMode: s.opts.Layout, layoutExplicit: s.opts.LayoutExplicit,
 		exclude:    s.opts.Exclude,
 		maxEntries: s.opts.MaxScanEntries,
+		unreached:  sw.reach.outputHidden,
 	}
 	removed, reconcileErr := rp.reconcile(ctx, sw.expected, &rc)
 	result.Removed = removed
@@ -378,20 +386,20 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 // reportVerdict derives the scan's verdicts from what the walk, the reaper and
 // the last sweep found, then logs the standing conditions that changed. Only a
 // scan that ran to the end can prove a per-path condition gone, and only for a
-// subject it reached, or any subject once it saw every /input path.
+// subject it reached (scanReach.input).
 func (s *Scanner) reportVerdict(result *ScanResult, out *store, sw *scanWalk, walkErr error) {
 	result.Outcome = outcomeOf(walkErr)
 	result.OrphanRemovalDisabled = out.reapDisabled
 	result.PreviousLayoutRetained = out.otherLayoutKept
 	result.CleanupDegraded = s.cleanupDegraded
 	enumerated := walkErr == nil
-	wholeTree := enumerated && result.inputFullyEnumerated()
+	wholeTree := sw.readWholeTree(result, walkErr)
 	if wholeTree {
 		coverage := wholeTreeCoverageOf(result)
 		result.NoSources = coverage == coverageNoSource || coverage == coverageAllOrphan
 		result.AllExcluded = coverage == coverageAllExcluded
 	}
-	logInputCoverageWarnings(s.standing, result, walkErr)
+	logInputCoverageWarnings(s.standing, result, walkErr, wholeTree)
 	if !wholeTree {
 		result.carryUnproven(&s.lastReported, enumerated)
 	}
@@ -399,11 +407,7 @@ func (s *Scanner) reportVerdict(result *ScanResult, out *store, sw *scanWalk, wa
 	if walkErr != nil {
 		return
 	}
-	inputReached := func(subject string, _ []string) bool { return wholeTree || sw.reach.input(subject) }
-	// A collision clears once the scan reached every claimant it was reported for.
-	s.standing.clearUnseen(condCollision, false, func(_ string, claimants []string) bool {
-		return sw.reach.claimants(claimants)
-	})
+	inputReached := func(subject string, _ []string) bool { return sw.reach.input(subject) }
 	s.standing.clearUnseen(condUnresolvedSymlink, false, inputReached)
 	// The aggregate unreadable_paths condition reports the clear; its per-path
 	// detail goes quietly.
@@ -449,6 +453,7 @@ type scanWalk struct {
 	pendingSources []string
 	observations   *observationLog
 	standing       *standing
+	claimants      map[string][]string
 	bundleBudget   *convert.BundleWorkBudget
 	enc            convert.EncoderType
 	layoutMode     outputpolicy.Layout
@@ -468,9 +473,11 @@ type scanWalk struct {
 	// unresolved counts input symlinks the confined root could not resolve.
 	unresolved int
 	// contested counts the claimants of standing collisions this scan could not
-	// reach (holdContested).
+	// reach (claimLedger).
 	contested int
-	formats   outputpolicy.Formats
+	// unreachedClaims counts every stored flat claimant this scan could not reach.
+	unreachedClaims int
+	formats         outputpolicy.Formats
 	// inputPasswordReady is false unless a non-blank password or the explicit
 	// empty-password opt-in was configured.
 	inputPasswordReady bool
@@ -500,6 +507,7 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 	// Charged once per enumerated path, before anything is read or remembered,
 	// so the budget bounds the walk's own state rather than trailing it.
 	if !sw.budget.Charge() {
+		sw.reach.stop(rel)
 		slog.Warn(scanBudgetMsg,
 			"path", logtext.Path(rel), "entries", sw.budget.Count(), "limit", sw.budget.Max(),
 			"remediation", scanbudget.InputRemediation)
@@ -507,12 +515,12 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 	}
 	if d.IsDir() {
 		// Withdrawn by the error call above if its listing fails.
-		sw.reach.list(rel)
+		sw.reach.enterDir(rel)
 		sw.noteSourceShapedDir(rel)
 		return nil
 	}
+	sw.noteUnwalkableSymlink(rel, d)
 	if !layout.IsSource(rel) {
-		sw.noteUnwalkableSymlink(rel, d)
 		return nil
 	}
 	// Ahead of every other classification: an excluded source is enumerated and
@@ -524,6 +532,9 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 	if sw.ignoreDisabledBundle(rel) {
 		return nil
 	}
+	// A source-named entry that is not a directory claims its stem until the scan
+	// finds the entry gone, whatever a link there points at, so a link that dangles
+	// still claims. The link rules of this walk are to be ruled together.
 	if sw.layoutMode == outputpolicy.LayoutFlat {
 		sw.pendingSources = append(sw.pendingSources, rel)
 		return nil
@@ -537,7 +548,8 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 // noteSourceShapedDir classifies a directory occupying a source path: an input
 // the scan cannot read. Counting it as unreadable keeps it health-neutral while
 // blocking orphan reaping, so sync never deletes the still-live artifacts of an
-// input path that still exists in an unusable shape.
+// input path that still exists in an unusable shape. The directory claims no
+// stem, so a flat claimant replaced by one leaves its stem's ledger.
 func (sw *scanWalk) noteSourceShapedDir(rel string) {
 	if !layout.IsSource(rel) {
 		return
@@ -563,15 +575,10 @@ func (sw *scanWalk) ignoreDisabledBundle(rel string) bool {
 
 // excludeSource resolves one enumerated source against INPUT_EXCLUDE_PATHS. An
 // excluded source is counted and then dropped: nothing about it is read,
-// decoded or written, and it registers NO expected artifact.
-//
-// Not registering is what makes OUTPUT_LIFECYCLE mean the same thing for an
-// exclusion as for every other narrowing of scope. Artifacts an excluded source
-// produced earlier become ordinary orphan candidates, so `keep` stays silent,
-// `warn` reports them, and `sync` reconciles them away — the same rule that
-// already governs a format switched off (FormatsExplicit) and a layout changed
-// (LayoutExplicit). Deletion remains gated on sync alone (resolveReap), so no
-// mode other than sync can remove anything here.
+// decoded or written, and it registers NO expected artifact, so what it produced
+// earlier becomes an ordinary orphan candidate under OUTPUT_LIFECYCLE, as for a
+// format switched off (FormatsExplicit) or a layout changed (LayoutExplicit).
+// Only sync deletes (resolveReap).
 func (sw *scanWalk) excludeSource(rel string) bool {
 	if sw.exclude.Empty() || !sw.exclude.Excludes(rel) {
 		return false
@@ -603,41 +610,86 @@ func (sw *scanWalk) processSource(ctx context.Context, rel string) error {
 	return ctx.Err()
 }
 
-// flatCollision names one group of sources whose flat output name is the same:
-// the shared output stem and every source that claims it.
-type flatCollision struct {
+// flatClaim is one flat output stem and the sources that claim it.
+type flatClaim struct {
 	stem    string
 	sources []string
 }
 
-// selectFlatSources partitions sources by flat output stem: a stem exactly one
-// source claims converts, a stem several sources claim converts NOTHING.
-// Arbitrating between colliding sources — by name, by age, by expiry — would
-// silently publish one operator input as another's artifact, so ambiguity is an
-// error the operator resolves, not a tie this app breaks. Sorting a clone keeps
-// the report order stable on every filesystem and leaves the walk's retained
-// order untouched.
-func selectFlatSources(sources []string) (unique []string, collisions []flatCollision) {
+// groupFlatClaims groups sources by flat output stem, in the order of each
+// stem's first source once sorted. Sorting a clone keeps the order stable on
+// every filesystem and leaves the walk's retained order untouched.
+func groupFlatClaims(sources []string) []flatClaim {
 	sorted := slices.Clone(sources)
 	slices.Sort(sorted)
-	claims := make(map[string][]string, len(sorted))
-	stems := make([]string, 0, len(sorted))
+	at := make(map[string]int, len(sorted))
+	var claims []flatClaim
 	for _, rel := range sorted {
 		stem := layout.FlatStem(layout.SourceStem(rel))
-		if _, claimed := claims[stem]; !claimed {
-			stems = append(stems, stem)
+		i, claimed := at[stem]
+		if !claimed {
+			i = len(claims)
+			at[stem] = i
+			claims = append(claims, flatClaim{stem: stem})
 		}
-		claims[stem] = append(claims[stem], rel)
+		claims[i].sources = append(claims[i].sources, rel)
 	}
-	for _, stem := range stems {
-		group := claims[stem]
-		if len(group) == 1 {
-			unique = append(unique, group[0])
-			continue
+	return claims
+}
+
+// stemLedger is one flat output stem's claimants: those this scan saw claim it,
+// and the stored ones the scan did not reach.
+// A stem two or more claimants hold converts none of them: arbitrating by name,
+// age or expiry would silently publish one operator input as another's artifact.
+type stemLedger struct {
+	stem      string
+	seen      []string
+	unreached []string
+}
+
+// stands reports whether the stem's collision holds.
+func (l *stemLedger) stands() bool { return len(l.seen)+len(l.unreached) > 1 }
+
+// members returns every claimant, sorted, in a new slice.
+func (l *stemLedger) members() []string {
+	members := slices.Concat(l.seen, l.unreached)
+	slices.Sort(members)
+	return members
+}
+
+// claimLedger returns this scan's ledger of every flat stem named in claims or
+// held by the stored ledger, and stores it for the next scan. A stored claimant
+// leaves only when the scan reached it and did not see it claim the stem: being
+// out of reach never removes one.
+func (sw *scanWalk) claimLedger(claims []flatClaim) []stemLedger {
+	unclaimed := maps.Clone(sw.claimants)
+	ledgers := make([]stemLedger, 0, len(claims)+len(unclaimed))
+	for _, claim := range claims {
+		ledgers = append(ledgers, stemLedger{stem: claim.stem, seen: claim.sources, unreached: sw.outOfReach(sw.claimants[claim.stem], claim.sources)})
+		delete(unclaimed, claim.stem)
+	}
+	for _, stem := range slices.Sorted(maps.Keys(unclaimed)) {
+		ledgers = append(ledgers, stemLedger{stem: stem, unreached: sw.outOfReach(unclaimed[stem], nil)})
+	}
+	clear(sw.claimants)
+	for i := range ledgers {
+		if members := ledgers[i].members(); len(members) > 0 {
+			sw.claimants[ledgers[i].stem] = members
 		}
-		collisions = append(collisions, flatCollision{stem: stem, sources: group})
 	}
-	return unique, collisions
+	return ledgers
+}
+
+// outOfReach returns the claimants among held that this scan neither saw in
+// seen nor reached.
+func (sw *scanWalk) outOfReach(held, seen []string) []string {
+	var unreached []string
+	for _, rel := range held {
+		if !slices.Contains(seen, rel) && !sw.reach.input(rel) {
+			unreached = append(unreached, rel)
+		}
+	}
+	return unreached
 }
 
 // collisionMsg is the ERROR record for a flat output-name collision.
@@ -662,6 +714,34 @@ func (sw *scanWalk) processFlatSources(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	candidates, err := sw.flatCandidates(ctx)
+	if err != nil {
+		return err
+	}
+	ledgers := sw.claimLedger(groupFlatClaims(candidates))
+	if err := sw.recordCollisions(ctx, ledgers); err != nil {
+		return err
+	}
+	for i := range ledgers {
+		ledger := &ledgers[i]
+		// An unreached claimant may still be there, so its artifacts are not orphans.
+		for _, rel := range ledger.unreached {
+			sw.registerExpected(rel)
+		}
+		sw.unreachedClaims += len(ledger.unreached)
+		if !ledger.stands() && len(ledger.seen) == 1 {
+			if err := sw.processSource(ctx, ledger.seen[0]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// flatCandidates returns the deferred sources that claim a flat output stem:
+// shadowed bundle spellings drop, and orphan certificates resolve as mirror
+// resolves them.
+func (sw *scanWalk) flatCandidates(ctx context.Context) ([]string, error) {
 	candidates := make([]string, 0, len(sw.pendingSources))
 	for _, rel := range sw.pendingSources {
 		if layout.IsBundle(rel) && sw.bundleShadowed(rel) {
@@ -669,42 +749,40 @@ func (sw *scanWalk) processFlatSources(ctx context.Context) error {
 		}
 		orphan, err := sw.resolveFlatOrphanCert(ctx, rel)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if orphan {
-			continue
-		}
-		candidates = append(candidates, rel)
-	}
-	unique, collisions := selectFlatSources(candidates)
-	if err := sw.recordCollisions(ctx, collisions); err != nil {
-		return err
-	}
-	for _, rel := range sw.holdContested(unique) {
-		if err := sw.processSource(ctx, rel); err != nil {
-			return err
+		if !orphan {
+			candidates = append(candidates, rel)
 		}
 	}
-	return nil
+	return candidates, nil
 }
 
-// recordCollisions reports each collision group and records its members'
-// outcomes and artifact claims.
-func (sw *scanWalk) recordCollisions(ctx context.Context, collisions []flatCollision) error {
-	for _, collision := range collisions {
+// recordCollisions reports each standing ledger, records its seen claimants'
+// outcomes and artifact claims, counts its unreached claimants in contested, and
+// clears the collision of every stem whose ledger holds fewer than two.
+func (sw *scanWalk) recordCollisions(ctx context.Context, ledgers []stemLedger) error {
+	for i := range ledgers {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if !sw.standing.reportFor(standingKey{kind: condCollision, subject: collision.stem}, len(collision.sources), collision.sources) {
-			slog.Debug(collisionMsg, "output_stem", logtext.Path(collision.stem), "count", len(collision.sources))
+		ledger := &ledgers[i]
+		key := standingKey{kind: condCollision, subject: ledger.stem}
+		if !ledger.stands() {
+			sw.standing.clear(key)
+			continue
+		}
+		members := ledger.members()
+		if !sw.standing.report(key, len(members)) {
+			slog.Debug(collisionMsg, "output_stem", logtext.Path(ledger.stem), "count", len(members))
 		} else {
 			slog.Error(collisionMsg,
-				"condition", condCollision, "output_stem", logtext.Path(collision.stem),
-				"count", len(collision.sources),
-				"sources", logtext.CapJoin(collision.sources, maxLoggedOrphanBytes),
+				"condition", condCollision, "output_stem", logtext.Path(ledger.stem),
+				"count", len(members),
+				"sources", logtext.CapJoin(members, maxLoggedOrphanBytes),
 				"remediation", collisionRemediation)
 		}
-		for _, rel := range collision.sources {
+		for _, rel := range ledger.seen {
 			// A collided source still CLAIMS its artifacts: the inputs exist, so
 			// the orphan reaper must keep whatever is at the contested path while
 			// the operator resolves the ambiguity.
@@ -712,8 +790,15 @@ func (sw *scanWalk) recordCollisions(ctx context.Context, collisions []flatColli
 			sw.registerExpected(rel)
 			sw.results = append(sw.results, statusCollided)
 		}
+		sw.contested += len(ledger.unreached)
 	}
 	return nil
+}
+
+// keepObserved reports whether the scan saw the source rel or did not reach it.
+func (sw *scanWalk) keepObserved(rel string) bool {
+	_, seen := sw.seen[rel]
+	return seen || !sw.reach.input(rel)
 }
 
 // gone reports whether the scan proved every one of sources absent: it reached
@@ -727,47 +812,18 @@ func (sw *scanWalk) gone(sources []string) bool {
 	return len(sources) > 0
 }
 
-// readWholeTree reports whether the walk, ended by walkErr, read every /input path.
-func (sw *scanWalk) readWholeTree(walkErr error) bool {
-	return walkErr == nil && sw.unreadable == 0 && sw.unresolved == 0 && sw.vanished == 0
-}
-
-// holdContested returns unique without the sources whose stem a standing
-// collision still contests through a claimant this scan did not reach: those are
-// recorded as collided, and the unreached claimants are counted in contested.
-func (sw *scanWalk) holdContested(unique []string) []string {
-	if sw.reach.whole {
-		return unique
+// readWholeTree reports whether the scan, ended by walkErr, read every /input
+// path: none the counts in result name, and none behind a link whose input name
+// kept it out of them that still holds a stored flat claimant or the source of
+// a mirrored artifact.
+func (sw *scanWalk) readWholeTree(result *ScanResult, walkErr error) bool {
+	switch {
+	case walkErr != nil || !result.inputFullyEnumerated() || sw.unreachedClaims > 0:
+		return false
+	case sw.layoutMode == outputpolicy.LayoutFlat:
+		return true
 	}
-	contested := make(map[string]struct{})
-	for stem, claimants := range sw.standing.unseenSources(condCollision) {
-		unreached := 0
-		for _, rel := range claimants {
-			if !sw.reach.input(rel) {
-				unreached++
-			}
-		}
-		if unreached > 0 {
-			contested[stem] = struct{}{}
-			sw.contested += unreached
-		}
-	}
-	if len(contested) == 0 {
-		return unique
-	}
-	kept := make([]string, 0, len(unique))
-	for _, rel := range unique {
-		stem := layout.FlatStem(layout.SourceStem(rel))
-		if _, held := contested[stem]; !held {
-			kept = append(kept, rel)
-			continue
-		}
-		slog.Debug(collisionMsg, "output_stem", logtext.Path(stem), "path", logtext.Path(rel))
-		sw.seen[rel] = struct{}{}
-		sw.registerExpected(rel)
-		sw.results = append(sw.results, statusCollided)
-	}
-	return kept
+	return !slices.ContainsFunc(sw.reach.links, sw.out.holdsDir)
 }
 
 // resolveFlatOrphanCert filters one arbitration candidate: a certificate whose
@@ -788,15 +844,22 @@ func (sw *scanWalk) resolveFlatOrphanCert(ctx context.Context, rel string) (bool
 	return true, sw.processSource(ctx, rel)
 }
 
-// noteUnwalkableSymlink reports a symlink under the input root that the walk
-// cannot follow.
+// noteUnwalkableSymlink records a symlink the walk enumerated, which it never
+// descends. One the scan cannot resolve through the input root keeps what is
+// under it unreached. Unless its name makes it an input, it is also warned about
+// and counted; a link named like an input is not reported as a link, and only a
+// bundle reports a read failure of its own.
 func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
-	if d.Type()&fs.ModeSymlink == 0 || layout.IsRelevant(rel) {
+	if d.Type()&fs.ModeSymlink == 0 {
 		return
 	}
 	fi, err := sw.src.stat(rel)
 	switch {
 	case err != nil && !errors.Is(err, fs.ErrNotExist):
+		sw.reach.enterLink(rel)
+		if layout.IsRelevant(rel) {
+			return
+		}
 		sw.unresolved++
 		level := slog.LevelDebug
 		if sw.standing.report(standingKey{kind: condUnresolvedSymlink, subject: rel}, 1) {
@@ -805,7 +868,7 @@ func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 		slog.Log(context.Background(), level, "skipping symlink that could not be resolved through the input root; anything it points to, including certificates under a linked directory, is not scanned",
 			"condition", condUnresolvedSymlink, "path", logtext.Path(rel), "error", logtext.Path(err.Error()),
 			"remediation", "mount that certificate path into /input directly instead of linking to it, or fix the permissions on the link target")
-	case err == nil && fi.IsDir():
+	case err == nil && fi.IsDir() && !layout.IsRelevant(rel):
 		slog.Debug("skipping symlinked directory; its target is walked directly", "path", logtext.Path(rel))
 	}
 }
@@ -877,8 +940,9 @@ func (sw *scanWalk) registerExpected(rel string) []string {
 // logInputCoverageWarnings names the health-neutral outcomes that produce no
 // output artifacts, for the whole input tree or for some PEM pairs, and that
 // summary counts alone cannot distinguish from a healthy steady state. Each is a
-// standing condition, logged when it appears, changes or clears.
-func logInputCoverageWarnings(st *standing, result *ScanResult, walkErr error) {
+// standing condition, logged when it appears, changes or clears. wholeTree is
+// whether the scan read every /input path, the proof a whole-tree claim needs.
+func logInputCoverageWarnings(st *standing, result *ScanResult, walkErr error, wholeTree bool) {
 	budgetStopped := errors.Is(walkErr, errScanBudgetExceeded)
 	if walkErr != nil && !budgetStopped {
 		return
@@ -886,7 +950,7 @@ func logInputCoverageWarnings(st *standing, result *ScanResult, walkErr error) {
 	// A claim about the WHOLE TREE ("no pair at all", "every certificate") needs a
 	// complete enumeration; a claim about the paths this scan read does not. Only a
 	// complete scan can prove a condition gone.
-	complete := walkErr == nil && result.inputFullyEnumerated()
+	complete := walkErr == nil && wholeTree
 	if st.track(standingKey{kind: condUnreadablePaths}, result.Unreadable, walkErr == nil) {
 		slog.Warn("some /input paths were unreadable and were skipped; health is unaffected",
 			"condition", condUnreadablePaths, "unreadable", result.Unreadable,
@@ -1206,16 +1270,16 @@ func (o *observationLog) forgetPair(rel string) {
 	delete(o.whole, rel)
 }
 
-// forget drops entries for paths a COMPLETE walk did not see, so a pair that
-// comes back is reported once again.
-func (o *observationLog) forget(seen map[string]struct{}) {
+// forget drops entries for paths keep rejects, the pairs a COMPLETE walk
+// proved gone, so a pair that comes back is reported once again.
+func (o *observationLog) forget(keep func(rel string) bool) {
 	for rel := range o.seen {
-		if _, ok := seen[rel]; !ok {
+		if !keep(rel) {
 			delete(o.seen, rel)
 		}
 	}
 	for rel := range o.whole {
-		if _, ok := seen[rel]; !ok {
+		if !keep(rel) {
 			delete(o.whole, rel)
 		}
 	}

@@ -159,7 +159,7 @@ func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr)
+			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr, tt.walkErr == nil && tt.result.inputFullyEnumerated())
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; empty-input notice present = %v, want %v",
@@ -203,7 +203,7 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_all_lack_a_key(t *testin
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr)
+			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr, tt.walkErr == nil && tt.result.inputFullyEnumerated())
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; all-orphan notice present = %v, want %v",
@@ -444,7 +444,7 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key(t *
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr)
+			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr, tt.walkErr == nil && tt.result.inputFullyEnumerated())
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; partial-orphan notice present = %v, want %v",
@@ -577,7 +577,7 @@ func TestLogScanOutcome_reports_observed_per_path_counts_when_the_entry_budget_s
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr)
+			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr, tt.walkErr == nil && tt.result.inputFullyEnumerated())
 
 			if got := logs.Contains(unreadableMsg); got != tt.wantUnreadable {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; unreadable notice present = %v, want %v",

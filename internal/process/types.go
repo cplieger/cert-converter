@@ -17,7 +17,7 @@ const (
 	statusVanished
 	statusUnwritable
 	// statusCollided marks a flat-layout source whose output name another source
-	// also claims this scan; nothing was converted for the contested name and
+	// also claims; nothing was converted for the contested name and
 	// the container goes unhealthy until the operator resolves the ambiguity.
 	statusCollided
 	// statusExcluded marks a source INPUT_EXCLUDE_PATHS covers: enumerated, its

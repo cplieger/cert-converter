@@ -112,21 +112,6 @@ func (s *standing) record(key standingKey, n int, state string, sources []string
 	return news
 }
 
-// unseenSources maps the subject of every standing condition of kind this scan
-// has not reported to the sources it was last reported for.
-func (s *standing) unseenSources(kind string) map[string][]string {
-	if s == nil {
-		return nil
-	}
-	held := make(map[string][]string)
-	for key, since := range s.conditions {
-		if _, ok := s.seen[key]; key.kind == kind && !ok {
-			held[key.subject] = since.sources
-		}
-	}
-	return held
-}
-
 // track reports a count condition: a positive n is reported, and a zero n
 // clears it when the scan's evidence can prove it gone (canClear).
 func (s *standing) track(key standingKey, n int, canClear bool) bool {
