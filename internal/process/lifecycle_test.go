@@ -2369,17 +2369,11 @@ func TestStoreReconcile_keeps_a_bundle_whose_private_key_is_still_present(t *tes
 	assertRemediationMentions(t, logs, loneKeyRetainedMsg, ".crt")
 }
 
-// TestStoreReconcile_lone_key_veto_reads_any_occupant_as_a_key pins the deliberate rule
-// for a key path that holds something other than a regular file.
-//
-// The key is asked for with the SAME ENOENT-only semantics as the certificate
-// (source.pathAbsent, one primitive for both questions): only an ENOENT counts as "no
-// key". A directory, a FIFO or a symlink whose target does not resolve therefore vetoes
-// the deletion too, because the alternative is unlinking private-key material on evidence
-// that amounts to "the key path is odd" — and an odd occupant is not the operator
-// removing the key. It never counts silently: the same WARN names the retention, which is
-// what turns a stray directory at a key path from a never-reaped bundle nobody can explain
-// into a named condition. Serial: it swaps waitBeforeReap and slog.Default.
+// TestStoreReconcile_lone_key_veto_reads_any_occupant_as_a_key pins the rule for a
+// key path holding something other than a regular file. The key is judged as the
+// certificate is (source.judge): only a key that cannot exist counts as "no key",
+// so a directory or FIFO there vetoes deleting private-key material, and the same
+// WARN names the retention. Serial: it swaps waitBeforeReap and slog.Default.
 func TestStoreReconcile_lone_key_veto_reads_any_occupant_as_a_key(t *testing.T) {
 	out := t.TempDir()
 	if err := os.WriteFile(filepath.Join(out, "odd.pfx"), []byte("pfx"), 0o600); err != nil {
@@ -2876,5 +2870,213 @@ func TestStoreInspect_reads_a_prior_at_the_readable_bound(t *testing.T) {
 	if sizeMsg := "prior pfx exceeds the readable bound"; logs.Contains(sizeMsg) {
 		t.Errorf("inspect(a prior of exactly %d bytes) logged %q, want no size-bound notice: that size is the largest this app reads, not the smallest it refuses",
 			maxPFXSize, sizeMsg)
+	}
+}
+
+// TestScannerRun_reaps_the_artifact_of_a_pair_whose_links_lead_nowhere pins that
+// under OUTPUT_LIFECYCLE=sync a pair whose certificate and key became links to
+// names missing inside /input is gone, as a deleted pair is: its artifact is
+// removed while another source keeps the input tree non-empty, and a tree left
+// with no source removes nothing.
+// Serial: it swaps slog.Default().
+func TestScannerRun_reaps_the_artifact_of_a_pair_whose_links_lead_nowhere(t *testing.T) {
+	for _, lay := range []outputpolicy.Layout{outputpolicy.LayoutFlat, outputpolicy.LayoutMirror} {
+		t.Run(string(lay), func(t *testing.T) {
+			sync := Options{Layout: lay, Lifecycle: outputpolicy.LifecycleSync}
+			t.Run("beside_another_source", func(t *testing.T) {
+				in, out := t.TempDir(), t.TempDir()
+				if err := os.Mkdir(filepath.Join(in, "x"), 0o750); err != nil {
+					t.Fatal(err)
+				}
+				writeSelfSignedPair(t, filepath.Join(in, "x"), "cert")
+				writeSelfSignedPair(t, in, "other")
+				logs := captureLogs(t)
+				scanner := newVerdictScanner(in, out, sync)
+				runScans(t, scanner, 1)
+				for _, name := range []string{"cert.crt", "cert.key"} {
+					relink(t, filepath.Join(in, "x", name), "gone-"+name)
+				}
+
+				res := runScans(t, scanner, 1)
+				if res.Removed != 1 || res.Orphan != 0 {
+					t.Errorf("the scan after x's links went nowhere = %+v, want Removed 1 and Orphan 0", res)
+				}
+				if _, err := os.Lstat(filepath.Join(out, "x", "cert.pfx")); !os.IsNotExist(err) {
+					t.Errorf("x/cert.pfx was kept: Lstat = %v", err)
+				}
+				for _, kind := range []string{condOrphanCertificates, condUnreadablePath} {
+					if got := conditionCount(logs, slog.LevelWarn, kind, ""); got != 0 {
+						t.Errorf("the scan logged %d %s WARNs, want 0", got, kind)
+					}
+				}
+				for _, name := range []string{"x/cert.crt", "x/cert.key"} {
+					if got := conditionCount(logs, slog.LevelWarn, "dangling_source_link", name); got != 1 {
+						t.Errorf("%s logged %d dangling_source_link WARNs, want 1", name, got)
+					}
+				}
+			})
+			t.Run("sole_pair", func(t *testing.T) {
+				in, out := t.TempDir(), t.TempDir()
+				writeSelfSignedPair(t, in, "x")
+				captureLogs(t)
+				scanner := newVerdictScanner(in, out, sync)
+				runScans(t, scanner, 1)
+				for _, name := range []string{"x.crt", "x.key"} {
+					relink(t, filepath.Join(in, name), "gone-"+name)
+				}
+
+				res := runScans(t, scanner, 1)
+				if res.Removed != 0 || res.Total != 0 || res.Orphan != 0 || !res.NoSources {
+					t.Errorf("the scan of a tree left with no source = %+v, want Removed 0, Total 0, Orphan 0 and NoSources", res)
+				}
+				if _, err := os.Stat(filepath.Join(out, "x.pfx")); err != nil {
+					t.Errorf("an empty input tree removed x.pfx: %v", err)
+				}
+			})
+			t.Run("link_climbs_out_through_a_missing_directory", func(t *testing.T) {
+				in, out := t.TempDir(), t.TempDir()
+				if err := os.Mkdir(filepath.Join(in, "b"), 0o750); err != nil {
+					t.Fatal(err)
+				}
+				writeSelfSignedPair(t, filepath.Join(in, "b"), "cert")
+				writeSelfSignedPair(t, in, "other")
+				logs := captureLogs(t)
+				scanner := newVerdictScanner(in, out, sync)
+				runScans(t, scanner, 1)
+				// The confined root stops at the missing component and answers
+				// ENOENT before it meets the climb out.
+				relink(t, filepath.Join(in, "b"), "no-such/../../outside")
+
+				if res := runScans(t, scanner, 1); res.Removed != 1 {
+					t.Errorf("the scan after b became a link to nothing = %+v, want Removed 1", res)
+				}
+				if _, err := os.Lstat(filepath.Join(out, "b", "cert.pfx")); !os.IsNotExist(err) {
+					t.Errorf("b/cert.pfx was kept: Lstat = %v", err)
+				}
+				if got := conditionCount(logs, slog.LevelWarn, condUnresolvedSymlink, ""); got != 0 {
+					t.Errorf("the link logged %d unresolved_symlink WARNs, want 0", got)
+				}
+			})
+		})
+	}
+}
+
+// sourceCameBackMsg is the re-check's line for a source that is present again.
+const sourceCameBackMsg = "source came back during the confirmation delay"
+
+// TestScannerRun_reaps_an_artifact_whose_source_runs_through_a_file pins that a
+// source path running through a regular file inside /input cannot exist, so
+// under OUTPUT_LIFECYCLE=sync its artifact is removed with no re-check warning.
+// Serial: it swaps slog.Default().
+func TestScannerRun_reaps_an_artifact_whose_source_runs_through_a_file(t *testing.T) {
+	for _, tc := range []struct {
+		change func(t *testing.T, in string)
+		name   string
+		lay    outputpolicy.Layout
+	}{
+		{name: "mirror_directory_became_a_file", lay: outputpolicy.LayoutMirror, change: func(t *testing.T, in string) {
+			t.Helper()
+			if err := os.RemoveAll(filepath.Join(in, "x")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(in, "x"), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "flat_link_through_a_file", lay: outputpolicy.LayoutFlat, change: func(t *testing.T, in string) {
+			t.Helper()
+			if err := os.WriteFile(filepath.Join(in, "f.txt"), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"cert.crt", "cert.key"} {
+				relink(t, filepath.Join(in, "x", name), "../f.txt/"+name)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in, out := t.TempDir(), t.TempDir()
+			if err := os.Mkdir(filepath.Join(in, "x"), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			writeSelfSignedPair(t, filepath.Join(in, "x"), "cert")
+			writeSelfSignedPair(t, in, "other")
+			logs := captureLogs(t)
+			scanner := newVerdictScanner(in, out, Options{Layout: tc.lay, Lifecycle: outputpolicy.LifecycleSync})
+			runScans(t, scanner, 1)
+			tc.change(t, in)
+
+			if res := runScans(t, scanner, 1); res.Removed != 1 {
+				t.Errorf("the scan after x's source ran through a file = %+v, want Removed 1", res)
+			}
+			if _, err := os.Lstat(filepath.Join(out, "x", "cert.pfx")); !os.IsNotExist(err) {
+				t.Errorf("x/cert.pfx was kept: Lstat = %v", err)
+			}
+			if got := logs.CountLevel(slog.LevelWarn, recheckUnreadableMsg); got != 0 {
+				t.Errorf("the re-check logged %d unreadable-input WARNs, want 0", got)
+			}
+			if logs.Contains(sourceCameBackMsg) {
+				t.Errorf("the re-check claimed the source came back; log = %q", logs.Messages())
+			}
+		})
+	}
+}
+
+// TestScannerRun_reaps_a_mirrored_artifact_under_a_directory_alias pins that
+// under OUTPUT_LIFECYCLE=sync a mirrored source directory replaced by a link to
+// another walked directory is gone: the walk reads the target under its own
+// path, so the alias's artifact is removed and the target's stays.
+// Serial: it swaps slog.Default().
+func TestScannerRun_reaps_a_mirrored_artifact_under_a_directory_alias(t *testing.T) {
+	in, _ := collidingTree(t)
+	out := t.TempDir()
+	logs := captureLogs(t)
+	scanner := newVerdictScanner(in, out, Options{Layout: outputpolicy.LayoutMirror, Lifecycle: outputpolicy.LifecycleSync})
+	runScans(t, scanner, 1)
+	relink(t, filepath.Join(in, "b"), "a")
+
+	if res := runScans(t, scanner, 1); res.Removed != 1 {
+		t.Errorf("the scan after b became an alias of a = %+v, want Removed 1", res)
+	}
+	if _, err := os.Lstat(filepath.Join(out, "b", "site", "cert.pfx")); !os.IsNotExist(err) {
+		t.Errorf("the alias's artifact b/site/cert.pfx was kept: Lstat = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "a", "site", "cert.pfx")); err != nil {
+		t.Errorf("the target's artifact a/site/cert.pfx was removed: %v", err)
+	}
+	if logs.Contains(sourceCameBackMsg) {
+		t.Errorf("the re-check claimed the alias's source came back; log = %q", logs.Messages())
+	}
+}
+
+// TestScannerRun_calls_off_a_flat_reap_when_an_unresolvable_link_appears_before_the_recheck
+// pins that the flat re-check counts a link it cannot resolve the way the scan
+// does: one that appears during the confirmation delay may hide the orphan's
+// source, so the reap is called off.
+// Serial: it swaps slog.Default() and the reap wait.
+func TestScannerRun_calls_off_a_flat_reap_when_an_unresolvable_link_appears_before_the_recheck(t *testing.T) {
+	in, outside := inputAndOutside(t)
+	writeSelfSignedPair(t, in, "other")
+	writeSelfSignedPair(t, in, "gone")
+	out := t.TempDir()
+	logs := captureLogs(t)
+	scanner := newVerdictScanner(in, out, Options{Layout: outputpolicy.LayoutFlat, Lifecycle: outputpolicy.LifecycleSync})
+	runScans(t, scanner, 1)
+	for _, name := range []string{"gone.crt", "gone.key"} {
+		if err := os.Remove(filepath.Join(in, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stubReapWait(t, func(context.Context) error {
+		return os.Symlink(outside, filepath.Join(in, "b"))
+	})
+
+	if res := runScans(t, scanner, 1); res.Removed != 0 {
+		t.Errorf("the scan whose re-check met a new unresolvable link = %+v, want nothing removed", res)
+	}
+	if _, err := os.Stat(filepath.Join(out, "gone.pfx")); err != nil {
+		t.Errorf("gone.pfx was removed: %v", err)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, flatRecheckIncompleteMsg); got != 1 {
+		t.Errorf("the re-check logged %d incomplete re-enumeration WARNs, want 1", got)
 	}
 }

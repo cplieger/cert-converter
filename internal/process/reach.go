@@ -125,6 +125,14 @@ func (r *scanReach) input(subject string) bool {
 	if _, unread := r.unread[subject]; unread {
 		return false
 	}
+	return r.judged(subject)
+}
+
+// judged reports whether the scan judged the /input path subject itself: it
+// listed the directory holding it, or an ancestor that holds no directory or
+// unresolved symlink on the way to it. Unlike input, a source the scan judged
+// but could not read counts.
+func (r *scanReach) judged(subject string) bool {
 	for child, dir := subject, path.Dir(subject); ; child, dir = dir, path.Dir(dir) {
 		if _, listed := r.listed[dir]; listed {
 			_, entered := r.entered[child]

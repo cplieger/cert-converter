@@ -286,21 +286,12 @@ func TestLogConversionObservations_is_silent_without_observations(t *testing.T) 
 	}
 }
 
-// TestNoteUnreadableInput_levels pins the benign-race half of the unreadable-input
-// notice, which the escaping-symlink tests only exercise from the Warn side. A
-// file that vanished between readdir and the read is a normal renewal race — the
-// next scan converts the replacement — so it stays at Debug, carries no
-// remediation hint, and is classified statusVanished rather than statusUnreadable.
-// Promoting either would put an operator-facing warning, pointing at /input
-// permissions, into the log (or into the alerted unreadable count) every time a
-// certificate is atomically replaced.
-//
-// ENOENT alone does not make it that race, which is the other half pinned here: a
-// symlink that is STILL THERE pointing at a missing target returns the same ENOENT
-// on every scan for as long as it exists, so it is the steady-state arm — Warn, the
-// remediation hint, and the alerted unreadable count — not the transient one. Reading
-// it as a race left such a certificate producing no PFX indefinitely with no
-// default-level signal anywhere. Runs serially: it swaps slog.Default().
+// TestNoteUnreadableInput_levels pins both levels of the unreadable-input notice.
+// A file gone between readdir and the read, or a link whose target went missing
+// after the walk judged it, is the renewal race: Debug, no remediation,
+// statusVanished, or every atomic certificate replacement would warn about /input
+// permissions. A real read failure warns as unreadable_path under the failing
+// path. Runs serially: it swaps slog.Default().
 func TestNoteUnreadableInput_levels(t *testing.T) {
 	const logRel = "example.com/tls.crt"
 	for _, tc := range []struct {
@@ -334,18 +325,23 @@ func TestNoteUnreadableInput_levels(t *testing.T) {
 			wantMsg: "certificate vanished during the scan", wantLevel: slog.LevelDebug, wantStatus: statusVanished,
 		},
 		{
-			err: fs.ErrNotExist, name: "a surviving symlink to a missing target is steady-state, not a race", what: "certificate",
+			err: fs.ErrNotExist, name: "a link that dangles at read time raced the judgement", what: "certificate",
 			inputRel: "tls.crt",
 			setup: func(t *testing.T, dir string) {
 				if err := os.Symlink("never-existed.pem", filepath.Join(dir, "tls.crt")); err != nil {
 					t.Fatal(err)
 				}
 			},
-			wantMsg: "cannot read certificate", wantLevel: slog.LevelWarn, wantStatus: statusUnreadable,
+			wantMsg: "certificate vanished during the scan", wantLevel: slog.LevelDebug, wantStatus: statusVanished,
 		},
 		{
 			err: errors.New("permission denied"), name: "an unreadable certificate warns", what: "certificate",
 			inputRel: "tls.crt", wantMsg: "cannot read certificate",
+			wantLevel: slog.LevelWarn, wantStatus: statusUnreadable,
+		},
+		{
+			err: errors.New("permission denied"), name: "an unreadable key warns under the key's path", what: "private key",
+			inputRel: "example.com/tls.key", wantMsg: "cannot read private key",
 			wantLevel: slog.LevelWarn, wantStatus: statusUnreadable,
 		},
 		{
@@ -374,7 +370,16 @@ func TestNoteUnreadableInput_levels(t *testing.T) {
 			if got := logs.CountLevel(tc.wantLevel, tc.wantMsg); got != 1 {
 				t.Fatalf("noteUnreadableInput(%v) logged %q, want %q at %s", tc.err, logs.Messages(), tc.wantMsg, tc.wantLevel)
 			}
-			if !logs.HasAttr(capture.Message(tc.wantMsg), "path", logRel) {
+			if tc.wantLevel == slog.LevelWarn {
+				// The standing condition's subject is the unreadable path, and its
+				// clear names that path, so the onset names it too.
+				if !logs.HasAttr(capture.Message(tc.wantMsg), "condition", condUnreadablePath) ||
+					!logs.HasAttr(capture.Message(tc.wantMsg), "path", tc.inputRel) ||
+					!logs.HasAttr(capture.Message(tc.wantMsg), "source", logRel) {
+					t.Errorf("noteUnreadableInput(%v) logged %q, want condition %s, path %s and source %s",
+						tc.err, logs.Messages(), condUnreadablePath, tc.inputRel, logRel)
+				}
+			} else if !logs.HasAttr(capture.Message(tc.wantMsg), "path", logRel) {
 				t.Errorf("noteUnreadableInput(%v) logged %q, want the cert's relative path", tc.err, logs.Messages())
 			}
 			// The remediation hint belongs to the actionable arm only: on the benign

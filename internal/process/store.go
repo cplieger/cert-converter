@@ -106,7 +106,7 @@ func (s *store) reportLaxDirAt(dir string) {
 	// dir is root-relative, so "." for a flat /output; the root is named
 	// alongside it, matching logOrphanWalkOutcome's own directory-level records.
 	slog.Log(context.Background(), level, laxDirMsg,
-		"condition", condPermissiveDir, "path", logtext.Path(dir), "dir", logtext.Path(s.root.Name()),
+		attrCondition, condPermissiveDir, "path", logtext.Path(dir), "dir", logtext.Path(s.root.Name()),
 		"mode", perm.String(), "want", os.FileMode(outputDirMode).String(),
 		"remediation", outputPermRemediation)
 }
@@ -468,7 +468,7 @@ func (s *store) reportLaxArtifact(rel string, perm os.FileMode) {
 		level = slog.LevelWarn
 	}
 	slog.Log(context.Background(), level, laxArtifactMsg,
-		"condition", condPermissiveFile, "path", logtext.Path(rel), "mode", perm.String(), "want", outputFileMode.String())
+		attrCondition, condPermissiveFile, "path", logtext.Path(rel), "mode", perm.String(), "want", outputFileMode.String())
 }
 
 // artifactGone clears rel's permissive-mode condition: nothing this app wrote is

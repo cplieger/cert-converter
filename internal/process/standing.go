@@ -15,6 +15,9 @@ type standingKey struct {
 	subject string
 }
 
+// attrCondition is the log attribute that names a standing condition's kind.
+const attrCondition = "condition"
+
 // The standing condition kinds, as the `condition` attribute spells them.
 const (
 	condUnreadablePaths    = "unreadable_paths"
@@ -29,6 +32,10 @@ const (
 	condConversionFailed   = "conversion_failed"
 	condPermissiveDir      = "permissive_output_dir"
 	condPermissiveFile     = "permissive_output_file"
+	condDanglingSource     = "dangling_source_link"
+	condClaimsRebuilt      = "claims_rebuilt"
+	condClaimsUnreadable   = "claims_unreadable"
+	condClaimsUnwritable   = "claims_unwritable"
 )
 
 // standingClearedMsg ends a standing condition, with how long it held.
@@ -85,6 +92,17 @@ func (s *standing) report(key standingKey, n int) bool {
 	return s.reportState(key, n, "")
 }
 
+// reportPath reports the per-path condition kind holding on rel and returns
+// its line's level, Warn when that is news and Debug while it holds, and the
+// line's leading attributes.
+func (s *standing) reportPath(kind, rel string) (level slog.Level, attrs []any) {
+	level = slog.LevelDebug
+	if s.report(standingKey{kind: kind, subject: rel}, 1) {
+		level = slog.LevelWarn
+	}
+	return level, append(make([]any, 0, 8), attrCondition, kind, "path", logtext.Path(rel))
+}
+
 // reportState is report for a condition whose state, such as a mode or a cause,
 // is news when it changes too.
 func (s *standing) reportState(key standingKey, n int, state string) bool {
@@ -134,7 +152,7 @@ func (s *standing) clear(key standingKey) {
 		return
 	}
 	delete(s.conditions, key)
-	attrs := []any{"condition", key.kind}
+	attrs := []any{attrCondition, key.kind}
 	if key.subject != "" {
 		attrs = append(attrs, cmp.Or(subjectAttr[key.kind], "path"), logtext.Path(key.subject))
 	}
@@ -159,6 +177,43 @@ func (s *standing) clearUnseen(kind string, quiet bool, reached func(subject str
 		}
 		s.clear(key)
 	}
+}
+
+// reported reports whether this scan reported key.
+func (s *standing) reported(key standingKey) bool {
+	if s == nil {
+		return false
+	}
+	_, ok := s.seen[key]
+	return ok
+}
+
+// countUnseen counts the conditions of kind this scan did not report whose
+// subject unreached answers true for.
+func (s *standing) countUnseen(kind string, unreached func(subject string) bool) int {
+	if s == nil {
+		return 0
+	}
+	n := 0
+	for key := range s.conditions {
+		if _, ok := s.seen[key]; key.kind == kind && !ok && unreached(key.subject) {
+			n++
+		}
+	}
+	return n
+}
+
+// anyHolds reports whether some standing condition satisfies match.
+func (s *standing) anyHolds(match func(key standingKey, sources []string) bool) bool {
+	if s == nil {
+		return false
+	}
+	for key, held := range s.conditions {
+		if match(key, held.sources) {
+			return true
+		}
+	}
+	return false
 }
 
 // clearUnless ends every condition of kind whose subject fails holds. Only a

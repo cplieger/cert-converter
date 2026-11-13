@@ -6,6 +6,13 @@ This page describes how cert-converter finds certificates, notices renewals, nam
 
 A scan walks the whole `/input` tree. It pairs each `<name>.crt` with the `<name>.key` beside it, and once an input password is set it also picks up `<name>.pfx` and `<name>.p12` bundles. A `.crt` with no matching `.key` is skipped and reported, not treated as an error. Each input file is read once, and the same bytes feed both the conversion and the change check.
 
+Every path the scan meets gets one verdict, and the conversion, the collision check, the counts and the cleanup all read that verdict, so they never disagree about a path.
+
+- A regular file, or a symlink to one inside `/input`, is present and is read under the link's own path.
+- A missing file, a symlink whose target does not exist, or a path through a file is absent, and counts as deleted.
+- A symlink to a folder inside `/input` is not followed, because the scan reaches that folder under its own path. A path through the link is not an input.
+- Anything else is unproven: a symlink that leaves `/input`, loops or cannot be read, an unreadable file, and a folder or other non-regular file at a certificate, key or bundle name. An unproven path proves nothing about what lies at or behind it, so every input seen there keeps its claim and its outputs, and cleanup removes nothing that may come from it.
+
 Each PFX output holds the private key, the certificate and the chain of issuing certificates from its source, whether that source is a PEM pair or a bundle. RSA, ECDSA, Ed25519 and ML-DSA keys are all supported.
 
 ## Noticing renewals
@@ -35,14 +42,15 @@ A restart removes the file until the first scan completes. That scan reads every
 The container is unhealthy when any of these holds:
 
 - The `/input` root cannot be read. That includes `/input` and `/output` being the same folder, or one being inside the other.
-- A certificate fails to convert. The causes are a PEM or key parse error, a PFX decode failure, a certificate that does not match its key, and a failed write.
+- A certificate fails to convert. The causes are a PEM or key parse error, a PFX decode failure, a certificate that does not match its key, and a failed write. The failure keeps counting while later scans cannot reach the source, for example behind an unreadable path, because nothing has shown it fixed.
 - Two inputs collide on one output name under the flat layout.
 
-It recovers on the next clean scan without a restart. Docker Engine does not act on health status itself. An orchestrator that does, such as Swarm or Kubernetes, restarts the container, and under plain Docker Compose the restart is yours to do. Nothing tells you about an unhealthy container unless something watches Docker health, as [Monitoring and alerts](monitoring.md#knowing-the-app-is-alive) explains. A collision whose inputs the restarted process can still reach is found again, so the container stays unhealthy. That is deliberate, because nothing else tells an orchestrator that an app is reading a file cert-converter refuses to update. A restart forgets an input the new process cannot reach, so if one input is left in reach it converts and health recovers.
+It recovers on the next clean scan without a restart. Docker Engine does not act on health status itself. An orchestrator that does, such as Swarm or Kubernetes, restarts the container, and under plain Docker Compose the restart is yours to do. Nothing tells you about an unhealthy container unless something watches Docker health, as [Monitoring and alerts](monitoring.md#knowing-the-app-is-alive) explains. A restart does not clear a collision, so the container stays unhealthy. That is deliberate, because nothing else tells an orchestrator that an app is reading a file cert-converter refuses to update. Under the flat layout a small record in `/output` lists each output name's claimants, so the restarted process keeps a claimant it cannot reach yet, and never publishes the other input under the shared name.
 
-Health tracks only failures a restart can clear, plus a collision a restart finds again. These conditions are logged at WARN with the action to take and leave health unchanged:
+Health tracks only failures a restart can clear, plus a collision a restart keeps. These conditions are logged at WARN with the action to take and leave health unchanged:
 
-- An unreadable path below `/input`, or a symlink that points outside the mount.
+- An unreadable path below `/input`, a symlink that points outside the mount, or a folder where a certificate file belongs, unless the source behind it already had a conversion failure.
+- A source symlink whose target does not exist, which counts as a deleted source.
 - An `/input` tree larger than `MAX_SCAN_ENTRIES`.
 - An `/output` folder more permissive than `0750`, or a file more permissive than `0600`.
 - A refused replacement of an output cert-converter could not read or verify.
@@ -59,3 +67,4 @@ Health tracks only failures a restart can clear, plus a collision a restart find
 - Output names follow the certificate's folder rather than the issuer's storage layout, so apps keep working across an issuer change.
 - An ambiguous output name converts nothing and turns the container unhealthy, rather than cert-converter guessing which certificate you meant.
 - The change check reads the output on disk instead of a state file, so writes happen only when the content changes and file timestamps stay meaningful.
+- The one record cert-converter keeps, under the flat layout only, says which inputs claim each output name. Without it a restart would forget an input it cannot reach yet, publish another input under a contested name, or remove an output whose input is still there behind a broken link.

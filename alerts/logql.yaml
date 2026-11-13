@@ -102,9 +102,10 @@ groups:
           summary: "cert-converter skipped an unreachable /input path"
           description: >
             An /input path could not be read or a symlink could not be resolved,
-            so its certificates were skipped. Health is unaffected. Fix
-            permissions for the UID in `user:`, and mount the certificate
-            directory instead of a symlink to it.
+            so its certificates were skipped. Health is unaffected unless a
+            skipped source already had a conversion failure, which keeps the
+            container unhealthy. Fix permissions for the UID in `user:`, and
+            mount the certificate directory instead of a symlink to it.
       - alert: CertConverterNoCertificateSources
         expr: |
           last_over_time({container="cert-converter"} |= `scan complete` | logfmt no_sources | unwrap no_sources [13h]) by (container) > 0

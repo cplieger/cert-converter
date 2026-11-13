@@ -38,48 +38,63 @@ func TestSourcePathVanished_reports_an_unclassifiable_path_as_steady_state(t *te
 	}
 }
 
-// TestSourcePathAbsent pins the primitive the orphan reap deletes on. Every arm is a
-// deletion decision over private key material, and only the first one may answer
-// "absent": the re-check runs after a deferral window in which a producer may have
-// rewritten the certificate, and any answer the confined Lstat cannot make with
-// certainty has to keep the bundle.
-func TestSourcePathAbsent(t *testing.T) {
+// TestSourceJudge pins the re-check's judgement of a source or key path, the
+// primitive the orphan reap deletes on. Only a path that cannot exist inside the
+// input root may read Absent: the re-check runs after a deferral window in which
+// a producer may have rewritten the certificate, and any path it cannot resolve
+// has to keep the bundle.
+func TestSourceJudge(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "back.crt"), []byte("cert"), 0o600); err != nil {
-		t.Fatal(err)
+	base := t.TempDir()
+	dir, outside := filepath.Join(base, "input"), filepath.Join(base, "outside")
+	for _, d := range []string{dir, outside, filepath.Join(dir, "a"), filepath.Join(dir, "occupied.crt")} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
 	}
-	// A regular file standing in for a path component: the confined Lstat answers
-	// ENOTDIR, the reachable non-ENOENT failure.
-	if err := os.WriteFile(filepath.Join(dir, "plain"), []byte("not a directory"), 0o600); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"back.crt", "plain", filepath.Join("a", "site.crt")} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("cert"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := os.Symlink("nowhere", filepath.Join(dir, "dangling.crt")); err != nil {
-		t.Fatal(err)
+	for name, target := range map[string]string{
+		"dangling.crt": "nowhere",
+		"escaping.crt": filepath.Join(outside, "real.crt"),
+		"out":          outside,
+		"through.crt":  "out/real.crt",
+		"b":            "a",
+		"filed.crt":    "plain/real.crt",
+	} {
+		if err := os.Symlink(target, filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	s := newInputSource(t, dir)
 
 	for _, tc := range []struct {
 		rel     string
-		want    bool
-		wantErr bool
 		why     string
+		want    verdict
+		wantErr bool
 	}{
-		{"missing.crt", true, false, "an ENOENT path is the durable absence the reap needs"},
-		{"back.crt", false, false, "a certificate that is present must keep its bundle, which is the case " +
-			"pathVanished would have answered true for"},
-		{"dangling.crt", false, false, "a symlink whose target is missing is still an entry in the operator's tree"},
-		{"plain/tls.crt", false, true, "a path the scan cannot classify is not proof of absence, and the " +
-			"failure must reach the caller so the retention is not narrated as a positive observation"},
+		{rel: "missing.crt", want: verdictAbsent, why: "no entry is the durable absence the reap needs"},
+		{rel: "back.crt", want: verdictPresent, why: "a certificate that is present must keep its bundle"},
+		{rel: "dangling.crt", want: verdictAbsent, why: "a link to a name missing inside the root is as gone as a deleted file"},
+		{rel: "escaping.crt", want: verdictUnproven, wantErr: true, why: "a link out of the root proves nothing"},
+		{rel: "through.crt", want: verdictUnproven, wantErr: true, why: "a link through a link out of the root proves nothing"},
+		{rel: "b/site.crt", want: verdictAbsent, why: "a path under an alias of a walked directory is not an input"},
+		{rel: "plain/tls.crt", want: verdictAbsent, why: "a path through a regular file cannot exist"},
+		{rel: "filed.crt", want: verdictAbsent, why: "a link whose target runs through a regular file cannot resolve"},
+		{rel: "occupied.crt", want: verdictMismatch, wantErr: true, why: "a directory at a source name proves nothing"},
 	} {
 		t.Run(tc.rel, func(t *testing.T) {
 			t.Parallel()
-			got, err := s.pathAbsent(tc.rel)
+			got, err := s.judge(tc.rel)
 			if got != tc.want {
-				t.Errorf("source.pathAbsent(%q) = %v, want %v: %s", tc.rel, got, tc.want, tc.why)
+				t.Errorf("source.judge(%q) = %d, want %d: %s", tc.rel, got, tc.want, tc.why)
 			}
 			if (err != nil) != tc.wantErr {
-				t.Errorf("source.pathAbsent(%q) error = %v, want error: %v: %s", tc.rel, err, tc.wantErr, tc.why)
+				t.Errorf("source.judge(%q) error = %v, want error: %v: the reason must reach the caller so a retention is not narrated as a positive observation", tc.rel, err, tc.wantErr)
 			}
 		})
 	}

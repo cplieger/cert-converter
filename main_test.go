@@ -161,7 +161,7 @@ func TestScanAndSetHealth_unreadable_pair_stays_healthy(t *testing.T) {
 
 	// CountExact, not Count: the record must be one line, not a second one that
 	// merely contains the message.
-	const unreadableMsg = "some /input paths were unreadable and were skipped; health is unaffected"
+	const unreadableMsg = "some /input paths were unreadable and were skipped; health is unaffected unless a skipped path had a standing conversion failure"
 	if n := logs.CountLevel(slog.LevelWarn, unreadableMsg); n != 1 {
 		t.Errorf("a scan with one unreadable pair logged %d WARN records with the message %q, want exactly 1; got logs %q",
 			n, unreadableMsg, logs.Messages())
@@ -242,7 +242,7 @@ func TestScanAndSetHealth_clean_scan_emits_no_unreadable_warning(t *testing.T) {
 
 	scanAndSetHealth(t.Context(), scanner, testReporter(), marker, false)
 
-	const unreadableMsg = "some /input paths were unreadable and were skipped; health is unaffected"
+	const unreadableMsg = "some /input paths were unreadable and were skipped; health is unaffected unless a skipped path had a standing conversion failure"
 	if n := logs.Count(unreadableMsg); n != 0 {
 		t.Errorf("a scan with nothing unreadable logged %d records mentioning %q, want 0: operators alert on that message, so it must stay specific to Unreadable > 0; got logs %q",
 			n, unreadableMsg, logs.Messages())
