@@ -321,7 +321,6 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 	walkErr := filesafe.WalkDirInRoot(ctx, inHandle, func(rel string, d fs.DirEntry, err error) error {
 		return sw.visit(ctx, rel, d, err)
 	})
-	sw.reach.whole = sw.readWholeTree(walkErr)
 	// Flat conversion runs on everything the walk enumerated, matching mirror's
 	// availability: an unreadable sub-path skips ITS sources, never the tree's.
 	// claimLedger owns how a collision is arbitrated.
@@ -354,17 +353,18 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 		evidenceEvicted: s.observations.takeEvictedWholeness(),
 	}
 	// Prune observation state for pairs that are gone, but ONLY when the walk
-	// proved the enumeration complete: an aborted walk, an unreadable sub-path or
-	// an unresolved symlink means `seen` is not the whole input tree, so a pair
-	// hidden behind it would be forgotten and re-warn on the next clean scan.
+	// proved the enumeration complete and only for paths it reached: a pair
+	// hidden behind an unreadable sub-path or an unresolved symlink would be
+	// forgotten and re-warn on the next clean scan.
 	if rc.walkEnumerationComplete() {
-		s.observations.forget(sw.seen)
+		s.observations.forget(sw.keepObserved)
 	}
 	rp := &reaper{
 		src: sw.src, out: out, mode: s.opts.Lifecycle, formats: s.opts.Formats,
 		layoutMode: s.opts.Layout, layoutExplicit: s.opts.LayoutExplicit,
 		exclude:    s.opts.Exclude,
 		maxEntries: s.opts.MaxScanEntries,
+		unreached:  sw.reach.outputHidden,
 	}
 	removed, reconcileErr := rp.reconcile(ctx, sw.expected, &rc)
 	result.Removed = removed
@@ -386,20 +386,20 @@ func (s *Scanner) Run(ctx context.Context) (ScanResult, error) {
 // reportVerdict derives the scan's verdicts from what the walk, the reaper and
 // the last sweep found, then logs the standing conditions that changed. Only a
 // scan that ran to the end can prove a per-path condition gone, and only for a
-// subject it reached, or any subject once it saw every /input path.
+// subject it reached (scanReach.input).
 func (s *Scanner) reportVerdict(result *ScanResult, out *store, sw *scanWalk, walkErr error) {
 	result.Outcome = outcomeOf(walkErr)
 	result.OrphanRemovalDisabled = out.reapDisabled
 	result.PreviousLayoutRetained = out.otherLayoutKept
 	result.CleanupDegraded = s.cleanupDegraded
 	enumerated := walkErr == nil
-	wholeTree := enumerated && result.inputFullyEnumerated()
+	wholeTree := sw.readWholeTree(result, walkErr)
 	if wholeTree {
 		coverage := wholeTreeCoverageOf(result)
 		result.NoSources = coverage == coverageNoSource || coverage == coverageAllOrphan
 		result.AllExcluded = coverage == coverageAllExcluded
 	}
-	logInputCoverageWarnings(s.standing, result, walkErr)
+	logInputCoverageWarnings(s.standing, result, walkErr, wholeTree)
 	if !wholeTree {
 		result.carryUnproven(&s.lastReported, enumerated)
 	}
@@ -407,7 +407,7 @@ func (s *Scanner) reportVerdict(result *ScanResult, out *store, sw *scanWalk, wa
 	if walkErr != nil {
 		return
 	}
-	inputReached := func(subject string, _ []string) bool { return wholeTree || sw.reach.input(subject) }
+	inputReached := func(subject string, _ []string) bool { return sw.reach.input(subject) }
 	s.standing.clearUnseen(condUnresolvedSymlink, false, inputReached)
 	// The aggregate unreadable_paths condition reports the clear; its per-path
 	// detail goes quietly.
@@ -475,7 +475,9 @@ type scanWalk struct {
 	// contested counts the claimants of standing collisions this scan could not
 	// reach (claimLedger).
 	contested int
-	formats   outputpolicy.Formats
+	// unreachedClaims counts every stored flat claimant this scan could not reach.
+	unreachedClaims int
+	formats         outputpolicy.Formats
 	// inputPasswordReady is false unless a non-blank password or the explicit
 	// empty-password opt-in was configured.
 	inputPasswordReady bool
@@ -678,9 +680,6 @@ func (sw *scanWalk) claimLedger(claims []flatClaim) []stemLedger {
 // outOfReach returns the claimants among held that this scan neither saw in
 // seen nor reached.
 func (sw *scanWalk) outOfReach(held, seen []string) []string {
-	if sw.reach.whole {
-		return nil
-	}
 	var unreached []string
 	for _, rel := range held {
 		if !slices.Contains(seen, rel) && !sw.reach.input(rel) {
@@ -721,7 +720,13 @@ func (sw *scanWalk) processFlatSources(ctx context.Context) error {
 		return err
 	}
 	for i := range ledgers {
-		if ledger := &ledgers[i]; !ledger.stands() && len(ledger.seen) == 1 {
+		ledger := &ledgers[i]
+		// An unreached claimant may still be there, so its artifacts are not orphans.
+		for _, rel := range ledger.unreached {
+			sw.registerExpected(rel)
+		}
+		sw.unreachedClaims += len(ledger.unreached)
+		if !ledger.stands() && len(ledger.seen) == 1 {
 			if err := sw.processSource(ctx, ledger.seen[0]); err != nil {
 				return err
 			}
@@ -787,6 +792,12 @@ func (sw *scanWalk) recordCollisions(ctx context.Context, ledgers []stemLedger) 
 	return nil
 }
 
+// keepObserved reports whether the scan saw the source rel or did not reach it.
+func (sw *scanWalk) keepObserved(rel string) bool {
+	_, seen := sw.seen[rel]
+	return seen || !sw.reach.input(rel)
+}
+
 // gone reports whether the scan proved every one of sources absent: it reached
 // each one's directory and did not see it.
 func (sw *scanWalk) gone(sources []string) bool {
@@ -798,9 +809,18 @@ func (sw *scanWalk) gone(sources []string) bool {
 	return len(sources) > 0
 }
 
-// readWholeTree reports whether the walk, ended by walkErr, read every /input path.
-func (sw *scanWalk) readWholeTree(walkErr error) bool {
-	return walkErr == nil && sw.unreadable == 0 && sw.unresolved == 0 && sw.vanished == 0
+// readWholeTree reports whether the scan, ended by walkErr, read every /input
+// path: none the counts in result name, and none behind a link whose input name
+// kept it out of them that still holds a stored flat claimant or the source of
+// a mirrored artifact.
+func (sw *scanWalk) readWholeTree(result *ScanResult, walkErr error) bool {
+	switch {
+	case walkErr != nil || !result.inputFullyEnumerated() || sw.unreachedClaims > 0:
+		return false
+	case sw.layoutMode == outputpolicy.LayoutFlat:
+		return true
+	}
+	return !slices.ContainsFunc(sw.reach.links, sw.out.holdsDir)
 }
 
 // resolveFlatOrphanCert filters one arbitration candidate: a certificate whose
@@ -916,8 +936,9 @@ func (sw *scanWalk) registerExpected(rel string) []string {
 // logInputCoverageWarnings names the health-neutral outcomes that produce no
 // output artifacts, for the whole input tree or for some PEM pairs, and that
 // summary counts alone cannot distinguish from a healthy steady state. Each is a
-// standing condition, logged when it appears, changes or clears.
-func logInputCoverageWarnings(st *standing, result *ScanResult, walkErr error) {
+// standing condition, logged when it appears, changes or clears. wholeTree is
+// whether the scan read every /input path, the proof a whole-tree claim needs.
+func logInputCoverageWarnings(st *standing, result *ScanResult, walkErr error, wholeTree bool) {
 	budgetStopped := errors.Is(walkErr, errScanBudgetExceeded)
 	if walkErr != nil && !budgetStopped {
 		return
@@ -925,7 +946,7 @@ func logInputCoverageWarnings(st *standing, result *ScanResult, walkErr error) {
 	// A claim about the WHOLE TREE ("no pair at all", "every certificate") needs a
 	// complete enumeration; a claim about the paths this scan read does not. Only a
 	// complete scan can prove a condition gone.
-	complete := walkErr == nil && result.inputFullyEnumerated()
+	complete := walkErr == nil && wholeTree
 	if st.track(standingKey{kind: condUnreadablePaths}, result.Unreadable, walkErr == nil) {
 		slog.Warn("some /input paths were unreadable and were skipped; health is unaffected",
 			"condition", condUnreadablePaths, "unreadable", result.Unreadable,
@@ -1245,16 +1266,16 @@ func (o *observationLog) forgetPair(rel string) {
 	delete(o.whole, rel)
 }
 
-// forget drops entries for paths a COMPLETE walk did not see, so a pair that
-// comes back is reported once again.
-func (o *observationLog) forget(seen map[string]struct{}) {
+// forget drops entries for paths keep rejects, the pairs a COMPLETE walk
+// proved gone, so a pair that comes back is reported once again.
+func (o *observationLog) forget(keep func(rel string) bool) {
 	for rel := range o.seen {
-		if _, ok := seen[rel]; !ok {
+		if !keep(rel) {
 			delete(o.seen, rel)
 		}
 	}
 	for rel := range o.whole {
-		if _, ok := seen[rel]; !ok {
+		if !keep(rel) {
 			delete(o.whole, rel)
 		}
 	}

@@ -517,6 +517,7 @@ func TestReportVerdict_clears_unreached_per_path_conditions_only_after_a_whole_t
 		{kind: condPermissiveFile, subject: "site/b.pfx"},
 		{kind: condPermissiveDir, subject: "site"},
 	}
+	// Only the whole-tree walk listed the root and found no site in it.
 	for name, tc := range map[string]struct {
 		result      ScanResult
 		wantCleared bool
@@ -535,6 +536,9 @@ func TestReportVerdict_clears_unreached_per_path_conditions_only_after_a_whole_t
 			s.standing.beginScan()
 			result := tc.result
 			sw := &scanWalk{expected: map[string]struct{}{}}
+			if tc.wantCleared {
+				sw.reach.enterDir(".")
+			}
 			s.reportVerdict(&result, &store{standing: s.standing}, sw, nil)
 			for _, key := range held {
 				if cleared := countClears(logs, key.kind) == 1; cleared != tc.wantCleared {

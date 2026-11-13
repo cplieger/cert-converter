@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/layout"
@@ -17,9 +18,12 @@ import (
 
 // reaper reconciles output artifacts with one scan's expected artifact set.
 type reaper struct {
-	src  *source
-	out  *store
-	mode outputpolicy.Lifecycle
+	src *source
+	out *store
+	// unreached keeps every orphan candidate it reports true for: one whose
+	// source may lie where the scan could not look. Nil keeps none.
+	unreached func(outRel string) bool
+	mode      outputpolicy.Lifecycle
 	// layoutMode selects the post-delay source re-check: the mirror layout
 	// derives a candidate's sources from its name and stats them, while the flat
 	// layout re-enumerates /input fresh per candidate (flatInventory).
@@ -129,6 +133,9 @@ func (rp *reaper) reconcile(ctx context.Context, expected map[string]struct{}, r
 		return 0, nil
 	}
 	orphaned := orphansOf(outputs, expected)
+	if rp.unreached != nil {
+		orphaned = slices.DeleteFunc(orphaned, rp.unreached)
+	}
 	if len(orphaned) == 0 {
 		return 0, nil
 	}

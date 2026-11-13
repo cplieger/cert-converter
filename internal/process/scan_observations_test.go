@@ -294,7 +294,7 @@ func TestObservationLog_forgetPair_spends_wholeness_without_resetting_deduplicat
 
 	// A COMPLETE walk that no longer sees the path prunes both halves, so a pair that
 	// comes back is reported once again.
-	o.forget(map[string]struct{}{})
+	o.forget(func(string) bool { return false })
 	o.note("tls.crt", fp, obs)
 	if got := countObservation(logs, convert.ObsLeafNotFirst); got != 2 {
 		t.Errorf("input re-read after forget logged %d leaf-not-first observations in total, want 2: forget prunes the signature as well as the wholeness",

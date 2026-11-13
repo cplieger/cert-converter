@@ -23,9 +23,8 @@ type scanReach struct {
 	// resolved is every artifact of a source whose every artifact was inspected
 	// and, where stale, written.
 	resolved map[string]struct{}
-	// whole is whether the walk listed every /input path, so one it did not
-	// enumerate is gone.
-	whole bool
+	// links is every symlink the scan could not resolve, in enumeration order.
+	links []string
 }
 
 // enterDir records that the walk enumerated the directory rel: it stays listed
@@ -40,6 +39,7 @@ func (r *scanReach) enterDir(rel string) {
 // not resolve it, so a path under it is not proven absent.
 func (r *scanReach) enterLink(rel string) {
 	r.order(rel)
+	r.links = append(r.links, rel)
 }
 
 func (r *scanReach) order(rel string) {
@@ -134,6 +134,12 @@ func (r *scanReach) input(subject string) bool {
 			return false
 		}
 	}
+}
+
+// outputHidden reports whether the scan did not reach the /input path the mirror
+// layout derives the /output path outRel from, so its source may still exist.
+func (r *scanReach) outputHidden(outRel string) bool {
+	return !r.input(layout.OutputStem(outRel))
 }
 
 // output reports whether the scan resolved the artifact at the /output path subject.
