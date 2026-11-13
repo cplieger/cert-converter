@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // captureLogs installs slogx/capture's Recorder as slog.Default() for the test and
@@ -49,35 +49,6 @@ func TestWalkLogPolicy_per_path_lines_are_debug_only(t *testing.T) {
 		assertDebugOnly(t, logs, "skipping unreadable path", "locked")
 		if sw.unreadable != 1 {
 			t.Errorf("unreadable = %d, want 1 so the aggregate in logInputCoverageWarnings fires", sw.unreadable)
-		}
-	})
-
-	// A DIRECTORY occupying a <name>.crt path is the same shape of steady-state layout
-	// mistake as the arm above — it recurs on every scan until an operator moves it —
-	// and it feeds the SAME unreadable counter, so the aggregate WARN in
-	// logInputCoverageWarnings already fires on this scan. Naming the path at the default level
-	// as well made one condition produce two WARN records per scan, which is the exact
-	// double-report this policy exists to prevent.
-	//
-	// The counter assertion here is what makes that argument true rather than assumed:
-	// demoting the line is only safe while the aggregate still fires. The reaping veto
-	// the same counter drives is pinned end-to-end by
-	// TestScannerRun_directory_in_cert_path_does_not_authorise_reaping.
-	t.Run("input walk directory in a cert path", func(t *testing.T) {
-		logs := captureLogs(t)
-		sw := &scanWalk{seen: map[string]struct{}{}}
-
-		if err := sw.visit(t.Context(), "blocked.crt", dirEntryOf(t, t.TempDir()), nil); err != nil {
-			t.Fatalf("visit(directory in a cert path) = %v, want nil so the rest of the tree is still walked", err)
-		}
-
-		assertDebugOnly(t, logs, "skipping source: input path is a directory", "blocked.crt")
-		if sw.unreadable != 1 {
-			t.Errorf("unreadable = %d, want 1 so the aggregate in logInputCoverageWarnings fires and reaping stays vetoed", sw.unreadable)
-		}
-		if len(sw.seen) != 0 || len(sw.results) != 0 {
-			t.Errorf("seen/results = %d/%d, want 0/0: an unreadable cert path is not a pair outcome",
-				len(sw.seen), len(sw.results))
 		}
 	})
 
@@ -162,7 +133,7 @@ func assertDebugOnly(t *testing.T, logs *capture.Recorder, msg, wantPath string)
 	if got := logs.CountLevel(slog.LevelWarn, msg); got != 0 {
 		t.Errorf("%q logged at WARN %d times, want 0; per-path lines must not reach the default level", msg, got)
 	}
-	if !logs.HasAttr(msg, "path", wantPath) {
+	if !logs.HasAttr(capture.Message(msg), "path", wantPath) {
 		t.Errorf("record %q does not name path=%q; demoting it must not make it undiscoverable", msg, wantPath)
 	}
 }
@@ -196,11 +167,11 @@ func assertAggregateWarnCount(t *testing.T, logs *capture.Recorder, msg, wantCou
 	if got := logs.CountLevel(slog.LevelWarn, msg); got != 1 {
 		t.Errorf("%q logged at WARN %d times, want exactly 1: %q", msg, got, logs.Messages())
 	}
-	if !logs.HasAttr(msg, "count", wantCount) {
-		got, _ := logs.AttrValue(msg, "count")
+	if !logs.HasAttr(capture.Message(msg), "count", wantCount) {
+		got, _ := logs.AttrValue(capture.Message(msg), "count")
 		t.Errorf("aggregate WARN %q count = %q, want %q", msg, got, wantCount)
 	}
-	if _, ok := logs.AttrValue(msg, "remediation"); !ok {
+	if _, ok := logs.AttrValue(capture.Message(msg), "remediation"); !ok {
 		t.Errorf("aggregate WARN %q has no remediation hint: it is the only line the operator sees", msg)
 	}
 }
@@ -294,21 +265,12 @@ func TestOutputWalkVisit_an_unreadable_path_vetoes_the_reap(t *testing.T) {
 	assertDebugOnly(t, logs, wantMsg, "locked/tls.pfx")
 }
 
-// TestOutputWalkVisit_a_vanished_path_does_not_veto_the_reap is the negative twin of the
-// test above, and the ONE witness for the /output half of the producer race: an ENOENT
-// below the root is a path removed under the walk -- by an operator following this app's
-// own "remove them from the output volume by hand" advice, or any other writer on a mount
-// this app does not own -- not a path this scan could not READ.
-//
-// Both halves matter and neither is asserted anywhere else. It must not raise
-// w.unreadable, because that counter is what carries reapDisabledPhrase into the
-// documented CertConverterOrphanRemovalDisabled alert with a remediation that sends the
-// operator after /output ownership, for an ordinary removal; and it must not stop the
-// enumeration, because the surviving bundles are still candidates. The asymmetry with the
-// /input side (scan_walk_test.go's vanished arm, which DOES veto) is deliberate: a missing
-// /input path leaves a hole in `seen` and can make a live bundle read as an orphan, while
-// a missing /output path is simply absent from w.found and a candidate never enumerated is
-// never reaped.
+// TestOutputWalkVisit_a_vanished_path_does_not_veto_the_reap pins the /output half of
+// the producer race: an ENOENT below the root is a path removed under the walk, not one
+// this scan could not READ. It must not raise w.unreadable, whose WARN would send the
+// operator after /output ownership for an ordinary removal, and it must not stop the
+// enumeration. Unlike /input, a missing /output path is simply absent from w.found,
+// and a candidate never enumerated is never reaped.
 // Runs serially: it swaps slog.Default().
 func TestOutputWalkVisit_a_vanished_path_does_not_veto_the_reap(t *testing.T) {
 	// Spelled out rather than imported from the production call site: an operator's
@@ -348,7 +310,7 @@ func TestOutputWalkVisit_a_vanished_path_does_not_veto_the_reap(t *testing.T) {
 // TestOutputWalkVisit_stops_the_orphan_walk_once_the_scan_is_cancelled pins the orphan
 // walk's PER-ENTRY cancellation guard, the one contract of visit nothing else reaches.
 //
-// The shared walker checks the context once per READ BATCH (atomicfile's fixed 256-entry
+// The shared walker checks the context once per READ BATCH (filesafe's fixed 256-entry
 // batch), so inside a batch this guard is the only thing that stops the enumeration -- and
 // a flat /output smaller than one batch is checked exactly once, before any entry is
 // visited. Drop it and a scan cancelled inside that batch enumerates the rest of the tree
@@ -389,17 +351,11 @@ func TestOutputWalkVisit_stops_the_orphan_walk_once_the_scan_is_cancelled(t *tes
 }
 
 // TestWalkLogPolicy_quiet_when_nothing_is_wrong pins the steady state: a readable
-// output tree with no symlinks emits no aggregate at all. A guard that also fired on
-// zero would put a "count=0" warning with a remediation hint into the log on every
-// scan of a perfectly healthy /output.
-//
-// The root's own mode is deliberately left as the host created it (t.TempDir yields
-// 0755 on some hosts, and an inherited default ACL can widen a fresh directory): the
-// orphan walk has no business inspecting directory permissions at all, so a
-// permissiveness record appearing here is a failure. The /output directory mode is
-// reported once per scan from the write side (store.reportLaxDir) and acts on nothing
-// — an earlier cycle asked this walk for that verdict and used it to veto reaping,
-// which the 2026-07 decision removed.
+// output tree with no symlinks emits no aggregate at all, where a guard that also
+// fired on zero would log a "count=0" warning on every healthy scan. The root's mode
+// is left as the host created it (t.TempDir yields 0755 on some hosts): the orphan
+// walk never inspects directory permissions, which only the write side reports
+// (store.reportLaxDir), so a permissiveness record here is a failure.
 func TestWalkLogPolicy_quiet_when_nothing_is_wrong(t *testing.T) {
 	dir := t.TempDir()
 	logs := captureLogs(t)
@@ -513,5 +469,34 @@ func TestStoreListOutputs_enumerates_a_tree_inside_the_budget(t *testing.T) {
 	if len(found) != 1 || found[0] != "a.pfx" {
 		t.Errorf("listOutputs(a tree exactly at the budget) found %v, want [a.pfx]: only this app's own"+
 			" output shape is a candidate", found)
+	}
+}
+
+// TestScannerRun_reports_a_directory_at_a_source_path_once pins that a directory
+// occupying a <name>.crt path is a standing condition: one WARN naming it, with the
+// fix, then Debug while it holds, and every scan counts it unreadable so reaping
+// stays vetoed.
+// Serial: it swaps slog.Default().
+func TestScannerRun_reports_a_directory_at_a_source_path_once(t *testing.T) {
+	in := t.TempDir()
+	if err := os.Mkdir(filepath.Join(in, "blocked.crt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	logs := captureLogs(t)
+	scanner := newVerdictScanner(in, t.TempDir(), Options{})
+	for scan := range 2 {
+		if res := runScans(t, scanner, 1); res.Unreadable != 1 {
+			t.Errorf("scan %d: Unreadable = %d, want 1", scan+1, res.Unreadable)
+		}
+	}
+	warns := conditionRecords(logs, slog.LevelWarn, condUnreadablePath, "blocked.crt")
+	if len(warns) != 1 {
+		t.Fatalf("two scans logged %d unreadable_path WARNs for blocked.crt, want 1; log = %q", len(warns), logs.Messages())
+	}
+	if !mentions(&warns[0], "replace it with a regular file") {
+		t.Errorf("the WARN for blocked.crt does not tell the operator to replace it with a regular file")
+	}
+	if got := conditionCount(logs, slog.LevelDebug, condUnreadablePath, "blocked.crt"); got != 1 {
+		t.Errorf("the second scan logged %d unreadable_path Debug records for blocked.crt, want 1", got)
 	}
 }

@@ -17,7 +17,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/testcerts"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 	"software.sslmate.com/src/go-pkcs12"
 )
 
@@ -193,9 +193,8 @@ func TestScannerRun_flatCollisionConvertsNeitherAndNamesBoth(t *testing.T) {
 	}
 }
 
-// collisionMsgPublished is the exact production record; retyped here so a reword
-// of the ERROR line fails this test instead of silently unpinning the published
-// CertConverterOutputNameCollision alert.
+// collisionMsgPublished is the exact production record, retyped here so a reword
+// of the ERROR line is a deliberate change.
 const collisionMsgPublished = "output name collision: several inputs produce the same output path, so none of them is converted"
 
 func TestScannerRun_syncRemovesEveryArtifactOfGoneSource(t *testing.T) {
@@ -331,7 +330,7 @@ func assertOnlyRegularFiles(t *testing.T, root string, want []string) {
 		if err != nil {
 			return err
 		}
-		if path == root || d.IsDir() {
+		if path == root || d.IsDir() || d.Name() == ".cert-converter-claims.json" {
 			return nil
 		}
 		rel, err := filepath.Rel(root, path)

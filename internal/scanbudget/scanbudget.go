@@ -9,13 +9,9 @@ const Default = 10_000
 // Ceiling is the highest MAX_SCAN_ENTRIES this app accepts before clamping.
 const Ceiling = 200_000
 
-// alertedPhrase is the substring alerts/logql.yaml uses as CertConverterInputTreeTooLarge's whole
-// matcher.
-const alertedPhrase = "holds more entries than one scan will enumerate"
-
 // InputTreeTooLarge is the leading clause every /input budget-stop message opens with; each walk
 // appends what IT stopped doing.
-const InputTreeTooLarge = "the /input tree " + alertedPhrase
+const InputTreeTooLarge = "the /input tree holds more entries than one scan will enumerate"
 
 // InputRemediation is the operator action for an /input budget stop, naming both ways out —
 // a mount pointed at the wrong tree, or a legitimately large certificate directory — and

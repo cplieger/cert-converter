@@ -4,7 +4,7 @@ This page covers what cert-converter exposes, how it treats the files it reads, 
 
 ## What it exposes
 
-cert-converter reads certificate sources from one mounted folder and writes converted files to another. It has no network listener and no open port, so there is nothing to expose or firewall. It runs as a non-root user on a distroless base with no shell or package manager. Keep the `/input` mount read-only, as the quick start does.
+cert-converter reads certificate sources from one mounted folder and writes converted files to another. It has no network listener unless `METRICS_LISTEN_ADDR` is set. That listener serves only `/metrics` and `/healthz`, has no login, and belongs on a private network. It runs as a non-root user on a distroless base with no shell or package manager. Keep the `/input` mount read-only, as the quick start does.
 
 ## How it reads input
 
@@ -36,15 +36,9 @@ Add these lines to the quick start service. [Hardening a compose file](https://g
       - ALL
     security_opt:
       - no-new-privileges:true
-    tmpfs:
-      - "/tmp:size=1m,mode=1777,noexec,nosuid,nodev"
 ```
 
-With `read_only: true`, the health marker still needs a writable `/tmp`, and the tmpfs supplies it. One megabyte is ample, because the marker is the only thing cert-converter writes outside `/output`.
-
-## Accepted scanner finding
-
-semgrep flags the fixed `/tmp/.healthy` marker path as a predictable temporary file. It is a contract between the main process and the `health` probe inside the container's own filesystem, not shared state an attacker can create first. Live scan results are on the repository's Security tab.
+With `read_only: true`, cert-converter writes to two places. Converted files go to the `/output` mount. The health file goes to `/dev/shm`, which stays writable under a read-only root, so no tmpfs is needed. If `/dev/shm` cannot be written, as under `ipc: none`, the healthcheck passes and the startup log says so, while `/healthz` on the metrics listener still gives the true answer.
 
 ## What the image contains
 
@@ -52,7 +46,7 @@ The final image is `gcr.io/distroless/static-debian13:nonroot` with one static G
 
 - [software.sslmate.com/src/go-pkcs12](https://pkg.go.dev/software.sslmate.com/src/go-pkcs12)
 - [github.com/fsnotify/fsnotify](https://github.com/fsnotify/fsnotify)
-- [github.com/cplieger/atomicfile](https://github.com/cplieger/atomicfile), [envx](https://github.com/cplieger/envx), [health](https://github.com/cplieger/health), [runesafe](https://github.com/cplieger/runesafe), [slogx](https://github.com/cplieger/slogx) and [pathinside](https://github.com/cplieger/pathinside)
+- [github.com/cplieger/go/filesafe](https://github.com/cplieger/go/tree/main/filesafe), [envx](https://github.com/cplieger/go/tree/main/envx), [health](https://github.com/cplieger/go/tree/main/health), [httpserver](https://github.com/cplieger/go/tree/main/httpserver), [measure](https://github.com/cplieger/go/tree/main/measure), [textsafe](https://github.com/cplieger/go/tree/main/textsafe), [slogx](https://github.com/cplieger/go/tree/main/slogx) and [pathinside](https://github.com/cplieger/go/tree/main/pathinside)
 - [golang.org/x/crypto](https://pkg.go.dev/golang.org/x/crypto) and [golang.org/x/sys](https://pkg.go.dev/golang.org/x/sys)
 
 The license text of every bundled component is in the image under `/usr/share/licenses/`. Dependencies are updated automatically by [Renovate](https://github.com/renovatebot/renovate), and the base images are pinned by digest. Each image carries a signed SBOM and the build provenance Docker records. [Reading the software bill of materials](https://github.com/cplieger/docs/blob/main/docs/images.md#reading-the-software-bill-of-materials) and [Checking with the GitHub CLI](https://github.com/cplieger/docs/blob/main/docs/images.md#checking-with-the-github-cli) show how to check the SBOM.

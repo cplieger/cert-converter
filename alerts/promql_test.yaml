@@ -1,0 +1,438 @@
+# promtool test rules alerts/promql_test.yaml
+rule_files:
+  - promql.yaml
+
+evaluation_interval: 1m
+
+tests:
+  - name: a failing scrape pages after 5m and keeps the target's labels
+    interval: 1m
+    input_series:
+      - series: 'up{job="cert-converter", instance="cc:9468"}'
+        values: "1 0x10"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CertConverterDown
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: CertConverterDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: cert-converter
+              instance: cc:9468
+            exp_annotations:
+              summary: "cert-converter is not being scraped"
+              description: "No successful scrape for 5m: the container is stopped, crash-looping or refusing to start, or the scrape cannot reach METRICS_LISTEN_ADDR. Check the container's state and its last ERROR line.\n"
+
+  - name: a target that is gone pages through the absent arm
+    interval: 1m
+    input_series:
+      - series: 'up{job="other", instance="x:1"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CertConverterDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: cert-converter
+            exp_annotations:
+              summary: "cert-converter is not being scraped"
+              description: "No successful scrape for 5m: the container is stopped, crash-looping or refusing to start, or the scrape cannot reach METRICS_LISTEN_ADDR. Check the container's state and its last ERROR line.\n"
+
+  - name: CertConverterConversionFailed holds while the last scan reports failed sources and clears at the next clean scan
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_last_scan_sources{outcome="failed", job="cert-converter", instance="cc:9468"}'
+        values: "0 2x5 0x5"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CertConverterConversionFailed
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CertConverterConversionFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+              outcome: failed
+            exp_annotations:
+              summary: "cert-converter failed to convert a certificate"
+              description: "The latest scan could not convert a source, so its output is stale or missing and the container is unhealthy. The `conversion failed` records name the file. Check ownership for the UID in `user:`, the PFX password and the chain.\n"
+      - eval_time: 8m
+        alertname: CertConverterConversionFailed
+        exp_alerts: []
+
+  - name: CertConverterOutputNameCollision holds while the last scan reports collided sources and clears at the next clean scan
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_last_scan_sources{outcome="collided", job="cert-converter", instance="cc:9468"}'
+        values: "0 2x5 0x5"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CertConverterOutputNameCollision
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CertConverterOutputNameCollision
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+              outcome: collided
+            exp_annotations:
+              summary: "Two cert-converter inputs claim one output name, so neither converts"
+              description: "Two inputs map to the same flat output path, so none of them converts and the container is unhealthy. The `output name collision` record names the path. Rename one input directory, or set OUTPUT_LAYOUT=mirror.\n"
+      - eval_time: 8m
+        alertname: CertConverterOutputNameCollision
+        exp_alerts: []
+
+  - name: CertConverterOutputWriteRefused holds while the last scan reports unwritable sources and clears at the next clean scan
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_last_scan_sources{outcome="unwritable", job="cert-converter", instance="cc:9468"}'
+        values: "0 2x5 0x5"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CertConverterOutputWriteRefused
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CertConverterOutputWriteRefused
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+              outcome: unwritable
+            exp_annotations:
+              summary: "cert-converter could not replace an output and left it as found"
+              description: "An /output condition refused a write, so a consumer can keep reading a stale file. Health is unaffected, so this alert is the only signal. The log record's `remediation` field names the action.\n"
+      - eval_time: 8m
+        alertname: CertConverterOutputWriteRefused
+        exp_alerts: []
+
+  - name: CertConverterScanAborted holds while the last scan ended aborted
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_last_scan_outcome{outcome="aborted", job="cert-converter", instance="cc:9468"}'
+        values: "0 1x5 0x5"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CertConverterScanAborted
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CertConverterScanAborted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+              outcome: aborted
+            exp_annotations:
+              summary: "cert-converter aborted a scan before completion"
+              description: "The latest scan ended early, usually because /input or /output could not be opened or walked, and the container is unhealthy. The `scan complete` record's `error` field names the cause.\n"
+      - eval_time: 8m
+        alertname: CertConverterScanAborted
+        exp_alerts: []
+
+  - name: CertConverterInputTreeTooLarge holds while the last scan ended budget_stopped
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_last_scan_outcome{outcome="budget_stopped", job="cert-converter", instance="cc:9468"}'
+        values: "0 1x5 0x5"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CertConverterInputTreeTooLarge
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CertConverterInputTreeTooLarge
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+              outcome: budget_stopped
+            exp_annotations:
+              summary: "cert-converter stopped a scan at the /input entry budget"
+              description: "The scan stopped at MAX_SCAN_ENTRIES, so every source past that point is unconverted. Health is unaffected. Check that /input holds only certificates. For a larger tree, raise MAX_SCAN_ENTRIES and the memory limit together.\n"
+      - eval_time: 8m
+        alertname: CertConverterInputTreeTooLarge
+        exp_alerts: []
+
+  - name: CertConverterChangeDetectionDegraded holds while scans run in poll mode
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_change_detection_mode{mode="poll", job="cert-converter", instance="cc:9468"}'
+        values: "0 1x5 0x5"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CertConverterChangeDetectionDegraded
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CertConverterChangeDetectionDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+              mode: poll
+            exp_annotations:
+              summary: "cert-converter is polling instead of watching for changes"
+              description: "No file watch could be set up, so a renewal waits for the next rescan every FALLBACK_SCAN_HOURS. The alert holds while polling lasts. Exhausted inotify instances on the host are the usual cause.\n"
+      - eval_time: 8m
+        alertname: CertConverterChangeDetectionDegraded
+        exp_alerts: []
+
+  - name: CertConverterInputPathUnreachable sums unreadable paths and unresolved symlinks
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_last_scan_sources{outcome="unreadable", job="cert-converter", instance="cc:9468"}'
+        values: "0 0x5 0x5"
+      - series: 'cert_converter_last_scan_sources{outcome="unresolved", job="cert-converter", instance="cc:9468"}'
+        values: "0 1x5 0x5"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CertConverterInputPathUnreachable
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CertConverterInputPathUnreachable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+            exp_annotations:
+              summary: "cert-converter skipped an unreachable /input path"
+              description: "An /input path could not be read or a symlink could not be resolved, so its certificates were skipped. Health is unaffected unless a skipped source already had a conversion failure, which keeps the container unhealthy. Fix permissions for the UID in `user:`, and mount the certificate directory instead of a symlink to it.\n"
+      - eval_time: 8m
+        alertname: CertConverterInputPathUnreachable
+        exp_alerts: []
+
+  - name: CertConverterNoCertificateSources holds while the condition gauge is 1
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_condition{condition="no_sources", job="cert-converter", instance="cc:9468"}'
+        values: "0 1x5 0x5"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CertConverterNoCertificateSources
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CertConverterNoCertificateSources
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+              condition: no_sources
+            exp_annotations:
+              summary: "cert-converter found no certificate sources under /input"
+              description: "A complete scan found no `.crt` and `.key` pair and no PFX or P12 bundle, so nothing is produced. Health is unaffected. Check the /input mount and the source file names.\n"
+      - eval_time: 8m
+        alertname: CertConverterNoCertificateSources
+        exp_alerts: []
+
+  - name: CertConverterEverySourceExcluded holds while the condition gauge is 1
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_condition{condition="all_excluded", job="cert-converter", instance="cc:9468"}'
+        values: "0 1x5 0x5"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CertConverterEverySourceExcluded
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CertConverterEverySourceExcluded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+              condition: all_excluded
+            exp_annotations:
+              summary: "cert-converter excluded every certificate source it found"
+              description: "INPUT_EXCLUDE_PATHS covers every source under /input, so the scan converted nothing and reported no failure. Narrow the exclusion list, or point /input at the certificates you want.\n"
+      - eval_time: 8m
+        alertname: CertConverterEverySourceExcluded
+        exp_alerts: []
+
+  - name: CertConverterOutputCleanupDegraded holds while the condition gauge is 1
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_condition{condition="cleanup_degraded", job="cert-converter", instance="cc:9468"}'
+        values: "0 1x5 0x5"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CertConverterOutputCleanupDegraded
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CertConverterOutputCleanupDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+              condition: cleanup_degraded
+            exp_annotations:
+              summary: "cert-converter cannot clean up stale /output temp files"
+              description: "Leftover `.atomicfile-*.tmp` files under /output, each holding a private key, cannot be removed and will accumulate. Health is unaffected. Check /output ownership and permissions for the UID in `user:`.\n"
+      - eval_time: 8m
+        alertname: CertConverterOutputCleanupDegraded
+        exp_alerts: []
+
+  - name: CertConverterOrphanRemovalDisabled holds while the condition gauge is 1
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_condition{condition="orphan_removal_disabled", job="cert-converter", instance="cc:9468"}'
+        values: "0 1x5 0x5"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CertConverterOrphanRemovalDisabled
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CertConverterOrphanRemovalDisabled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+              condition: orphan_removal_disabled
+            exp_annotations:
+              summary: "cert-converter cannot remove orphaned /output artifacts"
+              description: "The scan could not prove any output orphaned, so it removed nothing, and an output whose source is gone can stay served. Health is unaffected. The `orphan removal is disabled` log record's `remediation` field names the action.\n"
+      - eval_time: 8m
+        alertname: CertConverterOrphanRemovalDisabled
+        exp_alerts: []
+
+  - name: CertConverterPreviousLayoutRetained holds while the condition gauge is 1
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_condition{condition="previous_layout_retained", job="cert-converter", instance="cc:9468"}'
+        values: "0 1x5 0x5"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CertConverterPreviousLayoutRetained
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CertConverterPreviousLayoutRetained
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+              condition: previous_layout_retained
+            exp_annotations:
+              summary: "cert-converter sync is keeping files from a previous OUTPUT_LAYOUT"
+              description: "Sync kept files laid out for the other layout because OUTPUT_LAYOUT is unset. Repoint consumers at the current paths, then set OUTPUT_LAYOUT explicitly or remove the old tree by hand.\n"
+      - eval_time: 8m
+        alertname: CertConverterPreviousLayoutRetained
+        exp_alerts: []
+
+  - name: CertConverterScanStalled fires past the deadline even while failing scans keep ending, and resolves at a healthy scan
+    interval: 1m
+    input_series:
+      # Deadline at 1h, so the arm reads past 1h15m and fires 10m later.
+      - series: 'cert_converter_scan_deadline_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "3600x99 999999x50"
+      - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "60+60x150"
+      - series: 'process_start_time_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "0x150"
+    alert_rule_test:
+      - eval_time: 74m
+        alertname: CertConverterScanStalled
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: CertConverterScanStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+            exp_annotations:
+              summary: "cert-converter scans have stalled"
+              description: "No scan finished healthy by the exported deadline, or, with deadline 0, none finished in 13h. Failing scans cross it too: check other cert-converter alerts first. Otherwise the watch loop is likely wedged: restart the container and check inotify limits.\n"
+      - eval_time: 105m
+        alertname: CertConverterScanStalled
+        exp_alerts: []
+
+  - name: CertConverterScanStalled stays quiet while the deadline is ahead, however old the last scan is
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_scan_deadline_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "360000x900"
+      - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "60x900"
+      - series: 'process_start_time_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "0x900"
+    alert_rule_test:
+      - eval_time: 14h
+        alertname: CertConverterScanStalled
+        exp_alerts: []
+
+  - name: CertConverterScanStalled reads the 13h window while the deadline is 0, and clears at the next scan
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_scan_deadline_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "0x900"
+      - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "60x799 48000x100"
+      - series: 'process_start_time_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "0x900"
+    alert_rule_test:
+      - eval_time: 13h5m
+        alertname: CertConverterScanStalled
+        exp_alerts: []
+      - eval_time: 13h15m
+        alertname: CertConverterScanStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+            exp_annotations:
+              summary: "cert-converter scans have stalled"
+              description: "No scan finished healthy by the exported deadline, or, with deadline 0, none finished in 13h. Failing scans cross it too: check other cert-converter alerts first. Otherwise the watch loop is likely wedged: restart the container and check inotify limits.\n"
+      - eval_time: 13h30m
+        alertname: CertConverterScanStalled
+        exp_alerts: []
+
+  - name: CertConverterScanStalled reads the process age while the deadline is 0 and no scan has ended
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_scan_deadline_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "0x900"
+      - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "0x900"
+      - series: 'process_start_time_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "0x900"
+    alert_rule_test:
+      - eval_time: 12h
+        alertname: CertConverterScanStalled
+        exp_alerts: []
+      - eval_time: 13h15m
+        alertname: CertConverterScanStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: cert-converter
+              instance: cc:9468
+            exp_annotations:
+              summary: "cert-converter scans have stalled"
+              description: "No scan finished healthy by the exported deadline, or, with deadline 0, none finished in 13h. Failing scans cross it too: check other cert-converter alerts first. Otherwise the watch loop is likely wedged: restart the container and check inotify limits.\n"
+
+  - name: CertConverterScanStalled never fires the deadline arm on a deadline of 0, with a scan every 6h
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_scan_deadline_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "0x1100"
+      - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "0 21600+0x359 43200+0x359 64800+0x359"
+      - series: 'process_start_time_seconds{job="cert-converter", instance="cc:9468"}'
+        values: "0x1100"
+    alert_rule_test:
+      - eval_time: 17h
+        alertname: CertConverterScanStalled
+        exp_alerts: []

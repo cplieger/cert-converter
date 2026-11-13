@@ -11,52 +11,8 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/go/slogx/capture"
 )
-
-// TestLogScanOutcome_levels pins the level and message of the end-of-scan
-// summary. The README's Loki alerts key on exactly these: a completed scan must
-// emit "scan complete" at Info (its absence for 8h is the stall alert), a
-// shutdown-cancelled walk must stay at Debug so a normal restart never pages,
-// and any other abort must be a Warn an operator sees.
-func TestLogScanOutcome_levels(t *testing.T) {
-	result := ScanResult{Total: 2, Converted: 1, Unchanged: 1}
-	tests := []struct {
-		walkErr   error
-		name      string
-		wantMsg   string
-		wantLevel slog.Level
-	}{
-		{nil, "completed walk logs scan complete at info", "scan complete", slog.LevelInfo},
-		{context.Canceled, "cancelled walk logs at debug", "scan cancelled during shutdown", slog.LevelDebug},
-		{context.DeadlineExceeded, "deadline exceeded logs at debug", "scan cancelled during shutdown", slog.LevelDebug},
-		{errors.New("permission denied"), "other abort logs at warn", "scan aborted before completion", slog.LevelWarn},
-		{
-			fmt.Errorf("%w: stopped at 3 entries (a.crt)", errScanBudgetExceeded),
-			"entry-budget abort logs its own summary at warn", scanBudgetSummaryMsg, slog.LevelWarn,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			logs := captureLogs(t)
-
-			logScanOutcome(t.Context(), &result, tt.walkErr)
-
-			// CountExact, not a substring: these messages are pinned by the README's
-			// Loki rules, so a superstring must not satisfy them.
-			if got := logs.CountExact(tt.wantMsg); got != 1 {
-				t.Errorf("logScanOutcome(walkErr=%v) logged %q, want message %q", tt.walkErr, logs.Messages(), tt.wantMsg)
-			}
-			if got := logs.CountLevel(tt.wantLevel, tt.wantMsg); got != 1 {
-				t.Errorf("logScanOutcome(walkErr=%v) logged %q at %s %d times, want 1", tt.walkErr, tt.wantMsg, tt.wantLevel, got)
-			}
-			if !logs.HasAttr(tt.wantMsg, "converted", "1") {
-				got, _ := logs.AttrValue(tt.wantMsg, "converted")
-				t.Errorf("logScanOutcome(walkErr=%v) logged converted=%q, want the converted count in the summary", tt.walkErr, got)
-			}
-		})
-	}
-}
 
 // TestFailEntry_levels pins the per-entry failure level split: a failure
 // caused by shutdown stays at Debug, so stopping the container never emits an
@@ -91,7 +47,7 @@ func TestFailEntry_levels(t *testing.T) {
 			if got := logs.CountLevel(tt.wantLevel, tt.wantMsg); got != 1 {
 				t.Errorf("failEntry(%v) logged %q at %s %d times, want 1", tt.err, tt.wantMsg, tt.wantLevel, got)
 			}
-			if !logs.HasAttr(tt.wantMsg, "path", "example.com/tls.crt") {
+			if !logs.HasAttr(capture.Message(tt.wantMsg), "path", "example.com/tls.crt") {
 				t.Errorf("failEntry(%v) logged %q, want the cert's relative path", tt.err, logs.Messages())
 			}
 		})
@@ -174,16 +130,12 @@ func TestReadPair_distinguishes_a_missing_key_from_an_unstattable_one(t *testing
 }
 
 // TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs pins the
-// empty-input notice the README documents (a certbot-style directory of
-// fullchain.pem/privkey.pem "produces no output and logs `no certificate pairs
-// found under the input root`"). A completed scan that visited no .crt is
-// indistinguishable from a healthy steady state in the summary counts -- failed
-// is 0, so the marker stays set and none of the README's Loki rules fire -- so
-// this line is the only signal of a wrong or vanished /input mount. It must fire
-// for exactly that shape: a scan that converted a pair, one whose empty result
-// is already explained by an unreadable sub-path, and an aborted scan must all
-// stay quiet, or the notice becomes noise on every fsnotify event and every
-// fallback tick. Runs serially: it swaps slog.Default().
+// empty-input notice the README documents. A completed scan that visited no .crt
+// looks healthy in the counts (failed is 0, so the marker stays set), so this line
+// and the record's no_sources field are the only signal of a wrong or vanished
+// /input mount. A scan that converted a pair, one whose empty result an unreadable
+// sub-path explains, and an aborted scan must all stay quiet.
+// Runs serially: it swaps slog.Default().
 func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing.T) {
 	const wantMsg = "no certificate sources found under the input root"
 	tests := []struct {
@@ -197,8 +149,8 @@ func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing
 		{nil, "an unreadable sub-path already explains the empty result", ScanResult{Unreadable: 1}, false},
 		// An unresolved input symlink hides part of the tree, so "no certificate
 		// pairs" is not a claim this scan can make. The symlink WARN one flow
-		// earlier already carries the correct diagnosis; repeating it here fires
-		// the README's CertConverterNoCertificateSources alert with the wrong one.
+		// earlier already carries the correct diagnosis; repeating it here gives the
+		// reader the wrong one.
 		{nil, "an unresolved symlink already explains the empty result", ScanResult{Unresolved: 1}, false},
 		{errors.New("permission denied"), "an aborted scan stays quiet", ScanResult{}, false},
 	}
@@ -207,7 +159,7 @@ func TestLogScanOutcome_flags_an_input_tree_with_no_certificate_pairs(t *testing
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), &tt.result, tt.walkErr)
+			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr, tt.walkErr == nil && tt.result.inputFullyEnumerated())
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; empty-input notice present = %v, want %v",
@@ -251,7 +203,7 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_all_lack_a_key(t *testin
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), &tt.result, tt.walkErr)
+			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr, tt.walkErr == nil && tt.result.inputFullyEnumerated())
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; all-orphan notice present = %v, want %v",
@@ -310,8 +262,8 @@ func TestLogConversionObservations_levels(t *testing.T) {
 			// Keyed attributes: the kind must be the `kind` attribute, not text that
 			// happens to appear in the detail or the path.
 			for key, want := range map[string]string{"kind": string(tc.kind), "path": "example.com/tls.crt"} {
-				if !logs.HasAttr(msg, key, want) {
-					got, _ := logs.AttrValue(msg, key)
+				if !logs.HasAttr(msg, capture.AttrName(key), want) {
+					got, _ := logs.AttrValue(msg, capture.AttrName(key))
 					t.Errorf("logConversionObservations(%s) logged %s=%q, want %q", tc.kind, key, got, want)
 				}
 			}
@@ -334,21 +286,12 @@ func TestLogConversionObservations_is_silent_without_observations(t *testing.T) 
 	}
 }
 
-// TestNoteUnreadableInput_levels pins the benign-race half of the unreadable-input
-// notice, which the escaping-symlink tests only exercise from the Warn side. A
-// file that vanished between readdir and the read is a normal renewal race — the
-// next scan converts the replacement — so it stays at Debug, carries no
-// remediation hint, and is classified statusVanished rather than statusUnreadable.
-// Promoting either would put an operator-facing warning, pointing at /input
-// permissions, into the log (or into the alerted unreadable count) every time a
-// certificate is atomically replaced.
-//
-// ENOENT alone does not make it that race, which is the other half pinned here: a
-// symlink that is STILL THERE pointing at a missing target returns the same ENOENT
-// on every scan for as long as it exists, so it is the steady-state arm — Warn, the
-// remediation hint, and the alerted unreadable count — not the transient one. Reading
-// it as a race left such a certificate producing no PFX indefinitely with no
-// default-level signal anywhere. Runs serially: it swaps slog.Default().
+// TestNoteUnreadableInput_levels pins both levels of the unreadable-input notice.
+// A file gone between readdir and the read, or a link whose target went missing
+// after the walk judged it, is the renewal race: Debug, no remediation,
+// statusVanished, or every atomic certificate replacement would warn about /input
+// permissions. A real read failure warns as unreadable_path under the failing
+// path. Runs serially: it swaps slog.Default().
 func TestNoteUnreadableInput_levels(t *testing.T) {
 	const logRel = "example.com/tls.crt"
 	for _, tc := range []struct {
@@ -382,18 +325,23 @@ func TestNoteUnreadableInput_levels(t *testing.T) {
 			wantMsg: "certificate vanished during the scan", wantLevel: slog.LevelDebug, wantStatus: statusVanished,
 		},
 		{
-			err: fs.ErrNotExist, name: "a surviving symlink to a missing target is steady-state, not a race", what: "certificate",
+			err: fs.ErrNotExist, name: "a link that dangles at read time raced the judgement", what: "certificate",
 			inputRel: "tls.crt",
 			setup: func(t *testing.T, dir string) {
 				if err := os.Symlink("never-existed.pem", filepath.Join(dir, "tls.crt")); err != nil {
 					t.Fatal(err)
 				}
 			},
-			wantMsg: "cannot read certificate", wantLevel: slog.LevelWarn, wantStatus: statusUnreadable,
+			wantMsg: "certificate vanished during the scan", wantLevel: slog.LevelDebug, wantStatus: statusVanished,
 		},
 		{
 			err: errors.New("permission denied"), name: "an unreadable certificate warns", what: "certificate",
 			inputRel: "tls.crt", wantMsg: "cannot read certificate",
+			wantLevel: slog.LevelWarn, wantStatus: statusUnreadable,
+		},
+		{
+			err: errors.New("permission denied"), name: "an unreadable key warns under the key's path", what: "private key",
+			inputRel: "example.com/tls.key", wantMsg: "cannot read private key",
 			wantLevel: slog.LevelWarn, wantStatus: statusUnreadable,
 		},
 		{
@@ -422,57 +370,25 @@ func TestNoteUnreadableInput_levels(t *testing.T) {
 			if got := logs.CountLevel(tc.wantLevel, tc.wantMsg); got != 1 {
 				t.Fatalf("noteUnreadableInput(%v) logged %q, want %q at %s", tc.err, logs.Messages(), tc.wantMsg, tc.wantLevel)
 			}
-			if !logs.HasAttr(tc.wantMsg, "path", logRel) {
+			if tc.wantLevel == slog.LevelWarn {
+				// The standing condition's subject is the unreadable path, and its
+				// clear names that path, so the onset names it too.
+				if !logs.HasAttr(capture.Message(tc.wantMsg), "condition", condUnreadablePath) ||
+					!logs.HasAttr(capture.Message(tc.wantMsg), "path", tc.inputRel) ||
+					!logs.HasAttr(capture.Message(tc.wantMsg), "source", logRel) {
+					t.Errorf("noteUnreadableInput(%v) logged %q, want condition %s, path %s and source %s",
+						tc.err, logs.Messages(), condUnreadablePath, tc.inputRel, logRel)
+				}
+			} else if !logs.HasAttr(capture.Message(tc.wantMsg), "path", logRel) {
 				t.Errorf("noteUnreadableInput(%v) logged %q, want the cert's relative path", tc.err, logs.Messages())
 			}
 			// The remediation hint belongs to the actionable arm only: on the benign
 			// race there is nothing for the operator to do.
-			_, hasHint := logs.AttrValue(tc.wantMsg, "remediation")
+			_, hasHint := logs.AttrValue(capture.Message(tc.wantMsg), "remediation")
 			if wantHint := tc.wantLevel == slog.LevelWarn; hasHint != wantHint {
 				t.Errorf("noteUnreadableInput(%v) remediation hint present = %v, want %v: %q", tc.err, hasHint, wantHint, logs.Messages())
 			}
 		})
-	}
-}
-
-// TestNoteUnreadableInput_names_the_published_unreachable_prefix pins the exact substring
-// the README publishes as one of CertConverterInputPathUnreachable's four matchers,
-// `skipping cert: cannot read`.
-//
-// The table above asserts the SUFFIX only ("cannot read certificate"), and every other
-// assertion in this package compares a captured record against the production string
-// itself -- so rewording the emitted message (to "cannot read the certificate for cert",
-// say) keeps the whole suite green while the documented alert stops matching and an
-// operator whose /input has become unreadable is never paged. The rule's other three
-// matchers are each spelled out literally somewhere in the suite; this was the one that
-// was not.
-//
-// Both `what` values are driven because the message is composed at the call site
-// ("skipping cert: cannot read " + what) rather than held as a const, so the prefix is not
-// pinned by any single string.
-// Runs serially: it swaps slog.Default().
-func TestNoteUnreadableInput_names_the_published_unreachable_prefix(t *testing.T) {
-	const published = "skipping cert: cannot read"
-
-	root, err := os.OpenRoot(t.TempDir())
-	if err != nil {
-		t.Fatalf("setup: os.OpenRoot: %v", err)
-	}
-	t.Cleanup(func() { _ = root.Close() })
-	sw := &scanWalk{src: &source{root: root}}
-
-	for _, what := range []string{"certificate", "private key"} {
-		logs := captureLogs(t)
-		if got := sw.noteUnreadableInput("example.com/tls.crt", "tls.crt", what,
-			errors.New("permission denied")); got != statusUnreadable {
-			t.Fatalf("noteUnreadableInput(%s, permission denied) = %v, want statusUnreadable", what, got)
-		}
-		if got := logs.CountLevel(slog.LevelWarn, published); got != 1 {
-			t.Errorf("noteUnreadableInput(%s, permission denied) logged %q at WARN %d times, want exactly"+
-				" 1: the README publishes that substring as CertConverterInputPathUnreachable's matcher,"+
-				" so rewording it silently stops the documented alert from ever firing again: %q",
-				what, published, got, logs.Messages())
-		}
 	}
 }
 
@@ -533,7 +449,7 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key(t *
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), &tt.result, tt.walkErr)
+			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr, tt.walkErr == nil && tt.result.inputFullyEnumerated())
 
 			if got := logs.Contains(wantMsg); got != tt.wantWarn {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; partial-orphan notice present = %v, want %v",
@@ -553,49 +469,11 @@ func TestLogScanOutcome_flags_an_input_tree_whose_certs_partially_lack_a_key(t *
 	}
 }
 
-// TestLogScanOutcome_names_the_unresolved_symlink_count pins the summary's
-// unresolved attribute. It is the ONLY aggregate trace of an input symlink the
-// confined root could not resolve: the count is carried as its own ScanResult
-// field, never folded into Unreadable, so without naming it here the summary
-// reports an all-zero, apparently healthy scan while an unresolvable link hid an
-// entire certificate subtree. Runs serially: it swaps slog.Default().
-func TestLogScanOutcome_names_the_unresolved_symlink_count(t *testing.T) {
-	logs := captureLogs(t)
-
-	logScanOutcome(t.Context(), &ScanResult{Total: 1, Converted: 1, Unresolved: 2}, nil)
-
-	if !logs.HasAttr("scan complete", "unresolved", "2") {
-		got, _ := logs.AttrValue("scan complete", "unresolved")
-		t.Errorf("logScanOutcome(unresolved=2) logged unresolved=%q, want the unresolved-symlink count in the summary", got)
-	}
-}
-
-// TestLogScanOutcome_names_the_vanished_count pins the summary's vanished
-// attribute. A cert replaced between readdir and the bounded read is counted in its
-// own ScanResult field, deliberately never folded into Unreadable, so this attribute
-// is the only aggregate trace that a scan ran while /input was being rewritten.
-// Runs serially: it swaps slog.Default().
-func TestLogScanOutcome_names_the_vanished_count(t *testing.T) {
-	logs := captureLogs(t)
-
-	logScanOutcome(t.Context(), &ScanResult{Total: 1, Vanished: 1}, nil)
-
-	if !logs.HasAttr("scan complete", "vanished", "1") {
-		got, _ := logs.AttrValue("scan complete", "vanished")
-		t.Errorf("logScanOutcome(vanished=1) logged vanished=%q, want the renewal-race count in the summary", got)
-	}
-}
-
-// TestScannerRun_an_unopenable_root_emits_the_scan_outcome_record pins the RECORD side
-// of the two pre-walk hard errors, which nothing else in the suite reaches: an /input
-// or /output root that cannot be opened at all must still emit the end-of-scan summary
-// the README's CertConverterScanAborted rule matches, not only return an error to
-// main. That is the whole reason both returns route through failScan rather than
-// returning directly, and it is the one failure class that stops every renewal, so
-// without this the wrapper can be dropped again with the suite green and the
-// documented alert silent. Runs serially: it swaps slog.Default().
-func TestScannerRun_an_unopenable_root_emits_the_scan_outcome_record(t *testing.T) {
-	const aborted = "scan aborted before completion"
+// TestScannerRun_an_unopenable_root_reports_an_aborted_scan pins the verdict of the
+// two pre-walk hard errors: an /input or /output root that cannot be opened stops every
+// renewal, so Run must report it as an aborted scan, not only return an error.
+func TestScannerRun_an_unopenable_root_reports_an_aborted_scan(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name      string
 		breakCert bool
@@ -604,24 +482,23 @@ func TestScannerRun_an_unopenable_root_emits_the_scan_outcome_record(t *testing.
 		{name: "output root", breakCert: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			certsRoot, outRoot := t.TempDir(), t.TempDir()
 			if tc.breakCert {
 				certsRoot = filepath.Join(certsRoot, "never-created")
 			} else {
 				outRoot = filepath.Join(outRoot, "never-created")
 			}
-			logs := captureLogs(t)
-
 			scanner := New(&Options{
 				CertsRoot: certsRoot, OutRoot: outRoot,
 				Password: "pw", Encoder: convert.EncNameModern2023,
 			})
-			if _, err := scanner.Run(t.Context()); err == nil {
+			res, err := scanner.Run(t.Context())
+			if err == nil {
 				t.Fatalf("Run(unopenable %s) = nil error, want a hard error so health flips", tc.name)
 			}
-			if got := logs.CountLevel(slog.LevelWarn, aborted); got != 1 {
-				t.Errorf("Run(unopenable %s) logged %q, want exactly one WARN %q: the documented scan-aborted alert never fires otherwise",
-					tc.name, logs.Messages(), aborted)
+			if res.Outcome != OutcomeAborted {
+				t.Errorf("Run(unopenable %s) Outcome = %v, want aborted: the scan-aborted alert reads it", tc.name, res.Outcome)
 			}
 		})
 	}
@@ -705,7 +582,7 @@ func TestLogScanOutcome_reports_observed_per_path_counts_when_the_entry_budget_s
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureLogs(t)
 
-			logScanOutcome(t.Context(), &tt.result, tt.walkErr)
+			logInputCoverageWarnings(newStanding(), &tt.result, tt.walkErr, tt.walkErr == nil && tt.result.inputFullyEnumerated())
 
 			if got := logs.Contains(unreadableMsg); got != tt.wantUnreadable {
 				t.Errorf("logScanOutcome(%+v, %v) logged %q; unreadable notice present = %v, want %v",

@@ -10,11 +10,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/cplieger/cert-converter/internal/logtext"
-	"github.com/cplieger/runesafe/v3"
+	"github.com/cplieger/go/textsafe"
 )
 
-// TestBoundLogText_applies_the_runesafe_single_line_policy pins the policy
-// boundLogText now delegates to (runesafe.SanitizeSingleLine): each unsafe rune
+// TestBoundLogText_applies_the_textsafe_single_line_policy pins the policy
+// boundLogText now delegates to (textsafe.SanitizeSingleLine): each unsafe rune
 // becomes a SPACE, invalid UTF-8 becomes U+FFFD, and legitimate text — including
 // non-ASCII letters — is untouched. Exact expected values rather than
 // "must not contain", because the replacement rune is part of the contract: a
@@ -35,7 +35,7 @@ import (
 // certificate subject in a real deployment. Exact equality against a want that is
 // valid UTF-8 and carries no truncation marker states both of those as part of the
 // expected value, so no separate assertion is needed for either.
-func TestBoundLogText_applies_the_runesafe_single_line_policy(t *testing.T) {
+func TestBoundLogText_applies_the_textsafe_single_line_policy(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct {
@@ -82,7 +82,7 @@ func TestBoundLogText_applies_the_runesafe_single_line_policy(t *testing.T) {
 // marked, and left as valid UTF-8 even when the cut lands mid-rune.
 //
 // The TOTAL bound is the assertion that changed when boundLogText stopped composing
-// its own cap-and-mark and took runesafe's caller-marker primitive: the marker is now
+// its own cap-and-mark and took textsafe's caller-marker primitive: the marker is now
 // charged AGAINST the limit, so the result never exceeds maxSubjectLogLen at all,
 // where it used to run to the limit PLUS the marker. Asserting the tighter bound is
 // what makes the new contract a contract rather than an accident.
@@ -106,7 +106,7 @@ func TestBoundLogText_bounds_and_marks(t *testing.T) {
 }
 
 // TestBoundLogText_is_the_library_primitive_with_this_apps_marker pins that
-// boundLogText adds NOTHING to runesafe.SanitizeSingleLineBudgeted except this app's
+// boundLogText adds NOTHING to textsafe.SanitizeSingleLineCapped except this app's
 // marker and limit. Comparing against the library's own output is the assertion,
 // rather than re-deriving the sanitize-cap-mark rule the production code just
 // delegated: a reintroduced local composition — a second cap, a marker appended
@@ -131,20 +131,19 @@ func TestBoundLogText_is_the_library_primitive_with_this_apps_marker(t *testing.
 		"a subject one byte over":                {in: strings.Repeat("a", maxSubjectLogLen+1), wantCut: true},
 		"multi-byte runes cut mid-rune":          {in: strings.Repeat("\u2603", 4000), wantCut: true},
 		"invalid bytes that GROW past the limit": {in: strings.Repeat("\xff", 200), wantCut: true},
-		// THE input class on which the two library primitives diverge, and the reason
-		// this app is on the work-bounding one (user-ratified 2026-08): 86 unsafe runes
-		// are 258 raw bytes that collapse to 86 sanitized. Capped sanitized all 258 first
-		// and returned the 86 whole and unmarked; Budgeted pre-caps the RAW bytes at the
-		// limit, so this is cut and marked. The whole point of the swap is that the work
-		// is bounded by the limit and not by the input, so wantCut is true BY DESIGN here
-		// — if it ever reads false again, boundLogText went back to Capped.
+		// THE input class that tells a cap-first primitive from a sanitize-first one:
+		// 86 unsafe runes are 258 raw bytes that collapse to 86 sanitized. A
+		// sanitize-first cap returns the 86 whole and unmarked; the cap-first
+		// primitive this app uses cuts the RAW bytes at the limit, so this is cut and
+		// marked. The work is bounded by the limit and not by the input, so wantCut is
+		// true BY DESIGN here: if it ever reads false, boundLogText caps after sanitizing.
 		"unsafe runes that SHRINK under the limit": {in: strings.Repeat("\u202e", 86), wantCut: true},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			wantText, wantCut := runesafe.SanitizeSingleLineBudgeted(tc.in, maxSubjectLogLen, logtext.Marker)
+			wantText, wantCut := textsafe.SanitizeSingleLineCapped(tc.in, maxSubjectLogLen, logtext.Marker)
 			got := boundLogText(tc.in, maxSubjectLogLen)
 
 			if got != wantText {
@@ -152,7 +151,7 @@ func TestBoundLogText_is_the_library_primitive_with_this_apps_marker(t *testing.
 					len(tc.in), got, wantText)
 			}
 			if wantCut != tc.wantCut {
-				t.Errorf("runesafe reported cut = %v for %s, want %v: the fixture no longer exercises what it claims",
+				t.Errorf("textsafe reported cut = %v for %s, want %v: the fixture no longer exercises what it claims",
 					wantCut, name, tc.wantCut)
 			}
 			if marked := strings.HasSuffix(got, logtext.Marker); marked != tc.wantCut {

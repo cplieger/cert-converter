@@ -173,12 +173,9 @@ func ArtifactsFor(outStem string, f outputpolicy.Formats) []string {
 // app's to convert. A member is a root-relative path naming either one file or
 // one directory; a directory covers everything beneath it.
 //
-// An excluded path is NOT the same as an absent one, and not the same as an
-// unreadable one. The scan still enumerates it and still registers the
-// artifacts it would produce, so orphan reconciliation keeps protecting those
-// artifacts; only the conversion is skipped. That is what stops a mistyped
-// exclusion from turning into a deletion, since nothing else guards a partial
-// exclusion the way the empty-tree veto guards a wrong mount.
+// An excluded path is enumerated and counted but never read, decoded or
+// written, and it registers no artifact: what it produced earlier is an orphan
+// candidate, which only OUTPUT_LIFECYCLE=sync removes.
 type ExcludeSet struct {
 	paths []string
 }

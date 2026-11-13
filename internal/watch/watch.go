@@ -12,11 +12,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cplieger/atomicfile/v4"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/cert-converter/internal/scancadence"
+	"github.com/cplieger/go/filesafe"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -64,6 +64,9 @@ var (
 
 // --- Watcher construction and options ---
 
+// modeClock is indirected so a test can move how long polling lasted.
+var modeClock = time.Now
+
 // newFSWatcher is the fsnotify construction seam.
 var newFSWatcher = fsnotify.NewWatcher
 
@@ -77,7 +80,13 @@ var removeWatch = func(watcher *fsnotify.Watcher, path string) error {
 
 // Watcher monitors a directory tree for cert/key changes and invokes a callback.
 type Watcher struct {
-	onChange func(ctx context.Context)
+	// pollingSince is when change detection last entered poll mode, so the
+	// record that leaves it says how long polling lasted.
+	pollingSince time.Time
+
+	// onChange runs one scan; polling is true while change detection is in poll
+	// mode, so the scan's record names the mode it ran in.
+	onChange func(ctx context.Context, polling bool)
 
 	// watched mirrors the fsnotify registration set, so membership is a map
 	// lookup rather than a scan of fsnotify's own list (see watchSetHas).
@@ -151,11 +160,11 @@ const (
 	modeStartup detectionMode = "startup" // previous_mode only, never mode
 )
 
-// level maps a mode to the level its records are emitted at, and is the single
-// home of the rule that gives the degradation a recurring signal at
-// LOG_LEVEL=warn: poll mode is a STANDING degradation, so its records are WARNs,
-// while watch mode is the intended state and reports at Info.
-func (m detectionMode) level() slog.Level {
+// entryLevel is the level of the record that enters mode: entering poll mode is
+// the start of a standing degradation, so a reader at LOG_LEVEL=warn sees it,
+// while watch mode is the intended state. The per-scan records stay at INFO and
+// the end-of-scan record carries the mode.
+func (m detectionMode) entryLevel() slog.Level {
 	if m == modePoll {
 		return slog.LevelWarn
 	}
@@ -186,18 +195,25 @@ const (
 // mode, coming from previous.
 func (w *Watcher) logModeEntry(ctx context.Context, mode, previous detectionMode, msg string, extra ...any) {
 	attrs := w.coverageAttrs("mode", string(mode), "previous_mode", string(previous))
-	slog.Log(ctx, mode.level(), msg, append(attrs, extra...)...)
+	switch {
+	case mode == modePoll:
+		w.pollingSince = modeClock()
+	case previous == modePoll && !w.pollingSince.IsZero():
+		attrs = append(attrs, "polled_for", modeClock().Sub(w.pollingSince).Round(time.Second).String())
+	}
+	slog.Log(ctx, mode.entryLevel(), msg, append(attrs, extra...)...)
 }
 
-// logScanState emits the ONE state record every scan carries, naming the mode
-// that is live as the scan runs.
-func (w *Watcher) logScanState(ctx context.Context, mode detectionMode, trigger string, extra ...any) {
+// scan emits the ONE state record every scan carries, naming the mode that is
+// live as the scan runs, then runs the scan in that mode.
+func (w *Watcher) scan(ctx context.Context, mode detectionMode, trigger string, extra ...any) {
 	attrs := w.coverageAttrs("mode", string(mode), "trigger", trigger)
-	slog.Log(ctx, mode.level(), msgScanState, append(attrs, extra...)...)
+	slog.Log(ctx, slog.LevelInfo, msgScanState, append(attrs, extra...)...)
+	w.onChange(ctx, mode == modePoll)
 }
 
 // New creates a Watcher for the given root directory.
-func New(root string, onChange func(ctx context.Context), opts ...Option) *Watcher {
+func New(root string, onChange func(ctx context.Context, polling bool), opts ...Option) *Watcher {
 	// Cleaned here so the field can only ever hold a canonical path: the
 	// root-vs-descendant severity policy (handleWatchAddError, classifyWatchEntry,
 	// validateWatchRootEntry) is raw string equality against it, and a trailing
@@ -340,8 +356,7 @@ func (w *Watcher) scanThenWatch(ctx context.Context, watcher *fsnotify.Watcher) 
 	if ctx.Err() != nil {
 		return nil
 	}
-	w.logScanState(ctx, modeWatch, triggerAttach)
-	w.onChange(ctx)
+	w.scan(ctx, modeWatch, triggerAttach)
 	return w.watchLoop(ctx, watcher)
 }
 
@@ -397,13 +412,13 @@ func (w *Watcher) walkWatchDirs(ctx context.Context, root string, register func(
 	// (scanbudget.Default when nothing was configured): an unbounded walk is not an
 	// option, because the tree it enumerates is one this app does not own.
 	budget := scanbudget.NewCounter(w.maxEntries)
-	// atomicfile owns the traversal mechanics, exactly as internal/process's two
+	// filesafe owns the traversal mechanics, exactly as internal/process's two
 	// walks over the same trees do: fixed 256-entry ReadDir batches, so
 	// MAX_SCAN_ENTRIES bounds this walk's MEMORY and not only its entry count; one
 	// directory handle open at a time; and O_DIRECTORY|O_NONBLOCK, so a directory
 	// replaced by a FIFO between the readdir that classified it and the descent is
 	// refused with ENOTDIR instead of blocking this goroutine in open(2) forever.
-	return atomicfile.WalkDirInRoot(ctx, handle, func(rel string, d fs.DirEntry, walkErr error) error {
+	return filesafe.WalkDirInRoot(ctx, handle, func(rel string, d fs.DirEntry, walkErr error) error {
 		// fsnotify registers a PATHNAME, not a directory handle (see addWatchDirs),
 		// so the ambient name is rebuilt for the registration and the diagnostics;
 		// the enumeration itself no longer constructs one.
@@ -416,7 +431,7 @@ func (w *Watcher) walkWatchDirs(ctx context.Context, root string, register func(
 			w.warnWatchBudget(root, &budget)
 			return fs.SkipAll
 		}
-		// d is nil on this walk's error arm (atomicfile reports a directory it could
+		// d is nil on this walk's error arm (filesafe reports a directory it could
 		// not open or finish for that directory's OWN path with d nil).
 		ok, err := w.classifyWatchEntry(root, path, d, walkErr)
 		if err != nil || !ok {
@@ -1010,15 +1025,13 @@ func (st *watchState) runDebouncedScan(ctx context.Context, watcher *fsnotify.Wa
 	if ctx.Err() != nil {
 		return
 	}
-	st.w.logScanState(ctx, modeWatch, triggerEvent)
-	st.w.onChange(ctx)
+	st.w.scan(ctx, modeWatch, triggerEvent)
 	st.safetyNetTimer.Reset(scancadence.Effective(st.w.fallback))
 }
 
 // runSafetyNetScan fires the periodic safety-net rescan and re-arms its timer.
 func (st *watchState) runSafetyNetScan(ctx context.Context) {
-	st.w.logScanState(ctx, modeWatch, st.w.safetyNetTrigger())
-	st.w.onChange(ctx)
+	st.w.scan(ctx, modeWatch, st.w.safetyNetTrigger())
 	st.safetyNetTimer.Reset(scancadence.Effective(st.w.fallback))
 }
 
@@ -1049,14 +1062,13 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) (upgraded *fsnotify.W
 	if ctx.Err() != nil {
 		return nil, nil
 	}
-	w.logScanState(ctx, modePoll, triggerStartup)
-	w.onChange(ctx)
+	w.scan(ctx, modePoll, triggerStartup)
 
 	if w.fallback <= 0 {
 		// Shutdown that arrived during the initial scan above is a clean stop, not
 		// lost change detection: returning a *LostError here would make main log
-		// "change detection is dead" and exit 1 on a normal SIGTERM, firing the
-		// CertConverterChangeDetectionDead critical alert for a graceful stop.
+		// "change detection is dead" and exit 1 on a normal SIGTERM, telling the
+		// reader a graceful stop was a failure.
 		if ctx.Err() != nil {
 			return nil, nil
 		}
@@ -1106,14 +1118,12 @@ func (w *Watcher) pollTick(ctx context.Context) (upgraded *fsnotify.Watcher, sto
 	case stageStopped:
 		return nil, true // shutdown interrupted the upgrade attempt; not a poll-mode continuation
 	case stageConstruct:
-		w.logScanState(ctx, modePoll, triggerPoll,
+		w.scan(ctx, modePoll, triggerPoll,
 			"upgrade_stage", upgradeStageConstruct, "error", logtext.Path(attachErr.Error()))
-		w.onChange(ctx)
 		return nil, false
 	case stageWatchDirs:
-		w.logScanState(ctx, modePoll, triggerPoll,
+		w.scan(ctx, modePoll, triggerPoll,
 			"upgrade_stage", upgradeStageWatchDirs, "error", logtext.Path(attachErr.Error()))
-		w.onChange(ctx)
 		return nil, false
 	case stageAttached:
 	}

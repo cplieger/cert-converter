@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -25,7 +25,7 @@ func TestHandleEventRecv_closed_channel_stops_the_loop(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)
 	root := t.TempDir()
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
@@ -57,7 +57,7 @@ func TestHandleEventRecv_arms_the_debounce_only_for_interesting_events(t *testin
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			w := New(root, func(context.Context) {})
+			w := New(root, func(context.Context, bool) {})
 			st := newWatchState(w)
 			t.Cleanup(st.stop)
 
@@ -88,7 +88,7 @@ func TestHandleEventRecv_arms_the_debounce_only_for_interesting_events(t *testin
 func TestHandleErrorRecv_closed_channel_stops_the_loop(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)
-	w := New(t.TempDir(), func(context.Context) {})
+	w := New(t.TempDir(), func(context.Context, bool) {})
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
@@ -119,7 +119,7 @@ func TestHandleSafetyNetTick_resyncs_the_watch_set_before_scanning(t *testing.T)
 	// renewal landing during a long scan produces no event and waits for the next
 	// tick. Asserting the watch list after the tick cannot tell the two orders apart.
 	var watchedAtScan []string
-	w := New(root, func(context.Context) {
+	w := New(root, func(context.Context, bool) {
 		scans++
 		watchedAtScan = watcher.WatchList()
 	}, WithFallback(time.Hour))
@@ -145,7 +145,7 @@ func TestHandleSafetyNetTick_skips_the_scan_when_shutdown_cut_the_resync_short(t
 	watcher := newTestWatcher(t)
 	root := t.TempDir()
 	scans := 0
-	w := New(root, func(context.Context) { scans++ }, WithFallback(time.Hour))
+	w := New(root, func(context.Context, bool) { scans++ }, WithFallback(time.Hour))
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -178,7 +178,7 @@ func TestHandleErrorRecv_defers_a_second_overflow_resync_to_the_floor(t *testing
 	if err := os.MkdirAll(nested, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
@@ -221,7 +221,7 @@ func TestHandleErrorRecv_keeps_the_loop_running_when_the_overflow_resync_fails(t
 	t.Parallel()
 	watcher := newClosedTestWatcher(t)
 	root := t.TempDir()
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
@@ -241,7 +241,7 @@ func TestHandleErrorRecv_does_not_resync_the_watch_set_for_a_benign_error(t *tes
 	t.Parallel()
 	watcher := newTestWatcher(t)
 	root := t.TempDir()
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("setup: addWatchDirs = %v", err)
 	}
@@ -364,7 +364,7 @@ func TestHandleSafetyNetTick_runs_the_scan_when_resync_fails(t *testing.T) {
 	t.Parallel()
 	watcher := newClosedTestWatcher(t)
 	scans := 0
-	w := New(t.TempDir(), func(context.Context) { scans++ }, WithFallback(time.Hour))
+	w := New(t.TempDir(), func(context.Context, bool) { scans++ }, WithFallback(time.Hour))
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
@@ -429,7 +429,7 @@ func TestHandleWatcherError_warns_with_the_operator_diagnostics(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
 			root := t.TempDir()
-			st := newWatchState(New(root, func(context.Context) {}, WithFallback(tc.fallback)))
+			st := newWatchState(New(root, func(context.Context, bool) {}, WithFallback(tc.fallback)))
 			t.Cleanup(st.stop)
 
 			st.handleWatcherError(tc.err)
@@ -438,7 +438,7 @@ func TestHandleWatcherError_warns_with_the_operator_diagnostics(t *testing.T) {
 				t.Fatalf("WARN %q logged %d times, want exactly 1; log = %v", tc.msg, n, logs.Messages())
 			}
 			for key, want := range tc.wantAttrs {
-				got, ok := logs.AttrValue(tc.msg, key)
+				got, ok := logs.AttrValue(capture.Message(tc.msg), capture.AttrName(key))
 				if !ok {
 					t.Errorf("WARN %q carries no %q attribute; an operator cannot act on the error without it", tc.msg, key)
 					continue
@@ -448,7 +448,7 @@ func TestHandleWatcherError_warns_with_the_operator_diagnostics(t *testing.T) {
 				}
 			}
 			if tc.msg == "watcher error" {
-				if got, _ := logs.AttrValue(tc.msg, "root"); got != root {
+				if got, _ := logs.AttrValue(capture.Message(tc.msg), "root"); got != root {
 					t.Errorf("WARN %q root = %q, want %q so the operator knows which tree lost an event", tc.msg, got, root)
 				}
 			}
@@ -477,7 +477,7 @@ func TestHandleEventRecv_reattaches_a_recreated_directory(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
 	}
@@ -527,7 +527,7 @@ func TestRunDebouncedScan_reasserts_registrations_the_kernel_dropped_silently(t 
 	if err := os.MkdirAll(child, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {}, WithDebounce(time.Millisecond))
+	w := New(root, func(context.Context, bool) {}, WithDebounce(time.Millisecond))
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
 	}
@@ -579,7 +579,7 @@ func TestRunDebouncedScan_floors_the_reassert_cadence(t *testing.T) {
 		t.Fatal(err)
 	}
 	scans := 0
-	w := New(root, func(context.Context) { scans++ }, WithDebounce(time.Millisecond))
+	w := New(root, func(context.Context, bool) { scans++ }, WithDebounce(time.Millisecond))
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
@@ -638,7 +638,7 @@ func TestRecvHelpers_do_no_work_after_cancellation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
 			watcher := newTestWatcher(t)
-			w := New(t.TempDir(), func(context.Context) {}, WithFallback(6*time.Hour))
+			w := New(t.TempDir(), func(context.Context, bool) {}, WithFallback(6*time.Hour))
 			st := newWatchState(w)
 			t.Cleanup(st.stop)
 			ctx, cancel := context.WithCancel(t.Context())
@@ -679,7 +679,7 @@ func TestHandleEventRecv_reattaches_a_directory_recreated_after_a_rename(t *test
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
 	}
@@ -728,7 +728,7 @@ func TestHandleSafetyNetTick_charges_its_reassert_to_the_floor(t *testing.T) {
 		t.Fatal(err)
 	}
 	scans := 0
-	w := New(root, func(context.Context) { scans++ }, WithFallback(time.Hour))
+	w := New(root, func(context.Context, bool) { scans++ }, WithFallback(time.Hour))
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 

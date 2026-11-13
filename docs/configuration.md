@@ -55,7 +55,7 @@ Both legacy profiles log a WARN at start, because their single-iteration SHA-1 M
 
 - `flat`, the default, names each output after the certificate's own folder. `<issuer>/<site>/<site>.crt` becomes `<site>/<site>.pfx`, so the paths your apps mount never contain the issuing CA's folder, and a change of issuer is invisible to them.
 - `mirror` reproduces each source's full path under `/input`.
-- Two sources that map to one flat output name are a collision. None of them is converted, an ERROR names the shared name, the number of claimants and a sample of them, and the container stays unhealthy. Rename one source folder, or set `mirror`.
+- Two sources that map to one flat output name are a collision. None of them is converted, an ERROR names the shared name, the number of claimants and a sample of them, and the container stays unhealthy. Rename one source folder, or set `mirror`. The collision holds across a restart, as [the ownership record](#flat-ownership-record) explains.
 - An unrecognized value uses the default and forces `OUTPUT_LIFECYCLE=warn`.
 - Under `sync`, files laid out for the other layout are removed only when `OUTPUT_LAYOUT` is set explicitly. While it is unset they are kept and reported, so an image upgrade never deletes a tree your apps still mount.
 
@@ -91,9 +91,24 @@ Do not use permissions to leave out a path. A path cert-converter cannot read co
 - `keep` is silent and never deletes.
 - An unrecognized value logs a WARN and uses `warn`.
 
-Only `sync` ever deletes anything, and it removes only files in cert-converter's own output shape, never a folder. It deletes nothing unless the scan proves it read `/input` completely. That proof needs at least one source found, a walk that finished within `MAX_SCAN_ENTRIES`, and no unreadable path, unresolvable symlink, conversion failure or output-name collision. A scan without that proof logs `orphan removal is disabled for this scan` and removes nothing, so a broken or empty mount is never read as "every certificate was deleted". Every scan that deletes something logs a WARN with the count and a sample of the paths.
+Only `sync` ever deletes anything, and it removes only files in cert-converter's own output shape, never a folder. It deletes nothing unless the scan proves it read `/input` completely. That proof needs at least one source found, a walk that finished within `MAX_SCAN_ENTRIES`, and no unreadable path, unresolvable symlink, conversion failure or output-name collision. A symlink is unresolvable when it leaves `/input`, loops, or is absolute, even one naming a path inside `/input`. An unresolvable symlink named like a bundle counts as an unreadable bundle and stops removal, except while bundle input is off or a PEM pair of the same name shadows it, because cert-converter then never reads it. One named like a certificate or key stops removal only when it is read with its pair and counts as an unreadable path. Otherwise `sync` keeps the outputs of every input cert-converter has seen behind the link, after a restart too, and a WARN names the link while it hides one. A scan without that proof logs `orphan removal is disabled for this scan` and removes nothing, so a broken or empty mount is never read as "every certificate was deleted". Every scan that deletes something logs a WARN with the count and a sample of the paths.
 
-An output whose `<name>.key` is still present is kept and reported by its own WARN, because a half-written or half-deleted pair does not prove the certificate is gone. Finish the change under `/input` by adding the matching `<name>.crt` or removing the leftover `<name>.key`, and the next scan removes the output.
+An output whose `<name>.key` is still present is kept and reported by its own WARN, because a half-written or half-deleted pair does not prove the certificate is gone. Finish the change under `/input` by adding the matching `<name>.crt` or removing the leftover `<name>.key`, and the next scan removes the output. A `<name>.key` symlink cert-converter cannot resolve keeps the output too, because it may still lead to a private key.
+
+A relative source or key symlink whose target does not exist inside `/input` counts as deleted, so under `sync` its outputs go as a deleted source's do. A WARN with `condition=dangling_source_link` names the link and its target when it appears and once after each restart, and a `standing condition cleared` record follows once the link is fixed or removed. A folder, or anything else that is not a regular file, at a source or key name is the opposite case: it counts as an unreadable path, keeps its outputs, stops removal and draws a WARN until you replace it with a regular file. An absolute symlink is unresolvable whether or not its target exists, so make links under `/input` relative.
+
+## Flat ownership record
+
+Under `OUTPUT_LAYOUT=flat`, cert-converter keeps a small record at `/output/.cert-converter-claims.json`. For each output name it lists the inputs that claim the name and the input whose conversion wrote the current outputs. It holds paths under `/input` and no key material, is written at mode `0600`, and changes only when a claim or an owner does.
+
+The record carries two things across a restart. A name collision stays a collision while one of its inputs is out of reach, so the restarted process never publishes the other input under the shared name. Under `sync`, an output whose source is gone is removed only once a scan has reached the input that wrote it and found it gone, no longer claiming the name, or covered by `INPUT_EXCLUDE_PATHS`. An output whose input sits behind an unreadable folder or an unresolvable symlink is kept. Outputs of a format you switched off, or laid out for another `OUTPUT_LAYOUT`, are removed as before, because that removal rests on the setting and not on a source being gone.
+
+- Deleting the file is safe. The next scan rebuilds it, and when `/output` already holds outputs a WARN with `condition=claims_rebuilt` says that an output whose input that scan cannot reach is not protected during it.
+- A file cert-converter cannot use, because it is unreadable, damaged, too large, from an unknown version or not a regular file, draws one WARN with `condition=claims_unreadable` at start. cert-converter then starts from an empty record and replaces the file at the next change.
+- A failed write draws a standing WARN with `condition=claims_unwritable`. The running process keeps using its record in memory and retries at the next scan, but a restart before a write succeeds forgets which input owns each output.
+- None of these affects health or a scan count.
+- The file is never removed, counted or reported as an output, and apps that read `/output` can ignore it.
+- `OUTPUT_LAYOUT=mirror` writes no record and leaves an existing one untouched, because a mirrored output's path already names its source.
 
 ## Scan cadence and size
 
@@ -111,11 +126,23 @@ An output whose `<name>.key` is still present is kept and reported by its own WA
 - Where the memory limit cannot move, lower this ceiling or set `OUTPUT_LIFECYCLE=keep`, which skips the walk of `/output`.
 - An empty, whitespace, invalid, zero or negative value uses `10000`, and a value above `200000` is clamped to that ceiling. Either repair is reported by a WARN at start naming the value you set. No value turns the budget off.
 
+## Metrics
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `METRICS_LISTEN_ADDR` | Address for a Prometheus metrics page and `/healthz`, for example `:9468`. Empty opens no port. | _(unset)_ |
+
+`METRICS_LISTEN_ADDR` is a listen address, a host and a port or a port alone such as `:9468`. While it is unset or empty, cert-converter opens no port.
+
+- Leading and trailing spaces and invisible characters are removed, so `" :9468"` listens on `:9468`.
+- The address is bound at startup, before the first scan. An address that is malformed or already taken stops the container with one error naming `METRICS_LISTEN_ADDR`, and cert-converter never falls back to another address.
+- The listener answers `GET /metrics` and `GET /healthz` with no login, so keep the port on your network. [Monitoring and alerts](monitoring.md) lists the series and what `/healthz` answers.
+
 ## Logging
 
-`LOG_LEVEL` sets the minimum log level, `debug`, `info`, `warn` or `error`, without regard to case. slog offsets such as `info+2` work too. An unrecognized value falls back to `info`.
+`LOG_LEVEL` sets the minimum log level, `debug`, `info`, `warn` or `error`, without regard to case. slog offsets such as `info+2` work too. An unrecognized value falls back to `info`. The log alert rules read an `info` record, so they need `info` or lower.
 
-`debug` adds the reason each source was skipped, each deletion's own path and the file-watch events. A source is skipped because it is an orphan, unchanged or excluded, because it is a bundle while bundle input is off, because a higher-precedence sibling shadows it, or because its folder is unreadable.
+`debug` adds the reason each source was skipped, each deletion's own path, each symlink to a folder, which the scan reaches under the folder's own path, and the file-watch events. A source is skipped because it is an orphan, unchanged or excluded, because it is a bundle while bundle input is off, because a higher-precedence sibling shadows it, or because its folder is unreadable.
 
 ## Volumes and file permissions
 
@@ -127,13 +154,13 @@ An output whose `<name>.key` is still present is kept and reported by its own WA
 - The whole tree is searched to any depth, so every source under the mount is converted. To narrow it, mount the folder you want converted, or list the paths to skip in `INPUT_EXCLUDE_PATHS`.
 - The folder and its files must be readable by the user in `user:`. Set `PUID` and `PGID` to the user and group that own the certificate files. Caddy writes each renewed certificate with mode `0600`, readable by its owner only, so a `chgrp` or `chmod` on the files is lost at the next renewal.
 
-`/output` holds the converted files, and it must be writable by the user in `user:`. File paths follow `OUTPUT_LAYOUT`.
+`/output` holds the converted files and, under the flat layout, the [ownership record](#flat-ownership-record). It must be writable by the user in `user:`. File paths follow `OUTPUT_LAYOUT`.
 
 Create the host output folder, owned by that user, before the first start. With the default user, run `mkdir -p /path/to/converted/output && sudo chown 1000:1000 /path/to/converted/output`. If `.env` sets `PUID` and `PGID`, use those numbers. If `/output` is not writable, the startup log says so and every conversion fails.
 
 Generated files are mode `0600` and the folders cert-converter creates are `0750`, all owned by that user. The output folder must keep that mode. If inherited ACL entries widen new files there, the startup log warns, every write is refused, and the `remediation` field names the entries to remove. The app that reads them must run as the same user or as a privileged process. Group membership is not enough, because mode `0600` gives the group no read access.
 
-cert-converter never changes the mode of what it finds under `/output`. An output folder more permissive than `0750`, or a file more permissive than `0600`, draws a WARN naming the mode and is left as found. Tighten it yourself, because a group-writable or world-writable output folder lets any other process on that mount replace a file. A file cert-converter writes again, for example after a renewal, lands at `0600`.
+cert-converter never changes the mode of what it finds under `/output`. An output folder more permissive than `0750`, or a file more permissive than `0600`, draws a WARN naming the mode and is left as found. The WARN is logged when cert-converter first finds the mode, again when the mode changes and once after each restart, and a `standing condition cleared` record follows once the mode is tightened or the path is gone. Tighten it yourself, because a group-writable or world-writable output folder lets any other process on that mount replace a file. A file cert-converter writes again, for example after a renewal, lands at `0600`.
 
 An inherited ACL that widens new files, for example on ZFS, stops `/output` from keeping mode `0600`. So does a filesystem that does not store Unix file modes. cert-converter then writes nothing there, and the startup log warns about it at once and names the fix.
 

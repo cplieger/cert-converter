@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/cplieger/atomicfile/v4"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/filesafe"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // wantVolumeMissingMsg is the ERROR substring Verify must log for a mount
@@ -204,8 +204,8 @@ func TestVerify_asks_only_for_read_access_on_the_input_volume(t *testing.T) {
 // Serial (no t.Parallel): it swaps the probeOutputWritable package var and slog.Default().
 func TestVerify_runs_the_output_write_probe(t *testing.T) {
 	dir := t.TempDir()
-	stubOutputProbe(t, atomicfile.ProbeResult{
-		Dir: dir, Stage: atomicfile.ProbeStageCreate, Err: fs.ErrPermission,
+	stubOutputProbe(t, filesafe.ProbeResult{
+		Dir: dir, Phase: filesafe.ProbePhaseCreate, Err: fs.ErrPermission,
 	}, nil)
 	logs := capture.Default(t)
 
@@ -225,7 +225,7 @@ func TestVerify_runs_the_output_write_probe(t *testing.T) {
 // this record the misconfiguration surfaces only at the next renewal.
 //
 // This case runs the REAL library probe, so the app's mapping is pinned against
-// atomicfile's actual outcome and not only against the stub below. The probe is
+// filesafe's actual outcome and not only against the stub below. The probe is
 // failed by opening the confined handle and then deleting the directory under it:
 // the handle stays valid and every create through it fails ENOENT, which no UID
 // bypasses. (That replaces the previous regular-file construction for the same
@@ -265,7 +265,7 @@ func TestWarnOutputNotWritable_reports_failed_probe(t *testing.T) {
 	// The stage is what tells an operator WHICH refusal they are looking at, now
 	// that the probe walks the whole create/write/flush/close/unlink ladder instead
 	// of the create alone.
-	if !logs.HasAttr(msg, "stage", atomicfile.ProbeStageCreate.String()) {
+	if !logs.HasAttr(msg, "stage", filesafe.ProbePhaseCreate.String()) {
 		t.Errorf("warnOutputNotWritable(%q) does not name the failing probe stage (logs %v)",
 			blocked, logs.Messages())
 	}
@@ -284,10 +284,10 @@ const wantOutputNotWritableMsg = "the output volume is not writable by the runni
 // and flushes the bytes and then refuses the unlink, a deferred write error that
 // surfaces only at close — get exercised at all; they are precisely the
 // misconfigurations this WARN set exists for.
-func stubOutputProbe(t *testing.T, res atomicfile.ProbeResult, err error) {
+func stubOutputProbe(t *testing.T, res filesafe.ProbeResult, err error) {
 	t.Helper()
 	prev := probeOutputWritable
-	probeOutputWritable = func(context.Context, *os.Root, string, ...atomicfile.Option) (atomicfile.ProbeResult, error) {
+	probeOutputWritable = func(context.Context, *os.Root, string, ...filesafe.WriteOption) (filesafe.ProbeResult, error) {
 		return res, err
 	}
 	t.Cleanup(func() { probeOutputWritable = prev })
@@ -296,7 +296,7 @@ func stubOutputProbe(t *testing.T, res atomicfile.ProbeResult, err error) {
 // TestWarnOutputNotWritable_probes_with_the_artifact_mode pins that the startup probe
 // asks for the same owner-only mode the converted files are written at, so a volume
 // that cannot hold that mode is refused at startup like a real write would be. The
-// options the probe receives are replayed through a real write, because an Option is
+// options the probe receives are replayed through a real write, because a WriteOption is
 // opaque: the file that write leaves behind is what those options mean.
 //
 // Serial (no t.Parallel): it swaps the probe seam.
@@ -308,16 +308,16 @@ func TestWarnOutputNotWritable_probes_with_the_artifact_mode(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = root.Close() })
 	prev := probeOutputWritable
-	var got []atomicfile.Option
-	probeOutputWritable = func(_ context.Context, _ *os.Root, _ string, opts ...atomicfile.Option) (atomicfile.ProbeResult, error) {
+	var got []filesafe.WriteOption
+	probeOutputWritable = func(_ context.Context, _ *os.Root, _ string, opts ...filesafe.WriteOption) (filesafe.ProbeResult, error) {
 		got = opts
-		return atomicfile.ProbeResult{Dir: dir}, nil
+		return filesafe.ProbeResult{Dir: dir}, nil
 	}
 	t.Cleanup(func() { probeOutputWritable = prev })
 
 	warnOutputNotWritable(root)
 
-	if _, err := atomicfile.WriteFileInRoot(t.Context(), root, "replay", []byte("x"), got...); err != nil {
+	if _, err := filesafe.WriteFileInRoot(t.Context(), root, "replay", []byte("x"), got...); err != nil {
 		t.Fatalf("Setup: WriteFileInRoot(replay) with the probe's options: %v", err)
 	}
 	info, err := os.Stat(filepath.Join(dir, "replay"))
@@ -360,25 +360,25 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 		name        string
 		wantMsg     string
 		wantAbsent  string
-		res         atomicfile.ProbeResult
+		res         filesafe.ProbeResult
 		wantWarns   int
 		wantRecords int
 	}{
 		{
 			name: "every stage passed is silent",
-			res:  atomicfile.ProbeResult{Dir: dir, Name: leakedName},
+			res:  filesafe.ProbeResult{Dir: dir, Name: leakedName},
 		},
 		{
 			name: "a refused create reports the volume as not writable",
-			res: atomicfile.ProbeResult{
-				Dir: dir, Stage: atomicfile.ProbeStageCreate, Err: fs.ErrPermission,
+			res: filesafe.ProbeResult{
+				Dir: dir, Phase: filesafe.ProbePhaseCreate, Err: fs.ErrPermission,
 			},
 			wantMsg:     wantOutputNotWritableMsg,
 			wantWarns:   1,
 			wantRecords: 1,
 			wantAttrs: map[string]string{
 				"role": "output", "path": dir,
-				"stage": atomicfile.ProbeStageCreate.String(),
+				"stage": filesafe.ProbePhaseCreate.String(),
 			},
 			// Nothing was durably written, so there is no probe file to reclaim and the
 			// sweep sentence would send an operator after a file that does not exist.
@@ -386,15 +386,15 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 		},
 		{
 			name: "a refused write that also leaked names the leftover",
-			res: atomicfile.ProbeResult{
-				Dir: dir, Name: leakedName, Stage: atomicfile.ProbeStageWrite,
+			res: filesafe.ProbeResult{
+				Dir: dir, Name: leakedName, Phase: filesafe.ProbePhaseWrite,
 				Err: fs.ErrPermission, Leaked: true,
 			},
 			wantMsg:     wantOutputNotWritableMsg,
 			wantWarns:   1,
 			wantRecords: 1,
 			wantAttrs: map[string]string{
-				"stage": atomicfile.ProbeStageWrite.String(), "leaked_probe": leakedPath,
+				"stage": filesafe.ProbePhaseWrite.String(), "leaked_probe": leakedPath,
 				"cleanup": staleTempRemediation,
 				"remediation": "the directory entry was accepted and the data was not, so this is not an ownership problem: " +
 					"check free space and any quota on the filesystem backing " + dir,
@@ -402,15 +402,15 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 		},
 		{
 			name: "a refused flush is not an ownership problem",
-			res: atomicfile.ProbeResult{
-				Dir: dir, Name: leakedName, Stage: atomicfile.ProbeStageSync,
+			res: filesafe.ProbeResult{
+				Dir: dir, Name: leakedName, Phase: filesafe.ProbePhaseSync,
 				Err: errors.New("disk quota exceeded"),
 			},
 			wantMsg:     wantOutputNotWritableMsg,
 			wantWarns:   1,
 			wantRecords: 1,
 			wantAttrs: map[string]string{
-				"stage": atomicfile.ProbeStageSync.String(),
+				"stage": filesafe.ProbePhaseSync.String(),
 				"remediation": "the directory entry was accepted and the data was not, so this is not an ownership problem: " +
 					"check free space and any quota on the filesystem backing " + dir,
 			},
@@ -418,15 +418,15 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 		},
 		{
 			name: "a volume that does not keep the owner-only mode is not an ownership problem",
-			res: atomicfile.ProbeResult{
-				Dir: dir, Stage: atomicfile.ProbeStageCreate,
-				Err: fmt.Errorf("%w: %s asked -rw------- stored -rw-rw----", atomicfile.ErrModeNotStored, leakedPath),
+			res: filesafe.ProbeResult{
+				Dir: dir, Phase: filesafe.ProbePhaseCreate,
+				Err: fmt.Errorf("%w: %s asked -rw------- stored -rw-rw----", filesafe.ErrModeNotStored, leakedPath),
 			},
 			wantMsg:     wantOutputNotWritableMsg,
 			wantWarns:   1,
 			wantRecords: 1,
 			wantAttrs: map[string]string{
-				"stage": atomicfile.ProbeStageCreate.String(),
+				"stage": filesafe.ProbePhaseCreate.String(),
 				"remediation": "the filesystem backing " + dir + " did not keep mode 0600 on a new file, so this is not an " +
 					"ownership problem: remove the inheritable ACL entries that widen new files there (on ZFS, the " +
 					"inherited group@/everyone@ entries or the dataset's aclinherit setting), or mount a filesystem " +
@@ -436,15 +436,15 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 		},
 		{
 			name: "a close failure keeps its own message",
-			res: atomicfile.ProbeResult{
-				Dir: dir, Name: leakedName, Stage: atomicfile.ProbeStageClose,
+			res: filesafe.ProbeResult{
+				Dir: dir, Name: leakedName, Phase: filesafe.ProbePhaseClose,
 				Err: errors.New("input/output error"),
 			},
 			wantMsg:     "failed to close the output write probe",
 			wantWarns:   1,
 			wantRecords: 1,
 			wantAttrs: map[string]string{
-				"path": leakedPath, "stage": atomicfile.ProbeStageClose.String(),
+				"path": leakedPath, "stage": filesafe.ProbePhaseClose.String(),
 			},
 			// The probe file WAS removed here, so the sweep remediation must not fire:
 			// it is keyed on ProbeResult.Leaked, not on the stage.
@@ -452,8 +452,8 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 		},
 		{
 			name: "a close failure that leaked keeps the sweep remediation",
-			res: atomicfile.ProbeResult{
-				Dir: dir, Name: leakedName, Stage: atomicfile.ProbeStageClose,
+			res: filesafe.ProbeResult{
+				Dir: dir, Name: leakedName, Phase: filesafe.ProbePhaseClose,
 				Err: errors.New("input/output error"), Leaked: true,
 			},
 			wantMsg:     "failed to close the output write probe",
@@ -463,8 +463,8 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 		},
 		{
 			name: "a refused unlink keeps its own message and the sweep remediation",
-			res: atomicfile.ProbeResult{
-				Dir: dir, Name: leakedName, Stage: atomicfile.ProbeStageRemove,
+			res: filesafe.ProbeResult{
+				Dir: dir, Name: leakedName, Phase: filesafe.ProbePhaseRemove,
 				Err: fs.ErrPermission, Leaked: true,
 			},
 			wantMsg:     "failed to remove the output write probe",
@@ -479,7 +479,7 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 			// must not print the diagnosis an operator would act on — and must not
 			// vanish either.
 			name:        "a probe that was not attempted is not the not-writable diagnosis",
-			probeErr:    errors.New("atomicfile: context canceled"),
+			probeErr:    errors.New("filesafe: context canceled"),
 			wantRecords: 1,
 			wantAttrs:   map[string]string{"path": dir},
 			wantAbsent:  "remediation",
@@ -507,13 +507,13 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 				t.Fatalf("warnOutputNotWritable did not emit the %q WARN (logs %v)", tc.wantMsg, logs.Messages())
 			}
 			for key, want := range tc.wantAttrs {
-				if !logs.HasAttr(tc.wantMsg, key, want) {
+				if !logs.HasAttr(capture.Message(tc.wantMsg), capture.AttrName(key), want) {
 					t.Errorf("warnOutputNotWritable %q record: attr %q = %q, want %q (logs %v)",
 						tc.wantMsg, key, attrOrMissing(logs, tc.wantMsg, key), want, logs.Messages())
 				}
 			}
 			if tc.wantAbsent != "" {
-				if got, ok := logs.AttrValue(tc.wantMsg, tc.wantAbsent); ok {
+				if got, ok := logs.AttrValue(capture.Message(tc.wantMsg), capture.AttrName(tc.wantAbsent)); ok {
 					t.Errorf("warnOutputNotWritable %q record carries attr %q = %q, want it absent",
 						tc.wantMsg, tc.wantAbsent, got)
 				}
@@ -524,7 +524,7 @@ func TestWarnOutputNotWritable_maps_every_probe_stage_to_its_own_warning(t *test
 
 // attrOrMissing renders an attr for a failure message, or reports it as absent.
 func attrOrMissing(logs *capture.Recorder, msgSub, key string) string {
-	if got, ok := logs.AttrValue(msgSub, key); ok {
+	if got, ok := logs.AttrValue(capture.Message(msgSub), capture.AttrName(key)); ok {
 		return got
 	}
 	return "<absent>"

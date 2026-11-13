@@ -16,8 +16,8 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/cert-converter/internal/scancadence"
-	"github.com/cplieger/runesafe/v3"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
+	"github.com/cplieger/go/textsafe"
 )
 
 func TestLoad_empty_password_optout_warns_only_on_unrecognized_values(t *testing.T) {
@@ -196,8 +196,7 @@ func TestFallbackInterval_is_silent(t *testing.T) {
 // diagnostics at their new home. Both values are silently repaired, so the WARN
 // naming the rejected value is the operator's only way to tell an intended
 // cadence from a default or a clamp. Message text, level and attribute keys are
-// asserted verbatim: a documented Loki matcher or an operator's grep keys on
-// them. Exactly one record per process start, and the derived value is asserted
+// asserted verbatim: an operator's grep keys on them. Exactly one record per process start, and the derived value is asserted
 // beside the warning so the two cannot drift.
 // slog.Default is process-global, so this test must not run in parallel with
 // anything that logs.
@@ -268,7 +267,7 @@ func TestLoad_warns_when_the_fallback_value_is_repaired(t *testing.T) {
 					tc.raw, n, tc.message, logs.Messages())
 			}
 			assertRejectedValue(t, logs, tc.message, tc.raw)
-			if !logs.HasAttr(tc.message, tc.attrKey, tc.attrWant) {
+			if !logs.HasAttr(capture.Message(tc.message), capture.AttrName(tc.attrKey), tc.attrWant) {
 				t.Errorf("Load() with FALLBACK_SCAN_HOURS=%q WARN %q = %q, want %q=%q (logs %v)",
 					tc.raw, tc.attrKey, mustAttr(t, logs, tc.message, tc.attrKey), tc.attrKey, tc.attrWant, logs.Messages())
 			}
@@ -309,7 +308,7 @@ func TestLoad_does_not_repair_a_usable_fallback_value(t *testing.T) {
 // record carried no such key.
 func mustAttr(t *testing.T, logs *capture.Recorder, msgSub, key string) string {
 	t.Helper()
-	got, ok := logs.AttrValue(msgSub, key)
+	got, ok := logs.AttrValue(capture.Message(msgSub), capture.AttrName(key))
 	if !ok {
 		return "<absent>"
 	}
@@ -324,11 +323,11 @@ func mustAttr(t *testing.T, logs *capture.Recorder, msgSub, key string) string {
 // only signal that the value they configured is longer than the record.
 func assertRejectedValue(t *testing.T, logs *capture.Recorder, msgSub, raw string) {
 	t.Helper()
-	got, ok := logs.AttrValue(msgSub, "value")
+	got, ok := logs.AttrValue(capture.Message(msgSub), "value")
 	if !ok {
 		t.Fatalf("the WARN matching %q carries no value attribute (logs %v)", msgSub, logs.Messages())
 	}
-	want, cut := runesafe.SanitizeSingleLineBudgeted(raw, maxRejectedValueLogLen, logtext.Marker)
+	want, cut := textsafe.SanitizeSingleLineCapped(raw, maxRejectedValueLogLen, logtext.Marker)
 	if got != want {
 		t.Errorf("the WARN for %q carried value=%q, want the gate's own %q: nothing may quote a rejected value raw",
 			raw, got, want)
@@ -841,7 +840,7 @@ func TestLoad_password_status_agrees_with_its_warning(t *testing.T) {
 				t.Errorf("Load() with PFX_PASSWORD=%q logged %d WARN records matching %q, want 1 (logs %v)",
 					tc.password, n, tc.wantWarnSub, logs.Messages())
 			}
-			if !logs.AttrContains(tc.wantWarnSub, "remediation", "PFX_PASSWORD") {
+			if !logs.AttrContains(capture.Message(tc.wantWarnSub), "remediation", "PFX_PASSWORD") {
 				t.Errorf("Load() with PFX_PASSWORD=%q WARN is missing an actionable remediation attr (logs %v)",
 					tc.password, logs.Messages())
 			}
@@ -1904,13 +1903,12 @@ func TestLoad_refuses_an_invisible_only_password_on_both_channels(t *testing.T) 
 }
 
 // invisibleOnlyWarn is the message substring of the invisible-only strength WARN.
-// Named once: three tests key on it, and it is the operator-facing text a Loki
-// matcher selects.
+// Named once: three tests key on it.
 const invisibleOnlyWarn = "consists only of invisible Unicode formatting characters"
 
 // paddedPasswordWarn is the message substring of the leading/trailing-whitespace WARN.
 // Named once: three tests key on it (both delivery channels plus the blank-password
-// suppression), and it is the operator-facing text a Loki matcher selects. Channel-
+// suppression). Channel-
 // neutral by design — the record fires for a padded PFX_PASSWORD and a padded
 // PFX_PASSWORD_FILE alike, and names which one in its "source" attribute.
 const paddedPasswordWarn = "the PFX password has leading or trailing whitespace"
@@ -2085,12 +2083,9 @@ func scanRepairName(r scanEntriesRepair) string {
 // TestLoad_warns_when_the_scan_entry_budget_is_repaired pins the two repair
 // diagnostics at their only home. Both values are silently repaired, so the WARN
 // naming the rejected value is the operator's only way to tell an intended budget
-// from a default or a clamp — a deployment that meant to raise the ceiling would
-// otherwise keep failing its scan at the default with nothing to explain why.
-// Message text, level and attribute keys are asserted verbatim: a documented Loki
-// matcher or an operator's grep keys on them. Exactly one record per process start.
-// slog.Default is process-global, so this test must not run in parallel with
-// anything that logs.
+// from a default or a clamp. Message text, level and attribute keys are asserted
+// verbatim: an operator's grep keys on them. Exactly one record per process start.
+// slog.Default is process-global, so this test must not run in parallel.
 func TestLoad_warns_when_the_scan_entry_budget_is_repaired(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -2145,7 +2140,7 @@ func TestLoad_warns_when_the_scan_entry_budget_is_repaired(t *testing.T) {
 					tc.raw, n, tc.message, logs.Messages())
 			}
 			assertRejectedValue(t, logs, tc.message, tc.raw)
-			if !logs.HasAttr(tc.message, tc.attrKey, tc.attrWant) {
+			if !logs.HasAttr(capture.Message(tc.message), capture.AttrName(tc.attrKey), tc.attrWant) {
 				t.Errorf("Load() with MAX_SCAN_ENTRIES=%q WARN %q = %q, want %q=%q (logs %v)",
 					tc.raw, tc.attrKey, mustAttr(t, logs, tc.message, tc.attrKey), tc.attrKey, tc.attrWant, logs.Messages())
 			}

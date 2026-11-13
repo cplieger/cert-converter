@@ -19,7 +19,7 @@ import (
 	"strings"
 
 	"github.com/cplieger/cert-converter/internal/logtext"
-	"github.com/cplieger/runesafe/v3"
+	"github.com/cplieger/go/textsafe"
 )
 
 // PEM block type constants.
@@ -326,7 +326,7 @@ const maxBlockTypeLogLen = 64
 // boundLogText makes input-derived text safe and bounded for a log-bound
 // diagnostic.
 func boundLogText(s string, limit int) string {
-	text, _ := runesafe.SanitizeSingleLineBudgeted(s, limit, logtext.Marker)
+	text, _ := textsafe.SanitizeSingleLineCapped(s, limit, logtext.Marker)
 	return text
 }
 

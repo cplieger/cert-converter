@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // TestWatchLoop_converts_a_real_cert_write_through_the_debounce is the first
@@ -25,7 +25,7 @@ func TestWatchLoop_converts_a_real_cert_write_through_the_debounce(t *testing.T)
 
 	root := t.TempDir()
 	scans := make(chan struct{}, 8)
-	w := New(root, func(context.Context) { scans <- struct{}{} }, WithDebounce(20*time.Millisecond))
+	w := New(root, func(context.Context, bool) { scans <- struct{}{} }, WithDebounce(20*time.Millisecond))
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("setup: addWatchDirs = %v", err)
 	}
@@ -65,7 +65,7 @@ func TestWatchLoop_returns_a_LostError_when_the_watcher_dies(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)
 	root := t.TempDir()
-	w := New(root, func(context.Context) {}, WithDebounce(20*time.Millisecond))
+	w := New(root, func(context.Context, bool) {}, WithDebounce(20*time.Millisecond))
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("setup: addWatchDirs = %v", err)
 	}
@@ -127,7 +127,7 @@ func TestPollLoopWithUpgrade_reports_dead_change_detection(t *testing.T) {
 	// a restart.
 	scanned := make(chan struct{}, 1)
 	// No WithFallback, i.e. FALLBACK_SCAN_HOURS=0/false.
-	w := New(t.TempDir(), func(context.Context) { scanned <- struct{}{} })
+	w := New(t.TempDir(), func(context.Context, bool) { scanned <- struct{}{} })
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	logs := capture.Default(t)
@@ -170,7 +170,7 @@ func TestRun_falls_back_to_polling_when_the_watch_set_cannot_be_built(t *testing
 	missingRoot := filepath.Join(t.TempDir(), "missing")
 	// No WithFallback: poll mode then has no interval, so it scans once and returns
 	// a *LostError -- an outcome reachable only through the poll fallback.
-	w := New(missingRoot, func(context.Context) { scans++ })
+	w := New(missingRoot, func(context.Context, bool) { scans++ })
 
 	err := w.Run(t.Context())
 
@@ -190,7 +190,7 @@ func TestWatchLoop_runs_the_periodic_fallback_scan_without_any_event(t *testing.
 	// A one-hour debounce: nothing is written under root, and even a stray event
 	// could not produce a scan on this timescale, so the scan below can only come
 	// from the fallback arm.
-	w := New(root, func(context.Context) { scans <- struct{}{} },
+	w := New(root, func(context.Context, bool) { scans <- struct{}{} },
 		WithDebounce(time.Hour), WithFallback(20*time.Millisecond))
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("setup: addWatchDirs = %v", err)
@@ -235,7 +235,7 @@ func TestWatchLoop_reports_lost_change_detection_when_the_root_watch_disappears(
 	watcher := newTestWatcher(t)
 	// No WithFallback: the disabled-rescan configuration is the only one where
 	// root loss is terminal.
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("addWatchDirs: %v", err)
 	}

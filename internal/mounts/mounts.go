@@ -11,8 +11,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cplieger/atomicfile/v4"
 	"github.com/cplieger/cert-converter/internal/logtext"
+	"github.com/cplieger/go/filesafe"
 )
 
 // Paths is the required mount set.
@@ -115,7 +115,7 @@ func closeRoot(root *os.Root, role string) {
 
 // probeOutputWritable is the writability probe warnOutputNotWritable runs, and a
 // package-var seam in the same style as main's runProbe and requiredVolumes.
-var probeOutputWritable = atomicfile.ProbeWritableInRoot
+var probeOutputWritable = filesafe.ProbeWritableInRoot
 
 // ArtifactMode is the mode every converted file is written at. The startup probe asks
 // for it so a volume that cannot hold it fails at startup rather than on the first renewal.
@@ -133,7 +133,7 @@ func warnOutputNotWritable(root *os.Root) {
 	// once before it creates anything, and its stages are single filesystem calls
 	// the OS does not make interruptible, so a context could not shorten a wedged
 	// mount. Startup has no context of its own until main's signal handler.
-	res, err := probeOutputWritable(context.Background(), root, ".", atomicfile.WithMode(ArtifactMode))
+	res, err := probeOutputWritable(context.Background(), root, ".", filesafe.WithMode(ArtifactMode))
 	switch {
 	case err != nil:
 		// A non-nil error means only "the probe was not attempted", which for the
@@ -160,7 +160,7 @@ const outputNotWritableMsg = "the output volume is not writable by the running U
 // warnOutputRefusedWrite reports a volume that never durably accepted the probe's
 // bytes: the create, the first write or the flush failed, so no PFX can be written
 // either.
-func warnOutputRefusedWrite(res atomicfile.ProbeResult) {
+func warnOutputRefusedWrite(res filesafe.ProbeResult) {
 	// One sanitized rendering of the probed volume, reused by the remediation and by both
 	// records' path attribute: the remediation is log text like any attribute (logtext.Path).
 	logRoot := logtext.Path(res.Dir)
@@ -171,29 +171,29 @@ func warnOutputRefusedWrite(res atomicfile.ProbeResult) {
 		" to the UID in user: (and check the mount is not read-only)"
 	// A create refusal is an ownership/read-only/missing-mount condition, which the
 	// chown advice above fits.
-	if res.Stage == atomicfile.ProbeStageWrite || res.Stage == atomicfile.ProbeStageSync {
+	if res.Phase == filesafe.ProbePhaseWrite || res.Phase == filesafe.ProbePhaseSync {
 		remediation = "the directory entry was accepted and the data was not, so this is not an ownership problem: " +
 			"check free space and any quota on the filesystem backing " + logRoot
 	}
-	if errors.Is(res.Err, atomicfile.ErrModeNotStored) {
+	if errors.Is(res.Err, filesafe.ErrModeNotStored) {
 		remediation = ModeNotStoredRemediation(logRoot)
 	}
 	if res.Leaked {
 		// Reachable when the write or the flush failed AND the follow-up unlink failed
 		// too: the volume is unusable and is still holding the probe file.
 		slog.Warn(outputNotWritableMsg,
-			"role", roleOutput, "path", logRoot, "stage", res.Stage.String(), "error", logtext.Path(res.Err.Error()),
+			"role", roleOutput, "path", logRoot, "stage", res.Phase.String(), "error", logtext.Path(res.Err.Error()),
 			"uid", os.Getuid(), "gid", os.Getgid(), "remediation", remediation,
 			"leaked_probe", logtext.Path(probePath(res)), "cleanup", staleTempRemediation)
 		return
 	}
 	slog.Warn(outputNotWritableMsg,
-		"role", roleOutput, "path", logRoot, "stage", res.Stage.String(), "error", logtext.Path(res.Err.Error()),
+		"role", roleOutput, "path", logRoot, "stage", res.Phase.String(), "error", logtext.Path(res.Err.Error()),
 		"uid", os.Getuid(), "gid", os.Getgid(), "remediation", remediation)
 }
 
 // ModeNotStoredRemediation is the operator action for a volume at root that would not
-// keep a new file at ArtifactMode (atomicfile.ErrModeNotStored).
+// keep a new file at ArtifactMode (filesafe.ErrModeNotStored).
 func ModeNotStoredRemediation(root string) string {
 	return "the filesystem backing " + root + " did not keep mode " + fmt.Sprintf("%#o", uint32(ArtifactMode)) +
 		" on a new file, so this is not an ownership problem: remove the inheritable ACL entries that widen new " +
@@ -203,24 +203,24 @@ func ModeNotStoredRemediation(root string) string {
 
 // warnOutputProbeTeardown reports a probe whose data reached disk and whose
 // teardown did not.
-func warnOutputProbeTeardown(res atomicfile.ProbeResult) {
+func warnOutputProbeTeardown(res filesafe.ProbeResult) {
 	msg := "failed to remove the output write probe"
-	if res.Stage == atomicfile.ProbeStageClose {
+	if res.Phase == filesafe.ProbePhaseClose {
 		msg = "failed to close the output write probe"
 	}
 	if res.Leaked {
-		slog.Warn(msg, "path", logtext.Path(probePath(res)), "stage", res.Stage.String(),
+		slog.Warn(msg, "path", logtext.Path(probePath(res)), "stage", res.Phase.String(),
 			"error", logtext.Path(res.Err.Error()),
 			"remediation", staleTempRemediation)
 		return
 	}
-	slog.Warn(msg, "path", logtext.Path(probePath(res)), "stage", res.Stage.String(),
+	slog.Warn(msg, "path", logtext.Path(probePath(res)), "stage", res.Phase.String(),
 		"error", logtext.Path(res.Err.Error()))
 }
 
 // probePath is the probe file's full path for a diagnostic, joined from the directory the
 // probe reported probing and the name it left there.
-func probePath(res atomicfile.ProbeResult) string {
+func probePath(res filesafe.ProbeResult) string {
 	return filepath.Join(res.Dir, res.Name)
 }
 

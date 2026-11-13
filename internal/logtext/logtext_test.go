@@ -6,7 +6,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cplieger/cert-converter/internal/logtext"
-	"github.com/cplieger/runesafe/v3"
+	"github.com/cplieger/go/textsafe"
 )
 
 // TestMarker pins the exact wording. It is an operator's query key for a cut record
@@ -97,7 +97,7 @@ func TestPath_rewrites_the_unsafe_classes_and_leaves_ordinary_names_alone(t *tes
 		}
 	}
 
-	// One case per class the policy names, so a hand-rolled subset (the drift runesafe
+	// One case per class the policy names, so a hand-rolled subset (the drift textsafe
 	// exists to prevent) fails here rather than in a later cycle.
 	for _, tc := range []struct {
 		name string
@@ -132,7 +132,7 @@ func TestPath_rewrites_the_unsafe_classes_and_leaves_ordinary_names_alone(t *tes
 // not drift on the wording: CapJoin caps a path inventory with Cap (after sanitizing
 // each name with Path — Cap is the non-sanitizing half of that pair because CapJoin
 // charges the marker's placement itself), and internal/convert hands the same const to
-// runesafe.SanitizeSingleLineBudgeted for certificate-derived text.
+// textsafe.SanitizeSingleLineCapped for certificate-derived text.
 //
 // What the two do NOT share is where the marker's bytes are charged, and that is
 // asserted rather than left implicit: Cap appends it after the cut, while the library
@@ -151,16 +151,16 @@ func TestMarker_names_the_cut_in_both_paths(t *testing.T) {
 			limit, len(capped), want)
 	}
 
-	sanitized, cut := runesafe.SanitizeSingleLineBudgeted(long, limit, logtext.Marker)
+	sanitized, cut := textsafe.SanitizeSingleLineCapped(long, limit, logtext.Marker)
 	if !cut {
-		t.Errorf("SanitizeSingleLineBudgeted(200 bytes, %d) reported no cut, want one", limit)
+		t.Errorf("SanitizeSingleLineCapped(200 bytes, %d) reported no cut, want one", limit)
 	}
 	if !strings.HasSuffix(sanitized, logtext.Marker) {
-		t.Errorf("SanitizeSingleLineBudgeted(200 bytes, %d) = %q, want the SAME marker %q as Cap: one condition, one vocabulary",
+		t.Errorf("SanitizeSingleLineCapped(200 bytes, %d) = %q, want the SAME marker %q as Cap: one condition, one vocabulary",
 			limit, sanitized, logtext.Marker)
 	}
 	if len(sanitized) > limit {
-		t.Errorf("SanitizeSingleLineBudgeted(200 bytes, %d) is %d bytes, want at most the limit: that path charges the marker against it",
+		t.Errorf("SanitizeSingleLineCapped(200 bytes, %d) is %d bytes, want at most the limit: that path charges the marker against it",
 			limit, len(sanitized))
 	}
 }

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -31,7 +31,7 @@ func TestRun_scans_once_with_the_watch_set_live(t *testing.T) {
 	scans := make(chan struct{}, 8)
 	// No WithFallback: the periodic rescan is disarmed, so any second scan observed
 	// below is a duplicate startup scan rather than a fallback tick.
-	w := New(root, func(context.Context) { scans <- struct{}{} }, WithDebounce(20*time.Millisecond))
+	w := New(root, func(context.Context, bool) { scans <- struct{}{} }, WithDebounce(20*time.Millisecond))
 
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -80,7 +80,7 @@ func TestRun_treats_a_shutdown_during_the_walk_as_a_clean_stop(t *testing.T) {
 		t.Fatal(err)
 	}
 	scans := 0
-	w := New(root, func(context.Context) { scans++ }, WithFallback(time.Hour))
+	w := New(root, func(context.Context, bool) { scans++ }, WithFallback(time.Hour))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -103,7 +103,7 @@ func TestScanThenWatch_skips_scan_after_shutdown(t *testing.T) {
 	t.Parallel()
 	watcher := newTestWatcher(t)
 	scans := 0
-	w := New(t.TempDir(), func(context.Context) { scans++ })
+	w := New(t.TempDir(), func(context.Context, bool) { scans++ })
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -137,7 +137,7 @@ func TestRun_upgrades_from_poll_to_watch_and_keeps_detecting_events(t *testing.T
 	}
 	scanStarted := make(chan struct{}, 4)
 	scanMayFinish := make(chan struct{})
-	w := New(root, func(ctx context.Context) {
+	w := New(root, func(ctx context.Context, _ bool) {
 		scanStarted <- struct{}{}
 		select {
 		case <-scanMayFinish:
@@ -258,7 +258,7 @@ func TestWatchMode_states_the_post_watch_set_sequence_once(t *testing.T) {
 				t.Fatal(err)
 			}
 			scans := make(chan struct{}, 8)
-			w := New(root, func(context.Context) { scans <- struct{}{} },
+			w := New(root, func(context.Context, bool) { scans <- struct{}{} },
 				WithDebounce(20*time.Millisecond), WithFallback(time.Hour))
 
 			ctx, cancel := context.WithCancel(t.Context())
@@ -358,7 +358,7 @@ func TestAttachWatchSet_closes_the_watcher_it_could_not_give_a_watch_set(t *test
 		}
 	})
 	missingRoot := filepath.Join(t.TempDir(), "missing")
-	w := New(missingRoot, func(context.Context) {}, WithFallback(time.Hour))
+	w := New(missingRoot, func(context.Context, bool) {}, WithFallback(time.Hour))
 
 	watcher, stopped := w.attachWatchSet(t.Context())
 
@@ -400,7 +400,7 @@ func TestRun_reports_a_watch_mode_loss_to_the_caller(t *testing.T) {
 	t.Cleanup(func() { newFSWatcher = prev })
 
 	scanned := make(chan struct{}, 4)
-	w := New(t.TempDir(), func(context.Context) { scanned <- struct{}{} },
+	w := New(t.TempDir(), func(context.Context, bool) { scanned <- struct{}{} },
 		WithDebounce(20*time.Millisecond), WithFallback(time.Hour))
 
 	done := make(chan error, 1)
@@ -459,7 +459,7 @@ func TestAttachWatchSet_names_the_rescan_cadence_when_it_degrades_to_polling(t *
 				newTestWatcher(t) // availability probe: the root, not fsnotify, must fail here
 			}
 			logs := capture.Default(t)
-			w := New(filepath.Join(t.TempDir(), "missing"), func(context.Context) {}, WithFallback(tc.fallback))
+			w := New(filepath.Join(t.TempDir(), "missing"), func(context.Context, bool) {}, WithFallback(tc.fallback))
 
 			watcher, stopped := w.attachWatchSet(t.Context())
 
@@ -473,7 +473,7 @@ func TestAttachWatchSet_names_the_rescan_cadence_when_it_degrades_to_polling(t *
 			if n := logs.CountLevel(slog.LevelWarn, tc.msg); n != 1 {
 				t.Fatalf("WARN %q logged %d times, want exactly 1; log = %v", tc.msg, n, logs.Messages())
 			}
-			got, ok := logs.AttrValue(tc.msg, "fallback_scan")
+			got, ok := logs.AttrValue(capture.Message(tc.msg), "fallback_scan")
 			if !ok {
 				t.Fatalf("WARN %q carries no fallback_scan attribute; an operator cannot tell which rescan cadence their configuration is running; log = %v", tc.msg, logs.Messages())
 			}
@@ -504,7 +504,7 @@ func TestTryAttachWatchSet_rebuilds_the_membership_mirror_for_a_new_watcher(t *t
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 
 	first, stage, err := w.tryAttachWatchSet(t.Context())
 	if stage != stageAttached || err != nil {

@@ -5,28 +5,21 @@ import (
 	"testing"
 )
 
-func TestSelectFlatSources_collidingStemConvertsNothingRegardlessOfArrival(t *testing.T) {
+func TestGroupFlatClaims_groupsEachStemsClaimantsRegardlessOfArrival(t *testing.T) {
 	t.Parallel()
 
-	unique, collisions := selectFlatSources([]string{
+	claims := groupFlatClaims([]string{
 		"issuer-z/shared/site.crt",
 		"issuer-y/other/cert.crt",
 		"issuer-a/shared/site.crt",
 	})
-	// The uncontested source converts; NEITHER claimant of the shared stem does.
-	wantUnique := []string{"issuer-y/other/cert.crt"}
-	if !slices.Equal(unique, wantUnique) {
-		t.Errorf("selectFlatSources(reverse arrival) unique = %v, want %v", unique, wantUnique)
+	if len(claims) != 2 {
+		t.Fatalf("groupFlatClaims(reverse arrival) = %+v, want two stems", claims)
 	}
-	if len(collisions) != 1 {
-		t.Fatalf("selectFlatSources(reverse arrival) collisions = %+v, want one group", collisions)
+	if got, want := claims[0], (flatClaim{stem: "shared/site", sources: []string{"issuer-a/shared/site.crt", "issuer-z/shared/site.crt"}}); got.stem != want.stem || !slices.Equal(got.sources, want.sources) {
+		t.Errorf("groupFlatClaims(reverse arrival)[0] = %+v, want %+v", got, want)
 	}
-	got := collisions[0]
-	if got.stem != "shared/site" {
-		t.Errorf("selectFlatSources(reverse arrival) collision stem = %q, want %q", got.stem, "shared/site")
-	}
-	wantSources := []string{"issuer-a/shared/site.crt", "issuer-z/shared/site.crt"}
-	if !slices.Equal(got.sources, wantSources) {
-		t.Errorf("selectFlatSources(reverse arrival) collision sources = %v, want %v", got.sources, wantSources)
+	if got, want := claims[1], (flatClaim{stem: "other/cert", sources: []string{"issuer-y/other/cert.crt"}}); got.stem != want.stem || !slices.Equal(got.sources, want.sources) {
+		t.Errorf("groupFlatClaims(reverse arrival)[1] = %+v, want %+v", got, want)
 	}
 }

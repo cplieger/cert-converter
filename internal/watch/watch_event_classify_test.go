@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -33,7 +33,7 @@ import (
 func TestHandleFsEvent_classifies_a_create_it_cannot_stat(t *testing.T) {
 	watcher := newTestWatcher(t)
 	root := t.TempDir()
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 
 	notADir := filepath.Join(root, "notes.txt")
 	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
@@ -84,7 +84,7 @@ func TestHandleFsEvent_classifies_a_create_it_cannot_stat(t *testing.T) {
 func TestHandleFsEvent_classifies_a_chmod_it_cannot_stat(t *testing.T) {
 	watcher := newTestWatcher(t)
 	root := t.TempDir()
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 
 	notADir := filepath.Join(root, "notes.txt")
 	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
@@ -150,7 +150,7 @@ func TestFallbackScanAttr_names_the_operator_configured_cadence(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := capture.Default(t)
-			w := New(root, func(context.Context) {}, WithFallback(tc.fallback))
+			w := New(root, func(context.Context, bool) {}, WithFallback(tc.fallback))
 			st := newWatchState(w)
 			t.Cleanup(st.stop)
 
@@ -187,7 +187,7 @@ func TestHandleFsEvent_does_not_watch_through_a_symlinked_directory(t *testing.T
 	if err := os.Symlink(outside, link); err != nil {
 		t.Skipf("symlinks unavailable on this filesystem: %v", err)
 	}
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
@@ -216,7 +216,7 @@ func TestHandleFsEvent_skips_the_reassert_for_an_already_watched_directory(t *te
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
 	}
@@ -252,7 +252,7 @@ func TestHandleRootWatchLoss_reattaches_the_watch_set_when_the_fallback_is_enabl
 		t.Fatal(err)
 	}
 	watcher := newTestWatcher(t)
-	w := New(root, func(context.Context) {}, WithFallback(time.Hour))
+	w := New(root, func(context.Context, bool) {}, WithFallback(time.Hour))
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
@@ -306,7 +306,7 @@ func TestHandleRootWatchLoss_only_the_root_being_taken_away_ends_change_detectio
 				path = root
 			}
 			// No WithFallback: the periodic rescan is disabled, so a loss is terminal.
-			w := New(root, func(context.Context) {})
+			w := New(root, func(context.Context, bool) {})
 			st := newWatchState(w)
 			t.Cleanup(st.stop)
 
@@ -334,7 +334,7 @@ func TestHandleRootWatchLoss_stays_live_when_the_reattach_fails(t *testing.T) {
 
 	logs := capture.Default(t)
 	root := t.TempDir()
-	w := New(root, func(context.Context) {}, WithFallback(6*time.Hour))
+	w := New(root, func(context.Context, bool) {}, WithFallback(6*time.Hour))
 	st := newWatchState(w)
 	t.Cleanup(st.stop)
 
@@ -345,7 +345,7 @@ func TestHandleRootWatchLoss_stays_live_when_the_reattach_fails(t *testing.T) {
 		t.Fatalf("WARN %q logged %d times, want exactly 1; log = %v", msg, n, logs.Messages())
 	}
 	for key, want := range map[string]string{"root": root, "fallback_scan": "6h0m0s"} {
-		got, ok := logs.AttrValue(msg, key)
+		got, ok := logs.AttrValue(msg, capture.AttrName(key))
 		if !ok {
 			t.Errorf("WARN %q carries no %q attribute; an operator cannot tell which tree lost real-time detection or when it is re-scanned", msg, key)
 			continue
@@ -379,7 +379,7 @@ func TestHandleFsEvent_reasserts_the_watch_set_for_a_new_directory(t *testing.T)
 	if err := os.MkdirAll(first, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 	if err := w.addWatchDirs(t.Context(), watcher, root); err != nil {
 		t.Fatalf("setup: addWatchDirs(%q) = %v, want nil", root, err)
 	}

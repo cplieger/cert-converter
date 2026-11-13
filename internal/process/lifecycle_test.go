@@ -15,13 +15,13 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/cplieger/atomicfile/v4"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/filesafe"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // newInputSource opens a confined source over dir: the INPUT tree the reap's
@@ -354,7 +354,7 @@ func TestSampleOrphanPaths_bounds_the_sample_by_bytes(t *testing.T) {
 	// maxLoggedOrphanBytes is not a multiple of three, so the cut offset lands INSIDE a
 	// rune. A naive slice would leave a partial-rune tail whose raw 0x80-0x9F bytes a
 	// non-UTF-8 terminal reads as C1 escape introducers, which is the class
-	// runesafe.CapBytes exists to prevent.
+	// textsafe.CapBytes exists to prevent.
 	t.Run("an oversized sample is cut on a rune boundary and marked", func(t *testing.T) {
 		t.Parallel()
 		paths := []string{strings.Repeat("→", maxLoggedOrphanBytes) + "/leaf.pfx"}
@@ -1396,7 +1396,7 @@ func TestContentFromCurrency_maps_every_outcome(t *testing.T) {
 			if got := logs.CountLevel(tc.wantLevel, tc.wantMsg); got != 1 {
 				t.Errorf("contentFromCurrency(%s) logged %q at %s %d times, want exactly 1", tc.res.Reason, tc.wantMsg, tc.wantLevel, got)
 			}
-			if !logs.HasAttr(tc.wantMsg, "path", "example.com/tls.pfx") {
+			if !logs.HasAttr(capture.Message(tc.wantMsg), "path", "example.com/tls.pfx") {
 				t.Errorf("contentFromCurrency(%s) logged %q, want the output path named", tc.res.Reason, logs.Messages())
 			}
 		})
@@ -1608,11 +1608,10 @@ func TestStoreReconcile_defers_once_per_batch(t *testing.T) {
 // TestScannerRun_reports_a_shutdown_that_arrives_during_reconciliation pins the one
 // place Scanner.Run turns a reconciliation error into the scan's own outcome. The input
 // walk completed cleanly, so walkErr is nil and nothing else in Run can notice that the
-// scan stopped halfway through the OUTPUT tree: without the fold, Run returns nil, logs
-// "scan complete" at Info -- the record the README's stall alert keys on -- and
-// main.healthyAfterScan leaves the health marker set for a scan that was cancelled
-// mid-reap under OUTPUT_LIFECYCLE=sync. Serial: it swaps waitBeforeReap and
-// slog.Default.
+// scan stopped halfway through the OUTPUT tree: without the fold, Run returns nil, the
+// caller writes a clean end-of-scan record and main.healthyAfterScan leaves the health
+// marker set for a scan that was cancelled mid-reap under OUTPUT_LIFECYCLE=sync.
+// Serial: it swaps waitBeforeReap.
 func TestScannerRun_reports_a_shutdown_that_arrives_during_reconciliation(t *testing.T) {
 	certsRoot := t.TempDir()
 	outRoot := t.TempDir()
@@ -1638,7 +1637,6 @@ func TestScannerRun_reports_a_shutdown_that_arrives_during_reconciliation(t *tes
 		cancel()
 		return ctx.Err()
 	})
-	logs := captureLogs(t)
 
 	res, err := scanner.Run(ctx)
 
@@ -1647,12 +1645,6 @@ func TestScannerRun_reports_a_shutdown_that_arrives_during_reconciliation(t *tes
 	}
 	if res.Removed != 0 {
 		t.Errorf("Run(shutdown during reconciliation) Removed = %d, want 0", res.Removed)
-	}
-	if got := logs.CountExact("scan complete"); got != 0 {
-		t.Errorf("Run(shutdown during reconciliation) logged %q, want no scan-complete record: it would leave the health marker set and satisfy the stall alert", logs.Messages())
-	}
-	if got := logs.CountLevel(slog.LevelDebug, "scan cancelled during shutdown"); got != 1 {
-		t.Errorf("Run(shutdown during reconciliation) logged %q, want the shutdown summary once at Debug", logs.Messages())
 	}
 	if _, statErr := os.Stat(orphan); statErr != nil {
 		t.Errorf("os.Stat(%q) = %v, want the orphan left in place: nothing may be deleted once the process is stopping", orphan, statErr)
@@ -1693,32 +1685,10 @@ func TestScannerRun_reports_the_reap_count(t *testing.T) {
 	}
 }
 
-// TestLogScanOutcome_names_the_output_side_counts pins the two /output-side counts in
-// the end-of-scan summary, the pair no other test asserts (unresolved and vanished each
-// have their own). Both are operator signals: removed is how many bundles this scan
-// deleted under OUTPUT_LIFECYCLE=sync, and unwritable is the health-neutral count of
-// bundles whose replacing write the volume refused, deliberately kept out of failed= and
-// unreadable= so each documented alert keeps its own diagnosis. Dropping either
-// attribute leaves a scan that deleted key material, or that left a world-readable
-// private key in place, indistinguishable from a clean one. Serial: it swaps
-// slog.Default.
-func TestLogScanOutcome_names_the_output_side_counts(t *testing.T) {
-	logs := captureLogs(t)
-
-	logScanOutcome(t.Context(), &ScanResult{Total: 2, Converted: 1, Removed: 3, Unwritable: 2}, nil)
-
-	for key, want := range map[string]string{"removed": "3", "unwritable": "2"} {
-		if !logs.HasAttr("scan complete", key, want) {
-			got, _ := logs.AttrValue("scan complete", key)
-			t.Errorf("logScanOutcome logged %s=%q, want %q", key, got, want)
-		}
-	}
-}
-
 // TestScanWalk_streams_directories_larger_than_one_read_batch pins the scan's entry
 // accounting across a tree bigger than one of the walk's read batches.
 //
-// atomicfile.WalkDirInRoot reads each directory in fixed-size batches through the
+// filesafe.WalkDirInRoot reads each directory in fixed-size batches through the
 // confined root instead of handing the whole thing to fs.WalkDir, which reads AND sorts
 // a directory's complete inventory before the entry budget gets to see a single path —
 // so a hostile flat /input could force that inventory into memory before it could be
@@ -1728,7 +1698,7 @@ func TestLogScanOutcome_names_the_output_side_counts(t *testing.T) {
 func TestScanWalk_streams_directories_larger_than_one_read_batch(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	// Comfortably more than atomicfile's fixed 256-entry read batch, so the walk's
+	// Comfortably more than filesafe's fixed 256-entry read batch, so the walk's
 	// per-directory loop has to span several of them.
 	const flat = 293
 	for i := range flat {
@@ -1754,7 +1724,7 @@ func TestScanWalk_streams_directories_larger_than_one_read_batch(t *testing.T) {
 	t.Cleanup(func() { _ = root.Close() })
 	sw := &scanWalk{src: &source{root: root}, seen: make(map[string]struct{}), observations: newObservationLog(0)}
 
-	if walkErr := atomicfile.WalkDirInRoot(t.Context(), root, func(rel string, d fs.DirEntry, err error) error {
+	if walkErr := filesafe.WalkDirInRoot(t.Context(), root, func(rel string, d fs.DirEntry, err error) error {
 		return sw.visit(t.Context(), rel, d, err)
 	}); walkErr != nil {
 		t.Fatalf("WalkDirInRoot(a tree spanning several read batches) = %v, want nil", walkErr)
@@ -1798,7 +1768,7 @@ func TestScanWalk_charges_an_unreadable_directory_once(t *testing.T) {
 	t.Cleanup(func() { _ = root.Close() })
 	sw := &scanWalk{src: &source{root: root}, seen: make(map[string]struct{}), observations: newObservationLog(0)}
 
-	if walkErr := atomicfile.WalkDirInRoot(t.Context(), root, func(rel string, d fs.DirEntry, err error) error {
+	if walkErr := filesafe.WalkDirInRoot(t.Context(), root, func(rel string, d fs.DirEntry, err error) error {
 		return sw.visit(t.Context(), rel, d, err)
 	}); walkErr != nil {
 		t.Fatalf("WalkDirInRoot(tree with one unreadable directory) = %v, want nil: an unreadable"+
@@ -1818,7 +1788,7 @@ func TestScanWalk_charges_an_unreadable_directory_once(t *testing.T) {
 
 // The directory half of the FIFO guarantee — a reader-less pipe swapped in for a
 // directory between the readdir that classified it and the open must be REFUSED with
-// ENOTDIR, never waited on — moved with the walk into atomicfile
+// ENOTDIR, never waited on — moved with the walk into filesafe
 // (TestWalkDirInRoot_refuses_a_fifo_in_a_directory_position), which owns the O_DIRECTORY
 // open. Its app-level consequence is pinned here by the unreadable-sub-path tests: such a
 // path is one unreadable entry, health-neutral and reap-vetoing.
@@ -2254,7 +2224,7 @@ func TestScannerRun_prunes_the_observation_log_despite_an_eviction(t *testing.T)
 // operator's only way out and a hint that does not name the setting is not one.
 func assertRemediationMentions(t *testing.T, logs *capture.Recorder, msg, want string) {
 	t.Helper()
-	got, ok := logs.AttrValue(msg, "remediation")
+	got, ok := logs.AttrValue(capture.Message(msg), "remediation")
 	if !ok {
 		t.Errorf("record %q carries no remediation: it is the only line the operator sees", msg)
 		return
@@ -2399,17 +2369,11 @@ func TestStoreReconcile_keeps_a_bundle_whose_private_key_is_still_present(t *tes
 	assertRemediationMentions(t, logs, loneKeyRetainedMsg, ".crt")
 }
 
-// TestStoreReconcile_lone_key_veto_reads_any_occupant_as_a_key pins the deliberate rule
-// for a key path that holds something other than a regular file.
-//
-// The key is asked for with the SAME ENOENT-only semantics as the certificate
-// (source.pathAbsent, one primitive for both questions): only an ENOENT counts as "no
-// key". A directory, a FIFO or a symlink whose target does not resolve therefore vetoes
-// the deletion too, because the alternative is unlinking private-key material on evidence
-// that amounts to "the key path is odd" — and an odd occupant is not the operator
-// removing the key. It never counts silently: the same WARN names the retention, which is
-// what turns a stray directory at a key path from a never-reaped bundle nobody can explain
-// into a named condition. Serial: it swaps waitBeforeReap and slog.Default.
+// TestStoreReconcile_lone_key_veto_reads_any_occupant_as_a_key pins the rule for a
+// key path holding something other than a regular file. The key is judged as the
+// certificate is (source.judge): only a key that cannot exist counts as "no key",
+// so a directory or FIFO there vetoes deleting private-key material, and the same
+// WARN names the retention. Serial: it swaps waitBeforeReap and slog.Default.
 func TestStoreReconcile_lone_key_veto_reads_any_occupant_as_a_key(t *testing.T) {
 	out := t.TempDir()
 	if err := os.WriteFile(filepath.Join(out, "odd.pfx"), []byte("pfx"), 0o600); err != nil {
@@ -2827,8 +2791,7 @@ func TestLoneKeyRemediation_promises_a_reap_only_where_one_can_follow(t *testing
 // broken /input tree. The sibling above cancels during reconciliation, where the walk
 // finished cleanly, and walk_log_policy_test's case hands the gate that fact ready-made;
 // neither exercises the derivation, so a scan stopping at SIGTERM could start emitting
-// the operator-actionable orphan-removal-disabled WARN -- the record the README's
-// CertConverterOrphanRemovalDisabled alert keys on -- on every container stop, with a
+// the operator-actionable orphan-removal-disabled WARN on every container stop, with a
 // remediation pointing at a mount that is fine. Serial: it swaps slog.Default.
 func TestScannerRun_stays_quiet_when_the_shutdown_arrives_during_the_input_walk(t *testing.T) {
 	certsRoot := t.TempDir()
@@ -2907,5 +2870,213 @@ func TestStoreInspect_reads_a_prior_at_the_readable_bound(t *testing.T) {
 	if sizeMsg := "prior pfx exceeds the readable bound"; logs.Contains(sizeMsg) {
 		t.Errorf("inspect(a prior of exactly %d bytes) logged %q, want no size-bound notice: that size is the largest this app reads, not the smallest it refuses",
 			maxPFXSize, sizeMsg)
+	}
+}
+
+// TestScannerRun_reaps_the_artifact_of_a_pair_whose_links_lead_nowhere pins that
+// under OUTPUT_LIFECYCLE=sync a pair whose certificate and key became links to
+// names missing inside /input is gone, as a deleted pair is: its artifact is
+// removed while another source keeps the input tree non-empty, and a tree left
+// with no source removes nothing.
+// Serial: it swaps slog.Default().
+func TestScannerRun_reaps_the_artifact_of_a_pair_whose_links_lead_nowhere(t *testing.T) {
+	for _, lay := range []outputpolicy.Layout{outputpolicy.LayoutFlat, outputpolicy.LayoutMirror} {
+		t.Run(string(lay), func(t *testing.T) {
+			sync := Options{Layout: lay, Lifecycle: outputpolicy.LifecycleSync}
+			t.Run("beside_another_source", func(t *testing.T) {
+				in, out := t.TempDir(), t.TempDir()
+				if err := os.Mkdir(filepath.Join(in, "x"), 0o750); err != nil {
+					t.Fatal(err)
+				}
+				writeSelfSignedPair(t, filepath.Join(in, "x"), "cert")
+				writeSelfSignedPair(t, in, "other")
+				logs := captureLogs(t)
+				scanner := newVerdictScanner(in, out, sync)
+				runScans(t, scanner, 1)
+				for _, name := range []string{"cert.crt", "cert.key"} {
+					relink(t, filepath.Join(in, "x", name), "gone-"+name)
+				}
+
+				res := runScans(t, scanner, 1)
+				if res.Removed != 1 || res.Orphan != 0 {
+					t.Errorf("the scan after x's links went nowhere = %+v, want Removed 1 and Orphan 0", res)
+				}
+				if _, err := os.Lstat(filepath.Join(out, "x", "cert.pfx")); !os.IsNotExist(err) {
+					t.Errorf("x/cert.pfx was kept: Lstat = %v", err)
+				}
+				for _, kind := range []string{condOrphanCertificates, condUnreadablePath} {
+					if got := conditionCount(logs, slog.LevelWarn, kind, ""); got != 0 {
+						t.Errorf("the scan logged %d %s WARNs, want 0", got, kind)
+					}
+				}
+				for _, name := range []string{"x/cert.crt", "x/cert.key"} {
+					if got := conditionCount(logs, slog.LevelWarn, "dangling_source_link", name); got != 1 {
+						t.Errorf("%s logged %d dangling_source_link WARNs, want 1", name, got)
+					}
+				}
+			})
+			t.Run("sole_pair", func(t *testing.T) {
+				in, out := t.TempDir(), t.TempDir()
+				writeSelfSignedPair(t, in, "x")
+				captureLogs(t)
+				scanner := newVerdictScanner(in, out, sync)
+				runScans(t, scanner, 1)
+				for _, name := range []string{"x.crt", "x.key"} {
+					relink(t, filepath.Join(in, name), "gone-"+name)
+				}
+
+				res := runScans(t, scanner, 1)
+				if res.Removed != 0 || res.Total != 0 || res.Orphan != 0 || !res.NoSources {
+					t.Errorf("the scan of a tree left with no source = %+v, want Removed 0, Total 0, Orphan 0 and NoSources", res)
+				}
+				if _, err := os.Stat(filepath.Join(out, "x.pfx")); err != nil {
+					t.Errorf("an empty input tree removed x.pfx: %v", err)
+				}
+			})
+			t.Run("link_climbs_out_through_a_missing_directory", func(t *testing.T) {
+				in, out := t.TempDir(), t.TempDir()
+				if err := os.Mkdir(filepath.Join(in, "b"), 0o750); err != nil {
+					t.Fatal(err)
+				}
+				writeSelfSignedPair(t, filepath.Join(in, "b"), "cert")
+				writeSelfSignedPair(t, in, "other")
+				logs := captureLogs(t)
+				scanner := newVerdictScanner(in, out, sync)
+				runScans(t, scanner, 1)
+				// The confined root stops at the missing component and answers
+				// ENOENT before it meets the climb out.
+				relink(t, filepath.Join(in, "b"), "no-such/../../outside")
+
+				if res := runScans(t, scanner, 1); res.Removed != 1 {
+					t.Errorf("the scan after b became a link to nothing = %+v, want Removed 1", res)
+				}
+				if _, err := os.Lstat(filepath.Join(out, "b", "cert.pfx")); !os.IsNotExist(err) {
+					t.Errorf("b/cert.pfx was kept: Lstat = %v", err)
+				}
+				if got := conditionCount(logs, slog.LevelWarn, condUnresolvedSymlink, ""); got != 0 {
+					t.Errorf("the link logged %d unresolved_symlink WARNs, want 0", got)
+				}
+			})
+		})
+	}
+}
+
+// sourceCameBackMsg is the re-check's line for a source that is present again.
+const sourceCameBackMsg = "source came back during the confirmation delay"
+
+// TestScannerRun_reaps_an_artifact_whose_source_runs_through_a_file pins that a
+// source path running through a regular file inside /input cannot exist, so
+// under OUTPUT_LIFECYCLE=sync its artifact is removed with no re-check warning.
+// Serial: it swaps slog.Default().
+func TestScannerRun_reaps_an_artifact_whose_source_runs_through_a_file(t *testing.T) {
+	for _, tc := range []struct {
+		change func(t *testing.T, in string)
+		name   string
+		lay    outputpolicy.Layout
+	}{
+		{name: "mirror_directory_became_a_file", lay: outputpolicy.LayoutMirror, change: func(t *testing.T, in string) {
+			t.Helper()
+			if err := os.RemoveAll(filepath.Join(in, "x")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(in, "x"), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "flat_link_through_a_file", lay: outputpolicy.LayoutFlat, change: func(t *testing.T, in string) {
+			t.Helper()
+			if err := os.WriteFile(filepath.Join(in, "f.txt"), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"cert.crt", "cert.key"} {
+				relink(t, filepath.Join(in, "x", name), "../f.txt/"+name)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in, out := t.TempDir(), t.TempDir()
+			if err := os.Mkdir(filepath.Join(in, "x"), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			writeSelfSignedPair(t, filepath.Join(in, "x"), "cert")
+			writeSelfSignedPair(t, in, "other")
+			logs := captureLogs(t)
+			scanner := newVerdictScanner(in, out, Options{Layout: tc.lay, Lifecycle: outputpolicy.LifecycleSync})
+			runScans(t, scanner, 1)
+			tc.change(t, in)
+
+			if res := runScans(t, scanner, 1); res.Removed != 1 {
+				t.Errorf("the scan after x's source ran through a file = %+v, want Removed 1", res)
+			}
+			if _, err := os.Lstat(filepath.Join(out, "x", "cert.pfx")); !os.IsNotExist(err) {
+				t.Errorf("x/cert.pfx was kept: Lstat = %v", err)
+			}
+			if got := logs.CountLevel(slog.LevelWarn, recheckUnreadableMsg); got != 0 {
+				t.Errorf("the re-check logged %d unreadable-input WARNs, want 0", got)
+			}
+			if logs.Contains(sourceCameBackMsg) {
+				t.Errorf("the re-check claimed the source came back; log = %q", logs.Messages())
+			}
+		})
+	}
+}
+
+// TestScannerRun_reaps_a_mirrored_artifact_under_a_directory_alias pins that
+// under OUTPUT_LIFECYCLE=sync a mirrored source directory replaced by a link to
+// another walked directory is gone: the walk reads the target under its own
+// path, so the alias's artifact is removed and the target's stays.
+// Serial: it swaps slog.Default().
+func TestScannerRun_reaps_a_mirrored_artifact_under_a_directory_alias(t *testing.T) {
+	in, _ := collidingTree(t)
+	out := t.TempDir()
+	logs := captureLogs(t)
+	scanner := newVerdictScanner(in, out, Options{Layout: outputpolicy.LayoutMirror, Lifecycle: outputpolicy.LifecycleSync})
+	runScans(t, scanner, 1)
+	relink(t, filepath.Join(in, "b"), "a")
+
+	if res := runScans(t, scanner, 1); res.Removed != 1 {
+		t.Errorf("the scan after b became an alias of a = %+v, want Removed 1", res)
+	}
+	if _, err := os.Lstat(filepath.Join(out, "b", "site", "cert.pfx")); !os.IsNotExist(err) {
+		t.Errorf("the alias's artifact b/site/cert.pfx was kept: Lstat = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "a", "site", "cert.pfx")); err != nil {
+		t.Errorf("the target's artifact a/site/cert.pfx was removed: %v", err)
+	}
+	if logs.Contains(sourceCameBackMsg) {
+		t.Errorf("the re-check claimed the alias's source came back; log = %q", logs.Messages())
+	}
+}
+
+// TestScannerRun_calls_off_a_flat_reap_when_an_unresolvable_link_appears_before_the_recheck
+// pins that the flat re-check counts a link it cannot resolve the way the scan
+// does: one that appears during the confirmation delay may hide the orphan's
+// source, so the reap is called off.
+// Serial: it swaps slog.Default() and the reap wait.
+func TestScannerRun_calls_off_a_flat_reap_when_an_unresolvable_link_appears_before_the_recheck(t *testing.T) {
+	in, outside := inputAndOutside(t)
+	writeSelfSignedPair(t, in, "other")
+	writeSelfSignedPair(t, in, "gone")
+	out := t.TempDir()
+	logs := captureLogs(t)
+	scanner := newVerdictScanner(in, out, Options{Layout: outputpolicy.LayoutFlat, Lifecycle: outputpolicy.LifecycleSync})
+	runScans(t, scanner, 1)
+	for _, name := range []string{"gone.crt", "gone.key"} {
+		if err := os.Remove(filepath.Join(in, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stubReapWait(t, func(context.Context) error {
+		return os.Symlink(outside, filepath.Join(in, "b"))
+	})
+
+	if res := runScans(t, scanner, 1); res.Removed != 0 {
+		t.Errorf("the scan whose re-check met a new unresolvable link = %+v, want nothing removed", res)
+	}
+	if _, err := os.Stat(filepath.Join(out, "gone.pfx")); err != nil {
+		t.Errorf("gone.pfx was removed: %v", err)
+	}
+	if got := logs.CountLevel(slog.LevelWarn, flatRecheckIncompleteMsg); got != 1 {
+		t.Errorf("the re-check logged %d incomplete re-enumeration WARNs, want 1", got)
 	}
 }

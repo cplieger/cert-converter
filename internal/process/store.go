@@ -12,13 +12,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cplieger/atomicfile/v4"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/mounts"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
+	"github.com/cplieger/go/filesafe"
 )
 
 // Output file and directory modes.
@@ -34,20 +34,25 @@ const outputPermRemediation = "check /output ownership and permissions for the U
 // store owns every touch of the output tree.
 type store struct {
 	root *os.Root
-	// laxDirsReported dedupes the lax-output-directory WARN to once per directory
-	// per scan.
-	laxDirsReported map[string]struct{}
+	// standing carries the permissive-mode conditions across scans; nil reports
+	// every finding as new.
+	standing *standing
+	// laxDirsChecked is the directories this scan has checked for a permissive mode.
+	laxDirsChecked map[string]struct{}
+	// maxEntries is this store's per-walk entry budget for the OUTPUT tree, injected
+	// from Options.MaxScanEntries exactly as scanWalk's is for /input.
+	maxEntries int
 	// formats scopes the own-shape predicate: only artifacts the CONFIGURED
 	// formats produce are enumerated as orphan candidates, so a format switched
 	// off leaves its old artifacts untouched.
 	formats outputpolicy.Formats
-	// maxEntries is this store's per-walk entry budget for the OUTPUT tree, injected
-	// from Options.MaxScanEntries exactly as scanWalk's is for /input.
-	maxEntries int
+	// reapDisabled and otherLayoutKept are this scan's reconciliation verdicts,
+	// set beside the WARN that reports each one so the record cannot drift from it.
+	reapDisabled    bool
+	otherLayoutKept bool
 }
 
-// laxDirMsg is the standing WARN for an /output directory more permissive than
-// outputDirMode: a group- or world-WRITABLE directory lets another process on
+// laxDirMsg reports an /output directory more permissive than outputDirMode: a group- or world-WRITABLE directory lets another process on
 // the shared mount unlink or replace an artifact, and a world-TRAVERSABLE one
 // exposes artifact names.
 const laxDirMsg = "the /output directory holding generated artifacts is more permissive than policy"
@@ -66,36 +71,50 @@ func (s *store) reportLaxDir(rel string) {
 	}
 }
 
-// reportLaxDirAt reports one output directory, once per directory per scan.
+// reportLaxDirAt checks one output directory once per scan: a permissive mode is
+// a standing condition keyed by the mode, cleared when the directory is found
+// tightened or gone.
 func (s *store) reportLaxDirAt(dir string) {
-	if _, done := s.laxDirsReported[dir]; done {
+	if _, done := s.laxDirsChecked[dir]; done {
 		return
 	}
+	key := standingKey{kind: condPermissiveDir, subject: dir}
 	// Lstat, not Stat: a symlink at a directory name is classified as itself,
 	// never by its target, so a linked directory is skipped rather than reported
 	// for a mode this app did not observe on the real path.
 	fi, err := s.root.Lstat(dir)
-	if err != nil || !fi.IsDir() {
+	switch {
+	case errors.Is(err, fs.ErrNotExist), err == nil && !fi.IsDir():
+		s.standing.clear(key)
+		return
+	case err != nil:
 		return
 	}
-	if s.laxDirsReported == nil {
-		s.laxDirsReported = make(map[string]struct{})
+	if s.laxDirsChecked == nil {
+		s.laxDirsChecked = make(map[string]struct{})
 	}
-	s.laxDirsReported[dir] = struct{}{}
-	if perm := fi.Mode().Perm(); laxerThan(perm, outputDirMode) {
-		// dir is root-relative, so "." for a flat /output; the root is named
-		// alongside it, matching logOrphanWalkOutcome's own directory-level records.
-		slog.Warn(laxDirMsg,
-			"path", logtext.Path(dir), "dir", logtext.Path(s.root.Name()),
-			"mode", perm.String(), "want", os.FileMode(outputDirMode).String(),
-			"remediation", outputPermRemediation)
+	s.laxDirsChecked[dir] = struct{}{}
+	perm := fi.Mode().Perm()
+	if !laxerThan(perm, outputDirMode) {
+		s.standing.clear(key)
+		return
 	}
+	level := slog.LevelDebug
+	if s.standing.reportState(key, 1, perm.String()) {
+		level = slog.LevelWarn
+	}
+	// dir is root-relative, so "." for a flat /output; the root is named
+	// alongside it, matching logOrphanWalkOutcome's own directory-level records.
+	slog.Log(context.Background(), level, laxDirMsg,
+		attrCondition, condPermissiveDir, "path", logtext.Path(dir), "dir", logtext.Path(s.root.Name()),
+		"mode", perm.String(), "want", os.FileMode(outputDirMode).String(),
+		"remediation", outputPermRemediation)
 }
 
 // writeFileInRoot is store.write's confined atomic write, indirected through a
 // package var: the failure that decides a HEALTH outcome cannot be staged in a temp
 // directory.
-var writeFileInRoot = atomicfile.WriteFileInRoot
+var writeFileInRoot = filesafe.WriteFileInRoot
 
 // write publishes a PKCS#12 artifact under the bundle read/write ceiling.
 func (s *store) write(ctx context.Context, rel string, data []byte) writeRefusal {
@@ -123,43 +142,46 @@ func (s *store) writeBounded(ctx context.Context, rel string, data []byte, maxBy
 		// can widen it, so the directory is observed after creation rather than assumed.
 		s.reportLaxDir(rel)
 	}
-	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
+	parent, base, err := filesafe.OpenParentInRoot(s.root, rel)
 	if err != nil {
 		return refuseWrite(classifyPinRefusal(err),
 			"write output: pin output directory for %q: %w", rel, err)
 	}
 	defer func() { _ = parent.Close() }()
 	if _, err := writeFileInRoot(ctx, parent, base, data,
-		atomicfile.WithMode(outputFileMode),
-		atomicfile.WithMaxBytes(maxBytes),
+		filesafe.WithMode(outputFileMode),
+		filesafe.WithMaxBytes(maxBytes),
 	); err != nil {
 		return refuseWrite(classifyWriteErrno(err), "write output: %w", err)
 	}
+	s.artifactGone(rel)
 	return nil
 }
 
 // --- Stale-temp sweep (store-owned) ---
 
-// staleTempAge is the age past which an atomicfile temp is considered orphaned by
+// staleTempAge is the age past which a filesafe temp is considered orphaned by
 // an interrupted write rather than staged by one still in flight.
 const staleTempAge = time.Hour
 
 // sweepStaleTemps removes atomic-write temp files orphaned by an interrupted
-// write, then narrates the outcome.
-func (s *store) sweepStaleTemps(ctx context.Context) {
-	res, walkErr := atomicfile.CleanupStaleTempsInRoot(ctx, s.root, staleTempAge, atomicfile.WithRecursive(true))
-	s.logSweepOutcome(res, walkErr)
+// write, then narrates the outcome. swept is false when shutdown cut the sweep
+// short, which proves nothing either way.
+func (s *store) sweepStaleTemps(ctx context.Context) (degraded, swept bool) {
+	res, walkErr := filesafe.CleanupStaleTempsInRoot(ctx, s.root, staleTempAge, filesafe.WithRecursive(true))
+	return s.logSweepOutcome(res, walkErr), walkErr == nil || !IsShutdown(walkErr)
 }
 
 // logSweepOutcome emits the end-of-sweep logs: the walk error, the reclaimed-orphan
 // count, temps that could not be inspected or removed, and output sub-paths the
-// sweep could not enter.
-func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
+// sweep could not enter. It reports whether any of them leaves temps behind.
+func (s *store) logSweepOutcome(res filesafe.SweepResult, walkErr error) (degraded bool) {
 	logDir := logtext.Path(s.root.Name())
 	if walkErr != nil {
 		if IsShutdown(walkErr) {
 			slog.Debug("stale temp cleanup cancelled during shutdown", "dir", logDir, "error", logtext.Path(walkErr.Error()))
 		} else {
+			degraded = true
 			slog.Warn("stale temp cleanup failed", "dir", logDir, "error", logtext.Path(walkErr.Error()),
 				"remediation", outputPermRemediation)
 		}
@@ -170,13 +192,16 @@ func (s *store) logSweepOutcome(res atomicfile.SweepResult, walkErr error) {
 		slog.Info("reaped stale temp files", "dir", logDir, "count", res.Removed)
 	}
 	if res.Failed > 0 {
+		degraded = true
 		slog.Warn("some stale output temps could not be inspected or removed", "dir", logDir,
 			"count", res.Failed, "remediation", outputPermRemediation)
 	}
 	if res.Unreadable > 0 {
+		degraded = true
 		slog.Warn("some output paths could not be inspected during stale temp cleanup",
 			"dir", logDir, "count", res.Unreadable, "remediation", outputPermRemediation)
 	}
+	return degraded
 }
 
 // --- Output-derived currency ---
@@ -226,9 +251,10 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 	s.reportLaxDir(rel)
 	// Pin rel's parent ONCE and address the bundle by basename through that pin
 	// for both syscalls below.
-	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
+	parent, base, err := filesafe.OpenParentInRoot(s.root, rel)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
+		s.artifactGone(rel)
 		return contentVerifiedStale, nil
 	case err != nil:
 		// A pin this app cannot obtain degrades the same way a stat failure
@@ -244,6 +270,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 	fi, err := parent.Lstat(base)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
+		s.artifactGone(rel)
 		return contentVerifiedStale, nil
 	case err != nil:
 		slog.Warn("cannot stat prior pfx; regenerating",
@@ -251,6 +278,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 			"remediation", outputPermRemediation)
 		return contentUnverified, nil
 	case !fi.Mode().IsRegular():
+		s.artifactGone(rel)
 		// A symlink must never be followed here, or unrelated content could
 		// satisfy the check.
 		slog.Warn("prior output path is not a regular file; regenerating",
@@ -259,7 +287,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		return contentVerifiedStale, nil
 	}
 
-	reportLaxArtifact(rel, fi.Mode().Perm())
+	s.reportLaxArtifact(rel, fi.Mode().Perm())
 
 	if fi.Size() > maxPFXSize {
 		slog.Warn("prior pfx exceeds the readable bound; regenerating",
@@ -277,7 +305,7 @@ func (s *store) inspect(ctx context.Context, rel string, want convert.Analysis,
 		// contentVerifiedStale, so a rewrite this app is then refused stays a
 		// conversion failure rather than a health-neutral one.
 		content := contentUnverified
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, atomicfile.ErrNotRegular) {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, filesafe.ErrNotRegular) {
 			content = contentVerifiedStale
 		}
 		slog.Warn("cannot read prior pfx; regenerating",
@@ -336,9 +364,10 @@ func contentFromCurrency(ctx context.Context, rel string, res convert.Currency,
 // same bounded read — with a byte comparison where the PFX path decodes.
 func (s *store) inspectRaw(ctx context.Context, rel string, want []byte) (contentState, error) {
 	s.reportLaxDir(rel)
-	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
+	parent, base, err := filesafe.OpenParentInRoot(s.root, rel)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
+		s.artifactGone(rel)
 		return contentVerifiedStale, nil
 	case err != nil:
 		slog.Warn("cannot pin the output directory of a prior output; regenerating",
@@ -351,6 +380,7 @@ func (s *store) inspectRaw(ctx context.Context, rel string, want []byte) (conten
 	fi, err := parent.Lstat(base)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
+		s.artifactGone(rel)
 		return contentVerifiedStale, nil
 	case err != nil:
 		slog.Warn("cannot stat prior output; regenerating",
@@ -358,6 +388,7 @@ func (s *store) inspectRaw(ctx context.Context, rel string, want []byte) (conten
 			"remediation", outputPermRemediation)
 		return contentUnverified, nil
 	case !fi.Mode().IsRegular():
+		s.artifactGone(rel)
 		// A symlink must never be followed here, or unrelated content could
 		// satisfy the check.
 		slog.Warn("prior output path is not a regular file; regenerating",
@@ -366,7 +397,7 @@ func (s *store) inspectRaw(ctx context.Context, rel string, want []byte) (conten
 		return contentVerifiedStale, nil
 	}
 
-	reportLaxArtifact(rel, fi.Mode().Perm())
+	s.reportLaxArtifact(rel, fi.Mode().Perm())
 
 	if fi.Size() != int64(len(want)) {
 		return contentVerifiedStale, nil
@@ -377,7 +408,7 @@ func (s *store) inspectRaw(ctx context.Context, rel string, want []byte) (conten
 			return contentUnresolved, fmt.Errorf("read prior output: %w", errors.Join(ctxErr, err))
 		}
 		content := contentUnverified
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, atomicfile.ErrNotRegular) {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, filesafe.ErrNotRegular) {
 			content = contentVerifiedStale
 		}
 		slog.Warn("cannot read prior output; regenerating",
@@ -391,8 +422,8 @@ func (s *store) inspectRaw(ctx context.Context, rel string, want []byte) (conten
 	return contentVerifiedCurrent, nil
 }
 
-// laxArtifactMsg is the standing WARN for a prior artifact carrying a
-// permission bit outputFileMode does not.
+// laxArtifactMsg reports a prior artifact carrying a permission bit
+// outputFileMode does not.
 const laxArtifactMsg = "prior output is more permissive than policy; leaving its mode as found"
 
 // outputPinRemediation is the operator action behind every /output LAYOUT refusal
@@ -424,14 +455,61 @@ func laxerThan(perm, policy os.FileMode) bool {
 	return perm&^policy != 0
 }
 
-// reportLaxArtifact warns when a prior artifact's mode is laxer than
-// outputFileMode.
-func reportLaxArtifact(rel string, perm os.FileMode) {
+// reportLaxArtifact reports a prior artifact's permissive mode as a standing
+// condition keyed by the mode, and clears it once the mode is within policy.
+func (s *store) reportLaxArtifact(rel string, perm os.FileMode) {
+	key := standingKey{kind: condPermissiveFile, subject: rel}
 	if !laxerThan(perm, outputFileMode) {
+		s.standing.clear(key)
 		return
 	}
-	slog.Warn(laxArtifactMsg,
-		"path", logtext.Path(rel), "mode", perm.String(), "want", outputFileMode.String())
+	level := slog.LevelDebug
+	if s.standing.reportState(key, 1, perm.String()) {
+		level = slog.LevelWarn
+	}
+	slog.Log(context.Background(), level, laxArtifactMsg,
+		attrCondition, condPermissiveFile, "path", logtext.Path(rel), "mode", perm.String(), "want", outputFileMode.String())
+}
+
+// artifactGone clears rel's permissive-mode condition: nothing this app wrote is
+// at rel any more, or a fresh write put outputFileMode there.
+func (s *store) artifactGone(rel string) {
+	s.standing.clear(standingKey{kind: condPermissiveFile, subject: rel})
+}
+
+// holdsDir reports whether /output may hold a directory at rel: one is there, or
+// the answer is unknown.
+func (s *store) holdsDir(rel string) bool {
+	fi, err := s.root.Lstat(rel)
+	if err != nil {
+		return !errors.Is(err, fs.ErrNotExist)
+	}
+	return fi.IsDir()
+}
+
+// clearUnmanaged ends the permissive-mode conditions on paths no expected
+// artifact lives at or under. Only a scan that saw the whole tree may call it.
+func (s *store) clearUnmanaged(expected map[string]struct{}) {
+	dirs := make(map[string]struct{})
+	for artifact := range expected {
+		for dir := path.Dir(artifact); ; dir = path.Dir(dir) {
+			if _, ok := dirs[dir]; ok {
+				break
+			}
+			dirs[dir] = struct{}{}
+			if dir == "." {
+				break
+			}
+		}
+	}
+	s.standing.clearUnless(condPermissiveFile, func(rel string) bool {
+		_, ok := expected[rel]
+		return ok
+	})
+	s.standing.clearUnless(condPermissiveDir, func(dir string) bool {
+		_, ok := dirs[dir]
+		return ok
+	})
 }
 
 // writeRefusalCause names WHAT refused an /output write, as the site that refused it
@@ -454,7 +532,7 @@ const (
 	// refusalVolume: the volume will not take the bytes (EROFS / ENOSPC / EDQUOT).
 	refusalVolume
 	// refusalModeNotStored: the volume will not keep a new file at outputFileMode
-	// (atomicfile.ErrModeNotStored), typically a default ACL that widens it.
+	// (filesafe.ErrModeNotStored), typically a default ACL that widens it.
 	refusalModeNotStored
 	// refusalTransient: the write failed for something that is NOT a steady-state
 	// condition of the operator's volume — a transient I/O error, an artifact
@@ -462,7 +540,7 @@ const (
 	refusalTransient
 
 	// refusalCauseCount is the enum's LENGTH, not a cause.
-	//deadset:ignore DS1004 -- Sentinel the exhaustive cause test iterates up to, so a newly added cause cannot go uncharacterised.
+	//deadset:ignore DS1102 -- Sentinel the exhaustive cause test iterates up to, so a newly added cause cannot go uncharacterised.
 	refusalCauseCount
 )
 
@@ -522,9 +600,9 @@ func refuseWrite(cause writeRefusalCause, format string, args ...any) writeRefus
 // errnos of the directory creation.
 func classifyWriteErrno(err error) writeRefusalCause {
 	switch {
-	case errors.Is(err, atomicfile.ErrModeNotStored):
+	case errors.Is(err, filesafe.ErrModeNotStored):
 		return refusalModeNotStored
-	// fs.ErrPermission covers both EPERM and EACCES: atomicfile's confined write
+	// fs.ErrPermission covers both EPERM and EACCES: filesafe's confined write
 	// returns an *fs.PathError wrapping a syscall.Errno, and Errno.Is maps both
 	// onto fs.ErrPermission (and only those, of the ones reachable here).
 	case errors.Is(err, fs.ErrPermission):
@@ -548,7 +626,7 @@ func classifyPinRefusal(err error) writeRefusalCause {
 
 // readBoundedInRoot reads an artifact inside the output tree under the
 // caller's format-specific ceiling.
-var readBoundedInRoot = atomicfile.ReadBoundedInRoot
+var readBoundedInRoot = filesafe.ReadBoundedInRoot
 
 // --- Output lifecycle: the /output half ---
 
@@ -557,7 +635,7 @@ var readBoundedInRoot = atomicfile.ReadBoundedInRoot
 // enough for a deletion decision to rest on it.
 func (s *store) listOutputs(ctx context.Context) (found []string, safe bool, err error) {
 	walk := outputWalk{budget: scanbudget.NewCounter(s.maxEntries), formats: s.formats}
-	if err := atomicfile.WalkDirInRoot(ctx, s.root, func(rel string, d fs.DirEntry, err error) error {
+	if err := filesafe.WalkDirInRoot(ctx, s.root, func(rel string, d fs.DirEntry, err error) error {
 		return walk.visit(ctx, rel, d, err)
 	}); err != nil {
 		// The entry-budget stop's per-path counts are observations rather than
@@ -642,6 +720,9 @@ func (w *outputWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err e
 // logOrphanWalkOutcome emits the orphan walk's single aggregate Warn.
 func (s *store) logOrphanWalkOutcome(unreadable, symlinked int) {
 	logDir := logtext.Path(s.root.Name())
+	if unreadable > 0 || symlinked > 0 {
+		s.reapDisabled = true
+	}
 	if unreadable > 0 {
 		slog.Warn("some output paths could not be read while looking for orphans; "+reapDisabledPhrase,
 			"dir", logDir, "count", unreadable,
@@ -679,7 +760,7 @@ func (s *store) removeOrphan(rel string) reapAttempt {
 	// One sanitized rendering for every record this attempt can emit; `rel`
 	// itself stays raw for the pin and the unlink below.
 	logRel := logtext.Path(rel)
-	parent, base, err := atomicfile.OpenParentInRoot(s.root, rel)
+	parent, base, err := filesafe.OpenParentInRoot(s.root, rel)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			slog.Debug("orphaned output vanished before removal", "path", logRel)

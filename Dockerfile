@@ -8,15 +8,16 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download
 COPY *.go ./
 COPY internal/ internal/
+ARG BUILD_VERSION=dev
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /cert-watcher .
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${BUILD_VERSION}" -o /cert-watcher .
 COPY LICENSE NOTICE ./
 COPY scripts/collect-licenses.sh scripts/
 RUN --mount=type=cache,target=/go/pkg/mod \
     sh scripts/collect-licenses.sh --name cert-converter .
 
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
 
 COPY --chmod=755 --from=builder /cert-watcher /cert-watcher
 COPY --from=builder /out/usr/share/licenses /usr/share/licenses

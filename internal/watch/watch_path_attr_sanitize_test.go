@@ -11,7 +11,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/logtext"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -53,7 +53,7 @@ func TestWatchRecords_sanitize_walk_supplied_names_in_log_attributes(t *testing.
 	}
 
 	watcher := newTestWatcher(t)
-	w := New(root, func(context.Context) {})
+	w := New(root, func(context.Context, bool) {})
 
 	logs := capture.Default(t)
 

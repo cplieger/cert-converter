@@ -10,7 +10,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/testcerts"
-	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 // TestScannerRun_reports_a_new_input_observation_once_on_an_unchanged_output pins
@@ -294,7 +294,7 @@ func TestObservationLog_forgetPair_spends_wholeness_without_resetting_deduplicat
 
 	// A COMPLETE walk that no longer sees the path prunes both halves, so a pair that
 	// comes back is reported once again.
-	o.forget(map[string]struct{}{})
+	o.forget(func(string) bool { return false })
 	o.note("tls.crt", fp, obs)
 	if got := countObservation(logs, convert.ObsLeafNotFirst); got != 2 {
 		t.Errorf("input re-read after forget logged %d leaf-not-first observations in total, want 2: forget prunes the signature as well as the wholeness",
@@ -306,14 +306,10 @@ func TestObservationLog_forgetPair_spends_wholeness_without_resetting_deduplicat
 }
 
 // TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unwritable
-// pins the once-per-change rule on the OTHER steady-state arm: a bundle this app could
-// not verify at all, whose replacing rewrite the output directory refused
-// (statusUnwritable). That condition recurs on every scan for as long as the operator
-// leaves /output as it is, so emitting the pair's input observations before the write
-// outcome is known re-named the same malformed input on every fsnotify event and every
-// fallback tick. The standing condition itself keeps its own per-scan WARN
-// (unreplaceableBundleMsg): the operator must keep being told /output is foreign-owned,
-// without the input diagnostic riding along.
+// pins the once-per-change rule on a bundle this app could not verify, whose
+// rewrite /output refused (statusUnwritable). That holds on every scan while
+// /output stays as it is, so neither the pair's input observations nor the
+// standing refusal may repeat per scan; the end-of-scan record carries the count.
 //
 // Serial: it swaps slog.Default() and the write seam.
 func TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unwritable(t *testing.T) {
@@ -352,6 +348,7 @@ func TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unw
 	// is the unverifiable one.
 	pfxPath := filepath.Join(outRoot, "chain.pfx")
 	stageOversizedBundle(t, pfxPath)
+	realWrite := writeFileInRoot
 	stubWriteRefusal(t, &fs.PathError{Op: "openat", Path: "chain.pfx", Err: syscall.EACCES})
 
 	logs := captureLogs(t)
@@ -371,8 +368,8 @@ func TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unw
 		t.Errorf("Run(unwritable output) logged %q at WARN %d times, want 1", unreplaceableArtifactMsg, got)
 	}
 
-	// Steady state: same inputs, same refusal. The condition repeats, the input
-	// diagnostic does not.
+	// Steady state: same inputs, same refusal. Neither the condition nor the input
+	// diagnostic is logged again.
 	res, err = scanner.Run(t.Context())
 	if err != nil {
 		t.Fatalf("Run(second unwritable scan) = error %v, want nil", err)
@@ -384,8 +381,18 @@ func TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unw
 		t.Errorf("two unwritable scans logged %d leaf-not-first observations in total, want 1: an"+
 			" already-reported input condition must not re-emit while the output stays foreign-owned", got)
 	}
-	if got := logs.CountLevel(slog.LevelWarn, unreplaceableArtifactMsg); got != 2 {
-		t.Errorf("two unwritable scans logged %q at WARN %d times, want 2 (one per scan): the standing"+
-			" condition keeps its own diagnostic", unreplaceableArtifactMsg, got)
+	if got := logs.CountLevel(slog.LevelWarn, unreplaceableArtifactMsg); got != 1 {
+		t.Errorf("two unwritable scans logged %q at WARN %d times, want 1: a standing condition is"+
+			" logged when it appears, not on every scan", unreplaceableArtifactMsg, got)
+	}
+
+	// The write goes through: the clear names the artifact under the onset's key.
+	writeFileInRoot = realWrite
+	if _, err := scanner.Run(t.Context()); err != nil {
+		t.Fatalf("Run(output writable again) = error %v, want nil", err)
+	}
+	onset, _ := logs.AttrValueExact(unreplaceableArtifactMsg, "output_path")
+	if cleared, ok := logs.AttrValueExact(standingClearedMsg, "output_path"); !ok || cleared != onset {
+		t.Errorf("the clear record's output_path = %q (present %v), want the onset's %q; log = %q", cleared, ok, onset, logs.Messages())
 	}
 }
