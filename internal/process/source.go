@@ -13,14 +13,6 @@ type source struct {
 	root *os.Root
 }
 
-// stat returns the error resolving rel within the input tree, without
-// following a symlink out of it. Used to classify a pair's sibling key before
-// committing to a read.
-func (s *source) stat(rel string) error {
-	_, err := s.root.Stat(rel)
-	return err
-}
-
 // readBounded opens rel within the input tree and reads it under
 // convert.MaxInputBytes (10 MB) — the cap internal/convert's acceptance bounds are
 // calibrated against, stated there so raising it lands in the diff beside the bounds

@@ -1497,25 +1497,18 @@ func (o *observationLog) forget(keep func(rel string) bool) {
 // of it.
 const inputPermRemediation = "check /input permissions and that the container runs as a UID that can read it, and that each certificate path is a regular file inside the mount, not a directory or a symlink out of it"
 
-// readPair resolves and reads the input side of one .crt entry: it classifies
-// the sibling .key (a key that is not there is a health-neutral statusOrphan, or the
-// transient statusVanished when this process had already read the pair whole — see
-// noteMissingKey; a non-ENOENT stat failure is statusUnreadable instead, because the
-// key is there and cannot be read — health-neutral too, but it also blocks orphan
-// reaping, which an orphan does not) and then performs both bounded reads through the
-// input source, so every /input byte is read once from within the confined root.
+// readPair reads one pair through the input source, after judging its sibling
+// key: an Absent key is an orphan or a vanish (noteMissingKey), and an Unproven
+// one is unreadable, which also blocks orphan reaping.
 func (sw *scanWalk) readPair(ctx context.Context, rel, keyRel string) (pairInputs, conversionStatus) {
-	if statErr := sw.src.stat(keyRel); statErr != nil {
-		if missingErr(statErr) {
-			return pairInputs{}, sw.noteMissingKey(rel, keyRel)
-		}
-		// A non-ENOENT stat failure (a sibling key that is a symlink the *os.Root
-		// refuses because it escapes /input, or a permission/IO error) is NOT a
-		// genuine "no key" orphan — the key is there and cannot be read.
+	switch key := sw.leaf(keyRel); judgeFacts(key, roleFile) {
+	case verdictAbsent:
+		return pairInputs{}, sw.noteMissingKey(rel, keyRel)
+	case verdictUnproven:
 		level, attrs := sw.standing.reportPath(condUnreadablePath, keyRel)
 		slog.Log(context.Background(), level, "skipping cert: cannot stat sibling key",
 			append(attrs, "source", logtext.Path(rel),
-				"error", logtext.Path(statErr.Error()), "remediation", inputPermRemediation)...)
+				"error", logtext.Path(key.err.Error()), "remediation", inputPermRemediation)...)
 		return pairInputs{}, statusUnreadable
 	}
 

@@ -187,11 +187,14 @@ func (s *Scanner) loadClaims(ctx context.Context, out *store) {
 // retries on every scan until a write succeeds. A shutdown does not stop the
 // write: the ledger change it carries is already what this process acts on.
 func (s *Scanner) persistClaims(ctx context.Context, out *store) {
+	key := standingKey{kind: condClaimsUnwritable}
 	if s.claimsPersisted == nil && len(s.claims) == 0 {
+		s.standing.clear(key)
 		return
 	}
 	data, err := encodeClaims(s.claims)
 	if err == nil && bytes.Equal(data, s.claimsPersisted) {
+		s.standing.clear(key)
 		return
 	}
 	if err == nil {
@@ -200,7 +203,6 @@ func (s *Scanner) persistClaims(ctx context.Context, out *store) {
 	if err == nil {
 		err = out.writeBounded(context.WithoutCancel(ctx), claimsFile, data, claimsCeiling(s.opts.MaxScanEntries))
 	}
-	key := standingKey{kind: condClaimsUnwritable}
 	if err != nil {
 		level := slog.LevelDebug
 		if s.standing.report(key, 1) {

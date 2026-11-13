@@ -150,7 +150,8 @@ func (s *source) judge(rel string) (verdict, error) {
 	if !f.linked && f.shape == shapeUnresolved {
 		return verdictUnproven, f.err
 	}
-	// The full path resolved, so every link on the way is an in-root directory.
+	// rel's own Lstat succeeded, so every ancestor resolved inside the root and a
+	// link among them is an alias, even when a final link did not resolve.
 	for dir := path.Dir(rel); dir != "."; dir = path.Dir(dir) {
 		fi, err := s.root.Lstat(dir)
 		if err != nil {

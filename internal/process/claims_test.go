@@ -442,6 +442,62 @@ func TestClaims_reports_a_failed_write_and_keeps_the_record_in_memory(t *testing
 	}
 }
 
+// TestClaims_clears_a_failed_write_when_nothing_is_left_to_write pins that a
+// ledger returning to what /output already holds clears claims_unwritable, so
+// the next failed write warns again.
+// Serial: it swaps slog.Default() and the write seam.
+func TestClaims_clears_a_failed_write_when_nothing_is_left_to_write(t *testing.T) {
+	t.Run("ledger_empties_before_any_write", func(t *testing.T) {
+		in, out := t.TempDir(), t.TempDir()
+		stubClaimsWrites(t, func() error { return &fs.PathError{Op: "openat", Path: claimsName, Err: syscall.EROFS} })
+		logs := captureLogs(t)
+		scanner := newVerdictScanner(in, out, Options{Layout: outputpolicy.LayoutFlat})
+		writeSelfSignedPair(t, in, "x")
+		runScans(t, scanner, 1)
+		for _, name := range []string{"x.crt", "x.key"} {
+			if err := os.Remove(filepath.Join(in, name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		runScans(t, scanner, 1)
+		if got := clearCount(logs, "claims_unwritable", ""); got != 1 {
+			t.Errorf("the scan that left nothing to write logged %d claims_unwritable clears, want 1", got)
+		}
+		writeSelfSignedPair(t, in, "x")
+		runScans(t, scanner, 1)
+		if got := conditionCount(logs, slog.LevelWarn, "claims_unwritable", ""); got != 2 {
+			t.Errorf("the two failed writes logged %d claims_unwritable WARNs, want 2", got)
+		}
+	})
+	t.Run("ledger_returns_to_the_written_record", func(t *testing.T) {
+		in, _ := claimantTree(t, "a", "b")
+		out := t.TempDir()
+		refused := false
+		stubClaimsWrites(t, func() error {
+			if refused {
+				return &fs.PathError{Op: "openat", Path: claimsName, Err: syscall.EROFS}
+			}
+			return nil
+		})
+		logs := captureLogs(t)
+		scanner := newVerdictScanner(in, out, Options{Layout: outputpolicy.LayoutFlat})
+		runScans(t, scanner, 1)
+		refused = true
+		addClaimant(t, in, "c")
+		runScans(t, scanner, 1)
+		removePair(t, in, "c")
+		runScans(t, scanner, 1)
+		if got := clearCount(logs, "claims_unwritable", ""); got != 1 {
+			t.Errorf("the scan back at the written record logged %d claims_unwritable clears, want 1", got)
+		}
+		addClaimant(t, in, "c")
+		runScans(t, scanner, 1)
+		if got := conditionCount(logs, slog.LevelWarn, "claims_unwritable", ""); got != 2 {
+			t.Errorf("the two failed writes logged %d claims_unwritable WARNs, want 2", got)
+		}
+	})
+}
+
 // TestClaims_owner_gate_guards_only_absence_reaps pins that the recorded owner
 // keeps only the artifacts whose removal rests on the source being gone: an
 // excluded owner's artifact, a switched-off format's and the other layout's are
