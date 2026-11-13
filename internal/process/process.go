@@ -532,6 +532,9 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 	if sw.ignoreDisabledBundle(rel) {
 		return nil
 	}
+	// A source-named entry that is not a directory claims its stem until the scan
+	// finds the entry gone, whatever a link there points at, so a link that dangles
+	// still claims. The link rules of this walk are to be ruled together.
 	if sw.layoutMode == outputpolicy.LayoutFlat {
 		sw.pendingSources = append(sw.pendingSources, rel)
 		return nil
@@ -843,8 +846,9 @@ func (sw *scanWalk) resolveFlatOrphanCert(ctx context.Context, rel string) (bool
 
 // noteUnwalkableSymlink records a symlink the walk enumerated, which it never
 // descends. One the scan cannot resolve through the input root keeps what is
-// under it unreached and, unless its name makes it an input that reports its
-// own read, is warned about and counted.
+// under it unreached. Unless its name makes it an input, it is also warned about
+// and counted; a link named like an input is not reported as a link, and only a
+// bundle reports a read failure of its own.
 func (sw *scanWalk) noteUnwalkableSymlink(rel string, d fs.DirEntry) {
 	if d.Type()&fs.ModeSymlink == 0 {
 		return
