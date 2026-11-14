@@ -10,7 +10,7 @@ Every setting is an environment variable. The container reads them once when it 
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `PFX_PASSWORD` | Password every PFX file carries, needed unless `PFX_PASSWORD_FILE` is set. A blank value stops the container at start. | required |
+| `PFX_PASSWORD` | The one password every PFX file carries, needed unless `PFX_PASSWORD_FILE` is set. A blank value stops the container at start. | required |
 | `PFX_PASSWORD_FILE` | Path to a Docker secret holding that password. It wins over `PFX_PASSWORD`. | _(unset)_ |
 | `PFX_ALLOW_EMPTY_PASSWORD` | Set to `true` to allow a blank password, which leaves the private key in each PFX file unprotected. | `false` |
 
@@ -91,20 +91,28 @@ Do not use permissions to leave out a path. A path cert-converter cannot read co
 - `keep` is silent and never deletes.
 - An unrecognized value logs a WARN and uses `warn`.
 
-Only `sync` ever deletes anything, and it removes only files in cert-converter's own output shape, never a folder. It deletes nothing unless the scan proves it read `/input` completely. That proof needs at least one source found, a walk that finished within `MAX_SCAN_ENTRIES`, and no unreadable path, unresolvable symlink, conversion failure or output-name collision. A symlink is unresolvable when it leaves `/input`, loops, or is absolute, even one naming a path inside `/input`. An unresolvable symlink named like a bundle counts as an unreadable bundle and stops removal, except while bundle input is off or a PEM pair of the same name shadows it, because cert-converter then never reads it. One named like a certificate or key stops removal only when it is read with its pair and counts as an unreadable path. Otherwise `sync` keeps the outputs of every input cert-converter has seen behind the link, after a restart too, and a WARN names the link while it hides one. A scan without that proof logs `orphan removal is disabled for this scan` and removes nothing, so a broken or empty mount is never read as "every certificate was deleted". Every scan that deletes something logs a WARN with the count and a sample of the paths.
+Only `sync` ever deletes anything, and it removes only files in cert-converter's own output shape, never a folder. It deletes nothing unless the scan proves it read `/input` completely. That proof needs at least one source found, a walk that finished within `MAX_SCAN_ENTRIES`, and no unreadable path, unresolvable symlink, conversion failure or output-name collision. A scan without that proof logs `orphan removal is disabled for this scan` and removes nothing, so a broken or empty mount is never read as "every certificate was deleted". Every scan that deletes something logs a WARN with the count and a sample of the paths.
+
+A symlink is unresolvable when it leaves `/input`, loops, or is absolute, even one naming a path inside `/input`. An unresolvable symlink named like a bundle counts as an unreadable bundle and stops removal. That does not apply while bundle input is off or a PEM pair of the same name shadows the link, because cert-converter then never reads it.
+
+An unresolvable symlink named like a certificate or key stops removal only when it is read with its pair and counts as an unreadable path. Otherwise `sync` keeps the outputs of every input cert-converter has seen behind the link, after a restart too, and a WARN names the link while it hides one.
 
 An output whose `<name>.key` is still present is kept and reported by its own WARN, because a half-written or half-deleted pair does not prove the certificate is gone. Finish the change under `/input` by adding the matching `<name>.crt` or removing the leftover `<name>.key`, and the next scan removes the output. A `<name>.key` symlink cert-converter cannot resolve keeps the output too, because it may still lead to a private key.
 
-A relative source or key symlink whose target does not exist inside `/input` counts as deleted, so under `sync` its outputs go as a deleted source's do. A WARN with `condition=dangling_source_link` names the link and its target when it appears and once after each restart, and a `standing condition cleared` record follows once the link is fixed or removed. A folder, or anything else that is not a regular file, at a source or key name is the opposite case: it counts as an unreadable path, keeps its outputs, stops removal and draws a WARN until you replace it with a regular file. An absolute symlink is unresolvable whether or not its target exists, so make links under `/input` relative.
+A relative source or key symlink whose target does not exist inside `/input` counts as deleted, so under `sync` its outputs go as a deleted source's do. A WARN with `condition=dangling_source_link` names the link and its target when it appears and once after each restart. A `standing condition cleared` record follows once the link is fixed or removed. An absolute symlink is unresolvable whether or not its target exists, so make links under `/input` relative.
+
+A folder, or anything else that is not a regular file, at a source or key name does not count as deleted. It counts as an unreadable path, keeps its outputs, stops removal and draws a WARN until you replace it with a regular file.
 
 ## Flat ownership record
 
 Under `OUTPUT_LAYOUT=flat`, cert-converter keeps a small record at `/output/.cert-converter-claims.json`. For each output name it lists the inputs that claim the name and the input whose conversion wrote the current outputs. It holds paths under `/input` and no key material, is written at mode `0600`, and changes only when a claim or an owner does.
 
-The record carries two things across a restart. A name collision stays a collision while one of its inputs is out of reach, so the restarted process never publishes the other input under the shared name. Under `sync`, an output whose source is gone is removed only once a scan has reached the input that wrote it and found it gone, no longer claiming the name, or covered by `INPUT_EXCLUDE_PATHS`. An output whose input sits behind an unreadable folder or an unresolvable symlink is kept. Outputs of a format you switched off, or laid out for another `OUTPUT_LAYOUT`, are removed as before, because that removal rests on the setting and not on a source being gone.
+The record carries two things across a restart. A name collision stays a collision while one of its inputs is out of reach, so the restarted process never publishes the other input under the shared name. Under `sync`, an output whose source is gone is removed only once a scan has reached the input that wrote it. That scan must find the input gone, no longer claiming the name, or covered by `INPUT_EXCLUDE_PATHS`.
+
+An output whose input sits behind an unreadable folder or an unresolvable symlink is kept. Outputs of a format you switched off, or laid out for another `OUTPUT_LAYOUT`, are removed as before, because that removal rests on the setting and not on a source being gone.
 
 - Deleting the file is safe. The next scan rebuilds it, and when `/output` already holds outputs a WARN with `condition=claims_rebuilt` says that an output whose input that scan cannot reach is not protected during it.
-- A file cert-converter cannot use, because it is unreadable, damaged, too large, from an unknown version or not a regular file, draws one WARN with `condition=claims_unreadable` at start. cert-converter then starts from an empty record and replaces the file at the next change.
+- A file cert-converter cannot use, because it is unreadable, damaged, too large, from an unknown version or not a regular file, draws one WARN with `condition=claims_unreadable` at start. The process then starts from an empty record and replaces the file at the next change.
 - A failed write draws a standing WARN with `condition=claims_unwritable`. The running process keeps using its record in memory and retries at the next scan, but a restart before a write succeeds forgets which input owns each output.
 - None of these affects health or a scan count.
 - The file is never removed, counted or reported as an output, and apps that read `/output` can ignore it.
@@ -160,7 +168,9 @@ Create the host output folder, owned by that user, before the first start. With 
 
 Generated files are mode `0600` and the folders cert-converter creates are `0750`, all owned by that user. The output folder must keep that mode. If inherited ACL entries widen new files there, the startup log warns, every write is refused, and the `remediation` field names the entries to remove. The app that reads them must run as the same user or as a privileged process. Group membership is not enough, because mode `0600` gives the group no read access.
 
-cert-converter never changes the mode of what it finds under `/output`. An output folder more permissive than `0750`, or a file more permissive than `0600`, draws a WARN naming the mode and is left as found. The WARN is logged when cert-converter first finds the mode, again when the mode changes and once after each restart, and a `standing condition cleared` record follows once the mode is tightened or the path is gone. Tighten it yourself, because a group-writable or world-writable output folder lets any other process on that mount replace a file. A file cert-converter writes again, for example after a renewal, lands at `0600`.
+cert-converter never changes the mode of what it finds under `/output`. An output folder more permissive than `0750`, or a file more permissive than `0600`, draws a WARN naming the mode and is left as found.
+
+The WARN is logged when cert-converter first finds the mode, again when the mode changes and once after each restart. A `standing condition cleared` record follows once the mode is tightened or the path is gone. Tighten it yourself, because a group-writable or world-writable output folder lets any other process on that mount replace a file. A file cert-converter writes again, for example after a renewal, lands at `0600`.
 
 An inherited ACL that widens new files, for example on ZFS, stops `/output` from keeping mode `0600`. So does a filesystem that does not store Unix file modes. cert-converter then writes nothing there, and the startup log warns about it at once and names the fix.
 

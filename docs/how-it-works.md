@@ -11,7 +11,7 @@ Every path the scan meets gets one verdict, and the conversion, the collision ch
 - A regular file, or a relative symlink to one inside `/input`, is present and is read under the link's own path.
 - A missing file, a relative symlink whose target does not exist inside `/input`, or a path through a file is absent, and counts as deleted.
 - A relative symlink to a folder inside `/input` is not followed, because the scan reaches that folder under its own path. A path through the link is not an input.
-- Anything else is unproven: a symlink that leaves `/input`, loops or cannot be read, an absolute symlink even when it names a path inside `/input`, a relative one that climbs out of `/input` and back in, an unreadable file, and a folder or other non-regular file at a certificate, key or bundle name. An unproven path proves nothing about what lies at or behind it, so every input seen there keeps its claim and its outputs, and cleanup removes nothing that may come from it.
+- Anything else is unproven. That covers a symlink that leaves `/input`, loops or cannot be read, and an absolute symlink even when it names a path inside `/input`. It also covers a relative symlink that climbs out of `/input` and back in, and an unreadable file. A folder or other non-regular file at a certificate, key or bundle name is unproven too. An unproven path proves nothing about what lies at or behind it, so every input seen there keeps its claim and its outputs, and cleanup removes nothing that may come from it.
 
 Each PFX output holds the private key, the certificate and the chain of issuing certificates from its source, whether that source is a PEM pair or a bundle. RSA, ECDSA, Ed25519 and ML-DSA keys are all supported.
 
@@ -31,9 +31,15 @@ By default an output is named after the certificate's own folder, not after the 
 
 When two inputs would produce the same output name, cert-converter converts neither and turns the container unhealthy. Picking one would publish one certificate under another's name, so it leaves the choice to you. [Configuration](configuration.md#output-formats-and-layout) has the details.
 
+An input a scan has seen claim an output name keeps that claim while later scans cannot reach it. That happens behind an unreadable folder or a link the scan cannot follow, and past a stop at `MAX_SCAN_ENTRIES`. The claim ends when a scan reaches the input and finds it gone or no longer claiming the name, or when `INPUT_EXCLUDE_PATHS` covers it. The [ownership record](configuration.md#flat-ownership-record) keeps the claims across a restart.
+
+The collision clears once fewer than two claims are left, and the remaining input converts once a scan reaches it. An input out of reach, whether or not it ever collided, still blocks a new input that claims the same name.
+
 ## Health
 
-After each scan, the main process keeps its health verdict in memory: healthy when the scan read `/input` and had no conversion failure and no output-name collision. It mirrors that verdict to a file at `/dev/shm/cert-converter.healthy`, refreshing the file after each healthy scan and removing it after an unhealthy one. The `health` subcommand passes while that file exists and is fresher than three times the guaranteed recheck cadence. That is 18 hours on the 6-hour default, and 72 hours when `FALLBACK_SCAN_HOURS` is `0`, `false` or above 24, because the 24-hour floor applies then. A staler file means the watch loop is stuck. The startup line reports both numbers, `fallback_scan` for your cadence or `disabled`, and `scan_floor` for the guaranteed one the deadline comes from.
+After each scan, the main process keeps its health verdict in memory. The verdict is healthy when the scan read `/input` and had no conversion failure and no output-name collision. The process mirrors that verdict to a file at `/dev/shm/cert-converter.healthy`, refreshing the file after each healthy scan and removing it after an unhealthy one.
+
+The `health` subcommand passes while that file exists and is fresher than three times the guaranteed recheck cadence. That is 18 hours on the 6-hour default, and 72 hours when `FALLBACK_SCAN_HOURS` is `0`, `false` or above 24, because the 24-hour floor applies then. A staler file means the watch loop is stuck. The startup line reports both numbers, `fallback_scan` for your cadence or `disabled`, and `scan_floor` for the guaranteed one the deadline comes from.
 
 With `METRICS_LISTEN_ADDR` set, `/healthz` reads the verdict in memory against the same deadline, so it and the healthcheck agree while the file can be written. If `/dev/shm` cannot be written, the healthcheck passes and the startup log says so, while `/healthz` still gives the true answer.
 
@@ -45,7 +51,9 @@ The container is unhealthy when any of these holds:
 - A certificate fails to convert. The causes are a PEM or key parse error, a PFX decode failure, a certificate that does not match its key, and a failed write. The failure keeps counting while later scans cannot reach the source, for example behind an unreadable path, because nothing has shown it fixed.
 - Two inputs collide on one output name under the flat layout.
 
-It recovers on the next clean scan without a restart. Docker Engine does not act on health status itself. An orchestrator that does, such as Swarm or Kubernetes, restarts the container, and under plain Docker Compose the restart is yours to do. Nothing tells you about an unhealthy container unless something watches Docker health, as [Monitoring and alerts](monitoring.md#knowing-the-app-is-alive) explains. A restart does not clear a collision, so the container stays unhealthy. That is deliberate, because nothing else tells an orchestrator that an app is reading a file cert-converter refuses to update. Under the flat layout a small record in `/output` lists each output name's claimants, so the restarted process keeps a claimant it cannot reach yet, and never publishes the other input under the shared name.
+It recovers on the next clean scan without a restart. Docker Engine does not act on health status itself. Docker Swarm replaces an unhealthy container, and under plain Docker Compose the restart is yours to do. Nothing tells you about an unhealthy container unless something watches Docker health, as [Monitoring and alerts](monitoring.md#knowing-the-app-is-alive) explains.
+
+A restart does not clear a collision, so the container stays unhealthy. That is deliberate, because nothing else tells an orchestrator that an app is reading a file cert-converter refuses to update. Under the flat layout, a small record in `/output` lists each output name's claimants. The restarted process therefore keeps a claimant it cannot reach yet, and never publishes the other input under the shared name.
 
 Health tracks only failures a restart can clear, plus a collision a restart keeps. These conditions are logged at WARN with the action to take and leave health unchanged:
 
