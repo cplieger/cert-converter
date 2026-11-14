@@ -3,24 +3,24 @@
 [![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/cert-converter/badges/size.json)](https://github.com/cplieger/cert-converter/pkgs/container/cert-converter) [![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)](https://github.com/cplieger/cert-converter/pkgs/container/cert-converter) [![base: Distroless](https://img.shields.io/badge/base-Distroless_nonroot-4285F4?logo=google)](https://github.com/cplieger/cert-converter/blob/main/Dockerfile) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/cert-converter/badges/mutation.json)](https://github.com/cplieger/cert-converter/issues?q=label%3Agremlins-tracker) [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/cert-converter/releases)
 
 <!-- hub-overview BEGIN -->
-cert-converter keeps PFX copies of your certificates current as they renew, for apps that accept only PFX. It does not request certificates or restart the apps that read them.
+cert-converter keeps PFX copies of your certificates current as they renew, for apps that accept only PFX. It does not request certificates, and it does not restart the app that reads the PFX file.
 
 ## What it does
 
-cert-converter renews the PFX file your app reads each time its certificate renews.
+cert-converter updates the PFX file your app reads each time its certificate renews.
 
-- Writes a password-protected PFX file for each `<name>.crt` and `<name>.key` pair, with the chain from the `.crt` file.
+- Writes a password-protected PFX file for each `<name>.crt` and `<name>.key` pair, with its issuing certificates and an RSA, ECDSA, Ed25519 or ML-DSA key.
 - Converts again a few seconds after a renewal, and rechecks the whole folder every 6 hours by default.
-- Can also turn PFX or P12 bundles into PEM files, or write PEM copies beside the PFX files.
-- Leaves a file untouched while it matches its certificate, password and encoding profile.
+- Can also turn `.pfx` and `.p12` bundles into PEM files, or write PEM copies beside the PFX files.
+- Leaves a converted file untouched while it matches its certificate, key, password and `PFX_ENCODER`.
 
 ## Who it is for
 
-cert-converter is built for people whose reverse proxy or certificate tool already renews certificates as files, and who run an app that takes only PFX. Examples are .NET apps, Windows tools and the Synology services that take only PFX. It reads `<name>.crt` and `<name>.key` pairs, the way Caddy saves each site's certificate. Certbot's `fullchain.pem` and `privkey.pem` are not read. Your app must reread the PFX file, or be restarted, to use a renewed certificate.
+cert-converter is built for people whose app takes only PFX, as some .NET apps, Windows tools and Synology services do. Their reverse proxy or certificate tool renews certificates as files. It reads `<name>.crt` and `<name>.key` pairs, as Caddy saves them, not Certbot's `fullchain.pem` and `privkey.pem`. It runs no command after a write, so your app must reread the PFX file or restart to use a renewed certificate.
 
-You need Docker on an `amd64` or `arm64` machine, and read access to the certificate files for the container's user.
+You need Docker on `amd64` or `arm64`, with the certificate files readable by the container's user.
 
-Consider [acme.sh](https://github.com/acmesh-official/acme.sh) if you want your certificate tool to write the PFX file itself. Its `--to-pkcs12` command exports a certificate and key as a password-protected PFX file.
+Consider [acme.sh](https://github.com/acmesh-official/acme.sh) if you want your certificate tool to write the PFX itself. Its `--to-pkcs12` command exports a certificate and key to a PFX file, and `--password` protects it.
 
 cert-converter is free software under the GPL-3.0-or-later license.
 <!-- hub-overview END -->
@@ -43,7 +43,7 @@ services:
       # Put PFX_PASSWORD=<a password> in .env. The container does not start without one.
       # docker inspect shows this value. See README "Security" to use a secret file instead.
       PFX_PASSWORD: "${PFX_PASSWORD:-}"
-      # warn keeps converted files whose certificate is gone, sync deletes them, keep stays silent.
+      # When a certificate is gone, warn logs its converted files, sync deletes them, and keep leaves them without a log line.
       # Use sync only once /input holds every certificate you want converted.
       OUTPUT_LIFECYCLE: "${OUTPUT_LIFECYCLE:-warn}"
       PFX_ENCODER: "modern2023"  # modern2023, modern2026, legacy, or legacyrc2
@@ -54,7 +54,7 @@ services:
       - "/path/to/converted/output:/output"
 ```
 
-1. In `compose.yaml`, replace `/path/to/certificates` with your certificate folder and `/path/to/converted/output` with the folder the converted files should go to.
+1. In `compose.yaml`, replace `/path/to/certificates` with your certificate folder and `/path/to/converted/output` with the folder the converted files should go to. With the official Caddy image, the certificate folder is `caddy/certificates` inside the folder you mount at Caddy's `/data`.
 2. Create a file named `.env` beside `compose.yaml` with these lines. Set `PUID` and `PGID` to the user and group that own the certificate files.
 
    ```text
@@ -75,16 +75,16 @@ Settings are environment variables, read when the container starts, so recreate 
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `PFX_PASSWORD` | Password every PFX file carries, needed unless `PFX_PASSWORD_FILE` is set. A blank value stops the container at start. | required |
+| `PFX_PASSWORD` | The one password every PFX file carries, needed unless `PFX_PASSWORD_FILE` is set. A blank value stops the container at start. | required |
 | `PFX_PASSWORD_FILE` | Path to a Docker secret holding that password. It wins over `PFX_PASSWORD`. | _(unset)_ |
 | `PFX_ALLOW_EMPTY_PASSWORD` | Set to `true` to allow a blank password, which leaves the private key in each PFX file unprotected. | `false` |
-| `PFX_ENCODER` | PFX encoding: `modern2023`, `modern2026` for OpenSSL 3.4.0 or later, `legacy` for older devices, `legacyrc2` as a last resort. | `modern2023` |
+| `PFX_ENCODER` | PFX encryption: `modern2023` for current software, `modern2026` for apps built on OpenSSL 3.4.0 or later, `legacy` for older devices, `legacyrc2` as a last resort. | `modern2023` |
 | `OUTPUT_FORMATS` | `pfx`, `pem` or `pfx,pem`. `pem` writes a `<name>.crt` and an unencrypted `<name>.key`. | `pfx` |
-| `OUTPUT_LAYOUT` | `flat` turns `<issuer>/<site>/<site>.crt` into `<site>/<site>.pfx`, without the issuer folder. `mirror` keeps the full path from `/input`. | `flat` |
+| `OUTPUT_LAYOUT` | `flat` names each output after its certificate's own folder, so `<issuer>/<site>/<site>.crt` becomes `<site>/<site>.pfx`. `mirror` copies the whole folder path from `/input`. | `flat` |
 | `OUTPUT_LIFECYCLE` | What happens to output whose certificate is gone: `warn` logs it, `sync` deletes it, `keep` stays silent. | `warn` |
 | `INPUT_PFX_PASSWORD` | Password for PFX or P12 files under `/input`. Bundle input stays off while it is unset. | _(unset)_ |
 | `INPUT_EXCLUDE_PATHS` | Comma-separated paths under `/input` to leave unconverted. | _(unset)_ |
-| `FALLBACK_SCAN_HOURS` | Hours between full rechecks of `/input`. At `0`, or above `24`, a full recheck runs once every 24 hours. | `6` |
+| `FALLBACK_SCAN_HOURS` | Hours between full rechecks of `/input`, which catch changes the file watch missed. `0`, `false` and values above `24` mean one recheck every 24 hours. | `6` |
 | `METRICS_LISTEN_ADDR` | Address for a Prometheus metrics page and `/healthz`, for example `:9468`. Empty opens no port. | _(unset)_ |
 | `LOG_LEVEL` | `debug`, `info`, `warn` or `error`. The log alert rules need `info`. | `info` |
 
@@ -95,7 +95,7 @@ Settings are environment variables, read when the container starts, so recreate 
 | `/input` | Certificate folder, read-only and searched to any depth. Must be readable by the container's user. |
 | `/output` | Converted files. Must be writable by the container's user. |
 
-Converted files are mode `0600` and belong to the container's user, so the app that reads them must run as that user or as root. The container opens no port unless you set `METRICS_LISTEN_ADDR`.
+Converted files are always mode `0600`, readable by the container's user only, so the app that reads them must run as that user or as root. The container opens no port unless you set `METRICS_LISTEN_ADDR`.
 
 ## Security
 
@@ -109,7 +109,7 @@ With `OUTPUT_FORMATS` set to `pem`, each private key is written as a plain `.key
 
 ## Troubleshooting
 
-The healthcheck runs `/cert-watcher health`. It passes while the last scan had no conversion failure and no name collision, and finished within the last 18 hours, or 72 hours when `FALLBACK_SCAN_HOURS` is `0`, `false` or above `24`. The container turns unhealthy when `/input` cannot be read, a certificate fails to convert, or two certificates claim the same output name. It recovers on the next clean scan. Docker does not restart an unhealthy container by itself, and an unhealthy container notifies nobody. [Monitoring and alerts](docs/monitoring.md) says what does.
+The image's Docker healthcheck runs `/cert-watcher health` every 30 seconds. It passes when the last scan had no failed conversion and no name collision, and ended within the last three recheck intervals. On the 6-hour default that window is 18 hours. With one recheck every 24 hours it is 72 hours. The container turns unhealthy when `/input` cannot be read, a certificate fails to convert, or two certificates claim the same output name. It recovers on the next clean scan. Docker does not restart an unhealthy container by itself, and an unhealthy container notifies nobody. [Monitoring and alerts](docs/monitoring.md) says what does.
 
 - `refusing to start` in the log means a mount is missing or the container's user cannot open it. The `remediation` field names the fix.
 - `the resolved PFX password is empty or blank` means `PFX_PASSWORD` is missing from `.env`.
