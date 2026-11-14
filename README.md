@@ -27,7 +27,7 @@ cert-converter is free software under the GPL-3.0-or-later license.
 
 ## Quick start
 
-The image is on GitHub Container Registry and Docker Hub, for `amd64` and `arm64`. This is the [`compose.yaml`](compose.yaml) in this repository.
+The image is on GitHub Container Registry and on Docker Hub as `cplieger/cert-converter`, for `amd64` and `arm64`. This is the [`compose.yaml`](compose.yaml) in this repository.
 
 ```yaml
 services:
