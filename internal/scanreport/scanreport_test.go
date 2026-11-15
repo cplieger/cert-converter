@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/process"
-	"github.com/cplieger/go/measure"
+	"github.com/cplieger/go/measure/v2"
 	"github.com/cplieger/go/slogx"
 	"github.com/cplieger/go/slogx/capture"
 )

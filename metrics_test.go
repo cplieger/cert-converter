@@ -18,10 +18,11 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/mounts"
+	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/scanreport"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/go/health/v2"
-	"github.com/cplieger/go/measure"
+	"github.com/cplieger/go/measure/v2"
 	"github.com/cplieger/go/slogx/capture"
 )
 
@@ -132,6 +133,59 @@ func TestNewMetrics_serves_build_info(t *testing.T) {
 	if want := `cert_converter_build_info{version="` + version + `"} 1`; !slices.Equal(lines, []string{want}) {
 		t.Errorf("build_info lines = %q, want [%q]", lines, want)
 	}
+}
+
+const metricsGolden = "testdata/metrics.golden"
+
+// TestMetricsPage_matches_golden pins the /metrics page byte for byte, minus the
+// Go and process families whose values move: every family, every seeded label
+// set and a value per instrument, after one scan that moves each of them.
+// Alert rules and dashboards key on these bytes. Serial: it swaps slog.Default().
+func TestMetricsPage_matches_golden(t *testing.T) {
+	capture.SwapDefault(t, slog.New(slog.DiscardHandler))
+	synctest.Test(t, func(t *testing.T) {
+		reg, reporter := newMetrics(time.Hour)
+		time.Sleep(90 * time.Minute)
+		reporter.Report(t.Context(), &scanreport.Scan{Polling: true, Healthy: true, Result: process.ScanResult{
+			Total: 91, Converted: 1, Unchanged: 2, Orphan: 3, Unreadable: 4, Unresolved: 5, Vanished: 6,
+			Unwritable: 7, Collided: 8, Excluded: 10, Ignored: 11, Removed: 12, Failed: 13,
+			Outcome: process.OutcomeBudgetStopped, NoSources: true, OrphanRemovalDisabled: true, CleanupDegraded: true,
+		}})
+		rec := httptest.NewRecorder()
+		reg.Handler().ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", http.NoBody))
+		got := appPage(rec.Body.String())
+
+		if os.Getenv("UPDATE_GOLDEN") == "1" {
+			if err := os.WriteFile(metricsGolden, []byte(got), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		want, err := os.ReadFile(metricsGolden)
+		if err != nil {
+			t.Fatalf("read %s: %v; regenerate with UPDATE_GOLDEN=1 go test -run TestMetricsPage_matches_golden .", metricsGolden, err)
+		}
+		if got != string(want) {
+			t.Errorf("the /metrics page differs from %s; regenerate with UPDATE_GOLDEN=1 go test -run TestMetricsPage_matches_golden . and review the diff\ngot:\n%s", metricsGolden, got)
+		}
+	})
+}
+
+// appPage drops the Go and process families' lines from a /metrics page.
+func appPage(page string) string {
+	var b strings.Builder
+	for line := range strings.SplitSeq(page, "\n") {
+		name := line
+		if rest, ok := strings.CutPrefix(line, "# HELP "); ok {
+			name = rest
+		} else if rest, ok := strings.CutPrefix(line, "# TYPE "); ok {
+			name = rest
+		}
+		if line == "" || strings.HasPrefix(name, "go_") || strings.HasPrefix(name, "process_") {
+			continue
+		}
+		b.WriteString(line + "\n")
+	}
+	return b.String()
 }
 
 // runWithMetricsAddr runs the watcher path with valid volumes and
