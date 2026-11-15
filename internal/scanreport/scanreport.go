@@ -123,9 +123,9 @@ func NewReporter(reg *measure.Registry, lease time.Duration) *Reporter {
 	r := &Reporter{
 		lease: lease,
 		sources: measure.NewLabeledGauge("last_scan_sources",
-			"Sources at each outcome in the last scan; a scan that did not cover the tree keeps the previous scan's problem counts.", measure.UnitNone, []string{"outcome"}),
+			"Sources at each outcome in the last scan; a scan that did not cover the tree keeps the previous scan's problem counts.", measure.UnitCount, []string{"outcome"}),
 		found: measure.NewGauge("last_scan_sources_found",
-			"Certificate sources the last scan found under /input.", measure.UnitNone),
+			"Certificate sources the last scan found under /input.", measure.UnitCount),
 		finished: measure.NewGauge("last_scan_timestamp_seconds",
 			"Unix time the last scan ended, 0 before the first one.", measure.UnitSeconds),
 		outcome: measure.NewLabeledGauge("last_scan_outcome",
