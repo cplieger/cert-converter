@@ -138,8 +138,7 @@ func TestNewMetrics_serves_build_info(t *testing.T) {
 const metricsGolden = "testdata/metrics.golden"
 
 // TestMetricsPage_matches_golden pins the /metrics page byte for byte, minus the
-// Go and process families whose values move: every family, every seeded label
-// set and a value per instrument, after one scan that moves each of them.
+// Go and process families, after one scan that sets every scan instrument.
 // Alert rules and dashboards key on these bytes. Serial: it swaps slog.Default().
 func TestMetricsPage_matches_golden(t *testing.T) {
 	capture.SwapDefault(t, slog.New(slog.DiscardHandler))
