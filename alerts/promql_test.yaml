@@ -436,3 +436,185 @@ tests:
       - eval_time: 17h
         alertname: CertConverterScanStalled
         exp_alerts: []
+
+  # The dashboard's cert-converter scrape tile, with $instance filled in.
+  # TestDashboardQueriesAreTheTestedOnes fails when this differs from the dashboard.
+  - name: "The scrape tile shows for an IPv6 target the alert names"
+    interval: 1m
+    input_series:
+      - series: 'up{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x10"
+    promql_expr_test:
+      - expr: &scrape_down '0 * max((ALERTS{alertname="CertConverterDown", alertstate="firing", instance="[::1]:9468"} or ALERTS{alertname="CertConverterDown", alertstate="firing", instance=""}))'
+        eval_time: 8m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+
+  - name: "The scrape tile stays hidden while only another target is down"
+    interval: 1m
+    input_series:
+      - series: 'up{job="cert-converter", instance="[::1]:9468"}'
+        values: "1x10"
+      - series: 'up{job="cert-converter", instance="1:9468"}'
+        values: "0x10"
+    promql_expr_test:
+      - expr: *scrape_down
+        eval_time: 8m
+        exp_samples: []
+
+  - name: "The scrape tile shows when no cert-converter target exists"
+    interval: 1m
+    input_series:
+      - series: 'up{job="other", instance="x:1"}'
+        values: "1x10"
+    promql_expr_test:
+      - expr: *scrape_down
+        eval_time: 8m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+
+  # The dashboard's Outputs removed query, with $instance and a 1m slot filled in.
+  # TestDashboardQueriesAreTheTestedOnes fails when this differs from the dashboard.
+  - name: "Outputs removed: one removal lights one slot"
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_removed_artifacts_total{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x10 1x10"
+      - series: 'process_start_time_seconds{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x20"
+    promql_expr_test:
+      - expr: &removed_slot 'round(sum by (instance) (((cert_converter_removed_artifacts_total{instance="[::1]:9468"} - cert_converter_removed_artifacts_total{instance="[::1]:9468"} offset 1m) unless on (instance) ((process_start_time_seconds{instance="[::1]:9468"} != process_start_time_seconds{instance="[::1]:9468"} offset 1m) or (process_start_time_seconds{instance="[::1]:9468"} > time() - 60000 / 1000))) or (cert_converter_removed_artifacts_total{instance="[::1]:9468"} and on (instance) ((process_start_time_seconds{instance="[::1]:9468"} != process_start_time_seconds{instance="[::1]:9468"} offset 1m) or (process_start_time_seconds{instance="[::1]:9468"} > time() - 60000 / 1000))) or (cert_converter_removed_artifacts_total{instance="[::1]:9468"} - min_over_time(cert_converter_removed_artifacts_total{instance="[::1]:9468"}[1m]))))'
+        eval_time: 10m
+        exp_samples:
+          - labels: '{instance="[::1]:9468"}'
+            value: 0
+      - expr: *removed_slot
+        eval_time: 11m
+        exp_samples:
+          - labels: '{instance="[::1]:9468"}'
+            value: 1
+      - expr: *removed_slot
+        eval_time: 12m
+        exp_samples:
+          - labels: '{instance="[::1]:9468"}'
+            value: 0
+      - expr: *removed_slot
+        eval_time: 13m
+        exp_samples:
+          - labels: '{instance="[::1]:9468"}'
+            value: 0
+  - name: "Outputs removed: a restart counts the new total, not the drop from the old one"
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_removed_artifacts_total{job="cert-converter", instance="[::1]:9468"}'
+        values: "3x10 1x10"
+      - series: 'process_start_time_seconds{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x10 660x9"
+    promql_expr_test:
+      - expr: *removed_slot
+        eval_time: 11m
+        exp_samples:
+          - labels: '{instance="[::1]:9468"}'
+            value: 1
+      - expr: *removed_slot
+        eval_time: 12m
+        exp_samples:
+          - labels: '{instance="[::1]:9468"}'
+            value: 0
+  - name: "Outputs removed: a restart counts the new total once when it passes the old one"
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_removed_artifacts_total{job="cert-converter", instance="[::1]:9468"}'
+        values: "1x10 3x10"
+      - series: 'process_start_time_seconds{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x10 660x9"
+    promql_expr_test:
+      - expr: *removed_slot
+        eval_time: 11m
+        exp_samples:
+          - labels: '{instance="[::1]:9468"}'
+            value: 3
+      - expr: *removed_slot
+        eval_time: 12m
+        exp_samples:
+          - labels: '{instance="[::1]:9468"}'
+            value: 0
+  - name: "Outputs removed: a slot with no removal shows 0"
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_removed_artifacts_total{job="cert-converter", instance="[::1]:9468"}'
+        values: "2x20"
+      - series: 'process_start_time_seconds{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x20"
+    promql_expr_test:
+      - expr: *removed_slot
+        eval_time: 15m
+        exp_samples:
+          - labels: '{instance="[::1]:9468"}'
+            value: 0
+  # The panel's description says a slot near a restart, a failed scrape or a
+  # scrape outage can show fewer or more than happened; these cases pin each one.
+  - name: "Outputs removed: a restart mid-slot counts only the new process's removals"
+    interval: 15s
+    input_series:
+      - series: 'cert_converter_removed_artifacts_total{job="cert-converter", instance="[::1]:9468"}'
+        values: "5x40 6 0 1 2x20"
+      - series: 'process_start_time_seconds{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x41 620x22"
+    promql_expr_test:
+      - expr: *removed_slot
+        eval_time: 11m
+        exp_samples:
+          - labels: '{instance="[::1]:9468"}'
+            value: 2
+  - name: "Outputs removed: a removal behind failed scrapes is not counted"
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_removed_artifacts_total{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x6 stale stale stale 3x10"
+      - series: 'process_start_time_seconds{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x6 stale stale stale 0x10"
+    promql_expr_test:
+      - expr: *removed_slot
+        eval_time: 10m
+        exp_samples:
+          - labels: '{instance="[::1]:9468"}'
+            value: 0
+  - name: "Outputs removed: a removal behind a scrape outage past the lookback is not counted"
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_removed_artifacts_total{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x6 _x5 3x10"
+      - series: 'process_start_time_seconds{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x6 _x5 0x10"
+    promql_expr_test:
+      - expr: *removed_slot
+        eval_time: 12m
+        exp_samples:
+          - labels: '{instance="[::1]:9468"}'
+            value: 0
+  - name: "Outputs removed: a removal behind a scrape outage inside the lookback lands on the first slot after it"
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_removed_artifacts_total{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x6 _x3 3x6"
+      - series: 'process_start_time_seconds{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x6 _x3 0x6"
+    promql_expr_test:
+      - expr: *removed_slot
+        eval_time: 8m
+        exp_samples:
+          - labels: '{instance="[::1]:9468"}'
+            value: 0
+      - expr: *removed_slot
+        eval_time: 10m
+        exp_samples:
+          - labels: '{instance="[::1]:9468"}'
+            value: 3
+      - expr: *removed_slot
+        eval_time: 11m
+        exp_samples:
+          - labels: '{instance="[::1]:9468"}'
+            value: 0
