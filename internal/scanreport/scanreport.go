@@ -103,6 +103,7 @@ type Reporter struct {
 	condition *measure.LabeledGauge
 	removed   *measure.Counter
 	deadline  *measure.Gauge
+	succeeded *measure.Gauge
 	lease     time.Duration
 }
 
@@ -137,8 +138,10 @@ func NewReporter(reg *measure.Registry, lease time.Duration) *Reporter {
 			"Output artifacts removed because their source is gone."),
 		deadline: measure.NewGauge("scan_deadline_timestamp_seconds",
 			"Unix time by which the next healthy scan is due: the last healthy scan's end, or the start, plus three guaranteed recheck cadences."),
+		succeeded: measure.NewGauge("last_success_timestamp_seconds",
+			"Unix time the last healthy scan ended, 0 before the first one."),
 	}
-	reg.MustRegister(r.sources, r.found, r.finished, r.outcome, r.mode, r.condition, r.removed, r.deadline)
+	reg.MustRegister(r.sources, r.found, r.finished, r.outcome, r.mode, r.condition, r.removed, r.deadline, r.succeeded)
 	r.set(&Scan{}, 0)
 	r.renewDeadline(reportClock())
 	for _, o := range outcomes {
@@ -158,6 +161,7 @@ func (r *Reporter) Report(ctx context.Context, scan *Scan) {
 	r.set(scan, float64(now.Unix()))
 	r.removed.Add(int64(scan.Result.Removed))
 	if scan.Healthy {
+		r.succeeded.Set(float64(now.Unix()))
 		r.renewDeadline(now)
 	}
 }

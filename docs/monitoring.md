@@ -26,6 +26,7 @@ Each scan sets the scan series from the same verdict it writes to the `scan comp
 | `cert_converter_change_detection_mode` | gauge | `mode`: `watch`, `poll` | `1` for the mode the last scan ran in, `0` for the other |
 | `cert_converter_condition` | gauge | `condition`: `no_sources`, `all_excluded`, `orphan_removal_disabled`, `previous_layout_retained`, `cleanup_degraded` | `1` while the last scan reported the condition |
 | `cert_converter_removed_artifacts_total` | counter | none | Outputs removed because their source is gone |
+| `cert_converter_last_success_timestamp_seconds` | gauge | none | Unix time the last healthy scan ended, `0` before the first one. An unhealthy scan leaves it unchanged |
 | `cert_converter_scan_deadline_timestamp_seconds` | gauge | none | Unix time the next healthy scan is due, three recheck intervals after the last healthy scan or the start. An unhealthy scan leaves it unchanged |
 | `cert_converter_build_info` | gauge | `version` | Always `1`. `version` is the release the image was built from |
 
