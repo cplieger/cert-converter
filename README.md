@@ -120,14 +120,14 @@ The image's Docker healthcheck runs `/cert-watcher health` every 30 seconds. It 
 
 ## Monitoring
 
-cert-converter writes one `scan complete` record to its log after every scan. Set `METRICS_LISTEN_ADDR` and it also serves a Prometheus metrics page. The same alerts ship twice, for Prometheus in [`alerts/promql.yaml`](alerts/promql.yaml) and for Loki in [`alerts/logql.yaml`](alerts/logql.yaml), so load one of the two. The image has a Docker healthcheck, and [Knowing the app is alive](docs/monitoring.md#knowing-the-app-is-alive) says what it proves and who is told. [Monitoring and alerts](docs/monitoring.md) lists the metrics and the rules.
+cert-converter writes one `scan complete` record to its log after every scan. Set `METRICS_LISTEN_ADDR` and it also serves a Prometheus metrics page. Alert rules for Prometheus and for Loki ship in [`alerts/`](alerts/). Load one of the two files. A Grafana dashboard ships as [`grafana-dashboard.json`](grafana-dashboard.json) and needs Grafana 13.2 or newer. The image has a Docker healthcheck, and [Knowing the app is alive](docs/monitoring.md#knowing-the-app-is-alive) says what it proves and who is told. [Monitoring and alerts](docs/monitoring.md) lists the metrics and the rules.
 
 ## Documentation
 
 - [Configuration](docs/configuration.md) explains every setting, the two mounts and the file permissions.
 - [How cert-converter works](docs/how-it-works.md) covers watching, output naming, cleanup and health.
 - [Security](docs/hardening.md) covers hardening, input limits and what the image contains.
-- [Monitoring and alerts](docs/monitoring.md) lists the metrics, the log record and both alert rule files, and who tells you the container stopped.
+- [Monitoring and alerts](docs/monitoring.md) lists the metrics, the dashboard, the log record and both alert rule files, and who tells you the container stopped.
 
 ## Credits
 

@@ -1,12 +1,12 @@
 # Monitoring and alerts
 
-This page lists what cert-converter reports, the alert rules that ship with it, and how to know the container is alive. It is for readers who want to be told when a certificate stops converting. cert-converter writes one `scan complete` record to its log after every scan. Set `METRICS_LISTEN_ADDR` and it also serves a metrics page, with metric alert rules in `alerts/promql.yaml`. If you run Loki and no Prometheus, `alerts/logql.yaml` gives you the same alerts from the log.
+This page lists what cert-converter reports, the Grafana dashboard and the alert rules that ship with it, and how to know the container is alive. It is for readers who want to be told when a certificate stops converting. cert-converter writes one `scan complete` record to its log after every scan. Set `METRICS_LISTEN_ADDR` and it also serves a metrics page, with metric alert rules in `alerts/promql.yaml`. If you run Loki and no Prometheus, `alerts/logql.yaml` gives you the same alerts from the log.
 
 ## What you get
 
 | You run | You get | You set up |
 | --- | --- | --- |
-| Prometheus, Mimir or VictoriaMetrics, with Alertmanager (the monitoring guide's starting stack adds Loki) | 14 alerts, including `CertConverterDown`, plus `up` and graphs | `METRICS_LISTEN_ADDR`, a scrape job named `cert-converter`, and [`alerts/promql.yaml`](../alerts/promql.yaml) |
+| Prometheus, Mimir or VictoriaMetrics, with Alertmanager (the monitoring guide's starting stack adds Loki) | 14 alerts, including `CertConverterDown`, plus `up` and the [dashboard](#dashboard) of each scan | `METRICS_LISTEN_ADDR`, a scrape job named `cert-converter`, and [`alerts/promql.yaml`](../alerts/promql.yaml) |
 | Loki and Alertmanager, no metric store | 15 alerts, including one for a refused start | [`alerts/logql.yaml`](../alerts/logql.yaml) on Loki's ruler, with `LOG_LEVEL` at `info` |
 | Grafana-managed alerting only | The same rules, imported into Grafana | A Prometheus or Loki data source, and one of the two rule files |
 | Docker or Unraid only | Docker health, and the log | An uptime prober on `/healthz` with `METRICS_LISTEN_ADDR` set, or something that watches Docker health |
@@ -30,13 +30,7 @@ Each scan sets the scan series from the same verdict it writes to the `scan comp
 | `cert_converter_scan_deadline_timestamp_seconds` | gauge | none | Unix time the next healthy scan is due, three recheck intervals after the last healthy scan or the start. An unhealthy scan leaves it unchanged |
 | `cert_converter_build_info` | gauge | `version` | Always `1`. `version` is the release the image was built from |
 
-Every labelled scan series starts at `0`, so each rule sees its series from the first scrape. The page also carries the Go runtime and process families (`go_*`, `process_*`) under the names Go's official Prometheus client uses, so stock Go dashboards work.
-
-Three queries to start with in Grafana's Metrics Drilldown:
-
-- `time() - cert_converter_last_scan_timestamp_seconds` is how long ago the last scan ended.
-- `cert_converter_last_scan_sources{outcome=~"converted|unchanged"}` is how many certificates are current.
-- `increase(cert_converter_removed_artifacts_total[1d])` is how many outputs `OUTPUT_LIFECYCLE=sync` removed in a day.
+Every labelled scan series starts at `0`, so each rule sees its series from the first scrape. The page also carries the Go runtime and process families (`go_*`, `process_*`) under the names Go's official Prometheus client uses, so stock Go dashboards work. The bundled [dashboard](#dashboard) shows the `cert_converter_*` series in Grafana.
 
 ## Logs
 
@@ -133,6 +127,16 @@ Notes on individual alerts:
 - `CertConverterOutputCleanupDegraded` fires when the temporary-file sweep stopped at the `/output` root, could not inspect or remove a file left by an interrupted write, or could not enter an `/output` sub-path.
 - `CertConverterOrphanRemovalDisabled` tells "nothing to remove" apart from "removal is off" under `OUTPUT_LIFECYCLE=sync`. A scan cannot prove a file is orphaned when `/input` was not fully listed, at scan time or at the check just before deletion. The same holds when an `/output` sub-path could not be read, the output tree holds a symlink, either tree exceeds `MAX_SCAN_ENTRIES`, or an output name collision left the tree ambiguous.
 - `CertConverterPreviousLayoutRetained` fires because the unset `OUTPUT_LAYOUT` default never deletes a tree an earlier configuration wrote, since a consumer may still mount those paths. Setting `OUTPUT_LAYOUT` explicitly lets `sync` remove the old tree.
+
+## Dashboard
+
+[`grafana-dashboard.json`](../grafana-dashboard.json) imports as the Cert Converter dashboard. It reads the metrics above from a Prometheus data source and needs Grafana 13.2 or newer. When you run more than one container, the cert-converter variable picks the instance to show. It has one page of three rows:
+
+- Needs attention appears only while an alert from `alerts/promql.yaml` fires, with one tile per rule. Each tile reads its rule's `ALERTS` series, which Prometheus and the Mimir ruler store beside your metrics. The row stays hidden while those rules are not loaded. `CertConverterStartupRefused` and `CertConverterChangeDetectionDead` read the log, so they have no tile.
+- Latest scan shows how the latest scan ended and whether it ran on a file watch or on polling. It also shows when the latest scan and the latest healthy scan ended, and when the next healthy scan is due. Sources by outcome has one bar for each outcome the latest scan gave a source.
+- History charts how each scan ended and when cert-converter polled for changes, over the selected range. It also charts each standing problem a scan reported and the outputs `OUTPUT_LIFECYCLE=sync` removed.
+
+The dashboard is versioned with the image, and the `grafana-dashboard.json` of release `<tag>` matches the metrics that image serves. Each release attaches it with its checksum at `https://github.com/cplieger/cert-converter/releases/download/<tag>/grafana-dashboard.json`, and each image publish pushes it as the OCI artifact `ghcr.io/cplieger/cert-converter/dashboard:<tag>`. The file sets `metadata.name` to `cert-converter`, which Grafana uses as the dashboard UID. Importing a newer copy over the old one updates it in place.
 
 ## Knowing the app is alive
 
