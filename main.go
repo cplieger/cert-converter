@@ -266,6 +266,7 @@ func run() int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	drainOnShutdown(ctx, st)
 
 	// Bound before the first scan, so a typo stops the container at once instead
 	// of leaving it converting with no page.
@@ -323,6 +324,13 @@ func run() int {
 		// produce no conversion.
 		watch.WithMaxEntries(cfg.MaxScanEntries))
 	return reportWatchExit(ctx, w.Run(ctx))
+}
+
+// drainOnShutdown makes the verdict unhealthy for good the moment ctx ends,
+// while w.Run still waits out the scan in flight, so that scan cannot report
+// healthy after the signal.
+func drainOnShutdown(ctx context.Context, st *health.Status) {
+	context.AfterFunc(ctx, st.BeginDrain)
 }
 
 // reportWatchExit turns the watcher's single exit into the process's exit code,
