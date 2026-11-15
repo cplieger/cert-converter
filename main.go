@@ -24,7 +24,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/go/health/v2"
 	"github.com/cplieger/go/httpserver"
-	"github.com/cplieger/go/measure"
+	"github.com/cplieger/go/measure/v2"
 	"github.com/cplieger/go/slogx"
 )
 
@@ -77,7 +77,7 @@ var version = "dev"
 func newMetrics(fallback time.Duration) (*measure.Registry, *scanreport.Reporter) {
 	reg := measure.NewRegistry(metricsPrefix)
 	buildInfo := measure.NewLabeledGauge("build_info",
-		"Always 1; the version label is the cert-converter release this process runs.", []string{"version"})
+		"Always 1; the version label is the cert-converter release this process runs.", measure.UnitNone, []string{"version"})
 	reg.MustRegister(buildInfo)
 	buildInfo.Set(1, version)
 	return reg, scanreport.NewReporter(reg, healthLease(fallback))

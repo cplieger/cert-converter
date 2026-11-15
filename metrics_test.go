@@ -22,7 +22,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/scanreport"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/go/health/v2"
-	"github.com/cplieger/go/measure"
+	"github.com/cplieger/go/measure/v2"
 	"github.com/cplieger/go/slogx/capture"
 )
 
