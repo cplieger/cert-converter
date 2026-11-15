@@ -292,9 +292,8 @@ func TestScanAndSetHealth_cancelled_context_leaves_marker_untouched(t *testing.T
 }
 
 // TestDrainOnShutdown_drops_a_healthy_scan_that_ends_after_the_signal pins the
-// shutdown order app-alerting sets: health turns unhealthy when the signal
-// context ends, so a scan still in flight that then finishes cleanly cannot
-// write the marker back.
+// shutdown order: health turns unhealthy when the signal context ends, so a
+// scan still in flight that then finishes cleanly cannot write the marker back.
 func TestDrainOnShutdown_drops_a_healthy_scan_that_ends_after_the_signal(t *testing.T) {
 	t.Parallel()
 

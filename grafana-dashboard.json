@@ -1484,7 +1484,7 @@
         "kind": "Panel",
         "spec": {
           "id": 21,
-          "title": "Change detection",
+          "title": "Detection mode",
           "description": "Whether the latest scan ran on a file watch or on polling. Watching picks up a renewed certificate in seconds. Polling waits for the next rescan every FALLBACK_SCAN_HOURS, and exhausted inotify instances on the host are the usual cause. No value means no scan has ended yet.",
           "links": [],
           "data": {
@@ -1665,7 +1665,7 @@
         "spec": {
           "id": 23,
           "title": "Last healthy scan",
-          "description": "When a scan last converted every source with no collision and no abort. A time older than Last scan ended means the scans since then failed, and the attention tiles say why. No value means no healthy scan since the start.",
+          "description": "When the latest healthy scan ended, meaning it read /input with no conversion failure and no output name collision. A stop at MAX_SCAN_ENTRIES or an unreadable or excluded source still counts as healthy, and Scan outcome and the attention tiles show those. A time older than Last scan ended means the scans since then were unhealthy. No value means no healthy scan since the start.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1829,7 +1829,7 @@
         "spec": {
           "id": 30,
           "title": "Sources by outcome",
-          "description": "What the latest scan did with each certificate source under /input, one bar per outcome it saw. Converted and Unchanged are current outputs. Any other bar names sources whose output is missing or stale, and the container log names each file. No value means the latest scan found no source, or cert-converter was not scraped.",
+          "description": "What the latest scan did with each certificate source under /input, one bar per outcome it saw. Converted and Unchanged are current outputs. Any other bar names sources whose output is missing or stale, and the container log names each file. No value means no scan has ended yet, the latest scan found no source, or cert-converter was not scraped.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1891,7 +1891,7 @@
                   "unit": "none",
                   "decimals": 0,
                   "min": 0,
-                  "noValue": "No sources found",
+                  "noValue": "No sources to show",
                   "color": {
                     "mode": "fixed",
                     "fixedColor": "blue"
@@ -1934,7 +1934,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "round(increase(cert_converter_removed_artifacts_total{instance=\"$instance\"}[$__interval]))",
+                        "expr": "round(increase(cert_converter_removed_artifacts_total{instance=\"$instance\"}[$__rate_interval]))",
                         "legendFormat": "Removed"
                       }
                     },
