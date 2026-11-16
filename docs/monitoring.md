@@ -136,6 +136,8 @@ Notes on individual alerts:
 - Latest scan shows how the latest scan ended and whether it ran on a file watch or on polling. It also shows when the latest scan and the latest healthy scan ended, and when the next healthy scan is due. Sources by outcome has one bar for each outcome the latest scan gave a source.
 - History charts how each scan ended and when cert-converter polled for changes, over the selected range. It also charts each standing problem a scan reported and the outputs `OUTPUT_LIFECYCLE=sync` removed.
 
+The charts that count per interval also read `process_start_time_seconds` to find a container restart. Keep the `process_*` series in your scrape, or a restart draws a negative bar.
+
 The dashboard is versioned with the image, and the `grafana-dashboard.json` of release `<tag>` matches the metrics that image serves. Each release attaches it with its checksum at `https://github.com/cplieger/cert-converter/releases/download/<tag>/grafana-dashboard.json`, and each image publish pushes it as the OCI artifact `ghcr.io/cplieger/cert-converter/dashboard:<tag>`. The file sets `metadata.name` to `cert-converter`, which Grafana uses as the dashboard UID. Importing a newer copy over the old one updates it in place.
 
 ## Knowing the app is alive
