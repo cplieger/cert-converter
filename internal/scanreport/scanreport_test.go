@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/process"
-	"github.com/cplieger/go/measure"
+	"github.com/cplieger/go/measure/v2"
 	"github.com/cplieger/go/slogx"
 	"github.com/cplieger/go/slogx/capture"
 )
@@ -140,9 +140,10 @@ func TestReportSetsEverySeriesFromTheRecord(t *testing.T) {
 		"cert_converter_last_scan_outcome{outcome=budget_stopped}": num("budget_stopped"),
 		"cert_converter_change_detection_mode{mode=poll}":          num("polling"),
 		"cert_converter_change_detection_mode{mode=watch}":         1 - num("polling"),
-		// Not a record field: the scan is not healthy, so the deadline keeps its
-		// start value (TestScanDeadline).
+		// Not record fields: the scan is not healthy, so the deadline keeps its
+		// start value and no healthy scan has ended (TestScanDeadline).
 		"cert_converter_scan_deadline_timestamp_seconds": float64(at.Add(lease).Unix()),
+		"cert_converter_last_success_timestamp_seconds":  0,
 	}
 	for _, outcome := range []string{"converted", "unchanged", "orphan", "unreadable", "unresolved", "vanished", "unwritable", "collided", "excluded", "ignored", "failed"} {
 		want["cert_converter_last_scan_sources{outcome="+outcome+"}"] = num(outcome)
@@ -172,9 +173,10 @@ func pinClock(t *testing.T, now *time.Time) {
 	t.Cleanup(func() { reportClock = prev })
 }
 
-// TestScanDeadline pins the stall rule's deadline: the start plus the lease
-// before any scan, a healthy scan's end plus the lease after it, and unchanged
-// by a scan that is not healthy, so scans that keep failing cross it.
+// TestScanDeadline pins the stall rule's deadline and the last healthy scan's
+// time beside it: the start plus the lease and 0 before any scan, a healthy
+// scan's end plus the lease and that end after it, and both unchanged by a scan
+// that is not healthy, so scans that keep failing cross the deadline.
 func TestScanDeadline(t *testing.T) {
 	const lease = 18 * time.Hour
 	start := time.Unix(1_800_000_000, 0)
@@ -183,50 +185,56 @@ func TestScanDeadline(t *testing.T) {
 	capture.SwapDefault(t, slog.New(slog.DiscardHandler))
 	reg := measure.NewRegistry("cert_converter")
 	reporter := NewReporter(reg, lease)
-	deadline := func() float64 {
+	gauge := func(name string) float64 {
 		t.Helper()
 		families, err := reg.Gather(t.Context())
 		if err != nil {
 			t.Fatalf("Gather = %v", err)
 		}
 		for _, f := range families {
-			if f.Name == "cert_converter_scan_deadline_timestamp_seconds" && len(f.Samples) == 1 {
+			if f.Name == name && len(f.Samples) == 1 {
 				return f.Samples[0].Value
 			}
 		}
-		t.Fatal("the registry exports no single cert_converter_scan_deadline_timestamp_seconds sample")
+		t.Fatalf("the registry exports no single %s sample", name)
 		return 0
 	}
+	deadline := func() float64 { return gauge("cert_converter_scan_deadline_timestamp_seconds") }
+	succeeded := func() float64 { return gauge("cert_converter_last_success_timestamp_seconds") }
 	unix := func(at time.Time) float64 { return float64(at.Unix()) }
 
 	if got, want := deadline(), unix(start.Add(lease)); got != want {
 		t.Errorf("deadline before any scan = %v, want the start plus the lease %v", got, want)
 	}
+	if got := succeeded(); got != 0 {
+		t.Errorf("last success before any scan = %v, want 0", got)
+	}
 	steps := []struct {
-		name string
-		scan Scan
-		at   time.Duration
-		want time.Time
+		name    string
+		scan    Scan
+		at      time.Duration
+		want    time.Time
+		success time.Time
 	}{
 		{
 			name: "a healthy scan moves it", at: time.Hour,
 			scan: Scan{Healthy: true, Result: process.ScanResult{Total: 1, Converted: 1}},
-			want: start.Add(time.Hour + lease),
+			want: start.Add(time.Hour + lease), success: start.Add(time.Hour),
 		},
 		{
 			name: "a failed conversion leaves it", at: 2 * time.Hour,
 			scan: Scan{Result: process.ScanResult{Total: 1, Failed: 1}},
-			want: start.Add(time.Hour + lease),
+			want: start.Add(time.Hour + lease), success: start.Add(time.Hour),
 		},
 		{
 			name: "an aborted scan leaves it", at: 3 * time.Hour,
 			scan: Scan{Result: process.ScanResult{Outcome: process.OutcomeAborted}, Err: errors.New("open input root")},
-			want: start.Add(time.Hour + lease),
+			want: start.Add(time.Hour + lease), success: start.Add(time.Hour),
 		},
 		{
 			name: "the next healthy scan moves it again", at: 4 * time.Hour,
 			scan: Scan{Healthy: true},
-			want: start.Add(4*time.Hour + lease),
+			want: start.Add(4*time.Hour + lease), success: start.Add(4 * time.Hour),
 		},
 	}
 	for _, step := range steps {
@@ -234,6 +242,9 @@ func TestScanDeadline(t *testing.T) {
 		reporter.Report(t.Context(), &step.scan)
 		if got := deadline(); got != unix(step.want) {
 			t.Errorf("%s: deadline = %v, want %v", step.name, got, unix(step.want))
+		}
+		if got := succeeded(); got != unix(step.success) {
+			t.Errorf("%s: last success = %v, want %v", step.name, got, unix(step.success))
 		}
 	}
 }

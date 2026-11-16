@@ -10,7 +10,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/process"
-	"github.com/cplieger/go/measure"
+	"github.com/cplieger/go/measure/v2"
 )
 
 // recordMessage is the end-of-scan record's message. The shipped log rules select
@@ -103,6 +103,7 @@ type Reporter struct {
 	condition *measure.LabeledGauge
 	removed   *measure.Counter
 	deadline  *measure.Gauge
+	succeeded *measure.Gauge
 	lease     time.Duration
 }
 
@@ -122,23 +123,25 @@ func NewReporter(reg *measure.Registry, lease time.Duration) *Reporter {
 	r := &Reporter{
 		lease: lease,
 		sources: measure.NewLabeledGauge("last_scan_sources",
-			"Sources at each outcome in the last scan; a scan that did not cover the tree keeps the previous scan's problem counts.", []string{"outcome"}),
+			"Sources at each outcome in the last scan; a scan that did not cover the tree keeps the previous scan's problem counts.", measure.UnitCount, []string{"outcome"}),
 		found: measure.NewGauge("last_scan_sources_found",
-			"Certificate sources the last scan found under /input."),
+			"Certificate sources the last scan found under /input.", measure.UnitCount),
 		finished: measure.NewGauge("last_scan_timestamp_seconds",
-			"Unix time the last scan ended, 0 before the first one."),
+			"Unix time the last scan ended, 0 before the first one.", measure.UnitSeconds),
 		outcome: measure.NewLabeledGauge("last_scan_outcome",
-			"1 for how the last scan ended, 0 for the other outcomes.", []string{"outcome"}),
+			"1 for how the last scan ended, 0 for the other outcomes.", measure.UnitNone, []string{"outcome"}),
 		mode: measure.NewLabeledGauge("change_detection_mode",
-			"1 for the change-detection mode the last scan ran in, 0 for the other.", []string{"mode"}),
+			"1 for the change-detection mode the last scan ran in, 0 for the other.", measure.UnitNone, []string{"mode"}),
 		condition: measure.NewLabeledGauge("condition",
-			"1 while the last scan reported the standing condition, else 0.", []string{"condition"}),
+			"1 while the last scan reported the standing condition, else 0.", measure.UnitNone, []string{"condition"}),
 		removed: measure.NewCounter("removed_artifacts_total",
-			"Output artifacts removed because their source is gone."),
+			"Output artifacts removed because their source is gone.", measure.UnitCount),
 		deadline: measure.NewGauge("scan_deadline_timestamp_seconds",
-			"Unix time by which the next healthy scan is due: the last healthy scan's end, or the start, plus three guaranteed recheck cadences."),
+			"Unix time by which the next healthy scan is due: the last healthy scan's end, or the start, plus three guaranteed recheck cadences.", measure.UnitSeconds),
+		succeeded: measure.NewGauge("last_success_timestamp_seconds",
+			"Unix time the last healthy scan ended, 0 before the first one.", measure.UnitSeconds),
 	}
-	reg.MustRegister(r.sources, r.found, r.finished, r.outcome, r.mode, r.condition, r.removed, r.deadline)
+	reg.MustRegister(r.sources, r.found, r.finished, r.outcome, r.mode, r.condition, r.removed, r.deadline, r.succeeded)
 	r.set(&Scan{}, 0)
 	r.renewDeadline(reportClock())
 	for _, o := range outcomes {
@@ -158,6 +161,7 @@ func (r *Reporter) Report(ctx context.Context, scan *Scan) {
 	r.set(scan, float64(now.Unix()))
 	r.removed.Add(int64(scan.Result.Removed))
 	if scan.Healthy {
+		r.succeeded.Set(float64(now.Unix()))
 		r.renewDeadline(now)
 	}
 }

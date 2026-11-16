@@ -24,7 +24,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/go/health/v2"
 	"github.com/cplieger/go/httpserver"
-	"github.com/cplieger/go/measure"
+	"github.com/cplieger/go/measure/v2"
 	"github.com/cplieger/go/slogx"
 )
 
@@ -77,7 +77,7 @@ var version = "dev"
 func newMetrics(fallback time.Duration) (*measure.Registry, *scanreport.Reporter) {
 	reg := measure.NewRegistry(metricsPrefix)
 	buildInfo := measure.NewLabeledGauge("build_info",
-		"Always 1; the version label is the cert-converter release this process runs.", []string{"version"})
+		"Always 1; the version label is the cert-converter release this process runs.", measure.UnitNone, []string{"version"})
 	reg.MustRegister(buildInfo)
 	buildInfo.Set(1, version)
 	return reg, scanreport.NewReporter(reg, healthLease(fallback))
@@ -266,6 +266,7 @@ func run() int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	drainOnShutdown(ctx, st)
 
 	// Bound before the first scan, so a typo stops the container at once instead
 	// of leaving it converting with no page.
@@ -323,6 +324,13 @@ func run() int {
 		// produce no conversion.
 		watch.WithMaxEntries(cfg.MaxScanEntries))
 	return reportWatchExit(ctx, w.Run(ctx))
+}
+
+// drainOnShutdown makes the verdict unhealthy for good the moment ctx ends,
+// while w.Run still waits out the scan in flight, so that scan cannot report
+// healthy after the signal.
+func drainOnShutdown(ctx context.Context, st *health.Status) {
+	context.AfterFunc(ctx, st.BeginDrain)
 }
 
 // reportWatchExit turns the watcher's single exit into the process's exit code,

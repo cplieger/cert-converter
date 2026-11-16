@@ -291,6 +291,40 @@ func TestScanAndSetHealth_cancelled_context_leaves_marker_untouched(t *testing.T
 	}
 }
 
+// TestDrainOnShutdown_drops_a_healthy_scan_that_ends_after_the_signal pins the
+// shutdown order: health turns unhealthy when the signal context ends, so a
+// scan still in flight that then finishes cleanly cannot write the marker back.
+func TestDrainOnShutdown_drops_a_healthy_scan_that_ends_after_the_signal(t *testing.T) {
+	t.Parallel()
+
+	marker, markerPath := newTestMarker(t)
+	marker.Set(true)
+
+	signalCtx, cancel := context.WithCancel(t.Context())
+	drainOnShutdown(signalCtx, marker)
+	cancel()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for marker.Healthy() {
+		if time.Now().After(deadline) {
+			t.Fatal("the verdict is still healthy 5s after the signal context ended")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	inDir, outDir := t.TempDir(), t.TempDir()
+	certPEM, keyPEM := testcerts.GenerateSelfSignedCert(t, "draining", "ecdsa")
+	writeCertAndKey(t, inDir, "draining", certPEM, keyPEM)
+	scanAndSetHealth(t.Context(), newTestScanner(inDir, outDir, "", convert.EncNameModern2023), testReporter(), marker, false)
+
+	if marker.Healthy() {
+		t.Error("a clean scan ending after the signal should leave the verdict unhealthy")
+	}
+	if _, err := os.Stat(markerPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("health marker should stay absent after the signal, stat error: %v", err)
+	}
+}
+
 // TestDispatchArgs pins the argv policy behind the runProbe seam: the watch
 // subcommand starts the watcher, the health subcommand probes the marker at
 // /dev/shm/cert-converter.healthy, and everything else (an unrecognized

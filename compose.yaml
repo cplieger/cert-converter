@@ -12,7 +12,7 @@ services:
       # Put PFX_PASSWORD=<a password> in .env. The container does not start without one.
       # docker inspect shows this value. See README "Security" to use a secret file instead.
       PFX_PASSWORD: "${PFX_PASSWORD:-}"
-      # warn keeps converted files whose certificate is gone, sync deletes them, keep stays silent.
+      # When a certificate is gone, warn logs its converted files, sync deletes them, and keep leaves them without a log line.
       # Use sync only once /input holds every certificate you want converted.
       OUTPUT_LIFECYCLE: "${OUTPUT_LIFECYCLE:-warn}"
       PFX_ENCODER: "modern2023"  # modern2023, modern2026, legacy, or legacyrc2

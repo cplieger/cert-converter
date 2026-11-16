@@ -1,0 +1,47 @@
+# HELP cert_converter_removed_artifacts_total Output artifacts removed because their source is gone.
+# TYPE cert_converter_removed_artifacts_total counter
+cert_converter_removed_artifacts_total 12
+# HELP cert_converter_build_info Always 1; the version label is the cert-converter release this process runs.
+# TYPE cert_converter_build_info gauge
+cert_converter_build_info{version="dev"} 1
+# HELP cert_converter_last_scan_sources Sources at each outcome in the last scan; a scan that did not cover the tree keeps the previous scan's problem counts.
+# TYPE cert_converter_last_scan_sources gauge
+cert_converter_last_scan_sources{outcome="collided"} 8
+cert_converter_last_scan_sources{outcome="converted"} 1
+cert_converter_last_scan_sources{outcome="excluded"} 10
+cert_converter_last_scan_sources{outcome="failed"} 13
+cert_converter_last_scan_sources{outcome="ignored"} 11
+cert_converter_last_scan_sources{outcome="orphan"} 3
+cert_converter_last_scan_sources{outcome="unchanged"} 2
+cert_converter_last_scan_sources{outcome="unreadable"} 4
+cert_converter_last_scan_sources{outcome="unresolved"} 5
+cert_converter_last_scan_sources{outcome="unwritable"} 7
+cert_converter_last_scan_sources{outcome="vanished"} 6
+# HELP cert_converter_last_scan_outcome 1 for how the last scan ended, 0 for the other outcomes.
+# TYPE cert_converter_last_scan_outcome gauge
+cert_converter_last_scan_outcome{outcome="aborted"} 0
+cert_converter_last_scan_outcome{outcome="budget_stopped"} 1
+cert_converter_last_scan_outcome{outcome="complete"} 0
+# HELP cert_converter_change_detection_mode 1 for the change-detection mode the last scan ran in, 0 for the other.
+# TYPE cert_converter_change_detection_mode gauge
+cert_converter_change_detection_mode{mode="poll"} 1
+cert_converter_change_detection_mode{mode="watch"} 0
+# HELP cert_converter_condition 1 while the last scan reported the standing condition, else 0.
+# TYPE cert_converter_condition gauge
+cert_converter_condition{condition="all_excluded"} 0
+cert_converter_condition{condition="cleanup_degraded"} 1
+cert_converter_condition{condition="no_sources"} 1
+cert_converter_condition{condition="orphan_removal_disabled"} 1
+cert_converter_condition{condition="previous_layout_retained"} 0
+# HELP cert_converter_last_scan_sources_found Certificate sources the last scan found under /input.
+# TYPE cert_converter_last_scan_sources_found gauge
+cert_converter_last_scan_sources_found 91
+# HELP cert_converter_last_scan_timestamp_seconds Unix time the last scan ended, 0 before the first one.
+# TYPE cert_converter_last_scan_timestamp_seconds gauge
+cert_converter_last_scan_timestamp_seconds 946690200
+# HELP cert_converter_scan_deadline_timestamp_seconds Unix time by which the next healthy scan is due: the last healthy scan's end, or the start, plus three guaranteed recheck cadences.
+# TYPE cert_converter_scan_deadline_timestamp_seconds gauge
+cert_converter_scan_deadline_timestamp_seconds 946701000
+# HELP cert_converter_last_success_timestamp_seconds Unix time the last healthy scan ended, 0 before the first one.
+# TYPE cert_converter_last_success_timestamp_seconds gauge
+cert_converter_last_success_timestamp_seconds 946690200
