@@ -167,17 +167,18 @@ func variableQuery(v *dashVariable) string {
 	return q.Spec.Query
 }
 
-// dashboardQueries is every variable and panel query, keyed by where it sits.
+// dashboardQueries is every variable and panel query, keyed by where it sits,
+// with its PromQL comments removed so no check reads a comment as a query.
 func dashboardQueries(d *dashboard) map[string]string {
 	queries := map[string]string{}
 	for name, v := range d.variables() {
 		if q := variableQuery(&v); q != "" {
-			queries["variable "+name] = q
+			queries["variable "+name] = withoutComments(q)
 		}
 	}
 	for name, p := range d.Spec.Elements {
 		for i, e := range panelExprs(&p) {
-			queries[fmt.Sprintf("%s %s query %d", name, p.Spec.Title, i)] = e
+			queries[fmt.Sprintf("%s %s query %d", name, p.Spec.Title, i)] = withoutComments(e)
 		}
 	}
 	return queries
@@ -242,8 +243,11 @@ var (
 	stringPartRe     = regexp.MustCompile(`^(?:` + promqlString + `)$`)
 	counterCallRe    = regexp.MustCompile(`\b(increase|rate|irate)\s*\(`)
 	// oneSlotRangeRe matches a range or subquery range of exactly one
-	// $__interval, in each of Grafana's spellings of it.
-	oneSlotRangeRe  = regexp.MustCompile(`\[\s*\$(?:__interval|\{__interval\}|\{__interval_ms\}ms)\s*(?::[^\]]*)?\]`)
+	// $__interval, as canonicalIntervals spells it.
+	oneSlotRangeRe = regexp.MustCompile(`\[\s*\$(?:__interval|\{__interval\}|\{__interval_ms\}ms)\s*(?::[^\]]*)?\]`)
+	// Grafana's variable grammar, variableRegex in
+	// https://github.com/grafana/grafana/blob/v13.2.3/public/app/features/variables/utils.ts
+	grafanaVarRe    = regexp.MustCompile(`\$(\w+)|\[\[(\w+?)(?::\w+)?\]\]|\$\{(\w+)(?:\.[^:^}]+)?(?::[^}]+)?\}`)
 	dashKeywords    = []string{"and", "or", "unless", "bool", "offset"}
 	userNamedLabels = []string{"job", "hostname", "container"}
 )
@@ -263,6 +267,31 @@ func skipString(s string, i int) int {
 		}
 	}
 	return len(s)
+}
+
+// withoutComments drops each # comment from expr, up to its newline. A # inside
+// a string literal opens no comment, and a quote inside a comment opens no
+// string.
+func withoutComments(expr string) string {
+	var b strings.Builder
+	for i := 0; i < len(expr); {
+		switch expr[i] {
+		case '#':
+			if j := strings.IndexByte(expr[i:], '\n'); j >= 0 {
+				i += j
+			} else {
+				i = len(expr)
+			}
+		case '"', '\'', '`':
+			j := skipString(expr, i)
+			b.WriteString(expr[i:j])
+			i = j
+		default:
+			b.WriteByte(expr[i])
+			i++
+		}
+	}
+	return b.String()
 }
 
 // promqlUnquote decodes a string literal. PromQL escapes as Go does
@@ -328,6 +357,22 @@ func callArgs(expr string, open int) string {
 		}
 	}
 	return expr[open+1:]
+}
+
+// canonicalIntervals rewrites every Grafana spelling of $__interval and
+// $__interval_ms to $__interval and ${__interval_ms}, which oneSlotRangeRe
+// reads.
+func canonicalIntervals(expr string) string {
+	return grafanaVarRe.ReplaceAllStringFunc(expr, func(ref string) string {
+		m := grafanaVarRe.FindStringSubmatch(ref)
+		switch m[1] + m[2] + m[3] {
+		case "__interval":
+			return "$__interval"
+		case "__interval_ms":
+			return "${__interval_ms}"
+		}
+		return ref
+	})
 }
 
 // dashboardSeries returns the series names a panel or variable query reads;
@@ -514,16 +559,18 @@ func TestDashboardMatchesOnlyTheSelectedInstance(t *testing.T) {
 }
 
 // TestDashboardCountsNeverReadOneSlotRange fails when a query takes a
-// counter's increase or rate over a range or subquery of [$__interval]: at
-// short ranges Grafana sets $__interval to the scrape interval, the window
-// holds one sample, and the panel goes empty while the user zooms in on an
-// incident.
+// counter's increase, rate or irate over a range or subquery of one
+// $__interval, in any of Grafana's spellings: at short ranges Grafana sets
+// $__interval to the scrape interval, the window holds one sample, and the
+// panel goes empty while the user zooms in on an incident.
 func TestDashboardCountsNeverReadOneSlotRange(t *testing.T) {
 	d := loadDashboard(t)
 	for where, expr := range dashboardQueries(&d) {
+		expr = canonicalIntervals(expr)
 		for _, loc := range counterCallRe.FindAllStringSubmatchIndex(expr, -1) {
-			if args := callArgs(expr, loc[1]-1); oneSlotRangeRe.MatchString(args) {
-				t.Errorf("%s takes %s over [$__interval], want [$__rate_interval] or an offset difference: %s", where, expr[loc[2]:loc[3]], expr)
+			// A label value is no range, so its text is blanked first.
+			if r := oneSlotRangeRe.FindString(anyStringRe.ReplaceAllString(callArgs(expr, loc[1]-1), `""`)); r != "" {
+				t.Errorf("%s takes %s over %s, want [$__rate_interval] or an offset difference: %s", where, expr[loc[2]:loc[3]], r, expr)
 			}
 		}
 	}
