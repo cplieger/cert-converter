@@ -23,6 +23,10 @@ type scanReach struct {
 	// resolved is every artifact of a source whose every artifact was inspected
 	// and, where stale, written.
 	resolved map[string]struct{}
+	// enumerated is every source name the walk enumerated.
+	enumerated map[string]struct{}
+	// stoppedAt is the entry the walk stopped at, at the entry budget.
+	stoppedAt string
 	// links is every symlink the scan could not resolve, in enumeration order.
 	links []string
 }
@@ -65,6 +69,7 @@ func (r *scanReach) withdraw(rel string) {
 // (filesafe.WalkDirInRoot), so the directories it listed in full are those it
 // began before the one holding rel.
 func (r *scanReach) stop(rel string) {
+	r.stoppedAt = rel
 	at := path.Dir(rel)
 	for dir := range r.listed {
 		if !r.walkedBefore(dir, at) {
@@ -92,6 +97,47 @@ func (r *scanReach) walkedBefore(dir, at string) bool {
 		}
 	}
 	return len(dirParts) < len(atParts)
+}
+
+// enumerate records that the walk enumerated the source rel.
+func (r *scanReach) enumerate(rel string) {
+	if r.enumerated == nil {
+		r.enumerated = make(map[string]struct{})
+	}
+	r.enumerated[rel] = struct{}{}
+}
+
+// provenGone reports whether a walk that stopped at the entry budget proved the
+// source rel absent: it reached rel's path (input), the path comes before the
+// stop in walk order, and the walk did not enumerate rel.
+func (r *scanReach) provenGone(rel string) bool {
+	if r.stoppedAt == "" || !r.input(rel) || !walksBefore(rel, r.stoppedAt) {
+		return false
+	}
+	_, enumerated := r.enumerated[rel]
+	return !enumerated
+}
+
+// walksBefore reports whether filesafe.WalkDirInRoot visits the path p before
+// the path s: it lists a directory's entries, each batch in name order, before
+// it walks the directory's subdirectories in the order it listed them.
+func walksBefore(p, s string) bool {
+	dp, ds := path.Dir(p), path.Dir(s)
+	switch {
+	case dp == ds:
+		return path.Base(p) < path.Base(s)
+	case dp == "." || strings.HasPrefix(ds, dp+"/"):
+		return true
+	case ds == "." || strings.HasPrefix(dp, ds+"/"):
+		return false
+	}
+	pParts, sParts := strings.Split(dp, "/"), strings.Split(ds, "/")
+	for i := range min(len(pParts), len(sParts)) {
+		if pParts[i] != sParts[i] {
+			return pParts[i] < sParts[i]
+		}
+	}
+	return false
 }
 
 // noteSource records how far the scan got with the source rel, whose artifacts

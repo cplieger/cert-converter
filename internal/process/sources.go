@@ -1,6 +1,7 @@
 package process
 
 import (
+	"errors"
 	"maps"
 	"slices"
 	"time"
@@ -90,13 +91,33 @@ func outcomeOfStatus(status conversionStatus) (SourceOutcome, bool) {
 
 // readVerdict reports whether outcome is a verdict on the source's own bytes or
 // configuration. An unread, vanished or collided source proves nothing about
-// whether an earlier failure was fixed.
+// whether an earlier problem was fixed.
 func readVerdict(outcome SourceOutcome) bool {
 	switch outcome {
 	case SourceUnreadable, SourceVanished, SourceCollided:
 		return false
 	default:
 		return true
+	}
+}
+
+// urgency ranks the problem outcomes in the order the dashboard's Outputs match
+// inputs ranks their reasons, the most urgent highest; 0 is no problem. A source
+// the scan did not read keeps a fact that outranks its new outcome.
+func urgency(outcome SourceOutcome) int {
+	switch outcome {
+	case SourceFailed:
+		return 5
+	case SourceCollided:
+		return 4
+	case SourceUnwritable:
+		return 3
+	case SourceUnreadable, SourceVanished:
+		return 2
+	case SourceOrphan:
+		return 1
+	default:
+		return 0
 	}
 }
 
@@ -146,14 +167,15 @@ func (sw *scanWalk) ownsArtifacts(rel string, outcome SourceOutcome, artifacts [
 }
 
 // mergeSources folds this scan's outcomes into the Scanner's memory. A source
-// leaves only when a scan ended by walkErr == nil reached its path and did not
-// resolve it, the proof keepObserved requires; any other unresolved source keeps
-// its fact, as carryUnproven keeps the counts.
+// the scan did not read keeps a fact of higher urgency. A source leaves only on
+// proof that it is gone: a scan that ran to the end reached its path and did not
+// resolve it, or one stopped at the entry budget proved it absent
+// (scanReach.provenGone). Any other source keeps its fact, as carryUnproven
+// keeps the counts.
 func (s *Scanner) mergeSources(sw *scanWalk, out *store, walkErr error) {
 	for rel, outcome := range sw.outcomes {
 		fact := s.sources[rel]
-		if fact.outcome == SourceFailed && !sw.reach.input(rel) && !readVerdict(outcome) {
-			// unreachedFailures still counts it failed, so the fact must agree.
+		if !sw.reach.input(rel) && !readVerdict(outcome) && urgency(fact.outcome) > urgency(outcome) {
 			continue
 		}
 		fact.outcome = outcome
@@ -169,11 +191,17 @@ func (s *Scanner) mergeSources(sw *scanWalk, out *store, walkErr error) {
 		}
 		s.sources[rel] = fact
 	}
-	if walkErr != nil {
+	var gone func(rel string) bool
+	switch {
+	case walkErr == nil:
+		gone = sw.reach.input
+	case errors.Is(walkErr, errScanBudgetExceeded):
+		gone = sw.reach.provenGone
+	default:
 		return
 	}
 	for rel := range s.sources {
-		if _, resolved := sw.outcomes[rel]; !resolved && sw.reach.input(rel) {
+		if _, resolved := sw.outcomes[rel]; !resolved && gone(rel) {
 			delete(s.sources, rel)
 		}
 	}

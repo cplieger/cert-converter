@@ -1788,7 +1788,7 @@
         "spec": {
           "id": 51,
           "title": "Last conversion",
-          "description": "When cert-converter last wrote an output for any certificate. After a restart this is the newest output file's time. No conversion yet means no certificate has an output, or cert-converter was not scraped.",
+          "description": "When cert-converter last wrote an output for any certificate. After a restart this is the newest output file's time. No conversion yet means no certificate has an output. Not scraped means cert-converter was not scraped, or its first scan has not ended.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1805,7 +1805,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "max(cert_converter_source_last_conversion_timestamp_seconds{instance=\"$instance\"} > 0) * 1000",
+                        "expr": "max(cert_converter_source_last_conversion_timestamp_seconds{instance=\"$instance\"} > 0) * 1000 or 0 * max(cert_converter_last_scan_timestamp_seconds{instance=\"$instance\"} > 0)",
                         "legendFormat": "",
                         "instant": true,
                         "range": false
@@ -1844,7 +1844,7 @@
               "fieldConfig": {
                 "defaults": {
                   "unit": "dateTimeFromNow",
-                  "noValue": "No conversion yet",
+                  "noValue": "Not scraped",
                   "color": {
                     "mode": "fixed",
                     "fixedColor": "text"
@@ -1857,7 +1857,18 @@
                         "color": "text"
                       }
                     ]
-                  }
+                  },
+                  "mappings": [
+                    {
+                      "type": "value",
+                      "options": {
+                        "0": {
+                          "index": 0,
+                          "text": "No conversion yet"
+                        }
+                      }
+                    }
+                  ]
                 },
                 "overrides": []
               }
@@ -2023,7 +2034,7 @@
                 "textMode": "value_and_name",
                 "text": {
                   "titleSize": 14,
-                  "valueSize": 28
+                  "valueSize": 18
                 }
               },
               "fieldConfig": {

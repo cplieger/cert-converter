@@ -25,10 +25,10 @@ import (
 )
 
 // ScanResult carries per-source outcome summary counts from a scan run. A scan
-// whose /input walk did not finish counts Failed, Orphan and Unwritable from
-// Sources, reports the other per-path counts and the reap and layout flags at
-// least as the previous scan did, and any scan that did not cover the tree keeps
-// NoSources and AllExcluded unless its own sources disprove them.
+// that did not cover the tree counts Failed, Orphan and Unwritable from Sources
+// and keeps NoSources and AllExcluded unless its own sources disprove them; one
+// whose /input walk did not finish also reports the other per-path counts and
+// the reap and layout flags at least as the previous scan did.
 type ScanResult struct {
 	// Sources is every source the scanner knows after this scan, sorted by Path,
 	// each with the outcome of the latest scan that reached it; the slice is not
@@ -114,23 +114,27 @@ func (o Outcome) String() string {
 	}
 }
 
-// carryUnproven raises the conditions a scan that did not enumerate the whole
-// tree cannot prove gone to the previous report's values. With enumerated, the
-// walk finished and only the whole-tree verdicts carry; a whole-tree verdict
-// this scan's own sources disprove does not. r.Sources must already hold the
-// merged facts.
+// carryUnproven keeps what a scan that did not cover the whole tree cannot prove
+// gone. The per-source problem counts follow r.Sources, which must already hold
+// the merged facts. With enumerated, the walk finished and only the whole-tree
+// verdicts also carry; a whole-tree verdict this scan's own sources disprove
+// does not. Otherwise the other per-path counts and flags keep at least the
+// previous report's values.
 func (r *ScanResult) carryUnproven(prev *ScanResult, enumerated bool) {
+	// Ahead of the counts below: both read this scan's own orphans.
 	r.NoSources = r.NoSources || (prev.NoSources && r.Total <= r.Orphan)
 	r.AllExcluded = r.AllExcluded || (prev.AllExcluded && r.Excluded == r.Total)
-	if enumerated {
-		return
-	}
-	// A source the walk did not reach keeps its fact (mergeSources), so the facts
-	// hold every per-source problem this scan cannot prove gone, and one it fixed
-	// stops counting. Unreadable and Unresolved also count paths that are no source.
+	// A fact changes only when this scan read its source, proved it gone or found
+	// it in a more urgent state (mergeSources), so the facts hold every
+	// per-source problem this scan cannot prove gone, and one it fixed stops
+	// counting.
 	r.Failed = r.sourcesAt(SourceFailed)
 	r.Orphan = r.sourcesAt(SourceOrphan)
 	r.Unwritable = r.sourcesAt(SourceUnwritable)
+	if enumerated {
+		return
+	}
+	// Unreadable and Unresolved also count paths that are no source.
 	r.Unreadable = max(r.Unreadable, prev.Unreadable)
 	r.Unresolved = max(r.Unresolved, prev.Unresolved)
 	// A scan that got as far as the claim ledger counts its own collisions
@@ -572,6 +576,7 @@ func (sw *scanWalk) visit(ctx context.Context, rel string, d fs.DirEntry, err er
 	if !layout.IsSource(rel) {
 		return nil
 	}
+	sw.reach.enumerate(rel)
 	// Ahead of the judgement: both decide from the path alone, so an excluded or
 	// disabled-bundle name counts the same whatever a link there points at.
 	if sw.excludeSource(rel) || sw.ignoreDisabledBundle(rel) {

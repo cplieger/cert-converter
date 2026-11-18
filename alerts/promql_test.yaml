@@ -1143,3 +1143,51 @@ tests:
             value: 1.8e+12
           - labels: '{instance="[::1]:9468", job="cert-converter", order="0 b/two.pfx", outcome="failed", rank="0", source="b/two.pfx"}'
             value: 0
+
+  # The dashboard's Last conversion query, with $instance filled in.
+  # TestDashboardQueriesAreTheTestedOnes fails when this differs from the dashboard.
+  - name: "Last conversion: the newest conversion in milliseconds"
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="[::1]:9468"}'
+        values: "1800000000x10"
+      - series: 'cert_converter_source_last_conversion_timestamp_seconds{job="cert-converter", instance="[::1]:9468", source="a/one.crt"}'
+        values: "1700000000x10"
+      - series: 'cert_converter_source_last_conversion_timestamp_seconds{job="cert-converter", instance="[::1]:9468", source="b/two.crt"}'
+        values: "1750000000x10"
+      - series: 'cert_converter_source_last_conversion_timestamp_seconds{job="cert-converter", instance="[::1]:9468", source="c/three.crt"}'
+        values: "0x10"
+    promql_expr_test:
+      - expr: &last_conversion 'max(cert_converter_source_last_conversion_timestamp_seconds{instance="[::1]:9468"} > 0) * 1000 or 0 * max(cert_converter_last_scan_timestamp_seconds{instance="[::1]:9468"} > 0)'
+        eval_time: 5m
+        exp_samples:
+          - labels: '{}'
+            value: 1.75e+12
+  - name: "Last conversion: no output after a scan answers 0"
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="[::1]:9468"}'
+        values: "1800000000x10"
+      - series: 'cert_converter_source_last_conversion_timestamp_seconds{job="cert-converter", instance="[::1]:9468", source="a/one.crt"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="other:9468"}'
+        values: "1800000000x10"
+      - series: 'cert_converter_source_last_conversion_timestamp_seconds{job="cert-converter", instance="other:9468", source="b/two.crt"}'
+        values: "1750000000x10"
+    promql_expr_test:
+      - expr: *last_conversion
+        eval_time: 5m
+        exp_samples:
+          - labels: '{}'
+            value: 0
+  - name: "Last conversion: no answer before the first scan ends"
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x10"
+      - series: 'cert_converter_source_last_conversion_timestamp_seconds{job="cert-converter", instance="other:9468", source="b/two.crt"}'
+        values: "1750000000x10"
+    promql_expr_test:
+      - expr: *last_conversion
+        eval_time: 5m
+        exp_samples: []

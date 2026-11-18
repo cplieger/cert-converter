@@ -260,6 +260,121 @@ func TestScanSources_an_unread_failed_source_stays_failed(t *testing.T) {
 	}
 }
 
+// A walk that finishes without reading a folder cannot prove the problems under
+// it gone, so their certificates keep counting in the problem counts the alert
+// rules read, as their rows keep saying.
+func TestScanSources_a_folder_the_walk_cannot_read_keeps_its_counts(t *testing.T) {
+	now := sourcesClock
+	pinConversionClock(t, &now)
+	inDir, outDir, outside := t.TempDir(), t.TempDir(), t.TempDir()
+	writeInput(t, filepath.Join(inDir, "d", "lone.crt"), []byte("not a certificate"))
+	writeSelfSignedPair(t, inDir, "site")
+	s := newSourcesScanner(inDir, outDir, nil)
+	if first, _ := s.Run(t.Context()); first.Orphan != 1 {
+		t.Fatalf("setup: first scan Orphan = %d, want 1", first.Orphan)
+	}
+	hideBehindLink(t, inDir, outside, "d")
+
+	result, err := s.Run(t.Context())
+	if err != nil || result.Outcome != OutcomeComplete || result.Unresolved != 1 {
+		t.Fatalf("Run(d/ behind a link) = %v, %v, Unresolved %d, want a finished walk with one unresolved link", result.Outcome, err, result.Unresolved)
+	}
+	if result.Orphan != 1 {
+		t.Errorf("Run(d/ behind a link).Orphan = %d, want 1", result.Orphan)
+	}
+	got := make(map[string]SourceState)
+	for _, st := range result.Sources {
+		got[st.Path] = st
+	}
+	if st, ok := got["d/lone.crt"]; !ok || st.Outcome != SourceOrphan {
+		t.Errorf("Sources[d/lone.crt] = %+v, %v, want orphan", st, ok)
+	}
+}
+
+// A write refused for a source the scan then cannot read stays refused: the
+// write-refused alert reads that count, and the table must agree with it.
+func TestScanSources_an_unread_unwritable_source_stays_unwritable(t *testing.T) {
+	now := sourcesClock
+	pinConversionClock(t, &now)
+	inDir, outDir := t.TempDir(), t.TempDir()
+	writeSelfSignedPair(t, inDir, "site")
+	writeInput(t, filepath.Join(inDir, "z", "notes.txt"), []byte("not an input"))
+	stageOversizedBundle(t, filepath.Join(outDir, "site.pfx"))
+	stubWriteRefusal(t, &fs.PathError{Op: "openat", Path: "site.pfx", Err: syscall.EROFS})
+	s := newSourcesScanner(inDir, outDir, nil)
+	if first, _ := s.Run(t.Context()); first.Unwritable != 1 {
+		t.Fatalf("setup: first scan Unwritable = %d, want 1", first.Unwritable)
+	}
+	cert := filepath.Join(inDir, "site.crt")
+	if err := os.Remove(cert); err != nil {
+		t.Fatalf("setup: Remove: %v", err)
+	}
+	if err := os.Mkdir(cert, 0o750); err != nil {
+		t.Fatalf("setup: Mkdir: %v", err)
+	}
+
+	// The root, site.crt/, site.key and z/ fit; the walk stops at z/notes.txt.
+	s.opts.MaxScanEntries = 4
+	result, err := s.Run(t.Context())
+	if err != nil || result.Outcome != OutcomeBudgetStopped {
+		t.Fatalf("Run(over budget) = %v, %v, want a budget stop with no error", result.Outcome, err)
+	}
+	if result.Unwritable != 1 {
+		t.Errorf("Run(over budget).Unwritable = %d, want 1", result.Unwritable)
+	}
+	if len(result.Sources) != 1 || result.Sources[0].Outcome != SourceUnwritable {
+		t.Errorf("Run(over budget).Sources = %+v, want site.crt unwritable", result.Sources)
+	}
+}
+
+// A scan stopped at MAX_SCAN_ENTRIES proves a source gone only where it listed
+// the folder before the stop, so facts cannot pile up while the tree stays over
+// the limit, and one past the stop is kept.
+func TestScanSources_a_stopped_scan_drops_a_source_gone_before_the_stop(t *testing.T) {
+	now := sourcesClock
+	pinConversionClock(t, &now)
+	inDir, outDir := t.TempDir(), t.TempDir()
+	writeSelfSignedPair(t, inDir, "a")
+	for _, dir := range []string{"b", "m", "z"} {
+		if err := os.Mkdir(filepath.Join(inDir, dir), 0o750); err != nil {
+			t.Fatalf("setup: Mkdir: %v", err)
+		}
+		writeSelfSignedPair(t, filepath.Join(inDir, dir), "site")
+	}
+	writeInput(t, filepath.Join(inDir, "b", "notes.txt"), []byte("not an input"))
+	s := newSourcesScanner(inDir, outDir, nil)
+	if first := scanSources(t, s); len(first) != 4 {
+		t.Fatalf("setup: first scan Sources = %+v, want 4", first)
+	}
+	for _, name := range []string{"a.crt", "a.key", "b/site.crt", "b/site.key"} {
+		if err := os.Remove(filepath.Join(inDir, name)); err != nil {
+			t.Fatalf("setup: Remove: %v", err)
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(inDir, "z")); err != nil {
+		t.Fatalf("setup: RemoveAll: %v", err)
+	}
+
+	// The root, b/, m/, b/notes.txt and m/site.crt fit; the walk stops at
+	// m/site.key, after it listed the root and b/ in full.
+	s.opts.MaxScanEntries = 5
+	result, err := s.Run(t.Context())
+	if err != nil || result.Outcome != OutcomeBudgetStopped {
+		t.Fatalf("Run(over budget) = %v, %v, want a budget stop with no error", result.Outcome, err)
+	}
+	got := make(map[string]SourceState)
+	for _, st := range result.Sources {
+		got[st.Path] = st
+	}
+	for _, rel := range []string{"a.crt", "b/site.crt"} {
+		if st, ok := got[rel]; ok {
+			t.Errorf("Sources[%s] = %+v, want no entry: the walk listed its folder before the stop", rel, st)
+		}
+	}
+	wantSource(t, got, "m/site.crt", SourceUnchanged, sourcesClock)
+	wantSource(t, got, "z/site.crt", SourceConverted, sourcesClock)
+}
+
 func TestScanSources_a_source_that_goes_is_dropped(t *testing.T) {
 	now := sourcesClock
 	pinConversionClock(t, &now)

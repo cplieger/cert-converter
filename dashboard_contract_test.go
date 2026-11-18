@@ -84,6 +84,12 @@ type dashPanel struct {
 		VizConfig struct {
 			Group string `json:"group"`
 			Spec  struct {
+				Options struct {
+					Text struct {
+						TitleSize int `json:"titleSize"`
+						ValueSize int `json:"valueSize"`
+					} `json:"text"`
+				} `json:"options"`
 				FieldConfig struct {
 					Overrides []dashOverride `json:"overrides"`
 					Defaults  struct {
@@ -507,6 +513,7 @@ func TestDashboardQueriesAreTheTestedOnes(t *testing.T) {
 		{"Outputs removed", "removed_slot"},
 		{"Outputs match inputs", "outputs_match"},
 		{"Each certificate", "certificate_table"},
+		{"Last conversion", "last_conversion"},
 	} {
 		t.Run(tc.anchor, func(t *testing.T) {
 			var exprs []string
@@ -1107,5 +1114,44 @@ func TestDashboardDetailsRowStartsCollapsed(t *testing.T) {
 	}
 	if !row(t, &d, "Details").Spec.Collapse {
 		t.Error("Details starts open, want it collapsed")
+	}
+}
+
+// TestDashboardLastConversionTellsNoOutputFromNotScraped fails when Last
+// conversion shows the same text for a finished scan that found no output,
+// which its query answers 0, and for an instance that answers nothing.
+func TestDashboardLastConversionTellsNoOutputFromNotScraped(t *testing.T) {
+	d := loadDashboard(t)
+	defaults := panelTitled(t, &d, "Last conversion").Spec.VizConfig.Spec.FieldConfig.Defaults
+	if defaults.NoValue != "Not scraped" {
+		t.Errorf("no-value text is %q, want %q", defaults.NoValue, "Not scraped")
+	}
+	var zero string
+	for _, m := range defaults.Mappings {
+		if o, ok := m.Options["0"]; ok && m.Type == "value" {
+			zero = o.Text
+		}
+	}
+	if zero != "No conversion yet" {
+		t.Errorf("0 maps to %q, want %q", zero, "No conversion yet")
+	}
+}
+
+// TestDashboardStatTextIsFixed fails when a stat leaves its text to auto sizing
+// or sizes it off the fleet's fixed sizes: 14 and 28, or 14 and 18 for a stat
+// that stacks several values in one tile (grafana/panels.md "Draw options").
+func TestDashboardStatTextIsFixed(t *testing.T) {
+	d := loadDashboard(t)
+	for name, p := range d.Spec.Elements {
+		if p.Spec.VizConfig.Group != "stat" {
+			continue
+		}
+		want := 28
+		if len(p.Spec.Data.Spec.Queries) > 1 {
+			want = 18
+		}
+		if got := p.Spec.VizConfig.Spec.Options.Text; got.TitleSize != 14 || got.ValueSize != want {
+			t.Errorf("%s %q text is %d/%d, want 14/%d", name, p.Spec.Title, got.TitleSize, got.ValueSize, want)
+		}
 	}
 }
