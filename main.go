@@ -18,9 +18,9 @@ import (
 	"github.com/cplieger/cert-converter/internal/config"
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/mounts"
+	"github.com/cplieger/cert-converter/internal/obs"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/scancadence"
-	"github.com/cplieger/cert-converter/internal/scanreport"
 	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/go/health/v2"
 	"github.com/cplieger/go/httpserver"
@@ -48,14 +48,14 @@ func healthyAfterScan(r *process.ScanResult) bool {
 
 // scanAndSetHealth runs one scan, reports its verdict to the record and the
 // metrics, and updates the health verdict.
-func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, reporter *scanreport.Reporter, st *health.Status, polling bool) {
+func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, reporter *obs.Reporter, st *health.Status, polling bool) {
 	result, err := scanner.Run(ctx)
 	if err != nil && process.IsShutdown(err) {
 		slog.Info("scan interrupted by shutdown", "reason", err)
 		return
 	}
 	healthy := err == nil && healthyAfterScan(&result)
-	reporter.Report(ctx, &scanreport.Scan{Result: result, Err: err, Polling: polling, Healthy: healthy})
+	reporter.Report(ctx, &obs.Scan{Result: result, Err: err, Polling: polling, Healthy: healthy})
 	if err != nil {
 		slog.Error("processing failed", "error", logtext.Path(err.Error()))
 	}
@@ -64,23 +64,15 @@ func scanAndSetHealth(ctx context.Context, scanner *process.Scanner, reporter *s
 
 // --- Metrics ---
 
-// metricsPrefix names every cert-converter series on the metrics page.
-const metricsPrefix = "cert_converter"
-
 // version is the release this binary was built from, stamped by the Dockerfile's
 // BUILD_VERSION; an unstamped build reports "dev".
 var version = "dev"
 
-// newMetrics builds the registry run serves, with the scan metrics on it. The
-// scan deadline's gap is the health lease, so CertConverterScanStalled and the
-// stale /healthz check judge the same moment.
-func newMetrics(fallback time.Duration) (*measure.Registry, *scanreport.Reporter) {
-	reg := measure.NewRegistry(metricsPrefix)
-	buildInfo := measure.NewLabeledGauge("build_info",
-		"Always 1; the version label is the cert-converter release this process runs.", measure.UnitNone, []string{"version"})
-	reg.MustRegister(buildInfo)
-	buildInfo.Set(1, version)
-	return reg, scanreport.NewReporter(reg, healthLease(fallback))
+// newMetrics builds the registry run serves. The scan deadline's gap is the
+// health lease, so CertConverterScanStalled and the stale /healthz check judge
+// the same moment.
+func newMetrics(fallback time.Duration) (*measure.Registry, *obs.Reporter) {
+	return obs.New(version, healthLease(fallback))
 }
 
 // startMetrics binds addr and serves reg's page and healthz on it until ctx

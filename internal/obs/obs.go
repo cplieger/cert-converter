@@ -1,7 +1,8 @@
-// Package scanreport writes each scan's verdict once, to the end-of-scan record the
-// shipped log rules read and to the metrics the shipped metric rules read, so the
-// two never disagree.
-package scanreport
+// Package obs owns cert-converter's metrics registry, prefixed cert_converter_:
+// build_info and the scan series. It writes each scan's verdict once, to the
+// end-of-scan record the shipped log rules read and to the metrics the shipped
+// metric rules read, so the two never disagree.
+package obs
 
 import (
 	"context"
@@ -116,10 +117,21 @@ var (
 	modes    = []string{"watch", "poll"}
 )
 
-// NewReporter registers the scan metrics on reg and seeds every label value at 0,
-// so a rule sees each series from the first scrape. lease is the gap the scan
-// deadline allows after the start and after each healthy scan.
-func NewReporter(reg *measure.Registry, lease time.Duration) *Reporter {
+// New builds the registry the metrics listener serves, with build_info set for
+// version and the scan series on it. lease is the gap the scan deadline allows
+// after the start and after each healthy scan.
+func New(version string, lease time.Duration) (*measure.Registry, *Reporter) {
+	reg := measure.NewRegistry("cert_converter")
+	buildInfo := measure.NewLabeledGauge("build_info",
+		"Always 1; the version label is the cert-converter release this process runs.", measure.UnitNone, []string{"version"})
+	reg.MustRegister(buildInfo)
+	buildInfo.Set(1, version)
+	return reg, newReporter(reg, lease)
+}
+
+// newReporter registers the scan metrics on reg and seeds every label value at
+// 0, so a rule sees each series from the first scrape.
+func newReporter(reg *measure.Registry, lease time.Duration) *Reporter {
 	r := &Reporter{
 		lease: lease,
 		sources: measure.NewLabeledGauge("last_scan_sources",

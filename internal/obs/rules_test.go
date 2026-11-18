@@ -1,4 +1,4 @@
-package scanreport
+package obs
 
 import (
 	"bytes"
