@@ -51,7 +51,6 @@ cert-converter writes logfmt records to standard error, with every timestamp in 
 - Under the flat layout, three WARNs report the [ownership record](configuration.md#flat-ownership-record). `claims_rebuilt` and `claims_unreadable` are logged once at start, and `claims_unwritable` is a standing problem. None of them affects health or a count, and no alert rule reads them.
 - With `METRICS_LISTEN_ADDR` set, each request to the listener writes an `http` record, at Debug for `/metrics` and `/healthz` and at `INFO` for any other path.
 - Look for a `remediation` field on warnings and errors. When present, it names the action to take.
-- With 112 or more certificates, `cert_converter_source_outcome` serves more than 1,000 series, and the first scrape after each start logs one `measure: collector problem` WARN naming that family. It needs no action.
 
 `scan complete` closes every scan that is not cut short by a shutdown. It is `INFO` when the scan covered the whole tree, and `WARN` when the scan aborted or stopped at `MAX_SCAN_ENTRIES`, with an `error` field on an abort. The log rules read this record at either level, so keep `LOG_LEVEL` at `info` if you use them. Every field except `error` is a number.
 
