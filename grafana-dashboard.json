@@ -1464,7 +1464,7 @@
         "spec": {
           "id": 23,
           "title": "Last healthy scan",
-          "description": "When the latest healthy scan ended, meaning it read /input with no conversion failure and no output name collision. A stop at MAX_SCAN_ENTRIES or an unreadable or excluded source still counts as healthy, and Scan outcome and the attention tiles show those. A time older than Last scan ended means the scans since then were unhealthy. No value means no healthy scan since the start.",
+          "description": "When the latest healthy scan ended, meaning it read /input with no conversion failure and no output name collision. A stop at MAX_SCAN_ENTRIES or an unreadable or excluded source still counts as healthy, and Outputs match inputs or the table shows it. A time older than Last scan ended means the scans since then were unhealthy. No value means no healthy scan since the start.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1630,7 +1630,7 @@
         "spec": {
           "id": 50,
           "title": "Outputs match inputs",
-          "description": "Yes when the latest scan left every output matching its input, otherwise No with the most urgent reason, and the table and the attention tiles show the rest. A red No is an aborted scan, a failed conversion or a name collision, which make the container unhealthy, and a yellow No does not. No scan yet means no scan has ended since the start, or cert-converter was not scraped. OUTPUT_LIFECYCLE=warn and keep never remove an output whose input is gone, which this tile cannot see.",
+          "description": "Yes when the latest scan left every output matching its input, otherwise No with the most urgent reason, and the table shows the rest. A red No means an aborted scan, a failed conversion or a name collision, which make the container unhealthy, and a yellow No leaves health unchanged. No scan yet means no scan has ended since the start, or cert-converter was not scraped. OUTPUT_LIFECYCLE=warn and keep never remove an output whose input is gone, which this tile cannot see.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1865,7 +1865,7 @@
         "spec": {
           "id": 52,
           "title": "Certificates",
-          "description": "Certificate sources cert-converter knows under /input, excluded ones included: one row each in the table below. Not scraped means cert-converter was not scraped, or its first scan has not ended.",
+          "description": "Certificate sources cert-converter knows under /input, excluded ones included. The table below has one row for each. Not scraped means cert-converter was not scraped, or its first scan has not ended.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1947,7 +1947,7 @@
         "spec": {
           "id": 53,
           "title": "Errors now",
-          "description": "Certificates the latest scan that reached them left failed, in a name collision, refused a write, unreadable, vanished during the scan or with their key missing. Green at 0, red from 1. A problem with the scan itself rather than one certificate shows in Outputs match inputs. Not scraped means cert-converter was not scraped, or its first scan has not ended.",
+          "description": "Certificates in a problem state in the table below: failed to convert, name collision, write refused, unreadable, vanished during scan or key missing. Green at 0, red from 1. A problem with the scan itself rather than one certificate shows in Outputs match inputs. Not scraped means cert-converter was not scraped, or its first scan has not ended.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -2114,7 +2114,7 @@
         "spec": {
           "id": 55,
           "title": "Each certificate",
-          "description": "Each certificate source under /input, problems first, with what the latest scan that reached it did and when it was last converted. The path is relative to /input. Failed and Name collision show in red, the other problems in yellow. Never means it has no output.",
+          "description": "Each certificate source under /input, problems first, with what the latest scan that reached it did and when it was last converted. The path is relative to /input. Failed to convert and Name collision show in red, the other problems in yellow. Never means it has no output.",
           "links": [],
           "data": {
             "kind": "QueryGroup",

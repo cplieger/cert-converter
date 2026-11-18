@@ -45,10 +45,10 @@ cert_converter_scan_deadline_timestamp_seconds 946701000
 # HELP cert_converter_last_success_timestamp_seconds Unix time the last healthy scan ended, 0 before the first one.
 # TYPE cert_converter_last_success_timestamp_seconds gauge
 cert_converter_last_success_timestamp_seconds 946690200
-# HELP cert_converter_next_scan_timestamp_seconds Unix time of the next guaranteed recheck of every source; a changed file under /input can bring a scan sooner.
+# HELP cert_converter_next_scan_timestamp_seconds Unix time of the next guaranteed recheck of every source. A changed file under /input can bring a scan sooner.
 # TYPE cert_converter_next_scan_timestamp_seconds gauge
 cert_converter_next_scan_timestamp_seconds 946693800
-# HELP cert_converter_source_outcome 1 for the outcome the latest scan that reached the source gave it, 0 for the others; source is a path under /input.
+# HELP cert_converter_source_outcome 1 for the outcome the latest scan that reached the source gave it, 0 for the others. The source label is a path under /input.
 # TYPE cert_converter_source_outcome gauge
 cert_converter_source_outcome{outcome="collided",source="a/one.crt"} 0
 cert_converter_source_outcome{outcome="converted",source="a/one.crt"} 1
@@ -68,7 +68,7 @@ cert_converter_source_outcome{outcome="unchanged",source="b/two.pfx"} 0
 cert_converter_source_outcome{outcome="unreadable",source="b/two.pfx"} 0
 cert_converter_source_outcome{outcome="unwritable",source="b/two.pfx"} 0
 cert_converter_source_outcome{outcome="vanished",source="b/two.pfx"} 0
-# HELP cert_converter_source_last_conversion_timestamp_seconds Unix time the source was last converted, from its newest output artifact after a restart; 0 when it has no output.
+# HELP cert_converter_source_last_conversion_timestamp_seconds Unix time the source was last converted, or 0 when it has no output. After a restart, the newest output file's modification time.
 # TYPE cert_converter_source_last_conversion_timestamp_seconds gauge
 cert_converter_source_last_conversion_timestamp_seconds{source="a/one.crt"} 1800000000
 cert_converter_source_last_conversion_timestamp_seconds{source="b/two.pfx"} 0

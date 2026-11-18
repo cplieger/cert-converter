@@ -6,7 +6,7 @@ This page lists what cert-converter reports, the Grafana dashboard and the alert
 
 | You run | You get | You set up |
 | --- | --- | --- |
-| Prometheus, Mimir or VictoriaMetrics, with Alertmanager (the monitoring guide's starting stack adds Loki) | 14 alerts, including `CertConverterDown`, plus `up` and the [dashboard](#dashboard) of each scan | `METRICS_LISTEN_ADDR`, a scrape job named `cert-converter`, and [`alerts/promql.yaml`](../alerts/promql.yaml) |
+| Prometheus, Mimir or VictoriaMetrics, with Alertmanager (the monitoring guide's starting stack adds Loki) | 14 alerts, including `CertConverterDown`, plus `up` and a [dashboard](#dashboard) of each certificate | `METRICS_LISTEN_ADDR`, a scrape job named `cert-converter`, and [`alerts/promql.yaml`](../alerts/promql.yaml) |
 | Loki and Alertmanager, no metric store | 15 alerts, including one for a refused start | [`alerts/logql.yaml`](../alerts/logql.yaml) on Loki's ruler, with `LOG_LEVEL` at `info` |
 | Grafana-managed alerting only | The same rules, imported into Grafana | A Prometheus or Loki data source, and one of the two rule files |
 | Docker or Unraid only | Docker health, and the log | An uptime prober on `/healthz` with `METRICS_LISTEN_ADDR` set, or something that watches Docker health |
@@ -15,11 +15,14 @@ This page lists what cert-converter reports, the Grafana dashboard and the alert
 
 The metrics page is off by default, and the container then opens no port. Set `METRICS_LISTEN_ADDR` to a listen address, for example `:9468`, and cert-converter serves `GET /metrics` on it. [Reaching an app's metrics page](https://github.com/cplieger/docs/blob/main/docs/monitoring.md#reaching-an-apps-metrics-page) shows how to let your scraper reach it. The page has no login, so keep the port on your network. Name the scrape job `cert-converter`, because `CertConverterDown` reads `up{job="cert-converter"}`.
 
-Each scan sets the scan series from the same verdict it writes to the `scan complete` record. The labels carry only the values listed below, never a path.
+Each scan sets the scan series from the same verdict it writes to the `scan complete` record. The labels carry only the values listed below, except `source`. `source` carries the path of a certificate source relative to `/input`, a file name you chose, with control and text-direction characters replaced by a space. Keep that in mind before you ship these series to a store other people read.
 
 | Series | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `cert_converter_last_scan_sources` | gauge | `outcome`: `converted`, `unchanged`, `orphan`, `unreadable`, `unresolved`, `vanished`, `unwritable`, `collided`, `excluded`, `ignored`, `failed` | Sources at each outcome in the last scan |
+| `cert_converter_source_outcome` | gauge | `source`: a path under `/input`. `outcome`: `converted`, `unchanged`, `failed`, `orphan`, `unreadable`, `unwritable`, `collided`, `excluded`, `vanished` | `1` for the outcome the latest scan that reached this source gave it, `0` for the others |
+| `cert_converter_source_last_conversion_timestamp_seconds` | gauge | `source` | Unix time the source was last converted. After a restart, the newest output file's modification time. `0` when the source has no output |
+| `cert_converter_next_scan_timestamp_seconds` | gauge | none | Unix time of the next guaranteed recheck, which runs every `FALLBACK_SCAN_HOURS` and at least daily. A changed file under `/input` brings a scan sooner |
 | `cert_converter_last_scan_sources_found` | gauge | none | Sources the last scan found under `/input` |
 | `cert_converter_last_scan_timestamp_seconds` | gauge | none | Unix time the last scan ended, `0` before the first one |
 | `cert_converter_last_scan_outcome` | gauge | `outcome`: `complete`, `aborted`, `budget_stopped` | `1` for how the last scan ended, `0` for the others |
@@ -30,7 +33,9 @@ Each scan sets the scan series from the same verdict it writes to the `scan comp
 | `cert_converter_scan_deadline_timestamp_seconds` | gauge | none | Unix time the next healthy scan is due, three recheck intervals after the last healthy scan or the start. An unhealthy scan leaves it unchanged |
 | `cert_converter_build_info` | gauge | `version` | Always `1`. `version` is the release the image was built from |
 
-Every labelled scan series starts at `0`, so each rule sees its series from the first scrape. The page also carries the Go runtime and process families (`go_*`, `process_*`) under the names Go's official Prometheus client uses, so stock Go dashboards work. The bundled [dashboard](#dashboard) shows the `cert_converter_*` series in Grafana.
+Every labelled scan count starts at `0`, so each rule sees its series from the first scrape. The page also carries the Go runtime and process families (`go_*`, `process_*`) under the names Go's official Prometheus client uses, so stock Go dashboards work. The bundled [dashboard](#dashboard) shows the `cert_converter_*` series in Grafana.
+
+The per-source series appear after the first scan. A source leaves them when a scan that ran to the end read its folder and no longer found it. When a scan stops early or cannot read a source's folder, that source keeps its previous outcome and time, as the counts keep theirs.
 
 ## Logs
 
@@ -133,10 +138,10 @@ Notes on individual alerts:
 [`grafana-dashboard.json`](../grafana-dashboard.json) imports as the Cert Converter dashboard. It reads the metrics above from a Prometheus data source and needs Grafana 13.2 or newer. When you run more than one container, the cert-converter variable picks the instance to show. It has one page of three rows:
 
 - Needs attention appears only while an alert from `alerts/promql.yaml` fires, with one tile per rule. Each tile reads its rule's `ALERTS` series, which Prometheus and the Mimir ruler store beside your metrics. The row stays hidden while those rules are not loaded. `CertConverterStartupRefused` and `CertConverterChangeDetectionDead` read the log, so they have no tile.
-- Latest scan shows how the latest scan ended and whether it ran on a file watch or on polling. It also shows when the latest scan and the latest healthy scan ended, and when the next healthy scan is due. Sources by outcome has one bar for each outcome the latest scan gave a source.
-- History charts how each scan ended and when cert-converter polled for changes, over the selected range. It also charts each standing problem a scan reported and the outputs `OUTPUT_LIFECYCLE=sync` removed.
+- Now opens with Outputs match inputs, which answers Yes, or No with the most urgent reason. Last conversion, Certificates, Errors now and Next scan follow. The table below them lists each certificate with its state and when it was last converted, problems first.
+- Details starts collapsed. It shows when the latest scan and the latest healthy scan ended, how many certificates were converted in the selected range, and the outputs `OUTPUT_LIFECYCLE=sync` removed.
 
-The charts that count per interval also read `process_start_time_seconds` to find a container restart. Keep the `process_*` series in your scrape, or a restart draws a negative bar.
+Outputs removed reads `process_start_time_seconds` too, to find a container restart. Keep the `process_*` series in your scrape, or a restart draws a negative bar.
 
 The dashboard is versioned with the image, and the `grafana-dashboard.json` of release `<tag>` matches the metrics that image serves. Each release attaches it with its checksum at `https://github.com/cplieger/cert-converter/releases/download/<tag>/grafana-dashboard.json`, and each image publish pushes it as the OCI artifact `ghcr.io/cplieger/cert-converter/dashboard:<tag>`. The file sets `metadata.name` to `cert-converter`, which Grafana uses as the dashboard UID. Importing a newer copy over the old one updates it in place.
 
