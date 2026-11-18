@@ -510,10 +510,8 @@ func TestDashboardQueriesAreTheTestedOnes(t *testing.T) {
 	fill := strings.NewReplacer(`$instance`, "[::1]:9468", `${__interval_ms}`, "60000", `$__interval`, "1m")
 	for _, tc := range []struct{ title, anchor string }{
 		{"cert-converter scrape", "scrape_down"},
-		{"Outputs removed", "removed_slot"},
 		{"Outputs match inputs", "outputs_match"},
 		{"Each certificate", "certificate_table"},
-		{"Last conversion", "last_conversion"},
 	} {
 		t.Run(tc.anchor, func(t *testing.T) {
 			var exprs []string
@@ -741,108 +739,20 @@ func servedValues(t *testing.T, family, label string) []string {
 	return out
 }
 
-const spanTitle = "${span} ${spanunit}"
-
-var rangeWordVars = []string{"span", "spanunit", "spanthe"}
-
 var fixedLengthRe = regexp.MustCompile(`(?i)\b\d+(?:\.\d+)?\s*(?:s|m|h|d|w|seconds?|minutes?|hours?|days?|weeks?)\b`)
 
-// customText is the text Grafana gives a custom variable whose query is query,
-// which titles render. The parse follows CustomVariable.transformCsvStringToOptions,
-// https://github.com/grafana/scenes/blob/main/packages/scenes/src/variables/variants/CustomVariable.tsx.
-// More than one option would let Grafana keep a stale choice, so it fails.
-func customText(t *testing.T, query string) string {
-	t.Helper()
-	entries := regexp.MustCompile(`(?:\\,|[^,])+`).FindAllString(query, -1)
-	if len(entries) != 1 {
-		t.Errorf("custom query %q gives %d options, want 1", query, len(entries))
-		return ""
-	}
-	if m := regexp.MustCompile(`^\s*(.+)\s:\s(.+)$`).FindStringSubmatch(entries[0]); m != nil {
-		return strings.TrimSpace(m[1])
-	}
-	return strings.TrimSpace(entries[0])
-}
-
-// rangeWords is the text of each range word variable once spanread holds the
-// option Grafana makes of its answer row, or none at all (""), as on a failed
-// first read.
-func rangeWords(t *testing.T, vars map[string]dashVariable, row string) map[string]string {
-	t.Helper()
-	read := vars["spanread"]
-	rx, err := regexp.Compile(strings.TrimSuffix(strings.TrimPrefix(read.Spec.Regex, "/"), "/"))
-	if err != nil || rx.SubexpIndex("value") < 0 || rx.SubexpIndex("text") < 0 {
-		t.Fatalf("spanread regex %q: %v, want value and text groups", read.Spec.Regex, err)
-	}
-	var value, text string
-	if row != "" {
-		m := rx.FindStringSubmatch(row)
-		if m == nil {
-			t.Fatalf("spanread regex %v does not match %s", rx, row)
-		}
-		value, text = m[rx.SubexpIndex("value")], m[rx.SubexpIndex("text")]
-	}
-	fill := strings.NewReplacer("${spanread:text}", text, "${spanread}", value)
-	words := map[string]string{}
-	for _, name := range rangeWordVars {
-		var query string
-		_ = json.Unmarshal(vars[name].Spec.Query, &query)
-		words[name] = customText(t, fill.Replace(query))
-	}
-	return words
-}
-
-// TestDashboardRangeFiguresNameTheRangeLength fails when a panel reading
-// $__range does not name the range length through span and spanunit, a title
-// names a fixed length, a query writes a fixed window or offset, or the range
-// words stop reading "30 days" from spanread's answer and "the range" before
-// it has one.
-func TestDashboardRangeFiguresNameTheRangeLength(t *testing.T) {
+// TestDashboardNamesNoFixedLength fails when a title names a fixed length or a
+// query writes a fixed window or offset, since every figure follows the time
+// picker. A panel that reads $__range must also put the range words back.
+func TestDashboardNamesNoFixedLength(t *testing.T) {
 	d := loadDashboard(t)
-	vars := d.variables()
-	read, ok := vars["spanread"]
-	if !ok {
-		t.Fatal("variable spanread missing, want one read of the range length for every range word")
-	}
-	if read.Kind != "QueryVariable" || read.Spec.Hide != "hideVariable" || read.Spec.Refresh != "onTimeRangeChanged" || !read.Spec.SkipURLSync {
-		t.Errorf("spanread is %s hide %q refresh %q, want a hidden QueryVariable refreshed on time range change, not in the URL",
-			read.Kind, read.Spec.Hide, read.Spec.Refresh)
-	}
-	for _, name := range rangeWordVars {
-		if v := vars[name]; v.Kind != "CustomVariable" || v.Spec.Hide != "hideVariable" || !v.Spec.SkipURLSync {
-			t.Errorf("variable %s is %q hide %q, want a hidden CustomVariable kept out of the URL", name, v.Kind, v.Spec.Hide)
-		}
-	}
-	// spanread's query writes the number to n and the unit to u, and Grafana
-	// gives a query_result row as "{labels} value timestamp":
-	// https://grafana.com/docs/grafana/latest/datasources/prometheus/template-variables/
-	for _, c := range []struct {
-		row  string
-		want map[string]string
-	}{
-		{"", map[string]string{"span": "the", "spanunit": "range", "spanthe": "the"}},
-		{`{n="30 : ",u="days : "} 1 1791585738061`, map[string]string{"span": "30", "spanunit": "days", "spanthe": "the 30"}},
-		{`{n="5.6 : ",u="hours : "} 1 1791585738061`, map[string]string{"span": "5.6", "spanunit": "hours", "spanthe": "the 5.6"}},
-		{`{n="45 : ",u="seconds : "} 1 1791585738061`, map[string]string{"span": "45", "spanunit": "seconds", "spanthe": "the 45"}},
-	} {
-		if got := rangeWords(t, vars, c.row); !maps.Equal(got, c.want) {
-			t.Errorf("range words for spanread answer %q are %v, want %v", c.row, got, c.want)
-		}
-	}
-	figures := 0
 	for name, p := range d.Spec.Elements {
-		if slices.ContainsFunc(panelExprs(&p), func(e string) bool { return strings.Contains(e, "$__range") }) {
-			figures++
-			if !strings.Contains(p.Spec.Title, spanTitle) {
-				t.Errorf("%s %q reads $__range, want its title to name %s", name, p.Spec.Title, spanTitle)
-			}
-		}
 		if fixedLengthRe.MatchString(p.Spec.Title) {
-			t.Errorf("%s %q names a fixed length, want the range words or none", name, p.Spec.Title)
+			t.Errorf("%s %q names a fixed length, want none", name, p.Spec.Title)
 		}
-	}
-	if figures == 0 {
-		t.Error("no range figure found; the check no longer reads the dashboard")
+		if slices.ContainsFunc(panelExprs(&p), func(e string) bool { return strings.Contains(e, "$__range") }) {
+			t.Errorf("%s %q reads $__range, which this dashboard's titles have no range words for", name, p.Spec.Title)
+		}
 	}
 	offsetRe := regexp.MustCompile(`\boffset\s+(\S+)`)
 	for where, expr := range dashboardQueries(&d) {
@@ -1020,26 +930,31 @@ func TestDashboardCertificateTableRanksProblemsFirst(t *testing.T) {
 			t.Errorf("outcome %s shows %s, want red or yellow for exactly the problems", o, shown.Color)
 		}
 	}
-	errorsNow := panelTitled(t, &d, "Errors now")
 	countedRe := regexp.MustCompile(`outcome=~"([^"]+)"`)
 	var counted []string
-	for _, q := range errorsNow.Spec.Data.Spec.Queries {
-		m := countedRe.FindStringSubmatch(q.Spec.Query.Spec.Expr)
-		if m == nil {
-			t.Errorf("Errors now query %s matches no outcome list", q.Spec.RefID)
+	for _, title := range []string{"Errors", "Warnings"} {
+		p := panelTitled(t, &d, title)
+		queries := p.Spec.Data.Spec.Queries
+		if len(queries) != 1 {
+			t.Errorf("%s holds %d queries, want 1", title, len(queries))
 			continue
 		}
-		color := colorAtOne(t, errorsNow, q.Spec.RefID)
+		m := countedRe.FindStringSubmatch(queries[0].Spec.Query.Spec.Expr)
+		if m == nil {
+			t.Errorf("%s matches no outcome list", title)
+			continue
+		}
+		color := colorAtOne(t, p, queries[0].Spec.RefID)
 		for o := range strings.SplitSeq(m[1], "|") {
 			counted = append(counted, o)
 			if shown := states[0].Options[o].Color; shown != color {
-				t.Errorf("Errors now shows %s %s from 1, the table %s", o, color, shown)
+				t.Errorf("%s shows %s %s from 1, the table %s", title, o, color, shown)
 			}
 		}
 	}
 	slices.Sort(counted)
 	if !slices.Equal(counted, sourceProblems) {
-		t.Errorf("Errors now counts %v, want %v", counted, sourceProblems)
+		t.Errorf("Errors and Warnings count %v, want %v", counted, sourceProblems)
 	}
 	for _, o := range sourceProblems {
 		for value, r := range outputsMatchSpec {
@@ -1098,42 +1013,19 @@ func colorAtOne(t *testing.T, p *dashPanel, refID string) string {
 	return color
 }
 
-// TestDashboardDetailsRowStartsCollapsed fails when the rows stop reading
-// attention, then the answers, then a collapsed Details row at the bottom.
-func TestDashboardDetailsRowStartsCollapsed(t *testing.T) {
+// TestDashboardRowsAreAttentionThenNow fails when the rows stop reading
+// attention, then the answers, with the answers open.
+func TestDashboardRowsAreAttentionThenNow(t *testing.T) {
 	d := loadDashboard(t)
 	var titles []string
 	for _, r := range d.Spec.Layout.Spec.Rows {
 		titles = append(titles, r.Spec.Title)
 	}
-	if want := []string{"Needs attention", "Now", "Details"}; !slices.Equal(titles, want) {
+	if want := []string{"Needs attention", "Now"}; !slices.Equal(titles, want) {
 		t.Errorf("rows are %q, want %q", titles, want)
 	}
 	if row(t, &d, "Now").Spec.Collapse {
 		t.Error("Now starts collapsed, want it open")
-	}
-	if !row(t, &d, "Details").Spec.Collapse {
-		t.Error("Details starts open, want it collapsed")
-	}
-}
-
-// TestDashboardLastConversionTellsNoOutputFromNotScraped fails when Last
-// conversion shows the same text for a finished scan that found no output,
-// which its query answers 0, and for an instance that answers nothing.
-func TestDashboardLastConversionTellsNoOutputFromNotScraped(t *testing.T) {
-	d := loadDashboard(t)
-	defaults := panelTitled(t, &d, "Last conversion").Spec.VizConfig.Spec.FieldConfig.Defaults
-	if defaults.NoValue != "Not scraped" {
-		t.Errorf("no-value text is %q, want %q", defaults.NoValue, "Not scraped")
-	}
-	var zero string
-	for _, m := range defaults.Mappings {
-		if o, ok := m.Options["0"]; ok && m.Type == "value" {
-			zero = o.Text
-		}
-	}
-	if zero != "No conversion yet" {
-		t.Errorf("0 maps to %q, want %q", zero, "No conversion yet")
 	}
 }
 
