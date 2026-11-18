@@ -86,7 +86,7 @@ Do not use permissions to leave out a path. A path cert-converter cannot read co
 
 `OUTPUT_LIFECYCLE` decides what happens to output files cert-converter no longer produces. That happens when the source left `/input`, when `INPUT_EXCLUDE_PATHS` now covers it, or when a format or layout you changed no longer emits it. For a PEM pair, the source is gone only when both the certificate and the private key are gone.
 
-- `warn`, the default, logs those files and leaves them in place.
+- `warn`, the default, logs those files, counts them in `cert_converter_last_scan_unmatched_outputs` and leaves them in place.
 - `sync` deletes them so `/output` tracks `/input`, after a recheck 30 seconds later confirms the source is still gone. Under the flat layout that recheck reads `/input` again from the start.
 - `keep` is silent and never deletes.
 - An unrecognized value logs a WARN and uses `warn`.

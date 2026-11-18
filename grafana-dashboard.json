@@ -1630,7 +1630,7 @@
         "spec": {
           "id": 50,
           "title": "Outputs match inputs",
-          "description": "Yes when the latest scan left every output matching its input, otherwise No with the most urgent reason, and the table shows the rest. A red No means an aborted scan, a failed conversion or a name collision, which make the container unhealthy, and a yellow No leaves health unchanged. No scan yet means no scan has ended since the start, or cert-converter was not scraped. OUTPUT_LIFECYCLE=warn and keep never remove an output whose input is gone, which this tile cannot see.",
+          "description": "Yes when the latest scan left every output matching its input, otherwise No with the most urgent reason, and the table and the attention tiles show the rest. A red No means an aborted scan, a failed conversion or a name collision, which make the container unhealthy, and a yellow No leaves health unchanged. No scan yet means no scan has ended since the start, or cert-converter was not scraped. OUTPUT_LIFECYCLE=keep never compares /output with /input, so this tile cannot see an output whose input is gone.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1647,7 +1647,7 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "max((cert_converter_last_scan_outcome{instance=\"$instance\", outcome=\"aborted\"} == bool 1) * 12 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=\"failed\"} > bool 0) * 11 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=\"collided\"} > bool 0) * 10 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=\"unwritable\"} > bool 0) * 9 or (cert_converter_last_scan_outcome{instance=\"$instance\", outcome=\"budget_stopped\"} == bool 1) * 8 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=~\"unreadable|unresolved|vanished\"} > bool 0) * 7 or (cert_converter_condition{instance=\"$instance\", condition=\"no_sources\"} == bool 1) * 6 or (cert_converter_condition{instance=\"$instance\", condition=\"all_excluded\"} == bool 1) * 5 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=\"orphan\"} > bool 0) * 4 or (cert_converter_condition{instance=\"$instance\", condition=\"orphan_removal_disabled\"} == bool 1) * 3 or (cert_converter_condition{instance=\"$instance\", condition=\"previous_layout_retained\"} == bool 1) * 2 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=\"ignored\"} > bool 0) * 1) and on () (cert_converter_last_scan_timestamp_seconds{instance=\"$instance\"} > 0)",
+                        "expr": "max((cert_converter_last_scan_outcome{instance=\"$instance\", outcome=\"aborted\"} == bool 1) * 13 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=\"failed\"} > bool 0) * 12 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=\"collided\"} > bool 0) * 11 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=\"unwritable\"} > bool 0) * 10 or (cert_converter_last_scan_outcome{instance=\"$instance\", outcome=\"budget_stopped\"} == bool 1) * 9 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=~\"unreadable|unresolved|vanished\"} > bool 0) * 8 or (cert_converter_condition{instance=\"$instance\", condition=\"no_sources\"} == bool 1) * 7 or (cert_converter_condition{instance=\"$instance\", condition=\"all_excluded\"} == bool 1) * 6 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=\"orphan\"} > bool 0) * 5 or (cert_converter_condition{instance=\"$instance\", condition=\"orphan_removal_disabled\"} == bool 1) * 4 or (cert_converter_last_scan_unmatched_outputs{instance=\"$instance\"} > bool 0) * 3 or (cert_converter_condition{instance=\"$instance\", condition=\"previous_layout_retained\"} == bool 1) * 2 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=\"ignored\"} > bool 0) * 1) and on () (cert_converter_last_scan_timestamp_seconds{instance=\"$instance\"} > 0)",
                         "legendFormat": "",
                         "instant": true,
                         "range": false
@@ -1708,63 +1708,68 @@
                           "text": "Yes",
                           "color": "green"
                         },
-                        "12": {
+                        "13": {
                           "index": 1,
                           "text": "No: scan aborted",
                           "color": "red"
                         },
-                        "11": {
+                        "12": {
                           "index": 2,
                           "text": "No: conversion failed",
                           "color": "red"
                         },
-                        "10": {
+                        "11": {
                           "index": 3,
                           "text": "No: name collision",
                           "color": "red"
                         },
-                        "9": {
+                        "10": {
                           "index": 4,
                           "text": "No: write refused",
                           "color": "yellow"
                         },
-                        "8": {
+                        "9": {
                           "index": 5,
                           "text": "No: input too large",
                           "color": "yellow"
                         },
-                        "7": {
+                        "8": {
                           "index": 6,
                           "text": "No: input unreadable",
                           "color": "yellow"
                         },
-                        "6": {
+                        "7": {
                           "index": 7,
                           "text": "No: no certificates",
                           "color": "yellow"
                         },
-                        "5": {
+                        "6": {
                           "index": 8,
                           "text": "No: all excluded",
                           "color": "yellow"
                         },
-                        "4": {
+                        "5": {
                           "index": 9,
                           "text": "No: key missing",
                           "color": "yellow"
                         },
-                        "3": {
+                        "4": {
                           "index": 10,
                           "text": "No: old outputs kept",
                           "color": "yellow"
                         },
-                        "2": {
+                        "3": {
                           "index": 11,
+                          "text": "No: outputs without input",
+                          "color": "yellow"
+                        },
+                        "2": {
+                          "index": 12,
                           "text": "No: old layout kept",
                           "color": "yellow"
                         },
                         "1": {
-                          "index": 12,
+                          "index": 13,
                           "text": "No: PFX input off",
                           "color": "yellow"
                         }
@@ -1947,7 +1952,7 @@
         "spec": {
           "id": 53,
           "title": "Errors now",
-          "description": "Certificates in a problem state in the table below: failed to convert, name collision, write refused, unreadable, vanished during scan or key missing. Green at 0, red from 1. A problem with the scan itself rather than one certificate shows in Outputs match inputs. Not scraped means cert-converter was not scraped, or its first scan has not ended.",
+          "description": "Certificates in a problem state in the table below. Unhealthy counts those that failed to convert or share an output name, red from 1, and Warnings counts write refused, unreadable, vanished during scan and key missing, yellow from 1, both green at 0. A problem with the scan itself rather than one certificate shows in Outputs match inputs. Not scraped means cert-converter was not scraped, or its first scan has not ended.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1964,13 +1969,34 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "count(cert_converter_source_outcome{instance=\"$instance\", outcome=~\"failed|collided|unwritable|unreadable|vanished|orphan\"} == 1) or 0 * max(cert_converter_last_scan_timestamp_seconds{instance=\"$instance\"} > 0)",
-                        "legendFormat": "",
+                        "expr": "count(cert_converter_source_outcome{instance=\"$instance\", outcome=~\"failed|collided\"} == 1) or 0 * max(cert_converter_last_scan_timestamp_seconds{instance=\"$instance\"} > 0)",
+                        "legendFormat": "Unhealthy",
                         "instant": true,
                         "range": false
                       }
                     },
                     "refId": "A",
+                    "hidden": false
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "expr": "count(cert_converter_source_outcome{instance=\"$instance\", outcome=~\"unwritable|unreadable|vanished|orphan\"} == 1) or 0 * max(cert_converter_last_scan_timestamp_seconds{instance=\"$instance\"} > 0)",
+                        "legendFormat": "Warnings",
+                        "instant": true,
+                        "range": false
+                      }
+                    },
+                    "refId": "B",
                     "hidden": false
                   }
                 }
@@ -1994,7 +2020,7 @@
                   ],
                   "values": false
                 },
-                "textMode": "auto",
+                "textMode": "value_and_name",
                 "text": {
                   "titleSize": 14,
                   "valueSize": 28
@@ -2016,12 +2042,37 @@
                       },
                       {
                         "value": 1,
-                        "color": "red"
+                        "color": "yellow"
                       }
                     ]
                   }
                 },
-                "overrides": []
+                "overrides": [
+                  {
+                    "matcher": {
+                      "id": "byFrameRefID",
+                      "options": "A"
+                    },
+                    "properties": [
+                      {
+                        "id": "thresholds",
+                        "value": {
+                          "mode": "absolute",
+                          "steps": [
+                            {
+                              "value": null,
+                              "color": "green"
+                            },
+                            {
+                              "value": 1,
+                              "color": "red"
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                ]
               }
             }
           }
@@ -2114,7 +2165,7 @@
         "spec": {
           "id": 55,
           "title": "Each certificate",
-          "description": "Each certificate source under /input, problems first, with what the latest scan that reached it did and when it was last converted. The path is relative to /input. Failed to convert and Name collision show in red, the other problems in yellow. Never means it has no output.",
+          "description": "Each certificate source under /input, problems first, with what the latest scan that reached it did and when it was last converted. The path is relative to /input. Failed to convert and Name collision show in red, the other problems in yellow. Never means it has no output, and No certificates means none was found, cert-converter was not scraped, or its first scan has not ended.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -2209,7 +2260,7 @@
               "fieldConfig": {
                 "defaults": {
                   "unit": "none",
-                  "noValue": "No certificates found yet",
+                  "noValue": "No certificates",
                   "thresholds": {
                     "mode": "absolute",
                     "steps": [

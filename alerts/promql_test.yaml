@@ -664,8 +664,10 @@ tests:
         values: "0x10"
       - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="previous_layout_retained"}'
         values: "0x10"
+      - series: 'cert_converter_last_scan_unmatched_outputs{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x10"
     promql_expr_test:
-      - expr: &outputs_match 'max((cert_converter_last_scan_outcome{instance="[::1]:9468", outcome="aborted"} == bool 1) * 12 or (cert_converter_last_scan_sources{instance="[::1]:9468", outcome="failed"} > bool 0) * 11 or (cert_converter_last_scan_sources{instance="[::1]:9468", outcome="collided"} > bool 0) * 10 or (cert_converter_last_scan_sources{instance="[::1]:9468", outcome="unwritable"} > bool 0) * 9 or (cert_converter_last_scan_outcome{instance="[::1]:9468", outcome="budget_stopped"} == bool 1) * 8 or (cert_converter_last_scan_sources{instance="[::1]:9468", outcome=~"unreadable|unresolved|vanished"} > bool 0) * 7 or (cert_converter_condition{instance="[::1]:9468", condition="no_sources"} == bool 1) * 6 or (cert_converter_condition{instance="[::1]:9468", condition="all_excluded"} == bool 1) * 5 or (cert_converter_last_scan_sources{instance="[::1]:9468", outcome="orphan"} > bool 0) * 4 or (cert_converter_condition{instance="[::1]:9468", condition="orphan_removal_disabled"} == bool 1) * 3 or (cert_converter_condition{instance="[::1]:9468", condition="previous_layout_retained"} == bool 1) * 2 or (cert_converter_last_scan_sources{instance="[::1]:9468", outcome="ignored"} > bool 0) * 1) and on () (cert_converter_last_scan_timestamp_seconds{instance="[::1]:9468"} > 0)'
+      - expr: &outputs_match 'max((cert_converter_last_scan_outcome{instance="[::1]:9468", outcome="aborted"} == bool 1) * 13 or (cert_converter_last_scan_sources{instance="[::1]:9468", outcome="failed"} > bool 0) * 12 or (cert_converter_last_scan_sources{instance="[::1]:9468", outcome="collided"} > bool 0) * 11 or (cert_converter_last_scan_sources{instance="[::1]:9468", outcome="unwritable"} > bool 0) * 10 or (cert_converter_last_scan_outcome{instance="[::1]:9468", outcome="budget_stopped"} == bool 1) * 9 or (cert_converter_last_scan_sources{instance="[::1]:9468", outcome=~"unreadable|unresolved|vanished"} > bool 0) * 8 or (cert_converter_condition{instance="[::1]:9468", condition="no_sources"} == bool 1) * 7 or (cert_converter_condition{instance="[::1]:9468", condition="all_excluded"} == bool 1) * 6 or (cert_converter_last_scan_sources{instance="[::1]:9468", outcome="orphan"} > bool 0) * 5 or (cert_converter_condition{instance="[::1]:9468", condition="orphan_removal_disabled"} == bool 1) * 4 or (cert_converter_last_scan_unmatched_outputs{instance="[::1]:9468"} > bool 0) * 3 or (cert_converter_condition{instance="[::1]:9468", condition="previous_layout_retained"} == bool 1) * 2 or (cert_converter_last_scan_sources{instance="[::1]:9468", outcome="ignored"} > bool 0) * 1) and on () (cert_converter_last_scan_timestamp_seconds{instance="[::1]:9468"} > 0)'
         eval_time: 5m
         exp_samples:
           - labels: '{}'
@@ -713,12 +715,14 @@ tests:
         values: "0x10"
       - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="previous_layout_retained"}'
         values: "0x10"
+      - series: 'cert_converter_last_scan_unmatched_outputs{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x10"
     promql_expr_test:
       - expr: *outputs_match
         eval_time: 5m
         exp_samples:
           - labels: '{}'
-            value: 11
+            value: 12
   - name: "Outputs match inputs: a missing key alone names the key"
     interval: 1m
     input_series:
@@ -762,12 +766,14 @@ tests:
         values: "0x10"
       - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="previous_layout_retained"}'
         values: "0x10"
+      - series: 'cert_converter_last_scan_unmatched_outputs{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x10"
     promql_expr_test:
       - expr: *outputs_match
         eval_time: 5m
         exp_samples:
           - labels: '{}'
-            value: 4
+            value: 5
   - name: "Outputs match inputs: an aborted scan outranks a failed conversion"
     interval: 1m
     input_series:
@@ -811,12 +817,116 @@ tests:
         values: "0x10"
       - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="previous_layout_retained"}'
         values: "0x10"
+      - series: 'cert_converter_last_scan_unmatched_outputs{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x10"
     promql_expr_test:
       - expr: *outputs_match
         eval_time: 5m
         exp_samples:
           - labels: '{}'
-            value: 12
+            value: 13
+  - name: "Outputs match inputs: outputs left without an input name them"
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="[::1]:9468"}'
+        values: "1800000000x10"
+      - series: 'cert_converter_last_scan_outcome{job="cert-converter", instance="[::1]:9468", outcome="complete"}'
+        values: "1x10"
+      - series: 'cert_converter_last_scan_outcome{job="cert-converter", instance="[::1]:9468", outcome="aborted"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_outcome{job="cert-converter", instance="[::1]:9468", outcome="budget_stopped"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="converted"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="unchanged"}'
+        values: "1x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="failed"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="orphan"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="unreadable"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="unwritable"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="collided"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="excluded"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="vanished"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="ignored"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="unresolved"}'
+        values: "0x10"
+      - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="no_sources"}'
+        values: "0x10"
+      - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="all_excluded"}'
+        values: "0x10"
+      - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="cleanup_degraded"}'
+        values: "0x10"
+      - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="orphan_removal_disabled"}'
+        values: "0x10"
+      - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="previous_layout_retained"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_unmatched_outputs{job="cert-converter", instance="[::1]:9468"}'
+        values: "2x10"
+    promql_expr_test:
+      - expr: *outputs_match
+        eval_time: 5m
+        exp_samples:
+          - labels: '{}'
+            value: 3
+  - name: "Outputs match inputs: removal turned off outranks the outputs it kept"
+    interval: 1m
+    input_series:
+      - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="[::1]:9468"}'
+        values: "1800000000x10"
+      - series: 'cert_converter_last_scan_outcome{job="cert-converter", instance="[::1]:9468", outcome="complete"}'
+        values: "1x10"
+      - series: 'cert_converter_last_scan_outcome{job="cert-converter", instance="[::1]:9468", outcome="aborted"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_outcome{job="cert-converter", instance="[::1]:9468", outcome="budget_stopped"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="converted"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="unchanged"}'
+        values: "1x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="failed"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="orphan"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="unreadable"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="unwritable"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="collided"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="excluded"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="vanished"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="ignored"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_sources{job="cert-converter", instance="[::1]:9468", outcome="unresolved"}'
+        values: "0x10"
+      - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="no_sources"}'
+        values: "0x10"
+      - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="all_excluded"}'
+        values: "0x10"
+      - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="cleanup_degraded"}'
+        values: "0x10"
+      - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="orphan_removal_disabled"}'
+        values: "1x10"
+      - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="previous_layout_retained"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_unmatched_outputs{job="cert-converter", instance="[::1]:9468"}'
+        values: "2x10"
+    promql_expr_test:
+      - expr: *outputs_match
+        eval_time: 5m
+        exp_samples:
+          - labels: '{}'
+            value: 4
   - name: "Outputs match inputs: no answer before the first scan ends"
     interval: 1m
     input_series:
@@ -859,6 +969,8 @@ tests:
       - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="orphan_removal_disabled"}'
         values: "0x10"
       - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="previous_layout_retained"}'
+        values: "0x10"
+      - series: 'cert_converter_last_scan_unmatched_outputs{job="cert-converter", instance="[::1]:9468"}'
         values: "0x10"
     promql_expr_test:
       - expr: *outputs_match
@@ -907,6 +1019,8 @@ tests:
         values: "0x10"
       - series: 'cert_converter_condition{job="cert-converter", instance="[::1]:9468", condition="previous_layout_retained"}'
         values: "0x10"
+      - series: 'cert_converter_last_scan_unmatched_outputs{job="cert-converter", instance="[::1]:9468"}'
+        values: "0x10"
       - series: 'cert_converter_last_scan_timestamp_seconds{job="cert-converter", instance="other:9468"}'
         values: "1800000000x10"
       - series: 'cert_converter_last_scan_outcome{job="cert-converter", instance="other:9468", outcome="complete"}'
@@ -947,6 +1061,8 @@ tests:
         values: "0x10"
       - series: 'cert_converter_condition{job="cert-converter", instance="other:9468", condition="previous_layout_retained"}'
         values: "0x10"
+      - series: 'cert_converter_last_scan_unmatched_outputs{job="cert-converter", instance="other:9468"}'
+        values: "1x10"
     promql_expr_test:
       - expr: *outputs_match
         eval_time: 5m

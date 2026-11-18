@@ -25,6 +25,7 @@ const (
 
 type dashQuery struct {
 	Spec struct {
+		RefID string `json:"refId"`
 		Query struct {
 			Spec struct {
 				Expr         string `json:"expr"`
@@ -34,14 +35,19 @@ type dashQuery struct {
 	} `json:"spec"`
 }
 
-// dashMapping is a value mapping: each value with the text and colour shown
-// for it.
 type dashMapping struct {
 	Options map[string]struct {
 		Text  string `json:"text"`
 		Color string `json:"color"`
 	} `json:"options"`
 	Type string `json:"type"`
+}
+
+type dashThresholds struct {
+	Steps []struct {
+		Value *float64 `json:"value"`
+		Color string   `json:"color"`
+	} `json:"steps"`
 }
 
 type dashOverride struct {
@@ -81,8 +87,9 @@ type dashPanel struct {
 				FieldConfig struct {
 					Overrides []dashOverride `json:"overrides"`
 					Defaults  struct {
-						NoValue  string        `json:"noValue"`
-						Mappings []dashMapping `json:"mappings"`
+						NoValue    string         `json:"noValue"`
+						Mappings   []dashMapping  `json:"mappings"`
+						Thresholds dashThresholds `json:"thresholds"`
 					} `json:"defaults"`
 				} `json:"fieldConfig"`
 			} `json:"spec"`
@@ -233,9 +240,8 @@ func row(t *testing.T, d *dashboard, title string) *layoutNode {
 	return nil
 }
 
-// gatherWithOneSource builds the registry the way run does and gathers it
-// after a scan holding one source, since the per-source families serve
-// nothing before such a scan.
+// gatherWithOneSource reports a scan holding one source before it gathers,
+// since the per-source families serve nothing before one.
 func gatherWithOneSource(t *testing.T) []measure.Family {
 	t.Helper()
 	capture.SwapDefault(t, slog.New(slog.DiscardHandler))
@@ -250,8 +256,6 @@ func gatherWithOneSource(t *testing.T) []measure.Family {
 	return families
 }
 
-// servedSeries returns each series name the registry serves with its label
-// names.
 func servedSeries(t *testing.T) map[string][]string {
 	t.Helper()
 	served := map[string][]string{}
@@ -368,7 +372,6 @@ func selectors(expr string) []selectorBlock {
 	return out
 }
 
-// madeLabels is every label a label_replace or label_join call in expr writes.
 func madeLabels(expr string) []string {
 	var out []string
 	for _, m := range madeLabelRe.FindAllStringSubmatch(expr, -1) {
@@ -687,7 +690,7 @@ func TestDashboardPanelsExplainThemselves(t *testing.T) {
 	}
 }
 
-// panelTitled is the one panel titled title.
+// panelTitled fails the test unless exactly one panel is titled title.
 func panelTitled(t *testing.T, d *dashboard, title string) *dashPanel {
 	t.Helper()
 	var found []dashPanel
@@ -702,7 +705,7 @@ func panelTitled(t *testing.T, d *dashboard, title string) *dashPanel {
 	return &found[0]
 }
 
-// onlyExpr is the query of p, which must hold one.
+// onlyExpr fails the test unless p holds exactly one query.
 func onlyExpr(t *testing.T, p *dashPanel) string {
 	t.Helper()
 	exprs := panelExprs(p)
@@ -712,7 +715,6 @@ func onlyExpr(t *testing.T, p *dashPanel) string {
 	return withoutComments(exprs[0])
 }
 
-// servedValues is every value the family's samples give label.
 func servedValues(t *testing.T, family, label string) []string {
 	t.Helper()
 	var out []string
@@ -734,10 +736,8 @@ func servedValues(t *testing.T, family, label string) []string {
 
 const spanTitle = "${span} ${spanunit}"
 
-// rangeWordVars are the variables a title names the range length with.
 var rangeWordVars = []string{"span", "spanunit", "spanthe"}
 
-// fixedLengthRe matches a length written as a number and a unit.
 var fixedLengthRe = regexp.MustCompile(`(?i)\b\d+(?:\.\d+)?\s*(?:s|m|h|d|w|seconds?|minutes?|hours?|days?|weeks?)\b`)
 
 // customText is the text Grafana gives a custom variable whose query is query,
@@ -859,19 +859,21 @@ type outputsMatchReason struct {
 }
 
 // outputsMatchSpec is every Outputs match inputs answer by value, the more
-// urgent the higher. Red marks what makes the container unhealthy.
+// urgent the higher. Red marks what makes the container unhealthy. Removal
+// turned off ranks above the outputs it kept, because it says why they stay.
 var outputsMatchSpec = map[string]outputsMatchReason{
 	"0":  {text: "Yes", color: "green"},
-	"12": {"cert_converter_last_scan_outcome", `outcome="aborted"`, "No: scan aborted", "red"},
-	"11": {"cert_converter_last_scan_sources", `outcome="failed"`, "No: conversion failed", "red"},
-	"10": {"cert_converter_last_scan_sources", `outcome="collided"`, "No: name collision", "red"},
-	"9":  {"cert_converter_last_scan_sources", `outcome="unwritable"`, "No: write refused", "yellow"},
-	"8":  {"cert_converter_last_scan_outcome", `outcome="budget_stopped"`, "No: input too large", "yellow"},
-	"7":  {"cert_converter_last_scan_sources", `outcome=~"unreadable|unresolved|vanished"`, "No: input unreadable", "yellow"},
-	"6":  {"cert_converter_condition", `condition="no_sources"`, "No: no certificates", "yellow"},
-	"5":  {"cert_converter_condition", `condition="all_excluded"`, "No: all excluded", "yellow"},
-	"4":  {"cert_converter_last_scan_sources", `outcome="orphan"`, "No: key missing", "yellow"},
-	"3":  {"cert_converter_condition", `condition="orphan_removal_disabled"`, "No: old outputs kept", "yellow"},
+	"13": {"cert_converter_last_scan_outcome", `outcome="aborted"`, "No: scan aborted", "red"},
+	"12": {"cert_converter_last_scan_sources", `outcome="failed"`, "No: conversion failed", "red"},
+	"11": {"cert_converter_last_scan_sources", `outcome="collided"`, "No: name collision", "red"},
+	"10": {"cert_converter_last_scan_sources", `outcome="unwritable"`, "No: write refused", "yellow"},
+	"9":  {"cert_converter_last_scan_outcome", `outcome="budget_stopped"`, "No: input too large", "yellow"},
+	"8":  {"cert_converter_last_scan_sources", `outcome=~"unreadable|unresolved|vanished"`, "No: input unreadable", "yellow"},
+	"7":  {"cert_converter_condition", `condition="no_sources"`, "No: no certificates", "yellow"},
+	"6":  {"cert_converter_condition", `condition="all_excluded"`, "No: all excluded", "yellow"},
+	"5":  {"cert_converter_last_scan_sources", `outcome="orphan"`, "No: key missing", "yellow"},
+	"4":  {"cert_converter_condition", `condition="orphan_removal_disabled"`, "No: old outputs kept", "yellow"},
+	"3":  {"cert_converter_last_scan_unmatched_outputs", "", "No: outputs without input", "yellow"},
 	"2":  {"cert_converter_condition", `condition="previous_layout_retained"`, "No: old layout kept", "yellow"},
 	"1":  {"cert_converter_last_scan_sources", `outcome="ignored"`, "No: PFX input off", "yellow"},
 }
@@ -887,11 +889,12 @@ func TestDashboardOutputsMatchNamesEveryReason(t *testing.T) {
 	expr := onlyExpr(t, p)
 	// A count is above 0 and a flag is 1 when its reason holds.
 	test := map[string]string{
-		"cert_converter_last_scan_sources": "> bool 0",
-		"cert_converter_last_scan_outcome": "== bool 1",
-		"cert_converter_condition":         "== bool 1",
+		"cert_converter_last_scan_sources":           "> bool 0",
+		"cert_converter_last_scan_unmatched_outputs": "> bool 0",
+		"cert_converter_last_scan_outcome":           "== bool 1",
+		"cert_converter_condition":                   "== bool 1",
 	}
-	operandRe := regexp.MustCompile(`\((\w+)\{instance="\$instance", ((?:outcome|condition)=~?"[^"]*")\} ((?:==|>) bool [01])\) \* (\d+)`)
+	operandRe := regexp.MustCompile(`\((\w+)\{instance="\$instance"(?:, ((?:outcome|condition)=~?"[^"]*"))?\} ((?:==|>) bool [01])\) \* (\d+)`)
 	operands := operandRe.FindAllStringSubmatch(expr, -1)
 	if n := strings.Count(expr, " bool "); len(operands) != n {
 		t.Errorf("read %d reasons of the %d bool comparisons in %s", len(operands), n, expr)
@@ -954,7 +957,8 @@ var sourceProblems = []string{"collided", "failed", "orphan", "unreadable", "unw
 // TestDashboardCertificateTableRanksProblemsFirst fails when an outcome the
 // per-source series serve falls in no rank or in both, the problems ranked
 // first differ from sourceProblems or from what Errors now counts, an outcome
-// has no State text or a problem is not shown red or yellow, or the table
+// has no State text or a problem is not shown red or yellow, Errors now or
+// Outputs match inputs colours a problem otherwise than the table, or the table
 // drops its sort key before sorting on it.
 func TestDashboardCertificateTableRanksProblemsFirst(t *testing.T) {
 	served := servedValues(t, "cert_converter_source_outcome", "outcome")
@@ -986,16 +990,6 @@ func TestDashboardCertificateTableRanksProblemsFirst(t *testing.T) {
 	if !slices.Equal(first, sourceProblems) {
 		t.Errorf("the table ranks %v first, want %v", first, sourceProblems)
 	}
-	countedRe := regexp.MustCompile(`outcome=~"([^"]+)"`)
-	m := countedRe.FindStringSubmatch(onlyExpr(t, panelTitled(t, &d, "Errors now")))
-	if m == nil {
-		t.Fatal("Errors now matches no outcome list")
-	}
-	counted := strings.Split(m[1], "|")
-	slices.Sort(counted)
-	if !slices.Equal(counted, sourceProblems) {
-		t.Errorf("Errors now counts %v, want %v", counted, sourceProblems)
-	}
 	var states []dashMapping
 	for _, o := range table.Spec.VizConfig.Spec.FieldConfig.Overrides {
 		for _, prop := range o.Properties {
@@ -1019,6 +1013,36 @@ func TestDashboardCertificateTableRanksProblemsFirst(t *testing.T) {
 			t.Errorf("outcome %s shows %s, want red or yellow for exactly the problems", o, shown.Color)
 		}
 	}
+	errorsNow := panelTitled(t, &d, "Errors now")
+	countedRe := regexp.MustCompile(`outcome=~"([^"]+)"`)
+	var counted []string
+	for _, q := range errorsNow.Spec.Data.Spec.Queries {
+		m := countedRe.FindStringSubmatch(q.Spec.Query.Spec.Expr)
+		if m == nil {
+			t.Errorf("Errors now query %s matches no outcome list", q.Spec.RefID)
+			continue
+		}
+		color := colorAtOne(t, errorsNow, q.Spec.RefID)
+		for o := range strings.SplitSeq(m[1], "|") {
+			counted = append(counted, o)
+			if shown := states[0].Options[o].Color; shown != color {
+				t.Errorf("Errors now shows %s %s from 1, the table %s", o, color, shown)
+			}
+		}
+	}
+	slices.Sort(counted)
+	if !slices.Equal(counted, sourceProblems) {
+		t.Errorf("Errors now counts %v, want %v", counted, sourceProblems)
+	}
+	for _, o := range sourceProblems {
+		for value, r := range outputsMatchSpec {
+			_, matched, _ := strings.Cut(r.matcher, `"`)
+			if r.series == "cert_converter_last_scan_sources" && slices.Contains(strings.Split(strings.TrimSuffix(matched, `"`), "|"), o) &&
+				r.color != states[0].Options[o].Color {
+				t.Errorf("Outputs match inputs shows %s %s at %s, the table %s", o, r.color, value, states[0].Options[o].Color)
+			}
+		}
+	}
 	sorted, filtered := -1, -1
 	for i, tr := range table.Spec.Data.Spec.Transformations {
 		switch tr.Group {
@@ -1040,6 +1064,31 @@ func TestDashboardCertificateTableRanksProblemsFirst(t *testing.T) {
 	if sorted < 0 || filtered < 0 || sorted > filtered {
 		t.Errorf("the table sorts at step %d and filters at step %d, want a sort before the filter drops order", sorted, filtered)
 	}
+}
+
+// colorAtOne is the colour p shows the query refID's value 1 in: its own
+// thresholds override, else the defaults.
+func colorAtOne(t *testing.T, p *dashPanel, refID string) string {
+	t.Helper()
+	th := p.Spec.VizConfig.Spec.FieldConfig.Defaults.Thresholds
+	for _, o := range p.Spec.VizConfig.Spec.FieldConfig.Overrides {
+		for _, prop := range o.Properties {
+			if o.Matcher.ID == "byFrameRefID" && o.Matcher.Options == refID && prop.ID == "thresholds" {
+				var own dashThresholds
+				if err := json.Unmarshal(prop.Value, &own); err != nil {
+					t.Fatalf("%q thresholds for %s: %v", p.Spec.Title, refID, err)
+				}
+				th = own
+			}
+		}
+	}
+	color := ""
+	for _, st := range th.Steps {
+		if st.Value == nil || *st.Value <= 1 {
+			color = st.Color
+		}
+	}
+	return color
 }
 
 // TestDashboardDetailsRowStartsCollapsed fails when the rows stop reading

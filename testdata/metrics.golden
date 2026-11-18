@@ -4,7 +4,7 @@ cert_converter_removed_artifacts_total 12
 # HELP cert_converter_build_info Always 1; the version label is the cert-converter release this process runs.
 # TYPE cert_converter_build_info gauge
 cert_converter_build_info{version="dev"} 1
-# HELP cert_converter_last_scan_sources Sources at each outcome in the last scan; a scan that did not cover the tree keeps the previous scan's problem counts.
+# HELP cert_converter_last_scan_sources Sources at each outcome in the last scan. A scan that did not cover the tree keeps each problem it could not prove gone.
 # TYPE cert_converter_last_scan_sources gauge
 cert_converter_last_scan_sources{outcome="collided"} 8
 cert_converter_last_scan_sources{outcome="converted"} 1
@@ -36,6 +36,9 @@ cert_converter_condition{condition="previous_layout_retained"} 0
 # HELP cert_converter_last_scan_sources_found Certificate sources the last scan found under /input.
 # TYPE cert_converter_last_scan_sources_found gauge
 cert_converter_last_scan_sources_found 91
+# HELP cert_converter_last_scan_unmatched_outputs Output files the last scan found with no matching source and left in place. 0 when the scan did not compare /output with /input.
+# TYPE cert_converter_last_scan_unmatched_outputs gauge
+cert_converter_last_scan_unmatched_outputs 14
 # HELP cert_converter_last_scan_timestamp_seconds Unix time the last scan ended, 0 before the first one.
 # TYPE cert_converter_last_scan_timestamp_seconds gauge
 cert_converter_last_scan_timestamp_seconds 946690200

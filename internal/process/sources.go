@@ -88,7 +88,18 @@ func outcomeOfStatus(status conversionStatus) (SourceOutcome, bool) {
 	}
 }
 
-// resolve counts status for rel and remembers it as rel's outcome this scan.
+// readVerdict reports whether outcome is a verdict on the source's own bytes or
+// configuration. An unread, vanished or collided source proves nothing about
+// whether an earlier failure was fixed.
+func readVerdict(outcome SourceOutcome) bool {
+	switch outcome {
+	case SourceUnreadable, SourceVanished, SourceCollided:
+		return false
+	default:
+		return true
+	}
+}
+
 func (sw *scanWalk) resolve(rel string, status conversionStatus) {
 	sw.results = append(sw.results, status)
 	if outcome, ok := outcomeOfStatus(status); ok {
@@ -105,7 +116,6 @@ func (sw *scanWalk) noteOutcome(rel string, outcome SourceOutcome) {
 	sw.outcomes[rel] = outcome
 }
 
-// artifactsOf returns every artifact path the enabled formats derive from rel.
 func (sw *scanWalk) artifactsOf(rel string) []string {
 	outStem := layout.SourceStem(rel)
 	if sw.layoutMode == outputpolicy.LayoutFlat {
@@ -142,6 +152,10 @@ func (sw *scanWalk) ownsArtifacts(rel string, outcome SourceOutcome, artifacts [
 func (s *Scanner) mergeSources(sw *scanWalk, out *store, walkErr error) {
 	for rel, outcome := range sw.outcomes {
 		fact := s.sources[rel]
+		if fact.outcome == SourceFailed && !sw.reach.input(rel) && !readVerdict(outcome) {
+			// unreachedFailures still counts it failed, so the fact must agree.
+			continue
+		}
 		fact.outcome = outcome
 		switch {
 		case outcome == SourceConverted:
@@ -165,7 +179,6 @@ func (s *Scanner) mergeSources(sw *scanWalk, out *store, walkErr error) {
 	}
 }
 
-// sourceStates returns the Scanner's memory sorted by path, in a new slice.
 func (s *Scanner) sourceStates() []SourceState {
 	states := make([]SourceState, 0, len(s.sources))
 	for _, rel := range slices.Sorted(maps.Keys(s.sources)) {

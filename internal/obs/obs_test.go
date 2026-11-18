@@ -106,7 +106,7 @@ func TestReportSetsEverySeriesFromTheRecord(t *testing.T) {
 
 	scan := Scan{Polling: true, Result: process.ScanResult{
 		Total: 9, Converted: 1, Unchanged: 2, Orphan: 3, Unreadable: 4, Unresolved: 5, Vanished: 6,
-		Unwritable: 7, Collided: 8, Excluded: 10, Ignored: 11, Removed: 12, Failed: 13,
+		Unwritable: 7, Collided: 8, Excluded: 10, Ignored: 11, Removed: 12, Failed: 13, UnmatchedOutputs: 14,
 		Outcome: process.OutcomeBudgetStopped, NoSources: true, CleanupDegraded: true,
 	}}
 	var buf bytes.Buffer
@@ -139,6 +139,7 @@ func TestReportSetsEverySeriesFromTheRecord(t *testing.T) {
 	want := map[string]float64{
 		"cert_converter_last_scan_sources_found":                   num("total"),
 		"cert_converter_removed_artifacts_total":                   num("removed"),
+		"cert_converter_last_scan_unmatched_outputs":               num("unmatched_outputs"),
 		"cert_converter_last_scan_timestamp_seconds":               float64(at.Unix()),
 		"cert_converter_last_scan_outcome{outcome=complete}":       1 - num("aborted") - num("budget_stopped"),
 		"cert_converter_last_scan_outcome{outcome=aborted}":        num("aborted"),
@@ -257,8 +258,8 @@ func TestScanDeadline(t *testing.T) {
 	}
 }
 
-// gathered returns every cert_converter_ sample reg serves, keyed by its family
-// name and labels in the order the family declares them.
+// gathered keys each sample as its family name, then {name=value} for each label
+// in the order the family declares them.
 func gathered(t *testing.T, reg *measure.Registry) map[string]float64 {
 	t.Helper()
 	families, err := reg.Gather(t.Context())
@@ -278,7 +279,6 @@ func gathered(t *testing.T, reg *measure.Registry) map[string]float64 {
 	return got
 }
 
-// sourceKeys returns the keys of got whose family is one of the per-source ones.
 func sourceKeys(got map[string]float64) []string {
 	var keys []string
 	for key := range got {

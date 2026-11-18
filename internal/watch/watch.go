@@ -1113,17 +1113,21 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) (upgraded *fsnotify.W
 // shutdown ended the mode.
 func (w *Watcher) pollUntilUpgrade(ctx context.Context) *fsnotify.Watcher {
 	interval := scancadence.Effective(w.fallback)
+	start := time.Now()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	w.reportNextScan(time.Now().Add(interval))
+	w.reportNextScan(start.Add(interval))
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case tick := <-ticker.C:
-			// A ticker keeps its cadence from tick to tick however long the scan takes.
-			w.reportNextScan(tick.Add(interval))
+		case <-ticker.C:
+			// The ticker stays on start's phase and drops the ticks a long scan
+			// overlaps, so a received tick can be stale; the next one it delivers is
+			// the first phase after now (runtime timer.unlockAndRun,
+			// https://github.com/golang/go/blob/go1.27.4/src/runtime/time.go).
+			w.reportNextScan(start.Add(time.Since(start).Truncate(interval) + interval))
 			fw, stopped := w.pollTick(ctx)
 			if stopped {
 				return nil

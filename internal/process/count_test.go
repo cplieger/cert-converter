@@ -133,19 +133,21 @@ func TestScanResultVetoes_every_counter_is_classified_and_honoured(t *testing.T)
 	t.Parallel()
 
 	classes := map[string]string{
-		"Removed":    vetoNone,
-		"Total":      vetoNone,
-		"Converted":  vetoNone,
-		"Unchanged":  vetoNone,
-		"Orphan":     vetoNone,
-		"Failed":     vetoConversion,
-		"Unwritable": vetoConversion,
-		"Unreadable": vetoDurable,
-		"Unresolved": vetoDurable,
-		"Vanished":   vetoTransient,
-		"Collided":   vetoConversion,
-		"Excluded":   vetoNone,
-		"Ignored":    vetoNone,
+		"Removed": vetoNone,
+		// Set only by the /output comparison, after the reap gate decided.
+		"UnmatchedOutputs": vetoNone,
+		"Total":            vetoNone,
+		"Converted":        vetoNone,
+		"Unchanged":        vetoNone,
+		"Orphan":           vetoNone,
+		"Failed":           vetoConversion,
+		"Unwritable":       vetoConversion,
+		"Unreadable":       vetoDurable,
+		"Unresolved":       vetoDurable,
+		"Vanished":         vetoTransient,
+		"Collided":         vetoConversion,
+		"Excluded":         vetoNone,
+		"Ignored":          vetoNone,
 	}
 
 	typ := reflect.TypeFor[ScanResult]()

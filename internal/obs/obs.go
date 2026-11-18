@@ -62,6 +62,7 @@ var fields = []struct {
 	{name: "excluded", of: func(s *Scan) int { return s.Result.Excluded }, series: seriesSource},
 	{name: "ignored", of: func(s *Scan) int { return s.Result.Ignored }, series: seriesSource},
 	{name: "removed", of: func(s *Scan) int { return s.Result.Removed }},
+	{name: "unmatched_outputs", of: func(s *Scan) int { return s.Result.UnmatchedOutputs }},
 	{name: "failed", of: func(s *Scan) int { return s.Result.Failed }, series: seriesSource},
 	{name: "aborted", of: func(s *Scan) int { return flag(s.Result.Outcome == process.OutcomeAborted) }},
 	{name: "budget_stopped", of: func(s *Scan) int { return flag(s.Result.Outcome == process.OutcomeBudgetStopped) }},
@@ -104,6 +105,7 @@ type Reporter struct {
 	next      *measure.Gauge
 	sources   *measure.LabeledGauge
 	found     *measure.Gauge
+	unmatched *measure.Gauge
 	finished  *measure.Gauge
 	outcome   *measure.LabeledGauge
 	mode      *measure.LabeledGauge
@@ -118,7 +120,6 @@ type Reporter struct {
 // scan deadline.
 var reportClock = time.Now
 
-// outcomeLabel names the label of every family keyed by an outcome.
 const outcomeLabel = "outcome"
 
 var (
@@ -144,7 +145,7 @@ func newReporter(reg *measure.Registry, lease time.Duration) *Reporter {
 	r := &Reporter{
 		lease: lease,
 		sources: measure.NewLabeledGauge("last_scan_sources",
-			"Sources at each outcome in the last scan; a scan that did not cover the tree keeps the previous scan's problem counts.", measure.UnitCount, []string{outcomeLabel}),
+			"Sources at each outcome in the last scan. A scan that did not cover the tree keeps each problem it could not prove gone.", measure.UnitCount, []string{outcomeLabel}),
 		found: measure.NewGauge("last_scan_sources_found",
 			"Certificate sources the last scan found under /input.", measure.UnitCount),
 		finished: measure.NewGauge("last_scan_timestamp_seconds",
@@ -155,6 +156,8 @@ func newReporter(reg *measure.Registry, lease time.Duration) *Reporter {
 			"1 for the change-detection mode the last scan ran in, 0 for the other.", measure.UnitNone, []string{"mode"}),
 		condition: measure.NewLabeledGauge("condition",
 			"1 while the last scan reported the standing condition, else 0.", measure.UnitNone, []string{"condition"}),
+		unmatched: measure.NewGauge("last_scan_unmatched_outputs",
+			"Output files the last scan found with no matching source and left in place. 0 when the scan did not compare /output with /input.", measure.UnitCount),
 		removed: measure.NewCounter("removed_artifacts_total",
 			"Output artifacts removed because their source is gone.", measure.UnitCount),
 		deadline: measure.NewGauge("scan_deadline_timestamp_seconds",
@@ -170,7 +173,7 @@ func newReporter(reg *measure.Registry, lease time.Duration) *Reporter {
 			"Unix time the source was last converted, or 0 when it has no output. After a restart, the newest output file's modification time.",
 			measure.UnitSeconds, []string{"source"}),
 	}
-	reg.MustRegister(r.sources, r.found, r.finished, r.outcome, r.mode, r.condition, r.removed, r.deadline, r.succeeded,
+	reg.MustRegister(r.sources, r.found, r.unmatched, r.finished, r.outcome, r.mode, r.condition, r.removed, r.deadline, r.succeeded,
 		r.next, measure.NewCollector(r.collectSources, r.outcomeOf, r.converted))
 	r.set(&Scan{}, 0)
 	start := reportClock()
@@ -225,7 +228,6 @@ func (r *Reporter) collectSources(_ context.Context, e *measure.Emitter) {
 	}
 }
 
-// unixOrZero is at in Unix seconds, and 0 for the zero time, which means none.
 func unixOrZero(at time.Time) float64 {
 	if at.IsZero() {
 		return 0
@@ -250,6 +252,7 @@ func (r *Reporter) set(scan *Scan, finished float64) {
 		}
 	}
 	r.found.Set(float64(scan.Result.Total))
+	r.unmatched.Set(float64(scan.Result.UnmatchedOutputs))
 	r.finished.Set(finished)
 	for _, o := range outcomes {
 		r.outcome.Set(float64(flag(scan.Result.Outcome == o)), o.String())

@@ -25,22 +25,26 @@ import (
 )
 
 // ScanResult carries per-source outcome summary counts from a scan run. A scan
-// whose /input walk did not finish reports the per-path counts and the reap and
-// layout flags at least as the previous scan did, and any scan that did not cover
-// the tree keeps NoSources and AllExcluded unless its own sources disprove them.
+// whose /input walk did not finish counts Failed, Orphan and Unwritable from
+// Sources, reports the other per-path counts and the reap and layout flags at
+// least as the previous scan did, and any scan that did not cover the tree keeps
+// NoSources and AllExcluded unless its own sources disprove them.
 type ScanResult struct {
 	// Sources is every source the scanner knows after this scan, sorted by Path,
 	// each with the outcome of the latest scan that reached it; the slice is not
 	// written after Run returns.
 	Sources []SourceState
 	// Removed counts artifacts deleted because their source is gone.
-	Removed    int
-	Total      int
-	Converted  int
-	Unchanged  int
-	Orphan     int
-	Failed     int
-	Unreadable int
+	Removed int
+	// UnmatchedOutputs counts /output artifacts this scan matched to no source and
+	// left in place; 0 when the scan did not compare /output with /input.
+	UnmatchedOutputs int
+	Total            int
+	Converted        int
+	Unchanged        int
+	Orphan           int
+	Failed           int
+	Unreadable       int
 	// Unresolved counts input symlinks not named like an input that the confined
 	// root could not resolve.
 	Unresolved int
@@ -113,18 +117,22 @@ func (o Outcome) String() string {
 // carryUnproven raises the conditions a scan that did not enumerate the whole
 // tree cannot prove gone to the previous report's values. With enumerated, the
 // walk finished and only the whole-tree verdicts carry; a whole-tree verdict
-// this scan's own sources disprove does not.
+// this scan's own sources disprove does not. r.Sources must already hold the
+// merged facts.
 func (r *ScanResult) carryUnproven(prev *ScanResult, enumerated bool) {
 	r.NoSources = r.NoSources || (prev.NoSources && r.Total <= r.Orphan)
 	r.AllExcluded = r.AllExcluded || (prev.AllExcluded && r.Excluded == r.Total)
 	if enumerated {
 		return
 	}
-	r.Orphan = max(r.Orphan, prev.Orphan)
-	r.Failed = max(r.Failed, prev.Failed)
+	// A source the walk did not reach keeps its fact (mergeSources), so the facts
+	// hold every per-source problem this scan cannot prove gone, and one it fixed
+	// stops counting. Unreadable and Unresolved also count paths that are no source.
+	r.Failed = r.sourcesAt(SourceFailed)
+	r.Orphan = r.sourcesAt(SourceOrphan)
+	r.Unwritable = r.sourcesAt(SourceUnwritable)
 	r.Unreadable = max(r.Unreadable, prev.Unreadable)
 	r.Unresolved = max(r.Unresolved, prev.Unresolved)
-	r.Unwritable = max(r.Unwritable, prev.Unwritable)
 	// A scan that got as far as the claim ledger counts its own collisions
 	// (claimLedger); only an aborted one may not have.
 	if r.Outcome == OutcomeAborted {
@@ -132,6 +140,16 @@ func (r *ScanResult) carryUnproven(prev *ScanResult, enumerated bool) {
 	}
 	r.OrphanRemovalDisabled = r.OrphanRemovalDisabled || prev.OrphanRemovalDisabled
 	r.PreviousLayoutRetained = r.PreviousLayoutRetained || prev.PreviousLayoutRetained
+}
+
+func (r *ScanResult) sourcesAt(outcome SourceOutcome) int {
+	n := 0
+	for i := range r.Sources {
+		if r.Sources[i].Outcome == outcome {
+			n++
+		}
+	}
+	return n
 }
 
 // conversionsClean reports whether nothing this scan did leaves the output tree in a
@@ -408,6 +426,7 @@ func (s *Scanner) reportVerdict(result *ScanResult, out *store, sw *scanWalk, wa
 	result.Outcome = outcomeOf(walkErr)
 	result.OrphanRemovalDisabled = out.reapDisabled
 	result.PreviousLayoutRetained = out.otherLayoutKept
+	result.UnmatchedOutputs = out.unmatched
 	result.CleanupDegraded = s.cleanupDegraded
 	enumerated := walkErr == nil
 	wholeTree := sw.readWholeTree(result, walkErr)
@@ -417,11 +436,11 @@ func (s *Scanner) reportVerdict(result *ScanResult, out *store, sw *scanWalk, wa
 		result.AllExcluded = coverage == coverageAllExcluded
 	}
 	logInputCoverageWarnings(s.standing, result, walkErr, wholeTree)
+	s.mergeSources(sw, out, walkErr)
+	result.Sources = s.sourceStates()
 	if !wholeTree {
 		result.carryUnproven(&s.lastReported, enumerated)
 	}
-	s.mergeSources(sw, out, walkErr)
-	result.Sources = s.sourceStates()
 	s.lastReported = *result
 	if walkErr != nil {
 		return
@@ -487,9 +506,8 @@ type scanWalk struct {
 	exclude       layout.ExcludeSet
 	password      string
 	inputPassword string
-	// outcomes is each source's outcome this scan (resolve, noteOutcome).
-	outcomes map[string]SourceOutcome
-	results  []conversionStatus
+	outcomes      map[string]SourceOutcome
+	results       []conversionStatus
 	// budget is this walk's entry ceiling and its charge counter, injected from
 	// Options.MaxScanEntries.
 	budget     scanbudget.Counter

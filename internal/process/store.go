@@ -39,17 +39,21 @@ type store struct {
 	standing *standing
 	// laxDirsChecked is the directories this scan has checked for a permissive mode.
 	laxDirsChecked map[string]struct{}
+	// written is every artifact this scan wrote, whose mtime dates this scan.
+	written map[string]struct{}
 	// maxEntries is this store's per-walk entry budget for the OUTPUT tree, injected
 	// from Options.MaxScanEntries exactly as scanWalk's is for /input.
 	maxEntries int
+	// reapDisabled, otherLayoutKept and unmatched are this scan's reconciliation
+	// verdicts, set beside the WARN that reports each one so the record cannot
+	// drift from it.
+	unmatched       int
+	reapDisabled    bool
+	otherLayoutKept bool
 	// formats scopes the own-shape predicate: only artifacts the CONFIGURED
 	// formats produce are enumerated as orphan candidates, so a format switched
 	// off leaves its old artifacts untouched.
 	formats outputpolicy.Formats
-	// reapDisabled and otherLayoutKept are this scan's reconciliation verdicts,
-	// set beside the WARN that reports each one so the record cannot drift from it.
-	reapDisabled    bool
-	otherLayoutKept bool
 }
 
 // laxDirMsg reports an /output directory more permissive than outputDirMode: a group- or world-WRITABLE directory lets another process on
@@ -154,6 +158,10 @@ func (s *store) writeBounded(ctx context.Context, rel string, data []byte, maxBy
 	); err != nil {
 		return refuseWrite(classifyWriteErrno(err), "write output: %w", err)
 	}
+	if s.written == nil {
+		s.written = make(map[string]struct{})
+	}
+	s.written[rel] = struct{}{}
 	s.artifactGone(rel)
 	return nil
 }
@@ -488,11 +496,14 @@ func (s *store) holdsDir(rel string) bool {
 }
 
 // newestArtifact returns the newest modification time among the regular files at
-// artifacts, and the zero time when none of them is one. A symlink is skipped,
-// as inspect never follows one.
+// artifacts this scan did not write, and the zero time when none of them is one.
+// A symlink is skipped, as inspect never follows one.
 func (s *store) newestArtifact(artifacts []string) time.Time {
 	var newest time.Time
 	for _, rel := range artifacts {
+		if _, now := s.written[rel]; now {
+			continue
+		}
 		fi, err := s.root.Lstat(rel)
 		if err != nil {
 			if !errors.Is(err, fs.ErrNotExist) {

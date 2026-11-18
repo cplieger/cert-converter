@@ -3,6 +3,7 @@ package process
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/convert"
@@ -311,18 +312,26 @@ func TestScannerRun_keeps_unproven_conditions_on_an_incomplete_scan(t *testing.T
 	t.Run("an unopenable root keeps every carried condition", func(t *testing.T) {
 		in := t.TempDir()
 		s := newVerdictScanner(in, t.TempDir(), Options{})
+		// The per-source counts follow the sources the scanner holds, so the
+		// previous report's own counts must not show through.
 		prev := ScanResult{
-			Orphan: 2, Failed: 3, Unreadable: 4, Unresolved: 5, Unwritable: 6, Collided: 7,
+			Orphan: 9, Failed: 9, Unreadable: 4, Unresolved: 5, Unwritable: 9, Collided: 7,
 			NoSources: true, AllExcluded: true,
 			OrphanRemovalDisabled: true, PreviousLayoutRetained: true,
 		}
 		s.lastReported = prev
-		res := abortedRun(t, s, in)
-		if res.Orphan != prev.Orphan {
-			t.Errorf("Run(/input missing) Orphan = %d, want %d", res.Orphan, prev.Orphan)
+		facts := map[SourceOutcome]int{SourceOrphan: 2, SourceFailed: 3, SourceUnwritable: 6, SourceConverted: 1}
+		for outcome, n := range facts {
+			for i := range n {
+				s.sources[outcome.String()+strconv.Itoa(i)+".crt"] = sourceFact{outcome: outcome}
+			}
 		}
-		if res.Failed != prev.Failed {
-			t.Errorf("Run(/input missing) Failed = %d, want %d", res.Failed, prev.Failed)
+		res := abortedRun(t, s, in)
+		if res.Orphan != facts[SourceOrphan] {
+			t.Errorf("Run(/input missing) Orphan = %d, want %d", res.Orphan, facts[SourceOrphan])
+		}
+		if res.Failed != facts[SourceFailed] {
+			t.Errorf("Run(/input missing) Failed = %d, want %d", res.Failed, facts[SourceFailed])
 		}
 		if res.Unreadable != prev.Unreadable {
 			t.Errorf("Run(/input missing) Unreadable = %d, want %d", res.Unreadable, prev.Unreadable)
@@ -330,8 +339,8 @@ func TestScannerRun_keeps_unproven_conditions_on_an_incomplete_scan(t *testing.T
 		if res.Unresolved != prev.Unresolved {
 			t.Errorf("Run(/input missing) Unresolved = %d, want %d", res.Unresolved, prev.Unresolved)
 		}
-		if res.Unwritable != prev.Unwritable {
-			t.Errorf("Run(/input missing) Unwritable = %d, want %d", res.Unwritable, prev.Unwritable)
+		if res.Unwritable != facts[SourceUnwritable] {
+			t.Errorf("Run(/input missing) Unwritable = %d, want %d", res.Unwritable, facts[SourceUnwritable])
 		}
 		if res.Collided != prev.Collided {
 			t.Errorf("Run(/input missing) Collided = %d, want %d", res.Collided, prev.Collided)
@@ -349,4 +358,34 @@ func TestScannerRun_keeps_unproven_conditions_on_an_incomplete_scan(t *testing.T
 			t.Errorf("Run(/input missing) PreviousLayoutRetained = false, want true")
 		}
 	})
+}
+
+// TestScannerRun_counts_unmatched_outputs pins UnmatchedOutputs: the outputs
+// with no input a scan leaves in place, which OUTPUT_LIFECYCLE=keep never
+// looks for.
+func TestScannerRun_counts_unmatched_outputs(t *testing.T) {
+	for _, c := range []struct {
+		lifecycle outputpolicy.Lifecycle
+		want      int
+	}{
+		{outputpolicy.LifecycleWarn, 2},
+		{outputpolicy.LifecycleKeep, 0},
+	} {
+		t.Run(string(c.lifecycle), func(t *testing.T) {
+			in, out := t.TempDir(), t.TempDir()
+			writeSelfSignedPair(t, in, "site")
+			for _, name := range []string{"gone.pfx", "old.pfx"} {
+				if err := os.WriteFile(filepath.Join(out, name), []byte("left by a removed source"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			res, err := newVerdictScanner(in, out, Options{Lifecycle: c.lifecycle}).Run(t.Context())
+			if err != nil {
+				t.Fatalf("Run = %v", err)
+			}
+			if res.UnmatchedOutputs != c.want {
+				t.Errorf("Run(OUTPUT_LIFECYCLE=%s).UnmatchedOutputs = %d, want %d", c.lifecycle, res.UnmatchedOutputs, c.want)
+			}
+		})
+	}
 }

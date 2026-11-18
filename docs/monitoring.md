@@ -24,6 +24,7 @@ Each scan sets the scan series from the same verdict it writes to the `scan comp
 | `cert_converter_source_last_conversion_timestamp_seconds` | gauge | `source` | Unix time the source was last converted. After a restart, the newest output file's modification time. `0` when the source has no output |
 | `cert_converter_next_scan_timestamp_seconds` | gauge | none | Unix time of the next guaranteed recheck, which runs every `FALLBACK_SCAN_HOURS` and at least daily. A changed file under `/input` brings a scan sooner |
 | `cert_converter_last_scan_sources_found` | gauge | none | Sources the last scan found under `/input` |
+| `cert_converter_last_scan_unmatched_outputs` | gauge | none | Output files the last scan found with no matching source and left in place, as `OUTPUT_LIFECYCLE=warn` does. `0` when the scan did not compare `/output` with `/input`, as under `keep` or after a scan that stopped early |
 | `cert_converter_last_scan_timestamp_seconds` | gauge | none | Unix time the last scan ended, `0` before the first one |
 | `cert_converter_last_scan_outcome` | gauge | `outcome`: `complete`, `aborted`, `budget_stopped` | `1` for how the last scan ended, `0` for the others |
 | `cert_converter_change_detection_mode` | gauge | `mode`: `watch`, `poll` | `1` for the mode the last scan ran in, `0` for the other |
@@ -35,7 +36,7 @@ Each scan sets the scan series from the same verdict it writes to the `scan comp
 
 Every labelled scan count starts at `0`, so each rule sees its series from the first scrape. The page also carries the Go runtime and process families (`go_*`, `process_*`) under the names Go's official Prometheus client uses, so stock Go dashboards work. The bundled [dashboard](#dashboard) shows the `cert_converter_*` series in Grafana.
 
-The per-source series appear after the first scan. A source leaves them when a scan that ran to the end read its folder and no longer found it. When a scan stops early or cannot read a source's folder, that source keeps its previous outcome and time, as the counts keep theirs.
+The per-source series appear after the first scan. A source leaves them when a scan that ran to the end read its folder and no longer found it. When a scan stops early or cannot read a source's folder, that source keeps its previous outcome and time.
 
 ## Logs
 
@@ -50,6 +51,7 @@ cert-converter writes logfmt records to standard error, with every timestamp in 
 - Under the flat layout, three WARNs report the [ownership record](configuration.md#flat-ownership-record). `claims_rebuilt` and `claims_unreadable` are logged once at start, and `claims_unwritable` is a standing problem. None of them affects health or a count, and no alert rule reads them.
 - With `METRICS_LISTEN_ADDR` set, each request to the listener writes an `http` record, at Debug for `/metrics` and `/healthz` and at `INFO` for any other path.
 - Look for a `remediation` field on warnings and errors. When present, it names the action to take.
+- With 112 or more certificates, `cert_converter_source_outcome` serves more than 1,000 series, and the first scrape after each start logs one `measure: collector problem` WARN naming that family. It needs no action.
 
 `scan complete` closes every scan that is not cut short by a shutdown. It is `INFO` when the scan covered the whole tree, and `WARN` when the scan aborted or stopped at `MAX_SCAN_ENTRIES`, with an `error` field on an abort. The log rules read this record at either level, so keep `LOG_LEVEL` at `info` if you use them. Every field except `error` is a number.
 
@@ -64,6 +66,7 @@ cert-converter writes logfmt records to standard error, with every timestamp in 
 | `collided` | Sources that share a flat output name with another source |
 | `excluded`, `ignored` | Sources under `INPUT_EXCLUDE_PATHS`, and bundles skipped while bundle input is off |
 | `removed` | Outputs removed this scan because their source is gone |
+| `unmatched_outputs` | Outputs with no matching source that this scan left in place |
 | `failed` | Sources that failed to convert, including one whose earlier failure this scan could not reach |
 | `aborted`, `budget_stopped` | `1` when the scan ended early, or stopped at `MAX_SCAN_ENTRIES` |
 | `polling` | `1` when the scan ran in poll mode instead of watching for changes |
@@ -76,12 +79,12 @@ cert-converter writes logfmt records to standard error, with every timestamp in 
 
 A scan that did not see the whole tree cannot prove a problem gone, so its record keeps what the previous scan reported.
 
-- When the scan aborted or stopped at `MAX_SCAN_ENTRIES`, the counts `orphan`, `unreadable`, `unresolved`, `unwritable` and `failed` stay at least at the previous scan's values. So do `orphan_removal_disabled` and `previous_layout_retained`. `collided` does so only when the scan aborted. A scan that stopped at `MAX_SCAN_ENTRIES` counts the claimants it knows of, as the `CertConverterOutputNameCollision` note says.
+- When the scan aborted or stopped at `MAX_SCAN_ENTRIES`, `failed`, `orphan` and `unwritable` count the certificates in that state in `cert_converter_source_outcome`. A certificate the scan did not reach keeps its previous state there, and one the scan converted no longer counts as failed. `unreadable` and `unresolved` stay at least at the previous scan's values, because they also count folders and links that are no certificate. So do `orphan_removal_disabled` and `previous_layout_retained`. `collided` does so only when the scan aborted. A scan that stopped at `MAX_SCAN_ENTRIES` counts the claimants it knows of, as the `CertConverterOutputNameCollision` note says.
 - `no_sources` and `all_excluded` carry over from the previous scan when the scan aborted or stopped at `MAX_SCAN_ENTRIES`. They also carry over when the walk finished but left an unreadable path, an unresolved symlink, a vanished path or a stored flat claim it could not reach. `no_sources` keeps the previous value unless this scan's `total` is greater than its `orphan` count. `all_excluded` keeps the previous value unless this scan's `excluded` count is below its `total`.
 - An unresolvable symlink named like a certificate, a key or a bundle also makes those two values carry over when it hides something cert-converter keeps. That is a stored flat claim, a conversion failure, an unreadable path or an unwritable output under it, or a mirrored output folder at its path.
 - The next scan that covers the whole tree resets every value.
 
-An aborted scan turns the container unhealthy. So does a failed conversion or a name collision, including a `failed` count carried through a stop at `MAX_SCAN_ENTRIES` or kept for a source the scan could not reach. The other carried values leave health unchanged.
+An aborted scan turns the container unhealthy. So does a failed conversion or a name collision, including a failure kept for a certificate the scan could not reach. The other carried values leave health unchanged.
 
 ## Alerting
 
@@ -138,7 +141,7 @@ Notes on individual alerts:
 [`grafana-dashboard.json`](../grafana-dashboard.json) imports as the Cert Converter dashboard. It reads the metrics above from a Prometheus data source and needs Grafana 13.2 or newer. When you run more than one container, the cert-converter variable picks the instance to show. It has one page of three rows:
 
 - Needs attention appears only while an alert from `alerts/promql.yaml` fires, with one tile per rule. Each tile reads its rule's `ALERTS` series, which Prometheus and the Mimir ruler store beside your metrics. The row stays hidden while those rules are not loaded. `CertConverterStartupRefused` and `CertConverterChangeDetectionDead` read the log, so they have no tile.
-- Now opens with Outputs match inputs, which answers Yes, or No with the most urgent reason. Last conversion, Certificates, Errors now and Next scan follow. The table below them lists each certificate with its state and when it was last converted, problems first.
+- Now opens with Outputs match inputs, which answers Yes, or No with the most urgent reason. Last conversion, Certificates, Errors now and Next scan follow. Errors now shows two counts, Unhealthy for the certificates that make the container unhealthy and Warnings for the other problems. The table below them lists each certificate with its state and when it was last converted, problems first.
 - Details starts collapsed. It shows when the latest scan and the latest healthy scan ended, how many certificates were converted in the selected range, and the outputs `OUTPUT_LIFECYCLE=sync` removed.
 
 Outputs removed reads `process_start_time_seconds` too, to find a container restart. Keep the `process_*` series in your scrape, or a restart draws a negative bar.

@@ -69,7 +69,7 @@ func TestWatchState_reports_the_floor_when_the_fallback_is_disabled(t *testing.T
 
 // TestPollLoop_reports_each_tick_plus_the_interval pins WithNextScan in poll
 // mode: each report is the instant of the next poll scan, which a ticker keeps
-// on its cadence even when a scan runs long.
+// on its cadence while each scan is shorter than the interval.
 // Serial (no t.Parallel): it swaps the package-level newFSWatcher seam.
 func TestPollLoop_reports_each_tick_plus_the_interval(t *testing.T) {
 	stubFSWatcherUnavailable(t)
@@ -104,6 +104,44 @@ func TestPollLoop_reports_each_tick_plus_the_interval(t *testing.T) {
 			if !at.Equal(reports[i]) {
 				t.Errorf("poll scan %d ran at t0+%v, but the report before it said t0+%v", i, at.Sub(t0), reports[i].Sub(t0))
 			}
+		}
+	})
+}
+
+// TestPollLoop_reports_a_future_tick_after_a_long_scan pins the report after a
+// poll scan that outlasts two intervals: the ticker drops the ticks it overlaps
+// and keeps its phase (time.NewTicker), so the next scan after the one ending at
+// t0+3h30m is due at t0+4h.
+// Serial (no t.Parallel): it swaps the package-level newFSWatcher seam.
+func TestPollLoop_reports_a_future_tick_after_a_long_scan(t *testing.T) {
+	stubFSWatcherUnavailable(t)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		var reports, scans []time.Time
+		w := New(absentWatchRoot, func(context.Context, bool) {
+			scans = append(scans, time.Now())
+			if len(scans) == 1 {
+				time.Sleep(150 * time.Minute)
+				return
+			}
+			cancel()
+		}, WithFallback(time.Hour), WithNextScan(func(next time.Time) { reports = append(reports, next) }))
+		t0 := time.Now()
+
+		if fw := w.pollUntilUpgrade(ctx); fw != nil {
+			fw.Close()
+			t.Fatal("pollUntilUpgrade upgraded with fsnotify unavailable")
+		}
+
+		if len(scans) != 2 {
+			t.Fatalf("ran %d poll scans, want 2", len(scans))
+		}
+		if len(reports) != 3 {
+			t.Fatalf("got %d next-scan reports %v, want 3: one when polling starts and one per tick", len(reports), reports)
+		}
+		if want := t0.Add(4 * time.Hour); !reports[2].Equal(want) {
+			t.Errorf("report made at t0+%v = t0+%v, want t0+%v, the ticker's next tick", scans[1].Sub(t0), reports[2].Sub(t0), want.Sub(t0))
 		}
 	})
 }

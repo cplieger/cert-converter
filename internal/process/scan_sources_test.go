@@ -146,6 +146,11 @@ func TestScanSources_partial_publication_fails_the_source(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(outDir, "site.key"), bytes.Repeat([]byte{'x'}, len(keyPEM)), outputFileMode); err != nil {
 		t.Fatalf("setup: write prior key artifact: %v", err)
 	}
+	// Older than any write the scan makes, so only the prior artifact dates it.
+	prior := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(filepath.Join(outDir, "site.key"), prior, prior); err != nil {
+		t.Fatalf("setup: Chtimes: %v", err)
+	}
 	priorRead := readBoundedInRoot
 	readBoundedInRoot = func(ctx context.Context, root *os.Root, name string, maxBytes int64) ([]byte, error) {
 		if name == "site.key" {
@@ -163,9 +168,95 @@ func TestScanSources_partial_publication_fails_the_source(t *testing.T) {
 	}
 	t.Cleanup(func() { writeFileInRoot = priorWrite })
 
+	// A new Scanner is a restart: its first scan dates the source from /output.
 	s := newSourcesScanner(inDir, outDir, func(o *Options) { o.Formats = outputpolicy.Formats{PFX: true, PEM: true} })
-	if got := scanSources(t, s)["site.crt"]; got.Outcome != SourceFailed {
+	got := scanSources(t, s)["site.crt"]
+	if got.Outcome != SourceFailed {
 		t.Errorf("Sources[site.crt].Outcome = %v after one artifact was written and its sibling refused, want %v", got.Outcome, SourceFailed)
+	}
+	if !got.LastConverted.Equal(prior) {
+		t.Errorf("Sources[site.crt].LastConverted = %v after a restart, want %v, the artifact the failed scan did not write", got.LastConverted, prior)
+	}
+}
+
+// A scan that stops at MAX_SCAN_ENTRIES proves a failure fixed only for a source
+// it converted, and keeps every other failure it did not reach. The root, a/, b/
+// and a/site.crt fit, so the walk converts a/site.crt and stops before b/.
+func TestScanSources_a_stopped_scan_counts_failures_from_the_facts(t *testing.T) {
+	now := sourcesClock
+	pinConversionClock(t, &now)
+	for _, c := range []struct {
+		name, failing string
+		fixed         bool
+		wantFailed    int
+		want          SourceOutcome
+	}{
+		{name: "fixed before the stop", failing: "a", fixed: true, wantFailed: 0, want: SourceConverted},
+		{name: "past the stop", failing: "b", wantFailed: 1, want: SourceFailed},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			inDir, outDir := t.TempDir(), t.TempDir()
+			for _, dir := range []string{"a", "b"} {
+				if err := os.Mkdir(filepath.Join(inDir, dir), 0o750); err != nil {
+					t.Fatalf("setup: Mkdir: %v", err)
+				}
+				writeSelfSignedPair(t, filepath.Join(inDir, dir), "site")
+			}
+			bad := filepath.Join(inDir, c.failing)
+			writeInput(t, filepath.Join(bad, "site.crt"), []byte("not a certificate"))
+			s := newSourcesScanner(inDir, outDir, nil)
+			if first, _ := s.Run(t.Context()); first.Failed != 1 {
+				t.Fatalf("setup: first scan Failed = %d, want 1", first.Failed)
+			}
+			if c.fixed {
+				writeSelfSignedPair(t, bad, "site")
+			}
+
+			s.opts.MaxScanEntries = 4
+			result, err := s.Run(t.Context())
+			if err != nil || result.Outcome != OutcomeBudgetStopped {
+				t.Fatalf("Run(over budget) = %v, %v, want a budget stop with no error", result.Outcome, err)
+			}
+			// healthyAfterScan and CertConverterConversionFailed read these counts.
+			if result.Failed != c.wantFailed || result.Collided != 0 {
+				t.Errorf("Run(over budget) Failed, Collided = %d, %d, want %d, 0", result.Failed, result.Collided, c.wantFailed)
+			}
+			got := make(map[string]SourceState)
+			for _, st := range result.Sources {
+				got[st.Path] = st
+			}
+			if st := got[c.failing+"/site.crt"]; st.Outcome != c.want {
+				t.Errorf("Sources[%s/site.crt].Outcome = %v, want %v", c.failing, st.Outcome, c.want)
+			}
+		})
+	}
+}
+
+// A failed source whose key turns into a folder cannot be read, so its failure
+// keeps counting, and its row keeps saying so, until a scan reaches it.
+func TestScanSources_an_unread_failed_source_stays_failed(t *testing.T) {
+	now := sourcesClock
+	pinConversionClock(t, &now)
+	inDir, outDir := t.TempDir(), t.TempDir()
+	writeInput(t, filepath.Join(inDir, "bad.crt"), []byte("not a certificate"))
+	writeInput(t, filepath.Join(inDir, "bad.key"), []byte("not a key"))
+	s := newSourcesScanner(inDir, outDir, nil)
+	if first, _ := s.Run(t.Context()); first.Failed != 1 {
+		t.Fatalf("setup: first scan Failed = %d, want 1", first.Failed)
+	}
+	if err := os.Remove(filepath.Join(inDir, "bad.key")); err != nil {
+		t.Fatalf("setup: Remove: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(inDir, "bad.key"), 0o750); err != nil {
+		t.Fatalf("setup: Mkdir: %v", err)
+	}
+
+	result, _ := s.Run(t.Context())
+	if result.Failed != 1 {
+		t.Errorf("Run(key unreadable).Failed = %d, want 1", result.Failed)
+	}
+	if len(result.Sources) != 1 || result.Sources[0].Outcome != SourceFailed {
+		t.Errorf("Run(key unreadable).Sources = %+v, want bad.crt failed", result.Sources)
 	}
 }
 
@@ -328,19 +419,38 @@ func TestScanSources_an_unreached_collision_claimant_stays_collided(t *testing.T
 	}
 }
 
-func TestOutcomeOfStatus_covers_every_source_status(t *testing.T) {
+// TestOutcomeOfStatus_maps_each_status_to_its_named_outcome pins the outcome
+// each per-source status gives and the label it is served under, from the
+// design's outcome table, and that every name is a documented
+// last_scan_sources outcome.
+func TestOutcomeOfStatus_maps_each_status_to_its_named_outcome(t *testing.T) {
 	t.Parallel()
-	seen := make(map[SourceOutcome]conversionStatus)
-	for status := statusUnset + 1; status < statusCount; status++ {
-		outcome, ok := outcomeOfStatus(status)
-		if !ok {
-			t.Errorf("outcomeOfStatus(%d) = _, false, want an outcome for every per-source status", status)
-			continue
+	spec := []struct {
+		status  conversionStatus
+		outcome SourceOutcome
+		name    string
+	}{
+		{statusConverted, SourceConverted, "converted"},
+		{statusUnchanged, SourceUnchanged, "unchanged"},
+		{statusFailed, SourceFailed, "failed"},
+		{statusOrphan, SourceOrphan, "orphan"},
+		{statusUnreadable, SourceUnreadable, "unreadable"},
+		{statusUnwritable, SourceUnwritable, "unwritable"},
+		{statusCollided, SourceCollided, "collided"},
+		{statusExcluded, SourceExcluded, "excluded"},
+		{statusVanished, SourceVanished, "vanished"},
+	}
+	if len(spec) != int(statusCount)-1 {
+		t.Errorf("the spec covers %d statuses, want every per-source status (%d)", len(spec), int(statusCount)-1)
+	}
+	for _, c := range spec {
+		outcome, ok := outcomeOfStatus(c.status)
+		if !ok || outcome != c.outcome {
+			t.Errorf("outcomeOfStatus(%d) = %d, %v, want %d (%s), true", c.status, outcome, ok, c.outcome, c.name)
 		}
-		if prev, dup := seen[outcome]; dup {
-			t.Errorf("outcomeOfStatus(%d) = %v, the outcome of status %d too, want distinct outcomes", status, outcome, prev)
+		if got := c.outcome.String(); got != c.name {
+			t.Errorf("outcome %d String() = %q, want %q", c.outcome, got, c.name)
 		}
-		seen[outcome] = status
 	}
 	if _, ok := outcomeOfStatus(statusUnset); ok {
 		t.Error("outcomeOfStatus(statusUnset) = _, true, want no outcome")
@@ -358,16 +468,9 @@ func TestOutcomeOfStatus_covers_every_source_status(t *testing.T) {
 	for _, m := range regexp.MustCompile("`([a-z_]+)`").FindAllSubmatch(row, -1) {
 		documented[string(m[1])] = true
 	}
-	names := SourceOutcomeNames()
-	if len(names) != int(sourceOutcomeCount) {
-		t.Fatalf("SourceOutcomeNames() holds %d names, want %d", len(names), sourceOutcomeCount)
-	}
-	for i, name := range names {
+	for i, name := range SourceOutcomeNames() {
 		if !documented[name] {
 			t.Errorf("SourceOutcomeNames()[%d] = %q, not a documented last_scan_sources outcome", i, name)
-		}
-		if got := SourceOutcome(i).String(); got != name {
-			t.Errorf("SourceOutcome(%d).String() = %q, want %q", i, got, name)
 		}
 	}
 }
