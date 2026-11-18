@@ -311,6 +311,7 @@ func run() int {
 	w := watch.New(requiredVolumes.Input, runAndSetHealth,
 		watch.WithDebounce(watchDebounce),
 		watch.WithFallback(cfg.FallbackInterval),
+		watch.WithNextScan(reporter.SetNextScan),
 		// Same MAX_SCAN_ENTRIES budget the scanner gets: both walks cross the same
 		// /input tree, and watches for directories the scan will never reach can
 		// produce no conversion.

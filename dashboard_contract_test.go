@@ -3,11 +3,17 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"regexp"
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/cplieger/cert-converter/internal/obs"
+	"github.com/cplieger/cert-converter/internal/process"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 const (
@@ -195,7 +201,12 @@ func row(t *testing.T, d *dashboard, title string) *layoutNode {
 // name it serves with its label names.
 func servedSeries(t *testing.T) map[string][]string {
 	t.Helper()
-	reg, _ := newMetrics(0)
+	capture.SwapDefault(t, slog.New(slog.DiscardHandler))
+	reg, reporter := newMetrics(0)
+	// The per-source families serve nothing before a scan holding a source.
+	reporter.Report(t.Context(), &obs.Scan{Result: process.ScanResult{Total: 1, Sources: []process.SourceState{
+		{Path: "a/one.crt", Outcome: process.SourceConverted, LastConverted: time.Unix(1_800_000_000, 0)},
+	}}})
 	families, err := reg.Gather(t.Context())
 	if err != nil {
 		t.Fatalf("Gather = %v", err)
@@ -214,8 +225,10 @@ func servedSeries(t *testing.T) map[string][]string {
 			served[f.Name] = labels
 		}
 	}
-	if _, ok := served["cert_converter_last_scan_outcome"]; !ok {
-		t.Fatalf("Setup: the registry serves no cert_converter_last_scan_outcome: %v", served)
+	for _, name := range []string{"cert_converter_last_scan_outcome", "cert_converter_source_outcome"} {
+		if _, ok := served[name]; !ok {
+			t.Fatalf("Setup: the registry serves no %s: %v", name, served)
+		}
 	}
 	return served
 }

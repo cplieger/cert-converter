@@ -7,11 +7,13 @@ package obs
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/go/measure/v2"
+	"github.com/cplieger/go/textsafe"
 )
 
 // recordMessage is the end-of-scan record's message. The shipped log rules select
@@ -96,6 +98,10 @@ func logRecord(ctx context.Context, scan *Scan) {
 
 // Reporter writes each scan's verdict to the record and the metrics in one call.
 type Reporter struct {
+	snapshot  atomic.Pointer[[]process.SourceState] // the latest reported scan's Sources
+	outcomeOf *measure.Desc
+	converted *measure.Desc
+	next      *measure.Gauge
 	sources   *measure.LabeledGauge
 	found     *measure.Gauge
 	finished  *measure.Gauge
@@ -111,6 +117,9 @@ type Reporter struct {
 // reportClock is indirected so a test can pin the last-scan timestamp and the
 // scan deadline.
 var reportClock = time.Now
+
+// outcomeLabel names the label of every family keyed by an outcome.
+const outcomeLabel = "outcome"
 
 var (
 	outcomes = []process.Outcome{process.OutcomeComplete, process.OutcomeAborted, process.OutcomeBudgetStopped}
@@ -135,13 +144,13 @@ func newReporter(reg *measure.Registry, lease time.Duration) *Reporter {
 	r := &Reporter{
 		lease: lease,
 		sources: measure.NewLabeledGauge("last_scan_sources",
-			"Sources at each outcome in the last scan; a scan that did not cover the tree keeps the previous scan's problem counts.", measure.UnitCount, []string{"outcome"}),
+			"Sources at each outcome in the last scan; a scan that did not cover the tree keeps the previous scan's problem counts.", measure.UnitCount, []string{outcomeLabel}),
 		found: measure.NewGauge("last_scan_sources_found",
 			"Certificate sources the last scan found under /input.", measure.UnitCount),
 		finished: measure.NewGauge("last_scan_timestamp_seconds",
 			"Unix time the last scan ended, 0 before the first one.", measure.UnitSeconds),
 		outcome: measure.NewLabeledGauge("last_scan_outcome",
-			"1 for how the last scan ended, 0 for the other outcomes.", measure.UnitNone, []string{"outcome"}),
+			"1 for how the last scan ended, 0 for the other outcomes.", measure.UnitNone, []string{outcomeLabel}),
 		mode: measure.NewLabeledGauge("change_detection_mode",
 			"1 for the change-detection mode the last scan ran in, 0 for the other.", measure.UnitNone, []string{"mode"}),
 		condition: measure.NewLabeledGauge("condition",
@@ -152,10 +161,22 @@ func newReporter(reg *measure.Registry, lease time.Duration) *Reporter {
 			"Unix time by which the next healthy scan is due: the last healthy scan's end, or the start, plus three guaranteed recheck cadences.", measure.UnitSeconds),
 		succeeded: measure.NewGauge("last_success_timestamp_seconds",
 			"Unix time the last healthy scan ended, 0 before the first one.", measure.UnitSeconds),
+		next: measure.NewGauge("next_scan_timestamp_seconds",
+			"Unix time of the next guaranteed recheck of every source; a changed file under /input can bring a scan sooner.", measure.UnitSeconds),
+		outcomeOf: measure.NewStateSetDesc("source_outcome",
+			"1 for the outcome the latest scan that reached the source gave it, 0 for the others; source is a path under /input.",
+			[]string{"source", outcomeLabel}, process.SourceOutcomeNames()),
+		converted: measure.NewGaugeDesc("source_last_conversion_timestamp_seconds",
+			"Unix time the source was last converted, from its newest output artifact after a restart; 0 when it has no output.",
+			measure.UnitSeconds, []string{"source"}),
 	}
-	reg.MustRegister(r.sources, r.found, r.finished, r.outcome, r.mode, r.condition, r.removed, r.deadline, r.succeeded)
+	reg.MustRegister(r.sources, r.found, r.finished, r.outcome, r.mode, r.condition, r.removed, r.deadline, r.succeeded,
+		r.next, measure.NewCollector(r.collectSources, r.outcomeOf, r.converted))
 	r.set(&Scan{}, 0)
-	r.renewDeadline(reportClock())
+	start := reportClock()
+	r.renewDeadline(start)
+	// The startup scan is the next guaranteed one, and it is due now.
+	r.SetNextScan(start)
 	for _, o := range outcomes {
 		r.outcome.Set(0, o.String())
 	}
@@ -171,11 +192,45 @@ func (r *Reporter) Report(ctx context.Context, scan *Scan) {
 	logRecord(ctx, scan)
 	now := reportClock()
 	r.set(scan, float64(now.Unix()))
+	sources := scan.Result.Sources
+	r.snapshot.Store(&sources)
 	r.removed.Add(int64(scan.Result.Removed))
 	if scan.Healthy {
 		r.succeeded.Set(float64(now.Unix()))
 		r.renewDeadline(now)
 	}
+}
+
+// SetNextScan records at as the time of the next guaranteed recheck of every
+// source.
+func (r *Reporter) SetNextScan(at time.Time) {
+	r.next.Set(float64(at.Unix()))
+}
+
+// collectSources serves one series per source of the latest reported scan, so a
+// source that scan no longer holds leaves the page; before the first report it
+// serves none.
+func (r *Reporter) collectSources(_ context.Context, e *measure.Emitter) {
+	sources := r.snapshot.Load()
+	if sources == nil {
+		return
+	}
+	for i := range *sources {
+		s := &(*sources)[i]
+		// The path is a file name from /input; it is sanitised where it leaves the
+		// program (textsafe README), as every log line naming it is.
+		label := textsafe.SanitizeSingleLine(s.Path)
+		e.EmitState(r.outcomeOf, s.Outcome.String(), label)
+		e.Emit(r.converted, unixOrZero(s.LastConverted), label)
+	}
+}
+
+// unixOrZero is at in Unix seconds, and 0 for the zero time, which means none.
+func unixOrZero(at time.Time) float64 {
+	if at.IsZero() {
+		return 0
+	}
+	return float64(at.Unix())
 }
 
 // renewDeadline dates the next healthy scan one lease after at. Only the start

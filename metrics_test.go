@@ -149,7 +149,12 @@ func TestMetricsPage_matches_golden(t *testing.T) {
 			Total: 91, Converted: 1, Unchanged: 2, Orphan: 3, Unreadable: 4, Unresolved: 5, Vanished: 6,
 			Unwritable: 7, Collided: 8, Excluded: 10, Ignored: 11, Removed: 12, Failed: 13,
 			Outcome: process.OutcomeBudgetStopped, NoSources: true, OrphanRemovalDisabled: true, CleanupDegraded: true,
+			Sources: []process.SourceState{
+				{Path: "a/one.crt", Outcome: process.SourceConverted, LastConverted: time.Unix(1_800_000_000, 0)},
+				{Path: "b/two.pfx", Outcome: process.SourceFailed},
+			},
 		}})
+		reporter.SetNextScan(time.Now().Add(time.Hour))
 		rec := httptest.NewRecorder()
 		reg.Handler().ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", http.NoBody))
 		got := appPage(rec.Body.String())
