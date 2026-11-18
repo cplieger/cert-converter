@@ -30,7 +30,7 @@
       }
     ],
     "cursorSync": "Crosshair",
-    "description": "Whether cert-converter keeps every certificate converted, with what needs your attention, and how its scans went over time. It reads the metrics page METRICS_LISTEN_ADDR serves, and the attention tiles need the rules from alerts/promql.yaml loaded.",
+    "description": "Whether cert-converter's outputs match its inputs, when each certificate was last converted, and what needs your attention. It reads the metrics page METRICS_LISTEN_ADDR serves, and the attention tiles need the rules from alerts/promql.yaml loaded.",
     "editable": true,
     "elements": {
       "panel-1": {
@@ -1377,207 +1377,6 @@
           }
         }
       },
-      "panel-20": {
-        "kind": "Panel",
-        "spec": {
-          "id": 20,
-          "title": "Scan outcome",
-          "description": "How the latest scan ended. Complete means it covered all of /input. Aborted means it ended early, and Stopped at limit means it stopped at MAX_SCAN_ENTRIES. No value means no scan has ended yet, or cert-converter was not scraped.",
-          "links": [],
-          "data": {
-            "kind": "QueryGroup",
-            "spec": {
-              "queries": [
-                {
-                  "kind": "PanelQuery",
-                  "spec": {
-                    "query": {
-                      "kind": "DataQuery",
-                      "group": "prometheus",
-                      "version": "v0",
-                      "datasource": {
-                        "name": "${datasource}"
-                      },
-                      "spec": {
-                        "expr": "max(cert_converter_last_scan_outcome{instance=\"$instance\", outcome=\"complete\"} * 1 or cert_converter_last_scan_outcome{instance=\"$instance\", outcome=\"aborted\"} * 2 or cert_converter_last_scan_outcome{instance=\"$instance\", outcome=\"budget_stopped\"} * 3) and on () (cert_converter_last_scan_timestamp_seconds{instance=\"$instance\"} > 0)",
-                        "legendFormat": "",
-                        "instant": true,
-                        "range": false
-                      }
-                    },
-                    "refId": "A",
-                    "hidden": false
-                  }
-                }
-              ],
-              "transformations": [],
-              "queryOptions": {}
-            }
-          },
-          "vizConfig": {
-            "kind": "VizConfig",
-            "group": "stat",
-            "version": "",
-            "spec": {
-              "options": {
-                "colorMode": "background",
-                "graphMode": "none",
-                "justifyMode": "center",
-                "reduceOptions": {
-                  "calcs": [
-                    "lastNotNull"
-                  ],
-                  "values": false
-                },
-                "textMode": "auto",
-                "text": {
-                  "titleSize": 14,
-                  "valueSize": 28
-                }
-              },
-              "fieldConfig": {
-                "defaults": {
-                  "unit": "none",
-                  "noValue": "No scan yet",
-                  "color": {
-                    "mode": "thresholds"
-                  },
-                  "thresholds": {
-                    "mode": "absolute",
-                    "steps": [
-                      {
-                        "value": null,
-                        "color": "text"
-                      }
-                    ]
-                  },
-                  "mappings": [
-                    {
-                      "type": "value",
-                      "options": {
-                        "1": {
-                          "index": 0,
-                          "text": "Complete",
-                          "color": "green"
-                        },
-                        "2": {
-                          "index": 1,
-                          "text": "Aborted",
-                          "color": "red"
-                        },
-                        "3": {
-                          "index": 2,
-                          "text": "Stopped at limit",
-                          "color": "yellow"
-                        }
-                      }
-                    }
-                  ]
-                },
-                "overrides": []
-              }
-            }
-          }
-        }
-      },
-      "panel-21": {
-        "kind": "Panel",
-        "spec": {
-          "id": 21,
-          "title": "Detection mode",
-          "description": "Whether the latest scan ran on a file watch or on polling. Watching picks up a renewed certificate in seconds. Polling waits for the next rescan every FALLBACK_SCAN_HOURS, and exhausted inotify instances on the host are the usual cause. No value means no scan has ended yet.",
-          "links": [],
-          "data": {
-            "kind": "QueryGroup",
-            "spec": {
-              "queries": [
-                {
-                  "kind": "PanelQuery",
-                  "spec": {
-                    "query": {
-                      "kind": "DataQuery",
-                      "group": "prometheus",
-                      "version": "v0",
-                      "datasource": {
-                        "name": "${datasource}"
-                      },
-                      "spec": {
-                        "expr": "max(cert_converter_change_detection_mode{instance=\"$instance\", mode=\"poll\"}) and on () (cert_converter_last_scan_timestamp_seconds{instance=\"$instance\"} > 0)",
-                        "legendFormat": "",
-                        "instant": true,
-                        "range": false
-                      }
-                    },
-                    "refId": "A",
-                    "hidden": false
-                  }
-                }
-              ],
-              "transformations": [],
-              "queryOptions": {}
-            }
-          },
-          "vizConfig": {
-            "kind": "VizConfig",
-            "group": "stat",
-            "version": "",
-            "spec": {
-              "options": {
-                "colorMode": "background",
-                "graphMode": "none",
-                "justifyMode": "center",
-                "reduceOptions": {
-                  "calcs": [
-                    "lastNotNull"
-                  ],
-                  "values": false
-                },
-                "textMode": "auto",
-                "text": {
-                  "titleSize": 14,
-                  "valueSize": 28
-                }
-              },
-              "fieldConfig": {
-                "defaults": {
-                  "unit": "none",
-                  "noValue": "No scan yet",
-                  "color": {
-                    "mode": "thresholds"
-                  },
-                  "thresholds": {
-                    "mode": "absolute",
-                    "steps": [
-                      {
-                        "value": null,
-                        "color": "text"
-                      }
-                    ]
-                  },
-                  "mappings": [
-                    {
-                      "type": "value",
-                      "options": {
-                        "0": {
-                          "index": 0,
-                          "text": "Watching",
-                          "color": "green"
-                        },
-                        "1": {
-                          "index": 1,
-                          "text": "Polling",
-                          "color": "yellow"
-                        }
-                      }
-                    }
-                  ]
-                },
-                "overrides": []
-              }
-            }
-          }
-        }
-      },
       "panel-22": {
         "kind": "Panel",
         "spec": {
@@ -1742,176 +1541,6 @@
           }
         }
       },
-      "panel-24": {
-        "kind": "Panel",
-        "spec": {
-          "id": 24,
-          "title": "Healthy scan due",
-          "description": "When the next healthy scan is due, three rescan intervals after the last healthy scan or the start. A time in the past means scans have stalled or keep failing, and the Scans attention tile shows once the CertConverterScanStalled alert fires. No value means cert-converter was not scraped.",
-          "links": [],
-          "data": {
-            "kind": "QueryGroup",
-            "spec": {
-              "queries": [
-                {
-                  "kind": "PanelQuery",
-                  "spec": {
-                    "query": {
-                      "kind": "DataQuery",
-                      "group": "prometheus",
-                      "version": "v0",
-                      "datasource": {
-                        "name": "${datasource}"
-                      },
-                      "spec": {
-                        "expr": "(cert_converter_scan_deadline_timestamp_seconds{instance=\"$instance\"} > 0) * 1000",
-                        "legendFormat": "",
-                        "instant": true,
-                        "range": false
-                      }
-                    },
-                    "refId": "A",
-                    "hidden": false
-                  }
-                }
-              ],
-              "transformations": [],
-              "queryOptions": {}
-            }
-          },
-          "vizConfig": {
-            "kind": "VizConfig",
-            "group": "stat",
-            "version": "",
-            "spec": {
-              "options": {
-                "colorMode": "value",
-                "graphMode": "none",
-                "justifyMode": "center",
-                "reduceOptions": {
-                  "calcs": [
-                    "lastNotNull"
-                  ],
-                  "values": false
-                },
-                "textMode": "auto",
-                "text": {
-                  "titleSize": 14,
-                  "valueSize": 28
-                }
-              },
-              "fieldConfig": {
-                "defaults": {
-                  "unit": "dateTimeFromNow",
-                  "noValue": "Not scraped",
-                  "color": {
-                    "mode": "fixed",
-                    "fixedColor": "text"
-                  },
-                  "thresholds": {
-                    "mode": "absolute",
-                    "steps": [
-                      {
-                        "value": null,
-                        "color": "text"
-                      }
-                    ]
-                  }
-                },
-                "overrides": []
-              }
-            }
-          }
-        }
-      },
-      "panel-30": {
-        "kind": "Panel",
-        "spec": {
-          "id": 30,
-          "title": "Sources by outcome",
-          "description": "What the latest scan did with each certificate source under /input, one bar per outcome it saw. Converted and Unchanged are current outputs. Any other bar names sources whose output is missing or stale, and the container log names each file. No value means no scan has ended yet, the latest scan found no source, or cert-converter was not scraped.",
-          "links": [],
-          "data": {
-            "kind": "QueryGroup",
-            "spec": {
-              "queries": [
-                {
-                  "kind": "PanelQuery",
-                  "spec": {
-                    "query": {
-                      "kind": "DataQuery",
-                      "group": "prometheus",
-                      "version": "v0",
-                      "datasource": {
-                        "name": "${datasource}"
-                      },
-                      "spec": {
-                        "expr": "label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(max by (outcome) (cert_converter_last_scan_sources{instance=\"$instance\"}) > 0, \"outcome\", \"Converted\", \"outcome\", \"converted\"), \"outcome\", \"Unchanged\", \"outcome\", \"unchanged\"), \"outcome\", \"No key\", \"outcome\", \"orphan\"), \"outcome\", \"Unreadable\", \"outcome\", \"unreadable\"), \"outcome\", \"Link unresolved\", \"outcome\", \"unresolved\"), \"outcome\", \"Vanished\", \"outcome\", \"vanished\"), \"outcome\", \"Write refused\", \"outcome\", \"unwritable\"), \"outcome\", \"Name collision\", \"outcome\", \"collided\"), \"outcome\", \"Excluded\", \"outcome\", \"excluded\"), \"outcome\", \"Bundle ignored\", \"outcome\", \"ignored\"), \"outcome\", \"Failed\", \"outcome\", \"failed\")",
-                        "legendFormat": "{{outcome}}",
-                        "instant": true,
-                        "range": false
-                      }
-                    },
-                    "refId": "A",
-                    "hidden": false
-                  }
-                }
-              ],
-              "transformations": [],
-              "queryOptions": {}
-            }
-          },
-          "vizConfig": {
-            "kind": "VizConfig",
-            "group": "bargauge",
-            "version": "",
-            "spec": {
-              "options": {
-                "displayMode": "basic",
-                "orientation": "horizontal",
-                "namePlacement": "left",
-                "showUnfilled": true,
-                "sizing": "manual",
-                "minVizHeight": 36,
-                "maxVizHeight": 36,
-                "valueMode": "color",
-                "reduceOptions": {
-                  "calcs": [
-                    "lastNotNull"
-                  ],
-                  "values": false
-                },
-                "text": {
-                  "titleSize": 14,
-                  "valueSize": 14
-                }
-              },
-              "fieldConfig": {
-                "defaults": {
-                  "unit": "none",
-                  "decimals": 0,
-                  "min": 0,
-                  "noValue": "No sources to show",
-                  "color": {
-                    "mode": "fixed",
-                    "fixedColor": "blue"
-                  },
-                  "thresholds": {
-                    "mode": "absolute",
-                    "steps": [
-                      {
-                        "value": null,
-                        "color": "blue"
-                      }
-                    ]
-                  }
-                },
-                "overrides": []
-              }
-            }
-          }
-        }
-      },
       "panel-31": {
         "kind": "Panel",
         "spec": {
@@ -1996,12 +1625,12 @@
           }
         }
       },
-      "panel-40": {
+      "panel-50": {
         "kind": "Panel",
         "spec": {
-          "id": 40,
-          "title": "Scans over time",
-          "description": "How each scan ended and how cert-converter watched for changes, over the selected range. Red is an aborted scan, and yellow is a scan stopped at MAX_SCAN_ENTRIES or a stretch of polling. A gap means no scan had ended since a start, or cert-converter was not scraped.",
+          "id": 50,
+          "title": "Outputs match inputs",
+          "description": "Yes when the latest scan left every output matching its input, otherwise No with the most urgent reason, and the table and the attention tiles show the rest. A red No is an aborted scan, a failed conversion or a name collision, which make the container unhealthy, and a yellow No does not. No scan yet means no scan has ended since the start, or cert-converter was not scraped. OUTPUT_LIFECYCLE=warn and keep never remove an output whose input is gone, which this tile cannot see.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -2018,30 +1647,13 @@
                         "name": "${datasource}"
                       },
                       "spec": {
-                        "expr": "(max(cert_converter_last_scan_outcome{instance=\"$instance\", outcome=\"complete\"} * 1 or cert_converter_last_scan_outcome{instance=\"$instance\", outcome=\"aborted\"} * 2 or cert_converter_last_scan_outcome{instance=\"$instance\", outcome=\"budget_stopped\"} * 3)) and on () (cert_converter_last_scan_timestamp_seconds{instance=\"$instance\"} > 0)",
-                        "legendFormat": "Last scan"
+                        "expr": "max((cert_converter_last_scan_outcome{instance=\"$instance\", outcome=\"aborted\"} == bool 1) * 12 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=\"failed\"} > bool 0) * 11 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=\"collided\"} > bool 0) * 10 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=\"unwritable\"} > bool 0) * 9 or (cert_converter_last_scan_outcome{instance=\"$instance\", outcome=\"budget_stopped\"} == bool 1) * 8 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=~\"unreadable|unresolved|vanished\"} > bool 0) * 7 or (cert_converter_condition{instance=\"$instance\", condition=\"no_sources\"} == bool 1) * 6 or (cert_converter_condition{instance=\"$instance\", condition=\"all_excluded\"} == bool 1) * 5 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=\"orphan\"} > bool 0) * 4 or (cert_converter_condition{instance=\"$instance\", condition=\"orphan_removal_disabled\"} == bool 1) * 3 or (cert_converter_condition{instance=\"$instance\", condition=\"previous_layout_retained\"} == bool 1) * 2 or (cert_converter_last_scan_sources{instance=\"$instance\", outcome=\"ignored\"} > bool 0) * 1) and on () (cert_converter_last_scan_timestamp_seconds{instance=\"$instance\"} > 0)",
+                        "legendFormat": "",
+                        "instant": true,
+                        "range": false
                       }
                     },
                     "refId": "A",
-                    "hidden": false
-                  }
-                },
-                {
-                  "kind": "PanelQuery",
-                  "spec": {
-                    "query": {
-                      "kind": "DataQuery",
-                      "group": "prometheus",
-                      "version": "v0",
-                      "datasource": {
-                        "name": "${datasource}"
-                      },
-                      "spec": {
-                        "expr": "(max(cert_converter_change_detection_mode{instance=\"$instance\", mode=\"poll\"}) + 4) and on () (cert_converter_last_scan_timestamp_seconds{instance=\"$instance\"} > 0)",
-                        "legendFormat": "Change detection"
-                      }
-                    },
-                    "refId": "B",
                     "hidden": false
                   }
                 }
@@ -2052,135 +1664,23 @@
           },
           "vizConfig": {
             "kind": "VizConfig",
-            "group": "state-timeline",
+            "group": "stat",
             "version": "",
             "spec": {
               "options": {
-                "showValue": "never",
-                "mergeValues": true,
-                "alignValue": "left",
-                "rowHeight": 0.9,
-                "legend": {
-                  "showLegend": true,
-                  "displayMode": "list",
-                  "placement": "bottom"
-                },
-                "tooltip": {
-                  "mode": "single"
-                }
-              },
-              "fieldConfig": {
-                "defaults": {
-                  "unit": "none",
-                  "noValue": "No scan yet",
-                  "color": {
-                    "mode": "fixed",
-                    "fixedColor": "green"
-                  },
-                  "thresholds": {
-                    "mode": "absolute",
-                    "steps": [
-                      {
-                        "value": null,
-                        "color": "green"
-                      }
-                    ]
-                  },
-                  "mappings": [
-                    {
-                      "type": "value",
-                      "options": {
-                        "1": {
-                          "index": 0,
-                          "text": "Complete",
-                          "color": "green"
-                        },
-                        "2": {
-                          "index": 1,
-                          "text": "Aborted",
-                          "color": "red"
-                        },
-                        "3": {
-                          "index": 2,
-                          "text": "Stopped at limit",
-                          "color": "yellow"
-                        },
-                        "4": {
-                          "index": 3,
-                          "text": "Watching",
-                          "color": "green"
-                        },
-                        "5": {
-                          "index": 4,
-                          "text": "Polling",
-                          "color": "yellow"
-                        }
-                      }
-                    }
+                "colorMode": "value",
+                "graphMode": "none",
+                "justifyMode": "center",
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
                   ],
-                  "custom": {
-                    "fillOpacity": 80,
-                    "lineWidth": 0
-                  }
+                  "values": false
                 },
-                "overrides": []
-              }
-            }
-          }
-        }
-      },
-      "panel-41": {
-        "kind": "Panel",
-        "spec": {
-          "id": 41,
-          "title": "Standing problems over time",
-          "description": "Each standing problem a scan reports, over the selected range, one row per problem. Yellow is a stretch while the latest scan reported it, and green is clear. Each one has its own attention tile while it holds. A gap means no scan had ended since a start, or cert-converter was not scraped.",
-          "links": [],
-          "data": {
-            "kind": "QueryGroup",
-            "spec": {
-              "queries": [
-                {
-                  "kind": "PanelQuery",
-                  "spec": {
-                    "query": {
-                      "kind": "DataQuery",
-                      "group": "prometheus",
-                      "version": "v0",
-                      "datasource": {
-                        "name": "${datasource}"
-                      },
-                      "spec": {
-                        "expr": "label_replace(label_replace(label_replace(label_replace(label_replace(max by (condition) (cert_converter_condition{instance=\"$instance\"}), \"condition\", \"No sources found\", \"condition\", \"no_sources\"), \"condition\", \"Every source excluded\", \"condition\", \"all_excluded\"), \"condition\", \"Orphan removal off\", \"condition\", \"orphan_removal_disabled\"), \"condition\", \"Previous layout kept\", \"condition\", \"previous_layout_retained\"), \"condition\", \"Temporary files left\", \"condition\", \"cleanup_degraded\") and on () (cert_converter_last_scan_timestamp_seconds{instance=\"$instance\"} > 0)",
-                        "legendFormat": "{{condition}}"
-                      }
-                    },
-                    "refId": "A",
-                    "hidden": false
-                  }
-                }
-              ],
-              "transformations": [],
-              "queryOptions": {}
-            }
-          },
-          "vizConfig": {
-            "kind": "VizConfig",
-            "group": "state-timeline",
-            "version": "",
-            "spec": {
-              "options": {
-                "showValue": "never",
-                "mergeValues": true,
-                "alignValue": "left",
-                "rowHeight": 0.9,
-                "legend": {
-                  "showLegend": true,
-                  "displayMode": "list",
-                  "placement": "bottom"
-                },
-                "tooltip": {
-                  "mode": "single"
+                "textMode": "auto",
+                "text": {
+                  "titleSize": 14,
+                  "valueSize": 28
                 }
               },
               "fieldConfig": {
@@ -2188,15 +1688,14 @@
                   "unit": "none",
                   "noValue": "No scan yet",
                   "color": {
-                    "mode": "fixed",
-                    "fixedColor": "green"
+                    "mode": "thresholds"
                   },
                   "thresholds": {
                     "mode": "absolute",
                     "steps": [
                       {
                         "value": null,
-                        "color": "green"
+                        "color": "red"
                       }
                     ]
                   },
@@ -2206,20 +1705,723 @@
                       "options": {
                         "0": {
                           "index": 0,
-                          "text": "Clear",
+                          "text": "Yes",
                           "color": "green"
                         },
-                        "1": {
+                        "12": {
                           "index": 1,
-                          "text": "Reported",
+                          "text": "No: scan aborted",
+                          "color": "red"
+                        },
+                        "11": {
+                          "index": 2,
+                          "text": "No: conversion failed",
+                          "color": "red"
+                        },
+                        "10": {
+                          "index": 3,
+                          "text": "No: name collision",
+                          "color": "red"
+                        },
+                        "9": {
+                          "index": 4,
+                          "text": "No: write refused",
+                          "color": "yellow"
+                        },
+                        "8": {
+                          "index": 5,
+                          "text": "No: input too large",
+                          "color": "yellow"
+                        },
+                        "7": {
+                          "index": 6,
+                          "text": "No: input unreadable",
+                          "color": "yellow"
+                        },
+                        "6": {
+                          "index": 7,
+                          "text": "No: no certificates",
+                          "color": "yellow"
+                        },
+                        "5": {
+                          "index": 8,
+                          "text": "No: all excluded",
+                          "color": "yellow"
+                        },
+                        "4": {
+                          "index": 9,
+                          "text": "No: key missing",
+                          "color": "yellow"
+                        },
+                        "3": {
+                          "index": 10,
+                          "text": "No: old outputs kept",
+                          "color": "yellow"
+                        },
+                        "2": {
+                          "index": 11,
+                          "text": "No: old layout kept",
+                          "color": "yellow"
+                        },
+                        "1": {
+                          "index": 12,
+                          "text": "No: PFX input off",
                           "color": "yellow"
                         }
                       }
                     }
+                  ]
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-51": {
+        "kind": "Panel",
+        "spec": {
+          "id": 51,
+          "title": "Last conversion",
+          "description": "When cert-converter last wrote an output for any certificate. After a restart this is the newest output file's time. No conversion yet means no certificate has an output, or cert-converter was not scraped.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "expr": "max(cert_converter_source_last_conversion_timestamp_seconds{instance=\"$instance\"} > 0) * 1000",
+                        "legendFormat": "",
+                        "instant": true,
+                        "range": false
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "stat",
+            "version": "",
+            "spec": {
+              "options": {
+                "colorMode": "value",
+                "graphMode": "none",
+                "justifyMode": "center",
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
                   ],
+                  "values": false
+                },
+                "textMode": "auto",
+                "text": {
+                  "titleSize": 14,
+                  "valueSize": 28
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "dateTimeFromNow",
+                  "noValue": "No conversion yet",
+                  "color": {
+                    "mode": "fixed",
+                    "fixedColor": "text"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": null,
+                        "color": "text"
+                      }
+                    ]
+                  }
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-52": {
+        "kind": "Panel",
+        "spec": {
+          "id": 52,
+          "title": "Certificates",
+          "description": "Certificate sources cert-converter knows under /input, excluded ones included: one row each in the table below. Not scraped means cert-converter was not scraped, or its first scan has not ended.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "expr": "count(cert_converter_source_outcome{instance=\"$instance\"} == 1) or 0 * max(cert_converter_last_scan_timestamp_seconds{instance=\"$instance\"} > 0)",
+                        "legendFormat": "",
+                        "instant": true,
+                        "range": false
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "stat",
+            "version": "",
+            "spec": {
+              "options": {
+                "colorMode": "value",
+                "graphMode": "none",
+                "justifyMode": "center",
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
+                  ],
+                  "values": false
+                },
+                "textMode": "auto",
+                "text": {
+                  "titleSize": 14,
+                  "valueSize": 28
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "none",
+                  "noValue": "Not scraped",
+                  "color": {
+                    "mode": "fixed",
+                    "fixedColor": "text"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": null,
+                        "color": "text"
+                      }
+                    ]
+                  }
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-53": {
+        "kind": "Panel",
+        "spec": {
+          "id": 53,
+          "title": "Errors now",
+          "description": "Certificates the latest scan that reached them left failed, in a name collision, refused a write, unreadable, vanished during the scan or with their key missing. Green at 0, red from 1. A problem with the scan itself rather than one certificate shows in Outputs match inputs. Not scraped means cert-converter was not scraped, or its first scan has not ended.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "expr": "count(cert_converter_source_outcome{instance=\"$instance\", outcome=~\"failed|collided|unwritable|unreadable|vanished|orphan\"} == 1) or 0 * max(cert_converter_last_scan_timestamp_seconds{instance=\"$instance\"} > 0)",
+                        "legendFormat": "",
+                        "instant": true,
+                        "range": false
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "stat",
+            "version": "",
+            "spec": {
+              "options": {
+                "colorMode": "value",
+                "graphMode": "none",
+                "justifyMode": "center",
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
+                  ],
+                  "values": false
+                },
+                "textMode": "auto",
+                "text": {
+                  "titleSize": 14,
+                  "valueSize": 28
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "none",
+                  "noValue": "Not scraped",
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": null,
+                        "color": "green"
+                      },
+                      {
+                        "value": 1,
+                        "color": "red"
+                      }
+                    ]
+                  }
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-54": {
+        "kind": "Panel",
+        "spec": {
+          "id": 54,
+          "title": "Next scan",
+          "description": "When cert-converter next rechecks every certificate on its own, every FALLBACK_SCAN_HOURS and at least daily. A changed file under /input brings a scan sooner. A time in the past means the scan is running now or the watch loop is stuck, which the Scans attention tile shows once CertConverterScanStalled fires. Not scraped means cert-converter was not scraped.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "expr": "(cert_converter_next_scan_timestamp_seconds{instance=\"$instance\"} > 0) * 1000",
+                        "legendFormat": "",
+                        "instant": true,
+                        "range": false
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "stat",
+            "version": "",
+            "spec": {
+              "options": {
+                "colorMode": "value",
+                "graphMode": "none",
+                "justifyMode": "center",
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
+                  ],
+                  "values": false
+                },
+                "textMode": "auto",
+                "text": {
+                  "titleSize": 14,
+                  "valueSize": 28
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "dateTimeFromNow",
+                  "noValue": "Not scraped",
+                  "color": {
+                    "mode": "fixed",
+                    "fixedColor": "text"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": null,
+                        "color": "text"
+                      }
+                    ]
+                  }
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-55": {
+        "kind": "Panel",
+        "spec": {
+          "id": 55,
+          "title": "Each certificate",
+          "description": "Each certificate source under /input, problems first, with what the latest scan that reached it did and when it was last converted. The path is relative to /input. Failed and Name collision show in red, the other problems in yellow. Never means it has no output.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "expr": "label_join(label_replace(label_replace(cert_converter_source_last_conversion_timestamp_seconds{instance=\"$instance\"} * 1000 * on (instance, source) group_left (outcome) (cert_converter_source_outcome{instance=\"$instance\"} == 1), \"rank\", \"0\", \"outcome\", \"failed|collided|unwritable|unreadable|vanished|orphan\"), \"rank\", \"1\", \"outcome\", \"converted|unchanged|excluded\"), \"order\", \" \", \"rank\", \"source\")",
+                        "legendFormat": "",
+                        "instant": true,
+                        "range": false,
+                        "format": "table"
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [
+                {
+                  "kind": "Transformation",
+                  "group": "sortBy",
+                  "spec": {
+                    "options": {
+                      "fields": {},
+                      "sort": [
+                        {
+                          "field": "order",
+                          "desc": false
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "kind": "Transformation",
+                  "group": "filterFieldsByName",
+                  "spec": {
+                    "options": {
+                      "include": {
+                        "names": [
+                          "source",
+                          "outcome",
+                          "Value"
+                        ]
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "Transformation",
+                  "group": "organize",
+                  "spec": {
+                    "options": {
+                      "excludeByName": {},
+                      "indexByName": {
+                        "source": 0,
+                        "outcome": 1,
+                        "Value": 2
+                      },
+                      "renameByName": {
+                        "source": "Certificate",
+                        "outcome": "State",
+                        "Value": "Last converted"
+                      }
+                    }
+                  }
+                }
+              ],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "table",
+            "version": "",
+            "spec": {
+              "options": {
+                "showHeader": true,
+                "cellHeight": "sm"
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "none",
+                  "noValue": "No certificates found yet",
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": null,
+                        "color": "text"
+                      }
+                    ]
+                  },
+                  "color": {
+                    "mode": "thresholds"
+                  },
                   "custom": {
-                    "fillOpacity": 80,
-                    "lineWidth": 0
+                    "align": "auto"
+                  }
+                },
+                "overrides": [
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "State"
+                    },
+                    "properties": [
+                      {
+                        "id": "mappings",
+                        "value": [
+                          {
+                            "type": "value",
+                            "options": {
+                              "converted": {
+                                "index": 0,
+                                "text": "Converted this scan",
+                                "color": "green"
+                              },
+                              "unchanged": {
+                                "index": 1,
+                                "text": "Up to date",
+                                "color": "green"
+                              },
+                              "failed": {
+                                "index": 2,
+                                "text": "Failed to convert",
+                                "color": "red"
+                              },
+                              "collided": {
+                                "index": 3,
+                                "text": "Name collision",
+                                "color": "red"
+                              },
+                              "unwritable": {
+                                "index": 4,
+                                "text": "Write refused",
+                                "color": "yellow"
+                              },
+                              "unreadable": {
+                                "index": 5,
+                                "text": "Unreadable",
+                                "color": "yellow"
+                              },
+                              "vanished": {
+                                "index": 6,
+                                "text": "Vanished during scan",
+                                "color": "yellow"
+                              },
+                              "orphan": {
+                                "index": 7,
+                                "text": "Key missing",
+                                "color": "yellow"
+                              },
+                              "excluded": {
+                                "index": 8,
+                                "text": "Excluded",
+                                "color": "text"
+                              }
+                            }
+                          }
+                        ]
+                      },
+                      {
+                        "id": "custom.cellOptions",
+                        "value": {
+                          "type": "color-text"
+                        }
+                      },
+                      {
+                        "id": "custom.width",
+                        "value": 190
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "Last converted"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "dateTimeFromNow"
+                      },
+                      {
+                        "id": "mappings",
+                        "value": [
+                          {
+                            "type": "value",
+                            "options": {
+                              "0": {
+                                "index": 0,
+                                "text": "Never"
+                              }
+                            }
+                          }
+                        ]
+                      },
+                      {
+                        "id": "custom.width",
+                        "value": 170
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byRegexp",
+                      "options": ".*"
+                    },
+                    "properties": [
+                      {
+                        "id": "noValue",
+                        "value": "-"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "panel-56": {
+        "kind": "Panel",
+        "spec": {
+          "id": 56,
+          "title": "Converted in ${span} ${spanunit}",
+          "description": "Certificates whose latest conversion falls inside the selected range. A certificate converted twice counts once, and one converted and then removed does not count. Not scraped means cert-converter was not scraped, or its first scan has not ended.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "expr": "count(cert_converter_source_last_conversion_timestamp_seconds{instance=\"$instance\"} > time() - $__range_s) or 0 * max(cert_converter_last_scan_timestamp_seconds{instance=\"$instance\"} > 0)",
+                        "legendFormat": "",
+                        "instant": true,
+                        "range": false
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "stat",
+            "version": "",
+            "spec": {
+              "options": {
+                "colorMode": "value",
+                "graphMode": "none",
+                "justifyMode": "center",
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
+                  ],
+                  "values": false
+                },
+                "textMode": "auto",
+                "text": {
+                  "titleSize": 14,
+                  "valueSize": 28
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "none",
+                  "noValue": "Not scraped",
+                  "color": {
+                    "mode": "fixed",
+                    "fixedColor": "text"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": null,
+                        "color": "text"
+                      }
+                    ]
                   }
                 },
                 "overrides": []
@@ -2693,7 +2895,7 @@
           {
             "kind": "RowsLayoutRow",
             "spec": {
-              "title": "Latest scan",
+              "title": "Now",
               "collapse": false,
               "layout": {
                 "kind": "GridLayout",
@@ -2704,63 +2906,63 @@
                       "spec": {
                         "x": 0,
                         "y": 0,
+                        "width": 7,
+                        "height": 4,
+                        "element": {
+                          "kind": "ElementReference",
+                          "name": "panel-50"
+                        }
+                      }
+                    },
+                    {
+                      "kind": "GridLayoutItem",
+                      "spec": {
+                        "x": 7,
+                        "y": 0,
+                        "width": 5,
+                        "height": 4,
+                        "element": {
+                          "kind": "ElementReference",
+                          "name": "panel-51"
+                        }
+                      }
+                    },
+                    {
+                      "kind": "GridLayoutItem",
+                      "spec": {
+                        "x": 12,
+                        "y": 0,
                         "width": 4,
                         "height": 4,
                         "element": {
                           "kind": "ElementReference",
-                          "name": "panel-20"
+                          "name": "panel-52"
                         }
                       }
                     },
                     {
                       "kind": "GridLayoutItem",
                       "spec": {
-                        "x": 4,
+                        "x": 16,
                         "y": 0,
-                        "width": 5,
+                        "width": 4,
                         "height": 4,
                         "element": {
                           "kind": "ElementReference",
-                          "name": "panel-21"
+                          "name": "panel-53"
                         }
                       }
                     },
                     {
                       "kind": "GridLayoutItem",
                       "spec": {
-                        "x": 9,
+                        "x": 20,
                         "y": 0,
-                        "width": 5,
+                        "width": 4,
                         "height": 4,
                         "element": {
                           "kind": "ElementReference",
-                          "name": "panel-22"
-                        }
-                      }
-                    },
-                    {
-                      "kind": "GridLayoutItem",
-                      "spec": {
-                        "x": 14,
-                        "y": 0,
-                        "width": 5,
-                        "height": 4,
-                        "element": {
-                          "kind": "ElementReference",
-                          "name": "panel-23"
-                        }
-                      }
-                    },
-                    {
-                      "kind": "GridLayoutItem",
-                      "spec": {
-                        "x": 19,
-                        "y": 0,
-                        "width": 5,
-                        "height": 4,
-                        "element": {
-                          "kind": "ElementReference",
-                          "name": "panel-24"
+                          "name": "panel-54"
                         }
                       }
                     },
@@ -2770,10 +2972,10 @@
                         "x": 0,
                         "y": 4,
                         "width": 24,
-                        "height": 9,
+                        "height": 10,
                         "element": {
                           "kind": "ElementReference",
-                          "name": "panel-30"
+                          "name": "panel-55"
                         }
                       }
                     }
@@ -2785,8 +2987,8 @@
           {
             "kind": "RowsLayoutRow",
             "spec": {
-              "title": "History",
-              "collapse": false,
+              "title": "Details",
+              "collapse": true,
               "layout": {
                 "kind": "GridLayout",
                 "spec": {
@@ -2796,11 +2998,37 @@
                       "spec": {
                         "x": 0,
                         "y": 0,
-                        "width": 24,
-                        "height": 6,
+                        "width": 8,
+                        "height": 4,
                         "element": {
                           "kind": "ElementReference",
-                          "name": "panel-40"
+                          "name": "panel-22"
+                        }
+                      }
+                    },
+                    {
+                      "kind": "GridLayoutItem",
+                      "spec": {
+                        "x": 8,
+                        "y": 0,
+                        "width": 8,
+                        "height": 4,
+                        "element": {
+                          "kind": "ElementReference",
+                          "name": "panel-23"
+                        }
+                      }
+                    },
+                    {
+                      "kind": "GridLayoutItem",
+                      "spec": {
+                        "x": 16,
+                        "y": 0,
+                        "width": 8,
+                        "height": 4,
+                        "element": {
+                          "kind": "ElementReference",
+                          "name": "panel-56"
                         }
                       }
                     },
@@ -2808,20 +3036,7 @@
                       "kind": "GridLayoutItem",
                       "spec": {
                         "x": 0,
-                        "y": 6,
-                        "width": 24,
-                        "height": 8,
-                        "element": {
-                          "kind": "ElementReference",
-                          "name": "panel-41"
-                        }
-                      }
-                    },
-                    {
-                      "kind": "GridLayoutItem",
-                      "spec": {
-                        "x": 0,
-                        "y": 14,
+                        "y": 4,
                         "width": 24,
                         "height": 7,
                         "element": {
@@ -2948,6 +3163,96 @@
           "regex": "/^\\{\\} ([0-9]+) /",
           "sort": "disabled",
           "options": [],
+          "multi": false,
+          "includeAll": false,
+          "allowCustomValue": false
+        }
+      },
+      {
+        "kind": "QueryVariable",
+        "spec": {
+          "name": "spanread",
+          "label": "Range length source",
+          "description": "Reads the length of the time range for span, spanunit and spanthe, all their words in one answer.",
+          "current": {
+            "text": "",
+            "value": ""
+          },
+          "hide": "hideVariable",
+          "refresh": "onTimeRangeChanged",
+          "skipUrlSync": true,
+          "query": {
+            "kind": "DataQuery",
+            "group": "prometheus",
+            "version": "v0",
+            "datasource": {
+              "name": "${datasource}"
+            },
+            "spec": {
+              "query": "query_result(label_replace(label_replace(count_values by (u) (\"n\", label_replace(round(vector($__range_s / 86400), 0.1) and on () (vector($__range_s) >= 172800), \"u\", \"days\", \"\", \"\") or on () label_replace(round(vector($__range_s / 3600), 0.1) and on () (vector($__range_s) >= 7200), \"u\", \"hours\", \"\", \"\") or on () label_replace(round(vector($__range_s / 60)) and on () (vector($__range_s) >= 120), \"u\", \"minutes\", \"\", \"\") or on () label_replace(round(vector($__range_s)), \"u\", \"seconds\", \"\", \"\")), \"n\", \"$1 : \", \"n\", \"(.+)\"), \"u\", \"$1 : \", \"u\", \"(.+)\"))"
+            }
+          },
+          "regex": "/^\\{n=\"(?<value>[^\"]+)\",u=\"(?<text>[^\"]+)\"\\} /",
+          "sort": "disabled",
+          "options": [],
+          "multi": false,
+          "includeAll": false,
+          "allowCustomValue": false,
+          "definition": "query_result(label_replace(label_replace(count_values by (u) (\"n\", label_replace(round(vector($__range_s / 86400), 0.1) and on () (vector($__range_s) >= 172800), \"u\", \"days\", \"\", \"\") or on () label_replace(round(vector($__range_s / 3600), 0.1) and on () (vector($__range_s) >= 7200), \"u\", \"hours\", \"\", \"\") or on () label_replace(round(vector($__range_s / 60)) and on () (vector($__range_s) >= 120), \"u\", \"minutes\", \"\", \"\") or on () label_replace(round(vector($__range_s)), \"u\", \"seconds\", \"\", \"\")), \"n\", \"$1 : \", \"n\", \"(.+)\"), \"u\", \"$1 : \", \"u\", \"(.+)\"))"
+        }
+      },
+      {
+        "kind": "CustomVariable",
+        "spec": {
+          "name": "span",
+          "label": "Range length",
+          "description": "The number of the dashboard time range's length, such as \"30\" in \"30 days\", from spanread. It reads \"the\" until spanread has read a length.",
+          "query": "${spanread}the",
+          "current": {
+            "text": "the",
+            "value": "the"
+          },
+          "options": [],
+          "hide": "hideVariable",
+          "skipUrlSync": true,
+          "multi": false,
+          "includeAll": false,
+          "allowCustomValue": false
+        }
+      },
+      {
+        "kind": "CustomVariable",
+        "spec": {
+          "name": "spanunit",
+          "label": "Range unit",
+          "description": "The unit of the dashboard time range's length, such as \"days\" in \"30 days\", from spanread. It reads \"range\" until spanread has read a length.",
+          "query": "${spanread:text}range",
+          "current": {
+            "text": "range",
+            "value": "range"
+          },
+          "options": [],
+          "hide": "hideVariable",
+          "skipUrlSync": true,
+          "multi": false,
+          "includeAll": false,
+          "allowCustomValue": false
+        }
+      },
+      {
+        "kind": "CustomVariable",
+        "spec": {
+          "name": "spanthe",
+          "label": "Range length with its article",
+          "description": "The word \"the\" and the number of the dashboard time range's length, such as \"the 30\" in \"the 30 days\", from spanread. It reads \"the\" until spanread has read a length.",
+          "query": "the ${spanread}${spanread:text}",
+          "current": {
+            "text": "the",
+            "value": "the"
+          },
+          "options": [],
+          "hide": "hideVariable",
+          "skipUrlSync": true,
           "multi": false,
           "includeAll": false,
           "allowCustomValue": false
