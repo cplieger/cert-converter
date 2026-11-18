@@ -88,6 +88,8 @@ type Watcher struct {
 	// mode, so the scan's record names the mode it ran in.
 	onChange func(ctx context.Context, polling bool)
 
+	nextScan func(next time.Time)
+
 	// watched mirrors the fsnotify registration set, so membership is a map
 	// lookup rather than a scan of fsnotify's own list (see watchSetHas).
 	watched map[string]struct{}
@@ -120,6 +122,19 @@ func WithFallback(d time.Duration) Option {
 // WithMaxEntries sets how many paths one watch-set walk may enumerate.
 func WithMaxEntries(n int) Option {
 	return func(w *Watcher) { w.maxEntries = n }
+}
+
+// WithNextScan has the watcher call report with the time of the next periodic
+// scan each time it arms that scan, from the watch loop's goroutine; nil reports
+// nothing. A file event can bring a scan sooner than the reported time.
+func WithNextScan(report func(next time.Time)) Option {
+	return func(w *Watcher) { w.nextScan = report }
+}
+
+func (w *Watcher) reportNextScan(next time.Time) {
+	if w.nextScan != nil {
+		w.nextScan(next)
+	}
 }
 
 // watchBudgetMsg is the operator-facing half of a watch-set walk that stopped at
@@ -902,7 +917,17 @@ func newWatchState(w *Watcher) *watchState {
 	st.repairTimer = time.NewTimer(minPreScanResync)
 	st.repairTimer.Stop()
 	st.safetyNetTimer = time.NewTimer(scancadence.Effective(w.fallback))
+	st.safetyNetTimer.Stop()
+	st.armSafetyNet()
 	return st
+}
+
+// armSafetyNet is the one place the periodic rescan is armed, so every arm
+// reports its time (WithNextScan).
+func (st *watchState) armSafetyNet() {
+	cadence := scancadence.Effective(st.w.fallback)
+	st.safetyNetTimer.Reset(cadence)
+	st.w.reportNextScan(time.Now().Add(cadence))
 }
 
 // stop releases every timer when the loop exits.
@@ -1026,13 +1051,13 @@ func (st *watchState) runDebouncedScan(ctx context.Context, watcher *fsnotify.Wa
 		return
 	}
 	st.w.scan(ctx, modeWatch, triggerEvent)
-	st.safetyNetTimer.Reset(scancadence.Effective(st.w.fallback))
+	st.armSafetyNet()
 }
 
 // runSafetyNetScan fires the periodic safety-net rescan and re-arms its timer.
 func (st *watchState) runSafetyNetScan(ctx context.Context) {
 	st.w.scan(ctx, modeWatch, st.w.safetyNetTrigger())
-	st.safetyNetTimer.Reset(scancadence.Effective(st.w.fallback))
+	st.armSafetyNet()
 }
 
 // handleWatcherError reacts to an fsnotify error: an event-queue overflow
@@ -1087,14 +1112,22 @@ func (w *Watcher) pollLoopWithUpgrade(ctx context.Context) (upgraded *fsnotify.W
 // tick, returning the upgraded watcher for watch mode to run over, or nil when a
 // shutdown ended the mode.
 func (w *Watcher) pollUntilUpgrade(ctx context.Context) *fsnotify.Watcher {
-	ticker := time.NewTicker(scancadence.Effective(w.fallback))
+	interval := scancadence.Effective(w.fallback)
+	start := time.Now()
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	w.reportNextScan(start.Add(interval))
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			// The ticker stays on start's phase and drops the ticks a long scan
+			// overlaps, so a received tick can be stale; the next one it delivers is
+			// the first phase after now (runtime timer.unlockAndRun,
+			// https://github.com/golang/go/blob/go1.27.4/src/runtime/time.go).
+			w.reportNextScan(start.Add(time.Since(start).Truncate(interval) + interval))
 			fw, stopped := w.pollTick(ctx)
 			if stopped {
 				return nil

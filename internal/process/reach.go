@@ -23,6 +23,10 @@ type scanReach struct {
 	// resolved is every artifact of a source whose every artifact was inspected
 	// and, where stale, written.
 	resolved map[string]struct{}
+	// enumerated is every source name the walk enumerated.
+	enumerated map[string]struct{}
+	// stoppedAt is the entry the walk stopped at, at the entry budget.
+	stoppedAt string
 	// links is every symlink the scan could not resolve, in enumeration order.
 	links []string
 }
@@ -65,6 +69,7 @@ func (r *scanReach) withdraw(rel string) {
 // (filesafe.WalkDirInRoot), so the directories it listed in full are those it
 // began before the one holding rel.
 func (r *scanReach) stop(rel string) {
+	r.stoppedAt = rel
 	at := path.Dir(rel)
 	for dir := range r.listed {
 		if !r.walkedBefore(dir, at) {
@@ -92,6 +97,38 @@ func (r *scanReach) walkedBefore(dir, at string) bool {
 		}
 	}
 	return len(dirParts) < len(atParts)
+}
+
+// enumerate records that the walk enumerated the source rel.
+func (r *scanReach) enumerate(rel string) {
+	if r.enumerated == nil {
+		r.enumerated = make(map[string]struct{})
+	}
+	r.enumerated[rel] = struct{}{}
+}
+
+// provenGone reports whether a walk that stopped at the entry budget proved the
+// source rel absent: it reached rel's path (input), which after stop means it
+// read rel's folder in full, and did not enumerate rel. A source named in a
+// listed folder can be enumerated and not processed, so input alone is no proof.
+func (r *scanReach) provenGone(rel string) bool {
+	if r.stoppedAt == "" || !r.input(rel) {
+		return false
+	}
+	_, enumerated := r.enumerated[rel]
+	return !enumerated
+}
+
+// inStopFolder reports whether the source rel sits in the folder the walk
+// stopped in and the walk neither enumerated nor failed to read it: the walk
+// read that folder only in part, so only a direct lookup of rel proves it gone.
+func (r *scanReach) inStopFolder(rel string) bool {
+	if r.stoppedAt == "" || path.Dir(rel) != path.Dir(r.stoppedAt) {
+		return false
+	}
+	_, enumerated := r.enumerated[rel]
+	_, unread := r.unread[rel]
+	return !enumerated && !unread
 }
 
 // noteSource records how far the scan got with the source rel, whose artifacts

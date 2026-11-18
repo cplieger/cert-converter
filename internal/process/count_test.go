@@ -72,7 +72,7 @@ func TestCountResults(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			got := countResults(tt.results, tt.unreadable, tt.unresolved, tt.vanished)
-			if got != tt.want {
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("countResults(%d results, unreadable=%d, unresolved=%d, vanished=%d) = %+v, want %+v",
 					len(tt.results), tt.unreadable, tt.unresolved, tt.vanished, got, tt.want)
 			}
@@ -133,19 +133,21 @@ func TestScanResultVetoes_every_counter_is_classified_and_honoured(t *testing.T)
 	t.Parallel()
 
 	classes := map[string]string{
-		"Removed":    vetoNone,
-		"Total":      vetoNone,
-		"Converted":  vetoNone,
-		"Unchanged":  vetoNone,
-		"Orphan":     vetoNone,
-		"Failed":     vetoConversion,
-		"Unwritable": vetoConversion,
-		"Unreadable": vetoDurable,
-		"Unresolved": vetoDurable,
-		"Vanished":   vetoTransient,
-		"Collided":   vetoConversion,
-		"Excluded":   vetoNone,
-		"Ignored":    vetoNone,
+		"Removed": vetoNone,
+		// Set only by the /output comparison, after the reap gate decided.
+		"UnmatchedOutputs": vetoNone,
+		"Total":            vetoNone,
+		"Converted":        vetoNone,
+		"Unchanged":        vetoNone,
+		"Orphan":           vetoNone,
+		"Failed":           vetoConversion,
+		"Unwritable":       vetoConversion,
+		"Unreadable":       vetoDurable,
+		"Unresolved":       vetoDurable,
+		"Vanished":         vetoTransient,
+		"Collided":         vetoConversion,
+		"Excluded":         vetoNone,
+		"Ignored":          vetoNone,
 	}
 
 	typ := reflect.TypeFor[ScanResult]()

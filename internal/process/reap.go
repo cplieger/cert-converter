@@ -170,6 +170,7 @@ func (rp *reaper) reportRetainedOrphans(orphaned []string, walkSafe bool) {
 		msg += "; " + reapDisabledPhrase
 		rp.out.reapDisabled = true
 	}
+	rp.out.unmatched = len(orphaned)
 	inaction, remediation := retentionProse(rp.mode, walkSafe)
 	slog.Warn(msg,
 		"count", len(orphaned), "paths", sampleOrphanPaths(orphaned),

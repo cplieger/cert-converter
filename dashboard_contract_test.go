@@ -3,11 +3,19 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"maps"
 	"os"
 	"regexp"
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/cplieger/cert-converter/internal/obs"
+	"github.com/cplieger/cert-converter/internal/process"
+	"github.com/cplieger/go/measure/v2"
+	"github.com/cplieger/go/slogx/capture"
 )
 
 const (
@@ -17,6 +25,7 @@ const (
 
 type dashQuery struct {
 	Spec struct {
+		RefID string `json:"refId"`
 		Query struct {
 			Spec struct {
 				Expr         string `json:"expr"`
@@ -26,14 +35,48 @@ type dashQuery struct {
 	} `json:"spec"`
 }
 
+type dashMapping struct {
+	Options map[string]struct {
+		Text  string `json:"text"`
+		Color string `json:"color"`
+	} `json:"options"`
+	Type string `json:"type"`
+}
+
+type dashThresholds struct {
+	Steps []struct {
+		Value *float64 `json:"value"`
+		Color string   `json:"color"`
+	} `json:"steps"`
+}
+
+type dashOverride struct {
+	Matcher struct {
+		Options any    `json:"options"`
+		ID      string `json:"id"`
+	} `json:"matcher"`
+	Properties []struct {
+		ID    string          `json:"id"`
+		Value json.RawMessage `json:"value"`
+	} `json:"properties"`
+}
+
+type dashTransformation struct {
+	Group string `json:"group"`
+	Spec  struct {
+		Options json.RawMessage `json:"options"`
+	} `json:"spec"`
+}
+
 type dashPanel struct {
 	Spec struct {
 		Title       string `json:"title"`
 		Description string `json:"description"`
 		Data        struct {
 			Spec struct {
-				Queries      []dashQuery `json:"queries"`
-				QueryOptions struct {
+				Queries         []dashQuery          `json:"queries"`
+				Transformations []dashTransformation `json:"transformations"`
+				QueryOptions    struct {
 					MaxDataPoints int `json:"maxDataPoints"`
 				} `json:"queryOptions"`
 			} `json:"spec"`
@@ -41,9 +84,18 @@ type dashPanel struct {
 		VizConfig struct {
 			Group string `json:"group"`
 			Spec  struct {
+				Options struct {
+					Text struct {
+						TitleSize int `json:"titleSize"`
+						ValueSize int `json:"valueSize"`
+					} `json:"text"`
+				} `json:"options"`
 				FieldConfig struct {
-					Defaults struct {
-						NoValue string `json:"noValue"`
+					Overrides []dashOverride `json:"overrides"`
+					Defaults  struct {
+						NoValue    string         `json:"noValue"`
+						Mappings   []dashMapping  `json:"mappings"`
+						Thresholds dashThresholds `json:"thresholds"`
 					} `json:"defaults"`
 				} `json:"fieldConfig"`
 			} `json:"spec"`
@@ -86,6 +138,7 @@ type layoutNode struct {
 		Rows                 []layoutNode    `json:"rows"`
 		Items                []gridItem      `json:"items"`
 		HideHeader           bool            `json:"hideHeader"`
+		Collapse             bool            `json:"collapse"`
 	} `json:"spec"`
 }
 
@@ -100,9 +153,11 @@ type dashVariable struct {
 		Hide    string `json:"hide"`
 		Refresh string `json:"refresh"`
 		Sort    string `json:"sort"`
-		// Query is a data query on a QueryVariable and absent on a
-		// DatasourceVariable.
-		Query json.RawMessage `json:"query"`
+		Regex   string `json:"regex"`
+		// Query is a data query on a QueryVariable, a string on a
+		// CustomVariable and absent on a DatasourceVariable.
+		Query       json.RawMessage `json:"query"`
+		SkipURLSync bool            `json:"skipUrlSync"`
 	} `json:"spec"`
 }
 
@@ -191,17 +246,26 @@ func row(t *testing.T, d *dashboard, title string) *layoutNode {
 	return nil
 }
 
-// servedSeries builds the registry the way run does and returns each series
-// name it serves with its label names.
-func servedSeries(t *testing.T) map[string][]string {
+// gatherWithOneSource reports a scan holding one source before it gathers,
+// since the per-source families serve nothing before one.
+func gatherWithOneSource(t *testing.T) []measure.Family {
 	t.Helper()
-	reg, _ := newMetrics(0)
+	capture.SwapDefault(t, slog.New(slog.DiscardHandler))
+	reg, reporter := newMetrics(0)
+	reporter.Report(t.Context(), &obs.Scan{Result: process.ScanResult{Total: 1, Sources: []process.SourceState{
+		{Path: "a/one.crt", Outcome: process.SourceConverted, LastConverted: time.Unix(1_800_000_000, 0)},
+	}}})
 	families, err := reg.Gather(t.Context())
 	if err != nil {
 		t.Fatalf("Gather = %v", err)
 	}
+	return families
+}
+
+func servedSeries(t *testing.T) map[string][]string {
+	t.Helper()
 	served := map[string][]string{}
-	for _, f := range families {
+	for _, f := range gatherWithOneSource(t) {
 		labels := []string{}
 		for _, s := range f.Samples {
 			for _, l := range s.Labels {
@@ -214,8 +278,10 @@ func servedSeries(t *testing.T) map[string][]string {
 			served[f.Name] = labels
 		}
 	}
-	if _, ok := served["cert_converter_last_scan_outcome"]; !ok {
-		t.Fatalf("Setup: the registry serves no cert_converter_last_scan_outcome: %v", served)
+	for _, name := range []string{"cert_converter_last_scan_outcome", "cert_converter_source_outcome"} {
+		if _, ok := served[name]; !ok {
+			t.Fatalf("Setup: the registry serves no %s: %v", name, served)
+		}
 	}
 	return served
 }
@@ -232,6 +298,9 @@ var (
 	dashFunctionRe = regexp.MustCompile(`\b[a-z_]+\s*\(`)
 	dashIdentRe    = regexp.MustCompile(`\b[a-zA-Z_:][a-zA-Z0-9_:]*\b`)
 	alertsRe       = regexp.MustCompile(`ALERTS\{alertname="([A-Za-z]+)"`)
+	// madeLabelRe matches the label a label_replace or label_join call writes:
+	// the first of the strings that close the call.
+	madeLabelRe = regexp.MustCompile(`,\s*"(\w+)"(?:\s*,\s*"(?:[^"\\]|\\.)*"){2,}\s*\)`)
 	// bracedVariableRe matches ${name}, whose braces are no selector.
 	bracedVariableRe = regexp.MustCompile(`\$\{\w+(?::\w+)?\}`)
 	dashKeywords     = []string{"and", "or", "unless", "bool", "offset"}
@@ -309,6 +378,14 @@ func selectors(expr string) []selectorBlock {
 	return out
 }
 
+func madeLabels(expr string) []string {
+	var out []string
+	for _, m := range madeLabelRe.FindAllStringSubmatch(expr, -1) {
+		out = append(out, m[1])
+	}
+	return out
+}
+
 // dashboardSeries returns the series names a panel or variable query reads;
 // label_values names a label after its series, which is no series.
 func dashboardSeries(expr string) []string {
@@ -378,8 +455,7 @@ func TestDashboardReadsOnlySeriesCertConverterServes(t *testing.T) {
 		for _, g := range dashGroupingRe.FindAllStringSubmatch(expr, -1) {
 			for l := range strings.SplitSeq(g[2], ",") {
 				l = strings.TrimSpace(l)
-				// A label the query names as a string is one label_replace makes.
-				computed := strings.Contains(expr, `"`+l+`"`)
+				computed := slices.Contains(madeLabels(expr), l)
 				if l != "" && !computed && !slices.Contains(labels, l) && !slices.Contains(scrape, l) {
 					t.Errorf("%s groups by %s, which no series it reads carries", where, l)
 				}
@@ -435,6 +511,9 @@ func TestDashboardQueriesAreTheTestedOnes(t *testing.T) {
 	for _, tc := range []struct{ title, anchor string }{
 		{"cert-converter scrape", "scrape_down"},
 		{"Outputs removed", "removed_slot"},
+		{"Outputs match inputs", "outputs_match"},
+		{"Each certificate", "certificate_table"},
+		{"Last conversion", "last_conversion"},
 	} {
 		t.Run(tc.anchor, func(t *testing.T) {
 			var exprs []string
@@ -614,6 +693,465 @@ func TestDashboardPanelsExplainThemselves(t *testing.T) {
 			if strings.TrimSpace(p.Spec.VizConfig.Spec.FieldConfig.Defaults.NoValue) == "" {
 				t.Errorf("%s %q has no no-value text", name, p.Spec.Title)
 			}
+		}
+	}
+}
+
+// panelTitled fails the test unless exactly one panel is titled title.
+func panelTitled(t *testing.T, d *dashboard, title string) *dashPanel {
+	t.Helper()
+	var found []dashPanel
+	for _, p := range d.Spec.Elements {
+		if p.Spec.Title == title {
+			found = append(found, p)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("found %d panels titled %q, want 1", len(found), title)
+	}
+	return &found[0]
+}
+
+// onlyExpr fails the test unless p holds exactly one query.
+func onlyExpr(t *testing.T, p *dashPanel) string {
+	t.Helper()
+	exprs := panelExprs(p)
+	if len(exprs) != 1 {
+		t.Fatalf("%q holds %d queries, want 1", p.Spec.Title, len(exprs))
+	}
+	return withoutComments(exprs[0])
+}
+
+func servedValues(t *testing.T, family, label string) []string {
+	t.Helper()
+	var out []string
+	for _, f := range gatherWithOneSource(t) {
+		if f.Name != family {
+			continue
+		}
+		for _, s := range f.Samples {
+			for _, l := range s.Labels {
+				if l.Name == label && !slices.Contains(out, l.Value) {
+					out = append(out, l.Value)
+				}
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+const spanTitle = "${span} ${spanunit}"
+
+var rangeWordVars = []string{"span", "spanunit", "spanthe"}
+
+var fixedLengthRe = regexp.MustCompile(`(?i)\b\d+(?:\.\d+)?\s*(?:s|m|h|d|w|seconds?|minutes?|hours?|days?|weeks?)\b`)
+
+// customText is the text Grafana gives a custom variable whose query is query,
+// which titles render. The parse follows CustomVariable.transformCsvStringToOptions,
+// https://github.com/grafana/scenes/blob/main/packages/scenes/src/variables/variants/CustomVariable.tsx.
+// More than one option would let Grafana keep a stale choice, so it fails.
+func customText(t *testing.T, query string) string {
+	t.Helper()
+	entries := regexp.MustCompile(`(?:\\,|[^,])+`).FindAllString(query, -1)
+	if len(entries) != 1 {
+		t.Errorf("custom query %q gives %d options, want 1", query, len(entries))
+		return ""
+	}
+	if m := regexp.MustCompile(`^\s*(.+)\s:\s(.+)$`).FindStringSubmatch(entries[0]); m != nil {
+		return strings.TrimSpace(m[1])
+	}
+	return strings.TrimSpace(entries[0])
+}
+
+// rangeWords is the text of each range word variable once spanread holds the
+// option Grafana makes of its answer row, or none at all (""), as on a failed
+// first read.
+func rangeWords(t *testing.T, vars map[string]dashVariable, row string) map[string]string {
+	t.Helper()
+	read := vars["spanread"]
+	rx, err := regexp.Compile(strings.TrimSuffix(strings.TrimPrefix(read.Spec.Regex, "/"), "/"))
+	if err != nil || rx.SubexpIndex("value") < 0 || rx.SubexpIndex("text") < 0 {
+		t.Fatalf("spanread regex %q: %v, want value and text groups", read.Spec.Regex, err)
+	}
+	var value, text string
+	if row != "" {
+		m := rx.FindStringSubmatch(row)
+		if m == nil {
+			t.Fatalf("spanread regex %v does not match %s", rx, row)
+		}
+		value, text = m[rx.SubexpIndex("value")], m[rx.SubexpIndex("text")]
+	}
+	fill := strings.NewReplacer("${spanread:text}", text, "${spanread}", value)
+	words := map[string]string{}
+	for _, name := range rangeWordVars {
+		var query string
+		_ = json.Unmarshal(vars[name].Spec.Query, &query)
+		words[name] = customText(t, fill.Replace(query))
+	}
+	return words
+}
+
+// TestDashboardRangeFiguresNameTheRangeLength fails when a panel reading
+// $__range does not name the range length through span and spanunit, a title
+// names a fixed length, a query writes a fixed window or offset, or the range
+// words stop reading "30 days" from spanread's answer and "the range" before
+// it has one.
+func TestDashboardRangeFiguresNameTheRangeLength(t *testing.T) {
+	d := loadDashboard(t)
+	vars := d.variables()
+	read, ok := vars["spanread"]
+	if !ok {
+		t.Fatal("variable spanread missing, want one read of the range length for every range word")
+	}
+	if read.Kind != "QueryVariable" || read.Spec.Hide != "hideVariable" || read.Spec.Refresh != "onTimeRangeChanged" || !read.Spec.SkipURLSync {
+		t.Errorf("spanread is %s hide %q refresh %q, want a hidden QueryVariable refreshed on time range change, not in the URL",
+			read.Kind, read.Spec.Hide, read.Spec.Refresh)
+	}
+	for _, name := range rangeWordVars {
+		if v := vars[name]; v.Kind != "CustomVariable" || v.Spec.Hide != "hideVariable" || !v.Spec.SkipURLSync {
+			t.Errorf("variable %s is %q hide %q, want a hidden CustomVariable kept out of the URL", name, v.Kind, v.Spec.Hide)
+		}
+	}
+	// spanread's query writes the number to n and the unit to u, and Grafana
+	// gives a query_result row as "{labels} value timestamp":
+	// https://grafana.com/docs/grafana/latest/datasources/prometheus/template-variables/
+	for _, c := range []struct {
+		row  string
+		want map[string]string
+	}{
+		{"", map[string]string{"span": "the", "spanunit": "range", "spanthe": "the"}},
+		{`{n="30 : ",u="days : "} 1 1791585738061`, map[string]string{"span": "30", "spanunit": "days", "spanthe": "the 30"}},
+		{`{n="5.6 : ",u="hours : "} 1 1791585738061`, map[string]string{"span": "5.6", "spanunit": "hours", "spanthe": "the 5.6"}},
+		{`{n="45 : ",u="seconds : "} 1 1791585738061`, map[string]string{"span": "45", "spanunit": "seconds", "spanthe": "the 45"}},
+	} {
+		if got := rangeWords(t, vars, c.row); !maps.Equal(got, c.want) {
+			t.Errorf("range words for spanread answer %q are %v, want %v", c.row, got, c.want)
+		}
+	}
+	figures := 0
+	for name, p := range d.Spec.Elements {
+		if slices.ContainsFunc(panelExprs(&p), func(e string) bool { return strings.Contains(e, "$__range") }) {
+			figures++
+			if !strings.Contains(p.Spec.Title, spanTitle) {
+				t.Errorf("%s %q reads $__range, want its title to name %s", name, p.Spec.Title, spanTitle)
+			}
+		}
+		if fixedLengthRe.MatchString(p.Spec.Title) {
+			t.Errorf("%s %q names a fixed length, want the range words or none", name, p.Spec.Title)
+		}
+	}
+	if figures == 0 {
+		t.Error("no range figure found; the check no longer reads the dashboard")
+	}
+	offsetRe := regexp.MustCompile(`\boffset\s+(\S+)`)
+	for where, expr := range dashboardQueries(&d) {
+		expr = dashQuotedRe.ReplaceAllString(expr, `""`)
+		windows := dashRangeRe.FindAllString(expr, -1)
+		for _, m := range offsetRe.FindAllStringSubmatch(expr, -1) {
+			windows = append(windows, m[1])
+		}
+		for _, w := range windows {
+			if !strings.Contains(w, "$") {
+				t.Errorf("%s writes the fixed window %s, want one that follows the time picker", where, w)
+			}
+		}
+	}
+}
+
+// outputsMatchReason is one answer of Outputs match inputs: the series and
+// matcher that raise it, and the text and colour the tile shows.
+type outputsMatchReason struct {
+	series, matcher, text, color string
+}
+
+// outputsMatchSpec is every Outputs match inputs answer by value, the more
+// urgent the higher. Red marks what makes the container unhealthy. Removal
+// turned off ranks above the outputs it kept, because it says why they stay.
+var outputsMatchSpec = map[string]outputsMatchReason{
+	"0":  {text: "Yes", color: "green"},
+	"13": {"cert_converter_last_scan_outcome", `outcome="aborted"`, "No: scan aborted", "red"},
+	"12": {"cert_converter_last_scan_sources", `outcome="failed"`, "No: conversion failed", "red"},
+	"11": {"cert_converter_last_scan_sources", `outcome="collided"`, "No: name collision", "red"},
+	"10": {"cert_converter_last_scan_sources", `outcome="unwritable"`, "No: write refused", "yellow"},
+	"9":  {"cert_converter_last_scan_outcome", `outcome="budget_stopped"`, "No: input too large", "yellow"},
+	"8":  {"cert_converter_last_scan_sources", `outcome=~"unreadable|unresolved|vanished"`, "No: input unreadable", "yellow"},
+	"7":  {"cert_converter_condition", `condition="no_sources"`, "No: no certificates", "yellow"},
+	"6":  {"cert_converter_condition", `condition="all_excluded"`, "No: all excluded", "yellow"},
+	"5":  {"cert_converter_last_scan_sources", `outcome="orphan"`, "No: key missing", "yellow"},
+	"4":  {"cert_converter_condition", `condition="orphan_removal_disabled"`, "No: old outputs kept", "yellow"},
+	"3":  {"cert_converter_last_scan_unmatched_outputs", "", "No: outputs without input", "yellow"},
+	"2":  {"cert_converter_condition", `condition="previous_layout_retained"`, "No: old layout kept", "yellow"},
+	"1":  {"cert_converter_last_scan_sources", `outcome="ignored"`, "No: PFX input off", "yellow"},
+}
+
+// TestDashboardOutputsMatchNamesEveryReason fails when Outputs match inputs
+// reads a reason other than its spec, at another rank, tests a count or a flag
+// the wrong way, shows another text or colour for it, or misses an outcome or
+// condition a shipped rule alerts on, except cleanup_degraded, whose leftover
+// temporary files leave every output matching its input.
+func TestDashboardOutputsMatchNamesEveryReason(t *testing.T) {
+	d := loadDashboard(t)
+	p := panelTitled(t, &d, "Outputs match inputs")
+	expr := onlyExpr(t, p)
+	// A count is above 0 and a flag is 1 when its reason holds.
+	test := map[string]string{
+		"cert_converter_last_scan_sources":           "> bool 0",
+		"cert_converter_last_scan_unmatched_outputs": "> bool 0",
+		"cert_converter_last_scan_outcome":           "== bool 1",
+		"cert_converter_condition":                   "== bool 1",
+	}
+	operandRe := regexp.MustCompile(`\((\w+)\{instance="\$instance"(?:, ((?:outcome|condition)=~?"[^"]*"))?\} ((?:==|>) bool [01])\) \* (\d+)`)
+	operands := operandRe.FindAllStringSubmatch(expr, -1)
+	if n := strings.Count(expr, " bool "); len(operands) != n {
+		t.Errorf("read %d reasons of the %d bool comparisons in %s", len(operands), n, expr)
+	}
+	got := map[string]outputsMatchReason{}
+	for _, m := range operands {
+		if _, dup := got[m[4]]; dup {
+			t.Errorf("value %s is raised by two reasons", m[4])
+		}
+		if m[3] != test[m[1]] {
+			t.Errorf("%s{%s} is tested %q, want %q", m[1], m[2], m[3], test[m[1]])
+		}
+		got[m[4]] = outputsMatchReason{series: m[1], matcher: m[2]}
+	}
+	got["0"] = outputsMatchReason{}
+	mappings := p.Spec.VizConfig.Spec.FieldConfig.Defaults.Mappings
+	if len(mappings) != 1 || mappings[0].Type != "value" {
+		t.Fatalf("Outputs match inputs has mappings %+v, want one value mapping", mappings)
+	}
+	for value, o := range mappings[0].Options {
+		r := got[value]
+		r.text, r.color = o.Text, o.Color
+		got[value] = r
+	}
+	values := slices.Collect(maps.Keys(got))
+	for v := range outputsMatchSpec {
+		if !slices.Contains(values, v) {
+			values = append(values, v)
+		}
+	}
+	slices.Sort(values)
+	for _, value := range values {
+		if got[value] != outputsMatchSpec[value] {
+			t.Errorf("value %s is %+v, want %+v", value, got[value], outputsMatchSpec[value])
+		}
+	}
+	read := map[string]bool{"cleanup_degraded": true}
+	for _, r := range outputsMatchSpec {
+		_, values, _ := strings.Cut(r.matcher, `"`)
+		for v := range strings.SplitSeq(strings.TrimSuffix(values, `"`), "|") {
+			read[v] = true
+		}
+	}
+	ruleValueRe := regexp.MustCompile(`(?:outcome|condition)=~?"([^"]+)"`)
+	for name, rule := range ruleExprs(t, promqlRules) {
+		for _, m := range ruleValueRe.FindAllStringSubmatch(rule, -1) {
+			for v := range strings.SplitSeq(m[1], "|") {
+				if !read[v] {
+					t.Errorf("%s alerts on %s, which Outputs match inputs gives no reason for", name, v)
+				}
+			}
+		}
+	}
+}
+
+// sourceProblems are the per-source outcomes that leave a certificate without
+// a current output: the table ranks them first and Errors now counts them.
+var sourceProblems = []string{"collided", "failed", "orphan", "unreadable", "unwritable", "vanished"}
+
+// TestDashboardCertificateTableRanksProblemsFirst fails when an outcome the
+// per-source series serve falls in no rank or in both, the problems ranked
+// first differ from sourceProblems or from what Errors now counts, an outcome
+// has no State text or a problem is not shown red or yellow, Errors now or
+// Outputs match inputs colours a problem otherwise than the table, or the table
+// drops its sort key before sorting on it.
+func TestDashboardCertificateTableRanksProblemsFirst(t *testing.T) {
+	served := servedValues(t, "cert_converter_source_outcome", "outcome")
+	if len(served) == 0 {
+		t.Fatal("Setup: cert_converter_source_outcome serves no outcome")
+	}
+	d := loadDashboard(t)
+	table := panelTitled(t, &d, "Each certificate")
+	rankRe := regexp.MustCompile(`"rank", "(\d)", "outcome", "([^"]+)"`)
+	ranks := map[string]*regexp.Regexp{}
+	for _, m := range rankRe.FindAllStringSubmatch(onlyExpr(t, table), -1) {
+		// label_replace anchors its regex at both ends:
+		// https://prometheus.io/docs/prometheus/latest/querying/functions/#label_replace
+		ranks[m[1]] = regexp.MustCompile("^(?:" + m[2] + ")$")
+	}
+	if len(ranks) != 2 || ranks["0"] == nil || ranks["1"] == nil {
+		t.Fatalf("the table ranks %v, want ranks 0 and 1", ranks)
+	}
+	var first []string
+	for _, o := range served {
+		in := slices.DeleteFunc(slices.Sorted(maps.Keys(ranks)), func(r string) bool { return !ranks[r].MatchString(o) })
+		if len(in) != 1 {
+			t.Errorf("outcome %s falls in ranks %v, want exactly one", o, in)
+		}
+		if ranks["0"].MatchString(o) {
+			first = append(first, o)
+		}
+	}
+	if !slices.Equal(first, sourceProblems) {
+		t.Errorf("the table ranks %v first, want %v", first, sourceProblems)
+	}
+	var states []dashMapping
+	for _, o := range table.Spec.VizConfig.Spec.FieldConfig.Overrides {
+		for _, prop := range o.Properties {
+			if o.Matcher.ID == "byName" && o.Matcher.Options == "State" && prop.ID == "mappings" {
+				if err := json.Unmarshal(prop.Value, &states); err != nil {
+					t.Fatalf("State mappings: %v", err)
+				}
+			}
+		}
+	}
+	if len(states) != 1 {
+		t.Fatalf("State has %d mappings, want one value mapping", len(states))
+	}
+	for _, o := range served {
+		shown, ok := states[0].Options[o]
+		warns := shown.Color == "red" || shown.Color == "yellow"
+		switch {
+		case !ok || shown.Text == "":
+			t.Errorf("outcome %s has no State text", o)
+		case warns != slices.Contains(sourceProblems, o):
+			t.Errorf("outcome %s shows %s, want red or yellow for exactly the problems", o, shown.Color)
+		}
+	}
+	errorsNow := panelTitled(t, &d, "Errors now")
+	countedRe := regexp.MustCompile(`outcome=~"([^"]+)"`)
+	var counted []string
+	for _, q := range errorsNow.Spec.Data.Spec.Queries {
+		m := countedRe.FindStringSubmatch(q.Spec.Query.Spec.Expr)
+		if m == nil {
+			t.Errorf("Errors now query %s matches no outcome list", q.Spec.RefID)
+			continue
+		}
+		color := colorAtOne(t, errorsNow, q.Spec.RefID)
+		for o := range strings.SplitSeq(m[1], "|") {
+			counted = append(counted, o)
+			if shown := states[0].Options[o].Color; shown != color {
+				t.Errorf("Errors now shows %s %s from 1, the table %s", o, color, shown)
+			}
+		}
+	}
+	slices.Sort(counted)
+	if !slices.Equal(counted, sourceProblems) {
+		t.Errorf("Errors now counts %v, want %v", counted, sourceProblems)
+	}
+	for _, o := range sourceProblems {
+		for value, r := range outputsMatchSpec {
+			_, matched, _ := strings.Cut(r.matcher, `"`)
+			if r.series == "cert_converter_last_scan_sources" && slices.Contains(strings.Split(strings.TrimSuffix(matched, `"`), "|"), o) &&
+				r.color != states[0].Options[o].Color {
+				t.Errorf("Outputs match inputs shows %s %s at %s, the table %s", o, r.color, value, states[0].Options[o].Color)
+			}
+		}
+	}
+	sorted, filtered := -1, -1
+	for i, tr := range table.Spec.Data.Spec.Transformations {
+		switch tr.Group {
+		case "sortBy":
+			var opts struct {
+				Sort []struct {
+					Field string `json:"field"`
+					Desc  bool   `json:"desc"`
+				} `json:"sort"`
+			}
+			if err := json.Unmarshal(tr.Spec.Options, &opts); err != nil || len(opts.Sort) != 1 || opts.Sort[0].Field != "order" || opts.Sort[0].Desc {
+				t.Errorf("the table sorts by %+v (%v), want order ascending", opts.Sort, err)
+			}
+			sorted = i
+		case "filterFieldsByName":
+			filtered = i
+		}
+	}
+	if sorted < 0 || filtered < 0 || sorted > filtered {
+		t.Errorf("the table sorts at step %d and filters at step %d, want a sort before the filter drops order", sorted, filtered)
+	}
+}
+
+// colorAtOne is the colour p shows the query refID's value 1 in: its own
+// thresholds override, else the defaults.
+func colorAtOne(t *testing.T, p *dashPanel, refID string) string {
+	t.Helper()
+	th := p.Spec.VizConfig.Spec.FieldConfig.Defaults.Thresholds
+	for _, o := range p.Spec.VizConfig.Spec.FieldConfig.Overrides {
+		for _, prop := range o.Properties {
+			if o.Matcher.ID == "byFrameRefID" && o.Matcher.Options == refID && prop.ID == "thresholds" {
+				var own dashThresholds
+				if err := json.Unmarshal(prop.Value, &own); err != nil {
+					t.Fatalf("%q thresholds for %s: %v", p.Spec.Title, refID, err)
+				}
+				th = own
+			}
+		}
+	}
+	color := ""
+	for _, st := range th.Steps {
+		if st.Value == nil || *st.Value <= 1 {
+			color = st.Color
+		}
+	}
+	return color
+}
+
+// TestDashboardDetailsRowStartsCollapsed fails when the rows stop reading
+// attention, then the answers, then a collapsed Details row at the bottom.
+func TestDashboardDetailsRowStartsCollapsed(t *testing.T) {
+	d := loadDashboard(t)
+	var titles []string
+	for _, r := range d.Spec.Layout.Spec.Rows {
+		titles = append(titles, r.Spec.Title)
+	}
+	if want := []string{"Needs attention", "Now", "Details"}; !slices.Equal(titles, want) {
+		t.Errorf("rows are %q, want %q", titles, want)
+	}
+	if row(t, &d, "Now").Spec.Collapse {
+		t.Error("Now starts collapsed, want it open")
+	}
+	if !row(t, &d, "Details").Spec.Collapse {
+		t.Error("Details starts open, want it collapsed")
+	}
+}
+
+// TestDashboardLastConversionTellsNoOutputFromNotScraped fails when Last
+// conversion shows the same text for a finished scan that found no output,
+// which its query answers 0, and for an instance that answers nothing.
+func TestDashboardLastConversionTellsNoOutputFromNotScraped(t *testing.T) {
+	d := loadDashboard(t)
+	defaults := panelTitled(t, &d, "Last conversion").Spec.VizConfig.Spec.FieldConfig.Defaults
+	if defaults.NoValue != "Not scraped" {
+		t.Errorf("no-value text is %q, want %q", defaults.NoValue, "Not scraped")
+	}
+	var zero string
+	for _, m := range defaults.Mappings {
+		if o, ok := m.Options["0"]; ok && m.Type == "value" {
+			zero = o.Text
+		}
+	}
+	if zero != "No conversion yet" {
+		t.Errorf("0 maps to %q, want %q", zero, "No conversion yet")
+	}
+}
+
+// TestDashboardStatTextIsFixed fails when a stat leaves its text to auto sizing
+// or sizes it off the fleet's fixed sizes: 14 and 28, or 14 and 18 for a stat
+// that stacks several values in one tile (grafana/panels.md "Draw options").
+func TestDashboardStatTextIsFixed(t *testing.T) {
+	d := loadDashboard(t)
+	for name, p := range d.Spec.Elements {
+		if p.Spec.VizConfig.Group != "stat" {
+			continue
+		}
+		want := 28
+		if len(p.Spec.Data.Spec.Queries) > 1 {
+			want = 18
+		}
+		if got := p.Spec.VizConfig.Spec.Options.Text; got.TitleSize != 14 || got.ValueSize != want {
+			t.Errorf("%s %q text is %d/%d, want 14/%d", name, p.Spec.Title, got.TitleSize, got.ValueSize, want)
 		}
 	}
 }
