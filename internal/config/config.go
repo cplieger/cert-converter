@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
@@ -16,6 +15,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/cert-converter/internal/scancadence"
+	"github.com/cplieger/go/httpserver/v2"
 	"github.com/cplieger/go/slogx"
 	"github.com/cplieger/go/textsafe"
 )
@@ -73,15 +73,18 @@ const (
 // Config holds the runtime configuration for cert-converter.
 type Config struct {
 	Password string
-	// MetricsListenAddr is METRICS_LISTEN_ADDR with invisible edge bytes trimmed;
+	// MetricsListenAddr is METRICS_LISTEN_ADDR read as httpserver.ListenAddr reads it;
 	// empty means no listener. The composition root binds it and refuses to start
 	// when the bind fails, which is the whole of its validation.
 	MetricsListenAddr string
-	InputPassword     string
-	EncoderName       convert.EncoderType
-	Lifecycle         outputpolicy.Lifecycle
-	Layout            outputpolicy.Layout
-	PasswordStatus    passwordStatus
+	// AllowedHosts are ALLOWED_HOSTS' entries for the ops listener; none
+	// serves every Host.
+	AllowedHosts   []string
+	InputPassword  string
+	EncoderName    convert.EncoderType
+	Lifecycle      outputpolicy.Lifecycle
+	Layout         outputpolicy.Layout
+	PasswordStatus passwordStatus
 	// Exclude names the input paths the operator declared are not this app's to
 	// convert. Excluded sources are enumerated and never converted, and their
 	// earlier artifacts are orphan candidates.
@@ -166,17 +169,9 @@ func Load() (Config, error) {
 		FallbackInterval:   fallbackInterval,
 		MaxScanEntries:     maxScanEntries,
 		PasswordStatus:     pw.Status,
-		MetricsListenAddr:  metricsListenAddr(),
+		MetricsListenAddr:  httpserver.ListenAddr(os.Getenv("METRICS_LISTEN_ADDR"), ""),
+		AllowedHosts:       strings.Split(os.Getenv("ALLOWED_HOSTS"), ","),
 	}, nil
-}
-
-// metricsListenAddr reads METRICS_LISTEN_ADDR. Edge whitespace and invisible
-// runes are trimmed because net.Listen reads them as part of a host name and the
-// container crash-loops on a lookup the operator cannot see in the value.
-func metricsListenAddr() string {
-	return strings.TrimFunc(os.Getenv("METRICS_LISTEN_ADDR"), func(r rune) bool {
-		return unicode.IsSpace(r) || isInvisibleRune(r)
-	})
 }
 
 // FallbackInterval returns the CONFIGURED FALLBACK_SCAN_HOURS as a duration, parsed

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -48,21 +49,21 @@ func freeAddr(t *testing.T) string {
 	return addr
 }
 
-// TestStartMetrics_serves_healthz pins the route on METRICS_LISTEN_ADDR: GET
+// TestStartOps_serves_healthz pins the route on METRICS_LISTEN_ADDR: GET
 // and HEAD answer 200 with {"status":"ok"} on a fresh verdict, 503 with one
 // reason on a failed one, and any other method gets 405. The stale verdict
 // needs a fake clock, so TestHealthz_names_each_fault covers it.
 // Serial: it reads FALLBACK_SCAN_HOURS.
-func TestStartMetrics_serves_healthz(t *testing.T) {
+func TestStartOps_serves_healthz(t *testing.T) {
 	t.Setenv("FALLBACK_SCAN_HOURS", "")
 	marker := health.NewStatus()
 	addr := freeAddr(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	reg, _ := newMetrics(0)
-	wait, err := startMetrics(ctx, addr, reg, newHealthz(marker, config.FallbackInterval()))
+	wait, err := startOps(ctx, &config.Config{MetricsListenAddr: addr}, reg, newHealthz(marker, config.FallbackInterval()))
 	if err != nil {
 		cancel()
-		t.Fatalf("startMetrics(%s) = %v", addr, err)
+		t.Fatalf("startOps(%s) = %v", addr, err)
 	}
 	t.Cleanup(func() {
 		cancel()
@@ -217,5 +218,50 @@ func TestHealthz_agrees_with_the_health_subcommand(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+// TestStartOps_applies_ALLOWED_HOSTS pins that the list reaches the listener: an
+// unset list serves every Host, a set one refuses an unlisted Host with the
+// host_not_allowed code, and a malformed entry stops the start naming the setting.
+func TestStartOps_applies_ALLOWED_HOSTS(t *testing.T) {
+	t.Setenv("FALLBACK_SCAN_HOURS", "")
+	reg, _ := newMetrics(0)
+	healthz := newHealthz(health.NewStatus(), config.FallbackInterval())
+	status := func(hosts []string, host string) (int, string) {
+		t.Helper()
+		addr := freeAddr(t)
+		ctx, cancel := context.WithCancel(t.Context())
+		wait, err := startOps(ctx, &config.Config{MetricsListenAddr: addr, AllowedHosts: hosts}, reg, healthz)
+		if err != nil {
+			cancel()
+			t.Fatalf("startOps = %v", err)
+		}
+		t.Cleanup(func() { cancel(); wait() })
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/metrics", http.NoBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = host
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body)
+	}
+	if code, _ := status([]string{""}, "anything.example"); code != http.StatusOK {
+		t.Errorf("an unset ALLOWED_HOSTS answered %d for a foreign Host, want 200", code)
+	}
+	if code, _ := status([]string{"cert-converter"}, "cert-converter:9468"); code != http.StatusOK {
+		t.Errorf("a listed Host answered %d, want 200", code)
+	}
+	if code, body := status([]string{"cert-converter"}, "attacker.example"); code != http.StatusForbidden || !strings.Contains(body, "host_not_allowed") {
+		t.Errorf("an unlisted Host answered %d %q, want 403 host_not_allowed", code, body)
+	}
+	_, err := startOps(t.Context(), &config.Config{MetricsListenAddr: freeAddr(t), AllowedHosts: []string{"http://bad"}}, reg, healthz)
+	if err == nil || !strings.Contains(err.Error(), "ALLOWED_HOSTS") {
+		t.Errorf("a malformed entry gave %v, want a start error naming ALLOWED_HOSTS", err)
 	}
 }

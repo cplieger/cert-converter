@@ -86,6 +86,7 @@ Settings are environment variables, read when the container starts, so recreate 
 | `INPUT_EXCLUDE_PATHS` | Comma-separated paths under `/input` to leave unconverted. | _(unset)_ |
 | `FALLBACK_SCAN_HOURS` | Hours between full rechecks of `/input`, which catch changes the file watch missed. `0`, `false` and values above `24` mean one recheck every 24 hours. | `6` |
 | `METRICS_LISTEN_ADDR` | Address for a Prometheus metrics page and `/healthz`, for example `:9468`. Empty opens no port. | _(unset)_ |
+| `ALLOWED_HOSTS` | Comma-separated `Host` names or IPs that port serves, such as `cert-converter,192.0.2.10`. Unset serves every `Host`. A request from the container itself is always served. | _(unset)_ |
 | `LOG_LEVEL` | `debug`, `info`, `warn` or `error`. The log alert rules need `info`. | `info` |
 
 `INPUT_PFX_PASSWORD_FILE` and `MAX_SCAN_ENTRIES` are in [Configuration](docs/configuration.md).

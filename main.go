@@ -23,7 +23,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/scancadence"
 	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/go/health/v2"
-	"github.com/cplieger/go/httpserver"
+	"github.com/cplieger/go/httpserver/v2"
 	"github.com/cplieger/go/measure/v2"
 	"github.com/cplieger/go/slogx"
 )
@@ -75,19 +75,26 @@ func newMetrics(fallback time.Duration) (*measure.Registry, *obs.Reporter) {
 	return obs.New(version, healthLease(fallback))
 }
 
-// startMetrics binds addr and serves reg's page and healthz on it until ctx
-// ends; wait blocks until the server has shut down. An empty addr opens no
-// listener.
-func startMetrics(ctx context.Context, addr string, reg *measure.Registry, healthz http.Handler) (wait func(), err error) {
-	ms, err := httpserver.ListenMetrics(ctx, addr, httpserver.MetricsHandlers{Metrics: reg.Handler(), Healthz: healthz})
+// startOps binds the ops listener and serves reg's page and healthz on it until
+// ctx ends; wait blocks until the server has shut down. An empty
+// METRICS_LISTEN_ADDR opens no listener.
+func startOps(ctx context.Context, cfg *config.Config, reg *measure.Registry, healthz http.Handler) (wait func(), err error) {
+	ops, err := httpserver.ListenOps(ctx, httpserver.OpsConfig{
+		Metrics:      reg.Handler(),
+		Healthz:      healthz,
+		Setting:      "METRICS_LISTEN_ADDR",
+		Addr:         cfg.MetricsListenAddr,
+		HostsSetting: "ALLOWED_HOSTS",
+		Hosts:        cfg.AllowedHosts,
+	})
 	if err != nil {
 		return nil, err
 	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := ms.Serve(ctx); err != nil {
-			slog.Error("metrics listener stopped", "address", logtext.Path(addr), "error", logtext.Path(err.Error()))
+		if err := httpserver.RunWithOps(ctx, ops); err != nil {
+			slog.Error("ops listener stopped", "address", logtext.Path(cfg.MetricsListenAddr), "error", logtext.Path(err.Error()))
 		}
 	}()
 	return func() { <-done }, nil
@@ -263,18 +270,18 @@ func run() int {
 	// Bound before the first scan, so a typo stops the container at once instead
 	// of leaving it converting with no page.
 	reg, reporter := newMetrics(cfg.FallbackInterval)
-	metricsCtx, stopMetrics := context.WithCancel(ctx)
-	waitMetrics, err := startMetrics(metricsCtx, cfg.MetricsListenAddr, reg, newHealthz(st, cfg.FallbackInterval))
+	opsCtx, stopOps := context.WithCancel(ctx)
+	waitOps, err := startOps(opsCtx, &cfg, reg, newHealthz(st, cfg.FallbackInterval))
 	if err != nil {
-		stopMetrics()
-		slog.Error("cannot listen on METRICS_LISTEN_ADDR; refusing to start",
+		stopOps()
+		slog.Error("cannot start the ops listener; refusing to start",
 			"address", logtext.Path(cfg.MetricsListenAddr), "error", logtext.Path(err.Error()),
-			"remediation", "set METRICS_LISTEN_ADDR to a free address such as :9468, or unset it")
+			"remediation", "set METRICS_LISTEN_ADDR to a free address such as :9468 and ALLOWED_HOSTS to host names or IPs, or unset them")
 		return 1
 	}
 	defer func() {
-		stopMetrics()
-		waitMetrics()
+		stopOps()
+		waitOps()
 	}()
 
 	scanner := process.New(&process.Options{

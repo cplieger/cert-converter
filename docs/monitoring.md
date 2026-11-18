@@ -13,7 +13,7 @@ This page lists what cert-converter reports, the Grafana dashboard and the alert
 
 ## Metrics
 
-The metrics page is off by default, and the container then opens no port. Set `METRICS_LISTEN_ADDR` to a listen address, for example `:9468`, and cert-converter serves `GET /metrics` on it. [Reaching an app's metrics page](https://github.com/cplieger/docs/blob/main/docs/monitoring.md#reaching-an-apps-metrics-page) shows how to let your scraper reach it. The page has no login, so keep the port on your network. Name the scrape job `cert-converter`, because `CertConverterDown` reads `up{job="cert-converter"}`.
+The metrics page is off by default, and the container then opens no port. Set `METRICS_LISTEN_ADDR` to a listen address, for example `:9468`, and cert-converter serves `GET /metrics` on it. [Reaching an app's metrics page](https://github.com/cplieger/docs/blob/main/docs/monitoring.md#reaching-an-apps-metrics-page) shows how to let your scraper reach it. The page has no login, so keep the port on your network, and set `ALLOWED_HOSTS` to the names your scraper uses to limit who can read it. Name the scrape job `cert-converter`, because `CertConverterDown` reads `up{job="cert-converter"}`.
 
 Each scan sets the scan series from the same verdict it writes to the `scan complete` record. The labels carry only the values listed below, except `source`. `source` carries the path of a certificate source relative to `/input`, a file name you chose, with control and text-direction characters replaced by a space. Keep that in mind before you ship these series to a store other people read.
 

@@ -16,6 +16,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/cplieger/cert-converter/internal/config"
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/mounts"
 	"github.com/cplieger/cert-converter/internal/obs"
@@ -40,10 +41,10 @@ func TestStartMetrics_logs_strays_but_not_scrapes(t *testing.T) {
 	addr := freeAddr(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	reg, _ := newMetrics(0)
-	wait, err := startMetrics(ctx, addr, reg, http.NotFoundHandler())
+	wait, err := startOps(ctx, &config.Config{MetricsListenAddr: addr}, reg, http.NotFoundHandler())
 	if err != nil {
 		cancel()
-		t.Fatalf("startMetrics(%s) = %v", addr, err)
+		t.Fatalf("startOps(%s) = %v", addr, err)
 	}
 	client := &http.Client{Timeout: 5 * time.Second}
 	for _, path := range []string{"/metrics", "/healthz", "/stray"} {
@@ -87,10 +88,10 @@ func TestStartMetrics_serves_the_page_on_GET(t *testing.T) {
 	addr := freeAddr(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	reg, _ := newMetrics(0)
-	wait, err := startMetrics(ctx, addr, reg, http.NotFoundHandler())
+	wait, err := startOps(ctx, &config.Config{MetricsListenAddr: addr}, reg, http.NotFoundHandler())
 	if err != nil {
 		cancel()
-		t.Fatalf("startMetrics(%s) = %v", addr, err)
+		t.Fatalf("startOps(%s) = %v", addr, err)
 	}
 	t.Cleanup(func() {
 		cancel()
