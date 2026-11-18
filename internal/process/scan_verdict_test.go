@@ -320,15 +320,15 @@ func TestScannerRun_keeps_unproven_conditions_on_an_incomplete_scan(t *testing.T
 			OrphanRemovalDisabled: true, PreviousLayoutRetained: true,
 		}
 		s.lastReported = prev
-		facts := map[SourceOutcome]int{SourceOrphan: 2, SourceFailed: 3, SourceUnwritable: 6, SourceConverted: 1}
+		facts := map[SourceOutcome]int{sourceOrphan: 2, SourceFailed: 3, sourceUnwritable: 6, SourceConverted: 1}
 		for outcome, n := range facts {
 			for i := range n {
 				s.sources[outcome.String()+strconv.Itoa(i)+".crt"] = sourceFact{outcome: outcome}
 			}
 		}
 		res := abortedRun(t, s, in)
-		if res.Orphan != facts[SourceOrphan] {
-			t.Errorf("Run(/input missing) Orphan = %d, want %d", res.Orphan, facts[SourceOrphan])
+		if res.Orphan != facts[sourceOrphan] {
+			t.Errorf("Run(/input missing) Orphan = %d, want %d", res.Orphan, facts[sourceOrphan])
 		}
 		if res.Failed != facts[SourceFailed] {
 			t.Errorf("Run(/input missing) Failed = %d, want %d", res.Failed, facts[SourceFailed])
@@ -339,8 +339,8 @@ func TestScannerRun_keeps_unproven_conditions_on_an_incomplete_scan(t *testing.T
 		if res.Unresolved != prev.Unresolved {
 			t.Errorf("Run(/input missing) Unresolved = %d, want %d", res.Unresolved, prev.Unresolved)
 		}
-		if res.Unwritable != facts[SourceUnwritable] {
-			t.Errorf("Run(/input missing) Unwritable = %d, want %d", res.Unwritable, facts[SourceUnwritable])
+		if res.Unwritable != facts[sourceUnwritable] {
+			t.Errorf("Run(/input missing) Unwritable = %d, want %d", res.Unwritable, facts[sourceUnwritable])
 		}
 		if res.Collided != prev.Collided {
 			t.Errorf("Run(/input missing) Collided = %d, want %d", res.Collided, prev.Collided)

@@ -129,8 +129,8 @@ func (r *ScanResult) carryUnproven(prev *ScanResult, enumerated bool) {
 	// per-source problem this scan cannot prove gone, and one it fixed stops
 	// counting.
 	r.Failed = r.sourcesAt(SourceFailed)
-	r.Orphan = r.sourcesAt(SourceOrphan)
-	r.Unwritable = r.sourcesAt(SourceUnwritable)
+	r.Orphan = r.sourcesAt(sourceOrphan)
+	r.Unwritable = r.sourcesAt(sourceUnwritable)
 	if enumerated {
 		return
 	}
@@ -673,7 +673,7 @@ func (sw *scanWalk) claimMismatched(rel, at string) {
 func (sw *scanWalk) holdUnproven(rel string) {
 	sw.seen[rel] = struct{}{}
 	sw.reach.noteSource(rel, statusUnreadable, sw.registerExpected(rel))
-	sw.noteOutcome(rel, SourceUnreadable)
+	sw.noteOutcome(rel, sourceUnreadable)
 }
 
 // danglingSourceMsg reports a source or key link whose target does not exist.
@@ -977,7 +977,7 @@ func (sw *scanWalk) recordCollisions(ctx context.Context, ledgers []stemLedger) 
 			sw.resolve(rel, statusCollided)
 		}
 		for _, rel := range ledger.unreached {
-			sw.noteOutcome(rel, SourceCollided)
+			sw.noteOutcome(rel, sourceCollided)
 		}
 		sw.contested += len(ledger.unreached)
 	}

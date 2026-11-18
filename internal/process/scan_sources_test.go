@@ -96,20 +96,20 @@ func TestScanSources_names_each_source_outcome(t *testing.T) {
 	t.Run("orphan", func(t *testing.T) {
 		inDir, outDir := t.TempDir(), t.TempDir()
 		writeInput(t, filepath.Join(inDir, "lone.crt"), []byte("not a certificate"))
-		wantSource(t, scanSources(t, newSourcesScanner(inDir, outDir, nil)), "lone.crt", SourceOrphan, time.Time{})
+		wantSource(t, scanSources(t, newSourcesScanner(inDir, outDir, nil)), "lone.crt", sourceOrphan, time.Time{})
 	})
 	t.Run("unreadable", func(t *testing.T) {
 		inDir, outDir := t.TempDir(), t.TempDir()
 		if err := os.Mkdir(filepath.Join(inDir, "x.crt"), 0o750); err != nil {
 			t.Fatalf("setup: Mkdir: %v", err)
 		}
-		wantSource(t, scanSources(t, newSourcesScanner(inDir, outDir, nil)), "x.crt", SourceUnreadable, time.Time{})
+		wantSource(t, scanSources(t, newSourcesScanner(inDir, outDir, nil)), "x.crt", sourceUnreadable, time.Time{})
 	})
 	t.Run("excluded", func(t *testing.T) {
 		inDir, outDir := t.TempDir(), t.TempDir()
 		writeSelfSignedPair(t, inDir, "site")
 		s := newSourcesScanner(inDir, outDir, func(o *Options) { o.Exclude = layout.NewExcludeSet([]string{"site.crt"}) })
-		wantSource(t, scanSources(t, s), "site.crt", SourceExcluded, time.Time{})
+		wantSource(t, scanSources(t, s), "site.crt", sourceExcluded, time.Time{})
 	})
 	t.Run("collided", func(t *testing.T) {
 		inDir, outDir := t.TempDir(), t.TempDir()
@@ -120,8 +120,8 @@ func TestScanSources_names_each_source_outcome(t *testing.T) {
 			writeSelfSignedPair(t, filepath.Join(inDir, dir), "site")
 		}
 		got := scanSources(t, newSourcesScanner(inDir, outDir, func(o *Options) { o.Layout = outputpolicy.LayoutFlat }))
-		wantSource(t, got, "x/shared/site.crt", SourceCollided, time.Time{})
-		wantSource(t, got, "y/shared/site.crt", SourceCollided, time.Time{})
+		wantSource(t, got, "x/shared/site.crt", sourceCollided, time.Time{})
+		wantSource(t, got, "y/shared/site.crt", sourceCollided, time.Time{})
 	})
 	t.Run("unwritable", func(t *testing.T) {
 		inDir, outDir := t.TempDir(), t.TempDir()
@@ -133,7 +133,7 @@ func TestScanSources_names_each_source_outcome(t *testing.T) {
 			t.Fatalf("setup: Chtimes: %v", err)
 		}
 		stubWriteRefusal(t, &fs.PathError{Op: "openat", Path: "site.pfx", Err: syscall.EROFS})
-		wantSource(t, scanSources(t, newSourcesScanner(inDir, outDir, nil)), "site.crt", SourceUnwritable, prior)
+		wantSource(t, scanSources(t, newSourcesScanner(inDir, outDir, nil)), "site.crt", sourceUnwritable, prior)
 	})
 }
 
@@ -286,7 +286,7 @@ func TestScanSources_a_folder_the_walk_cannot_read_keeps_its_counts(t *testing.T
 	for _, st := range result.Sources {
 		got[st.Path] = st
 	}
-	if st, ok := got["d/lone.crt"]; !ok || st.Outcome != SourceOrphan {
+	if st, ok := got["d/lone.crt"]; !ok || st.Outcome != sourceOrphan {
 		t.Errorf("Sources[d/lone.crt] = %+v, %v, want orphan", st, ok)
 	}
 }
@@ -322,7 +322,7 @@ func TestScanSources_an_unread_unwritable_source_stays_unwritable(t *testing.T) 
 	if result.Unwritable != 1 {
 		t.Errorf("Run(over budget).Unwritable = %d, want 1", result.Unwritable)
 	}
-	if len(result.Sources) != 1 || result.Sources[0].Outcome != SourceUnwritable {
+	if len(result.Sources) != 1 || result.Sources[0].Outcome != sourceUnwritable {
 		t.Errorf("Run(over budget).Sources = %+v, want site.crt unwritable", result.Sources)
 	}
 }
@@ -522,7 +522,7 @@ func TestScanSources_restart_reads_the_newest_artifact_time(t *testing.T) {
 
 			got := scanSources(t, newSourcesScanner(inDir, outDir, adjust))
 			wantSource(t, got, "site.crt", SourceUnchanged, m2)
-			wantSource(t, got, "site.pfx", SourceExcluded, time.Time{})
+			wantSource(t, got, "site.pfx", sourceExcluded, time.Time{})
 		})
 	}
 }
@@ -546,8 +546,8 @@ func TestScanSources_a_flat_collision_claimant_shows_no_winner_time(t *testing.T
 	writeSelfSignedPair(t, filepath.Join(inDir, "y/shared"), "site")
 
 	got := scanSources(t, newSourcesScanner(inDir, outDir, flat))
-	wantSource(t, got, "x/shared/site.crt", SourceCollided, owned)
-	wantSource(t, got, "y/shared/site.crt", SourceCollided, time.Time{})
+	wantSource(t, got, "x/shared/site.crt", sourceCollided, owned)
+	wantSource(t, got, "y/shared/site.crt", sourceCollided, time.Time{})
 }
 
 // After a restart the ownership record is the only evidence of a claimant the
@@ -577,7 +577,7 @@ func TestScanSources_an_unreached_collision_claimant_stays_collided(t *testing.T
 	}
 	collided := 0
 	for _, st := range result.Sources {
-		if st.Outcome == SourceCollided {
+		if st.Outcome == sourceCollided {
 			collided++
 		}
 	}
@@ -599,12 +599,12 @@ func TestOutcomeOfStatus_maps_each_status_to_its_named_outcome(t *testing.T) {
 		{statusConverted, SourceConverted, "converted"},
 		{statusUnchanged, SourceUnchanged, "unchanged"},
 		{statusFailed, SourceFailed, "failed"},
-		{statusOrphan, SourceOrphan, "orphan"},
-		{statusUnreadable, SourceUnreadable, "unreadable"},
-		{statusUnwritable, SourceUnwritable, "unwritable"},
-		{statusCollided, SourceCollided, "collided"},
-		{statusExcluded, SourceExcluded, "excluded"},
-		{statusVanished, SourceVanished, "vanished"},
+		{statusOrphan, sourceOrphan, "orphan"},
+		{statusUnreadable, sourceUnreadable, "unreadable"},
+		{statusUnwritable, sourceUnwritable, "unwritable"},
+		{statusCollided, sourceCollided, "collided"},
+		{statusExcluded, sourceExcluded, "excluded"},
+		{statusVanished, sourceVanished, "vanished"},
 	}
 	if len(spec) != int(statusCount)-1 {
 		t.Errorf("the spec covers %d statuses, want every per-source status (%d)", len(spec), int(statusCount)-1)
