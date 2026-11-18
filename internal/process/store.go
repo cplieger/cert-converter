@@ -487,6 +487,26 @@ func (s *store) holdsDir(rel string) bool {
 	return fi.IsDir()
 }
 
+// newestArtifact returns the newest modification time among the regular files at
+// artifacts, and the zero time when none of them is one. A symlink is skipped,
+// as inspect never follows one.
+func (s *store) newestArtifact(artifacts []string) time.Time {
+	var newest time.Time
+	for _, rel := range artifacts {
+		fi, err := s.root.Lstat(rel)
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				slog.Debug("cannot read an output artifact's modification time", "path", logtext.Path(rel), "error", logtext.Path(err.Error()))
+			}
+			continue
+		}
+		if fi.Mode().IsRegular() && fi.ModTime().After(newest) {
+			newest = fi.ModTime()
+		}
+	}
+	return newest
+}
+
 // clearUnmanaged ends the permissive-mode conditions on paths no expected
 // artifact lives at or under. Only a scan that saw the whole tree may call it.
 func (s *store) clearUnmanaged(expected map[string]struct{}) {

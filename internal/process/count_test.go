@@ -72,7 +72,7 @@ func TestCountResults(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			got := countResults(tt.results, tt.unreadable, tt.unresolved, tt.vanished)
-			if got != tt.want {
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("countResults(%d results, unreadable=%d, unresolved=%d, vanished=%d) = %+v, want %+v",
 					len(tt.results), tt.unreadable, tt.unresolved, tt.vanished, got, tt.want)
 			}
