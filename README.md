@@ -5,6 +5,8 @@
 <!-- hub-overview BEGIN -->
 cert-converter keeps PFX copies of your certificates current as they renew, for apps that accept only PFX. It does not request certificates, and it does not restart the app that reads the PFX file.
 
+![The bundled Grafana dashboard showing outputs matching inputs, four certificates with no errors or warnings, the last scan six minutes ago and the next in six hours, and a table of each certificate with its state and when it was last converted](docs/images/header.png)
+
 ## What it does
 
 cert-converter updates the PFX file your app reads each time its certificate renews.
