@@ -153,11 +153,9 @@ type dashVariable struct {
 		Hide    string `json:"hide"`
 		Refresh string `json:"refresh"`
 		Sort    string `json:"sort"`
-		Regex   string `json:"regex"`
 		// Query is a data query on a QueryVariable, a string on a
 		// CustomVariable and absent on a DatasourceVariable.
-		Query       json.RawMessage `json:"query"`
-		SkipURLSync bool            `json:"skipUrlSync"`
+		Query json.RawMessage `json:"query"`
 	} `json:"spec"`
 }
 

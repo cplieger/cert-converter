@@ -19,12 +19,12 @@ const (
 	SourceConverted SourceOutcome = iota
 	SourceUnchanged
 	SourceFailed
-	SourceOrphan
-	SourceUnreadable
-	SourceUnwritable
-	SourceCollided
-	SourceExcluded
-	SourceVanished
+	sourceOrphan
+	sourceUnreadable
+	sourceUnwritable
+	sourceCollided
+	sourceExcluded
+	sourceVanished
 	sourceOutcomeCount
 )
 
@@ -74,17 +74,17 @@ func outcomeOfStatus(status conversionStatus) (SourceOutcome, bool) {
 	case statusFailed:
 		return SourceFailed, true
 	case statusOrphan:
-		return SourceOrphan, true
+		return sourceOrphan, true
 	case statusUnreadable:
-		return SourceUnreadable, true
+		return sourceUnreadable, true
 	case statusVanished:
-		return SourceVanished, true
+		return sourceVanished, true
 	case statusUnwritable:
-		return SourceUnwritable, true
+		return sourceUnwritable, true
 	case statusCollided:
-		return SourceCollided, true
+		return sourceCollided, true
 	case statusExcluded:
-		return SourceExcluded, true
+		return sourceExcluded, true
 	default:
 		return 0, false
 	}
@@ -95,7 +95,7 @@ func outcomeOfStatus(status conversionStatus) (SourceOutcome, bool) {
 // whether an earlier problem was fixed.
 func readVerdict(outcome SourceOutcome) bool {
 	switch outcome {
-	case SourceUnreadable, SourceVanished, SourceCollided:
+	case sourceUnreadable, sourceVanished, sourceCollided:
 		return false
 	default:
 		return true
@@ -109,13 +109,13 @@ func urgency(outcome SourceOutcome) int {
 	switch outcome {
 	case SourceFailed:
 		return 5
-	case SourceCollided:
+	case sourceCollided:
 		return 4
-	case SourceUnwritable:
+	case sourceUnwritable:
 		return 3
-	case SourceUnreadable, SourceVanished:
+	case sourceUnreadable, sourceVanished:
 		return 2
-	case SourceOrphan:
+	case sourceOrphan:
 		return 1
 	default:
 		return 0
@@ -151,7 +151,7 @@ func (sw *scanWalk) artifactsOf(rel string) []string {
 // one is another source's, and a flat stem belongs to its owner, or to its sole
 // claimant while it has none.
 func (sw *scanWalk) ownsArtifacts(rel string, outcome SourceOutcome, artifacts []string) bool {
-	if outcome == SourceExcluded && slices.ContainsFunc(artifacts, func(a string) bool {
+	if outcome == sourceExcluded && slices.ContainsFunc(artifacts, func(a string) bool {
 		_, expected := sw.expected[a]
 		return expected
 	}) {
