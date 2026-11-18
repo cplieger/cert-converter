@@ -108,36 +108,27 @@ func (r *scanReach) enumerate(rel string) {
 }
 
 // provenGone reports whether a walk that stopped at the entry budget proved the
-// source rel absent: it reached rel's path (input), the path comes before the
-// stop in walk order, and the walk did not enumerate rel.
+// source rel absent: it reached rel's path (input), which after stop means it
+// read rel's folder in full, and did not enumerate rel. A source named in a
+// listed folder can be enumerated and not processed, so input alone is no proof.
 func (r *scanReach) provenGone(rel string) bool {
-	if r.stoppedAt == "" || !r.input(rel) || !walksBefore(rel, r.stoppedAt) {
+	if r.stoppedAt == "" || !r.input(rel) {
 		return false
 	}
 	_, enumerated := r.enumerated[rel]
 	return !enumerated
 }
 
-// walksBefore reports whether filesafe.WalkDirInRoot visits the path p before
-// the path s: it lists a directory's entries, each batch in name order, before
-// it walks the directory's subdirectories in the order it listed them.
-func walksBefore(p, s string) bool {
-	dp, ds := path.Dir(p), path.Dir(s)
-	switch {
-	case dp == ds:
-		return path.Base(p) < path.Base(s)
-	case dp == "." || strings.HasPrefix(ds, dp+"/"):
-		return true
-	case ds == "." || strings.HasPrefix(dp, ds+"/"):
+// inStopFolder reports whether the source rel sits in the folder the walk
+// stopped in and the walk neither enumerated nor failed to read it: the walk
+// read that folder only in part, so only a direct lookup of rel proves it gone.
+func (r *scanReach) inStopFolder(rel string) bool {
+	if r.stoppedAt == "" || path.Dir(rel) != path.Dir(r.stoppedAt) {
 		return false
 	}
-	pParts, sParts := strings.Split(dp, "/"), strings.Split(ds, "/")
-	for i := range min(len(pParts), len(sParts)) {
-		if pParts[i] != sParts[i] {
-			return pParts[i] < sParts[i]
-		}
-	}
-	return false
+	_, enumerated := r.enumerated[rel]
+	_, unread := r.unread[rel]
+	return !enumerated && !unread
 }
 
 // noteSource records how far the scan got with the source rel, whose artifacts

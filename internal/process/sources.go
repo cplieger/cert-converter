@@ -2,6 +2,7 @@ package process
 
 import (
 	"errors"
+	"io/fs"
 	"maps"
 	"slices"
 	"time"
@@ -166,12 +167,24 @@ func (sw *scanWalk) ownsArtifacts(rel string, outcome SourceOutcome, artifacts [
 	return len(claim.Members) == 0 || slices.Equal(claim.Members, []string{rel})
 }
 
+// lookedUpGone reports whether the source rel, in the folder a stopped walk read
+// only in part, is absent from /input. Only the stop folder qualifies: the walk
+// opened it, so no link on the way can turn a lookup into a false not-exist.
+// Any lookup error other than not-exist keeps the source.
+func (sw *scanWalk) lookedUpGone(rel string) bool {
+	if !sw.reach.inStopFolder(rel) {
+		return false
+	}
+	_, err := sw.src.root.Lstat(rel)
+	return errors.Is(err, fs.ErrNotExist)
+}
+
 // mergeSources folds this scan's outcomes into the Scanner's memory. A source
 // the scan did not read keeps a fact of higher urgency. A source leaves only on
 // proof that it is gone: a scan that ran to the end reached its path and did not
 // resolve it, or one stopped at the entry budget proved it absent
-// (scanReach.provenGone). Any other source keeps its fact, as carryUnproven
-// keeps the counts.
+// (scanReach.provenGone, lookedUpGone). Any other source keeps its fact, as
+// carryUnproven keeps the counts.
 func (s *Scanner) mergeSources(sw *scanWalk, out *store, walkErr error) {
 	for rel, outcome := range sw.outcomes {
 		fact := s.sources[rel]
@@ -196,7 +209,7 @@ func (s *Scanner) mergeSources(sw *scanWalk, out *store, walkErr error) {
 	case walkErr == nil:
 		gone = sw.reach.input
 	case errors.Is(walkErr, errScanBudgetExceeded):
-		gone = sw.reach.provenGone
+		gone = func(rel string) bool { return sw.reach.provenGone(rel) || sw.lookedUpGone(rel) }
 	default:
 		return
 	}

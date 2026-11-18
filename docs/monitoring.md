@@ -36,7 +36,7 @@ Each scan sets the scan series from the same verdict it writes to the `scan comp
 
 Every labelled scan count starts at `0`, so each rule sees its series from the first scrape. The page also carries the Go runtime and process families (`go_*`, `process_*`) under the names Go's official Prometheus client uses, so stock Go dashboards work. The bundled [dashboard](#dashboard) shows the `cert_converter_*` series in Grafana.
 
-The per-source series appear after the first scan. A source leaves them when a scan proves it gone. A scan that ran to the end proves it when it read the source's folder and no longer found the source. A scan that stopped at `MAX_SCAN_ENTRIES` proves it when it read the folder and passed the source's place before it stopped. A source the scan did not reach keeps its previous outcome and time. A source the scan could not read takes its new outcome only when that outcome is a more urgent problem, in the order Outputs match inputs ranks them.
+The per-source series appear after the first scan. A source leaves them when a scan proves it gone. A scan that ran to the end proves it when it read the source's folder and no longer found the source. A scan that stopped at `MAX_SCAN_ENTRIES` proves it when it read the source's folder in full before it stopped and did not find the source, or when the source's file is gone from the folder it stopped in. A source the scan did not reach keeps its previous outcome and time. A source the scan could not read takes its new outcome only when that outcome is a more urgent problem, in the order Outputs match inputs ranks them.
 
 ## Logs
 
