@@ -123,7 +123,7 @@ const (
 )
 
 // TestScanResultVetoes_every_counter_is_classified_and_honoured is the reap-gate half of
-// the guard scanreport's TestRecordCarriesEveryVerdictField gives the reporting half.
+// the guard obs's TestRecordCarriesEveryVerdictField gives the reporting half.
 // A new /input coverage counter compiles and reaches the record, but nothing makes it
 // reach durablyEnumerated, so sync would delete bundles it cannot prove orphaned. The
 // case tables name today's fields; reflection covers a field that does not exist yet.

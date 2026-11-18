@@ -18,15 +18,15 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/mounts"
+	"github.com/cplieger/cert-converter/internal/obs"
 	"github.com/cplieger/cert-converter/internal/process"
-	"github.com/cplieger/cert-converter/internal/scanreport"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/go/health/v2"
 	"github.com/cplieger/go/measure/v2"
 	"github.com/cplieger/go/slogx/capture"
 )
 
-func testReporter() *scanreport.Reporter {
+func testReporter() *obs.Reporter {
 	_, reporter := newMetrics(0)
 	return reporter
 }
@@ -145,7 +145,7 @@ func TestMetricsPage_matches_golden(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		reg, reporter := newMetrics(time.Hour)
 		time.Sleep(90 * time.Minute)
-		reporter.Report(t.Context(), &scanreport.Scan{Polling: true, Healthy: true, Result: process.ScanResult{
+		reporter.Report(t.Context(), &obs.Scan{Polling: true, Healthy: true, Result: process.ScanResult{
 			Total: 91, Converted: 1, Unchanged: 2, Orphan: 3, Unreadable: 4, Unresolved: 5, Vanished: 6,
 			Unwritable: 7, Collided: 8, Excluded: 10, Ignored: 11, Removed: 12, Failed: 13,
 			Outcome: process.OutcomeBudgetStopped, NoSources: true, OrphanRemovalDisabled: true, CleanupDegraded: true,

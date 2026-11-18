@@ -1,4 +1,4 @@
-package scanreport
+package obs
 
 import (
 	"bytes"
@@ -97,7 +97,7 @@ func TestReportSetsEverySeriesFromTheRecord(t *testing.T) {
 	at := time.Unix(1_800_000_000, 0)
 	pinClock(t, &at)
 	reg := measure.NewRegistry("cert_converter")
-	reporter := NewReporter(reg, lease)
+	reporter := newReporter(reg, lease)
 
 	scan := Scan{Polling: true, Result: process.ScanResult{
 		Total: 9, Converted: 1, Unchanged: 2, Orphan: 3, Unreadable: 4, Unresolved: 5, Vanished: 6,
@@ -184,7 +184,7 @@ func TestScanDeadline(t *testing.T) {
 	pinClock(t, &now)
 	capture.SwapDefault(t, slog.New(slog.DiscardHandler))
 	reg := measure.NewRegistry("cert_converter")
-	reporter := NewReporter(reg, lease)
+	reporter := newReporter(reg, lease)
 	gauge := func(name string) float64 {
 		t.Helper()
 		families, err := reg.Gather(t.Context())
