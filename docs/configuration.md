@@ -139,11 +139,13 @@ An output whose input sits behind an unreadable folder or an unresolvable symlin
 | Variable | Description | Default |
 | --- | --- | --- |
 | `METRICS_LISTEN_ADDR` | Address for a Prometheus metrics page and `/healthz`, for example `:9468`. Empty opens no port. | _(unset)_ |
+| `ALLOWED_HOSTS` | Comma-separated `Host` names or IPs that port serves, such as `cert-converter,192.0.2.10`. Unset serves every `Host`. | _(unset)_ |
 
 `METRICS_LISTEN_ADDR` is a listen address, a host and a port or a port alone such as `:9468`. While it is unset or empty, cert-converter opens no port.
 
 - Leading and trailing spaces and invisible characters are removed, so `" :9468"` listens on `:9468`.
 - The address is bound at startup, before the first scan. An address that is malformed or already taken stops the container with one error naming `METRICS_LISTEN_ADDR`, and cert-converter never falls back to another address.
+- `ALLOWED_HOSTS` limits the `Host` names the listener serves. A request whose `Host` is not listed gets `403` with the code `host_not_allowed`, so a scraper or a prober must use a listed name. A request from the container itself passes, so the Docker health check needs no entry. An entry no `Host` can match, such as one with a scheme or a path, stops the container with an error naming `ALLOWED_HOSTS`.
 - The listener answers `GET /metrics` and `GET /healthz` with no login, so keep the port on your network. [Monitoring and alerts](monitoring.md) lists the series and what `/healthz` answers.
 
 ## Logging
