@@ -9,7 +9,8 @@ import (
 	"unicode"
 
 	"github.com/cplieger/cert-converter/internal/convert"
-	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/envx/v2"
+	"github.com/cplieger/go/masked"
 )
 
 // errEmptyPassword indicates the resolved PFX password is blank — empty, entirely
@@ -51,7 +52,7 @@ const (
 // secret FILE is what the opt-out let through (suppresses warnPasswordStrength's generic
 // guidance).
 type resolvedPassword struct {
-	Value     string
+	Value     masked.Secret
 	Status    passwordStatus
 	Channel   string
 	BlankFile bool
@@ -64,7 +65,8 @@ func resolvePassword() (resolvedPassword, error) {
 	// An EMPTY PFX_PASSWORD_FILE is not the file channel at all, so neither
 	// warnBothPasswordChannels nor envx's own error can report it.
 	warnBlankPasswordFilePointer()
-	password, source, secretErr := envx.SecretWithSource("PFX_PASSWORD")
+	secret, source, secretErr := envx.SecretWithSource("PFX_PASSWORD")
+	password := secret.Reveal()
 	// Every startup refusal below names PFX_PASSWORD; this line says the file wins
 	// when both channels are set, or the refusal points at the ignored variable.
 	warnBothPasswordChannels(source)
@@ -105,7 +107,7 @@ func resolvePassword() (resolvedPassword, error) {
 	}
 	logPasswordDelivery(source, password, status, blankSecretFile != nil)
 	return resolvedPassword{
-		Value:     password,
+		Value:     masked.NewSecret(password),
 		Status:    status,
 		Channel:   channel,
 		BlankFile: blankSecretFile != nil,

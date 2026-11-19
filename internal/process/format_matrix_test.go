@@ -17,6 +17,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx/capture"
 	"software.sslmate.com/src/go-pkcs12"
 )
@@ -244,8 +245,8 @@ func newFormatScanner(input, output string, formats outputpolicy.Formats, layout
 	return process.New(&process.Options{
 		CertsRoot:          input,
 		OutRoot:            output,
-		Password:           "output-password",
-		InputPassword:      inputPassword,
+		Password:           masked.NewSecret("output-password"),
+		InputPassword:      masked.NewSecret(inputPassword),
 		InputPasswordReady: inputPassword != "",
 		Encoder:            convert.EncNameModern2023,
 		Formats:            formats,
@@ -476,7 +477,7 @@ func TestScannerRun_PFXSourceIsIgnoredUntilInputIsEnabled(t *testing.T) {
 	scanner := process.New(&process.Options{
 		CertsRoot: input,
 		OutRoot:   output,
-		Password:  "output-password",
+		Password:  masked.NewSecret("output-password"),
 		// Bypass config intentionally: New must not let an internal caller enable
 		// an empty input password.
 		InputPasswordReady: true,
@@ -619,7 +620,7 @@ func TestScannerRun_legacyUnsetFormatsDoNotDeletePEMFiles(t *testing.T) {
 	scanner := process.New(&process.Options{
 		CertsRoot: input,
 		OutRoot:   output,
-		Password:  "output-password",
+		Password:  masked.NewSecret("output-password"),
 		Encoder:   convert.EncNameModern2023,
 		Lifecycle: outputpolicy.LifecycleSync,
 	})
@@ -652,7 +653,7 @@ func TestScannerRun_flatLayoutConvertsEnumeratedPrefixAtBudgetStop(t *testing.T)
 	scanner := process.New(&process.Options{
 		CertsRoot:       input,
 		OutRoot:         output,
-		Password:        "output-password",
+		Password:        masked.NewSecret("output-password"),
 		Encoder:         convert.EncNameModern2023,
 		Formats:         outputpolicy.Formats{PFX: true},
 		FormatsExplicit: true,

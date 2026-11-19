@@ -17,6 +17,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/go/filesafe"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx/capture"
 )
 
@@ -469,7 +470,7 @@ func TestScannerRun_rewrites_a_bundle_it_could_not_verify(t *testing.T) {
 			scanner := New(&Options{
 				CertsRoot: certsRoot,
 				OutRoot:   outRoot,
-				Password:  "pw",
+				Password:  masked.NewSecret("pw"),
 				Encoder:   convert.EncNameModern2023,
 			})
 			res, err := scanner.Run(t.Context())
@@ -562,7 +563,7 @@ func TestScannerRun_when_an_unverifiable_bundle_cannot_be_rewritten(t *testing.T
 			scanner := New(&Options{
 				CertsRoot: certsRoot,
 				OutRoot:   outRoot,
-				Password:  "pw",
+				Password:  masked.NewSecret("pw"),
 				Encoder:   convert.EncNameModern2023,
 			})
 			stubWriteRefusal(t, tc.writeErr)
@@ -677,7 +678,7 @@ func TestScannerRun_when_the_output_parent_cannot_be_pinned(t *testing.T) {
 	res, err := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 	}).Run(t.Context())
 	if err != nil {
@@ -732,7 +733,7 @@ func TestScannerRun_when_a_file_blocks_the_mirrored_output_directory(t *testing.
 	res, err := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 	}).Run(t.Context())
 	if err != nil {
@@ -790,7 +791,7 @@ func TestScannerRun_a_genuine_conversion_failure_still_flips_health(t *testing.T
 			res, err := New(&Options{
 				CertsRoot: certsRoot,
 				OutRoot:   outRoot,
-				Password:  "pw",
+				Password:  masked.NewSecret("pw"),
 				Encoder:   convert.EncNameModern2023,
 			}).Run(t.Context())
 			if err != nil {
@@ -912,7 +913,7 @@ func TestScannerRun_inspect_cancelled_by_shutdown_is_reported_quietly(t *testing
 	res, err := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 	}).Run(ctx)
 
@@ -969,7 +970,7 @@ func TestScannerRun_partialArtifactPublicationFailsTheSource(t *testing.T) {
 	scanner := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 		Formats:   outputpolicy.Formats{PEM: true},
 	})

@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
-	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/envx/v2"
 	"github.com/cplieger/go/slogx/capture"
 )
 
@@ -245,8 +245,8 @@ func TestLoad_wiresInputBundlePassword(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Load() = %v, want nil", err)
 			}
-			if cfg.InputPassword != tc.want {
-				t.Errorf("Load() InputPassword = %q, want %q", cfg.InputPassword, tc.want)
+			if cfg.InputPassword.Reveal() != tc.want {
+				t.Errorf("Load() InputPassword = %q, want %q", cfg.InputPassword.Reveal(), tc.want)
 			}
 			if cfg.InputPasswordReady != tc.wantReady {
 				t.Errorf("Load() InputPasswordReady = %v, want %v", cfg.InputPasswordReady, tc.wantReady)

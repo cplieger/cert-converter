@@ -10,7 +10,8 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
-	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/envx/v2"
+	"github.com/cplieger/go/masked"
 )
 
 // resolveFormats reads OUTPUT_FORMATS and reports every token the parser had to
@@ -106,7 +107,7 @@ func validExcludePath(entry string) bool {
 }
 
 type resolvedInputPassword struct {
-	Value string
+	Value masked.Secret
 	Ready bool
 }
 
@@ -117,7 +118,8 @@ type resolvedInputPassword struct {
 // trust boundary around parser work the dependency cannot preflight itself.
 func resolveInputPassword() (resolvedInputPassword, error) {
 	warnBlankInputPasswordFilePointer()
-	password, source, secretErr := envx.SecretWithSource("INPUT_PFX_PASSWORD")
+	secret, source, secretErr := envx.SecretWithSource("INPUT_PFX_PASSWORD")
+	password := secret.Reveal()
 	warnBothInputPasswordChannels(source)
 	_, envSet := os.LookupEnv("INPUT_PFX_PASSWORD")
 	configured := envSet || source == envx.SecretSourceFile
@@ -151,7 +153,7 @@ func resolveInputPassword() (resolvedInputPassword, error) {
 	if source == envx.SecretSourceFile {
 		slog.Info("input bundle password configured", "source", inputPasswordChannel(source))
 	}
-	return resolvedInputPassword{Value: password, Ready: true}, nil
+	return resolvedInputPassword{Value: masked.NewSecret(password), Ready: true}, nil
 }
 
 // warnBothInputPasswordChannels mirrors warnBothPasswordChannels for the input

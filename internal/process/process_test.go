@@ -10,6 +10,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/go/masked"
 )
 
 // newScanner constructs a Scanner over the given input/output roots with the
@@ -19,7 +20,7 @@ func newScanner(certsRoot, outRoot string) *process.Scanner {
 	return process.New(&process.Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 	})
 }
@@ -31,7 +32,7 @@ func newSyncScanner(certsRoot, outRoot string) *process.Scanner {
 	return process.New(&process.Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 		Lifecycle: outputpolicy.LifecycleSync,
 	})
@@ -43,7 +44,7 @@ func newMirrorScanner(certsRoot, outRoot string) *process.Scanner {
 	return process.New(&process.Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 		Layout:    outputpolicy.LayoutMirror,
 	})

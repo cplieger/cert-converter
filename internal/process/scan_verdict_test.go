@@ -9,11 +9,12 @@ import (
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
+	"github.com/cplieger/go/masked"
 )
 
 func newVerdictScanner(certsRoot, outRoot string, opts Options) *Scanner {
 	opts.CertsRoot, opts.OutRoot = certsRoot, outRoot
-	opts.Password, opts.Encoder = "pw", convert.EncNameModern2023
+	opts.Password, opts.Encoder = masked.NewSecret("pw"), convert.EncNameModern2023
 	return New(&opts)
 }
 

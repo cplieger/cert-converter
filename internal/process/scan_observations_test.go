@@ -10,6 +10,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx/capture"
 )
 
@@ -43,7 +44,7 @@ func TestScannerRun_reports_a_new_input_observation_once_on_an_unchanged_output(
 	scanner := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 	})
 
@@ -161,7 +162,7 @@ func TestScannerRun_keeps_observation_state_across_an_incomplete_enumeration(t *
 	scanner := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 	})
 
@@ -327,7 +328,7 @@ func TestScannerRun_reports_an_input_observation_once_while_the_output_stays_unw
 	scanner := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 	})
 	if res, err := scanner.Run(t.Context()); err != nil || res.Converted != 1 {

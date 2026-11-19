@@ -16,6 +16,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/cert-converter/internal/scancadence"
 	"github.com/cplieger/go/httpserver/v2"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx"
 	"github.com/cplieger/go/textsafe"
 )
@@ -72,7 +73,7 @@ const (
 
 // Config holds the runtime configuration for cert-converter.
 type Config struct {
-	Password string
+	Password masked.Secret
 	// MetricsListenAddr is METRICS_LISTEN_ADDR read as httpserver.ListenAddr reads it;
 	// empty means no listener. The composition root binds it and refuses to start
 	// when the bind fails, which is the whole of its validation.
@@ -80,7 +81,7 @@ type Config struct {
 	// AllowedHosts are ALLOWED_HOSTS' entries for the ops listener; none
 	// serves every Host.
 	AllowedHosts   []string
-	InputPassword  string
+	InputPassword  masked.Secret
 	EncoderName    convert.EncoderType
 	Lifecycle      outputpolicy.Lifecycle
 	Layout         outputpolicy.Layout
