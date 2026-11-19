@@ -590,7 +590,8 @@ func attentionTile(name, expr string) string {
 // attentionTile's for its rule, the row's variable does not count exactly
 // those tiles in layout order, a tile is not hidden until its query answers,
 // or any query reads an ALERTS selector that is not one of attentionReads'
-// for a shipped rule.
+// for a shipped rule, or a query reads a rule with instance="" but not with
+// instance="$instance".
 func TestDashboardAttentionTilesMirrorEveryShippedRule(t *testing.T) {
 	d := loadDashboard(t)
 	rules := ruleExprs(t, promqlRules)
@@ -602,7 +603,12 @@ func TestDashboardAttentionTilesMirrorEveryShippedRule(t *testing.T) {
 		}
 	}
 	for where, expr := range dashboardQueries(&d) {
-		for _, sel := range selectors(bracedVariableRe.ReplaceAllString(expr, "$$v")) {
+		sels := selectors(bracedVariableRe.ReplaceAllString(expr, "$$v"))
+		var texts []string
+		for _, sel := range sels {
+			texts = append(texts, sel.text)
+		}
+		for _, sel := range sels {
 			if sel.name != "ALERTS" {
 				continue
 			}
@@ -610,8 +616,13 @@ func TestDashboardAttentionTilesMirrorEveryShippedRule(t *testing.T) {
 			if m := alertsRe.FindStringSubmatch(sel.text); m != nil {
 				name = m[1]
 			}
-			if rule, ok := rules[name]; !ok || !slices.Contains(attentionReads(name, rule), sel.text) {
+			rule, ok := rules[name]
+			if !ok || !slices.Contains(attentionReads(name, rule), sel.text) {
 				t.Errorf("%s reads %s, which is none of the reads attentionReads gives a rule in %s, so it reads another instance's alerts, an unshipped alert or, with instance=\"\" on a rule with no absent arm, nothing", where, sel.text, promqlRules)
+				continue
+			}
+			if reads := attentionReads(name, rule); strings.HasSuffix(sel.text, `instance=""}`) && !slices.Contains(texts, reads[0]) {
+				t.Errorf("%s reads %s without %s in the same query: a read of only instance=\"\" misses the rule's alerts for the picked target", where, sel.text, reads[0])
 			}
 		}
 	}
