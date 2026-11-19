@@ -10,7 +10,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
-	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/envx/v2"
 )
 
 // resolveFormats reads OUTPUT_FORMATS and reports every token the parser had to

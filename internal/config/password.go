@@ -9,7 +9,7 @@ import (
 	"unicode"
 
 	"github.com/cplieger/cert-converter/internal/convert"
-	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/envx/v2"
 )
 
 // errEmptyPassword indicates the resolved PFX password is blank — empty, entirely

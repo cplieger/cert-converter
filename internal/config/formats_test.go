@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
-	"github.com/cplieger/go/envx"
+	"github.com/cplieger/go/envx/v2"
 	"github.com/cplieger/go/slogx/capture"
 )
 
