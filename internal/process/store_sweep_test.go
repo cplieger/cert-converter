@@ -12,6 +12,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/go/filesafe"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx/capture"
 )
 
@@ -157,7 +158,7 @@ func TestScannerRun_sweeps_stale_temps_once_per_window(t *testing.T) {
 	scanner := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 	})
 

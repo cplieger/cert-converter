@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/cert-converter/internal/convert"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx/capture"
 )
 
@@ -491,7 +492,7 @@ func TestScannerRun_an_unopenable_root_reports_an_aborted_scan(t *testing.T) {
 			}
 			scanner := New(&Options{
 				CertsRoot: certsRoot, OutRoot: outRoot,
-				Password: "pw", Encoder: convert.EncNameModern2023,
+				Password: masked.NewSecret("pw"), Encoder: convert.EncNameModern2023,
 			})
 			res, err := scanner.Run(t.Context())
 			if err == nil {

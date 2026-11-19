@@ -18,6 +18,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/go/filesafe"
+	"github.com/cplieger/go/masked"
 )
 
 // sourcesClock is the conversion time every test in this file pins.
@@ -31,7 +32,7 @@ func pinConversionClock(t *testing.T, at *time.Time) {
 }
 
 func newSourcesScanner(inDir, outDir string, adjust func(*Options)) *Scanner {
-	opts := &Options{CertsRoot: inDir, OutRoot: outDir, Password: "pw", Encoder: convert.EncNameModern2023}
+	opts := &Options{CertsRoot: inDir, OutRoot: outDir, Password: masked.NewSecret("pw"), Encoder: convert.EncNameModern2023}
 	if adjust != nil {
 		adjust(opts)
 	}

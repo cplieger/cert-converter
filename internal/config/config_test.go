@@ -641,9 +641,9 @@ func TestLoad_password_file_is_verbatim_and_takes_precedence_over_env(t *testing
 			if err != nil {
 				t.Fatalf("Load() with PFX_PASSWORD_FILE = %v, want nil", err)
 			}
-			if cfg.Password != tc.want {
+			if cfg.Password.Reveal() != tc.want {
 				t.Errorf("Load() Password = %q, want %q (the file wins over PFX_PASSWORD, and its bytes are the password apart from one trailing line ending)",
-					cfg.Password, tc.want)
+					cfg.Password.Reveal(), tc.want)
 			}
 		})
 	}
@@ -919,8 +919,8 @@ func TestLoad_password_file_log_records_source_without_secret_or_path(t *testing
 	if err != nil {
 		t.Fatalf("Load() with PFX_PASSWORD_FILE = %v, want nil", err)
 	}
-	if cfg.Password != secret {
-		t.Fatalf("Load() Password = %q, want the file's contents", cfg.Password)
+	if cfg.Password.Reveal() != secret {
+		t.Fatalf("Load() Password = %q, want the file's contents", cfg.Password.Reveal())
 	}
 
 	if !logs.HasAttr("PFX password configured", "source", "PFX_PASSWORD_FILE") {
@@ -958,8 +958,8 @@ func TestLoad_env_password_logs_no_secret_source(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() = %v, want nil", err)
 	}
-	if cfg.Password != secret {
-		t.Fatalf("Load() Password = %q, want the configured environment value", cfg.Password)
+	if cfg.Password.Reveal() != secret {
+		t.Fatalf("Load() Password = %q, want the configured environment value", cfg.Password.Reveal())
 	}
 
 	if n := logs.Count("PFX password configured"); n != 0 {
@@ -1369,8 +1369,8 @@ func TestLoad_blank_secret_file_obeys_the_same_optout(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Load(blank file, opt-out) = %v, want nil: the opt-out must mean the same thing for both channels", err)
 		}
-		if cfg.Password != "" {
-			t.Errorf("Password = %q, want empty: a blank file must never silently fall back to PFX_PASSWORD", cfg.Password)
+		if cfg.Password.Reveal() != "" {
+			t.Errorf("Password = %q, want empty: a blank file must never silently fall back to PFX_PASSWORD", cfg.Password.Reveal())
 		}
 		// The blank FILE must say so: an INFO "PFX password configured" here
 		// reported a secret that was never configured.
@@ -1439,7 +1439,7 @@ func TestLoad_blank_secret_file_obeys_the_same_optout(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Load = %v, want nil", err)
 		}
-		if cfg.Password == "from-env" {
+		if cfg.Password.Reveal() == "from-env" {
 			t.Error("a blank secret file fell back to PFX_PASSWORD; the file channel exists to be authoritative")
 		}
 	})
@@ -1553,9 +1553,9 @@ func TestLoad_warns_when_a_mounted_secret_password_is_padded(t *testing.T) {
 			}
 			// Asserted alongside the WARN so the two cannot drift: the record is only
 			// truthful if the padding really is part of the delivered password.
-			if cfg.Password != tc.wantPassword {
+			if cfg.Password.Reveal() != tc.wantPassword {
 				t.Errorf("Load() with PFX_PASSWORD_FILE=%q Password = %q, want %q verbatim",
-					tc.contents, cfg.Password, tc.wantPassword)
+					tc.contents, cfg.Password.Reveal(), tc.wantPassword)
 			}
 			wantCount := 0
 			if tc.wantWarn {
@@ -1594,9 +1594,9 @@ func TestLoad_uses_the_env_password_verbatim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() = %v, want nil", err)
 	}
-	if cfg.Password != padded {
+	if cfg.Password.Reveal() != padded {
 		t.Errorf("Load() Password = %q, want %q verbatim: the whitespace is part of the password embedded in every PFX file",
-			cfg.Password, padded)
+			cfg.Password.Reveal(), padded)
 	}
 	for _, r := range logs.Records() {
 		if strings.Contains(r.Message, padded) {
@@ -1691,8 +1691,8 @@ func TestLoad_warns_when_a_blank_file_overrides_a_configured_env_password(t *tes
 	if err != nil {
 		t.Fatalf("Load(blank file, opt-out) = %v, want nil", err)
 	}
-	if cfg.Password != "" {
-		t.Fatalf("Load() Password = %q, want empty: a blank file must never fall back to PFX_PASSWORD", cfg.Password)
+	if cfg.Password.Reveal() != "" {
+		t.Fatalf("Load() Password = %q, want empty: a blank file must never fall back to PFX_PASSWORD", cfg.Password.Reveal())
 	}
 	const conflict = "both PFX_PASSWORD and PFX_PASSWORD_FILE are set"
 	if n := logs.CountLevel(slog.LevelWarn, conflict); n != 1 {
@@ -1875,9 +1875,9 @@ func TestLoad_refuses_an_invisible_only_password_on_both_channels(t *testing.T) 
 				// and these cases write none), so the delivered value is identical
 				// on either channel — which is why an invisible rune beside padding
 				// still reaches the encoder unseen.
-				if cfg.Password != tc.password {
+				if cfg.Password.Reveal() != tc.password {
 					t.Errorf("Load(%s=%q, opt-out) Password = %q, want %q verbatim",
-						ch.channel, tc.password, cfg.Password, tc.password)
+						ch.channel, tc.password, cfg.Password.Reveal(), tc.password)
 				}
 				if cfg.PasswordStatus != passwordInvisibleOnly {
 					t.Errorf("Load(%s=%q, opt-out) status = %q, want %q: the startup line must not report a password nobody can retype as configured",

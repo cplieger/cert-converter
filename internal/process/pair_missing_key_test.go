@@ -9,6 +9,7 @@ import (
 
 	"github.com/cplieger/cert-converter/internal/convert"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
+	"github.com/cplieger/go/masked"
 )
 
 // missingKeyAggregate is logInputCoverageWarnings' partial-orphan line: the
@@ -126,7 +127,7 @@ func TestScannerRun_reports_a_key_replaced_mid_scan_as_transient_then_names_a_ke
 	scanner := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 		Lifecycle: outputpolicy.LifecycleSync,
 	})
@@ -231,7 +232,7 @@ func TestScannerRun_grants_the_vanished_key_grace_after_a_failed_write(t *testin
 	scanner := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 		Lifecycle: outputpolicy.LifecycleKeep,
 	})

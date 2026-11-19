@@ -11,6 +11,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/go/masked"
 )
 
 // TestScannerRun_flatConvertsSourcesFromSeveralProviders pins multi-provider
@@ -32,8 +33,8 @@ func TestScannerRun_flatConvertsSourcesFromSeveralProviders(t *testing.T) {
 	scanner := process.New(&process.Options{
 		CertsRoot:          input,
 		OutRoot:            output,
-		Password:           "output-password",
-		InputPassword:      "input-password",
+		Password:           masked.NewSecret("output-password"),
+		InputPassword:      masked.NewSecret("input-password"),
 		InputPasswordReady: true,
 		Encoder:            convert.EncNameModern2023,
 		Formats:            outputpolicy.Formats{PFX: true},
@@ -76,7 +77,7 @@ func TestScannerRun_defaultLayoutSyncRetainsMirrorLaidArtifacts(t *testing.T) {
 	writePEMSource(t, filepath.Join(input, "issuer", "site"), "site", certPEM, keyPEM)
 
 	mirror := process.New(&process.Options{
-		CertsRoot: input, OutRoot: output, Password: "output-password",
+		CertsRoot: input, OutRoot: output, Password: masked.NewSecret("output-password"),
 		Encoder: convert.EncNameModern2023, Layout: outputpolicy.LayoutMirror,
 	})
 	if result, err := mirror.Run(t.Context()); err != nil || result.Converted != 1 {
@@ -84,7 +85,7 @@ func TestScannerRun_defaultLayoutSyncRetainsMirrorLaidArtifacts(t *testing.T) {
 	}
 
 	defaulted := process.New(&process.Options{
-		CertsRoot: input, OutRoot: output, Password: "output-password",
+		CertsRoot: input, OutRoot: output, Password: masked.NewSecret("output-password"),
 		Encoder:   convert.EncNameModern2023,
 		Lifecycle: outputpolicy.LifecycleSync,
 		// Layout and LayoutExplicit deliberately unset: the post-upgrade state of
@@ -116,7 +117,7 @@ func TestScannerRun_explicitFlatSyncReconcilesMirrorTreeAway(t *testing.T) {
 	writePEMSource(t, filepath.Join(input, "issuer", "site"), "site", certPEM, keyPEM)
 
 	mirror := process.New(&process.Options{
-		CertsRoot: input, OutRoot: output, Password: "output-password",
+		CertsRoot: input, OutRoot: output, Password: masked.NewSecret("output-password"),
 		Encoder: convert.EncNameModern2023, Layout: outputpolicy.LayoutMirror,
 	})
 	if result, err := mirror.Run(t.Context()); err != nil || result.Converted != 1 {
@@ -124,7 +125,7 @@ func TestScannerRun_explicitFlatSyncReconcilesMirrorTreeAway(t *testing.T) {
 	}
 
 	explicit := process.New(&process.Options{
-		CertsRoot: input, OutRoot: output, Password: "output-password",
+		CertsRoot: input, OutRoot: output, Password: masked.NewSecret("output-password"),
 		Encoder:        convert.EncNameModern2023,
 		Lifecycle:      outputpolicy.LifecycleSync,
 		Layout:         outputpolicy.LayoutFlat,

@@ -16,6 +16,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/go/filesafe"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx/capture"
 )
 
@@ -829,7 +830,7 @@ func TestScannerRun_reports_but_does_not_rewrite_a_content_current_bundle_whose_
 			scanner := New(&Options{
 				CertsRoot: certsRoot,
 				OutRoot:   outRoot,
-				Password:  "pw",
+				Password:  masked.NewSecret("pw"),
 				Encoder:   convert.EncNameModern2023,
 			})
 			if res, err := scanner.Run(t.Context()); err != nil || res.Converted != 1 {
@@ -935,7 +936,7 @@ func TestScannerRun_a_write_for_its_own_reasons_installs_the_policy_mode(t *test
 	scanner := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 	})
 	if res, err := scanner.Run(t.Context()); err != nil || res.Converted != 1 {

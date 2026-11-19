@@ -19,6 +19,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/cert-converter/internal/watch"
 	"github.com/cplieger/go/health/v2"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx/capture"
 )
 
@@ -31,7 +32,7 @@ func newTestScanner(certsRoot, outRoot, password string, enc convert.EncoderType
 	return process.New(&process.Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  password,
+		Password:  masked.NewSecret(password),
 		Encoder:   enc,
 		// main always passes the parsed cfg.Lifecycle, which ParseLifecycle
 		// guarantees is one of the three modes; the zero value is not.

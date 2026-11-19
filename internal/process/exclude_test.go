@@ -13,6 +13,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/process"
 	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx/capture"
 )
 
@@ -22,7 +23,7 @@ func newExcludingScanner(input, output string, exclude layout.ExcludeSet, lifecy
 	return process.New(&process.Options{
 		CertsRoot:       input,
 		OutRoot:         output,
-		Password:        "output-password",
+		Password:        masked.NewSecret("output-password"),
 		Encoder:         convert.EncNameModern2023,
 		Formats:         outputpolicy.Formats{PFX: true},
 		FormatsExplicit: true,
@@ -152,7 +153,7 @@ func TestScannerRun_excludingASourceRespectsTheLifecycleModeInMirrorLayout(t *te
 
 			mirrorScanner := func(exclude layout.ExcludeSet) *process.Scanner {
 				return process.New(&process.Options{
-					CertsRoot: input, OutRoot: output, Password: "output-password",
+					CertsRoot: input, OutRoot: output, Password: masked.NewSecret("output-password"),
 					Encoder: convert.EncNameModern2023, Formats: outputpolicy.Formats{PFX: true, PEM: true},
 					FormatsExplicit: true, Layout: outputpolicy.LayoutMirror, LayoutExplicit: true,
 					Lifecycle: tc.mode, Exclude: exclude,
@@ -264,8 +265,8 @@ func TestScannerRun_excludedCertDoesNotShadowItsSiblingBundle(t *testing.T) {
 	scanner := process.New(&process.Options{
 		CertsRoot:          input,
 		OutRoot:            output,
-		Password:           "output-password",
-		InputPassword:      "input-password",
+		Password:           masked.NewSecret("output-password"),
+		InputPassword:      masked.NewSecret("input-password"),
 		InputPasswordReady: true,
 		Encoder:            convert.EncNameModern2023,
 		Formats:            outputpolicy.Formats{PFX: true},

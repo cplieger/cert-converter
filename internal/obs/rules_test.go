@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cplieger/cert-converter/internal/process"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx"
 )
 
@@ -251,7 +252,7 @@ func TestLogQLStateRulesHoldThroughAnAbortedScan(t *testing.T) {
 	if err := os.Mkdir(in, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	scanner := process.New(&process.Options{CertsRoot: in, OutRoot: t.TempDir(), Password: "pw"})
+	scanner := process.New(&process.Options{CertsRoot: in, OutRoot: t.TempDir(), Password: masked.NewSecret("pw")})
 	scanOnce := func() map[string]string {
 		result, err := scanner.Run(t.Context())
 		return renderRecord(t, &Scan{Result: result, Err: err})

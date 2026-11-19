@@ -21,6 +21,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
 	"github.com/cplieger/go/filesafe"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx/capture"
 )
 
@@ -1127,7 +1128,7 @@ func TestScannerRun_a_stale_bundle_with_a_lax_mode_is_a_conversion_failure(t *te
 	scanner := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 	})
 	// The first scan runs with the write seam live, so the bundle under test is a real one
@@ -1625,7 +1626,7 @@ func TestScannerRun_reports_a_shutdown_that_arrives_during_reconciliation(t *tes
 	scanner := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 		Lifecycle: outputpolicy.LifecycleSync,
 	})
@@ -1668,7 +1669,7 @@ func TestScannerRun_reports_the_reap_count(t *testing.T) {
 	scanner := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 		Lifecycle: outputpolicy.LifecycleSync,
 	})
@@ -1833,7 +1834,7 @@ func TestScannerRun_refuses_a_tree_over_the_entry_budget(t *testing.T) {
 	result, err := New(&Options{
 		CertsRoot: inDir, OutRoot: outDir,
 		Encoder:  convert.EncNameModern2023,
-		Password: "pw", Lifecycle: outputpolicy.LifecycleSync,
+		Password: masked.NewSecret("pw"), Lifecycle: outputpolicy.LifecycleSync,
 		// Two: the walk root itself plus one entry, so the third hand-off trips the budget.
 		MaxScanEntries: 2,
 	}).Run(t.Context())
@@ -1879,7 +1880,7 @@ func TestScannerRun_takes_the_injected_entry_budget(t *testing.T) {
 	if _, err := New(&Options{
 		CertsRoot: inDir, OutRoot: outDir,
 		Encoder:  convert.EncNameModern2023,
-		Password: "pw", Lifecycle: outputpolicy.LifecycleSync,
+		Password: masked.NewSecret("pw"), Lifecycle: outputpolicy.LifecycleSync,
 		// Exactly the tree's size: the root plus a.crt, b.crt and c.crt.
 		MaxScanEntries: 4,
 	}).Run(t.Context()); err != nil {
@@ -2136,7 +2137,7 @@ func TestScannerRun_fails_closed_when_the_observation_log_evicts_wholeness_evide
 	// four pairs, so reserving room for live.crt has to evict one.
 	scanner := New(&Options{
 		CertsRoot: certsRoot, OutRoot: outRoot,
-		Password: "pw", Encoder: convert.EncNameModern2023,
+		Password: masked.NewSecret("pw"), Encoder: convert.EncNameModern2023,
 		Lifecycle:      outputpolicy.LifecycleSync,
 		MaxScanEntries: 4,
 	})
@@ -2184,7 +2185,7 @@ func TestScannerRun_prunes_the_observation_log_despite_an_eviction(t *testing.T)
 	writeSelfSignedPair(t, certsRoot, "live")
 	scanner := New(&Options{
 		CertsRoot: certsRoot, OutRoot: outRoot,
-		Password: "pw", Encoder: convert.EncNameModern2023,
+		Password: masked.NewSecret("pw"), Encoder: convert.EncNameModern2023,
 		Lifecycle:      outputpolicy.LifecycleSync,
 		MaxScanEntries: 4,
 	})
@@ -2800,7 +2801,7 @@ func TestScannerRun_stays_quiet_when_the_shutdown_arrives_during_the_input_walk(
 	scanner := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 		Lifecycle: outputpolicy.LifecycleSync,
 	})

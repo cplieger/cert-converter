@@ -13,6 +13,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/logtext"
 	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx/capture"
 )
 
@@ -52,7 +53,7 @@ func TestScannerRun_sanitizes_walk_supplied_names_in_log_attributes(t *testing.T
 	scanner := New(&Options{
 		CertsRoot: certsRoot,
 		OutRoot:   outRoot,
-		Password:  "pw",
+		Password:  masked.NewSecret("pw"),
 		Encoder:   convert.EncNameModern2023,
 	})
 

@@ -16,6 +16,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx/capture"
 )
 
@@ -1214,7 +1215,7 @@ func TestScannerRun_reports_an_input_named_link_that_hides_a_claimant(t *testing
 		t.Run(tc.name, func(t *testing.T) {
 			in, outside := claimantTree(t, "a", tc.name)
 			logs := captureLogs(t)
-			scanner := newVerdictScanner(in, t.TempDir(), Options{Layout: outputpolicy.LayoutFlat, InputPassword: "x", InputPasswordReady: true})
+			scanner := newVerdictScanner(in, t.TempDir(), Options{Layout: outputpolicy.LayoutFlat, InputPassword: masked.NewSecret("x"), InputPasswordReady: true})
 			if res := runScans(t, scanner, 1); res.Collided != 2 {
 				t.Fatalf("setup: Collided = %d, want 2", res.Collided)
 			}

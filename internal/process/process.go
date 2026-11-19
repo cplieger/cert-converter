@@ -22,6 +22,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/scanbudget"
 	"github.com/cplieger/go/filesafe"
+	"github.com/cplieger/go/masked"
 )
 
 // ScanResult carries per-source outcome summary counts from a scan run. A scan
@@ -194,8 +195,8 @@ type Options struct {
 	Layout        outputpolicy.Layout
 	CertsRoot     string
 	OutRoot       string
-	Password      string
-	InputPassword string
+	Password      masked.Secret
+	InputPassword masked.Secret
 	// Exclude names input paths that are enumerated but never converted.
 	Exclude layout.ExcludeSet
 	// MaxScanEntries is how many entries one scan may enumerate in EACH mounted tree
@@ -259,7 +260,7 @@ func New(opts *Options) *Scanner {
 	if normalized.Layout == "" {
 		normalized.Layout = outputpolicy.DefaultLayout()
 	}
-	if normalized.InputPasswordReady && normalized.InputPassword == "" {
+	if normalized.InputPasswordReady && normalized.InputPassword.IsZero() {
 		normalized.InputPasswordReady = false
 	}
 	return &Scanner{
@@ -508,8 +509,8 @@ type scanWalk struct {
 	enc           convert.EncoderType
 	layoutMode    outputpolicy.Layout
 	exclude       layout.ExcludeSet
-	password      string
-	inputPassword string
+	password      masked.Secret
+	inputPassword masked.Secret
 	outcomes      map[string]SourceOutcome
 	results       []conversionStatus
 	// budget is this walk's entry ceiling and its charge counter, injected from
@@ -1637,7 +1638,7 @@ func (sw *scanWalk) convertBundle(ctx context.Context, rel string) conversionSta
 		return sw.noteUnreadableInput(rel, rel, "bundle", err)
 	}
 	fingerprint := pairFingerprint(data, nil)
-	analysis, err := convert.AnalyseBundleWithBudget(ctx, data, sw.inputPassword, sw.bundleBudget)
+	analysis, err := convert.AnalyseBundleWithBudget(ctx, data, sw.inputPassword.Reveal(), sw.bundleBudget)
 	if err != nil {
 		return sw.failSource(rel, err.Error(), err)
 	}
@@ -1758,7 +1759,7 @@ func foldStatuses(statuses []conversionStatus) conversionStatus {
 // emitPFX resolves one source's PKCS#12 artifact: current, rewritten, refused, or
 // failed, with each arm's diagnostic emitted here.
 func (sw *scanWalk) emitPFX(ctx context.Context, rel, pfxRel string, em *emission) conversionStatus {
-	state, err := sw.out.inspect(ctx, pfxRel, em.analysis, sw.enc, sw.password)
+	state, err := sw.out.inspect(ctx, pfxRel, em.analysis, sw.enc, sw.password.Reveal())
 	if err != nil {
 		// A cancellation, and nothing else: inspect resolves every other
 		// question about the bytes on disk into contentUnverified or
@@ -1769,7 +1770,7 @@ func (sw *scanWalk) emitPFX(ctx context.Context, rel, pfxRel string, em *emissio
 		return statusUnchanged
 	}
 	slog.Debug("converting source", "path", logtext.Path(rel), "output_path", logtext.Path(pfxRel))
-	pfxData, err := em.analysis.Encode(sw.enc, sw.password)
+	pfxData, err := em.analysis.Encode(sw.enc, sw.password.Reveal())
 	if err != nil {
 		return sw.failSource(rel, err.Error(), err)
 	}

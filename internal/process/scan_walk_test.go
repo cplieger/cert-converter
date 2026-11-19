@@ -15,6 +15,7 @@ import (
 	"github.com/cplieger/cert-converter/internal/layout"
 	"github.com/cplieger/cert-converter/internal/outputpolicy"
 	"github.com/cplieger/cert-converter/internal/testcerts"
+	"github.com/cplieger/go/masked"
 	"github.com/cplieger/go/slogx/capture"
 )
 
@@ -341,7 +342,7 @@ func TestScannerRun_treats_a_source_link_to_nothing_as_a_deleted_source(t *testi
 	for _, lay := range []outputpolicy.Layout{outputpolicy.LayoutFlat, outputpolicy.LayoutMirror} {
 		t.Run(string(lay), func(t *testing.T) {
 			sync := Options{Layout: lay, Lifecycle: outputpolicy.LifecycleSync}
-			bundles := Options{Layout: lay, InputPassword: linkBundlePassword, InputPasswordReady: true}
+			bundles := Options{Layout: lay, InputPassword: masked.NewSecret(linkBundlePassword), InputPasswordReady: true}
 			t.Run("certificate_beside_its_key", func(t *testing.T) {
 				in, out := t.TempDir(), t.TempDir()
 				writeSelfSignedPair(t, in, "x")
